@@ -266,7 +266,6 @@ _HF_CACHEDIR_TAG_CONTENT = (
 
 def _record_dvc_output_limit_incomplete(
     results: ModelAuditResultModel,
-    scan_metadata: dict[str, Any],
     dvc_path: str,
     resolution: DvcResolution,
 ) -> None:
@@ -274,7 +273,6 @@ def _record_dvc_output_limit_incomplete(
     if resolution.omitted_output_count == 0:
         return
 
-    scan_metadata["success"] = False
     _add_issue_to_model(
         results,
         "DVC output limit exceeded - not all declared outputs were scanned",
@@ -477,7 +475,6 @@ def _record_incomplete_dvc_resolution(
     if not resolution.analysis_incomplete:
         return
 
-    scan_metadata["success"] = False
     scan_metadata["has_operational_errors"] = True
     details: dict[str, Any] = {
         "analysis_incomplete": True,
@@ -508,7 +505,6 @@ def _record_incomplete_dvc_scan_budget(
     limit: int,
 ) -> None:
     """Record exhaustion of a shared DVC scan budget."""
-    scan_metadata["success"] = False
     scan_metadata["has_operational_errors"] = True
     _add_issue_to_model(
         results,
@@ -531,7 +527,6 @@ def _record_directory_special_file_unscanned(
     file_path: str,
 ) -> None:
     """Fail closed when a directory entry is not a regular file."""
-    scan_metadata["success"] = False
     scan_metadata["has_operational_errors"] = True
     _add_issue_to_model(
         results,
@@ -3275,11 +3270,8 @@ def scan_model_directory_or_file(
     # Initialize results using Pydantic model from the start
     results = create_initial_audit_result()
     # Store additional scan metadata
-    scan_metadata = {
-        "path": path,
-        "success": True,
+    scan_metadata: dict[str, Any] = {
         "has_operational_errors": False,
-        "scanners": [],  # Track the scanners used (different from scanner_names)
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
@@ -3658,7 +3650,6 @@ def scan_model_directory_or_file(
             def record_non_regular_directory_entry(file_path: Path) -> None:
                 nonlocal aggregate_hash_complete
                 aggregate_hash_complete = False
-                scan_metadata["success"] = False
                 scan_metadata["has_operational_errors"] = True
                 _add_issue_to_model(
                     results,
@@ -3809,7 +3800,6 @@ def scan_model_directory_or_file(
                             reported_traversal_targets=reported_traversal_targets,
                         )
                         if entry_unavailable:
-                            scan_metadata["success"] = False
                             scan_metadata["has_operational_errors"] = True
                     record_uncovered_dvc_file_symlink(file_path_obj, resolved_file)
                     if resolved_file is None:
@@ -4945,15 +4935,7 @@ def scan_model_directory_or_file(
                                 file_hashes.append(external_data_content_hash)
                                 recorded_content_hashes.add(external_data_content_hash)
 
-                        # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
-                        if scanner_name:
-                            # Ensure scanners list exists and is properly typed
-                            if "scanners" not in scan_metadata:
-                                scan_metadata["scanners"] = []
-                            scanners_list = scan_metadata["scanners"]
-                            if isinstance(scanners_list, list) and scanner_name not in scanners_list:
-                                scanners_list.append(scanner_name)
                         if scanner_name and scanner_name not in results.scanner_names and scanner_name != "unknown":
                             results.scanner_names.append(scanner_name)
 
@@ -5062,7 +5044,6 @@ def scan_model_directory_or_file(
                             break
                     except Exception as e:
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
-                        scan_metadata["success"] = False
                         scan_metadata["has_operational_errors"] = True
 
                         _add_issue_to_model(
@@ -5108,7 +5089,7 @@ def scan_model_directory_or_file(
                         scanner_selection_extensions=scanner_selection_extensions,
                     ):
                         aggregate_hash_complete = False
-                        _record_dvc_output_limit_incomplete(results, scan_metadata, dvc_path, dvc_resolution)
+                        _record_dvc_output_limit_incomplete(results, dvc_path, dvc_resolution)
 
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
@@ -5119,7 +5100,6 @@ def scan_model_directory_or_file(
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.warning("Scan terminated early due to total size limit")
-                scan_metadata["success"] = False
                 scan_metadata["has_operational_errors"] = True
                 _add_issue_to_model(
                     results,
@@ -5335,7 +5315,6 @@ def scan_model_directory_or_file(
                         dvc_scanned_directories.add(resolved_directory)
                         internally_scanned_dvc_directories.add(resolved_directory)
                     if _results_have_operational_error(nested_result):
-                        scan_metadata["success"] = False
                         scan_metadata["has_operational_errors"] = True
                     results.content_hash = None
                     aggregate_hash_complete = False
@@ -5481,7 +5460,6 @@ def scan_model_directory_or_file(
                             limit=max_total_size,
                         )
                     else:
-                        scan_metadata["success"] = False
                         scan_metadata["has_operational_errors"] = True
                     break
 
@@ -5524,11 +5502,10 @@ def scan_model_directory_or_file(
                         aggregate_hash_complete = False
                 if not dvc_outputs_covered:
                     aggregate_hash_complete = False
-                    _record_dvc_output_limit_incomplete(results, scan_metadata, path, single_dvc_resolution)
+                    _record_dvc_output_limit_incomplete(results, path, single_dvc_resolution)
 
     except KeyboardInterrupt:
         logger.debug("Scan interrupted by user")
-        scan_metadata["success"] = False
         scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
@@ -5540,7 +5517,6 @@ def scan_model_directory_or_file(
             logger.error(f"Error during scan: {format_terminal_text(report_error)}")
         else:
             logger.exception(f"Error during scan: {report_error}")
-        scan_metadata["success"] = False
         scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results,
@@ -6121,6 +6097,17 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    def with_file_size(result: ScanResult) -> ScanResult:
+        # Ensure bytes_scanned reflects the actual file size even when a scanner
+        # returns early (e.g. missing optional dependency, parse error).  The file
+        # size was already computed above via os.path.getsize and is guaranteed to
+        # be accurate.  Without this fallback the scan summary reports "Size: 0
+        # bytes" for every file whose scanner didn't explicitly set the field.
+        if result.bytes_scanned == 0 and file_size > 0:
+            result.bytes_scanned = file_size
+
+        return result
+
     bypass_cache_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(path, config, file_size)
 
     # Check if we should use extreme handler BEFORE applying size limits
@@ -6338,26 +6325,20 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Validate file type consistency as a security check
     if header_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_llamafile_routing_result(path, config)
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     nemo_routing_inconclusive = (
         header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT
     )
     validated_hdf5_nemo_overlap = nemo_routing_inconclusive and hdf5_signature_offset is not None
     if nemo_routing_inconclusive and not validated_hdf5_nemo_overlap:
         sr = _make_incomplete_nemo_routing_result(path)
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if (
         header_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
         or magic_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
     ):
         sr = _make_incomplete_tokenizer_json_routing_result(path)
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if (
         header_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
         or magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
@@ -6372,30 +6353,22 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 context="overlapping JSON analysis",
                 kind=SCANNER_SELECTION_PREFERRED_KIND,
             )
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if (
         header_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
         or magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
     ):
         sr = _make_incomplete_xgboost_ubjson_routing_result(path)
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if header_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT or magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_onnx_routing_result(path)
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if (
         header_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
         or magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
     ):
         sr = _make_incomplete_sentencepiece_model_proto_result(path)
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_pickle_routing_result(path)
         merge_safetensors_overlap_analysis(
@@ -6405,9 +6378,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             scanner_selection,
             safetensors_overlap_scanner_ids,
         )
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if (
         header_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
         or magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
@@ -6420,9 +6391,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             scanner_selection,
             safetensors_overlap_scanner_ids,
         )
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
     if (
         header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT
     ) and hdf5_signature_offset is None:
@@ -6434,9 +6403,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             scanner_selection,
             safetensors_overlap_scanner_ids,
         )
-        if sr.bytes_scanned == 0 and file_size > 0:
-            sr.bytes_scanned = file_size
-        return sr
+        return with_file_size(sr)
 
     should_validate_gzip_tar_tail = (
         format_probe_error is None
@@ -6840,24 +6807,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_protobuf_model_result(path)
             elif magic_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and header_format != "unknown":
                 sr = _make_unavailable_recognized_format_result(path, header_format, scanner_id)
-            elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_llamafile_routing_result(path, config)
             elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_nemo_routing_result(path)
-            elif magic_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_tokenizer_json_routing_result(path)
-            elif magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
-            elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_xgboost_ubjson_routing_result(path)
-            elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_onnx_routing_result(path)
-            elif magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_sentencepiece_model_proto_result(path)
-            elif magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_pickle_routing_result(path)
-            elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
@@ -7103,15 +7054,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             rule_code=rule_code,
         )
 
-    # Ensure bytes_scanned reflects the actual file size even when a scanner
-    # returns early (e.g. missing optional dependency, parse error).  The file
-    # size was already computed above via os.path.getsize and is guaranteed to
-    # be accurate.  Without this fallback the scan summary reports "Size: 0
-    # bytes" for every file whose scanner didn't explicitly set the field.
-    if result.bytes_scanned == 0 and file_size > 0:
-        result.bytes_scanned = file_size
-
-    return result
+    return with_file_size(result)
 
 
 def scan_model_streaming(

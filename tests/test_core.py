@@ -10137,6 +10137,7 @@ def test_scan_file_fails_closed_when_disguised_llamafile_route_probe_cannot_read
     result = scan_file(str(payload), config={"cache_scan_results": False})
 
     assert result.scanner_name == "unknown"
+    assert result.bytes_scanned == payload.stat().st_size
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["operational_error_reason"] == "llamafile_routing_incomplete"
@@ -16190,6 +16191,7 @@ def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(
     result = scan_file(str(unavailable_onnx))
 
     assert result.scanner_name == "unknown"
+    assert result.bytes_scanned == unavailable_onnx.stat().st_size
     assert result.success is False
     assert result.has_errors is False
     assert result.metadata["scan_outcome"] == "inconclusive"
