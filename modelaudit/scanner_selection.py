@@ -110,7 +110,6 @@ def _scanner_aliases() -> dict[str, str]:
 
     for scanner_id, scanner_info in _scanner_metadata().items():
         add(scanner_id, scanner_id)
-        add(scanner_id.replace("_", "-"), scanner_id)
 
         class_name = str(scanner_info.get("class", ""))
         add(class_name, scanner_id)
@@ -119,8 +118,6 @@ def _scanner_aliases() -> dict[str, str]:
 
     # Common user-facing aliases from docs and issue examples.
     aliases.setdefault("H5Scanner".strip().lower().replace("_", "").replace("-", ""), "keras_h5")
-    aliases.setdefault("TensorflowSavedModelScanner".strip().lower().replace("_", "").replace("-", ""), "tf_savedmodel")
-    aliases.setdefault("TensorflowMetaGraphScanner".strip().lower().replace("_", "").replace("-", ""), "tf_metagraph")
     return aliases
 
 
