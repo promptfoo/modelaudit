@@ -5132,7 +5132,6 @@ class NetworkCommDetector:
         self._url_context_starts: list[int] = []
         self._url_context_iterator: Iterator[tuple[int, int, str]] | None = None
         self._pending_url_context: tuple[int, int, str] | None = None
-        self._url_context_scan_complete = False
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
         self._has_sensitive_evidence_hint = False
@@ -5200,12 +5199,10 @@ class NetworkCommDetector:
             self._url_contexts = self._index_url_contexts(data)
             self._url_context_starts = [start for start, _end, _url in self._url_contexts]
             self._url_context_iterator = None
-            self._url_context_scan_complete = True
         else:
             self._url_contexts = []
             self._url_context_starts = []
             self._url_context_iterator = self._iter_url_contexts(data)
-            self._url_context_scan_complete = False
         self._pending_url_context = None
 
         scanners = (
@@ -5379,16 +5376,12 @@ class NetworkCommDetector:
             if match_start < cached[1]:
                 return cached
 
-        while not self._url_context_scan_complete:
+        while self._url_context_iterator is not None:
             if self._pending_url_context is None:
-                if self._url_context_iterator is None:
-                    self._url_context_scan_complete = True
-                    break
                 try:
                     self._pending_url_context = next(self._url_context_iterator)
                 except StopIteration:
                     self._url_context_iterator = None
-                    self._url_context_scan_complete = True
                     break
 
             context = self._pending_url_context

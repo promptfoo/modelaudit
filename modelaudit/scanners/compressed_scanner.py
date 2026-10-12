@@ -8,7 +8,9 @@ import lzma
 import os
 import tempfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from functools import partial
+from itertools import chain
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -23,7 +25,7 @@ from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import member_scan_incomplete
 from .archive_member_security import scan_archive_member_for_known_risks
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, Issue, IssueSeverity, ScanResult
 
 ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY = "_compressed_allow_safetensors_nonmember_trailing"
 COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY = "_compressed_source_size_limit"
@@ -531,56 +533,6 @@ class CompressedScanner(BaseScanner):
         return total_out
 
     @staticmethod
-    def _read_bzip2_stream_with_limits(
-        source: Any,
-        destination: Any,
-        max_decompressed_bytes: int,
-        max_ratio: float,
-        compressed_size: int,
-        chunk_size: int,
-        on_new_member: Callable[[], None] | None = None,
-        allow_zero_padding_trailing: bool = False,
-    ) -> int:
-        return CompressedScanner._read_concatenated_stream_with_limits(
-            source=source,
-            destination=destination,
-            decompressor_factory=bz2.BZ2Decompressor,
-            error_types=(OSError, EOFError),
-            codec="bzip2",
-            max_decompressed_bytes=max_decompressed_bytes,
-            max_ratio=max_ratio,
-            compressed_size=compressed_size,
-            chunk_size=chunk_size,
-            on_new_member=on_new_member,
-            allow_zero_padding_trailing=allow_zero_padding_trailing,
-        )
-
-    @staticmethod
-    def _read_xz_stream_with_limits(
-        source: Any,
-        destination: Any,
-        max_decompressed_bytes: int,
-        max_ratio: float,
-        compressed_size: int,
-        chunk_size: int,
-        on_new_member: Callable[[], None] | None = None,
-        allow_zero_padding_trailing: bool = False,
-    ) -> int:
-        return CompressedScanner._read_concatenated_stream_with_limits(
-            source=source,
-            destination=destination,
-            decompressor_factory=lambda: lzma.LZMADecompressor(format=lzma.FORMAT_AUTO),
-            error_types=(lzma.LZMAError, EOFError),
-            codec="xz",
-            max_decompressed_bytes=max_decompressed_bytes,
-            max_ratio=max_ratio,
-            compressed_size=compressed_size,
-            chunk_size=chunk_size,
-            on_new_member=on_new_member,
-            allow_zero_padding_trailing=allow_zero_padding_trailing,
-        )
-
-    @staticmethod
     def _read_gzip_stream_with_limits(
         source: Any,
         destination: Any,
@@ -861,65 +813,41 @@ class CompressedScanner(BaseScanner):
                 )
                 source = bounded_source
                 if codec == "gzip":
-                    total_out = self._read_gzip_stream_with_limits(
-                        source=source,
-                        destination=outputs,
-                        max_decompressed_bytes=self.max_decompressed_bytes,
-                        max_ratio=self.max_decompression_ratio,
-                        compressed_size=projected_compressed_size,
-                        chunk_size=self.chunk_size,
-                        on_new_member=lambda: outputs.start_new_member(suffix),
+                    reader: Callable[..., int] = partial(
+                        self._read_gzip_stream_with_limits,
                         allow_nonmember_trailing=bool(self.config.get(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY)),
-                        allow_zero_padding_trailing=allow_zero_padding,
                     )
                 elif codec == "bzip2":
-                    total_out = self._read_bzip2_stream_with_limits(
-                        source=source,
-                        destination=outputs,
-                        max_decompressed_bytes=self.max_decompressed_bytes,
-                        max_ratio=self.max_decompression_ratio,
-                        compressed_size=projected_compressed_size,
-                        chunk_size=self.chunk_size,
-                        on_new_member=lambda: outputs.start_new_member(suffix),
-                        allow_zero_padding_trailing=allow_zero_padding,
+                    reader = partial(
+                        CompressedScanner._read_concatenated_stream_with_limits,
+                        decompressor_factory=bz2.BZ2Decompressor,
+                        error_types=(OSError, EOFError),
+                        codec="bzip2",
                     )
                 elif codec == "xz":
-                    total_out = self._read_xz_stream_with_limits(
-                        source=source,
-                        destination=outputs,
-                        max_decompressed_bytes=self.max_decompressed_bytes,
-                        max_ratio=self.max_decompression_ratio,
-                        compressed_size=projected_compressed_size,
-                        chunk_size=self.chunk_size,
-                        on_new_member=lambda: outputs.start_new_member(suffix),
-                        allow_zero_padding_trailing=allow_zero_padding,
+                    reader = partial(
+                        CompressedScanner._read_concatenated_stream_with_limits,
+                        decompressor_factory=lambda: lzma.LZMADecompressor(format=lzma.FORMAT_AUTO),
+                        error_types=(lzma.LZMAError, EOFError),
+                        codec="xz",
                     )
                 elif codec == "lz4":
                     lz4_frame = self._get_lz4_frame_module()
-                    total_out = self._read_lz4_stream_with_limits(
-                        source=source,
-                        destination=outputs,
-                        lz4_frame=lz4_frame,
-                        max_decompressed_bytes=self.max_decompressed_bytes,
-                        max_ratio=self.max_decompression_ratio,
-                        compressed_size=projected_compressed_size,
-                        chunk_size=self.chunk_size,
-                        on_new_member=lambda: outputs.start_new_member(suffix),
-                        allow_zero_padding_trailing=allow_zero_padding,
-                    )
+                    reader = partial(self._read_lz4_stream_with_limits, lz4_frame=lz4_frame)
                 elif codec == "zlib":
-                    total_out = self._read_zlib_stream_with_limits(
-                        source=source,
-                        destination=outputs,
-                        max_decompressed_bytes=self.max_decompressed_bytes,
-                        max_ratio=self.max_decompression_ratio,
-                        compressed_size=projected_compressed_size,
-                        chunk_size=self.chunk_size,
-                        on_new_member=lambda: outputs.start_new_member(suffix),
-                        allow_zero_padding_trailing=allow_zero_padding,
-                    )
+                    reader = self._read_zlib_stream_with_limits
                 else:
                     raise _CorruptStreamError(f"Unsupported compression codec: {codec}")
+                total_out = reader(
+                    source=source,
+                    destination=outputs,
+                    max_decompressed_bytes=self.max_decompressed_bytes,
+                    max_ratio=self.max_decompression_ratio,
+                    compressed_size=projected_compressed_size,
+                    chunk_size=self.chunk_size,
+                    on_new_member=lambda: outputs.start_new_member(suffix),
+                    allow_zero_padding_trailing=allow_zero_padding,
+                )
         except (_DecompressionLimitExceeded, _CorruptStreamError) as exc:
             if self.config.get(PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY):
                 outputs.close()
@@ -967,21 +895,14 @@ class CompressedScanner(BaseScanner):
 
     @staticmethod
     def _rewrite_inner_locations(inner_result: ScanResult, temp_path: str, provenance: str) -> None:
-        for issue in inner_result.issues:
-            issue.location = CompressedScanner._rewrite_wrapper_location(issue.location, temp_path, provenance)
+        findings: Iterator[Issue | Check] = chain(inner_result.issues, inner_result.checks)
+        for finding in findings:
+            finding.location = CompressedScanner._rewrite_wrapper_location(finding.location, temp_path, provenance)
 
-            if issue.details:
-                issue.details["compressed_wrapper"] = provenance
+            if finding.details:
+                finding.details["compressed_wrapper"] = provenance
             else:
-                issue.details = {"compressed_wrapper": provenance}
-
-        for check in inner_result.checks:
-            check.location = CompressedScanner._rewrite_wrapper_location(check.location, temp_path, provenance)
-
-            if check.details:
-                check.details["compressed_wrapper"] = provenance
-            else:
-                check.details = {"compressed_wrapper": provenance}
+                finding.details = {"compressed_wrapper": provenance}
 
     @staticmethod
     def _is_transport_fragment_member(inner_result: ScanResult, member_result: ScanResult) -> bool:
