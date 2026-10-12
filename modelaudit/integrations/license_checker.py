@@ -592,31 +592,19 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
             if not info.get("isOsiApproved", True):
                 incompatible_files.append(file_path)
 
-    if deprecated_files:
-        warnings.append(
-            {
-                "type": "license_warning",
-                "severity": "error" if strict else "warning",
-                "message": (f"Deprecated licenses detected ({len(deprecated_files)} files)."),
-                "details": {
-                    "files": deprecated_files[:5],
-                    "total_count": len(deprecated_files),
-                },
-            }
-        )
-
-    if incompatible_files:
-        warnings.append(
-            {
-                "type": "license_warning",
-                "severity": "error" if strict else "warning",
-                "message": (f"Incompatible licenses detected ({len(incompatible_files)} files)."),
-                "details": {
-                    "files": incompatible_files[:5],
-                    "total_count": len(incompatible_files),
-                },
-            }
-        )
+    for label, files in (("Deprecated", deprecated_files), ("Incompatible", incompatible_files)):
+        if files:
+            warnings.append(
+                {
+                    "type": "license_warning",
+                    "severity": "error" if strict else "warning",
+                    "message": f"{label} licenses detected ({len(files)} files).",
+                    "details": {
+                        "files": files[:5],
+                        "total_count": len(files),
+                    },
+                }
+            )
 
     return warnings
 

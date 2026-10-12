@@ -239,20 +239,13 @@ def get_lfs_remediation_steps(repo_hint: str | None = None) -> list[str]:
     Returns:
         List of remediation step strings
     """
-    steps = [
+    return [
         "Run 'git lfs pull' in the repository to download the actual file",
+        (
+            f"Download directly: huggingface-cli download {repo_hint}"
+            if repo_hint
+            else "Download directly using huggingface-cli download <repo-id> <filename>"
+        ),
+        "Use the HuggingFace web interface to download the file",
+        "Check your Git LFS installation: git lfs install && git lfs pull",
     ]
-
-    if repo_hint:
-        steps.append(f"Download directly: huggingface-cli download {repo_hint}")
-    else:
-        steps.append("Download directly using huggingface-cli download <repo-id> <filename>")
-
-    steps.extend(
-        [
-            "Use the HuggingFace web interface to download the file",
-            "Check your Git LFS installation: git lfs install && git lfs pull",
-        ]
-    )
-
-    return steps

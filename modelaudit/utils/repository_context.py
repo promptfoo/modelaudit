@@ -45,19 +45,6 @@ def normalize_repository_member_path(value: object) -> str | None:
     return path.as_posix()
 
 
-def _raw_inventory_files(raw_inventory: object) -> Iterable[object] | None:
-    if isinstance(raw_inventory, RepositoryFileInventory):
-        return raw_inventory.files
-    if isinstance(raw_inventory, Mapping):
-        raw_inventory = raw_inventory.get("files")
-
-    if isinstance(raw_inventory, str):
-        return (raw_inventory,)
-    if isinstance(raw_inventory, Iterable) and not isinstance(raw_inventory, (bytes, bytearray)):
-        return raw_inventory
-    return None
-
-
 def repository_file_inventory_from_config(config: Mapping[str, Any] | None) -> tuple[str, ...]:
     """Return normalized repository member paths from scanner config."""
     return repository_file_inventory_context_from_config(config).files
@@ -72,14 +59,17 @@ def repository_file_inventory_context_from_config(config: Mapping[str, Any] | No
     if isinstance(raw_inventory, RepositoryFileInventory):
         return raw_inventory
 
-    candidates = _raw_inventory_files(raw_inventory)
-    if candidates is None:
+    if isinstance(raw_inventory, Mapping):
+        raw_inventory = raw_inventory.get("files")
+    if isinstance(raw_inventory, str):
+        raw_inventory = (raw_inventory,)
+    if not isinstance(raw_inventory, Iterable) or isinstance(raw_inventory, (bytes, bytearray)):
         return RepositoryFileInventory((), {})
 
     inventory: list[str] = []
     seen: set[str] = set()
     safetensors_by_parent: dict[str, set[str]] = {}
-    for index, candidate in enumerate(candidates):
+    for index, candidate in enumerate(raw_inventory):
         if index >= MAX_REPOSITORY_INVENTORY_FILES:
             break
         normalized = normalize_repository_member_path(candidate)

@@ -62,11 +62,6 @@ class _ModelURLParser(HTMLParser):
                 if _PYTORCH_MODEL_URL_PATTERN.fullmatch(stripped_value):
                     self.candidates.append((stripped_value, False, True))
 
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.handle_starttag(tag, attrs)
-        if tag.casefold() in {"script", "style"}:
-            self._raw_text_depth -= 1
-
     def handle_endtag(self, tag: str) -> None:
         if tag.casefold() in {"script", "style"} and self._raw_text_depth:
             self._raw_text_depth -= 1
@@ -852,6 +847,7 @@ def download_pytorch_hub_model(
     for _, relative_path in artifacts:
         _safe_destination_path(dest_root, relative_path)
 
+    staging_dir: Path | None = None
     try:
         total_size = _get_total_size(weight_urls)
         if total_size > 0:
@@ -859,27 +855,16 @@ def download_pytorch_hub_model(
             has_space, message = check_disk_space(dest_root, total_size)
             if not has_space:
                 raise Exception(f"Cannot download model from {url}: {message}")
-    except BaseException:
-        if cache_dir is None:
-            shutil.rmtree(dest_root, ignore_errors=True)
-        raise
 
-    staging_dir: Path | None = None
-    files_dir = dest_root
-    backup_dir: Path | None = None
-    if cache_dir is not None:
-        try:
+        files_dir = dest_root
+        backup_dir: Path | None = None
+        if cache_dir is not None:
             staging_dir = Path(tempfile.mkdtemp(prefix=".modelaudit_pth_stage_", dir=dest_root)).resolve()
             files_dir = staging_dir / "files"
             backup_dir = staging_dir / "backups"
             files_dir.mkdir()
             backup_dir.mkdir()
-        except BaseException:
-            if staging_dir is not None:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            raise
 
-    try:
         downloaded_size = 0
         for weight_url, relative_path in artifacts:
             try:

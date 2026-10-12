@@ -289,16 +289,9 @@ def _home_fallback_config_dir() -> Path:
 
 def _config_dir_candidates() -> list[Path]:
     """Return config directory candidates in preference order."""
-    candidates = [Path(user_config_dir("promptfoo")), _home_fallback_config_dir()]
-    unique_candidates: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        unique_candidates.append(candidate)
-        seen.add(key)
-    return unique_candidates
+    primary = Path(user_config_dir("promptfoo"))
+    fallback = _home_fallback_config_dir()
+    return [primary] if str(primary) == str(fallback) else [primary, fallback]
 
 
 def _select_config_directory(create_if_not_exists: bool = False) -> Path:
@@ -445,15 +438,7 @@ def write_global_config_partial(partial_config: dict[str, Any]) -> None:
 
 def get_user_id() -> str:
     """Get user ID, creating one if it doesn't exist."""
-    global_config = read_global_config()
-    if not global_config.id:
-        new_id = str(uuid4())
-        updated_config = GlobalConfig(global_config.to_dict())
-        updated_config.id = new_id
-        write_global_config(updated_config)
-        return new_id
-
-    return cast(str, global_config.id)
+    return cast(str, read_global_config().id)
 
 
 def get_user_email() -> str | None:
@@ -478,18 +463,8 @@ class ModelAuditConfig:
 
     def get_api_key(self) -> str | None:
         """Get API key with delegation-aware precedence."""
-        # 1. Environment (ModelAudit-specific)
-        env_key = os.environ.get("MODELAUDIT_API_KEY")
-        if env_key:
-            return env_key
-
-        # 2. Check if delegated from promptfoo
-        if os.environ.get("PROMPTFOO_DELEGATED"):
-            # Use shared promptfoo config
-            return self.cloud_config.get_api_key()
-
-        # 3. Fall back to regular config
-        return self.cloud_config.get_api_key()
+        # Prefer ModelAudit-specific environment configuration over the shared config.
+        return os.environ.get("MODELAUDIT_API_KEY") or self.cloud_config.get_api_key()
 
     def set_api_key(self, api_key: str) -> None:
         """Set API key in config."""
@@ -497,13 +472,9 @@ class ModelAuditConfig:
 
     def get_api_host(self) -> str:
         """Get API host with delegation-aware precedence."""
-        # 1. Environment (ModelAudit-specific or standard)
+        # Prefer environment configuration over the shared config, including delegated calls.
         env_host = os.environ.get("MODELAUDIT_API_HOST") or os.environ.get("API_HOST")
-        if env_host:
-            return env_host
-
-        # 2. Use shared promptfoo config (works for both delegated and normal cases)
-        return self.cloud_config.get_api_host()
+        return env_host or self.cloud_config.get_api_host()
 
     def set_api_host(self, api_host: str) -> None:
         """Set API host in config."""
@@ -511,13 +482,8 @@ class ModelAuditConfig:
 
     def get_user_email(self) -> str | None:
         """Get user email with delegation-aware precedence."""
-        # 1. Environment (ModelAudit-specific)
-        env_email = os.environ.get("MODELAUDIT_USER_EMAIL")
-        if env_email:
-            return env_email
-
-        # 2. Use shared promptfoo config (works for both delegated and normal cases)
-        return get_user_email()
+        # Prefer ModelAudit-specific environment configuration over the shared config.
+        return os.environ.get("MODELAUDIT_USER_EMAIL") or get_user_email()
 
     def set_user_email(self, user_email: str) -> None:
         """Set user email in config."""
@@ -525,12 +491,8 @@ class ModelAuditConfig:
 
     def get_app_url(self) -> str:
         """Get app URL from environment or config."""
-        # Check environment first (maintaining compatibility)
-        env_url = os.environ.get("MODELAUDIT_APP_URL")
-        if env_url:
-            return env_url
-
-        return self.cloud_config.get_app_url()
+        # Prefer environment configuration over the shared config.
+        return os.environ.get("MODELAUDIT_APP_URL") or self.cloud_config.get_app_url()
 
     def set_app_url(self, app_url: str) -> None:
         """Set app URL in config."""
