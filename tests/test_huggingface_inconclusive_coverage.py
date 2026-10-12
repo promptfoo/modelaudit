@@ -1,8 +1,6 @@
 """Pinned Hugging Face reproductions for incomplete aggregate coverage."""
 
-from collections.abc import Iterator
 from pathlib import Path
-from types import TracebackType
 
 import pytest
 import requests
@@ -23,30 +21,6 @@ _PINNED_FILES = {
 }
 
 
-class _MockResponse:
-    def __init__(self, payload: bytes) -> None:
-        self._payload = payload
-        self.headers = {"Content-Length": str(len(payload))}
-
-    def __enter__(self) -> "_MockResponse":
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        return None
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
-        for offset in range(0, len(self._payload), chunk_size):
-            yield self._payload[offset : offset + chunk_size]
-
-
 def _mock_pinned_payload(filename: str) -> bytes:
     if filename == "Fig1.png":
         png_header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (b"\x00" * 32)
@@ -57,40 +31,21 @@ def _mock_pinned_payload(filename: str) -> bytes:
     raise AssertionError(f"unexpected pinned file requested: {filename}")
 
 
-def _download_bounded(url: str, destination: Path) -> None:
-    with requests.get(url, stream=True, timeout=(5, 30)) as response:
-        response.raise_for_status()
-        content_length = response.headers.get("Content-Length")
-        if content_length is not None and int(content_length) > _MAX_DOWNLOAD_BYTES:
-            pytest.fail(f"pinned reproduction exceeded byte cap before download: {content_length}")
-
-        total = 0
-        with destination.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > _MAX_DOWNLOAD_BYTES:
-                    pytest.fail(f"pinned reproduction exceeded byte cap: {total}")
-                handle.write(chunk)
-
-
 def test_pinned_huggingface_inconclusive_files_fail_coverage_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Pinned false-positive files must not produce success=true with incomplete metadata."""
-    payloads_by_url = {url: _mock_pinned_payload(filename) for filename, url in _PINNED_FILES.items()}
-    requested_urls: list[str] = []
 
-    def fake_get(url: str, *args: object, **kwargs: object) -> _MockResponse:
-        requested_urls.append(url)
-        return _MockResponse(payloads_by_url[url])
+    def fake_get(url: str, *args: object, **kwargs: object) -> None:
+        pytest.fail(f"unexpected HTTP request during local scan: {url}")
 
     monkeypatch.setattr(requests, "get", fake_get)
 
-    for filename, url in _PINNED_FILES.items():
-        _download_bounded(url, tmp_path / filename)
-    assert requested_urls == list(_PINNED_FILES.values())
+    for filename in _PINNED_FILES:
+        payload_bytes = _mock_pinned_payload(filename)
+        if len(payload_bytes) > _MAX_DOWNLOAD_BYTES:
+            pytest.fail(f"pinned reproduction exceeded byte cap before download: {len(payload_bytes)}")
+        (tmp_path / filename).write_bytes(payload_bytes)
 
     result = CliRunner().invoke(
         cli,

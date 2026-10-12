@@ -16,11 +16,12 @@ from ..scanner_selection import SCANNER_SELECTION_CONFIG_KEY
 from ..utils.helpers.evidence import format_terminal_text
 from ..utils.sources.jfrog import (
     _positive_limit,
+    _require_size_within_limit,
     detect_jfrog_target_type,
     download_artifact,
     download_jfrog_folder,
-    format_size,
 )
+from ..utils.sources.jfrog import format_size as format_size
 
 logger = logging.getLogger(__name__)
 
@@ -125,18 +126,13 @@ def scan_jfrog_artifact(
                 size = None if target_info.get("size_known") is False else target_info.get("size")
                 if isinstance(size, bool) or not (isinstance(size, int) and size >= 0):
                     size = None
-                if size is None:
-                    raise ValueError(
-                        f"Cannot verify JFrog artifact size for {display_url}; refusing to download with maximum "
-                        f"allowed size {format_size(file_download_limit)}"
-                    )
-                if size > file_download_limit:
-                    raise ValueError(
-                        f"JFrog artifact size ({format_size(size)}) exceeds maximum allowed size "
-                        f"({format_size(file_download_limit)}) for {display_url}"
-                    )
-                # Release metadata temporaries before the download begins.
-                del size
+                _require_size_within_limit(
+                    size=size,
+                    limit=file_download_limit,
+                    display_url=display_url,
+                    description="artifact",
+                    require_known=True,
+                )
             logger.debug(f"Downloading JFrog file {log_url} to {download_dir}")
             download_path = download_artifact(
                 url,

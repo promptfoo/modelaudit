@@ -51,57 +51,30 @@ SAFETENSORS_HEADER = struct.pack("<Q", 50) + b'{"__metadata__": {}, "weight": {}
 class TestIsLfsPointer:
     """Tests for the is_lfs_pointer function."""
 
-    def test_valid_lfs_pointer(self, tmp_path: Path) -> None:
-        """Detect a valid LFS pointer file."""
-        file_path = tmp_path / "model.bin"
-        file_path.write_bytes(VALID_LFS_POINTER)
-
-        assert is_lfs_pointer(file_path) is True
-
-    def test_lfs_pointer_with_whitespace(self, tmp_path: Path) -> None:
-        """Detect LFS pointer with extra whitespace."""
-        file_path = tmp_path / "model.bin"
-        file_path.write_bytes(LFS_POINTER_WITH_WHITESPACE)
-
-        assert is_lfs_pointer(file_path) is True
-
-    def test_binary_pickle_not_lfs(self, tmp_path: Path) -> None:
-        """Binary pickle files are not LFS pointers."""
-        file_path = tmp_path / "model.pkl"
-        file_path.write_bytes(PICKLE_HEADER)
-
-        assert is_lfs_pointer(file_path) is False
-
-    def test_safetensors_not_lfs(self, tmp_path: Path) -> None:
-        """SafeTensors files are not LFS pointers."""
-        file_path = tmp_path / "model.safetensors"
-        file_path.write_bytes(SAFETENSORS_HEADER)
-
-        assert is_lfs_pointer(file_path) is False
-
-    def test_large_file_not_lfs(self, tmp_path: Path) -> None:
-        """Files larger than LFS_MAX_POINTER_SIZE cannot be LFS pointers."""
-        file_path = tmp_path / "large_model.bin"
-        # Create a file larger than the max pointer size
-        file_path.write_bytes(b"x" * (LFS_MAX_POINTER_SIZE + 100))
-
-        assert is_lfs_pointer(file_path) is False
-
-    def test_file_exactly_at_limit(self, tmp_path: Path) -> None:
-        """File exactly at LFS_MAX_POINTER_SIZE should be checked."""
-        # Create valid LFS pointer padded to exactly the limit
-        content = VALID_LFS_POINTER + b" " * (LFS_MAX_POINTER_SIZE - len(VALID_LFS_POINTER))
-        file_path = tmp_path / "edge_case.bin"
+    @pytest.mark.parametrize(
+        ("filename", "content", "expected"),
+        [
+            pytest.param("model.bin", VALID_LFS_POINTER, True, id="test_valid_lfs_pointer"),
+            pytest.param("model.bin", LFS_POINTER_WITH_WHITESPACE, True, id="test_lfs_pointer_with_whitespace"),
+            pytest.param("model.pkl", PICKLE_HEADER, False, id="test_binary_pickle_not_lfs"),
+            pytest.param("model.safetensors", SAFETENSORS_HEADER, False, id="test_safetensors_not_lfs"),
+            pytest.param("large_model.bin", b"x" * (LFS_MAX_POINTER_SIZE + 100), False, id="test_large_file_not_lfs"),
+            pytest.param(
+                "edge_case.bin",
+                VALID_LFS_POINTER + b" " * (LFS_MAX_POINTER_SIZE - len(VALID_LFS_POINTER)),
+                True,
+                id="test_file_exactly_at_limit",
+            ),
+            pytest.param("empty.bin", b"", False, id="test_empty_file_not_lfs"),
+            pytest.param("partial.bin", b"version https://git-lfs", False, id="test_partial_signature_not_lfs"),
+        ],
+    )
+    def test_regular_file_detection(self, tmp_path: Path, filename: str, content: bytes, expected: bool) -> None:
+        """Recognize bounded LFS signatures without misclassifying regular files."""
+        file_path = tmp_path / filename
         file_path.write_bytes(content)
 
-        assert is_lfs_pointer(file_path) is True
-
-    def test_empty_file_not_lfs(self, tmp_path: Path) -> None:
-        """Empty files are not LFS pointers."""
-        file_path = tmp_path / "empty.bin"
-        file_path.write_bytes(b"")
-
-        assert is_lfs_pointer(file_path) is False
+        assert is_lfs_pointer(file_path) is expected
 
     def test_nonexistent_file(self, tmp_path: Path) -> None:
         """Non-existent files return False (no exception)."""
@@ -112,14 +85,6 @@ class TestIsLfsPointer:
     def test_directory_not_lfs(self, tmp_path: Path) -> None:
         """Directories are not LFS pointers."""
         assert is_lfs_pointer(tmp_path) is False
-
-    def test_partial_signature_not_lfs(self, tmp_path: Path) -> None:
-        """File with partial LFS signature is not an LFS pointer."""
-        file_path = tmp_path / "partial.bin"
-        # Only part of the signature
-        file_path.write_bytes(b"version https://git-lfs")
-
-        assert is_lfs_pointer(file_path) is False
 
     def test_signature_constant_value(self) -> None:
         """Verify the LFS signature constant is correct."""
@@ -162,37 +127,19 @@ class TestParseLfsPointer:
         assert info is not None
         assert info.size == 1024
 
-    def test_parse_malformed_no_size_returns_none(self, tmp_path: Path) -> None:
-        """Malformed pointer without size field returns None."""
-        file_path = tmp_path / "model.bin"
-        file_path.write_bytes(MALFORMED_LFS_POINTER_NO_SIZE)
-
-        info = parse_lfs_pointer(file_path)
-
-        assert info is None
-
-    def test_parse_malformed_no_oid_returns_none(self, tmp_path: Path) -> None:
-        """Malformed pointer without oid field returns None."""
-        file_path = tmp_path / "model.bin"
-        file_path.write_bytes(MALFORMED_LFS_POINTER_NO_OID)
-
-        info = parse_lfs_pointer(file_path)
-
-        assert info is None
-
-    def test_parse_binary_file_returns_none(self, tmp_path: Path) -> None:
-        """Binary files return None (not valid pointers)."""
-        file_path = tmp_path / "model.pkl"
-        file_path.write_bytes(PICKLE_HEADER)
-
-        info = parse_lfs_pointer(file_path)
-
-        assert info is None
-
-    def test_parse_large_file_returns_none(self, tmp_path: Path) -> None:
-        """Files too large to be pointers return None."""
-        file_path = tmp_path / "large.bin"
-        file_path.write_bytes(b"x" * (LFS_MAX_POINTER_SIZE + 100))
+    @pytest.mark.parametrize(
+        ("filename", "content"),
+        [
+            pytest.param("model.bin", MALFORMED_LFS_POINTER_NO_SIZE, id="test_parse_malformed_no_size_returns_none"),
+            pytest.param("model.bin", MALFORMED_LFS_POINTER_NO_OID, id="test_parse_malformed_no_oid_returns_none"),
+            pytest.param("model.pkl", PICKLE_HEADER, id="test_parse_binary_file_returns_none"),
+            pytest.param("large.bin", b"x" * (LFS_MAX_POINTER_SIZE + 100), id="test_parse_large_file_returns_none"),
+        ],
+    )
+    def test_parse_invalid_regular_file(self, tmp_path: Path, filename: str, content: bytes) -> None:
+        """Reject incomplete pointers and non-pointer regular files."""
+        file_path = tmp_path / filename
+        file_path.write_bytes(content)
 
         info = parse_lfs_pointer(file_path)
 
