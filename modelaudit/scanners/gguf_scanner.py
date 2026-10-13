@@ -18,7 +18,7 @@ from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanRes
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
 # Values derived from ggml source: every type in `enum ggml_type` is listed. Of the
 # IDs ggml has retired, 31-33 are kept because published files still use them; they
-# store Q4_0 blocks in a different order. 4, 5 and 36-38 stay unknown.
+# store the Q4_0 blocks of several rows together. 4, 5 and 36-38 stay unknown.
 _GGML_TYPE_INFO = {
     0: (1, 4),  # F32
     1: (1, 2),  # F16
@@ -58,6 +58,13 @@ _GGML_TYPE_INFO = {
     40: (64, 36),  # NVFP4
     41: (128, 18),  # Q1_0
     42: (64, 18),  # Q2_0
+}
+# Rows that the retired Q4_0 layouts pack into one on-disk block (block_q4_0x4 and
+# block_q4_0x8 in ggml): a tensor of these types holds whole groups of rows.
+_GGML_INTERLEAVED_ROW_GROUPS = {
+    31: 4,  # Q4_0_4_4
+    32: 4,  # Q4_0_4_8
+    33: 8,  # Q4_0_8_8
 }
 _UINT64_MAX: int = 2**64 - 1
 
@@ -1073,6 +1080,25 @@ class GgufScanner(BaseScanner):
                         "block_size": blck,
                         "elements": nelements,
                         "row_width": row_width,
+                    },
+                    rule_code="S804",
+                )
+
+            row_group = _GGML_INTERLEAVED_ROW_GROUPS.get(tensor.tensor_type)
+            rows = nelements // row_width
+            if row_group is not None and rows % row_group != 0:
+                result.add_check(
+                    name="Tensor Block Alignment Check",
+                    passed=False,
+                    message=f"Tensor {tensor.name} not aligned to its {row_group}-row block groups",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "tensor_name": tensor.name,
+                        "block_size": blck,
+                        "elements": nelements,
+                        "rows": rows,
+                        "row_group": row_group,
                     },
                     rule_code="S804",
                 )

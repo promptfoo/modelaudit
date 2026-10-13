@@ -1693,8 +1693,7 @@ def test_gguf_rank250_current_types_do_not_mask_unknown_future_type(tmp_path: Pa
     assert determine_exit_code(aggregate) == 2
 
 
-# One block of every other tensor type in ggml's `enum ggml_type`, and of the three retired
-# Q4_0 layouts that published files still use: (type, name, block size, type size)
+# One block of every other tensor type in ggml's `enum ggml_type`: (type, name, block size, type size)
 _GGML_SINGLE_BLOCK_TENSOR_TYPES = [
     (16, "iq2_xxs", 256, 66),
     (17, "iq2_xs", 256, 74),
@@ -1708,9 +1707,6 @@ _GGML_SINGLE_BLOCK_TENSOR_TYPES = [
     (27, "i64", 1, 8),
     (28, "f64", 1, 8),
     (29, "iq1_m", 256, 56),
-    (31, "q4_0_4_4", 32, 18),
-    (32, "q4_0_4_8", 32, 18),
-    (33, "q4_0_8_8", 32, 18),
     (34, "tq1_0", 256, 54),
     (35, "tq2_0", 256, 66),
     (39, "mxfp4", 32, 17),
@@ -1837,6 +1833,63 @@ def test_gguf_block_tensor_rows_must_hold_whole_blocks(
     assert not any(check.name == "Tensor Data Bounds Check" for check in accepted.checks)
     _assert_no_warning_or_critical_issues(accepted)
     assert determine_exit_code(scan_model_directory_or_file(str(whole_rows), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "type_name", "row_group"),
+    [
+        (31, "q4_0_4_4", 4),
+        (32, "q4_0_4_8", 4),
+        (33, "q4_0_8_8", 8),
+    ],
+    ids=["q4_0_4_4", "q4_0_4_8", "q4_0_8_8"],
+)
+def test_gguf_retired_interleaved_q4_0_layouts_hold_whole_row_groups(
+    tmp_path: Path,
+    tensor_type: int,
+    type_name: str,
+    row_group: int,
+) -> None:
+    # ggml retired these layouts, but published files still use them. Each on-disk block
+    # carries the Q4_0 blocks of `row_group` rows, 18 bytes per row.
+    group_size = row_group * 18
+
+    def scan_tensor(label: str, dims: tuple[int, ...], tensor_data_size: int) -> tuple[Any, int]:
+        path = tmp_path / f"{type_name}_{label}.gguf"
+        _write_gguf_with_tensor_type(
+            path,
+            tensor_type=tensor_type,
+            tensor_name=f"{type_name}_{label}".encode(),
+            dims=dims,
+            tensor_data_size=tensor_data_size,
+        )
+        direct = GgufScanner().scan(str(path))
+        return direct, determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False))
+
+    whole, whole_exit_code = scan_tensor("whole_group", (32, row_group), group_size)
+    assert whole.success is True
+    assert not any(check.name == "Tensor Type Validation" for check in whole.checks)
+    assert not any(check.name == "Tensor Block Alignment Check" for check in whole.checks)
+    assert not any(check.name == "Tensor Data Bounds Check" for check in whole.checks)
+    _assert_no_warning_or_critical_issues(whole)
+    assert whole_exit_code == 0
+
+    truncated, truncated_exit_code = scan_tensor("truncated", (32, row_group), group_size - 1)
+    bounds_checks = [check for check in truncated.checks if check.name == "Tensor Data Bounds Check"]
+    assert len(bounds_checks) == 1
+    assert bounds_checks[0].status == CheckStatus.FAILED
+    assert bounds_checks[0].details["expected"] == group_size
+    assert truncated_exit_code == 1
+
+    for label, dims in (("partial_group", (32, row_group - 1)), ("single_row", (32,))):
+        rows = dims[1] if len(dims) > 1 else 1
+        partial, partial_exit_code = scan_tensor(label, dims, rows * 18)
+        alignment_checks = [check for check in partial.checks if check.name == "Tensor Block Alignment Check"]
+        assert len(alignment_checks) == 1
+        assert alignment_checks[0].status == CheckStatus.FAILED
+        assert alignment_checks[0].details["rows"] == rows
+        assert alignment_checks[0].details["row_group"] == row_group
+        assert partial_exit_code == 1
 
 
 @pytest.mark.parametrize("tensor_type", [4, 5, 36, 37, 38, 43, 142])
