@@ -27663,6 +27663,156 @@ class TestOnnxOutputInvarianceReviewRegressions:
         assert analyzer.retained_tensor_bytes == 0
 
 
+class TestOnnxPerViewBudgetRegressions:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)
+    _save = staticmethod(TestOnnxOutputInvarianceReviewRegressions._save)
+
+    def _expanded_views(self, tmp_path: Path, duplicate_consumers: bool = False) -> tuple[Path, Any]:
+        nodes = []
+        outputs = []
+        tensors = [self._tensor("W", 1)]
+        for index, width in enumerate((66, 65, 64)):
+            tensors.append(self._tensor(f"shape{index}", [64, width], np.int64))
+            nodes.append(helper.make_node("Expand", ["W", f"shape{index}"], [f"expanded{index}"]))
+            for consumer in range(2 if duplicate_consumers else 1):
+                output = f"Y{index}_{consumer}"
+                nodes.append(helper.make_node("MatMul", ["X", f"expanded{index}"], [output]))
+                outputs.append(self._value(output, [1, width]))
+        graph = helper.make_graph(nodes, "shared_initializer_views", [self._value("X", [1, 64])], outputs, tensors)
+        return self._save(graph, tmp_path)
+
+    @pytest.mark.parametrize("duplicate_consumers", [False, True])
+    @pytest.mark.parametrize(
+        ("limit", "widths", "charged_bytes"),
+        [(16384, [64], 16384), (16896, [66], 16896), (33280, [66, 64], 33280), (49920, [66, 65, 64], 49920)],
+    )
+    def test_distinct_views_reserve_each_successful_spec(
+        self, tmp_path: Path, duplicate_consumers: bool, limit: int, widths: list[int], charged_bytes: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        _, model = self._expanded_views(tmp_path, duplicate_consumers)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        assert all(np.array_equal(value, np.full_like(value, 64)) for value in actual)
+        analyzer = WeightDistributionScanner({"max_array_size": 20000, "max_weight_distribution_total_bytes": limit})
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=20000,
+            pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size
+            ),
+            retain_array_check=lambda name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size, retain=True
+            ),
+        )
+        assert [spec.weights.shape for spec in plan.specs] == [(64, width) for width in widths]
+        assert [spec.analysis_id for spec in plan.specs] == list(range(len(widths)))
+        assert [spec.context["analysis_id"] for spec in plan.specs] == list(range(len(widths)))
+        assert [spec.context["consumer_count"] for spec in plan.specs] == [2 if duplicate_consumers else 1] * len(
+            widths
+        )
+        assert analyzer.retained_tensor_bytes == charged_bytes
+        assert sum(spec.weights.nbytes for spec in plan.specs) == charged_bytes
+        assert plan.oversized_initializers_skipped == int(len(widths) < 3)
+        assert plan.extraction_failures == 0
+        assert plan.coverage_gaps == {}
+
+    @pytest.mark.parametrize("route", ["onnx", "weights"])
+    @pytest.mark.parametrize("limit", [33280, 49920])
+    def test_distinct_view_budget_reaches_both_scanner_routes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, limit: int
+    ) -> None:
+        path, _ = self._expanded_views(tmp_path)
+        captured: list[Any] = []
+        charged: list[int] = []
+        original = WeightDistributionScanner._analyze_onnx_weight_specs
+
+        def record_analysis(scanner: Any, specs: list[Any]) -> list[tuple[dict[str, Any], Any]]:
+            captured.extend(specs)
+            charged.append(scanner.retained_tensor_bytes)
+            return original(scanner, specs)
+
+        monkeypatch.setattr(WeightDistributionScanner, "_analyze_onnx_weight_specs", record_analysis)
+        config = {"max_array_size": 20000, "max_weight_distribution_total_bytes": limit}
+        scanner = OnnxScanner(config) if route == "onnx" else WeightDistributionScanner(config)
+        result = scanner.scan(str(path))
+        widths = [66, 64] if limit == 33280 else [66, 65, 64]
+        assert [spec.weights.shape for spec in captured] == [(64, width) for width in widths]
+        assert charged == [limit]
+        assert result.success is (limit == 49920)
+        if limit == 33280:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    def _anomalous_views(self, tmp_path: Path) -> tuple[Path, Any]:
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 100
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "W"], ["Y"]),
+                helper.make_node("Reshape", ["W", "shape"], ["reshaped"]),
+                helper.make_node("MatMul", ["Z", "reshaped"], ["V"]),
+            ],
+            "retained_anomalous_view",
+            [self._value("X", [1, 64]), self._value("Z", [1, 32])],
+            [self._value("Y", [1, 64]), self._value("V", [1, 128])],
+            [self._tensor("W", weights), self._tensor("shape", [32, 128], np.int64)],
+        )
+        return self._save(graph, tmp_path)
+
+    @pytest.mark.parametrize("route", ["onnx", "weights"])
+    def test_rejected_later_view_preserves_earlier_anomaly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+    ) -> None:
+        path, _ = self._anomalous_views(tmp_path)
+        captured: list[tuple[dict[str, Any], Any]] = []
+        original = WeightDistributionScanner._analyze_onnx_weight_specs
+
+        def record_analysis(scanner: Any, specs: list[Any]) -> list[tuple[dict[str, Any], Any]]:
+            findings = original(scanner, specs)
+            captured.extend(findings)
+            return findings
+
+        monkeypatch.setattr(WeightDistributionScanner, "_analyze_onnx_weight_specs", record_analysis)
+        scanner_type = OnnxScanner if route == "onnx" else WeightDistributionScanner
+        scanner_type({"max_array_size": 20000, "max_weight_distribution_total_bytes": 32768}).scan(str(path))
+        expected = [finding for finding, spec in captured if spec.analysis_id == 0]
+        assert expected
+        captured.clear()
+        assert path.stat().st_size < 24576
+        result = scanner_type({"max_array_size": 20000, "max_weight_distribution_total_bytes": 24576}).scan(str(path))
+        assert [finding for finding, _spec in captured] == expected
+        assert all(spec.analysis_id == 0 for _finding, spec in captured)
+        assert result.issues
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    def test_rejected_view_is_uncached_and_exits_with_scan_error(self, tmp_path: Path) -> None:
+        path, _ = self._anomalous_views(tmp_path)
+        assert path.stat().st_size < 24576
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                aggregate = scan_model_directory_or_file(
+                    str(path),
+                    cache_enabled=True,
+                    cache_dir=str(cache_dir),
+                    min_cache_file_size=0,
+                    max_array_size=20000,
+                    max_weight_distribution_total_bytes=24576,
+                )
+                assert aggregate.success is False
+                assert aggregate.issues
+                assert determine_exit_code(aggregate) == 2
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["total_entries"] == stats["cache_hits"] == 0
+        finally:
+            reset_cache_manager()
+
+
 class TestOnnxRecurrentConsumerReviewRegressions:
     _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
     _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)

@@ -13151,7 +13151,6 @@ def _build_onnx_weight_analysis_plan(
                 continue
 
             array = onnx.numpy_helper.to_array(initializer)
-            retained_logical_bytes = int(array.nbytes)
             prepared_specs: list[_OnnxWeightAnalysisSpec] = []
             transformed_views: dict[tuple[_OnnxWeightTransform, ...], Any] = {(): array}
             for consumer_group, logical_bytes in accepted_groups:
@@ -13268,17 +13267,20 @@ def _build_onnx_weight_analysis_plan(
                         "consumers": consumer_group.consumers,
                         "consumers_truncated": consumer_group.consumer_count > len(consumer_group.consumers),
                     }
-                    prepared_specs.append(
-                        _OnnxWeightAnalysisSpec(
-                            initializer_index=initializer_index,
-                            analysis_id=analysis_id + len(prepared_specs),
-                            weights=analysis_weights,
-                            output_axes=conceptual_output_axes,
-                            matrix_analysis=matrix_analysis,
-                            context=context,
-                        ),
+                    prepared_spec = _OnnxWeightAnalysisSpec(
+                        initializer_index=initializer_index,
+                        analysis_id=analysis_id + len(prepared_specs),
+                        weights=analysis_weights,
+                        output_axes=conceptual_output_axes,
+                        matrix_analysis=matrix_analysis,
+                        context=context,
                     )
-                    retained_logical_bytes = max(retained_logical_bytes, logical_bytes)
+                    if retain_array_check is not None and not retain_array_check(bounded_name, logical_bytes):
+                        if not oversized_view_skipped:
+                            plan.oversized_initializers_skipped += 1
+                            oversized_view_skipped = True
+                        continue
+                    prepared_specs.append(prepared_spec)
                 except Exception as exc:
                     plan.extraction_failures += 1
                     logger.warning(
@@ -13287,9 +13289,6 @@ def _build_onnx_weight_analysis_plan(
                         type(exc).__name__,
                     )
             if prepared_specs:
-                if retain_array_check is not None and not retain_array_check(bounded_name, retained_logical_bytes):
-                    plan.oversized_initializers_skipped += 1
-                    continue
                 plan.specs.extend(prepared_specs)
                 analysis_id += len(prepared_specs)
                 analyzed_initializer_indexes.add(initializer_index)
