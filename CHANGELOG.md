@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reuse ONNX local-function default maps and bound copying them into call environments.
+- Avoid false ONNX weight-coverage gaps from unreachable Scan-8 bodies with a statically empty batch.
 - Charge each distinct ONNX weight-analysis view against the cumulative byte budget while preserving accepted findings and reporting incomplete coverage for skipped views.
 - Preserve ONNX training-normalization and loop-exit weight coverage when entry shapes are unproven or state ranks later increase.
 - Apply ONNX output rank and type semantics to deferred numeric provenance, and retain coverage when pooling or convolution turns dimensions into numeric coefficients.

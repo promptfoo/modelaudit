@@ -36557,3 +36557,235 @@ class TestOnnxReviewedExitAndTrainingSemantics:
         actual: Any = ReferenceEvaluator(evaluation_model).run(None, feeds)
         np.testing.assert_allclose(actual[0], expected, rtol=1e-5, atol=1e-6)
         self._assert_contract(model, tmp_path, training)
+
+
+class TestOnnxFunctionDefaultWorkRegressions:
+    @staticmethod
+    def _model(tmp_path: Path, *, defaults: int = 16, calls: int = 8, overrides: bool = False) -> Any:
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        path = create_repeated_local_function_default_weight_model(tmp_path, weights)
+        model = onnx.load(str(path))
+        function = model.functions[0]
+        branch = helper.make_graph(
+            [helper.make_node("Identity", ["function_weight"], ["branch_weight"])],
+            "default_branch",
+            [],
+            [helper.make_tensor_value_info("branch_weight", TensorProto.FLOAT, [64, 64])],
+        )
+        function.attribute_proto.extend(
+            [helper.make_attribute("branch", branch)]
+            + [helper.make_attribute(f"unused_{index}", float(index)) for index in range(defaults)]
+        )
+        function.node.append(
+            helper.make_node(
+                "Constant", [], ["condition"], value=onnx.numpy_helper.from_array(np.array(True, np.bool_))
+            )
+        )
+        conditional = helper.make_node("If", ["condition"], ["unused_result"])
+        for name in ("then_branch", "else_branch"):
+            conditional.attribute.append(
+                onnx.AttributeProto(name=name, ref_attr_name="branch", type=onnx.AttributeProto.GRAPH)
+            )
+        function.node.append(conditional)
+        del model.graph.node[:]
+        del model.graph.output[:]
+        for index in range(calls):
+            call = helper.make_node("DefaultWeight", [], [f"W{index}"], domain="modelaudit.test")
+            if overrides and index:
+                call.attribute.append(
+                    helper.make_attribute("default_weight", onnx.numpy_helper.from_array(np.zeros_like(weights)))
+                )
+            model.graph.node.extend([call, helper.make_node("MatMul", ["X", f"W{index}"], [f"Y{index}"])])
+            model.graph.output.append(helper.make_tensor_value_info(f"Y{index}", TensorProto.FLOAT, [1, 64]))
+        onnx.checker.check_model(model, full_check=True)
+        return model
+
+    @pytest.mark.parametrize("defaults,budget", [(16, None), (130, 256)])
+    def test_repeated_graph_defaults_are_enumerated_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defaults: int, budget: int | None
+    ) -> None:
+        from types import SimpleNamespace
+
+        model = self._model(tmp_path, defaults=defaults)
+        if budget is not None:
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", budget)
+        function = model.functions[0]
+        visits = {"defaults": 0}
+
+        class CountedDefaults:
+            def __len__(self) -> int:
+                return len(function.attribute_proto)
+
+            def __iter__(self) -> Any:
+                for attribute in function.attribute_proto:
+                    visits["defaults"] += 1
+                    yield attribute
+
+        class CountedFunction:
+            attribute_proto = CountedDefaults()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(function, name)
+
+        counted_model = SimpleNamespace(
+            graph=model.graph,
+            functions=[CountedFunction()],
+            opset_import=model.opset_import,
+            training_info=model.training_info,
+        )
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            counted_model, onnx=onnx, np=np, max_array_size=None
+        )
+        if budget is None:
+            assert visits["defaults"] == len(function.attribute_proto)
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            assert plan.specs[0].context["consumer_count"] == 8
+        else:
+            assert visits["defaults"] == 0
+            assert plan.coverage_gaps["attribute_binding_work_limit"] == 1
+            assert plan.specs == []
+
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_call_overrides_preserve_default_identity_and_findings(self, tmp_path: Path, scanner_type: Any) -> None:
+        model = self._model(tmp_path, calls=3, overrides=True)
+        path = _save_onnx_model(model, tmp_path / "default-overrides.onnx")
+        result = scanner_type().scan(str(path))
+        assert result.success is True
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 3
+
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_default_merge_budget_preserves_prior_findings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner_type: Any
+    ) -> None:
+        model = self._model(tmp_path, defaults=40, calls=6, overrides=True)
+        path = _save_onnx_model(model, tmp_path / "default-budget.onnx")
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 256)
+        result = scanner_type().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert (
+            result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["attribute_binding_work_limit"] == 1
+        )
+        assert TestWeightDistributionSemantics._extreme_checks(result)
+
+    def test_default_binding_limit_is_uncached_and_exits_with_scan_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model = self._model(tmp_path, defaults=40, calls=6, overrides=True)
+        path = _save_onnx_model(model, tmp_path / "default-budget-cache.onnx")
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 256)
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                aggregate = scan_model_directory_or_file(
+                    str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                )
+                assert aggregate.success is False
+                assert aggregate.issues
+                assert determine_exit_code(aggregate) == 2
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["total_entries"] == stats["cache_hits"] == 0
+        finally:
+            reset_cache_manager()
+
+
+class TestOnnxEmptyScan8BatchRegressions:
+    @staticmethod
+    def _model(batch_size: int, *, runtime_lengths: bool = False, runtime_sequence: bool = False) -> Any:
+        source_names = [f"state_{index}" for index in range(33)]
+        tensors = [
+            onnx.numpy_helper.from_array(np.zeros((batch_size,), np.float32), name=name) for name in source_names
+        ]
+        tensors.append(onnx.numpy_helper.from_array(np.zeros((batch_size, 1, 1), np.float32), name="sequence"))
+        tensors.append(onnx.numpy_helper.from_array(np.ones((batch_size,), np.int64), name="lengths"))
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state"], ["matrix"], axes=[0, 1]),
+                helper.make_node("MatMul", ["X", "matrix"], ["score"]),
+                helper.make_node("Identity", ["state"], ["next_state"]),
+            ],
+            "scan8_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("slice", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("score", TensorProto.FLOAT, [1, 1]),
+            ],
+        )
+        inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])]
+        if runtime_lengths:
+            inputs.append(helper.make_tensor_value_info("lengths", TensorProto.INT64, [None]))
+        if runtime_sequence:
+            inputs.append(helper.make_tensor_value_info("sequence", TensorProto.FLOAT, [None, 1, 1]))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial"]),
+                helper.make_node(
+                    "Scan", ["lengths", "initial", "sequence"], ["final", "scores"], body=body, num_scan_inputs=1
+                ),
+            ],
+            "empty_scan8_batch",
+            inputs,
+            [helper.make_tensor_value_info("scores", TensorProto.FLOAT, [batch_size, 1, 1, 1])],
+            initializer=tensors,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        return model
+
+    @pytest.mark.parametrize(
+        "batch_size,runtime_lengths,runtime_sequence",
+        [(0, False, False), (1, False, False), (1, True, False), (0, True, False), (0, False, True)],
+    )
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_empty_batch_does_not_promote_unreachable_carried_gap(
+        self, tmp_path: Path, batch_size: int, runtime_lengths: bool, runtime_sequence: bool, scanner_type: Any
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._model(batch_size, runtime_lengths=runtime_lengths, runtime_sequence=runtime_sequence)
+        path = _save_onnx_model(model, tmp_path / "empty-batch.onnx")
+        body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+        runtime = ReferenceEvaluator(body, opsets={"": 8})
+        executed = []
+        for _batch in range(batch_size):
+            values: Any = runtime.run(
+                None,
+                {"state": np.float32(0), "slice": np.zeros(1, np.float32), "X": np.ones((1, 1), np.float32)},
+            )
+            executed.append(values[1])
+        assert len(executed) == batch_size
+        result = scanner_type().scan(str(path))
+        gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+        complete = batch_size == 0 and not runtime_lengths and not runtime_sequence
+        assert result.success is complete
+        if not complete:
+            assert gaps["lineages_per_value_limit"] > 0
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert gaps == {}
+
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_empty_batch_preserves_reachable_weight_findings(self, tmp_path: Path, scanner_type: Any) -> None:
+        model = self._model(0)
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        model.graph.initializer.append(onnx.numpy_helper.from_array(weights, name="Bad"))
+        model.graph.input.append(helper.make_tensor_value_info("hot_input", TensorProto.FLOAT, [1, 64]))
+        model.graph.node.append(helper.make_node("MatMul", ["hot_input", "Bad"], ["hot_output"]))
+        model.graph.output.append(helper.make_tensor_value_info("hot_output", TensorProto.FLOAT, [1, 64]))
+        onnx.checker.check_model(model, full_check=True)
+        path = _save_onnx_model(model, tmp_path / "empty-batch-reachable-weight.onnx")
+        result = scanner_type().scan(str(path))
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1

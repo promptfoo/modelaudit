@@ -2199,6 +2199,43 @@ def _build_onnx_weight_analysis_plan(
         function_attribute_references[function_id] = result
         return result
 
+    function_attribute_defaults: dict[int, tuple[Any, dict[str, Any], dict[str, tuple[Any, ...]]]] = {}
+    function_default_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def reserve_function_default_work(work: int) -> bool:
+        nonlocal function_default_work_remaining
+        if work > function_default_work_remaining:
+            function_default_work_remaining = 0
+            plan.coverage_gaps.setdefault("attribute_binding_work_limit", 1)
+            return False
+        function_default_work_remaining -= work
+        return True
+
+    def default_function_attribute_maps(function: Any) -> tuple[dict[str, Any], dict[str, tuple[Any, ...]]]:
+        cached = function_attribute_defaults.get(id(function))
+        if cached is not None and cached[0] is function:
+            return cached[1], cached[2]
+        attributes: dict[str, Any] = {}
+        source_keys: dict[str, tuple[Any, ...]] = {}
+        referenced_names = referenced_function_attributes(function)
+        defaults = getattr(function, "attribute_proto", ())
+        if referenced_names != frozenset() and reserve_function_default_work(2 * len(defaults)):
+            function_source_scope = (
+                "function",
+                str(getattr(function, "domain", "")),
+                str(getattr(function, "name", "")),
+                str(getattr(function, "overload", "")),
+            )
+            for position, attribute in enumerate(defaults):
+                name = str(attribute.name)
+                if referenced_names is None or name in referenced_names:
+                    attributes[name] = attribute
+                    source_keys[name] = (*function_source_scope, "default_attribute", position)
+        # Function owners and their immutable default environments are shared
+        # across calls, including failed budget checks.
+        function_attribute_defaults[id(function)] = (function, attributes, source_keys)
+        return attributes, source_keys
+
     def bound_function_attributes(
         function: Any,
         node: Any,
@@ -2207,12 +2244,14 @@ def _build_onnx_weight_analysis_plan(
         referenced_names = referenced_function_attributes(function)
         if referenced_names == frozenset():
             return {}
-        attributes = {
-            str(attribute.name): attribute
-            for attribute in getattr(function, "attribute_proto", ())
-            if referenced_names is None or str(attribute.name) in referenced_names
-        }
-        for attribute in getattr(node, "attribute", ()):
+        defaults, _source_keys = default_function_attribute_maps(function)
+        call_attributes = getattr(node, "attribute", ())
+        if not call_attributes:
+            return defaults
+        if not reserve_function_default_work(len(defaults)):
+            return {}
+        attributes = defaults.copy()
+        for attribute in call_attributes:
             if referenced_names is not None and str(attribute.name) not in referenced_names:
                 continue
             resolved_attribute = resolve_attribute(attribute)
@@ -2597,7 +2636,7 @@ def _build_onnx_weight_analysis_plan(
                 if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
                     return True
                 constant_sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
-                if constant_sequence_lens is None or any(length <= 0 for length in constant_sequence_lens):
+                if not constant_sequence_lens or any(length <= 0 for length in constant_sequence_lens):
                     return True
         scan_input_axes = (
             scan_input_axes
@@ -7787,7 +7826,32 @@ def _build_onnx_weight_analysis_plan(
                     num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
                 )
             )
+            node_scan8_empty_batch = False
+            if (
+                is_builtin_neural_operator
+                and node.op_type == "Scan"
+                and scan_sequence_lens_input_offset(node, opset_versions)
+                and node.input
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and constant_int64_vector_values(constants.get(str(node.input[0]))) == ()
+            ):
+                scan_count = resolved_int_attribute(node, "num_scan_inputs", 1)
+                scan_names = tuple(str(name) for name in node.input[max(1, len(node.input) - scan_count) :])
+                node_scan8_empty_batch = (
+                    scan_count > 0
+                    and len(scan_names) == scan_count
+                    and all(
+                        name
+                        and not graph_input_is_runtime_overridable(name, graph_input_names, constants)
+                        and (shape := constant_initializer_shape(constants, name)) is not None
+                        and len(shape) >= 2
+                        and shape[0] == 0
+                        for name in scan_names
+                    )
+                )
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
+                if node_scan8_empty_batch and attribute.name == "body":
+                    continue
                 if is_model_local_function:
                     # Graph attributes are evaluated where the function body uses them.
                     continue
@@ -10421,20 +10485,20 @@ def _build_onnx_weight_analysis_plan(
                 function_bound_unknown_value_ranks: set[str] = set()
                 function_bound_proven_value_ranks: set[str] = set()
                 function_source_scope = ("function", *function_key)
-                function_bound_attributes: dict[str, Any] = {}
-                function_bound_attribute_keys: dict[str, tuple[Any, ...]] = {}
+                function_bound_attributes, function_bound_attribute_keys = default_function_attribute_maps(function)
                 referenced_attributes = referenced_function_attributes(function)
-                for default_position, attribute in enumerate(getattr(function, "attribute_proto", ())):
-                    attribute_name = str(attribute.name)
-                    if referenced_attributes is not None and attribute_name not in referenced_attributes:
-                        continue
-                    function_bound_attributes[attribute_name] = attribute
-                    function_bound_attribute_keys[attribute_name] = (
-                        *function_source_scope,
-                        "default_attribute",
-                        default_position,
-                    )
-                for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
+                call_attributes = () if referenced_attributes == frozenset() else getattr(node, "attribute", ())
+                if call_attributes:
+                    if reserve_function_default_work(
+                        len(function_bound_attributes) + len(function_bound_attribute_keys)
+                    ):
+                        function_bound_attributes = function_bound_attributes.copy()
+                        function_bound_attribute_keys = function_bound_attribute_keys.copy()
+                    else:
+                        function_bound_attributes = {}
+                        function_bound_attribute_keys = {}
+                        call_attributes = ()
+                for attribute_position, attribute in enumerate(call_attributes):
                     attribute_name = str(attribute.name)
                     if referenced_attributes is not None and attribute_name not in referenced_attributes:
                         continue
