@@ -3405,6 +3405,12 @@ def _call_graph_entrypoints_for_reference(
     if _is_explicit_method_import_reference(name):
         return entrypoints
     if _resolve_class_target(f"{module}.{name}") is None:
+        if (module, name) == ("click.utils", "LazyFile") and entrypoints == ("click.utils.__getattr__",):
+            class_target = _click_lazy_file_compatibility_target()
+            compat_methods, _ = _pickle_owner_proof_for_reference(reference)
+            if class_target is not None and compat_methods is not None:
+                class_entries = _filter_class_entrypoints(_class_entrypoints(class_target), compat_methods)
+                return tuple(dict.fromkeys((*entrypoints, *class_entries)))
         return entrypoints
     opcode = str(reference.get("opcode", ""))
     if opcode in _NEWOBJ_OPCODES:
@@ -6087,6 +6093,187 @@ def _resolve_module_getattr_target(
             return None
         return _resolve_alias_function_target(alias_target)
     return None
+
+
+def _click_lazy_file_compatibility_target() -> str | None:
+    # This is additive reachability for Click's observed compatibility hook,
+    # not a general module __getattr__ interpreter or a trusted-clean proof.
+    context = _module_source_context("click.utils")
+    if context is None:
+        return None
+    budget = _MAX_TRUSTED_REFERENCE_GLOBALS
+
+    def charge() -> bool:
+        nonlocal budget
+        budget -= 1
+        return budget >= 0
+
+    def same_ast(node: object, expected_node: object) -> bool:
+        if not charge() or type(node) is not type(expected_node):
+            return False
+        if isinstance(node, ast.AST) and isinstance(expected_node, ast.AST):
+            return all(same_ast(getattr(node, field), getattr(expected_node, field)) for field in node._fields)
+        if isinstance(node, list) and isinstance(expected_node, list):
+            return len(node) == len(expected_node) and all(
+                same_ast(item, expected_item) for item, expected_item in zip(node, expected_node, strict=True)
+            )
+        return bool(node == expected_node)
+
+    protected = {
+        "LazyFile",
+        "_LazyFile",
+        "__getattr__",
+        "globals",
+        "__builtins__",
+        "AttributeError",
+        "DeprecationWarning",
+        "warnings",
+        "t",
+        "te",
+    }
+    bindings: dict[str, list[ast.stmt]] = {name: [] for name in protected}
+    future_annotations = False
+    getter: ast.FunctionDef | None = None
+    target: ast.ClassDef | None = None
+    typing_import: ast.Import | None = None
+    typing_extension_import: ast.stmt | None = None
+    param_spec_assignment: ast.stmt | None = None
+
+    def function_header_is_plain(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        if not charge() or node.decorator_list or getattr(node, "type_params", []):
+            return False
+        return all(
+            charge() and isinstance(value, ast.Constant)
+            for value in (*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None))
+        )
+
+    def class_body_is_plain(node: ast.ClassDef) -> bool:
+        if not charge() or node.bases or node.keywords or node.decorator_list or getattr(node, "type_params", []):
+            return False
+        for item in node.body:
+            if not charge():
+                return False
+            if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef):
+                if node.name == "_LazyFile":
+                    if item.name == "__new__":
+                        return False
+                    if item.name == "__init__":
+                        if isinstance(item, ast.AsyncFunctionDef):
+                            return False
+                        pending: list[ast.AST] = list(item.body)
+                        while pending:
+                            if not charge():
+                                return False
+                            child = pending.pop()
+                            if isinstance(child, ast.Yield | ast.YieldFrom):
+                                return False
+                            pending.extend(ast.iter_child_nodes(child))
+                if not function_header_is_plain(item):
+                    return False
+            elif isinstance(item, ast.AnnAssign):
+                if not isinstance(item.target, ast.Name) or item.value is not None:
+                    return False
+            elif isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant):
+                continue
+            elif not isinstance(item, ast.Pass):
+                return False
+        return True
+
+    type_checking = ast.parse(
+        'if t.TYPE_CHECKING:\n    import typing_extensions as te\n    P = te.ParamSpec("P")'
+    ).body[0]
+    type_variables = (
+        ast.parse('R = t.TypeVar("R")').body[0],
+        ast.parse('P = te.ParamSpec("P")').body[0],
+    )
+    for statement in context.module_statements:
+        if not charge():
+            return None
+        names: tuple[str, ...] = ()
+        if isinstance(statement, ast.Import):
+            imported_names: list[str] = []
+            for alias in statement.names:
+                if not charge():
+                    return None
+                imported_name = alias.asname or alias.name.split(".")[0]
+                imported_names.append(imported_name)
+                if imported_name == "t":
+                    if (alias.name, alias.asname) != ("typing", "t"):
+                        return None
+                    typing_import = statement
+                elif imported_name == "te" and statement is not typing_extension_import:
+                    return None
+            names = tuple(imported_names)
+        elif isinstance(statement, ast.ImportFrom):
+            if any(not charge() or alias.name == "*" for alias in statement.names):
+                return None
+            names = tuple(alias.asname or alias.name for alias in statement.names)
+            if statement.module == "__future__" and statement.level == 0:
+                future_annotations |= any(alias.name == "annotations" for alias in statement.names)
+        elif isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+            names = (statement.name,)
+            if not future_annotations or not function_header_is_plain(statement):
+                return None
+            if statement.name == "__getattr__" and isinstance(statement, ast.FunctionDef):
+                getter = statement
+        elif isinstance(statement, ast.ClassDef):
+            names = (statement.name,)
+            if not future_annotations or not class_body_is_plain(statement):
+                return None
+            if statement.name == "_LazyFile":
+                target = statement
+        elif isinstance(statement, ast.If):
+            if typing_import is None or not same_ast(statement, type_checking):
+                return None
+            typing_extension_import, param_spec_assignment = statement.body
+        elif isinstance(statement, ast.Assign):
+            if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+                return None
+            names = (statement.targets[0].id,)
+            if not isinstance(statement.value, ast.Constant) and not (
+                (typing_import is not None and same_ast(statement, type_variables[0]))
+                or (statement is param_spec_assignment and same_ast(statement, type_variables[1]))
+            ):
+                return None
+        elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            pass
+        elif not isinstance(statement, ast.Pass):
+            return None
+        for name in names:
+            if name in bindings:
+                bindings[name].append(statement)
+
+    if not future_annotations or getter is None or target is None:
+        return None
+    if bindings["__getattr__"] != [getter] or bindings["_LazyFile"] != [target]:
+        return None
+    for name, statements in bindings.items():
+        if name in {"__getattr__", "_LazyFile"}:
+            continue
+        if name in {"t", "te"}:
+            if len(statements) > 1 or any(not isinstance(item, ast.Import) for item in statements):
+                return None
+        elif statements:
+            return None
+    if not bindings["t"] and any(isinstance(item, ast.If | ast.Assign) for item in context.module_statements):
+        return None
+    expected = ast.parse("""def __getattr__(name: str) -> object:
+    import warnings
+    if name in {
+        "LazyFile", "KeepOpenFile", "make_default_short_help", "PacifyFlushWrapper",
+        "safecall", "get_text_stream", "get_binary_stream",
+    }:
+        warnings.warn(
+            f"'click.utils.{name}' is deprecated and will be removed in Click 9.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return globals()[f"_{name}"]
+    raise AttributeError(name)
+""").body[0]
+    if not same_ast(getter, expected):
+        return None
+    return "click.utils._LazyFile"
 
 
 def _loaded_extension_callable_bypasses_module_getattr(module_name: str, name: str) -> bool:
