@@ -1008,9 +1008,15 @@ jobs:
           truncated = modelaudit_picklescan.scan_bytes(b"\x80\x04")
           assert truncated.status.value != "complete", truncated
           assert truncated.verdict.value != "clean", truncated
+          import string
+
+          # Qualify normal lazy-pattern initialization after importing the scanner.
+          string.Template("warm").substitute({})
           template = modelaudit_picklescan.scan_bytes(
               b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R."
           )
+          assert template.status.value == "complete", template
+          assert template.verdict.value == "clean", template
           assert any(
               invocation.get("template_receiver_state_unmodified") is True
               for invocation in template.metadata.get("callable_invocations", ())

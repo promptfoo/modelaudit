@@ -189,6 +189,7 @@ _MAX_TRUSTED_PTH_PATHS = 64
 _MAX_TRUSTED_REFERENCE_FUNCTIONS = 128
 _MAX_TRUSTED_REFERENCE_GLOBALS = 1024
 _MAX_TRUSTED_SLOT_NAMES = 1024
+_REGEX_IGNORECASE = re.IGNORECASE
 _REGEX_PATTERN_TYPE = type(re.compile(""))
 _REGEX_SUB_METHOD_TYPE = type(re.compile("").sub)
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
@@ -2613,11 +2614,18 @@ def _loaded_trusted_reference_matches_baseline(
             return True
     if expected is None:
         return False
-    return (
-        _loaded_interpreter_states_match(module_state, expected[0])
-        and _loaded_interpreter_reference_states_match(reference_state, expected[1])
-        and _trusted_reference_executable_matches_snapshot(reference_state[1], expected[2])
-    )
+    if not _loaded_interpreter_states_match(
+        module_state, expected[0]
+    ) or not _loaded_interpreter_reference_states_match(reference_state, expected[1]):
+        return False
+    if _trusted_reference_executable_matches_snapshot(reference_state[1], expected[2]):
+        return True
+    if (module_name, name) == ("string", "Template"):
+        try:
+            return _template_has_trusted_compiled_pattern()
+        except _CallGraphAnalysisLimitError:
+            return False
+    return False
 
 
 def _loaded_site_package_reference_owner_matches(
@@ -6073,11 +6081,11 @@ def _template_has_trusted_compiled_pattern() -> bool:
         return False
     pattern = state[1]
     canonical = (
-        import_only_reference_is_proven_trusted("string", "Template")
-        and _template_runtime_matches_trusted_source(module)
+        _template_runtime_matches_trusted_source(module)
         and pattern.pattern == _canonical_template_pattern_text()
         # IGNORECASE | VERBOSE | UNICODE, the standard Template flags.
         and pattern.flags == 98
+        and _template_cached_class_matches_startup(pattern)
     )
     for name, expected in (
         ("delimiter", "$"),
@@ -6090,6 +6098,55 @@ def _template_has_trusted_compiled_pattern() -> bool:
     if not canonical:
         raise _CallGraphAnalysisLimitError("cached string.Template runtime does not match the trusted defaults")
     return True
+
+
+def _template_cached_class_matches_startup(pattern: object) -> bool:
+    if _trusted_module_origin_kind("string") != "stdlib" or not _template_uses_reviewed_lazy_pattern():
+        return False
+    module_state = _current_loaded_interpreter_module_state("string")
+    reference = _current_loaded_interpreter_reference_state("string", "Template")
+    _track_loaded_interpreter_module_state("string", module_state)
+    _track_loaded_interpreter_reference_state("string", "Template", reference)
+    expected = _TRUSTED_LOADED_REFERENCE_BASELINES.get(("string", "Template"))
+    if (
+        expected is None
+        or not module_state[0]
+        or not _loaded_module_metadata_matches_spec_without_hooks("string", *module_state[1:])
+        or not _loaded_interpreter_states_match(module_state, expected[0])
+        or not _loaded_interpreter_reference_states_match(reference, expected[1])
+        or not expected[2][1]
+        or expected[2][1][0][0] is not reference[1]
+    ):
+        return False
+    if _trusted_reference_executable_matches_snapshot(reference[1], expected[2]):
+        return True
+    namespace = expected[2][1][0][1]
+    descriptor = _current_loaded_interpreter_reference_state("string", "_TemplatePattern")
+    flags = _current_loaded_interpreter_reference_state("string", "Template.flags")
+    _track_loaded_interpreter_reference_state("string", "_TemplatePattern", descriptor)
+    _track_loaded_interpreter_reference_state("string", "Template.flags", flags)
+    if (
+        "pattern" not in namespace
+        or "flags" not in namespace
+        or not descriptor[0]
+        or namespace["pattern"][0][0] is not descriptor[1]
+        or namespace["flags"][0][0] is not None
+        or not flags[0]
+        or flags[1] is not _REGEX_IGNORECASE
+    ):
+        return False
+    # Only the reviewed first-use cache writes may differ from the startup class.
+    # Keep the global baseline immutable and retain every other member check.
+    cached_namespace = {
+        **namespace,
+        "pattern": _trusted_class_member_snapshot("pattern", pattern),
+        "flags": _trusted_class_member_snapshot("flags", flags[1]),
+    }
+    cached_snapshot = (
+        expected[2][0],
+        ((expected[2][1][0][0], cached_namespace), *expected[2][1][1:]),
+    )
+    return _trusted_reference_executable_matches_snapshot(reference[1], cached_snapshot)
 
 
 def _template_runtime_matches_trusted_source(module: object) -> bool:

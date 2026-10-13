@@ -8868,8 +8868,9 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 @pytest.mark.parametrize("template", ["plain text", "$$"])
+@pytest.mark.parametrize("warm_after_import", [False, True])
 def test_scan_bytes_keeps_template_defaultdict_no_placeholder_clean(
-    method_name: str, template: str, tmp_path: Path
+    method_name: str, template: str, warm_after_import: bool, tmp_path: Path
 ) -> None:
     payload = _builtins_help_defaultdict_template_payload(
         method_name, template, with_mapping=method_name in {"Template.substitute", "Template.safe_substitute"}
@@ -8880,11 +8881,15 @@ import string
 import sys
 
 # Python 3.14 defers the re import until first pattern access.
-string.Template("warm").substitute({})
-from modelaudit_picklescan import SafetyVerdict, scan_bytes
+if sys.argv[4] == "False":
+    string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+if sys.argv[4] == "True":
+    string.Template("warm").substitute({})
 
 payload = bytes.fromhex(sys.argv[1])
 report = scan_bytes(payload, source="cached-template-no-placeholder.pkl")
+assert report.status == ScanStatus.COMPLETE, report
 assert report.verdict == SafetyVerdict.CLEAN, report
 assert not any(
     invocation.get("module") == "builtins"
@@ -8900,7 +8905,9 @@ expected = {
 }[sys.argv[2]]
 assert pickle.loads(payload) == expected
 """
-    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), method_name, template])
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, payload.hex(), method_name, template, str(warm_after_import)]
+    )
 
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template pattern became lazy in Python 3.14")
@@ -8972,7 +8979,10 @@ def test_template_unknown_or_nonempty_keywords_keep_import_edge(
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-pattern qualification starts in Python 3.14")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
-def test_scan_bytes_rejects_custom_cached_template_pattern(tmp_path: Path, method_name: str) -> None:
+@pytest.mark.parametrize("warm_after_import", [False, True])
+def test_scan_bytes_rejects_custom_cached_template_pattern(
+    tmp_path: Path, method_name: str, warm_after_import: bool
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "custom_pattern_marker"
@@ -8987,6 +8997,10 @@ import re
 import string
 import sys
 from pathlib import Path
+
+if sys.argv[4] == "True":
+    from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+    string.Template("warm").substitute({})
 
 # Match the standard flags, but make an otherwise inert string perform a mapping lookup.
 string.Template.pattern = re.compile(
@@ -9007,7 +9021,10 @@ assert not marker.exists()
 assert pickle.loads(payload) == "factory-value"
 assert marker.read_text() == "factory-called"
 """
-    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
+    _assert_isolated_python(
+        tmp_path,
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), str(warm_after_import)],
+    )
 
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template import-branch proof is Python 3.14-specific")
@@ -9037,15 +9054,19 @@ def test_template_keyword_proof_rejects_nonstdlib_origin(monkeypatch: pytest.Mon
 
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template pattern became lazy in Python 3.14")
-def test_template_pattern_cache_change_does_not_reuse_clean_report(tmp_path: Path) -> None:
+@pytest.mark.parametrize("warm_after_import", [False, True])
+def test_template_pattern_cache_change_does_not_reuse_clean_report(tmp_path: Path, warm_after_import: bool) -> None:
     payload = _builtins_help_defaultdict_template_payload("Template.substitute", "plain text")
     child_code = """
 import string
 import sys
 
 original_pattern = vars(string.Template)["pattern"]
-string.Template("warm").substitute({})
+if sys.argv[2] == "False":
+    string.Template("warm").substitute({})
 from modelaudit_picklescan import SafetyVerdict, scan_bytes, shared_source_sensitive_caches
+if sys.argv[2] == "True":
+    string.Template("warm").substitute({})
 
 payload = bytes.fromhex(sys.argv[1])
 with shared_source_sensitive_caches():
@@ -9054,7 +9075,7 @@ with shared_source_sensitive_caches():
     assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
 assert vars(string.Template)["pattern"] is original_pattern
 """
-    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex()])
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), str(warm_after_import)])
 
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template import-branch proof is Python 3.14-specific")
@@ -9446,7 +9467,10 @@ assert marker.read_text() == "factory-called"
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template callback qualification is Python 3.14-specific")
 @pytest.mark.parametrize("customization", ["method", "module_global", "copied_globals", "builtin_context"])
-def test_template_invalid_callback_runtime_is_authenticated(tmp_path: Path, customization: str) -> None:
+@pytest.mark.parametrize("warm_after_import", [False, True])
+def test_template_invalid_callback_runtime_is_authenticated(
+    tmp_path: Path, customization: str, warm_after_import: bool
+) -> None:
     marker = tmp_path / "invalid_callback_marker"
     receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$")) + b"R"
     payload = b"\x80\x04" + _global_operand("string", "Template.substitute") + _args_tuple(receiver, b"}") + b"R."
@@ -9460,6 +9484,8 @@ from types import FunctionType
 marker = Path(sys.argv[1])
 payload = bytes.fromhex(sys.argv[2])
 customization = sys.argv[3]
+if sys.argv[4] == "True":
+    from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
 string.Template("warm").substitute({})
 original = string.Template._invalid
 def changed_error(*args):
@@ -9493,7 +9519,9 @@ else:
     raise AssertionError("the invalid-placeholder callback did not execute")
 assert marker.read_text() == "invalid-called"
 """
-    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), customization])
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), customization, str(warm_after_import)]
+    )
 
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template default qualification is Python 3.14-specific")
@@ -9547,8 +9575,14 @@ assert marker.read_text() == "factory-called"
         ("Template.substitute", "$", True, "ValueError"),
     ],
 )
+@pytest.mark.parametrize("warm_after_import", [False, True])
 def test_template_canonical_placeholders_and_defaults_remain_clean(
-    tmp_path: Path, method_name: str, template: str, explicit_mapping: bool, expected_error: str
+    tmp_path: Path,
+    method_name: str,
+    template: str,
+    explicit_mapping: bool,
+    expected_error: str,
+    warm_after_import: bool,
 ) -> None:
     receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand(template)) + b"R"
     arguments = _args_tuple(receiver, b"}") if explicit_mapping else _args_tuple(receiver)
@@ -9558,8 +9592,11 @@ import pickle
 import string
 import sys
 
-string.Template("warm").substitute({})
+if sys.argv[4] == "False":
+    string.Template("warm").substitute({})
 from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+if sys.argv[4] == "True":
+    string.Template("warm").substitute({})
 
 payload = bytes.fromhex(sys.argv[1])
 expected = sys.argv[2]
@@ -9575,7 +9612,9 @@ else:
     assert not expected_error
     assert result == expected, result
 """
-    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), template, expected_error])
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, payload.hex(), template, expected_error, str(warm_after_import)]
+    )
 
 
 def test_scan_bytes_blocks_formatter_vformat_defaultdict_factory_rce(tmp_path: Path) -> None:

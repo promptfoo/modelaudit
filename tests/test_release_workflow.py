@@ -151,6 +151,9 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     assert '"$SMOKE_PYTHON" -I -' in smoke
     assert "import modelaudit_picklescan._rust as native" in smoke
     assert "origin.is_relative_to(Path(sys.prefix).resolve())" in smoke
+    assert 'string.Template("warm").substitute({})' in smoke
+    assert 'assert template.status.value == "complete"' in smoke
+    assert 'assert template.verdict.value == "clean"' in smoke
 
 
 def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
