@@ -967,7 +967,16 @@ jobs:
 
       - name: Run standalone package tests
         run: |
-          uv run --with pytest --with pytest-xdist --with 'typing-extensions>=4.14' pytest -n auto tests --tb=short
+          uv run --with pytest --with pytest-xdist --with 'typing-extensions>=4.14' pytest -n auto tests --tb=short --junitxml="$RUNNER_TEMP/picklescan-test-results.xml"
+
+      - name: Preserve Windows standalone test evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: picklescan-tests-${{ matrix.os }}-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/picklescan-test-results.xml
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Build standalone package
         run: |

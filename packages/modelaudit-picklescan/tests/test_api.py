@@ -26,6 +26,7 @@ import time
 import uuid
 import warnings
 import zipfile
+import zipimport
 from importlib import import_module, invalidate_caches
 from importlib import metadata as importlib_metadata
 from importlib.abc import Loader
@@ -14263,6 +14264,73 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
+def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
+    diagnostics: dict[str, Any] = {
+        "source_fingerprints": source_fingerprints,
+        "import_runtime_trusted": call_graph._interpreter_import_runtime_is_trusted(),
+        "importers": [],
+    }
+    cache = call_graph._runtime_path_importer_cache_without_hooks()
+    if cache is None:
+        return json.dumps(diagnostics, indent=2)
+    for entry in (call_graph._runtime_search_path_without_hooks() or ())[:64]:
+        cache_key = entry or os.getcwd()
+        finder = dict.get(cache, cache_key)
+        if finder is None:
+            continue
+        record: dict[str, Any] = {
+            "entry": entry,
+            "finder_type": f"{type(finder).__module__}.{type(finder).__qualname__}",
+            "trusted": call_graph._is_trusted_standard_path_importer(finder, cache_key),
+        }
+        diagnostics["importers"].append(record)
+        if type(finder) is not zipimport.zipimporter:
+            continue
+        state = object.__getattribute__(finder, "__dict__")
+        if type(state) is not dict:
+            continue
+        record["state_fields"] = sorted(key for key in state if type(key) is str)
+        archive = state.get("archive")
+        if type(archive) is not str:
+            continue
+        record["archive"] = archive
+        record["prefix"] = state.get("prefix")
+        record["zip_runtime_trusted"] = call_graph._zipimport_runtime_is_trusted()
+        try:
+            path_stat = os.stat(archive)
+            record["path_stat"] = call_graph._stat_identity(path_stat)
+            names = call_graph._zipimport_bounded_central_directory_names(archive, path_stat)
+            record["central_directory_names"] = (
+                None if names is None else [name[:128].hex() for name in sorted(names)[:8]]
+            )
+            with open(archive, "rb") as stream:
+                record["descriptor_stat"] = call_graph._stat_identity(os.fstat(stream.fileno()))
+                tail_size = min(path_stat.st_size, 65557)
+                stream.seek(path_stat.st_size - tail_size)
+                tail = stream.read(tail_size)
+                end_offset = tail.rfind(b"PK\x05\x06")
+                if end_offset >= 0 and end_offset + 22 <= len(tail):
+                    fields = struct.unpack_from("<4H2LH", tail, end_offset + 4)
+                    record["end_record"] = fields
+                    record["preceding_locator_signature"] = tail[
+                        max(0, end_offset - 20) : max(0, end_offset - 16)
+                    ].hex()
+                    central_start = path_stat.st_size - tail_size + end_offset - fields[4]
+                    record["central_start"] = central_start
+                    if central_start >= 0:
+                        stream.seek(central_start)
+                        record["central_signature"] = stream.read(4).hex()
+            files = call_graph._zipimport_directory_cache_files(archive)
+            record["cache_files_safe"] = call_graph._zipimport_files_are_safe(files)
+            if names is not None and record["zip_runtime_trusted"] and record["cache_files_safe"]:
+                record["cache_matches_disk"] = files == cast(
+                    collections.abc.Callable[[str], object], call_graph._ZIP_READ_DIRECTORY
+                )(archive)
+        except (OSError, ValueError, struct.error) as error:
+            record["diagnostic_error"] = f"{type(error).__name__}: {error}"
+    return json.dumps(diagnostics, indent=2)
+
+
 def test_with_call_graph_findings_records_source_fingerprint_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14287,7 +14355,7 @@ def test_with_call_graph_findings_records_source_fingerprint_metadata(
     assert "call_graph_source_fingerprints" not in updated.metadata
     assert "call_graph_source_fingerprints" not in updated.to_dict()["metadata"]
     source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
-    assert source_fingerprints["reusable"] is True
+    assert source_fingerprints["reusable"] is True, _source_fingerprint_diagnostics(source_fingerprints)
     assert str(module_path.absolute()) in source_fingerprints["fingerprints"]
     assert source_fingerprints["module_sources"] == {"safe_module": str(module_path.absolute())}
     assert source_fingerprints["loaded_module_sources"] == {}

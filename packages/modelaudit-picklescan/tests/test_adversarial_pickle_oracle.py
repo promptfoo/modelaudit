@@ -1778,7 +1778,7 @@ def _csv_tempfile_pth_payload(
         _dict_setitem("quoting", b"K\x03"),
         _dict_setitem("doublequote", b"\x88"),
         _dict_setitem("skipinitialspace", b"\x89"),
-        _dict_setitem("escapechar", _text_operand("\\")),
+        _dict_setitem("escapechar", b"N"),
         _dict_setitem("strict", b"\x89"),
         b"tR\x94",
     ]
@@ -4972,7 +4972,13 @@ def test_scan_bytes_blocks_codecs_open_fragmented_pth_rce(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("writer_method", ["DictWriter.writerow", "DictWriter.writerows"])
-def test_scan_bytes_blocks_csv_tempfile_fragmented_pth_rce(tmp_path: Path, writer_method: str) -> None:
+@pytest.mark.parametrize("backslash_path", [False, True], ids=["native-path", "backslash-path"])
+def test_scan_bytes_blocks_csv_tempfile_fragmented_pth_rce(
+    tmp_path: Path, writer_method: str, backslash_path: bool
+) -> None:
+    if backslash_path:
+        tmp_path = tmp_path / "windows\\directory"
+        tmp_path.mkdir(parents=True)
     marker = tmp_path / f"csv_tempfile_{writer_method.rsplit('.', maxsplit=1)[-1]}_pth_rce_marker"
     control_payload = _csv_tempfile_pth_payload(
         tmp_path,

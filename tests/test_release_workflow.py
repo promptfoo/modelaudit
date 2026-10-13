@@ -154,6 +154,11 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     assert "${{ matrix.python-version }}" in _step_by_name(steps, "Pin Python version")["run"]
     assert job["defaults"]["run"]["working-directory"] == "packages/modelaudit-picklescan"
     assert job["defaults"]["run"]["shell"] == "bash"
+    test_run = _step_by_name(steps, "Run standalone package tests")["run"]
+    assert '--junitxml="$RUNNER_TEMP/picklescan-test-results.xml"' in test_run
+    evidence = _step_by_name(steps, "Preserve Windows standalone test evidence")
+    assert evidence["if"] == "always() && runner.os == 'Windows'"
+    assert evidence["uses"].startswith("actions/upload-artifact@")
     smoke = _step_by_name(steps, "Smoke test standalone package wheel install")["run"]
     assert 'uv pip install --python "$SMOKE_PYTHON"' in smoke
     assert "/Scripts/python.exe" in smoke
