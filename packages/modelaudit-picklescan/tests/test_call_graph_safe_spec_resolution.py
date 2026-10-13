@@ -1648,6 +1648,422 @@ def test_forged_zipimporter_directory_entry_is_not_trusted(
     _assert_non_allowlisted_global(report, module, name)
 
 
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+@pytest.mark.parametrize("prefix", ["", "package", "package/nested"])
+def test_zipimporter_identity_survives_normal_cache_invalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+    prefix: str,
+) -> None:
+    archive_path = tmp_path / "launcher.exe"
+    payload_path = tmp_path / "payload.zip"
+    _write_zipimporter_archive(
+        payload_path, "trusted_module", include_module=True, prefix=f"{prefix}/" if prefix else ""
+    )
+    archive_path.write_bytes(b"MZ" + bytes(126) + payload_path.read_bytes() + b"PE-TRAILER")
+    if relative:
+        monkeypatch.chdir(tmp_path)
+    root = archive_path.name if relative else str(archive_path)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, root, raising=False)
+    entry = f"{root}/{prefix}" if prefix else root
+    finder = zipimporter(entry)
+    before = call_graph._zipimporter_resolution_identity(finder, entry)
+    assert before is not None
+
+    finder.invalidate_caches()
+
+    assert call_graph._zipimporter_resolution_identity(finder, entry) == before
+    assert type(zipimporter.find_spec(finder, "trusted_module")) is ModuleSpec
+
+
+@pytest.mark.parametrize("poison", [None, {}, {"forged.py": None}], ids=["none", "empty", "forged"])
+def test_zipimporter_cache_restoration_does_not_heal_poison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poison: object,
+) -> None:
+    archive_path = tmp_path / "poisoned.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.setitem(directory_cache, entry, poison)
+
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert directory_cache[entry] is poison
+
+
+def test_zipimporter_missing_cache_does_not_heal_legacy_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "legacy.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    files = _zipimporter_directory_files(finder)
+    object.__getattribute__(finder, "__dict__")["_files"] = files
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert entry not in directory_cache
+
+
+@pytest.mark.parametrize("mismatch", ["archive", "prefix", "extra-state"])
+def test_zipimporter_missing_cache_checks_state_before_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    archive_path = tmp_path / "mismatched.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    state.pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    if mismatch == "archive":
+        state["archive"] = str(tmp_path / "other.zip")
+    elif mismatch == "prefix":
+        state["prefix"] = "other/"
+    else:
+        state["extra"] = None
+
+    def unexpected_read(_archive: str) -> dict[str, object] | None:
+        pytest.fail("mismatched importer state reached the directory reader")
+
+    monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", unexpected_read)
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert entry not in directory_cache
+
+
+def test_zipimporter_cache_restoration_preserves_raced_poison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "race.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    state.pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    original_reader = call_graph._zipimport_read_bounded_archive_files
+
+    def populate_poison_while_reading(archive: str) -> dict[str, object] | None:
+        files = original_reader(archive)
+        directory_cache[archive] = None
+        return files
+
+    monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", populate_poison_while_reading)
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert directory_cache[entry] is None
+
+
+@pytest.mark.parametrize("mutation", ["archive", "prefix", "dictionary"])
+def test_zipimporter_cache_restoration_rechecks_importer_after_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    archive_path = tmp_path / "mutated-state.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    state.pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    original_reader = call_graph._zipimport_read_bounded_archive_files
+
+    def change_importer_while_reading(archive: str) -> dict[str, object] | None:
+        files = original_reader(archive)
+        if mutation == "dictionary":
+            object.__setattr__(finder, "__dict__", dict(state))
+        else:
+            state[mutation] = "changed"
+        return files
+
+    monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", change_importer_while_reading)
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+
+
+def test_zipimporter_cache_restoration_rejects_archive_change_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "changed-during-read.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    object.__getattribute__(finder, "__dict__").pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    original_reader = call_graph._ZIP_READ_DIRECTORY
+    assert isinstance(original_reader, FunctionType)
+
+    def replace_archive_while_reading(archive: str) -> object:
+        files = original_reader(archive)
+        _write_zipimporter_archive(archive_path, "replacement_module", include_module=True)
+        return files
+
+    namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    monkeypatch.setitem(namespace, "_read_directory", replace_archive_while_reading)
+    monkeypatch.setattr(call_graph, "_ZIP_READ_DIRECTORY", replace_archive_while_reading)
+    monkeypatch.setattr(
+        call_graph,
+        "_ZIP_READ_DIRECTORY_SNAPSHOT",
+        call_graph._trusted_executable_value_snapshot(replace_archive_while_reading),
+    )
+
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert entry not in directory_cache
+
+
+@pytest.mark.parametrize("limit", ["archive-bytes", "implicit-count", "implicit-bytes"])
+def test_zipimporter_missing_cache_bounds_reader_and_constructor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: str,
+) -> None:
+    archive_path = tmp_path / "bounded.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("first/second/third/module.py", "")
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    object.__getattribute__(finder, "__dict__").pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    if limit == "archive-bytes":
+        monkeypatch.setattr(call_graph, "_MAX_ZIPIMPORT_ARCHIVE_BYTES", archive_path.stat().st_size - 1)
+    elif limit == "implicit-count":
+        monkeypatch.setattr(call_graph, "_MAX_SOURCE_FINGERPRINT_CANDIDATES", 2)
+    else:
+        # The central directory fits; the expanded names do not.
+        filename = "first/second/third/module.py"
+        monkeypatch.setattr(
+            call_graph,
+            "_MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES",
+            call_graph._ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE + len(filename),
+        )
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("long_directory_name/" * 4 + "module.py", "")
+        # Bound the central directory at its actual size while expanded prefixes exceed it.
+        monkeypatch.setattr(
+            call_graph,
+            "_MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES",
+            call_graph._ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE + len("long_directory_name/" * 4 + "module.py"),
+        )
+    calls: list[str] = []
+
+    def forbidden_reader(archive: str) -> object:
+        calls.append(archive)
+        raise AssertionError("unbounded directory reader invoked")
+
+    namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    monkeypatch.setitem(namespace, "_read_directory", forbidden_reader)
+    monkeypatch.setattr(call_graph, "_ZIP_READ_DIRECTORY", forbidden_reader)
+    monkeypatch.setattr(
+        call_graph,
+        "_ZIP_READ_DIRECTORY_SNAPSHOT",
+        call_graph._trusted_executable_value_snapshot(forbidden_reader),
+    )
+
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert calls == []
+    assert entry not in directory_cache
+
+
+@pytest.mark.parametrize("change_archive", [False, True], ids=["unchanged", "changed"])
+def test_zip_cache_invalidation_preserves_shared_snapshot_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change_archive: bool,
+) -> None:
+    archive_path = tmp_path / "snapshot.zip"
+    _write_zipimporter_archive(archive_path, "statistics", include_module=False)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    with (
+        _standard_import_runtime(
+            monkeypatch,
+            module="statistics",
+            importer_cache={entry: finder},
+            search_path=[entry],
+        ),
+        call_graph.shared_source_sensitive_caches(),
+    ):
+        generation = call_graph._begin_shared_source_report()
+        call_graph._track_shared_source_candidates(("statistics",))
+        if change_archive:
+            _write_zipimporter_archive(archive_path, "statistics", include_module=True)
+        finder.invalidate_caches()
+        if change_archive:
+            with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="source changed"):
+                call_graph._ensure_shared_source_snapshot_stable(generation)
+        else:
+            call_graph._ensure_shared_source_snapshot_stable(generation)
+            metadata = call_graph.shared_source_fingerprint_metadata()
+            assert metadata is not None and metadata["reusable"] is True
+
+
+@pytest.mark.parametrize("module_in_zip", [False, True], ids=["later-filesystem-module", "in-archive-module"])
+def test_zip_cache_invalidation_retains_malicious_help_and_benign_detection(
+    tmp_path: Path,
+    module_in_zip: bool,
+) -> None:
+    script = r"""
+import importlib
+import pickle
+import sys
+import zipfile
+import zipimport
+from pathlib import Path
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+root = Path(sys.argv[1])
+in_zip = sys.argv[2] == "True"
+marker = root / "executed"
+launcher = root / "pytest.exe"
+module_dir = root / "modules"
+module_dir.mkdir()
+malicious = (
+    "from pathlib import Path\n"
+    f"Path({str(marker)!r}).write_text('executed')\n"
+    "def help(*args, **kwargs): return 'oracle-result'\n"
+)
+launcher.write_bytes(b"MZ" + bytes(1022))
+with zipfile.ZipFile(launcher, "a", compression=zipfile.ZIP_STORED) as archive:
+    archive.writestr("__main__.py", "raise AssertionError('launcher executed')\n")
+    if in_zip:
+        archive.writestr("pydoc.py", malicious)
+if not in_zip:
+    (module_dir / "pydoc.py").write_text(malicious, encoding="utf-8")
+sys.path[:0] = [str(launcher), str(module_dir)]
+sys.modules.pop("pydoc", None)
+finder = zipimport.zipimporter(str(launcher))
+sys.path_importer_cache[str(launcher)] = finder
+payload = b"\x80\x04cbuiltins\nhelp\n)R."
+for phase in ("warm", "invalidated"):
+    if phase == "invalidated":
+        importlib.invalidate_caches()
+    benign = scan_bytes(b"\x80\x04ccollections\nOrderedDict\n)R.", source=phase + "-benign.pkl")
+    assert benign.status == ScanStatus.COMPLETE and benign.verdict == SafetyVerdict.CLEAN, benign
+    # Invalidate again so a preceding benign scan cannot repair the malicious scan's premise.
+    importlib.invalidate_caches()
+    malicious_report = scan_bytes(payload, source=phase + "-malicious.pkl")
+    assert malicious_report.status == ScanStatus.COMPLETE, malicious_report
+    assert malicious_report.verdict == SafetyVerdict.MALICIOUS, malicious_report
+    assert any(f.rule_code == "DANGEROUS_CALL_GRAPH" for f in malicious_report.findings)
+    assert not marker.exists()
+assert pickle.loads(payload) == "oracle-result"
+assert marker.read_text() == "executed"
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(module_in_zip)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("cache_state", ["poison-none", "overbudget"])
+def test_rejected_zip_importer_marks_frozen_python_callable_incomplete(
+    tmp_path: Path,
+    cache_state: str,
+) -> None:
+    script = r"""
+import pickle
+import sys
+import zipfile
+import zipimport
+from pathlib import Path
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+from modelaudit_picklescan import call_graph
+
+root = Path(sys.argv[1])
+cache_state = sys.argv[2]
+marker = root / "executed"
+launcher = root / "pytest.exe"
+module_dir = root / "modules"
+module_dir.mkdir()
+(module_dir / "pydoc.py").write_text(
+    "from pathlib import Path\n"
+    f"Path({str(marker)!r}).write_text('executed')\n"
+    "def help(*args, **kwargs): return 'oracle-result'\n",
+    encoding="utf-8",
+)
+launcher.write_bytes(b"MZ" + bytes(1022))
+with zipfile.ZipFile(launcher, "a", compression=zipfile.ZIP_STORED) as archive:
+    archive.writestr("__main__.py", "raise AssertionError('launcher executed')\n")
+    if cache_state == "overbudget":
+        for index in range(call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES + 1):
+            archive.writestr(f"entry-{index}.txt", "")
+sys.path[:0] = [str(launcher), str(module_dir)]
+sys.modules.pop("pydoc", None)
+finder = zipimport.zipimporter(str(launcher))
+sys.path_importer_cache[str(launcher)] = finder
+if cache_state == "poison-none":
+    zipimport._zip_directory_cache[str(launcher)] = None
+
+payload = b"\x80\x04cbuiltins\nhelp\n)R."
+report = scan_bytes(payload, source=cache_state + ".pkl")
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict == SafetyVerdict.UNKNOWN, report
+assert any(
+    notice.code == "call_graph_source_unavailable"
+    and notice.details.get("module") == "_sitebuiltins"
+    and notice.details.get("name") == "_Helper.__call__"
+    for notice in report.notices
+), report
+assert not marker.exists()
+
+# Native builtins do not require a Python AST and retain their existing contract.
+benign = scan_bytes(b"\x80\x04cbuiltins\nlen\n]\x85R.", source="native-builtin.pkl")
+assert benign.status == ScanStatus.COMPLETE and benign.verdict == SafetyVerdict.CLEAN, benign
+
+# Incomplete Python coverage must not erase a separately known dangerous call.
+mixed = payload[:-1] + b"0cbuiltins\neval\n\x8c\x011\x85R."
+dangerous = scan_bytes(mixed, source="incomplete-and-known-danger.pkl")
+assert dangerous.status == ScanStatus.INCONCLUSIVE, dangerous
+assert dangerous.verdict == SafetyVerdict.MALICIOUS, dangerous
+assert not marker.exists()
+
+if cache_state == "overbudget":
+    # This is a valid runtime archive; only the scanner's bounded analysis declines it.
+    assert pickle.loads(payload) == "oracle-result"
+    assert marker.read_text() == "executed"
+else:
+    # Do not heal or execute a poisoned cache to manufacture a successful oracle.
+    assert zipimport._zip_directory_cache[str(launcher)] is None
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), cache_state],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_zipimporter_identity_accepts_bounded_launcher_prefix_and_trailer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

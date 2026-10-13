@@ -2420,6 +2420,12 @@ def find_unanalyzed_callable_call_graph_references(
         if _call_graph_entrypoints_for_reference(module, name, reference):
             continue
         reason = _call_graph_source_unavailable_reason(module)
+        if reason is None and _interpreter_module_origin_without_import_hooks(module) == "frozen":
+            state = _current_loaded_interpreter_reference_state(module, name)
+            _track_loaded_interpreter_reference_state(module, name, state)
+            if state[0] and type(state[1]) is FunctionType:
+                # Frozen origin authenticates the module, not coverage of its Python body.
+                reason = "source_unavailable"
         if reason is None:
             continue
         references.append(
@@ -4402,26 +4408,84 @@ def _cached_bounded_zipimporter_excludes_module(
     return _bounded_zip_archive_excludes_module(archive, prefix, module_name) and files == snapshot
 
 
-def _zipimport_archive_files_match(archive: str, files: object) -> bool:
-    if not _zipimport_files_are_safe(files) or not _zipimport_runtime_is_trusted():
-        return False
+def _zipimport_directory_entries_are_bounded(names: frozenset[bytes]) -> bool:
+    # CPython adds implicit directory entries after reading the central directory.
+    # Bound their count and total name bytes before asking its reader to allocate them.
+    path_separator = os.path.sep.encode("ascii")
+    expanded = {name.replace(b"/", path_separator) for name in names}
+    name_bytes = sum(len(name) for name in expanded)
+    for name in tuple(expanded):
+        while True:
+            separator = name.rstrip(path_separator).rfind(path_separator)
+            if separator < 0:
+                break
+            name = name[: separator + 1]
+            if name in expanded:
+                break
+            name_bytes += len(name)
+            if (
+                len(expanded) >= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+                or name_bytes > _MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES
+            ):
+                return False
+            expanded.add(name)
+    return len(expanded) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+
+
+def _zipimport_read_bounded_archive_files(archive: str) -> dict[str, object] | None:
+    if not _zipimport_runtime_is_trusted():
+        return None
     try:
         before = os.stat(archive)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_size > _MAX_ZIPIMPORT_ARCHIVE_BYTES
-            or not _zipimport_central_directory_is_bounded(archive, before)
-        ):
-            return False
+        if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_ZIPIMPORT_ARCHIVE_BYTES:
+            return None
+        names = _zipimport_bounded_central_directory_names(archive, before)
+        if names is None or not _zipimport_directory_entries_are_bounded(names):
+            return None
         archive_files = cast(Callable[[str], object], _ZIP_READ_DIRECTORY)(archive)
         after = os.stat(archive)
     except Exception:
+        return None
+    if (
+        _stat_identity(before) != _stat_identity(after)
+        or not _zipimport_runtime_is_trusted()
+        or not _zipimport_files_are_safe(archive_files)
+    ):
+        return None
+    return cast(dict[str, object], archive_files)
+
+
+def _zipimport_archive_files_match(archive: str, files: object) -> bool:
+    if not _zipimport_files_are_safe(files):
         return False
-    return (
-        _stat_identity(before) == _stat_identity(after)
-        and _zipimport_files_are_safe(archive_files)
-        and files == archive_files
-    )
+    archive_files = _zipimport_read_bounded_archive_files(archive)
+    return archive_files is not None and files == archive_files
+
+
+def _zipimport_restore_missing_directory_cache(
+    instance_state: dict[str, object],
+    archive: str,
+    prefix: str,
+    cache_key: str,
+) -> object:
+    # Modern CPython invalidates only the shared directory cache. Legacy importers
+    # retain _files; a missing shared entry cannot authenticate that older state.
+    if set(instance_state) != {"archive", "prefix"} or not _zipimport_runtime_is_trusted():
+        return None
+    archive_state = _zipimport_archive_state_from_entry(cache_key)
+    if not isinstance(archive_state, tuple):
+        return None
+    _absolute_archive, expected_prefix, expected_archive = archive_state
+    if archive != expected_archive or prefix != expected_prefix.replace("/", os.path.sep):
+        return None
+    directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
+    if dict.__contains__(directory_cache, archive):
+        return None
+    files = _zipimport_read_bounded_archive_files(archive)
+    if files is None:
+        return None
+    # Never replace a concurrently populated or poisoned entry.
+    return files if dict.setdefault(directory_cache, archive, files) is files else None
 
 
 def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | None:
@@ -4440,8 +4504,14 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
         return None
     archive = dict.get(instance_state, "archive")
     prefix = dict.get(instance_state, "prefix")
-    files = _zipimport_directory_cache_files(archive) if type(archive) is str else None
-    if type(archive) is not str or type(prefix) is not str or not _zipimport_files_are_safe(files):
+    if type(archive) is not str or type(prefix) is not str or not _zipimport_runtime_is_trusted():
+        return None
+    directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
+    if dict.__contains__(directory_cache, archive):
+        files = dict.__getitem__(directory_cache, archive)
+    else:
+        files = _zipimport_restore_missing_directory_cache(instance_state, archive, prefix, cache_key)
+    if not _zipimport_files_are_safe(files):
         return None
     try:
         expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
@@ -4457,6 +4527,12 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
         and dict.get(instance_state, "_files", files) is files
         and dict.get(expected_state, "_files", files) is files
         and _zipimport_archive_files_match(archive, files)
+        and _zipimport_directory_cache_files(archive) is files
+        and object.__getattribute__(finder, "__dict__") is instance_state
+        and type(dict.get(instance_state, "archive")) is str
+        and dict.get(instance_state, "archive") == archive
+        and type(dict.get(instance_state, "prefix")) is str
+        and dict.get(instance_state, "prefix") == prefix
     ):
         return None
     files_identity = _string_sequence_identity(

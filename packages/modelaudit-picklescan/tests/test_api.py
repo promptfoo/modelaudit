@@ -14300,7 +14300,9 @@ def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
             path_stat = os.stat(archive)
             record["path_stat"] = call_graph._stat_identity(path_stat)
             names = call_graph._zipimport_bounded_central_directory_names(archive, path_stat)
-            record["central_directory_names"] = None if names is None else [name[:128].hex() for name in sorted(names)[:8]]
+            record["central_directory_names"] = (
+                None if names is None else [name[:128].hex() for name in sorted(names)[:8]]
+            )
             with open(archive, "rb") as stream:
                 record["descriptor_stat"] = call_graph._stat_identity(os.fstat(stream.fileno()))
                 tail_size = min(path_stat.st_size, 65557)
