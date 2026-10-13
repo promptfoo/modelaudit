@@ -413,8 +413,6 @@ def add_scan_result_to_model(
     results.bytes_scanned += file_result.bytes_scanned
     normalize_unclassified_scan_failure(file_result)
 
-    if file_result.scanner_name and file_result.scanner_name not in scan_metadata.get("scanners", []):
-        scan_metadata.setdefault("scanners", []).append(file_result.scanner_name)
     if (
         file_result.scanner_name
         and file_result.scanner_name not in results.scanner_names
