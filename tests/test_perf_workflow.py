@@ -842,5 +842,15 @@ def test_python314_platform_smoke_is_required_for_python_changes() -> None:
     steps = smoke["steps"]
     sync = _step_by_name(steps, "Sync Python 3.14 smoke dependencies")["run"]
     assert "--locked --python 3.14 --extra all-ci-windows --extra h5" in sync
-    run = _step_by_name(steps, "Test Python 3.14 native pickle and H5 scanning")["run"]
-    assert "--locked --python 3.14 pytest tests/test_python_compatibility.py -n 0" in run
+    probe = _step_by_name(steps, "Verify Python 3.14 native and H5 imports")
+    # PowerShell reports the last native command's status, so the probe must own its step.
+    assert probe["run"].strip().splitlines() == [
+        'uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"'
+    ]
+    assert "if" not in probe
+    assert "continue-on-error" not in probe
+    assert "continue-on-error" not in smoke
+    test_step = _step_by_name(steps, "Test Python 3.14 native pickle and H5 scanning")
+    assert steps.index(probe) < steps.index(test_step)
+    assert "if" not in test_step
+    assert "--locked --python 3.14 pytest tests/test_python_compatibility.py -n 0" in test_step["run"]

@@ -462,10 +462,11 @@ jobs:
       - name: Sync Python 3.14 smoke dependencies
         run: uv sync --locked --python 3.14 --extra all-ci-windows --extra h5
 
+      - name: Verify Python 3.14 native and H5 imports
+        run: uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"
+
       - name: Test Python 3.14 native pickle and H5 scanning
-        run: |
-          uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"
-          uv run --locked --python 3.14 pytest tests/test_python_compatibility.py -n 0 --tb=short
+        run: uv run --locked --python 3.14 pytest tests/test_python_compatibility.py -n 0 --tb=short
 
   slow-tests:
     name: Slow/Integration Tests (Python 3.12)
