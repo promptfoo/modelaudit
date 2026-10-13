@@ -9379,6 +9379,205 @@ assert marker.exists() == known_placeholder
     )
 
 
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template constructor qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("before_import", [False, True])
+def test_template_replaced_defaultdict_constructor_is_not_inert(
+    tmp_path: Path, method_name: str, before_import: bool
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "constructor_factory_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    payload = _builtins_help_defaultdict_template_payload(method_name, "plain text")
+    child_code = """
+import collections
+import importlib.metadata
+import pickle
+import re
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+pattern = vars(string.Template)["pattern"]
+original = collections.defaultdict
+def replacement(*args, **kwargs):
+    if args == (help,) and not kwargs:
+        string.Template.pattern = re.compile(
+            r"(?P<named>.+)|(?P<braced>(?!))|(?P<escaped>(?!))|(?P<invalid>(?!))",
+            re.IGNORECASE | re.VERBOSE,
+        )
+    return original(*args, **kwargs)
+before_import = sys.argv[4] == "True"
+if before_import:
+    collections.defaultdict = replacement
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes, shared_source_sensitive_caches
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+with shared_source_sensitive_caches():
+    if not before_import:
+        assert scan_bytes(payload).verdict == SafetyVerdict.CLEAN
+        collections.defaultdict = replacement
+    report = scan_bytes(payload)
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert report.verdict != SafetyVerdict.CLEAN, report
+    assert any(error.category == "call_graph_analysis_error" for error in report.errors), report
+    assert vars(string.Template)["pattern"] is pattern
+    assert not marker.exists()
+    if not before_import:
+        collections.defaultdict = original
+        assert scan_bytes(payload).verdict == SafetyVerdict.CLEAN
+collections.defaultdict = replacement
+assert pickle.loads(payload) == "factory-value"
+assert marker.read_text() == "factory-called"
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), str(before_import)]
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template callback qualification is Python 3.14-specific")
+@pytest.mark.parametrize("customization", ["method", "module_global", "copied_globals", "builtin_context"])
+def test_template_invalid_callback_runtime_is_authenticated(tmp_path: Path, customization: str) -> None:
+    marker = tmp_path / "invalid_callback_marker"
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$")) + b"R"
+    payload = b"\x80\x04" + _global_operand("string", "Template.substitute") + _args_tuple(receiver, b"}") + b"R."
+    child_code = """
+import pickle
+import string
+import sys
+from pathlib import Path
+from types import FunctionType
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+customization = sys.argv[3]
+string.Template("warm").substitute({})
+original = string.Template._invalid
+def changed_error(*args):
+    marker.write_text("invalid-called")
+    return RuntimeError("invalid-called")
+if customization == "method":
+    def replacement(self, match):
+        raise changed_error()
+    string.Template._invalid = replacement
+elif customization == "module_global":
+    string.ValueError = changed_error
+else:
+    namespace = dict(original.__globals__) if customization == "copied_globals" else original.__globals__
+    if customization == "copied_globals":
+        namespace["ValueError"] = changed_error
+    else:
+        namespace["__builtins__"] = dict(original.__builtins__, ValueError=changed_error)
+    string.Template._invalid = FunctionType(original.__code__, namespace, original.__name__, original.__defaults__)
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+report = scan_bytes(payload)
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any(error.category == "call_graph_analysis_error" for error in report.errors), report
+assert not marker.exists()
+try:
+    pickle.loads(payload)
+except RuntimeError as error:
+    assert str(error) == "invalid-called", error
+else:
+    raise AssertionError("the invalid-placeholder callback did not execute")
+assert marker.read_text() == "invalid-called"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), customization])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template default qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_template_custom_mapping_default_cannot_hide_factory(tmp_path: Path, method_name: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "default_factory_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    payload = _builtins_help_defaultdict_template_payload(method_name, "$missing", with_mapping=False)
+    child_code = """
+import collections
+import pickle
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+method_name = sys.argv[4].split(".")[-1]
+vars(string.Template)[method_name].__defaults__ = (collections.defaultdict(help),)
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+report = scan_bytes(payload)
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any(error.category == "call_graph_analysis_error" for error in report.errors), report
+assert not marker.exists()
+assert pickle.loads(payload) == "factory-value"
+assert marker.read_text() == "factory-called"
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), method_name]
+    )
+
+
+@pytest.mark.parametrize(
+    ("method_name", "template", "explicit_mapping", "expected_error"),
+    [
+        ("Template.safe_substitute", "$missing", True, ""),
+        ("Template.safe_substitute", "$missing", False, ""),
+        ("Template.safe_substitute", "$", True, ""),
+        ("Template.substitute", "$missing", False, "KeyError"),
+        ("Template.substitute", "$", True, "ValueError"),
+    ],
+)
+def test_template_canonical_placeholders_and_defaults_remain_clean(
+    tmp_path: Path, method_name: str, template: str, explicit_mapping: bool, expected_error: str
+) -> None:
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand(template)) + b"R"
+    arguments = _args_tuple(receiver, b"}") if explicit_mapping else _args_tuple(receiver)
+    payload = b"\x80\x04" + _global_operand("string", method_name) + arguments + b"R."
+    child_code = """
+import pickle
+import string
+import sys
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+payload = bytes.fromhex(sys.argv[1])
+expected = sys.argv[2]
+expected_error = sys.argv[3]
+report = scan_bytes(payload)
+assert report.status == ScanStatus.COMPLETE, report
+assert report.verdict == SafetyVerdict.CLEAN, report
+try:
+    result = pickle.loads(payload)
+except (KeyError, ValueError) as error:
+    assert type(error).__name__ == expected_error, error
+else:
+    assert not expected_error
+    assert result == expected, result
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), template, expected_error])
+
+
 def test_scan_bytes_blocks_formatter_vformat_defaultdict_factory_rce(tmp_path: Path) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()

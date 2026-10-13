@@ -15,6 +15,7 @@ import sys
 import sysconfig
 import threading
 import zipimport
+from _collections import defaultdict as _CANONICAL_COLLECTIONS_DEFAULTDICT
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
@@ -6092,6 +6093,16 @@ def _template_has_trusted_compiled_pattern() -> bool:
 
 
 def _template_runtime_matches_trusted_source(module: object) -> bool:
+    if type(module) is not ModuleType or type(_IMPORT_RUNTIME_BUILTINS) is not dict:
+        return False
+    namespace = ModuleType.__getattribute__(module, "__dict__")
+    sentinel = namespace.get("_sentinel_dict")
+    if type(sentinel) is not dict or sentinel:
+        return False
+    factory = _current_loaded_interpreter_reference_state("collections", "defaultdict")
+    _track_loaded_interpreter_reference_state("collections", "defaultdict", factory)
+    if not factory[0] or factory[1] is not _CANONICAL_COLLECTIONS_DEFAULTDICT:
+        return False
     state = _loaded_reference_state_without_hooks(module, "Template")
     _track_loaded_interpreter_reference_state("string", "Template", state)
     if not state[0] or type(state[1]) is not type:
@@ -6113,7 +6124,7 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
         _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
         if member[0]:
             return False
-    for name in ("__init__", "substitute", "safe_substitute", "is_valid", "get_identifiers"):
+    for name in ("__init__", "_invalid", "substitute", "safe_substitute", "is_valid", "get_identifiers"):
         member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
         _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
         if (
@@ -6121,8 +6132,44 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
             or type(member[1]) is not FunctionType
             or getattr(member[1].__code__, "co_qualname", None) != f"Template.{name}"
             or not _function_owner_matches_trusted_source(member[1], expected_module="string")
+            or not _template_function_runtime_is_canonical(member[1], module, name, sentinel)
         ):
             return False
+    return True
+
+
+def _template_function_runtime_is_canonical(
+    function: FunctionType, module: ModuleType, name: str, sentinel: object
+) -> bool:
+    namespace = ModuleType.__getattribute__(module, "__dict__")
+    if (
+        function.__globals__ is not namespace
+        or object.__getattribute__(function, "__builtins__") is not _IMPORT_RUNTIME_BUILTINS
+        or type(_IMPORT_RUNTIME_BUILTINS) is not dict
+        or function.__kwdefaults__ is not None
+        or function.__closure__ is not None
+    ):
+        return False
+    defaults = function.__defaults__
+    if name in {"substitute", "safe_substitute"}:
+        if type(defaults) is not tuple or len(defaults) != 1 or defaults[0] is not sentinel:
+            return False
+    elif defaults is not None:
+        return False
+    for dependency in _code_loaded_global_names(function.__code__):
+        state = _loaded_reference_state_without_hooks(module, dependency)
+        _track_loaded_interpreter_reference_state("string", dependency, state)
+        if dependency == "_sentinel_dict":
+            if not state[0] or state[1] is not sentinel:
+                return False
+            continue
+        value = namespace.get(dependency, _IMPORT_RUNTIME_BUILTINS.get(dependency))
+        expected = _IMPORT_RUNTIME_BUILTIN_VALUE_SNAPSHOTS.get(dependency)
+        if expected is None or not _runtime_value_matches_snapshot(value, expected):
+            return False
+        if not state[0]:
+            builtin_state = _current_loaded_interpreter_reference_state("builtins", dependency)
+            _track_loaded_interpreter_reference_state("builtins", dependency, builtin_state)
     return True
 
 
