@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Recognize the remaining GGUF tensor types that ggml defines (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ4_NL, I8, I16, I32, I64, F64, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0, and Q2_0), so GGUF files that use them get tensor bounds validation instead of an inconclusive scan. Retired and unknown type IDs remain inconclusive.
+
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
 
 ### Security

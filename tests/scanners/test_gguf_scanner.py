@@ -1693,6 +1693,117 @@ def test_gguf_rank250_current_types_do_not_mask_unknown_future_type(tmp_path: Pa
     assert determine_exit_code(aggregate) == 2
 
 
+# One block of every other tensor type in ggml's `enum ggml_type`: (type, name, block size, type size)
+_GGML_SINGLE_BLOCK_TENSOR_TYPES = [
+    (16, "iq2_xxs", 256, 66),
+    (17, "iq2_xs", 256, 74),
+    (18, "iq3_xxs", 256, 98),
+    (19, "iq1_s", 256, 50),
+    (20, "iq4_nl", 32, 18),
+    (22, "iq2_s", 256, 82),
+    (24, "i8", 1, 1),
+    (25, "i16", 1, 2),
+    (26, "i32", 1, 4),
+    (27, "i64", 1, 8),
+    (28, "f64", 1, 8),
+    (29, "iq1_m", 256, 56),
+    (34, "tq1_0", 256, 54),
+    (35, "tq2_0", 256, 66),
+    (39, "mxfp4", 32, 17),
+    (40, "nvfp4", 64, 36),
+    (41, "q1_0", 128, 18),
+    (42, "q2_0", 64, 18),
+]
+_GGML_SINGLE_BLOCK_TENSOR_TYPE_IDS = [name for _type, name, _block, _size in _GGML_SINGLE_BLOCK_TENSOR_TYPES]
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "type_name", "block_size", "type_size"),
+    _GGML_SINGLE_BLOCK_TENSOR_TYPES,
+    ids=_GGML_SINGLE_BLOCK_TENSOR_TYPE_IDS,
+)
+def test_gguf_remaining_ggml_tensor_types_are_supported(
+    tmp_path: Path,
+    tensor_type: int,
+    type_name: str,
+    block_size: int,
+    type_size: int,
+) -> None:
+    tensor_name = f"blk.0.attn_q.weight.{type_name}"
+    path = tmp_path / f"type{tensor_type}.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        tensor_name=tensor_name.encode(),
+        dims=(block_size,),
+        tensor_data_size=type_size,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is True
+    assert direct.metadata["tensors"] == [{"name": tensor_name, "type": tensor_type, "dims": [block_size]}]
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    assert not any(check.name == "Tensor Block Alignment Check" for check in direct.checks)
+    assert not any(check.name == "Tensor Data Bounds Check" for check in direct.checks)
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "type_name", "block_size", "type_size"),
+    _GGML_SINGLE_BLOCK_TENSOR_TYPES,
+    ids=_GGML_SINGLE_BLOCK_TENSOR_TYPE_IDS,
+)
+def test_gguf_remaining_ggml_tensor_types_reach_bounds_validation(
+    tmp_path: Path,
+    tensor_type: int,
+    type_name: str,
+    block_size: int,
+    type_size: int,
+) -> None:
+    tensor_name = f"{type_name}_truncated"
+    path = tmp_path / f"type{tensor_type}_truncated.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        tensor_name=tensor_name.encode(),
+        dims=(block_size,),
+        tensor_data_size=type_size - 1,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    bounds_checks = [check for check in direct.checks if check.name == "Tensor Data Bounds Check"]
+    assert len(bounds_checks) == 1
+    assert bounds_checks[0].status == CheckStatus.FAILED
+    assert bounds_checks[0].details["tensor_name"] == tensor_name
+    assert bounds_checks[0].details["expected"] == type_size
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("tensor_type", [4, 5, 31, 32, 33, 36, 37, 38, 43, 142])
+def test_gguf_retired_and_foreign_tensor_types_stay_inconclusive(tmp_path: Path, tensor_type: int) -> None:
+    path = tmp_path / f"type{tensor_type}.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type=tensor_type)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_STRUCTURE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    type_checks = [check for check in direct.checks if check.name == "Tensor Type Validation"]
+    assert len(type_checks) == 1
+    assert type_checks[0].status == CheckStatus.FAILED
+    assert type_checks[0].details["tensor_type"] == tensor_type
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_gguf_bf16_truncated_tensor_data_reports_bounds_check(tmp_path: Path) -> None:
     path = tmp_path / "bf16_truncated_tensor_data.gguf"
     _write_gguf_with_tensor_type(
