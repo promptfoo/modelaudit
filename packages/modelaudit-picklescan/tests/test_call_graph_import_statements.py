@@ -8867,7 +8867,25 @@ if marker.read_text() != marker_content:
     assert marker.read_text() == marker_content
 
 
-@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "Template.substitute",
+        "Template.safe_substitute",
+        pytest.param(
+            "Template.is_valid",
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 14), reason="Lazy-pattern helper qualification starts in 3.14"
+            ),
+        ),
+        pytest.param(
+            "Template.get_identifiers",
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 14), reason="Lazy-pattern helper qualification starts in 3.14"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("template", ["plain text", "$$"])
 @pytest.mark.parametrize("warm_after_import", [False, True])
 def test_scan_bytes_keeps_template_defaultdict_no_placeholder_clean(
@@ -8909,6 +8927,48 @@ assert pickle.loads(payload) == expected
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, payload.hex(), method_name, template, str(warm_after_import)]
     )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Lazy-pattern helper qualification starts in 3.14")
+@pytest.mark.parametrize("method_name", ["Template.is_valid", "Template.get_identifiers"])
+@pytest.mark.parametrize("benign_first", [False, True])
+def test_template_cached_helpers_require_unmodified_receiver(
+    tmp_path: Path, method_name: str, benign_first: bool
+) -> None:
+    setup = (
+        b"\x80\x04" + _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain text")) + b"R\x940"
+    )
+    invocation = _global_operand("string", method_name) + _args_tuple(b"h\x00") + b"R"
+    mutation = (
+        _global_operand("builtins", "object.__setattr__")
+        + _args_tuple(b"h\x00", _unicode_operand("template"), _unicode_operand("$changed"))
+        + b"R0"
+    )
+    payload = setup + (invocation + b"0" if benign_first else b"") + mutation + invocation + b"."
+    child_code = """
+import pickle
+import string
+import sys
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+payload = bytes.fromhex(sys.argv[1])
+method_name = sys.argv[2]
+benign_first = sys.argv[3] == "True"
+report = scan_bytes(payload)
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+proofs = [
+    invocation.get("template_receiver_state_unmodified")
+    for invocation in report.metadata.get("callable_invocations", [])
+    if invocation.get("module") == "string" and invocation.get("name") == method_name
+]
+assert proofs == ([True, False] if benign_first else [False]), proofs
+assert any("receiver state cannot be proven unchanged" in error.message for error in report.errors), report
+assert pickle.loads(payload) == (True if method_name == "Template.is_valid" else ["changed"])
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), method_name, str(benign_first)])
 
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template pattern became lazy in Python 3.14")

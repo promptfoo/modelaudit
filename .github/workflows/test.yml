@@ -880,7 +880,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 30 || 15 }}
+    timeout-minutes: ${{ matrix.timeout-minutes || ((matrix.os == 'macos-15-intel' || matrix.os == 'windows-latest') && 30 || 15) }}
     strategy:
       fail-fast: false
       matrix:
@@ -896,6 +896,7 @@ jobs:
             python-version: "3.14"
           - os: macos-15-intel
             python-version: "3.14"
+            timeout-minutes: 75
           - os: ubuntu-24.04-arm
             python-version: "3.14"
           - os: windows-latest
@@ -1049,6 +1050,12 @@ jobs:
               invocation.get("template_receiver_state_unmodified") is True
               for invocation in template.metadata.get("callable_invocations", ())
           ), template
+          if sys.version_info >= (3, 14):
+              for method in ("Template.is_valid", "Template.get_identifiers"):
+                  payload = b"\x80\x04cstring\n" + method.encode() + b"\ncstring\nTemplate\n\x8c\x05plain\x85R\x85R."
+                  helper = modelaudit_picklescan.scan_bytes(payload)
+                  assert helper.status.value == "complete", helper
+                  assert helper.verdict.value == "clean", helper
           print(f"standalone wheel API passed on {sys.version}")
           PY
           )

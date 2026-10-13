@@ -135,6 +135,14 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
 
     assert {"3.10", "3.11", "3.12", "3.13", "3.14"} <= set(versions)
     assert {(os_name, "3.14") for os_name in release_platforms} <= lanes
+    assert job["timeout-minutes"] == (
+        "${{ matrix.timeout-minutes || ((matrix.os == 'macos-15-intel' || "
+        "matrix.os == 'windows-latest') && 30 || 15) }}"
+    )
+    intel314 = next(
+        lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.14"
+    )
+    assert intel314["timeout-minutes"] == 75
     assert project["requires-python"] == ">=3.10"
     assert cargo["features"]["abi3"] == ["pyo3/abi3-py310"]
     for version in versions:
@@ -154,6 +162,8 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     assert 'string.Template("warm").substitute({})' in smoke
     assert 'assert template.status.value == "complete"' in smoke
     assert 'assert template.verdict.value == "clean"' in smoke
+    assert 'for method in ("Template.is_valid", "Template.get_identifiers")' in smoke
+    assert 'assert helper.verdict.value == "clean"' in smoke
 
 
 def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
