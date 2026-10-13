@@ -1054,14 +1054,22 @@ class GgufScanner(BaseScanner):
                     },
                 )
 
-            if nelements % blck != 0:
+            # ggml stores whole blocks per row, so it rejects a tensor whose first
+            # dimension is not a multiple of the block size even when its total is.
+            row_width = tensor.dims[0] if tensor.dims else 1
+            if row_width % blck != 0:
                 result.add_check(
                     name="Tensor Block Alignment Check",
                     passed=False,
                     message=f"Tensor {tensor.name} not aligned to block size {blck}",
                     severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
-                    details={"tensor_name": tensor.name, "block_size": blck, "elements": nelements},
+                    details={
+                        "tensor_name": tensor.name,
+                        "block_size": blck,
+                        "elements": nelements,
+                        "row_width": row_width,
+                    },
                     rule_code="S804",
                 )
 

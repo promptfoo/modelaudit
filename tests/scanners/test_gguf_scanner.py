@@ -1785,6 +1785,56 @@ def test_gguf_remaining_ggml_tensor_types_reach_bounds_validation(
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize(
+    ("tensor_type", "type_name", "block_size", "type_size"),
+    [
+        (12, "q4_k", 256, 144),
+        (16, "iq2_xxs", 256, 66),
+        (20, "iq4_nl", 32, 18),
+    ],
+    ids=["q4_k", "iq2_xxs", "iq4_nl"],
+)
+def test_gguf_block_tensor_rows_must_hold_whole_blocks(
+    tmp_path: Path,
+    tensor_type: int,
+    type_name: str,
+    block_size: int,
+    type_size: int,
+) -> None:
+    # ggml rejects a row that is not a multiple of the block size, even when the tensor's total is.
+    split_rows = tmp_path / f"{type_name}_split_rows.gguf"
+    _write_gguf_with_tensor_type(
+        split_rows,
+        tensor_type=tensor_type,
+        tensor_name=f"{type_name}_split_rows".encode(),
+        dims=(1, block_size),
+        tensor_data_size=type_size,
+    )
+    whole_rows = tmp_path / f"{type_name}_whole_rows.gguf"
+    _write_gguf_with_tensor_type(
+        whole_rows,
+        tensor_type=tensor_type,
+        tensor_name=f"{type_name}_whole_rows".encode(),
+        dims=(block_size, 2),
+        tensor_data_size=2 * type_size,
+    )
+
+    rejected = GgufScanner().scan(str(split_rows))
+    accepted = GgufScanner().scan(str(whole_rows))
+
+    alignment_checks = [check for check in rejected.checks if check.name == "Tensor Block Alignment Check"]
+    assert len(alignment_checks) == 1
+    assert alignment_checks[0].status == CheckStatus.FAILED
+    assert alignment_checks[0].details["row_width"] == 1
+    assert alignment_checks[0].details["block_size"] == block_size
+    assert determine_exit_code(scan_model_directory_or_file(str(split_rows), cache_enabled=False)) == 1
+    assert accepted.success is True
+    assert not any(check.name == "Tensor Block Alignment Check" for check in accepted.checks)
+    assert not any(check.name == "Tensor Data Bounds Check" for check in accepted.checks)
+    _assert_no_warning_or_critical_issues(accepted)
+    assert determine_exit_code(scan_model_directory_or_file(str(whole_rows), cache_enabled=False)) == 0
+
+
 @pytest.mark.parametrize("tensor_type", [4, 5, 31, 32, 33, 36, 37, 38, 43, 142])
 def test_gguf_retired_and_foreign_tensor_types_stay_inconclusive(tmp_path: Path, tensor_type: int) -> None:
     path = tmp_path / f"type{tensor_type}.gguf"
