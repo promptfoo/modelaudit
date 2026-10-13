@@ -111,6 +111,61 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
+// Receiver-state proof is deliberately limited to passive construction prefixes.
+// Container mutation/hashing, external state and arbitrary calls may change aliases.
+const TEMPLATE_PASSIVE_PREFIX_OPCODES: &[&str] = &[
+    "PROTO",
+    "FRAME",
+    "STOP",
+    "MARK",
+    "POP",
+    "POP_MARK",
+    "DUP",
+    "NONE",
+    "NEWTRUE",
+    "NEWFALSE",
+    "INT",
+    "BININT",
+    "BININT1",
+    "BININT2",
+    "LONG",
+    "LONG1",
+    "LONG4",
+    "FLOAT",
+    "BINFLOAT",
+    "STRING",
+    "BINSTRING",
+    "SHORT_BINSTRING",
+    "UNICODE",
+    "BINUNICODE",
+    "BINUNICODE8",
+    "SHORT_BINUNICODE",
+    "BINBYTES",
+    "BINBYTES8",
+    "SHORT_BINBYTES",
+    "BYTEARRAY8",
+    "EMPTY_TUPLE",
+    "TUPLE",
+    "TUPLE1",
+    "TUPLE2",
+    "TUPLE3",
+    "EMPTY_LIST",
+    "LIST",
+    "EMPTY_DICT",
+    "EMPTY_SET",
+    "PUT",
+    "BINPUT",
+    "LONG_BINPUT",
+    "MEMOIZE",
+    "GET",
+    "BINGET",
+    "LONG_BINGET",
+    // These receive additional symbol/argument checks before preserving the proof.
+    "GLOBAL",
+    "STACK_GLOBAL",
+    "REDUCE",
+];
+
 #[derive(Clone, Copy)]
 enum CallbackDispatchGuard {
     Always,
@@ -672,6 +727,7 @@ pub(crate) struct ScanState<'a> {
     import_reference_keys: HashSet<ImportReferenceDedupeKey>,
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
     callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
+    template_receiver_may_have_mutated: bool,
     non_allowlisted_global_imports: Vec<PendingGlobalImportFinding>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
@@ -742,6 +798,7 @@ impl<'a> ScanState<'a> {
             import_reference_keys: HashSet::new(),
             callable_invocations: Vec::new(),
             callable_invocation_keys: HashSet::new(),
+            template_receiver_may_have_mutated: false,
             non_allowlisted_global_imports: Vec::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
@@ -1364,6 +1421,9 @@ impl<'a> ScanState<'a> {
     }
 
     fn handle_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
+        if !TEMPLATE_PASSIVE_PREFIX_OPCODES.contains(&opcode.name) {
+            self.template_receiver_may_have_mutated = true;
+        }
         match opcode.name {
             "PROTO" => {
                 if let ArgValue::Int(value) = opcode.arg {
@@ -1747,6 +1807,9 @@ impl<'a> ScanState<'a> {
             }
             name if REDUCE_OPCODES.contains(&name) => {
                 let invocations = self.consume_callable_opcode(opcode, position);
+                if invocations.is_empty() {
+                    self.template_receiver_may_have_mutated = true;
+                }
                 for invocation in &invocations {
                     self.mark_non_allowlisted_global_invoked(invocation);
                     self.push_callable_invocation(invocation);
@@ -6878,6 +6941,22 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_global_ref(&mut self, reference: &GlobalRef, op_name: &'static str) {
+        if reference.malformed
+            || !matches!(
+                (reference.module.as_str(), reference.name.as_str()),
+                (
+                    "string",
+                    "Template"
+                        | "Template.substitute"
+                        | "Template.safe_substitute"
+                        | "Template.is_valid"
+                        | "Template.get_identifiers"
+                ) | ("collections", "defaultdict")
+                    | ("builtins" | "__builtin__", "help")
+            )
+        {
+            self.template_receiver_may_have_mutated = true;
+        }
         let symbol = reference.symbol();
         let severity = global_severity(&reference.module, &reference.name);
         let is_dangerous = severity.is_some();
@@ -7163,12 +7242,33 @@ impl<'a> ScanState<'a> {
         });
     }
 
+    fn template_prefix_constructor_is_inert(invocation: &CallableInvocation) -> bool {
+        if invocation.op_name != "REDUCE"
+            || invocation.reference.malformed
+            || invocation.positional_arg_count != Some(invocation.args.len())
+        {
+            return false;
+        }
+        match (
+            invocation.reference.module.as_str(),
+            invocation.reference.name.as_str(),
+        ) {
+            ("string", "Template") => matches!(
+                invocation.args.as_slice(),
+                [StackValue::Text { .. } | StackValue::TextSpan { .. }]
+            ),
+            ("collections", "defaultdict") => invocation.args.len() <= 1,
+            _ => false,
+        }
+    }
+
     fn push_callable_invocation(&mut self, invocation: &CallableInvocation) {
         if invocation.reference.malformed {
+            self.template_receiver_may_have_mutated = true;
             return;
         }
 
-        let template_receiver_literal_unbuilt = (invocation.reference.module == "string"
+        let template_receiver_state_unmodified = (invocation.reference.module == "string"
             && matches!(
                 invocation.reference.name.as_str(),
                 "Template.substitute"
@@ -7180,8 +7280,13 @@ impl<'a> ScanState<'a> {
             matches!(
                 invocation.args.first(),
                 Some(StackValue::StringTemplate { .. })
-            ) && !self.opcode_counts.contains_key("BUILD")
+            ) && !self.template_receiver_may_have_mutated
         });
+        // Capture this call's proof first; arbitrary primary calls must invalidate
+        // aliases before synthetic callbacks, duplicate elision or metadata limits.
+        if !Self::template_prefix_constructor_is_inert(invocation) {
+            self.template_receiver_may_have_mutated = true;
+        }
         let dedupe_key = (
             invocation.reference.module.clone(),
             invocation.reference.name.clone(),
@@ -7193,7 +7298,7 @@ impl<'a> ScanState<'a> {
             invocation.positional_arg_count,
             invocation.build_uses_slot_state,
             invocation.keyword_arg_names.clone(),
-            template_receiver_literal_unbuilt,
+            template_receiver_state_unmodified,
         );
         if self.callable_invocation_keys.contains(&dedupe_key) {
             return;
@@ -7228,9 +7333,9 @@ impl<'a> ScanState<'a> {
                 DetailValue::UInt(invocation.opcode_position as u64),
             ),
         ];
-        if let Some(proven) = template_receiver_literal_unbuilt {
+        if let Some(proven) = template_receiver_state_unmodified {
             details.push((
-                "template_receiver_literal_unbuilt".to_string(),
+                "template_receiver_state_unmodified".to_string(),
                 DetailValue::Bool(proven),
             ));
         }
@@ -8124,7 +8229,10 @@ impl<'a> ScanState<'a> {
                 self.nested_depth,
                 Some(self.deadline),
             );
+            // Skipped padding and earlier streams may have changed process state.
+            follow_on_scan.template_receiver_may_have_mutated = true;
             follow_on_scan.run();
+            self.template_receiver_may_have_mutated = true;
             skip_offsets_before =
                 skip_offsets_before.max(absolute_offset.saturating_add(candidate_len));
             let had_findings = !follow_on_scan.findings.is_empty();
@@ -8271,11 +8379,13 @@ impl<'a> ScanState<'a> {
                 })
                 .collect::<Option<Vec<_>>>()
         });
-        let template_receiver_literal_unbuilt =
+        let template_receiver_state_unmodified =
             details
                 .iter()
                 .find_map(|(key, value)| match (key.as_str(), value) {
-                    ("template_receiver_literal_unbuilt", DetailValue::Bool(value)) => Some(*value),
+                    ("template_receiver_state_unmodified", DetailValue::Bool(value)) => {
+                        Some(*value)
+                    }
                     _ => None,
                 });
         Some((
@@ -8287,7 +8397,7 @@ impl<'a> ScanState<'a> {
             positional_arg_count,
             build_uses_slot_state,
             keyword_arg_names,
-            template_receiver_literal_unbuilt,
+            template_receiver_state_unmodified,
         ))
     }
 

@@ -1999,7 +1999,7 @@ def find_dangerous_call_graphs(
                 in {"Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"}
                 and reference.get("invocation_import_reference")
                 and _template_uses_reviewed_lazy_pattern()
-                and reference.get("template_receiver_literal_unbuilt") is not True
+                and reference.get("template_receiver_state_unmodified") is not True
             ):
                 raise _CallGraphAnalysisLimitError("string.Template receiver state cannot be proven unchanged")
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
@@ -3307,7 +3307,7 @@ def _iter_call_graph_references(
             positional_arg_count if isinstance(positional_arg_count, int) else None,
             _optional_bool_reference_detail(item.get("build_uses_slot_state")),
             _complete_keyword_arg_names(item),
-            _optional_bool_reference_detail(item.get("template_receiver_literal_unbuilt")),
+            _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
         )
         if invocation_key in seen_invocations:
             continue
@@ -3393,7 +3393,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 positional_arg_count if isinstance(positional_arg_count, int) else None,
                 _optional_bool_reference_detail(item.get("build_uses_slot_state")),
                 _complete_keyword_arg_names(item),
-                _optional_bool_reference_detail(item.get("template_receiver_literal_unbuilt")),
+                _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
             )
             if reference_key in seen:
                 continue
@@ -6073,6 +6073,7 @@ def _template_has_trusted_compiled_pattern() -> bool:
     pattern = state[1]
     canonical = (
         import_only_reference_is_proven_trusted("string", "Template")
+        and _template_runtime_matches_trusted_source(module)
         and pattern.pattern == _canonical_template_pattern_text()
         # IGNORECASE | VERBOSE | UNICODE, the standard Template flags.
         and pattern.flags == 98
@@ -6086,7 +6087,42 @@ def _template_has_trusted_compiled_pattern() -> bool:
         _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
         canonical = canonical and member[0] and type(member[1]) is type(expected) and member[1] == expected
     if not canonical:
-        raise _CallGraphAnalysisLimitError("cached string.Template pattern does not match the trusted default pattern")
+        raise _CallGraphAnalysisLimitError("cached string.Template runtime does not match the trusted defaults")
+    return True
+
+
+def _template_runtime_matches_trusted_source(module: object) -> bool:
+    state = _loaded_reference_state_without_hooks(module, "Template")
+    _track_loaded_interpreter_reference_state("string", "Template", state)
+    if not state[0] or type(state[1]) is not type:
+        return False
+    class_object = cast(type[object], state[1])
+    if type.__getattribute__(class_object, "__mro__") != (class_object, object):
+        return False
+    for name, expected in (
+        ("__new__", object.__new__),
+        ("__setattr__", object.__setattr__),
+        ("__getattribute__", object.__getattribute__),
+    ):
+        member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
+        _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
+        if not member[0] or member[1] is not expected:
+            return False
+    for name in ("__getattr__", "__del__", "template"):
+        member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
+        _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
+        if member[0]:
+            return False
+    for name in ("__init__", "substitute", "safe_substitute", "is_valid", "get_identifiers"):
+        member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
+        _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
+        if (
+            not member[0]
+            or type(member[1]) is not FunctionType
+            or getattr(member[1].__code__, "co_qualname", None) != f"Template.{name}"
+            or not _function_owner_matches_trusted_source(member[1], expected_module="string")
+        ):
+            return False
     return True
 
 

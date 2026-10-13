@@ -1012,7 +1012,7 @@ jobs:
               b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R."
           )
           assert any(
-              invocation.get("template_receiver_literal_unbuilt") is True
+              invocation.get("template_receiver_state_unmodified") is True
               for invocation in template.metadata.get("callable_invocations", ())
           ), template
           print(f"standalone wheel API passed on {sys.version}")

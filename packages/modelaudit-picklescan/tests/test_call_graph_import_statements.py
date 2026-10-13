@@ -9,6 +9,7 @@ import io
 import mailbox
 import os
 import pickle
+import pickletools
 import py_compile
 import subprocess
 import sys
@@ -9140,7 +9141,7 @@ report = scan_bytes(payload)
 assert report.verdict != SafetyVerdict.CLEAN, report
 assert report.status == ScanStatus.INCONCLUSIVE, report
 proofs = [
-    invocation.get("template_receiver_literal_unbuilt")
+    invocation.get("template_receiver_state_unmodified")
     for invocation in report.metadata.get("callable_invocations", [])
     if invocation.get("module") == "string" and invocation.get("name") == method_name
 ]
@@ -9152,6 +9153,229 @@ assert marker.read_text() == "factory-called"
     _assert_isolated_python(
         tmp_path,
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), method_name, str(benign_first)],
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template receiver qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("benign_first", [False, True])
+@pytest.mark.parametrize("mutation", ["object_setattr", "setter_alias", "dict_setitem", "bound_setter"])
+def test_scan_bytes_rejects_template_mutation_without_build(
+    tmp_path: Path, method_name: str, benign_first: bool, mutation: str
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "non_build_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    invocation = _global_operand("string", method_name) + _args_tuple(b"h\x01", b"h\x00") + b"R"
+    setup = b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R\x940",
+            _global_operand("string", "Template"),
+            _args_tuple(_unicode_operand("plain text")),
+            b"R\x940",
+        ]
+    )
+    setter_args = _args_tuple(b"h\x01", _unicode_operand("template"), _unicode_operand("$missing"))
+    mutations = {
+        "object_setattr": b"cbuiltins\nobject.__setattr__\n" + setter_args + b"R0",
+        "setter_alias": (
+            _global_operand("builtins", "getattr")
+            + _args_tuple(_global_operand("builtins", "object"), _unicode_operand("__setattr__"))
+            + b"R"
+            + setter_args
+            + b"R0"
+        ),
+        "dict_setitem": (
+            _global_operand("builtins", "object.__getattribute__")
+            + _args_tuple(b"h\x01", _unicode_operand("__dict__"))
+            + b"R"
+            + _unicode_operand("template")
+            + _unicode_operand("$missing")
+            + b"s0"
+        ),
+        "bound_setter": (
+            _global_operand("builtins", "object.__getattribute__")
+            + _args_tuple(b"h\x01", _unicode_operand("__setattr__"))
+            + b"R"
+            + _args_tuple(_unicode_operand("template"), _unicode_operand("$missing"))
+            + b"R0"
+        ),
+    }
+    payload = setup + (invocation + b"0" if benign_first else b"") + mutations[mutation] + invocation + b"."
+    assert all(opcode.name != "BUILD" for opcode, _argument, _position in pickletools.genops(payload))
+    child_code = """
+import pickle
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+method_name = sys.argv[4]
+benign_first = sys.argv[5] == "True"
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+report = scan_bytes(payload)
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert report.status == ScanStatus.INCONCLUSIVE, report
+proofs = [
+    invocation.get("template_receiver_state_unmodified")
+    for invocation in report.metadata.get("callable_invocations", [])
+    if invocation.get("module") == "string" and invocation.get("name") == method_name
+]
+assert proofs == ([True, False] if benign_first else [False]), proofs
+assert any("receiver state cannot be proven unchanged" in error.message for error in report.errors), report
+assert not marker.exists()
+assert pickle.loads(payload) == "factory-value"
+assert marker.read_text() == "factory-called"
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), method_name, str(benign_first)],
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template runtime qualification is Python 3.14-specific")
+@pytest.mark.parametrize("customization", ["constructor", "attribute_lookup", "method"])
+def test_scan_bytes_rejects_template_runtime_replaced_before_import(tmp_path: Path, customization: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "runtime_replacement_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    payload = _builtins_help_defaultdict_template_payload("Template.substitute", "plain text")
+    child_code = """
+import pickle
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+customization = sys.argv[4]
+if customization == "constructor":
+    def replacement(self, template):
+        self.template = "$missing"
+    string.Template.__init__ = replacement
+elif customization == "attribute_lookup":
+    def replacement(self, name):
+        return "$missing" if name == "template" else object.__getattribute__(self, name)
+    string.Template.__getattribute__ = replacement
+else:
+    def replacement(self, mapping):
+        return mapping["missing"]
+    string.Template.substitute = replacement
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+report = scan_bytes(payload)
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert not marker.exists()
+assert pickle.loads(payload) == "factory-value"
+assert marker.read_text() == "factory-called"
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), customization]
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template receiver qualification is Python 3.14-specific")
+@pytest.mark.parametrize("prefix_kind", ["call", "container", "hashing", "stopped_call", "mapping_constructor"])
+@pytest.mark.parametrize("known_placeholder", [False, True])
+def test_template_unproven_prefix_retains_coverage_and_known_detections(
+    tmp_path: Path, prefix_kind: str, known_placeholder: bool
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "prefix_factory_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    prefixes = {
+        "call": b"cbuiltins\nlen\n)\x85R0",
+        "container": b"]Na0",
+        "hashing": b"(N\x910",
+        "stopped_call": b"cbuiltins\nlen\n)\x85R.",
+        "mapping_constructor": b"ccollections\ndefaultdict\ncbuiltins\nhelp\n}\x86R0",
+    }
+    payload = (
+        b"\x80\x04"
+        + prefixes[prefix_kind]
+        + _builtins_help_defaultdict_template_payload(
+            "Template.substitute", "$missing" if known_placeholder else "plain text"
+        )
+    )
+    child_code = """
+import io
+import pickle
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+known_placeholder = sys.argv[4] == "True"
+separate_stream = sys.argv[5] == "stopped_call"
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+report = scan_bytes(payload)
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any("receiver state cannot be proven unchanged" in error.message for error in report.errors), report
+proofs = [
+    invocation.get("template_receiver_state_unmodified")
+    for invocation in report.metadata.get("callable_invocations", [])
+    if invocation.get("module") == "string" and invocation.get("name") == "Template.substitute"
+]
+assert proofs == [False], proofs
+if known_placeholder:
+    assert report.verdict == SafetyVerdict.MALICIOUS, report
+    assert any(
+        finding.details.get("call_path", ())[0:1] == ("_sitebuiltins._Helper.__call__",)
+        for finding in report.findings
+    ), report
+assert not marker.exists()
+stream = io.BytesIO(payload)
+if separate_stream:
+    assert pickle.load(stream) == 0
+result = pickle.load(stream)
+assert result == ("factory-value" if known_placeholder else "plain text")
+assert marker.exists() == known_placeholder
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            str(known_placeholder),
+            prefix_kind,
+        ],
     )
 
 
