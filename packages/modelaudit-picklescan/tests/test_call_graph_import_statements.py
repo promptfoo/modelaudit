@@ -9028,6 +9028,232 @@ assert marker.read_text() == "factory-called"
     )
 
 
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-program qualification starts in Python 3.14")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize(
+    "customization",
+    [
+        "program",
+        "groups",
+        "text_hook",
+        "mapping_hook",
+        "names_hook",
+        "group_value_hook",
+        "cache_poison",
+        "compiler_hook",
+    ],
+)
+def test_template_cached_regex_program_and_data_are_authenticated(
+    tmp_path: Path, method_name: str, customization: str
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "regex_factory_marker"
+    scan_marker = tmp_path / "regex_inspection_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    literal = "$$" if customization == "groups" else "plain text"
+    payload = _builtins_help_defaultdict_template_payload(method_name, literal)
+    child_code = r"""
+import _sre
+import pickle
+import re
+import string
+import sys
+from pathlib import Path
+from re import _compiler, _parser
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+scan_marker = Path(sys.argv[3])
+payload = bytes.fromhex(sys.argv[4])
+customization = sys.argv[5]
+string.Template("warm").substitute({})
+canonical = string.Template.pattern
+expression = canonical.pattern
+if customization in {"program", "cache_poison"}:
+    expression = r"(?P<named>.+)|(?P<braced>(?!))|(?P<escaped>(?!))|(?P<invalid>(?!))"
+elif customization == "compiler_hook":
+    expression = r"(?P<escaped>(?!))|(?P<named>.+)|(?P<braced>(?!))|(?P<invalid>(?!))"
+parsed = _parser.parse(expression, canonical.flags)
+code = _compiler._code(parsed, canonical.flags)
+groups = dict(parsed.state.groupdict)
+if customization == "groups":
+    groups["named"], groups["escaped"] = groups["escaped"], groups["named"]
+names = [None] * parsed.state.groups
+for name, index in groups.items():
+    names[index] = name
+names = tuple(names)
+text = canonical.pattern
+def callback(*args, **kwargs):
+    scan_marker.write_text("inspection-callback")
+    raise AssertionError("regex data callback executed")
+if customization == "text_hook":
+    class Text(str):
+        __hash__ = str.__hash__
+        __eq__ = callback
+    text = Text(text)
+elif customization == "mapping_hook":
+    class Mapping(dict):
+        __eq__ = __iter__ = __getitem__ = items = keys = get = copy = callback
+    groups = Mapping(groups)
+elif customization == "names_hook":
+    class Names(tuple):
+        __eq__ = __iter__ = __getitem__ = callback
+    names = Names(names)
+elif customization == "group_value_hook":
+    class Index(int):
+        __hash__ = int.__hash__
+        __eq__ = callback
+    groups["named"] = Index(groups["named"])
+pattern = _sre.compile(text, canonical.flags, code, parsed.state.groups - 1, groups, names)
+string.Template.pattern = pattern
+if customization == "cache_poison":
+    for cache in (re._cache, re._cache2):
+        cache[(str, canonical.pattern, 66)] = pattern
+        cache[(str, canonical.pattern, 98)] = pattern
+elif customization == "compiler_hook":
+    original_code = _compiler._code
+    target_expression = (
+        r"\$(?:(?P<escaped>\$)|(?P<named>(?a:[_a-z][_a-z0-9]*))|"
+        r"{(?P<braced>(?a:[_a-z][_a-z0-9]*))}|(?P<invalid>))"
+    )
+    def replaced_code(parsed, flags):
+        if parsed.state.str == target_expression:
+            return code
+        return original_code(parsed, flags)
+    _compiler._code = replaced_code
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+report = scan_bytes(payload)
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any(error.category == "call_graph_analysis_error" for error in report.errors), report
+assert not marker.exists(), "scanner invoked the mapping factory"
+assert not scan_marker.exists(), "scanner invoked a regex-data callback"
+result = pickle.loads(payload)
+if customization in {"program", "groups", "cache_poison", "compiler_hook"}:
+    assert result == "factory-value", result
+    assert marker.read_text() == "factory-called"
+else:
+    assert result == "plain text", result
+    assert not marker.exists()
+    assert not scan_marker.exists()
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            str(scan_marker),
+            payload.hex(),
+            customization,
+        ],
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-program qualification starts in Python 3.14")
+@pytest.mark.parametrize("attribute", ["MAGIC", "CODESIZE"])
+def test_template_unknown_regex_program_format_is_incomplete(tmp_path: Path, attribute: str) -> None:
+    payload = _builtins_help_defaultdict_template_payload("Template.substitute", "$$")
+    child_code = """
+import _sre
+import pickle
+import string
+import sys
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+payload = bytes.fromhex(sys.argv[1])
+setattr(_sre, sys.argv[2], getattr(_sre, sys.argv[2]) + 1)
+report = scan_bytes(payload)
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any(error.category == "call_graph_analysis_error" for error in report.errors), report
+assert pickle.loads(payload) == "$"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), attribute])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-program qualification starts in Python 3.14")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_template_canonical_program_survives_regex_cache_eviction(tmp_path: Path, method_name: str) -> None:
+    payload = _builtins_help_defaultdict_template_payload(method_name, "$$")
+    child_code = """
+import pickle
+import re
+import string
+import sys
+
+string.Template("warm").substitute({})
+re.purge()
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes, shared_source_sensitive_caches
+
+payload = bytes.fromhex(sys.argv[1])
+with shared_source_sensitive_caches():
+    for _ in range(2):
+        report = scan_bytes(payload)
+        assert report.status == ScanStatus.COMPLETE, report
+        assert report.verdict == SafetyVerdict.CLEAN, report
+        re.purge()
+assert pickle.loads(payload) == "$"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex()])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-program qualification starts in Python 3.14")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_template_group_mutation_does_not_reuse_clean_report(tmp_path: Path, method_name: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "mutated_group_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    payload = _builtins_help_defaultdict_template_payload(method_name, "$$")
+    child_code = """
+import gc
+import pickle
+import string
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+string.Template("warm").substitute({})
+pattern = string.Template.pattern
+groups = next(value for value in gc.get_referents(pattern) if type(value) is dict)
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes, shared_source_sensitive_caches
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+with shared_source_sensitive_caches():
+    before = scan_bytes(payload)
+    assert before.status == ScanStatus.COMPLETE, before
+    assert before.verdict == SafetyVerdict.CLEAN, before
+    groups["named"], groups["escaped"] = groups["escaped"], groups["named"]
+    after = scan_bytes(payload)
+    assert after.status == ScanStatus.INCONCLUSIVE, after
+    assert after.verdict != SafetyVerdict.CLEAN, after
+    assert any(error.category == "call_graph_analysis_error" for error in after.errors), after
+assert string.Template.pattern is pattern
+assert not marker.exists()
+assert pickle.loads(payload) == "factory-value"
+assert marker.read_text() == "factory-called"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
+
+
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template import-branch proof is Python 3.14-specific")
 @pytest.mark.parametrize("extra_call", ["__import__('untrusted')", "builtins.__import__('untrusted')"])
 def test_template_keyword_proof_keeps_explicit_import_calls(monkeypatch: pytest.MonkeyPatch, extra_call: str) -> None:

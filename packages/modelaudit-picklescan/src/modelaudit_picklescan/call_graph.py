@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import _imp
+import _sre
 import ast
 import dis
+import gc
 import hashlib
 import marshal
 import os
@@ -191,6 +193,113 @@ _MAX_TRUSTED_REFERENCE_GLOBALS = 1024
 _MAX_TRUSTED_SLOT_NAMES = 1024
 _REGEX_IGNORECASE = re.IGNORECASE
 _REGEX_PATTERN_TYPE = type(re.compile(""))
+
+_GC_GET_REFERENTS = gc.get_referents
+_SRE_COMPILE = _sre.compile
+# Reviewed CPython SRE program (magic 20230612, 32-bit words) for:
+# r"\$(?:(?P<escaped>\$)|(?P<named>(?a:[_a-z][_a-z0-9]*))|"
+# r"{(?P<braced>(?a:[_a-z][_a-z0-9]*))}|(?P<invalid>))", flags=98.
+# Keep the reference independent of mutable Python compiler functions and caches.
+_TEMPLATE_PATTERN_CODE = (
+    14,
+    8,
+    1,
+    1,
+    4294967295,
+    1,
+    1,
+    36,
+    0,
+    16,
+    36,
+    7,
+    9,
+    17,
+    0,
+    16,
+    36,
+    17,
+    1,
+    15,
+    77,
+    32,
+    17,
+    2,
+    31,
+    7,
+    16,
+    95,
+    22,
+    97,
+    122,
+    0,
+    24,
+    16,
+    0,
+    4294967295,
+    31,
+    11,
+    9,
+    0,
+    67043328,
+    2147483648,
+    134217726,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    17,
+    3,
+    15,
+    45,
+    36,
+    16,
+    123,
+    17,
+    4,
+    31,
+    7,
+    16,
+    95,
+    22,
+    97,
+    122,
+    0,
+    24,
+    16,
+    0,
+    4294967295,
+    31,
+    11,
+    9,
+    0,
+    67043328,
+    2147483648,
+    134217726,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    17,
+    5,
+    16,
+    125,
+    15,
+    9,
+    7,
+    17,
+    6,
+    17,
+    7,
+    15,
+    2,
+    0,
+    1,
+)
 _REGEX_SUB_METHOD_TYPE = type(re.compile("").sub)
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
@@ -6082,9 +6191,7 @@ def _template_has_trusted_compiled_pattern() -> bool:
     pattern = state[1]
     canonical = (
         _template_runtime_matches_trusted_source(module)
-        and pattern.pattern == _canonical_template_pattern_text()
-        # IGNORECASE | VERBOSE | UNICODE, the standard Template flags.
-        and pattern.flags == 98
+        and _template_pattern_program_is_canonical(pattern)
         and _template_cached_class_matches_startup(pattern)
     )
     for name, expected in (
@@ -6098,6 +6205,76 @@ def _template_has_trusted_compiled_pattern() -> bool:
     if not canonical:
         raise _CallGraphAnalysisLimitError("cached string.Template runtime does not match the trusted defaults")
     return True
+
+
+def _template_pattern_program_is_canonical(pattern: object) -> bool:
+    for module_name, name, native in (
+        ("gc", "get_referents", _GC_GET_REFERENTS),
+        ("_sre", "compile", _SRE_COMPILE),
+    ):
+        _, module, _ = _loaded_module_state_without_hooks(module_name)
+        state = _current_loaded_interpreter_reference_state(module_name, name)
+        _track_loaded_interpreter_reference_state(module_name, name, state)
+        if (
+            type(native) is not BuiltinFunctionType
+            or native.__name__ != name
+            or native.__self__ is not module
+            or not state[0]
+            or state[1] is not native
+            or not _loaded_interpreter_module_matches_startup(module_name)
+        ):
+            return False
+    for name, expected in (("MAGIC", 20230612), ("CODESIZE", 4)):
+        state = _current_loaded_interpreter_reference_state("_sre", name)
+        _track_loaded_interpreter_reference_state("_sre", name, state)
+        if not state[0] or type(state[1]) is not int or state[1] != expected:
+            return False
+    text = _canonical_template_pattern_text()
+    if type(text) is not str:
+        return False
+    try:
+        expected_groups = {"escaped": 1, "named": 2, "braced": 3, "invalid": 4}
+        expected_names = (None, "escaped", "named", "braced", "invalid")
+        reference: re.Pattern[str] = _SRE_COMPILE(
+            text, 98, list(_TEMPLATE_PATTERN_CODE), 4, expected_groups, expected_names
+        )
+        # Authenticate the native type before reading any candidate attributes.
+        if type(pattern) is not type(reference):
+            return False
+        candidate = pattern
+        if (
+            type(candidate.pattern) is not str
+            or candidate.pattern != text
+            or candidate.flags != 98
+            or candidate.groups != 4
+        ):
+            return False
+        # Pattern's C traversal exposes raw data without mappingproxy subclass dispatch.
+        referents = _GC_GET_REFERENTS(candidate)
+        mappings = [value for value in referents if type(value) is dict]
+        group_names = [value for value in referents if type(value) is tuple]
+        if (
+            len(referents) != 4
+            or len(mappings) != 1
+            or len(group_names) != 1
+            or not any(value is type(reference) for value in referents)
+            or not any(value is candidate.pattern for value in referents)
+            or len(mappings[0]) != 4
+            or len(group_names[0]) != 5
+        ):
+            return False
+        items = tuple(dict.items(mappings[0]))
+        if not all(type(name) is str and type(index) is int for name, index in items):
+            return False
+        names = group_names[0]
+        if not all(name is None or type(name) is str for name in names):
+            return False
+        if dict(items) != expected_groups or names != expected_names:
+            return False
+        # CPython equality checks code bytes but omits group state, checked above.
+        return candidate == reference
+    except Exception:
+        return False
 
 
 def _template_cached_class_matches_startup(pattern: object) -> bool:
