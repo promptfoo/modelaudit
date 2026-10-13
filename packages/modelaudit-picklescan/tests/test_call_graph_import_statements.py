@@ -9630,8 +9630,9 @@ assert marker.exists() == known_placeholder
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template constructor qualification is Python 3.14-specific")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 @pytest.mark.parametrize("before_import", [False, True])
+@pytest.mark.parametrize("replacement_kind", ["public_function", "both_functions", "borrowed_descriptors"])
 def test_template_replaced_defaultdict_constructor_is_not_inert(
-    tmp_path: Path, method_name: str, before_import: bool
+    tmp_path: Path, method_name: str, before_import: bool, replacement_kind: str
 ) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -9642,6 +9643,7 @@ def test_template_replaced_defaultdict_constructor_is_not_inert(
     )
     payload = _builtins_help_defaultdict_template_payload(method_name, "plain text")
     child_code = """
+import _collections
 import collections
 import importlib.metadata
 import pickle
@@ -9661,8 +9663,24 @@ def replacement(*args, **kwargs):
         )
     return original(*args, **kwargs)
 before_import = sys.argv[4] == "True"
+replacement_kind = sys.argv[5]
+installed = replacement
+if replacement_kind == "borrowed_descriptors":
+    class ReplacedDefaultDict(dict):
+        __init__ = original.__init__
+        __missing__ = original.__missing__
+        default_factory = original.default_factory
+        def __new__(cls, *args, **kwargs):
+            return replacement(*args, **kwargs)
+    ReplacedDefaultDict.__module__ = "collections"
+    ReplacedDefaultDict.__name__ = ReplacedDefaultDict.__qualname__ = "defaultdict"
+    installed = ReplacedDefaultDict
+def install_replacement():
+    collections.defaultdict = installed
+    if replacement_kind != "public_function":
+        _collections.defaultdict = installed
 if before_import:
-    collections.defaultdict = replacement
+    install_replacement()
 from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes, shared_source_sensitive_caches
 
 module_dir = Path(sys.argv[1])
@@ -9673,7 +9691,7 @@ sys.modules.pop("pydoc", None)
 with shared_source_sensitive_caches():
     if not before_import:
         assert scan_bytes(payload).verdict == SafetyVerdict.CLEAN
-        collections.defaultdict = replacement
+        install_replacement()
     report = scan_bytes(payload)
     assert report.status == ScanStatus.INCONCLUSIVE, report
     assert report.verdict != SafetyVerdict.CLEAN, report
@@ -9682,13 +9700,24 @@ with shared_source_sensitive_caches():
     assert not marker.exists()
     if not before_import:
         collections.defaultdict = original
+        _collections.defaultdict = original
         assert scan_bytes(payload).verdict == SafetyVerdict.CLEAN
-collections.defaultdict = replacement
+install_replacement()
 assert pickle.loads(payload) == "factory-value"
 assert marker.read_text() == "factory-called"
 """
     _assert_isolated_python(
-        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), str(before_import)]
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            str(before_import),
+            replacement_kind,
+        ],
     )
 
 

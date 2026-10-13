@@ -6340,7 +6340,7 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
         return False
     factory = _current_loaded_interpreter_reference_state("collections", "defaultdict")
     _track_loaded_interpreter_reference_state("collections", "defaultdict", factory)
-    if not factory[0] or factory[1] is not _CANONICAL_COLLECTIONS_DEFAULTDICT:
+    if not factory[0] or not _template_defaultdict_constructor_is_canonical(factory[1]):
         return False
     state = _loaded_reference_state_without_hooks(module, "Template")
     _track_loaded_interpreter_reference_state("string", "Template", state)
@@ -6372,6 +6372,35 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
             or getattr(member[1].__code__, "co_qualname", None) != f"Template.{name}"
             or not _function_owner_matches_trusted_source(member[1], expected_module="string")
             or not _template_function_runtime_is_canonical(member[1], module, name, sentinel)
+        ):
+            return False
+    return True
+
+
+def _template_defaultdict_constructor_is_canonical(value: object) -> bool:
+    if value is not _CANONICAL_COLLECTIONS_DEFAULTDICT or type(value) is not type:
+        return False
+    owner = value
+    # Py_TPFLAGS_IMMUTABLETYPE: module exports are mutable, native type slots are not.
+    if not type.__getattribute__(owner, "__flags__") & (1 << 8):
+        return False
+    if type.__getattribute__(owner, "__mro__") != (owner, dict, object):
+        return False
+    for name, expected in (("__module__", "collections"), ("__name__", "defaultdict")):
+        actual = type.__getattribute__(owner, name)
+        if type(actual) is not str or actual != expected:
+            return False
+    for name, descriptor_type in (
+        ("__init__", WrapperDescriptorType),
+        ("__missing__", MethodDescriptorType),
+        ("default_factory", MemberDescriptorType),
+    ):
+        try:
+            member = type.__getattribute__(owner, name)
+        except AttributeError:
+            return False
+        if type(member) is not descriptor_type or not _trusted_owner_bound_builtin_descriptor_matches(
+            owner, name, member
         ):
             return False
     return True
