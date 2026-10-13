@@ -36789,3 +36789,122 @@ class TestOnnxEmptyScan8BatchRegressions:
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+
+class TestOnnxEmptyScan8OutputRegressions:
+    @staticmethod
+    def _model(batch_size: int, state_dims: tuple[int, ...], auxiliary: str = "none") -> Any:
+        from onnx.reference import ReferenceEvaluator
+
+        state_shape = (batch_size, *state_dims)
+        state = np.zeros(state_shape, np.float32)
+        tensors = [
+            onnx.numpy_helper.from_array(state, name="initial"),
+            onnx.numpy_helper.from_array(np.zeros((batch_size, 1, 1), np.float32), name="sequence"),
+            onnx.numpy_helper.from_array(np.ones(batch_size, np.int64), name="lengths"),
+        ]
+        left_shape = (1, batch_size) if len(state_dims) == 1 else (1, state_dims[0])
+        inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, list(left_shape))]
+        nodes = []
+        body_inputs = [helper.make_tensor_value_info("state", TensorProto.FLOAT, list(state_dims))]
+        body_outputs = [helper.make_tensor_value_info("next_state", TensorProto.FLOAT, list(state_dims))]
+        body_nodes = [helper.make_node("Identity", ["state"], ["next_state"])]
+        state_inputs = ["initial"]
+        state_outputs = ["final"]
+        if auxiliary != "none":
+            state_inputs.append("auxiliary")
+            state_outputs.append("unused_final")
+            body_inputs.append(helper.make_tensor_value_info("auxiliary_state", TensorProto.FLOAT, []))
+            body_outputs.append(helper.make_tensor_value_info("next_auxiliary", TensorProto.FLOAT, []))
+            body_nodes.append(helper.make_node("Identity", ["auxiliary_state"], ["next_auxiliary"]))
+            if auxiliary == "dynamic":
+                inputs.append(helper.make_tensor_value_info("auxiliary", TensorProto.FLOAT, [batch_size]))
+            else:
+                assert auxiliary == "capped"
+                sources = [f"auxiliary_{index}" for index in range(33)]
+                tensors.extend(
+                    onnx.numpy_helper.from_array(np.zeros(batch_size, np.float32), name=name) for name in sources
+                )
+                nodes.append(helper.make_node("Sum", sources, ["auxiliary"]))
+        body_inputs.append(helper.make_tensor_value_info("slice", TensorProto.FLOAT, [1]))
+        body_outputs.append(helper.make_tensor_value_info("slice_output", TensorProto.FLOAT, [1]))
+        body_nodes.append(helper.make_node("Identity", ["slice"], ["slice_output"]))
+        body = helper.make_graph(body_nodes, "scan8_output_body", body_inputs, body_outputs)
+        carried = state.copy()
+        runtime = ReferenceEvaluator(body, opsets={"": 8})
+        for batch in range(batch_size):
+            feeds = {"state": state[batch], "slice": np.zeros(1, np.float32)}
+            if auxiliary != "none":
+                feeds["auxiliary_state"] = np.array(0, np.float32)
+            values: Any = runtime.run(None, feeds)
+            carried[batch] = values[0]
+        np.testing.assert_array_equal(carried, state)
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["lengths", *state_inputs, "sequence"],
+                    [*state_outputs, "sequence_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ]
+        )
+        expected = np.matmul(np.ones(left_shape, np.float32), carried)
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "scan8_downstream_state",
+                inputs,
+                [helper.make_tensor_value_info("Y", TensorProto.FLOAT, list(expected.shape))],
+                initializer=tensors,
+            ),
+            opset_imports=[helper.make_opsetid("", 8)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        assert expected.shape == ((1, 64) if len(state_dims) == 1 else (batch_size, 1, 2))
+        assert np.count_nonzero(expected) == 0
+        return model
+
+    @pytest.mark.parametrize(
+        "state_dims,batch_size,auxiliary",
+        [
+            ((64,), 0, "none"),
+            ((2, 2), 0, "none"),
+            ((2, 2), 1, "none"),
+            ((64,), 0, "dynamic"),
+            ((2, 2), 0, "dynamic"),
+            ((64,), 0, "capped"),
+            ((2, 2), 0, "capped"),
+        ],
+    )
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_downstream_state_keeps_its_own_provenance(
+        self, tmp_path: Path, state_dims: tuple[int, ...], batch_size: int, auxiliary: str, scanner_type: Any
+    ) -> None:
+        model = self._model(batch_size, state_dims, auxiliary)
+        path = _save_onnx_model(model, tmp_path / "scan8-downstream.onnx")
+        result = scanner_type().scan(str(path))
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert TestWeightDistributionSemantics._extreme_checks(result) == []
+
+    @pytest.mark.parametrize("state_dims", [(64,), (2, 2)])
+    def test_empty_downstream_state_is_successfully_cached(self, tmp_path: Path, state_dims: tuple[int, ...]) -> None:
+        model = self._model(0, state_dims)
+        path = _save_onnx_model(model, tmp_path / "scan8-downstream-cache.onnx")
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                result = scan_model_directory_or_file(
+                    str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                )
+                assert result.success is True
+                assert determine_exit_code(result) == 0
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] > 0
+        finally:
+            reset_cache_manager()

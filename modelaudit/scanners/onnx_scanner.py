@@ -10606,6 +10606,9 @@ def _build_onnx_weight_analysis_plan(
                     ),
                 )
 
+            # A proven-empty Scan still maps each returned state to its initial value.
+            has_subgraph_output_mapping = bool(subgraph_results) or node_scan8_empty_batch
+
             # Keep dimension provenance: a later Cast can turn dimensions into weights.
             is_shape_query = is_builtin_neural_operator and node.op_type in {"Shape", "Size"}
             output_lineages: dict[int, _OnnxWeightLineage] = {}
@@ -10710,7 +10713,7 @@ def _build_onnx_weight_analysis_plan(
                 all_input_lineages
                 and node.op_type not in _QUANTIZED_WEIGHT_OPERATORS
                 and function is None
-                and not subgraph_results
+                and not has_subgraph_output_mapping
             ):
                 prelu_data_is_activation = (
                     is_builtin_neural_operator
@@ -12623,11 +12626,11 @@ def _build_onnx_weight_analysis_plan(
                 if per_output_lineages:
                     value_lineages[name] = per_output_lineages
                     input_lineage_limit_gap_count_for_output = (
-                        0 if subgraph_results else all_input_lineage_limit_gap_count
+                        0 if has_subgraph_output_mapping else all_input_lineage_limit_gap_count
                     )
                     input_weight_lineage_limit_gap_count_for_output = (
                         0
-                        if subgraph_results
+                        if has_subgraph_output_mapping
                         or transform_output_demotes_weight_gap
                         or cast_output_is_nonfloating_transform
                         else all_input_output_weight_lineage_limit_gap_count
@@ -12638,7 +12641,7 @@ def _build_onnx_weight_analysis_plan(
                         else transformed_input_output_weight_lineage_gap_summary
                     )
                     input_non_shape_lineage_limit_gap_count_for_output = (
-                        0 if subgraph_results else all_input_non_shape_lineage_limit_gap_count
+                        0 if has_subgraph_output_mapping else all_input_non_shape_lineage_limit_gap_count
                     )
                     input_non_shape_lineage_gap_summary_for_output = (
                         empty_weight_gap_summary
@@ -12647,7 +12650,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                     input_rank_promotable_lineage_limit_gap_count_for_output = (
                         0
-                        if subgraph_results
+                        if has_subgraph_output_mapping
                         or rank_operator_promotes_deferred_gap
                         or cast_output_is_nonfloating_transform
                         else all_input_output_rank_promotable_lineage_limit_gap_count
@@ -12804,7 +12807,7 @@ def _build_onnx_weight_analysis_plan(
                     elif clear_output_rank:
                         clear_known_value_rank(name)
 
-                mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
+                mapped_subgraph_output = has_subgraph_output_mapping and output_index < len(subgraph_output_dynamic)
                 output_is_dynamic = (
                     subgraph_output_dynamic[output_index]
                     if mapped_subgraph_output and per_output_lineages
