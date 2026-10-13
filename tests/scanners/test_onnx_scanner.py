@@ -36908,3 +36908,168 @@ class TestOnnxEmptyScan8OutputRegressions:
             assert stats["cache_hits"] > 0
         finally:
             reset_cache_manager()
+
+
+class TestOnnxEmptyScan8StackedProvenance:
+    @staticmethod
+    def _model(mode: str) -> Any:
+        from onnx.reference import ReferenceEvaluator
+
+        constant_body = mode == "constant_dimensions"
+        sequence_shape = (0, 1, 1 if constant_body else 64)
+        body_nodes = (
+            [helper.make_node("Constant", [], ["out"], value=onnx.numpy_helper.from_array(np.ones(64, np.float32)))]
+            if constant_body
+            else [helper.make_node("Identity", ["slice"], ["out"])]
+        )
+        body = helper.make_graph(
+            body_nodes,
+            "empty_stacked_body",
+            [helper.make_tensor_value_info("slice", TensorProto.FLOAT, [sequence_shape[-1]])],
+            [helper.make_tensor_value_info("out", TensorProto.FLOAT, [64])],
+        )
+        scan = helper.make_node("Scan", ["lengths", "sequence"], ["stacked"], body=body, num_scan_inputs=1)
+        after = []
+        value = "stacked"
+        if mode == "identity":
+            after.append(helper.make_node("Identity", [value], ["copied"]))
+            value = "copied"
+        dimensions = mode in {"dimensions", "constant_dimensions"}
+        if dimensions:
+            after.extend(
+                [
+                    helper.make_node("Shape", [value], ["dims"]),
+                    helper.make_node("Cast", ["dims"], ["float_dims"], to=TensorProto.FLOAT),
+                    helper.make_node("Unsqueeze", ["float_dims"], ["weight"], axes=[0]),
+                ]
+            )
+            value = "weight"
+        after.append(helper.make_node("MatMul", ["X", value], ["Y"]))
+        shape = [1, 3] if dimensions else [0, 1, 64]
+        output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, shape)
+        model = helper.make_model(
+            helper.make_graph(
+                [scan, *after],
+                "empty_stacked_provenance",
+                [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+                [output],
+                initializer=[
+                    onnx.numpy_helper.from_array(np.empty(sequence_shape, np.float32), name="sequence"),
+                    onnx.numpy_helper.from_array(np.empty(0, np.int64), name="lengths"),
+                ],
+            ),
+            opset_imports=[helper.make_opsetid("", 8)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        consumer_graph = helper.make_graph(
+            after,
+            "downstream_oracle",
+            [
+                helper.make_tensor_value_info("stacked", TensorProto.FLOAT, [0, 1, 64]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [output],
+        )
+        actual: Any = ReferenceEvaluator(consumer_graph, opsets={"": 8}).run(
+            None, {"stacked": np.empty((0, 1, 64), np.float32), "X": np.ones((1, 1), np.float32)}
+        )
+        expected = np.array([[0, 1, 64]], np.float32) if dimensions else np.empty((0, 1, 64), np.float32)
+        np.testing.assert_array_equal(actual[0], expected)
+        return model
+
+    @pytest.mark.parametrize("mode", ["direct", "identity", "dimensions", "constant_dimensions"])
+    def test_empty_outputs_keep_dimension_provenance(self, tmp_path: Path, mode: str) -> None:
+        model = self._model(mode)
+        incomplete = mode in {"dimensions", "constant_dimensions"}
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        if incomplete:
+            assert plan.coverage_gaps["unresolved_initializer_lineage"] == 1
+            assert plan.unresolved_lineage_samples[0]["reason"] == "shape_dimensions_lineage"
+            assert plan.unresolved_lineage_samples[0]["initializer"] == (
+                "out" if mode == "constant_dimensions" else "sequence"
+            )
+        else:
+            assert plan.coverage_gaps == {}
+            assert plan.exclusion_counts["empty_weight_view"] == 1
+        TestOnnxDeferredNumericCoverage._assert_contract(model, tmp_path, incomplete)
+
+
+class TestOnnxUnreachableScanWeightConsumers:
+    @staticmethod
+    def _model(nested: bool, reachable_call: bool) -> Any:
+        domain = "modelaudit.empty_scan"
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        function = helper.make_function(
+            domain,
+            "Weighted",
+            ["function_input"],
+            ["function_output"],
+            [
+                helper.make_node("Constant", [], ["function_weight"], value=onnx.numpy_helper.from_array(weights)),
+                helper.make_node("MatMul", ["function_input", "function_weight"], ["function_output"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 8)],
+        )
+        if nested:
+            branch = helper.make_graph(
+                [helper.make_node("Weighted", ["slice"], ["branch_output"], domain=domain)],
+                "nested_weight_branch",
+                [],
+                [helper.make_tensor_value_info("branch_output", TensorProto.FLOAT, [64])],
+            )
+            body_nodes = [
+                helper.make_node("If", ["condition"], ["out"], then_branch=branch, else_branch=branch),
+            ]
+        else:
+            body_nodes = [helper.make_node("Weighted", ["slice"], ["out"], domain=domain)]
+        body = helper.make_graph(
+            body_nodes,
+            "empty_function_body",
+            [helper.make_tensor_value_info("slice", TensorProto.FLOAT, [64])],
+            [helper.make_tensor_value_info("out", TensorProto.FLOAT, [64])],
+            initializer=[onnx.numpy_helper.from_array(np.array(True, np.bool_), name="condition")] if nested else [],
+        )
+        nodes = [helper.make_node("Scan", ["lengths", "sequence"], ["stacked"], body=body, num_scan_inputs=1)]
+        inputs = []
+        outputs = [helper.make_tensor_value_info("stacked", TensorProto.FLOAT, [0, 1, 64])]
+        if reachable_call:
+            inputs.append(helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64]))
+            nodes.append(helper.make_node("Weighted", ["X"], ["Y"], domain=domain))
+            outputs.append(helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 64]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "empty_function_consumers",
+                inputs,
+                outputs,
+                initializer=[
+                    onnx.numpy_helper.from_array(np.empty((0, 1, 64), np.float32), name="sequence"),
+                    onnx.numpy_helper.from_array(np.empty(0, np.int64), name="lengths"),
+                ],
+            ),
+            opset_imports=[helper.make_opsetid("", 8), helper.make_opsetid(domain, 1)],
+            functions=[function],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        return model
+
+    @pytest.mark.parametrize("nested", [False, True])
+    @pytest.mark.parametrize("reachable_call", [False, True])
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_nested_consumer_mode_does_not_hide_later_reachable_findings(
+        self, tmp_path: Path, nested: bool, reachable_call: bool, scanner_type: Any
+    ) -> None:
+        model = self._model(nested, reachable_call)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == int(reachable_call)
+        if reachable_call:
+            assert plan.specs[0].context["consumer_count"] == 1
+        path = _save_onnx_model(model, tmp_path / "empty-function-consumers.onnx")
+        result = scanner_type().scan(str(path))
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == int(reachable_call)
