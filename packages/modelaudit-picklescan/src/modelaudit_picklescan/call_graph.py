@@ -1559,6 +1559,12 @@ _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
         ("zipfile", "ZipInfo"),
     }
 )
+# The lazy-pattern path authenticates both runtime methods and receiver state.
+if sys.version_info >= (3, 14):
+    _TRUSTED_IMPORT_ONLY_REFERENCES |= {
+        ("string", "Template.get_identifiers"),
+        ("string", "Template.is_valid"),
+    }
 _LEGACY_BUILTIN_EXCEPTION_NAMES = frozenset(
     {
         "ArithmeticError",
