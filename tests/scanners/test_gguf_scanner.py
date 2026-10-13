@@ -1693,7 +1693,8 @@ def test_gguf_rank250_current_types_do_not_mask_unknown_future_type(tmp_path: Pa
     assert determine_exit_code(aggregate) == 2
 
 
-# One block of every other tensor type in ggml's `enum ggml_type`: (type, name, block size, type size)
+# One block of every other tensor type in ggml's `enum ggml_type`, and of the three retired
+# Q4_0 layouts that published files still use: (type, name, block size, type size)
 _GGML_SINGLE_BLOCK_TENSOR_TYPES = [
     (16, "iq2_xxs", 256, 66),
     (17, "iq2_xs", 256, 74),
@@ -1707,6 +1708,9 @@ _GGML_SINGLE_BLOCK_TENSOR_TYPES = [
     (27, "i64", 1, 8),
     (28, "f64", 1, 8),
     (29, "iq1_m", 256, 56),
+    (31, "q4_0_4_4", 32, 18),
+    (32, "q4_0_4_8", 32, 18),
+    (33, "q4_0_8_8", 32, 18),
     (34, "tq1_0", 256, 54),
     (35, "tq2_0", 256, 66),
     (39, "mxfp4", 32, 17),
@@ -1835,7 +1839,7 @@ def test_gguf_block_tensor_rows_must_hold_whole_blocks(
     assert determine_exit_code(scan_model_directory_or_file(str(whole_rows), cache_enabled=False)) == 0
 
 
-@pytest.mark.parametrize("tensor_type", [4, 5, 31, 32, 33, 36, 37, 38, 43, 142])
+@pytest.mark.parametrize("tensor_type", [4, 5, 36, 37, 38, 43, 142])
 def test_gguf_retired_and_foreign_tensor_types_stay_inconclusive(tmp_path: Path, tensor_type: int) -> None:
     path = tmp_path / f"type{tensor_type}.gguf"
     _write_gguf_with_tensor_type(path, tensor_type=tensor_type)

@@ -16,8 +16,9 @@ from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
-# Values derived from ggml source: every type in `enum ggml_type` is listed, and the
-# IDs ggml has retired (4, 5, 31-33, 36-38) stay unknown.
+# Values derived from ggml source: every type in `enum ggml_type` is listed. Of the
+# IDs ggml has retired, 31-33 are kept because published files still use them; they
+# store Q4_0 blocks in a different order. 4, 5 and 36-38 stay unknown.
 _GGML_TYPE_INFO = {
     0: (1, 4),  # F32
     1: (1, 2),  # F16
@@ -48,6 +49,9 @@ _GGML_TYPE_INFO = {
     28: (1, 8),  # F64
     29: (256, 56),  # IQ1_M
     30: (1, 2),  # BF16
+    31: (32, 18),  # Q4_0_4_4 (retired)
+    32: (32, 18),  # Q4_0_4_8 (retired)
+    33: (32, 18),  # Q4_0_8_8 (retired)
     34: (256, 54),  # TQ1_0
     35: (256, 66),  # TQ2_0
     39: (32, 17),  # MXFP4
