@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -1288,16 +1289,42 @@ def test_mlflow_source_preview_cannot_alias_a_literal_uri(monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_sbom_saved_oversized_streams_keep_source_associations(legacy: bool) -> None:
+@pytest.mark.parametrize("scanner_backed", [False, True], ids=["fallback", "complete"])
+def test_sbom_saved_oversized_streams_keep_source_associations(legacy: bool, scanner_backed: bool) -> None:
     from modelaudit.cli import _format_scan_output
 
-    records = [("malicious", b"cos\nsystem\n(S'printf sample'\ntR.", "6"), ("benign", b"\x80\x04N.", "3")]
+    records = [
+        ("malicious", b"cos\nsystem\n(S'printf sample'\ntR.", "5" if scanner_backed else "6"),
+        ("benign", b"\x80\x04N.", "0" if scanner_backed else "3"),
+    ]
     exports = []
     for ordered in [records, list(reversed(records)), records + records]:
         aggregate = create_initial_audit_result()
         for name, payload, _risk in ordered:
             source = f"https://bucket.s3.amazonaws.com/{name}.pkl?token=" + "x" * (256 * 1024)
-            aggregate.aggregate_scan_result(_scan_sbom_stream(payload, source).model_dump())
+            # Exercise the historical incomplete fallback explicitly; do not
+            # depend on version-specific pathlib error suppression to select it.
+            scanner_support = (
+                nullcontext()
+                if scanner_backed
+                else patch(
+                    "modelaudit.scanners.pickle_scanner.PickleScanner.scan_stream", side_effect=OSError("unavailable")
+                )
+            )
+            with scanner_support:
+                scanned = _scan_sbom_stream(payload, source)
+            assert scanned.success is scanner_backed
+            if scanner_backed:
+                if name == "malicious":
+                    assert {issue.message for issue in scanned.issues if issue.severity == IssueSeverity.CRITICAL} == {
+                        "Found REDUCE opcode invoking dangerous global: os.system",
+                        "Raw pickle content references dangerous helper: os.system",
+                    }
+                else:
+                    assert scanned.issues == []
+            else:
+                assert any("Streaming analysis incomplete" in issue.message for issue in scanned.issues)
+            aggregate.aggregate_scan_result(scanned.model_dump())
         aggregate.finalize_statistics()
         aggregate.deduplicate_issues()
         exported = _format_scan_output(aggregate, [], output_format="json", verbose=True)
@@ -1309,7 +1336,7 @@ def test_sbom_saved_oversized_streams_keep_source_associations(legacy: bool) -> 
         output = generate_sbom(paths, saved.model_dump()) if legacy else generate_sbom_pydantic(paths, saved)
         components = json.loads(output)["components"]
         assert len(components) == len({c["bom-ref"] for c in components}) == 2
-        # These oversized names use the historical incomplete-stream fallback, without content hashes.
+        # Keep both complete and incomplete source associations through export.
         assert {
             (
                 c["type"],
@@ -1318,6 +1345,11 @@ def test_sbom_saved_oversized_streams_keep_source_associations(legacy: bool) -> 
             )
             for c in components
         } == {("machine-learning-model", str(len(payload)), risk) for _name, payload, risk in records}
-        assert all(not c.get("hashes") for c in components)
+        if scanner_backed:
+            assert {tuple((h["alg"], h["content"]) for h in c["hashes"]) for c in components} == {
+                (("SHA-256", hashlib.sha256(payload).hexdigest()),) for _name, payload, _risk in records
+            }
+        else:
+            assert all(not c.get("hashes") for c in components)
         exports.append(components)
     assert exports[0] == exports[1] == exports[2]

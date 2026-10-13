@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Support standard CPython 3.14 with native pickle and H5 scanner validation across Linux, macOS, and Windows.
+
+### Fixed
+
+- Preserve early TAR findings after sparse-file probing and enforce SafeTensors JSON nesting limits consistently across Python versions.
+- Keep complete streamed pickle analysis available for oversized remote source URLs across Python versions, preserving SBOM findings and source associations.
+
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
 
 ### Security

@@ -3468,9 +3468,12 @@ def test_zlib_shaped_header_keeps_safetensors_security_routing(tmp_path: Path) -
     ("description", "expected_critical"),
     [("<script>alert('xss')</script>", True), ("Model weights", False)],
 )
+@pytest.mark.parametrize("quoted_brackets", [False, True])
 def test_fdict_shaped_native_safetensors_keeps_security_routing(
-    tmp_path: Path, description: str, expected_critical: bool
+    tmp_path: Path, description: str, expected_critical: bool, quoted_brackets: bool
 ) -> None:
+    if quoted_brackets:
+        description += '"\\[{}]' * 300
     file_path = tmp_path / "fdict-shaped-header.safetensors"
     header_len = 0x2078
     header = json.dumps(
@@ -3524,8 +3527,8 @@ def test_zlib_shaped_deep_header_fails_closed(tmp_path: Path) -> None:
     assert result.success is False
     assert repeated_result.success is False
     assert parse_check.status == CheckStatus.FAILED
-    assert parse_check.details["exception_type"] == "RecursionError"
-    assert "maximum recursion depth exceeded" in parse_check.message
+    assert parse_check.details["exception_type"] == "ValueError"
+    assert "JSON nesting depth limit" in parse_check.message
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert determine_exit_code(aggregate) == 2
 

@@ -30,6 +30,7 @@ from ...scanner_registry_metadata import (
     get_extension_format_map,
     get_registered_scanner_extensions,
 )
+from ..helpers.json_limits import validate_json_structural_limits
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
@@ -4956,6 +4957,7 @@ def _validated_safetensors_routing_header(
         return None
 
     try:
+        validate_json_structural_limits(header, None, "SafeTensors header")
         parsed_header = json.loads(header.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None

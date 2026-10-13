@@ -1181,13 +1181,20 @@ class TarScanner(BaseScanner):
             offset = tail_start
             checked_bytes = 0
             while True:
+                # Sparse queries move the descriptor behind the buffered reader.
+                # Restore it before any buffered seek/read, including early returns.
+                descriptor = file_obj.fileno()
+                descriptor_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
                 try:
-                    data_offset = os.lseek(file_obj.fileno(), offset, os.SEEK_DATA)
-                except OSError as exc:
-                    return exc.errno == errno.ENXIO
-                if data_offset >= tail_end:
-                    return True
-                hole_offset = min(os.lseek(file_obj.fileno(), data_offset, os.SEEK_HOLE), tail_end)
+                    try:
+                        data_offset = os.lseek(descriptor, offset, os.SEEK_DATA)
+                    except OSError as exc:
+                        return exc.errno == errno.ENXIO
+                    if data_offset >= tail_end:
+                        return True
+                    hole_offset = min(os.lseek(descriptor, data_offset, os.SEEK_HOLE), tail_end)
+                finally:
+                    os.lseek(descriptor, descriptor_offset, os.SEEK_SET)
                 if hole_offset <= offset:
                     return False
                 checked_bytes += hole_offset - data_offset

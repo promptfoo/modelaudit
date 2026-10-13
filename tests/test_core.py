@@ -9351,11 +9351,12 @@ def test_raw_tar_hdf5_entry_limit_preserves_early_nemo_finding(tmp_path: Path) -
     )
 
 
-def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("target", "dangerous"), [("os.system", True), ("torch.nn.Linear", False)])
+def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path, target: str, dangerous: bool) -> None:
     model_path = tmp_path / "raw-nemo-padding-limit.h5"
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
-        [("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")],
+        [("model_config.yaml", f"model:\n  _target_: {target}\n  command: echo pwned\n".encode())],
     )
     config = {
         "cache_enabled": False,
@@ -9371,12 +9372,17 @@ def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path)
     assert result.scanner_name == "keras_h5"
     assert "nemo" in result.metadata["supplemental_scanners"]
     assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-        and check.status == CheckStatus.FAILED
-        and check.details["target"] == "os.system"
-        for check in result.checks
+    assert (
+        any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == target
+            for check in result.checks
+        )
+        is dangerous
     )
+    assert result.success is False
+    assert any(entry["path"].endswith(":model_config.yaml") for entry in result.metadata["contents"])
 
 
 def test_raw_tar_hdf5_metadata_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:

@@ -61,12 +61,12 @@ def create_executorch_archive(tmp_path: Path, *, malicious: bool = False) -> Pat
     return zip_path
 
 
-def _pickle_payload_with_eval(source: str) -> bytes:
+def _pickle_payload_with_eval(source: str, *, protocol: int | None = None) -> bytes:
     class EvalPayload:
         def __reduce__(self):
             return (eval, (source,))
 
-    return pickle.dumps(EvalPayload())
+    return pickle.dumps(EvalPayload(), protocol=protocol)
 
 
 def _large_first_operand_pickle_with_eval(operand_size: int = 70 * 1024) -> bytes:
@@ -1601,7 +1601,7 @@ def test_executorch_scans_hidden_extensionless_pickle_member(tmp_path: Path) -> 
 
 def test_executorch_scans_hidden_protocol6_pickle_member(tmp_path: Path) -> None:
     model_path = tmp_path / "hidden-protocol6-pickle.ptl"
-    payload = bytearray(_pickle_payload_with_eval("print('evil')"))
+    payload = bytearray(_pickle_payload_with_eval("print('evil')", protocol=4))
     assert payload[:2] == b"\x80\x04"
     payload[1] = 6
     with zipfile.ZipFile(model_path, "w") as zipf:
@@ -1709,7 +1709,7 @@ def test_executorch_scans_hidden_protocol0_pickle_with_boundary_spanning_first_o
 
 def test_executorch_scans_hidden_protocolless_binary_pickle(tmp_path: Path) -> None:
     model_path = tmp_path / "hidden-protocolless-binary.ptl"
-    payload = _pickle_payload_with_eval("print('evil')")
+    payload = _pickle_payload_with_eval("print('evil')", protocol=4)
     assert payload.startswith(b"\x80\x04")
     with zipfile.ZipFile(model_path, "w") as zipf:
         zipf.writestr("version", "1")

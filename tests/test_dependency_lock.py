@@ -160,7 +160,7 @@ def test_root_requires_hardened_picklescan_release() -> None:
     bounds = {specifier.operator: specifier.version for specifier in dependency.specifier}
     assert len(dependency.specifier) == 2
     assert set(bounds) == {">=", "<"}
-    assert Version(bounds[">="]) >= Version("0.1.11")
+    assert Version(bounds[">="]) >= Version("0.1.13")
     assert Version(bounds["<"]) == Version("0.2.0")
     locked_version = ".".join(str(part) for part in _locked_version(_lock_package_block("modelaudit-picklescan")))
     assert dependency.specifier.contains(locked_version)
@@ -214,3 +214,21 @@ def test_renovate_keeps_legacy_xgboost_cohort_compatible() -> None:
     current_value_pattern = re.compile(rule["matchCurrentValue"].removeprefix("/").removesuffix("/"))
     assert current_value_pattern.search(">=3.2,<3.3") is not None
     assert current_value_pattern.search(">=3.4,<3.5") is None
+
+
+@pytest.mark.parametrize("extra", ["h5", "numpy1", "all-ci", "all"])
+@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14"])
+def test_h5py_requirements_preserve_older_python_floors(extra: str, python_version: str) -> None:
+    project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    requirements = [
+        requirement
+        for entry in project["optional-dependencies"][extra]
+        if (requirement := Requirement(entry)).name == "h5py"
+        and (requirement.marker is None or requirement.marker.evaluate({"python_version": python_version}))
+    ]
+
+    assert len(requirements) == 1
+    requirement = requirements[0]
+    assert requirement.specifier.contains("3.15.0")
+    assert not requirement.specifier.contains("4.0.0")
+    assert requirement.specifier.contains("3.14.0") is (python_version != "3.14")
