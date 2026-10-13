@@ -902,6 +902,7 @@ jobs:
             python-version: "3.14"
           - os: windows-latest
             python-version: "3.14"
+            timeout-minutes: 60
     defaults:
       run:
         shell: bash

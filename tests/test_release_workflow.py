@@ -145,6 +145,10 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     assert intel314["timeout-minutes"] == 75
     arm314 = next(lane for lane in matrix["include"] if lane["os"] == "macos-14" and lane["python-version"] == "3.14")
     assert arm314["timeout-minutes"] == 30
+    windows314 = next(
+        lane for lane in matrix["include"] if lane["os"] == "windows-latest" and lane["python-version"] == "3.14"
+    )
+    assert windows314["timeout-minutes"] == 60
     assert project["requires-python"] == ">=3.10"
     assert cargo["features"]["abi3"] == ["pyo3/abi3-py310"]
     for version in versions:
