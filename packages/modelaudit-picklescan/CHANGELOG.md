@@ -7,6 +7,15 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Support standard CPython 3.14 with standalone package tests and installed-wheel API checks, preserving Python 3.10 compatibility.
+
+### Fixed
+
+- Follow Python 3.14's lazy annotation helpers to retain detection of annotation evaluation.
+- Distinguish cached, benign string-template calls from deferred pattern imports, without treating an unreachable keyword-only import as executed; fail closed for customized patterns and unproven receiver state.
+
 ## [0.1.12](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.11...modelaudit-picklescan-v0.1.12) (2026-10-06)
 
 ### Fixed

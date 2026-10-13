@@ -10572,7 +10572,8 @@ def test_scan_bytes_detects_copyreg_dispatch_table_reducer_deletion(
         )
         pickle.loads(payload)
         assert union_type not in copyreg.dispatch_table
-        with pytest.raises(TypeError, match=r"cannot pickle 'types\.UnionType' object"):
+        union_type_name = f"{union_type.__module__}.{union_type.__qualname__}"
+        with pytest.raises(TypeError, match=re.escape(f"cannot pickle '{union_type_name}' object")):
             pickle.dumps(int | str, protocol=4)
     finally:
         copyreg.dispatch_table.clear()

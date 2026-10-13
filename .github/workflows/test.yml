@@ -857,15 +857,24 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
           # Exercise the release platform where scalar-probe timing regressed.
           - os: macos-15-intel
             python-version: "3.11"
           - os: macos-15-intel
             python-version: "3.12"
+          - os: macos-14
+            python-version: "3.14"
+          - os: macos-15-intel
+            python-version: "3.14"
+          - os: ubuntu-24.04-arm
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.14"
     defaults:
       run:
+        shell: bash
         working-directory: packages/modelaudit-picklescan
     steps:
       - *checkout-repo
@@ -942,6 +951,11 @@ jobs:
         run: |
           set -euo pipefail
           uv venv /tmp/modelaudit-picklescan-wheel-smoke
+          if [[ -x /tmp/modelaudit-picklescan-wheel-smoke/bin/python ]]; then
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/bin/python
+          else
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/Scripts/python.exe
+          fi
 
           shopt -s nullglob
           picklescan_wheels=(/tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.whl)
@@ -951,23 +965,57 @@ jobs:
             exit 1
           fi
 
-          uv pip install --python /tmp/modelaudit-picklescan-wheel-smoke/bin/python "${picklescan_wheels[0]}"
+          uv pip install --python "$SMOKE_PYTHON" "${picklescan_wheels[0]}"
 
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH='' /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' "$SMOKE_PYTHON" -I - <<'PY'
+          import importlib.metadata
           import importlib.util
+          import io
+          import pickle
+          import sys
+          from pathlib import Path
 
           import modelaudit_picklescan
+          import modelaudit_picklescan._rust as native
 
           assert importlib.util.find_spec("modelaudit") is None
-          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
-          report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
-          assert report.status.value == "complete", report
-          assert report.verdict.value == "clean", report
-          assert not any(notice.code == "engine_fallback" for notice in report.notices)
-          print("standalone modelaudit_picklescan wheel loaded without modelaudit")
+          assert not importlib.metadata.requires("modelaudit-picklescan")
+          for module in (modelaudit_picklescan, native):
+              origin = Path(module.__file__).resolve()
+              assert origin.is_relative_to(Path(sys.prefix).resolve()), origin
+              print(f"{module.__name__}: {origin}")
+          assert (Path(modelaudit_picklescan.__file__).parent / "py.typed").is_file()
+
+          for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+              payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=protocol)
+              path = Path(f"protocol-{protocol}.pkl")
+              path.write_bytes(payload)
+              for report in (
+                  modelaudit_picklescan.scan_bytes(payload),
+                  modelaudit_picklescan.scan_stream(io.BytesIO(payload)),
+                  modelaudit_picklescan.scan_file(path),
+              ):
+                  assert report.status.value == "complete", report
+                  assert report.verdict.value == "clean", report
+                  assert not any(notice.code == "engine_fallback" for notice in report.notices)
+
+          malicious = modelaudit_picklescan.scan_bytes(b"cos\nsystem\n(S'echo unexpected'\ntR.")
+          assert malicious.verdict.value == "malicious", malicious
+          assert any(finding.rule_code == "DANGEROUS_CALL" for finding in malicious.findings), malicious
+          truncated = modelaudit_picklescan.scan_bytes(b"\x80\x04")
+          assert truncated.status.value != "complete", truncated
+          assert truncated.verdict.value != "clean", truncated
+          template = modelaudit_picklescan.scan_bytes(
+              b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R."
+          )
+          assert any(
+              invocation.get("template_receiver_literal_unbuilt") is True
+              for invocation in template.metadata.get("callable_invocations", ())
+          ), template
+          print(f"standalone wheel API passed on {sys.version}")
           PY
           )
 

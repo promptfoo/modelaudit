@@ -117,6 +117,42 @@ def test_root_release_accepts_current_picklescan_version() -> None:
     assert Requirement(picklescan_requirements[0]).specifier.contains(picklescan_project["version"])
 
 
+def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi() -> None:
+    root_dir = Path(__file__).resolve().parents[1]
+    package_dir = root_dir / "packages/modelaudit-picklescan"
+    project = tomllib.loads((package_dir / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    cargo = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+    workflow = yaml.safe_load((root_dir / ".github/workflows/test.yml").read_text(encoding="utf-8"))
+    job = _jobs(workflow)["picklescan-package"]
+    matrix = job["strategy"]["matrix"]
+    versions = matrix["python-version"]
+    lanes = {(os_name, version) for os_name in matrix["os"] for version in versions}
+    lanes.update((lane["os"], lane["python-version"]) for lane in matrix["include"])
+    release_platforms = {
+        lane["os"]
+        for lane in _jobs(_load_release_workflow())["build-picklescan-package"]["strategy"]["matrix"]["include"]
+    }
+
+    assert {"3.10", "3.11", "3.12", "3.13", "3.14"} <= set(versions)
+    assert {(os_name, "3.14") for os_name in release_platforms} <= lanes
+    assert project["requires-python"] == ">=3.10"
+    assert cargo["features"]["abi3"] == ["pyo3/abi3-py310"]
+    for version in versions:
+        assert f"Programming Language :: Python :: {version}" in project["classifiers"]
+
+    steps = _job_steps(workflow, "picklescan-package")
+    assert "${{ matrix.python-version }}" in _step_by_name(steps, "Pin Python version")["run"]
+    assert job["defaults"]["run"]["working-directory"] == "packages/modelaudit-picklescan"
+    assert job["defaults"]["run"]["shell"] == "bash"
+    smoke = _step_by_name(steps, "Smoke test standalone package wheel install")["run"]
+    assert 'uv pip install --python "$SMOKE_PYTHON"' in smoke
+    assert "/Scripts/python.exe" in smoke
+    assert 'cd "$smoke_dir"' in smoke
+    assert '"$SMOKE_PYTHON" -I -' in smoke
+    assert "import modelaudit_picklescan._rust as native" in smoke
+    assert "origin.is_relative_to(Path(sys.prefix).resolve())" in smoke
+
+
 def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
     root_dir = Path(__file__).resolve().parents[1]
     root_lock = tomllib.loads((root_dir / "uv.lock").read_text(encoding="utf-8"))

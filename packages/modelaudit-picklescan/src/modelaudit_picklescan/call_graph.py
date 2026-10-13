@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
@@ -188,6 +188,7 @@ _MAX_TRUSTED_PTH_PATHS = 64
 _MAX_TRUSTED_REFERENCE_FUNCTIONS = 128
 _MAX_TRUSTED_REFERENCE_GLOBALS = 1024
 _MAX_TRUSTED_SLOT_NAMES = 1024
+_REGEX_PATTERN_TYPE = type(re.compile(""))
 _REGEX_SUB_METHOD_TYPE = type(re.compile("").sub)
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
@@ -1992,6 +1993,15 @@ def find_dangerous_call_graphs(
             continue
 
         try:
+            if (
+                module == "string"
+                and name
+                in {"Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"}
+                and reference.get("invocation_import_reference")
+                and _template_uses_reviewed_lazy_pattern()
+                and reference.get("template_receiver_literal_unbuilt") is not True
+            ):
+                raise _CallGraphAnalysisLimitError("string.Template receiver state cannot be proven unchanged")
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
@@ -2001,7 +2011,12 @@ def find_dangerous_call_graphs(
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
         try:
-            sink_path = _first_matching_path(entrypoints, _find_sink_path)
+            path_for = (
+                partial(_find_sink_path, keyword_arg_names=_complete_keyword_arg_names(reference))
+                if module == "string" and name in {"Template.substitute", "Template.safe_substitute"}
+                else _find_sink_path
+            )
+            sink_path = _first_matching_path(entrypoints, path_for)
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
@@ -3277,7 +3292,7 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    seen_invocations: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None]] = set()
+    seen_invocations: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -3292,6 +3307,7 @@ def _iter_call_graph_references(
             positional_arg_count if isinstance(positional_arg_count, int) else None,
             _optional_bool_reference_detail(item.get("build_uses_slot_state")),
             _complete_keyword_arg_names(item),
+            _optional_bool_reference_detail(item.get("template_receiver_literal_unbuilt")),
         )
         if invocation_key in seen_invocations:
             continue
@@ -3355,7 +3371,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None]] = set()
+    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -3377,6 +3393,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 positional_arg_count if isinstance(positional_arg_count, int) else None,
                 _optional_bool_reference_detail(item.get("build_uses_slot_state")),
                 _complete_keyword_arg_names(item),
+                _optional_bool_reference_detail(item.get("template_receiver_literal_unbuilt")),
             )
             if reference_key in seen:
                 continue
@@ -5794,11 +5811,15 @@ def _find_standard_path_spec(
 
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
-def _find_sink_path(start: str) -> tuple[str, ...] | None:
+def _find_sink_path(
+    start: str,
+    keyword_arg_names: tuple[str, ...] | None = None,
+) -> tuple[str, ...] | None:
     return _find_matching_call_path(
         start,
         _rce_sink,
         import_execution_fallback_allowed=_can_follow_import_execution_fallback(start, 0),
+        ignored_direct_import_from=start if _template_import_requires_keywords(start, keyword_arg_names) else None,
     )
 
 
@@ -5827,12 +5848,16 @@ def _find_invoked_import_execution_path(
     )
     if not can_enter:
         return None
-    if _IMPORT_EXECUTION_SINK in _direct_import_execution_calls(function_node, module_name, is_package):
+    ignore_direct_import = _template_import_requires_keywords(resolved, keyword_arg_names)
+    if not ignore_direct_import and _IMPORT_EXECUTION_SINK in _direct_import_execution_calls(
+        function_node, module_name, is_package
+    ):
         return (resolved, _IMPORT_EXECUTION_SINK)
     path = _find_matching_call_path(
         resolved,
         _rce_sink,
         import_execution_fallback_allowed=True,
+        ignored_direct_import_from=resolved if ignore_direct_import else None,
     )
     if path is None or not _is_import_execution_sink(path[-1]):
         return None
@@ -5856,6 +5881,7 @@ def _find_matching_call_path(
     sink_for: Callable[[str], str | None],
     *,
     import_execution_fallback_allowed: bool = False,
+    ignored_direct_import_from: str | None = None,
 ) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...]]] = deque([(start, (start,))])
     visited = {start}
@@ -5875,6 +5901,8 @@ def _find_matching_call_path(
         calls = _calls_for_function(function_name)
         if calls is None:
             continue
+        if function_name == ignored_direct_import_from:
+            calls = tuple(call for call in calls if call != _IMPORT_EXECUTION_SINK)
 
         bounded_calls = calls[:_MAX_CALLS_PER_FUNCTION]
         for call in bounded_calls:
@@ -5892,7 +5920,9 @@ def _find_matching_call_path(
 
         if sink_for is _rce_sink:
             for call in sorted(bounded_calls, key=_short_sink_call_priority):
-                short_sink_path = _find_short_matching_call_path(call, sink_for)
+                short_sink_path = _find_short_matching_call_path(
+                    call, sink_for, ignored_direct_import_from=ignored_direct_import_from
+                )
                 if short_sink_path is not None:
                     sink = short_sink_path[-1]
                     if _is_tcl_interpreter_dispatch_call(sink) or _is_import_execution_sink(sink):
@@ -5919,7 +5949,12 @@ def _short_sink_call_priority(call_name: str) -> int:
     return 2
 
 
-def _find_short_matching_call_path(start: str, sink_for: Callable[[str], str | None]) -> tuple[str, ...] | None:
+def _find_short_matching_call_path(
+    start: str,
+    sink_for: Callable[[str], str | None],
+    *,
+    ignored_direct_import_from: str | None = None,
+) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...], int]] = deque([(start, (start,), 0)])
     visited = {start}
 
@@ -5928,6 +5963,8 @@ def _find_short_matching_call_path(start: str, sink_for: Callable[[str], str | N
         calls = _calls_for_function(function_name)
         if calls is None:
             continue
+        if function_name == ignored_direct_import_from:
+            calls = tuple(call for call in calls if call != _IMPORT_EXECUTION_SINK)
         for call in calls[:_MAX_CALLS_PER_FUNCTION]:
             sink = sink_for(call)
             if sink is not None:
@@ -5954,7 +5991,134 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
     analysis = _analyze_module(module_name)
     if analysis is None:
         return None
-    return analysis.calls_by_function.get(f"{module_name}.{qualified_name}")
+    calls = analysis.calls_by_function.get(f"{module_name}.{qualified_name}")
+    if calls is None:
+        return None
+    if (
+        any(call.startswith("string.Template.pattern.") for call in calls)
+        and module_name == "string"
+        and _template_uses_reviewed_lazy_pattern()
+        and not _template_has_trusted_compiled_pattern()
+    ):
+        calls = (*calls, "string.Template._compile_pattern")
+    return calls
+
+
+def _template_import_requires_keywords(function_name: str, keyword_arg_names: tuple[str, ...] | None) -> bool:
+    if keyword_arg_names != () or function_name not in {
+        "string.Template.substitute",
+        "string.Template.safe_substitute",
+    }:
+        return False
+    name = function_name.removeprefix("string.")
+    if _trusted_module_origin_kind("string") != "stdlib" or not import_only_reference_is_proven_trusted("string", name):
+        return False
+    context = _source_function_context(function_name)
+    if context is None:
+        return False
+    function = context[2]
+    if function.args.kwarg is None or function.args.kwarg.arg != "kws" or not function.body:
+        return False
+    # Only this reviewed leading branch can import collections, and empty **kws cannot enter it.
+    branch = ast.parse(
+        "if mapping is _sentinel_dict:\n"
+        "    mapping = kws\n"
+        "elif kws:\n"
+        "    from collections import ChainMap\n"
+        "    mapping = ChainMap(kws, mapping)\n"
+    ).body[0]
+    imports = [node for node in ast.walk(function) if isinstance(node, ast.Import | ast.ImportFrom)]
+    expected_calls = (
+        ast.dump(ast.parse("ChainMap(kws, mapping)", mode="eval").body),
+        ast.dump(ast.parse("self.pattern.sub(convert, self.template)", mode="eval").body),
+    )
+    return (
+        len(imports) == 1
+        and ast.dump(function.body[0]) == ast.dump(branch)
+        and tuple(ast.dump(call) for call in _iter_call_nodes(function)) == expected_calls
+    )
+
+
+def _template_uses_reviewed_lazy_pattern() -> bool:
+    context = _module_source_context("string")
+    if context is None or not _is_stdlib_source_path(str(context.source_path)):
+        return False
+    descriptor = ast.parse(
+        "class _TemplatePattern:\n"
+        "    def __get__(self, instance, cls=None):\n"
+        "        if cls is None:\n"
+        "            return self\n"
+        "        return cls._compile_pattern()\n"
+    ).body[0]
+    if not any(
+        isinstance(statement, ast.ClassDef) and ast.dump(statement) == ast.dump(descriptor)
+        for statement in context.module_statements
+    ):
+        return False
+    template = _find_qualified_class_def(context.module_statements, "Template")
+    if template is None:
+        return False
+    pattern = ast.dump(ast.parse("pattern = _TemplatePattern").body[0])
+    return any(ast.dump(statement) == pattern for statement in template.body)
+
+
+def _template_has_trusted_compiled_pattern() -> bool:
+    loaded, module, _spec = _loaded_module_state_without_hooks("string")
+    if not loaded:
+        return False
+    state = _loaded_reference_state_without_hooks(module, "Template.pattern")
+    _track_loaded_interpreter_reference_state("string", "Template.pattern", state)
+    if not state[0] or type(state[1]) is not _REGEX_PATTERN_TYPE:
+        return False
+    pattern = state[1]
+    canonical = (
+        import_only_reference_is_proven_trusted("string", "Template")
+        and pattern.pattern == _canonical_template_pattern_text()
+        # IGNORECASE | VERBOSE | UNICODE, the standard Template flags.
+        and pattern.flags == 98
+    )
+    for name, expected in (
+        ("delimiter", "$"),
+        ("idpattern", r"(?a:[_a-z][_a-z0-9]*)"),
+        ("braceidpattern", None),
+    ):
+        member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
+        _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
+        canonical = canonical and member[0] and type(member[1]) is type(expected) and member[1] == expected
+    if not canonical:
+        raise _CallGraphAnalysisLimitError("cached string.Template pattern does not match the trusted default pattern")
+    return True
+
+
+def _canonical_template_pattern_text() -> str | None:
+    context = _source_function_context("string.Template._compile_pattern")
+    if context is None:
+        return None
+    expressions = [
+        node.value
+        for node in ast.walk(context[2])
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "pattern" for target in node.targets)
+        and isinstance(node.value, ast.JoinedStr)
+    ]
+    if len(expressions) != 1:
+        return None
+    replacements = {"delim": r"\$", "id": r"(?a:[_a-z][_a-z0-9]*)", "bid": r"(?a:[_a-z][_a-z0-9]*)"}
+    parts: list[str] = []
+    for value in expressions[0].values:
+        if isinstance(value, ast.Constant) and type(value.value) is str:
+            parts.append(value.value)
+        elif (
+            isinstance(value, ast.FormattedValue)
+            and isinstance(value.value, ast.Name)
+            and value.value.id in replacements
+            and value.conversion == -1
+            and value.format_spec is None
+        ):
+            parts.append(replacements[value.value.id])
+        else:
+            return None
+    return "".join(parts)
 
 
 @_register_source_sensitive_cache
@@ -6263,6 +6427,12 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
             local_class_targets,
         )
     )
+    if (
+        module_name == "typing"
+        and aliases.get("_lazy_annotationlib") == "typing._LazyAnnotationLib"
+        and _typing_uses_reviewed_annotationlib_proxy(context)
+    ):
+        aliases["_lazy_annotationlib"] = "annotationlib"
     calls_by_function, class_entrypoints = _collect_function_calls(
         context.module_statements,
         module_name,
@@ -6279,6 +6449,24 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         direct_names=export_summary.direct_names,
         calls_by_function=calls_by_function,
         class_entrypoints=class_entrypoints,
+    )
+
+
+def _typing_uses_reviewed_annotationlib_proxy(context: _ModuleSourceContext) -> bool:
+    if not _is_stdlib_source_path(str(context.source_path)):
+        return False
+    # CPython 3.14 forwards these attributes without eagerly importing annotationlib.
+    proxy = ast.parse(
+        "class _LazyAnnotationLib:\n"
+        "    def __getattr__(self, attr):\n"
+        "        global _lazy_annotationlib\n"
+        "        import annotationlib\n"
+        "        _lazy_annotationlib = annotationlib\n"
+        "        return getattr(annotationlib, attr)\n"
+    ).body[0]
+    return any(
+        isinstance(statement, ast.ClassDef) and ast.dump(statement) == ast.dump(proxy)
+        for statement in context.module_statements
     )
 
 

@@ -1523,7 +1523,7 @@ def _builtins_help_defaultdict_formatter_private_vformat_payload(
     return b"".join(parts)
 
 
-def _builtins_help_defaultdict_template_payload(method_name: str, template: str) -> bytes:
+def _builtins_help_defaultdict_template_payload(method_name: str, template: str, *, with_mapping: bool = True) -> bytes:
     return b"".join(
         [
             b"\x80\x04",
@@ -1538,7 +1538,7 @@ def _builtins_help_defaultdict_template_payload(method_name: str, template: str)
             b"\x94",
             b"0",
             _global_operand("string", method_name),
-            _args_tuple(b"h\x01", b"h\x00"),
+            _args_tuple(b"h\x01", b"h\x00") if with_mapping else _args_tuple(b"h\x01"),
             b"R.",
         ]
     )
@@ -8866,17 +8866,292 @@ if marker.read_text() != marker_content:
 
 
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
-def test_scan_bytes_keeps_template_defaultdict_no_placeholder_clean(method_name: str) -> None:
+@pytest.mark.parametrize("template", ["plain text", "$$"])
+def test_scan_bytes_keeps_template_defaultdict_no_placeholder_clean(
+    method_name: str, template: str, tmp_path: Path
+) -> None:
+    payload = _builtins_help_defaultdict_template_payload(
+        method_name, template, with_mapping=method_name in {"Template.substitute", "Template.safe_substitute"}
+    )
+    child_code = """
+import pickle
+import string
+import sys
+
+# Python 3.14 defers the re import until first pattern access.
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, scan_bytes
+
+payload = bytes.fromhex(sys.argv[1])
+report = scan_bytes(payload, source="cached-template-no-placeholder.pkl")
+assert report.verdict == SafetyVerdict.CLEAN, report
+assert not any(
+    invocation.get("module") == "builtins"
+    and invocation.get("name") == "help"
+    and invocation.get("positional_arg_count") == 0
+    for invocation in report.metadata.get("callable_invocations", [])
+)
+expected = {
+    "Template.substitute": sys.argv[3].replace("$$", "$"),
+    "Template.safe_substitute": sys.argv[3].replace("$$", "$"),
+    "Template.is_valid": True,
+    "Template.get_identifiers": [],
+}[sys.argv[2]]
+assert pickle.loads(payload) == expected
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), method_name, template])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template pattern became lazy in Python 3.14")
+@pytest.mark.parametrize(
+    "method_name", ["Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"]
+)
+def test_scan_bytes_detects_uncached_template_pattern_import(tmp_path: Path, method_name: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "re_import_marker"
+    (module_dir / "re.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
+        "raise RuntimeError('shadow-re-imported')\n"
+    )
+    payload = _builtins_help_defaultdict_template_payload(
+        method_name, "plain text", with_mapping=method_name in {"Template.substitute", "Template.safe_substitute"}
+    )
+    child_code = """
+import pickle
+import string
+import sys
+from pathlib import Path
+
+from modelaudit_picklescan import SafetyVerdict, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+method_name = sys.argv[4]
+original_pattern = vars(string.Template)["pattern"]
+assert original_pattern is vars(string)["_TemplatePattern"]
+sys.path.insert(0, str(module_dir))
+report = scan_bytes(payload, source="uncached-template-no-placeholder.pkl")
+assert report.verdict == SafetyVerdict.MALICIOUS, report
+assert any(
+    finding.details.get("call_path") == (
+        "string." + method_name,
+        "string.Template._compile_pattern",
+        "builtins.__import__",
+    )
+    for finding in report.findings
+), report
+assert vars(string.Template)["pattern"] is original_pattern
+assert not marker.exists()
+sys.modules.pop("re", None)
+try:
+    pickle.loads(payload)
+except RuntimeError as error:
+    assert str(error) == "shadow-re-imported", error
+else:
+    raise AssertionError("the uncached pattern did not import shadow re")
+assert marker.read_text() == "imported"
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), method_name],
+    )
+    assert marker.read_text() == "imported"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template imports moved into keyword branch in Python 3.14")
+@pytest.mark.parametrize("keyword_arg_names", [None, ("value",)])
+def test_template_unknown_or_nonempty_keywords_keep_import_edge(
+    keyword_arg_names: tuple[str, ...] | None,
+) -> None:
+    path = call_graph._find_sink_path("string.Template.substitute", keyword_arg_names)
+    assert path == ("string.Template.substitute", "builtins.__import__")
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-pattern qualification starts in Python 3.14")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_scan_bytes_rejects_custom_cached_template_pattern(tmp_path: Path, method_name: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "custom_pattern_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
     payload = _builtins_help_defaultdict_template_payload(method_name, "plain text")
+    child_code = """
+import pickle
+import re
+import string
+import sys
+from pathlib import Path
 
-    report = scan_bytes(payload, source=f"string-{method_name}-defaultdict-no-placeholder.pkl")
+# Match the standard flags, but make an otherwise inert string perform a mapping lookup.
+string.Template.pattern = re.compile(
+    r"(?P<named>.+)|(?P<braced>(?!))|(?P<escaped>(?!))|(?P<invalid>(?!))",
+    re.IGNORECASE | re.VERBOSE,
+)
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
 
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+report = scan_bytes(payload)
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert not marker.exists()
+assert pickle.loads(payload) == "factory-value"
+assert marker.read_text() == "factory-called"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template import-branch proof is Python 3.14-specific")
+@pytest.mark.parametrize("extra_call", ["__import__('untrusted')", "builtins.__import__('untrusted')"])
+def test_template_keyword_proof_keeps_explicit_import_calls(monkeypatch: pytest.MonkeyPatch, extra_call: str) -> None:
+    context = call_graph._source_function_context("string.Template.substitute")
+    assert context is not None
+    function = ast.parse(ast.unparse(context[2])).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    function.body.append(ast.parse(extra_call).body[0])
+    original = call_graph._source_function_context
+
+    def source_context(name: str) -> tuple[str, bool, ast.FunctionDef | ast.AsyncFunctionDef] | None:
+        return (context[0], context[1], function) if name == "string.Template.substitute" else original(name)
+
+    monkeypatch.setattr(call_graph, "_source_function_context", source_context)
+    assert not call_graph._template_import_requires_keywords("string.Template.substitute", ())
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template import-branch proof is Python 3.14-specific")
+def test_template_keyword_proof_rejects_nonstdlib_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = call_graph._trusted_module_origin_kind
+    monkeypatch.setattr(
+        call_graph, "_trusted_module_origin_kind", lambda name: "site_packages" if name == "string" else original(name)
+    )
+    assert not call_graph._template_import_requires_keywords("string.Template.substitute", ())
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template pattern became lazy in Python 3.14")
+def test_template_pattern_cache_change_does_not_reuse_clean_report(tmp_path: Path) -> None:
+    payload = _builtins_help_defaultdict_template_payload("Template.substitute", "plain text")
+    child_code = """
+import string
+import sys
+
+original_pattern = vars(string.Template)["pattern"]
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, scan_bytes, shared_source_sensitive_caches
+
+payload = bytes.fromhex(sys.argv[1])
+with shared_source_sensitive_caches():
+    assert scan_bytes(payload).verdict == SafetyVerdict.CLEAN
+    string.Template.pattern = original_pattern
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+assert vars(string.Template)["pattern"] is original_pattern
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex()])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template import-branch proof is Python 3.14-specific")
+def test_template_keyword_proof_rejects_replaced_method(monkeypatch: pytest.MonkeyPatch) -> None:
+    import string
+
+    def substitute(*args: object, **kwargs: object) -> str:
+        return "replacement"
+
+    monkeypatch.setattr(string.Template, "substitute", substitute)
+    assert not call_graph._template_import_requires_keywords("string.Template.substitute", ())
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template import-branch proof is Python 3.14-specific")
+def test_template_keyword_wrapper_keeps_import_edge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "template_wrapper.py").write_text(
+        "import string\n"
+        "def substitute(template, mapping):\n"
+        "    return string.Template.substitute(template, mapping, extra='value')\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_call_graph_caches()
+    path = call_graph._find_invoked_import_execution_path("template_wrapper.substitute", 2)
+    assert path == (
+        "template_wrapper.substitute",
+        "string.Template.substitute",
+        "builtins.__import__",
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template receiver qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("benign_first", [False, True])
+def test_scan_bytes_rejects_built_template_instance_pattern(
+    tmp_path: Path, method_name: str, benign_first: bool
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "instance_pattern_marker"
+    (module_dir / "pydoc.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n"
+    )
+    invocation = _global_operand("string", method_name) + _args_tuple(b"h\x01", b"h\x00") + b"R"
+    setup = b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R\x940",
+            _global_operand("string", "Template"),
+            _args_tuple(_unicode_operand("plain text")),
+            b"R\x940",
+        ]
+    )
+    pattern = r"(?P<named>.+)|(?P<braced>(?!))|(?P<escaped>(?!))|(?P<invalid>(?!))"
+    override = b"".join(
+        [
+            b"h\x01}",
+            _unicode_operand("pattern"),
+            _global_operand("re", "_compile"),
+            _args_tuple(_unicode_operand(pattern), b"Kb"),
+            b"Rsb0",
+        ]
+    )
+    payload = setup + (invocation + b"0" if benign_first else b"") + override + invocation + b"."
+    child_code = """
+import pickle
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+method_name = sys.argv[4]
+benign_first = sys.argv[5] == "True"
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+report = scan_bytes(payload)
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert report.status == ScanStatus.INCONCLUSIVE, report
+proofs = [
+    invocation.get("template_receiver_literal_unbuilt")
+    for invocation in report.metadata.get("callable_invocations", [])
+    if invocation.get("module") == "string" and invocation.get("name") == method_name
+]
+assert proofs == ([True, False] if benign_first else [False]), proofs
+assert not marker.exists()
+assert pickle.loads(payload) == "factory-value"
+assert marker.read_text() == "factory-called"
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), method_name, str(benign_first)],
     )
 
 

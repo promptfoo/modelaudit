@@ -476,6 +476,7 @@ type CallableInvocationDedupeKey = (
     Option<usize>,
     Option<bool>,
     Option<Vec<String>>,
+    Option<bool>,
 );
 type PendingGlobalImportFinding = (String, usize, Vec<(String, DetailValue)>);
 
@@ -7167,6 +7168,20 @@ impl<'a> ScanState<'a> {
             return;
         }
 
+        let template_receiver_literal_unbuilt = (invocation.reference.module == "string"
+            && matches!(
+                invocation.reference.name.as_str(),
+                "Template.substitute"
+                    | "Template.safe_substitute"
+                    | "Template.is_valid"
+                    | "Template.get_identifiers"
+            ))
+        .then(|| {
+            matches!(
+                invocation.args.first(),
+                Some(StackValue::StringTemplate { .. })
+            ) && !self.opcode_counts.contains_key("BUILD")
+        });
         let dedupe_key = (
             invocation.reference.module.clone(),
             invocation.reference.name.clone(),
@@ -7178,6 +7193,7 @@ impl<'a> ScanState<'a> {
             invocation.positional_arg_count,
             invocation.build_uses_slot_state,
             invocation.keyword_arg_names.clone(),
+            template_receiver_literal_unbuilt,
         );
         if self.callable_invocation_keys.contains(&dedupe_key) {
             return;
@@ -7212,6 +7228,12 @@ impl<'a> ScanState<'a> {
                 DetailValue::UInt(invocation.opcode_position as u64),
             ),
         ];
+        if let Some(proven) = template_receiver_literal_unbuilt {
+            details.push((
+                "template_receiver_literal_unbuilt".to_string(),
+                DetailValue::Bool(proven),
+            ));
+        }
         if let Some(positional_arg_count) = invocation.positional_arg_count {
             details.push((
                 "positional_arg_count".to_string(),
@@ -8249,6 +8271,13 @@ impl<'a> ScanState<'a> {
                 })
                 .collect::<Option<Vec<_>>>()
         });
+        let template_receiver_literal_unbuilt =
+            details
+                .iter()
+                .find_map(|(key, value)| match (key.as_str(), value) {
+                    ("template_receiver_literal_unbuilt", DetailValue::Bool(value)) => Some(*value),
+                    _ => None,
+                });
         Some((
             module,
             name,
@@ -8258,6 +8287,7 @@ impl<'a> ScanState<'a> {
             positional_arg_count,
             build_uses_slot_state,
             keyword_arg_names,
+            template_receiver_literal_unbuilt,
         ))
     }
 
