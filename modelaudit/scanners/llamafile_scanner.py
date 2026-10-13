@@ -424,18 +424,6 @@ LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER: set[str] = {
 }
 
 
-def _has_command_indicator(text: str) -> bool:
-    """Return whether text contains command-shaped execution syntax."""
-    command_signal, _, _, _, _ = _runtime_text_signals(text)
-    return command_signal
-
-
-def _remote_transfer_targets_network(text: str) -> bool:
-    """Return whether a curl/wget command has a literal non-local target."""
-    _, remote_target, _, _, _ = _transfer_invocation_signals(text)
-    return remote_target
-
-
 def _unquote_transfer_token(token: str) -> str:
     if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
         return token[1:-1]
@@ -634,12 +622,6 @@ def _interpreter_command_analysis(text: str) -> tuple[int | None, bool]:
         else:
             token_scan_limited |= argv_limited
     return None, token_scan_limited
-
-
-def _interpreter_command_start(text: str) -> int | None:
-    """Return the first bounded shell/Python invocation that executes command text."""
-    command_start, _ = _interpreter_command_analysis(text)
-    return command_start
 
 
 def _transfer_wrapper_prefix_context(tokens: list[str]) -> tuple[bool, bool]:
@@ -2150,7 +2132,8 @@ def _transfer_command_context(
     if command_token_index == 0:
         return False, None, False, False
     command_text = text[segment_tokens[0][1] : token_end]
-    interpreter_start = _interpreter_command_start(command_text)
+    # Return the first bounded shell/Python invocation that executes command text.
+    interpreter_start = _interpreter_command_analysis(command_text)[0]
     if interpreter_start is None:
         return False, None, False, False
     interpreter_match = INTERPRETER_WORD_RE.search(command_text, interpreter_start)
@@ -2973,7 +2956,7 @@ def _redacted_runtime_evidence(text: str) -> str:
         )
         if (match := pattern.search(text)) is not None
     ]
-    if (interpreter_start := _interpreter_command_start(text)) is not None:
+    if (interpreter_start := _interpreter_command_analysis(text)[0]) is not None:
         command_anchors.append(interpreter_start)
     remote_url_anchors: list[int] = []
     for match in URL_TOKEN_RE.finditer(text):
@@ -3027,16 +3010,6 @@ def _remote_runtime_fragment_analysis(text: str) -> tuple[bool, bool]:
         ):
             return True, False
     return False, False
-
-
-def _has_remote_runtime_fragment(text: str) -> bool:
-    remote, _ = _remote_runtime_fragment_analysis(text)
-    return remote
-
-
-def _has_network_indicator(text: str) -> bool:
-    _, network_signal, _, _, _ = _runtime_text_signals(text)
-    return network_signal
 
 
 def _runtime_text_signals(text: str) -> tuple[bool, bool, bool, bool, bool]:
@@ -4296,7 +4269,8 @@ class LlamafileScanner(BaseScanner):
         if lowered in LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER:
             return True
         if command_signal is None:
-            command_signal = _has_command_indicator(text)
+            # Return whether text contains command-shaped execution syntax.
+            command_signal = _runtime_text_signals(text)[0]
         if command_signal:
             return False
 
@@ -4306,7 +4280,7 @@ class LlamafileScanner(BaseScanner):
         for fragment in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER:
             if fragment not in normalized:
                 continue
-            if fragment in {"%'18t connect", "%'18t socket"} and _has_remote_runtime_fragment(normalized):
+            if fragment in {"%'18t connect", "%'18t socket"} and _remote_runtime_fragment_analysis(normalized)[0]:
                 continue
             candidate = normalized.replace(fragment, "", 1)
             (
@@ -4368,7 +4342,7 @@ class LlamafileScanner(BaseScanner):
             any(token in normalized_runtime_text_lower for token in NETWORK_TOKENS)
             or NETWORK_CODE_RE.search(normalized_runtime_text_lower) is not None
             or has_transfer_hint
-            or _has_remote_runtime_fragment(runtime_text)
+            or _remote_runtime_fragment_analysis(runtime_text)[0]
         )
         if not has_command_signal:
             command_evidence_budget = 0
@@ -5094,15 +5068,7 @@ class LlamafileScanner(BaseScanner):
     @staticmethod
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:
         """Mark Llamafile analysis coverage as explicitly incomplete."""
-        result.metadata["analysis_incomplete"] = True
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-
-        reasons = result.metadata.get("scan_outcome_reasons")
-        if not isinstance(reasons, list):
-            reasons = []
-            result.metadata["scan_outcome_reasons"] = reasons
-        if reason not in reasons:
-            reasons.append(reason)
+        BaseScanner._mark_inconclusive_metadata_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     def _merge_polyglot_findings(
         self,
@@ -5404,10 +5370,6 @@ class LlamafileScanner(BaseScanner):
                 return candidate_offset
 
         return -1
-
-    @classmethod
-    def _embedded_torch7_candidate_has_actionable_signal(cls, path: Path, offset: int, max_scan_bytes: int) -> bool:
-        return cls._embedded_torch7_candidate_actionable_signal_rank(path, offset, max_scan_bytes) > 0
 
     def _scan_embedded_torch7_candidate(
         self,

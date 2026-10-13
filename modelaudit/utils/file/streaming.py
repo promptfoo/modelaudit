@@ -278,23 +278,18 @@ def stream_analyze_file(
             scan_result = None
 
         if scan_result is None:
-            partial_methods = [
-                ("scan_stream", True),
-                ("scan_bytes", False),
-                ("scan_fileobj", False),
-            ]
-            for method_name, needs_size in partial_methods:
+            for method_name in ("scan_stream", "scan_bytes", "scan_fileobj"):
                 if hasattr(scanner, method_name):
                     method = getattr(scanner, method_name)
                     try:
                         temp_file.seek(0)
-                        if method_name == "scan_stream" and needs_size:
+                        if method_name == "scan_stream":
                             if _scan_stream_accepts_source_keyword(method):
                                 scan_result = method(temp_file, bytes_read, source=url)
                             else:
                                 scan_result = method(temp_file, bytes_read)
                         else:
-                            scan_result = method(temp_file, bytes_to_read) if needs_size else method(temp_file)
+                            scan_result = method(temp_file)
                         break
                     except Exception:
                         scan_result = None

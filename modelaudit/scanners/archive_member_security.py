@@ -9,7 +9,7 @@ import shlex
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from types import EllipsisType
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, BinaryIO, Literal
 
 from ._archive_outcomes import mark_archive_scan_incomplete
 from .base import IssueSeverity
@@ -391,19 +391,15 @@ def _localized_instance_root(root_name: str, local_name: str) -> str:
     return f"{root_name}@{local_name}"
 
 
-def _is_localized_instance_root(root_name: str, base_root: str) -> bool:
-    return root_name.startswith(f"{base_root}@")
-
-
 def _is_ctypes_library_loader_object_root(root_name: str) -> bool:
     return root_name in _CTYPES_LIBRARY_LOADER_OBJECTS or any(
-        _is_localized_instance_root(root_name, loader_root) for loader_root in _CTYPES_LIBRARY_LOADER_OBJECTS
+        root_name.startswith(f"{loader_root}@") for loader_root in _CTYPES_LIBRARY_LOADER_OBJECTS
     )
 
 
 def _is_webbrowser_controller_root(root_name: str) -> bool:
     return root_name in _WEBBROWSER_CONTROLLER_FACTORIES or any(
-        _is_localized_instance_root(root_name, controller_root) for controller_root in _WEBBROWSER_CONTROLLER_FACTORIES
+        root_name.startswith(f"{controller_root}@") for controller_root in _WEBBROWSER_CONTROLLER_FACTORIES
     )
 
 
@@ -482,13 +478,6 @@ def _normalized_high_risk_python_call_name(name: str) -> str | None:
     if ctypes_load_name is not None:
         return ctypes_load_name
     return None
-
-
-def _has_static_overwritable_reference_prefix(name: str) -> bool:
-    return any(
-        name == reference_name or name.startswith(f"{reference_name}.")
-        for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
-    )
 
 
 def _is_overwritable_high_risk_reference(name: str) -> bool:
@@ -766,6 +755,20 @@ def _python_member_has_non_python_shebang(source_bytes: bytes) -> bool:
     return command is None or _PYTHON_SHEBANG_COMMAND_RE.fullmatch(command) is None
 
 
+def _cached_executable_prefix_reader(member_file: BinaryIO, prefix_cache: bytes) -> Callable[[int], bytes]:
+    def read_prefix(limit: int) -> bytes:
+        nonlocal prefix_cache
+        if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
+            return prefix_cache[:limit]
+        member_file.seek(0)
+        expanded_prefix = member_file.read(limit)
+        if len(expanded_prefix) > len(prefix_cache):
+            prefix_cache = expanded_prefix
+        return prefix_cache[:limit]
+
+    return read_prefix
+
+
 def _probe_python_archive_member_executable_content(path: str) -> ExecutableArchiveMemberProbeOutcome:
     try:
         with open(path, "rb") as member_file:
@@ -773,15 +776,7 @@ def _probe_python_archive_member_executable_content(path: str) -> ExecutableArch
             if prefix_cache.startswith(b"#!"):
                 return "detected" if _python_member_has_non_python_shebang(prefix_cache) else "absent"
 
-            def read_prefix(limit: int) -> bytes:
-                nonlocal prefix_cache
-                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
-                    return prefix_cache[:limit]
-                member_file.seek(0)
-                expanded_prefix = member_file.read(limit)
-                if len(expanded_prefix) > len(prefix_cache):
-                    prefix_cache = expanded_prefix
-                return prefix_cache[:limit]
+            read_prefix = _cached_executable_prefix_reader(member_file, prefix_cache)
 
             return probe_executable_archive_member_signature(read_prefix)
     except OSError:
@@ -794,15 +789,7 @@ def executable_archive_member_content_rule_code(path: str) -> str | None:
         with open(path, "rb") as member_file:
             prefix_cache = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
 
-            def read_prefix(limit: int) -> bytes:
-                nonlocal prefix_cache
-                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
-                    return prefix_cache[:limit]
-                member_file.seek(0)
-                expanded_prefix = member_file.read(limit)
-                if len(expanded_prefix) > len(prefix_cache):
-                    prefix_cache = expanded_prefix
-                return prefix_cache[:limit]
+            read_prefix = _cached_executable_prefix_reader(member_file, prefix_cache)
 
             return _executable_archive_member_content_rule_code(prefix_cache, read_prefix=read_prefix)
     except OSError:
@@ -1235,10 +1222,6 @@ def _decode_operator_itemgetter_key(field: str) -> tuple[bool, _StaticItemKey]:
             return False, None
         return True, tuple(item for _resolved, item in decoded_items)
     return False, None
-
-
-def _resolve_operator_itemgetter_key(node: ast.AST) -> tuple[bool, _StaticItemKey]:
-    return _resolve_static_item_key(node)
 
 
 def _resolve_static_container_update_names(
@@ -2162,7 +2145,7 @@ def _resolve_operator_accessor_factory_names(
         and _keywords_are_all_empty_static_kwargs(node.keywords)
         and expanded_args
     ):
-        resolved_item_keys = tuple(_resolve_operator_itemgetter_key(arg) for arg in expanded_args)
+        resolved_item_keys = tuple(_resolve_static_item_key(arg) for arg in expanded_args)
         if all(resolved for resolved, _item_key in resolved_item_keys):
             accessor_names.add(
                 _encode_operator_accessor_name(
@@ -2501,14 +2484,6 @@ def _operator_accessor_field_groups(accessor_names: frozenset[str] | None, prefi
     )
 
 
-def _operator_attrgetter_member_names(accessor_names: frozenset[str] | None) -> frozenset[str]:
-    return frozenset(
-        fields[0]
-        for fields in _operator_accessor_field_groups(accessor_names, _OPERATOR_ATTRGETTER_ALIAS_PREFIX)
-        if len(fields) == 1
-    )
-
-
 def _operator_itemgetter_keys(accessor_names: frozenset[str] | None) -> frozenset[_StaticItemKey]:
     keys: set[_StaticItemKey] = set()
     for fields in _operator_accessor_field_groups(accessor_names, _OPERATOR_ITEMGETTER_ALIAS_PREFIX):
@@ -2541,14 +2516,18 @@ def _resolve_operator_attrgetter_call_result_names(
     target_node = _operator_accessor_target_node(node)
     if target_node is None:
         return None
-    attr_names = _operator_attrgetter_member_names(
-        _resolve_static_reference_names(
-            node.func,
-            alias_scopes,
-            allow_module_locals_mapping=allow_module_locals_mapping,
-            allow_local_namespace_mapping=allow_local_namespace_mapping,
-        )
+    accessor_names = _resolve_static_reference_names(
+        node.func,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
     )
+    attr_names = frozenset(
+        fields[0]
+        for fields in _operator_accessor_field_groups(accessor_names, _OPERATOR_ATTRGETTER_ALIAS_PREFIX)
+        if len(fields) == 1
+    )
+    del accessor_names
     if not attr_names:
         return None
     target_roots = _resolve_static_reference_names(
@@ -3722,12 +3701,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if self._non_module_scope_depth == 0:
             self._bind_name(key, resolved_names)
 
-    def _delete_alias_binding(self, name: str) -> None:
-        module_write_name = f"{_MODULE_NAMESPACE_WRITE_PREFIX}{name}"
-        for scope in self.alias_scopes:
-            scope.pop(name, None)
-            scope.pop(module_write_name, None)
-
     def _restore_deleted_dynamic_target_bindings(
         self, target_names: frozenset[str] | set[str], syntactic_name: str | None
     ) -> bool:
@@ -4158,21 +4131,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if roots is None or key is None:
             return None
         return method_name, roots, key, value_node
-
-    def _resolve_namespace_keyword_update_call(self, node: ast.Call) -> list[tuple[frozenset[str], str, ast.AST]]:
-        if not (isinstance(node.func, ast.Attribute) and node.func.attr == "update" and not node.args):
-            return []
-        if any(keyword.arg is None for keyword in node.keywords):
-            return []
-        roots = _resolve_namespace_mapping_roots(
-            node.func.value,
-            self.alias_scopes,
-            allow_module_locals_mapping=self._non_module_scope_depth == 0,
-            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
-        )
-        if roots is None:
-            return []
-        return [(roots, keyword.arg, keyword.value) for keyword in node.keywords if keyword.arg is not None]
 
     @staticmethod
     def _merge_alias_values(*values: _AliasValue) -> _AliasValue:
@@ -5479,14 +5437,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 continue
             self._record_import(alias, f"{node.module}.{alias.name}")
 
-    def _visit_child_scope(self, body: list[ast.stmt]) -> None:
-        self._push_alias_scope()
-        try:
-            for statement in body:
-                self.visit(statement)
-        finally:
-            self._pop_alias_scope()
-
     def _visit_conditional_branch(self, body: list[ast.stmt]) -> _AliasScope:
         branch_scope: _AliasScope = {}
         parent_is_class_scope = id(self.alias_scopes[-1]) in self._class_scope_ids
@@ -5674,13 +5624,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         finally:
             self._pop_alias_scope()
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self._visit_function_scope(node)
         self._bind_name(node.name, None)
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._visit_function_scope(node)
-        self._bind_name(node.name, None)
+    visit_AsyncFunctionDef = visit_FunctionDef
 
     @staticmethod
     def _is_ctypes_loader_init_alias(names: _AliasValue) -> bool:
@@ -7545,7 +7493,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if (
                 normalized_direct_name is not None
                 and direct_head_names == frozenset({direct_call_head})
-                and not _has_static_overwritable_reference_prefix(direct_call_name)
+                and not any(
+                    direct_call_name == reference_name or direct_call_name.startswith(f"{reference_name}.")
+                    for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+                )
             ):
                 self.risky_calls.add(normalized_direct_name)
 

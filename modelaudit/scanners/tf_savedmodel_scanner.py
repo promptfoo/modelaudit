@@ -191,29 +191,19 @@ def _regular_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, in
     return (
         file_stat.st_dev,
         file_stat.st_ino,
-        _stat_mode(file_stat),
+        int(getattr(file_stat, "st_mode", 0) or 0),
         file_stat.st_size,
         file_stat.st_mtime_ns,
         file_stat.st_ctime_ns,
     )
 
 
-def _stat_mode(file_stat: os.stat_result) -> int:
-    return int(getattr(file_stat, "st_mode", 0) or 0)
-
-
-def _is_regular_file(file_stat: os.stat_result) -> bool:
-    return stat.S_ISREG(_stat_mode(file_stat))
-
-
-def _is_directory(file_stat: os.stat_result) -> bool:
-    return stat.S_ISDIR(_stat_mode(file_stat))
-
-
 def _is_link_like(file_stat: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     file_attributes = getattr(file_stat, "st_file_attributes", 0) or 0
-    return stat.S_ISLNK(_stat_mode(file_stat)) or bool(reparse_flag and file_attributes & reparse_flag)
+    return stat.S_ISLNK(int(getattr(file_stat, "st_mode", 0) or 0)) or bool(
+        reparse_flag and file_attributes & reparse_flag
+    )
 
 
 @contextlib.contextmanager
@@ -227,8 +217,8 @@ def _open_bound_regular_file(path: Path, expected_stat: os.stat_result) -> Itera
         opened_stat = os.fstat(descriptor)
         if (
             _is_link_like(expected_stat)
-            or not _is_regular_file(expected_stat)
-            or not _is_regular_file(opened_stat)
+            or not stat.S_ISREG(int(getattr(expected_stat, "st_mode", 0) or 0))
+            or not stat.S_ISREG(int(getattr(opened_stat, "st_mode", 0) or 0))
             or _regular_file_identity(opened_stat) != _regular_file_identity(expected_stat)
         ):
             raise OSError("file identity changed before bounded read")
@@ -394,20 +384,12 @@ def _redact_savedmodel_detail_string(value: Any, max_chars: int = 200) -> str:
     return redact_evidence_string(str(value), max_chars=max_chars)
 
 
-def _redact_savedmodel_detail_value(value: Any, max_string_chars: int = 200) -> Any:
-    return redact_evidence_value(value, max_string_chars=max_string_chars)
-
-
 def _redact_savedmodel_relative_path(file_path: Path, model_root: Path) -> str:
     try:
         relative_path = file_path.relative_to(model_root)
     except ValueError:
         relative_path = Path(file_path.name)
     return str(Path(*(_redact_savedmodel_detail_string(part) for part in relative_path.parts)))
-
-
-def _redact_savedmodel_file_location(file_path: Path, model_root: Path) -> str:
-    return str(model_root / _redact_savedmodel_relative_path(file_path, model_root))
 
 
 def _looks_like_pe_executable(content_head: bytes) -> bool:
@@ -839,7 +821,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             expected_stat = path_obj.lstat()
         except OSError as error:
             return self._finish_read_failure(result, path, error)
-        if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
+        if _is_link_like(expected_stat) or not stat.S_ISREG(int(getattr(expected_stat, "st_mode", 0) or 0)):
             return self._finish_read_failure(result, path, OSError("SavedModel source is not a regular file"))
         file_size = expected_stat.st_size
         result.metadata["file_size"] = file_size
@@ -970,7 +952,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             for file in files:
                 file_path = Path(root) / file
                 redacted_file = _redact_savedmodel_detail_string(file)
-                redacted_location = _redact_savedmodel_file_location(file_path, model_root)
+                redacted_location = str(model_root / _redact_savedmodel_relative_path(file_path, model_root))
                 redacted_directory = str(Path(redacted_location).parent)
                 if (
                     any(
@@ -1010,7 +992,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         ):
                             text_path = Path(file_path)
                             text_stat = text_path.lstat()
-                            if _is_link_like(text_stat) or not _is_regular_file(text_stat):
+                            if _is_link_like(text_stat) or not stat.S_ISREG(int(getattr(text_stat, "st_mode", 0) or 0)):
                                 raise OSError("blacklist source is not a regular file")
                             with _open_bound_regular_file(text_path, text_stat) as f:
                                 content_sample = f.read(_MAX_SAVEDMODEL_TEXT_SCAN_BYTES + 1)
@@ -1119,7 +1101,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
                 continue
 
-            if not _is_directory(assets_dir_stat):
+            if not stat.S_ISDIR(int(getattr(assets_dir_stat, "st_mode", 0) or 0)):
                 continue
 
             for root, dir_names, files in os.walk(assets_dir):
@@ -1128,7 +1110,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     child_dir = Path(root) / dir_name
                     redacted_dir_name = _redact_savedmodel_detail_string(dir_name)
                     redacted_relative_dir = _redact_savedmodel_relative_path(child_dir, model_root)
-                    redacted_dir_location = _redact_savedmodel_file_location(child_dir, model_root)
+                    redacted_dir_location = str(model_root / _redact_savedmodel_relative_path(child_dir, model_root))
                     try:
                         child_stat = child_dir.lstat()
                     except OSError as exc:
@@ -1172,7 +1154,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         )
                         continue
 
-                    if _is_directory(child_stat):
+                    if stat.S_ISDIR(int(getattr(child_stat, "st_mode", 0) or 0)):
                         retained_dirs.append(dir_name)
 
                 dir_names[:] = retained_dirs
@@ -1194,7 +1176,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             f"{redacted_relative_path}"
                         ),
                         severity=IssueSeverity.WARNING,
-                        location=_redact_savedmodel_file_location(file_path, model_root),
+                        location=str(model_root / _redact_savedmodel_relative_path(file_path, model_root)),
                         details={
                             "file_name": redacted_file_name,
                             "detected_content_type": ", ".join(detected_types),
@@ -1207,7 +1189,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Scan non-canonical root entries that can accompany a SavedModel."""
         for child_path in model_root.iterdir():
             redacted_child_name = _redact_savedmodel_detail_string(child_path.name)
-            redacted_child_location = _redact_savedmodel_file_location(child_path, model_root)
+            redacted_child_location = str(model_root / _redact_savedmodel_relative_path(child_path, model_root))
             try:
                 child_stat = child_path.lstat()
             except OSError as exc:
@@ -1229,13 +1211,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
                 continue
 
-            if child_path.name in _CORE_ROOT_MODEL_FILES and _is_regular_file(child_stat):
+            if child_path.name in _CORE_ROOT_MODEL_FILES and stat.S_ISREG(int(getattr(child_stat, "st_mode", 0) or 0)):
                 continue
-            if child_path.name in _CORE_ROOT_ASSET_DIRS and (_is_directory(child_stat) or _is_link_like(child_stat)):
+            if child_path.name in _CORE_ROOT_ASSET_DIRS and (
+                stat.S_ISDIR(int(getattr(child_stat, "st_mode", 0) or 0)) or _is_link_like(child_stat)
+            ):
                 continue
-            if child_path.name in _CORE_ROOT_MODEL_DIRS and _is_directory(child_stat):
+            if child_path.name in _CORE_ROOT_MODEL_DIRS and stat.S_ISDIR(int(getattr(child_stat, "st_mode", 0) or 0)):
                 continue
-            if _is_directory(child_stat):
+            if stat.S_ISDIR(int(getattr(child_stat, "st_mode", 0) or 0)):
                 self._scan_saved_model_supplemental_directory(model_root, child_path, result)
                 continue
 
@@ -1254,7 +1238,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 child_dir = Path(root) / dir_name
                 redacted_dir_name = _redact_savedmodel_detail_string(dir_name)
                 redacted_relative_dir = _redact_savedmodel_relative_path(child_dir, model_root)
-                redacted_dir_location = _redact_savedmodel_file_location(child_dir, model_root)
+                redacted_dir_location = str(model_root / _redact_savedmodel_relative_path(child_dir, model_root))
                 try:
                     child_stat = child_dir.lstat()
                 except OSError as exc:
@@ -1298,7 +1282,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     )
                     continue
 
-                if _is_directory(child_stat):
+                if stat.S_ISDIR(int(getattr(child_stat, "st_mode", 0) or 0)):
                     retained_dirs.append(dir_name)
 
             dir_names[:] = retained_dirs
@@ -1332,7 +1316,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 f"Suspicious executable-like content detected in SavedModel supplemental file: {redacted_file_name}"
             ),
             severity=IssueSeverity.WARNING,
-            location=_redact_savedmodel_file_location(file_path, model_root),
+            location=str(model_root / _redact_savedmodel_relative_path(file_path, model_root)),
             details={
                 "file_name": redacted_file_name,
                 "detected_content_type": ", ".join(detected_types),
@@ -1352,7 +1336,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     ) -> list[str]:
         """Return suspicious content types found in a SavedModel asset file."""
         redacted_file_name = _redact_savedmodel_detail_string(file_path.name)
-        redacted_location = _redact_savedmodel_file_location(file_path, model_root)
+        redacted_location = str(model_root / _redact_savedmodel_relative_path(file_path, model_root))
         try:
             file_stat = file_path.lstat()
         except OSError as exc:
@@ -1394,7 +1378,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 rule_code="S902",
             )
             return []
-        if not _is_regular_file(file_stat):
+        if not stat.S_ISREG(int(getattr(file_stat, "st_mode", 0) or 0)):
             result.add_check(
                 name=check_name,
                 passed=False,
@@ -1683,7 +1667,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if node_context.function_name:
             details["function_name"] = _redact_savedmodel_detail_string(node_context.function_name)
         if extra_details:
-            redacted_extra_details = _redact_savedmodel_detail_value(extra_details)
+            redacted_extra_details = redact_evidence_value(extra_details, max_string_chars=200)
             if isinstance(redacted_extra_details, dict):
                 details.update(redacted_extra_details)
         return details
@@ -1995,7 +1979,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         try:
             path_obj = Path(path)
             expected_stat = path_obj.lstat()
-            if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
+            if _is_link_like(expected_stat) or not stat.S_ISREG(int(getattr(expected_stat, "st_mode", 0) or 0)):
                 raise OSError("Keras metadata source is not a regular file")
             with _open_bound_regular_file(path_obj, expected_stat) as f:
                 content = f.read(_MAX_KERAS_METADATA_PARSE_BYTES + 1)
@@ -2163,11 +2147,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
-        # NOTE: _check_protobuf_buffer_overflow() and
-        # _check_protobuf_field_bomb() are intentionally not enabled yet.
-        # Their thresholds are heuristic and currently lack regression
-        # coverage, so wiring them in would expand SavedModel findings beyond
-        # the narrowly-scoped function-definition fix until they are validated.
+        # NOTE: _check_protobuf_buffer_overflow() is intentionally not enabled yet.
+        # Its thresholds are heuristic and currently lack regression coverage,
+        # so wiring it in would expand SavedModel findings beyond the narrowly-scoped
+        # function-definition fix until it is validated.
 
     @staticmethod
     def _protobuf_string_scan_windows(string_val: str) -> tuple[list[tuple[int, int, str]], bool]:
@@ -2388,55 +2371,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         ),
                     )
 
-    def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for protobuf field bombs (DoS via excessive fields)"""
-
-        total_nodes = 0
-        total_attrs = 0
-
-        for meta_graph in saved_model.meta_graphs:
-            meta_graph_nodes = 0
-            meta_graph_attrs = 0
-
-            for node_context in self._iter_meta_graph_node_contexts(meta_graph):
-                meta_graph_nodes += 1
-                node = node_context.node
-                meta_graph_attrs += len(node.attr) if hasattr(node, "attr") else 0
-
-            total_nodes += meta_graph_nodes
-            total_attrs += meta_graph_attrs
-
-            # Check for excessive nodes in single meta graph
-            if meta_graph_nodes > 50000:  # 50k nodes threshold
-                result.add_check(
-                    name="Protobuf Node Count Bomb Check",
-                    passed=False,
-                    message=f"Meta graph contains excessive nodes ({meta_graph_nodes:,}) - potential DoS attack",
-                    severity=IssueSeverity.WARNING,
-                    location=self.current_file_path,
-                    details={
-                        "node_count": meta_graph_nodes,
-                        "node_threshold": 50000,
-                        "attack_type": "protobuf_node_bomb",
-                    },
-                )
-
-        # Check total model complexity
-        if total_nodes > 100000:  # 100k total nodes
-            result.add_check(
-                name="Protobuf Total Complexity Check",
-                passed=False,
-                message=f"Model has excessive total complexity ({total_nodes:,} nodes, {total_attrs:,} attributes)",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-                details={
-                    "total_nodes": total_nodes,
-                    "total_attributes": total_attrs,
-                    "node_threshold": 100000,
-                    "attack_type": "protobuf_complexity_bomb",
-                },
-            )
-
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract TensorFlow SavedModel metadata."""
         metadata = super().extract_metadata(file_path)
@@ -2516,7 +2450,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             with contextlib.suppress(PackageNotFoundError, Exception):
                 metadata["tensorflow_version"] = version("tensorflow")
 
-            redacted_signature_details = _redact_savedmodel_detail_value(signature_details)
+            redacted_signature_details = redact_evidence_value(signature_details, max_string_chars=200)
             metadata.update(
                 {
                     "meta_graph_count": len(saved_model.meta_graphs),
@@ -2531,7 +2465,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 }
             )
             if tag_sets:
-                metadata["tag_sets"] = _redact_savedmodel_detail_value(tag_sets)
+                metadata["tag_sets"] = redact_evidence_value(tag_sets, max_string_chars=200)
 
         except Exception as e:
             metadata["extraction_error"] = redact_untrusted_error_message(e)

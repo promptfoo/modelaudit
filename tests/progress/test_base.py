@@ -1,7 +1,9 @@
 """Tests for progress tracking base module."""
 
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from modelaudit.progress.base import (
     ProgressPhase,
@@ -26,12 +28,17 @@ class TestProgressPhase:
 class TestProgressStats:
     """Tests for ProgressStats dataclass."""
 
-    def test_default_values(self):
+    def test_default_values(self) -> None:
         """Test default values are set correctly."""
         stats = ProgressStats()
         assert stats.bytes_processed == 0
         assert stats.total_bytes == 0
         assert stats.items_processed == 0
+        assert stats.total_items == 0
+        assert stats.current_item == ""
+        assert stats.status_message == ""
+        assert stats.bytes_per_second >= 0
+        assert stats.items_per_second >= 0
         assert stats.current_phase == ProgressPhase.INITIALIZING
 
     def test_elapsed_time(self):
@@ -40,74 +47,46 @@ class TestProgressStats:
         time.sleep(0.05)
         assert stats.elapsed_time >= 0.05
 
-    def test_bytes_percentage_zero_total(self):
-        """Test bytes percentage with zero total."""
-        stats = ProgressStats(total_bytes=0)
-        assert stats.bytes_percentage == 0.0
-
-    def test_bytes_percentage_normal(self):
-        """Test bytes percentage calculation."""
-        stats = ProgressStats(bytes_processed=50, total_bytes=100)
-        assert stats.bytes_percentage == 50.0
-
-    def test_bytes_percentage_capped(self):
-        """Test bytes percentage is capped at 100."""
-        stats = ProgressStats(bytes_processed=150, total_bytes=100)
-        assert stats.bytes_percentage == 100.0
-
-    def test_items_percentage_zero_total(self):
-        """Test items percentage with zero total."""
-        stats = ProgressStats(total_items=0)
-        assert stats.items_percentage == 0.0
-
-    def test_items_percentage_normal(self):
-        """Test items percentage calculation."""
-        stats = ProgressStats(items_processed=25, total_items=100)
-        assert stats.items_percentage == 25.0
-
-    def test_format_bytes_bytes(self):
-        """Test byte formatting for small values."""
+    @pytest.mark.parametrize("counter", ["bytes", "items"])
+    @pytest.mark.parametrize(
+        ("processed", "total", "expected"),
+        [(0, 0, 0.0), (25, 100, 25.0), (50, 100, 50.0), (150, 100, 100.0)],
+        ids=["zero-total", "quarter", "half", "capped"],
+    )
+    def test_percentage(self, counter: str, processed: int, total: int, expected: float) -> None:
+        """Test percentages for empty, partially processed and exceeded totals."""
         stats = ProgressStats()
-        assert stats.format_bytes(500) == "500.0 B"
+        setattr(stats, f"{counter}_processed", processed)
+        setattr(stats, f"total_{counter}", total)
+        assert getattr(stats, f"{counter}_percentage") == expected
 
-    def test_format_bytes_kilobytes(self):
-        """Test byte formatting for KB values."""
-        stats = ProgressStats()
-        assert "KB" in stats.format_bytes(1500)
+    @pytest.mark.parametrize(
+        ("size", "expected"),
+        [(500, "500.0 B"), (1536, "1.5 KB"), (2048 * 1024, "2.0 MB"), (3 * 1024**3, "3.0 GB")],
+        ids=["bytes", "kilobytes", "megabytes", "gigabytes"],
+    )
+    def test_format_bytes(self, size: int, expected: str) -> None:
+        assert ProgressStats().format_bytes(size) == expected
 
-    def test_format_bytes_megabytes(self):
-        """Test byte formatting for MB values."""
-        stats = ProgressStats()
-        assert "MB" in stats.format_bytes(1500000)
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [(30, "30.0s"), (90, "1m 30s"), (3661, "1h 1m")],
+        ids=["seconds", "minutes", "hours"],
+    )
+    def test_format_time(self, seconds: int, expected: str) -> None:
+        assert ProgressStats().format_time(seconds) == expected
 
-    def test_format_bytes_gigabytes(self):
-        """Test byte formatting for GB values."""
-        stats = ProgressStats()
-        assert "GB" in stats.format_bytes(1500000000)
-
-    def test_format_time_seconds(self):
-        """Test time formatting for seconds."""
-        stats = ProgressStats()
-        assert "s" in stats.format_time(30)
-
-    def test_format_time_minutes(self):
-        """Test time formatting for minutes."""
-        stats = ProgressStats()
-        result = stats.format_time(90)
-        assert "m" in result
-
-    def test_format_time_hours(self):
-        """Test time formatting for hours."""
-        stats = ProgressStats()
-        result = stats.format_time(7200)
-        assert "h" in result
-
-    def test_update_performance_metrics(self):
+    def test_update_performance_metrics(self) -> None:
         """Test performance metrics update."""
-        stats = ProgressStats(bytes_processed=1000, total_bytes=2000)
+        stats = ProgressStats(total_bytes=2000, total_items=10)
+        stats.bytes_processed = 1000
+        stats.items_processed = 5
         time.sleep(0.01)
         stats.update_performance_metrics()
         assert stats.bytes_per_second > 0
+        assert stats.bytes_percentage == 50.0
+        assert stats.items_percentage == 50.0
+        assert stats.elapsed_time > 0
 
     def test_estimated_time_remaining(self):
         """Test estimated time remaining calculation."""
@@ -160,11 +139,13 @@ class TestProgressReporter:
 class TestProgressTracker:
     """Tests for ProgressTracker class."""
 
-    def test_initialization(self):
+    def test_initialization(self) -> None:
         """Test tracker initialization."""
         tracker = ProgressTracker(total_bytes=1000, total_items=10)
         assert tracker.stats.total_bytes == 1000
         assert tracker.stats.total_items == 10
+        assert tracker.reporters == []
+        assert tracker._callbacks == []
 
     def test_add_reporter(self):
         """Test adding a reporter."""
@@ -196,11 +177,12 @@ class TestProgressTracker:
         assert tracker.stats.bytes_processed == 500
         assert tracker.stats.current_item == "file.pkl"
 
-    def test_increment_bytes(self):
+    def test_increment_bytes(self) -> None:
         """Test incrementing bytes."""
         tracker = ProgressTracker(total_bytes=1000, update_interval=0)
         tracker.increment_bytes(100)
-        tracker.increment_bytes(200)
+        tracker.increment_bytes(200, "file2.txt")
+        assert tracker.stats.current_item == "file2.txt"
         assert tracker.stats.bytes_processed == 300
 
     def test_update_items(self):
@@ -230,13 +212,12 @@ class TestProgressTracker:
         assert tracker.stats.total_bytes == 5000
         assert tracker.stats.total_items == 50
 
-    def test_force_update(self):
+    def test_force_update(self) -> None:
         """Test forcing update."""
         reporter = MockReporter(update_interval=0)
         tracker = ProgressTracker(reporters=[reporter], update_interval=0)
         tracker.force_update()
-        # Reporter should have been called
-        assert len(reporter.progress_calls) >= 0
+        assert reporter.progress_calls == [tracker.stats]
 
     def test_complete(self):
         """Test completion."""
@@ -245,14 +226,14 @@ class TestProgressTracker:
         tracker.complete()
         assert len(reporter.completions) == 1
 
-    def test_report_error(self):
+    def test_report_error(self) -> None:
         """Test error reporting."""
         reporter = MockReporter()
         tracker = ProgressTracker(reporters=[reporter])
         error = ValueError("Test error")
         tracker.report_error(error)
         assert len(reporter.errors) == 1
-        assert reporter.errors[0][0] == error
+        assert reporter.errors[0] == (error, tracker.stats)
 
     def test_get_stats_returns_copy(self):
         """Test that get_stats returns a copy."""
@@ -262,69 +243,52 @@ class TestProgressTracker:
         stats2 = tracker.get_stats()
         assert stats1.bytes_processed != stats2.bytes_processed
 
-    def test_callback_invocation(self):
+    def test_callback_invocation(self) -> None:
         """Test that callbacks are invoked."""
         callback = MagicMock()
         tracker = ProgressTracker(update_interval=0)
         tracker.add_callback(callback)
         tracker.force_update()
-        callback.assert_called()
+        callback.assert_called_once()
+        observed = []
+        callback.side_effect = lambda stats: observed.append(stats.bytes_processed)
+        tracker.update_bytes(200)
+        tracker.update_bytes(500)
+        assert observed == [200, 500]
 
-    def test_reporter_exception_handling(self):
-        """Test that reporter exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_progress(self, stats):
-                raise RuntimeError("Reporter failed")
-
-        reporter = FailingReporter(update_interval=0)
+    @pytest.mark.parametrize(
+        ("reporter_method", "tracker_method", "args", "message"),
+        [
+            ("report_progress", "force_update", (), "Reporter failed"),
+            ("report_phase_change", "set_phase", (ProgressPhase.ANALYZING,), "Phase change failed"),
+            ("report_completion", "complete", (), "Completion failed"),
+            ("report_error", "report_error", (ValueError("Original error"),), "Error reporting failed"),
+        ],
+        ids=["progress", "phase-change", "completion", "error-reporting"],
+    )
+    def test_reporter_exception_handling(
+        self,
+        reporter_method: str,
+        tracker_method: str,
+        args: tuple[object, ...],
+        message: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test each reporter failure is reached and logged without crashing the tracker."""
+        caplog.set_level("WARNING", logger="modelaudit.progress")
+        reporter = MockReporter(update_interval=0)
         tracker = ProgressTracker(reporters=[reporter], update_interval=0)
-        # Should not raise
-        tracker.force_update()
+        with patch.object(reporter, reporter_method, side_effect=RuntimeError(message)) as failing_method:
+            getattr(tracker, tracker_method)(*args)
+        failing_method.assert_called_once()
+        assert message in caplog.text
 
-    def test_phase_change_exception_handling(self):
-        """Test that phase change exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_phase_change(self, old, new):
-                raise RuntimeError("Phase change failed")
-
-        reporter = FailingReporter()
-        tracker = ProgressTracker(reporters=[reporter])
-        # Should not raise
-        tracker.set_phase(ProgressPhase.ANALYZING)
-
-    def test_completion_exception_handling(self):
-        """Test that completion exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_completion(self, stats):
-                raise RuntimeError("Completion failed")
-
-        reporter = FailingReporter()
-        tracker = ProgressTracker(reporters=[reporter])
-        # Should not raise
-        tracker.complete()
-
-    def test_error_reporting_exception_handling(self):
-        """Test that error reporting exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_error(self, error, stats):
-                raise RuntimeError("Error reporting failed")
-
-        reporter = FailingReporter()
-        tracker = ProgressTracker(reporters=[reporter])
-        # Should not raise
-        tracker.report_error(ValueError("Original error"))
-
-    def test_callback_exception_handling(self):
+    def test_callback_exception_handling(self, caplog: pytest.LogCaptureFixture) -> None:
         """Test that callback exceptions don't crash tracker."""
-
-        def failing_callback(stats):
-            raise RuntimeError("Callback failed")
-
+        caplog.set_level("WARNING", logger="modelaudit.progress")
+        callback = MagicMock(side_effect=RuntimeError("Callback failed"))
         tracker = ProgressTracker(update_interval=0)
-        tracker.add_callback(failing_callback)
-        # Should not raise
+        tracker.add_callback(callback)
         tracker.force_update()
+        callback.assert_called_once_with(tracker.stats)
+        assert "Callback failed" in caplog.text

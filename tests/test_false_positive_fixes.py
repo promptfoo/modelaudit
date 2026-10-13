@@ -310,6 +310,10 @@ class TestFalsePositiveFixes:
             "encoder.layer.0.attention.self.key.weight": torch.randn(768, 768, generator=generator) * 0.02,
             "encoder.layer.0.attention.self.value.weight": torch.randn(768, 768, generator=generator) * 0.02,
         }
+        # Isolate executable-signature coverage from accidental pickle prefixes
+        # in the random tensor bytes by starting each storage with a zero float.
+        for weights in bert_weights.values():
+            weights.view(-1)[0] = 0.0
 
         # Save the model
         torch.save(bert_weights, bert_file)

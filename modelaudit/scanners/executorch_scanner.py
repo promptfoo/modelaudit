@@ -20,7 +20,7 @@ from ..utils.file.detection import (
     _looks_like_proto0_or_1_pickle,
     is_executorch_archive,
 )
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, _scanner_stat_identity
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import (
     apply_pickle_member_context,
@@ -825,15 +825,7 @@ class ExecuTorchScanner(BaseScanner):
             )
         return opened_stat, None
 
-    @staticmethod
-    def _stable_stat_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
-        return (
-            stat_result.st_dev,
-            stat_result.st_ino,
-            stat_result.st_size,
-            stat_result.st_mtime_ns,
-            stat_result.st_ctime_ns,
-        )
+    _stable_stat_identity = staticmethod(_scanner_stat_identity)
 
     @classmethod
     def _snapshot_archive(

@@ -39,13 +39,7 @@ def is_within_directory(base_dir: str, target: str) -> bool:
             return os.path.commonpath([target_norm, base_norm]) == base_norm
         except ValueError:
             return False
-    try:
-        return target_path.is_relative_to(base_path)
-    except AttributeError:  # Python < 3.9
-        try:
-            return os.path.commonpath([target_path, base_path]) == str(base_path)
-        except ValueError:
-            return False
+    return target_path.is_relative_to(base_path)
 
 
 def normalize_path_for_match(path: str) -> str:

@@ -25,13 +25,10 @@ impl NestedSurfaceOutcome {
         self.has_critical_finding
             || self.incomplete
             || (self.has_unclassified_execution && nested_has_execution_opcode)
-            || (self.depth_limited && nested_has_execution_opcode)
     }
 
-    pub(crate) fn should_stop_raw_probe_scan(&self, nested_has_execution_opcode: bool) -> bool {
-        self.has_critical_finding
-            || self.incomplete
-            || (self.depth_limited && nested_has_execution_opcode)
+    pub(crate) fn should_stop_raw_probe_scan(&self) -> bool {
+        self.has_critical_finding || self.incomplete
     }
 }
 

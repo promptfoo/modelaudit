@@ -14,6 +14,7 @@ from modelaudit.scanners import manifest_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
 from modelaudit.utils.helpers import cache_decorator
+from tests.cache_lifecycle import IsolatedCacheManager
 
 
 def _cloud_read_failure(
@@ -160,8 +161,7 @@ def test_manifest_blacklist_invalid_utf8_is_operational_not_security_finding(tmp
     cache_dir = tmp_path / "cache"
 
     direct = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregates = [
             scan_model_directory_or_file(
                 str(test_file),
@@ -190,8 +190,6 @@ def test_manifest_blacklist_invalid_utf8_is_operational_not_security_finding(tmp
             )
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_manifest_unreadable_path_preflight_is_operational_not_security_finding(
@@ -246,8 +244,7 @@ def test_manifest_blacklist_read_failure_bypasses_stale_clean_cache(
     test_file.write_text(json.dumps({"model_type": "bert", "padding": "x" * 11_000}), encoding="utf-8")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -288,8 +285,6 @@ def test_manifest_blacklist_read_failure_bypasses_stale_clean_cache(
             aggregate.file_metadata[str(test_file)].get("operational_error_reason") == "manifest_blacklist_read_failed"
         )
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
@@ -300,8 +295,7 @@ def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
     test_file.write_text(json.dumps({"model_type": "bert", "padding": "x" * 11_000}), encoding="utf-8")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -338,8 +332,6 @@ def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
         assert aggregate.file_metadata[str(test_file)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         assert aggregate.file_metadata[str(test_file)].get("operational_error_reason") == "manifest_read_failed"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_manifest_cloud_storage_read_failure_is_inconclusive_after_parse_retry(
@@ -421,8 +413,7 @@ def test_manifest_cloud_storage_read_failure_bypasses_stale_clean_cache(
     )
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -463,8 +454,6 @@ def test_manifest_cloud_storage_read_failure_bypasses_stale_clean_cache(
             == "manifest_cloud_storage_read_failed"
         )
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
@@ -2059,8 +2048,7 @@ def test_manifest_scanner_timeout_preserves_weak_hash_finding_and_is_not_cached(
         "should_bypass_cache_for_read_failure_aware_file",
         lambda _path: False,
     )
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregates = [
             scan_model_directory_or_file(
                 str(test_file),
@@ -2081,8 +2069,6 @@ def test_manifest_scanner_timeout_preserves_weak_hash_finding_and_is_not_cached(
             )
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_manifest_scanner_timeout_keeps_strong_hash_near_match_clean(

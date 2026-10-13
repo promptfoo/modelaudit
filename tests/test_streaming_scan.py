@@ -32,7 +32,12 @@ from modelaudit.core import (
     scan_model_streaming,
 )
 from modelaudit.integrations.sarif_formatter import format_sarif_output
-from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initial_audit_result
+from modelaudit.models import (
+    FileMetadataModel,
+    LicenseInfoModel,
+    ModelAuditResultModel,
+    create_initial_audit_result,
+)
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file import detection as file_detection
@@ -122,6 +127,23 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
 
 def create_external_onnx_payload(tmp_path: Path, external_path: str = "model.onnx_data") -> bytes:
     return build_external_onnx_payload(tmp_path, external_path, "streaming_external_data_graph")
+
+
+def _write_onnx_cache_snapshot(
+    tmp_path: Path, cache_root: Path, model_name: str = "model.onnx"
+) -> tuple[Path, Path, Path]:
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / model_name).symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    return snapshot_dir, model_blob, sidecar_blob
 
 
 def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
@@ -836,17 +858,7 @@ def test_scan_model_directory_hf_cache_onnx_external_data_uses_snapshot_alias(
     cache_hub = tmp_path / "hf-hub"
     monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
     cache_root = cache_hub / "models--test--model"
-    blobs_dir = cache_root / "blobs"
-    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
-    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    snapshot_dir, _, _ = _write_onnx_cache_snapshot(tmp_path, cache_root)
 
     result = scan_model_directory_or_file(
         str(snapshot_dir),
@@ -899,17 +911,7 @@ def test_scan_model_directory_hf_cache_onnx_external_data_rejects_nested_cache_l
     cache_hub = tmp_path / "hf-hub"
     monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
     fake_cache_root = cache_hub / "scratch" / "models--test--model"
-    blobs_dir = fake_cache_root / "blobs"
-    snapshot_dir = fake_cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
-    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    snapshot_dir, _, _ = _write_onnx_cache_snapshot(tmp_path, fake_cache_root)
 
     result = scan_model_directory_or_file(
         str(snapshot_dir),
@@ -1466,23 +1468,60 @@ def test_cross_directory_shard_reconciliation_rejects_sequential_hardlinks() -> 
     assert _complete_validated_shard_family_sources(targets) == set()
 
 
-def test_cross_directory_shard_reconciliation_updates_stale_scalar_reason() -> None:
+def _create_validated_streaming_shards(
+    stack: ExitStack, tmp_path: Path
+) -> tuple[list[Path], dict[str, dict[str, int | str]]]:
+    stack.enter_context(patch.object(tempfile, "tempdir", str(tmp_path)))
+    shards: list[Path] = []
+    validated_targets = {}
+    for shard_index in range(1, 3):
+        shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=tmp_path, prefix="modelaudit_stream_")))
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(b"shard")
+        shards.append(shard_path)
+        validated_targets.update(
+            _snapshot_validated_shard_target(
+                str(shard_path),
+                family_group="trusted-stream:model-a",
+                family_group_policy="stream_staging",
+            )
+        )
+    return shards, validated_targets
+
+
+def _create_failed_streaming_shard_result(
+    stack: ExitStack, tmp_path: Path, *, files_scanned: int
+) -> tuple[ModelAuditResultModel, dict[str, dict[str, int | str]]]:
+    stack.enter_context(patch.object(tempfile, "tempdir", str(tmp_path)))
+    validated_targets = {}
+    result = create_initial_audit_result()
+    result.files_scanned = files_scanned
+    result.has_errors = True
+    result.success = False
+    for shard_index in range(1, 3):
+        shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=tmp_path, prefix="modelaudit_stream_")))
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(b"shard")
+        validated_targets.update(
+            _snapshot_validated_shard_target(
+                str(shard_path),
+                family_group="trusted-stream:model-a",
+                family_group_policy="stream_staging",
+            )
+        )
+        result.file_metadata[str(shard_path)] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome="inconclusive",
+            scan_outcome_reason="missing_model_shards",
+            scan_outcome_reasons=["missing_model_shards"],
+        )
+    return result, validated_targets
+
+
+def test_cross_directory_shard_reconciliation_updates_stale_scalar_reason(tmp_path: Path) -> None:
     """Removing one reason must leave scalar outcome metadata aligned with the remaining reason."""
     with ExitStack() as stack:
-        shards: list[Path] = []
-        validated_targets = {}
-        for shard_index in range(1, 3):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
-            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
-            shard_path.write_bytes(b"shard")
-            shards.append(shard_path)
-            validated_targets.update(
-                _snapshot_validated_shard_target(
-                    str(shard_path),
-                    family_group="trusted-stream:model-a",
-                    family_group_policy="stream_staging",
-                )
-            )
+        shards, validated_targets = _create_validated_streaming_shards(stack, tmp_path)
 
         result = create_initial_audit_result()
         result.success = False
@@ -1504,23 +1543,10 @@ def test_cross_directory_shard_reconciliation_updates_stale_scalar_reason() -> N
             assert metadata["scan_outcome"] == "inconclusive"
 
 
-def test_cross_directory_shard_reconciliation_preserves_secondary_coverage_failure() -> None:
+def test_cross_directory_shard_reconciliation_preserves_secondary_coverage_failure(tmp_path: Path) -> None:
     """Disproving missing peers must retain another incomplete-coverage explanation."""
     with ExitStack() as stack:
-        shards: list[Path] = []
-        validated_targets = {}
-        for shard_index in range(1, 3):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
-            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
-            shard_path.write_bytes(b"shard")
-            shards.append(shard_path)
-            validated_targets.update(
-                _snapshot_validated_shard_target(
-                    str(shard_path),
-                    family_group="trusted-stream:model-a",
-                    family_group_policy="stream_staging",
-                )
-            )
+        shards, validated_targets = _create_validated_streaming_shards(stack, tmp_path)
 
         source_result = ScanResult(scanner_name="safetensors")
         source_result.add_check(
@@ -1566,23 +1592,10 @@ def test_cross_directory_shard_reconciliation_preserves_secondary_coverage_failu
         assert "Unable to read 1 model shard(s)" in result.issues[0].message
 
 
-def test_cross_directory_shard_reconciliation_clears_stale_outcome_message() -> None:
+def test_cross_directory_shard_reconciliation_clears_stale_outcome_message(tmp_path: Path) -> None:
     """Removing the final inconclusive reason must remove its stale explanation."""
     with ExitStack() as stack:
-        shards: list[Path] = []
-        validated_targets = {}
-        for shard_index in range(1, 3):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
-            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
-            shard_path.write_bytes(b"shard")
-            shards.append(shard_path)
-            validated_targets.update(
-                _snapshot_validated_shard_target(
-                    str(shard_path),
-                    family_group="trusted-stream:model-a",
-                    family_group_policy="stream_staging",
-                )
-            )
+        shards, validated_targets = _create_validated_streaming_shards(stack, tmp_path)
 
         result = create_initial_audit_result()
         result.success = False
@@ -1606,31 +1619,10 @@ def test_cross_directory_shard_reconciliation_clears_stale_outcome_message() -> 
             assert "scan_outcome_message" not in metadata
 
 
-def test_cross_directory_shard_reconciliation_clears_stale_operational_error_state() -> None:
+def test_cross_directory_shard_reconciliation_clears_stale_operational_error_state(tmp_path: Path) -> None:
     """A disproven missing-shard failure must not leave the aggregate at exit code 2."""
     with ExitStack() as stack:
-        validated_targets = {}
-        result = create_initial_audit_result()
-        result.files_scanned = 2
-        result.has_errors = True
-        result.success = False
-        for shard_index in range(1, 3):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
-            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
-            shard_path.write_bytes(b"shard")
-            validated_targets.update(
-                _snapshot_validated_shard_target(
-                    str(shard_path),
-                    family_group="trusted-stream:model-a",
-                    family_group_policy="stream_staging",
-                )
-            )
-            result.file_metadata[str(shard_path)] = FileMetadataModel(
-                analysis_incomplete=True,
-                scan_outcome="inconclusive",
-                scan_outcome_reason="missing_model_shards",
-                scan_outcome_reasons=["missing_model_shards"],
-            )
+        result, validated_targets = _create_failed_streaming_shard_result(stack, tmp_path, files_scanned=2)
 
         assert (
             _reconcile_cross_directory_shard_coverage(
@@ -1645,31 +1637,10 @@ def test_cross_directory_shard_reconciliation_clears_stale_operational_error_sta
         assert determine_exit_code(result) == 0
 
 
-def test_cross_directory_shard_reconciliation_preserves_retained_aggregate_failure() -> None:
+def test_cross_directory_shard_reconciliation_preserves_retained_aggregate_failure(tmp_path: Path) -> None:
     """A retained incomplete-analysis issue must keep the aggregate at exit code 2."""
     with ExitStack() as stack:
-        validated_targets = {}
-        result = create_initial_audit_result()
-        result.files_scanned = 2
-        result.has_errors = True
-        result.success = False
-        for shard_index in range(1, 3):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
-            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
-            shard_path.write_bytes(b"shard")
-            validated_targets.update(
-                _snapshot_validated_shard_target(
-                    str(shard_path),
-                    family_group="trusted-stream:model-a",
-                    family_group_policy="stream_staging",
-                )
-            )
-            result.file_metadata[str(shard_path)] = FileMetadataModel(
-                analysis_incomplete=True,
-                scan_outcome="inconclusive",
-                scan_outcome_reason="missing_model_shards",
-                scan_outcome_reasons=["missing_model_shards"],
-            )
+        result, validated_targets = _create_failed_streaming_shard_result(stack, tmp_path, files_scanned=2)
         result.issues.append(
             Issue(
                 message="Total scan size limit exceeded",
@@ -1691,31 +1662,10 @@ def test_cross_directory_shard_reconciliation_preserves_retained_aggregate_failu
         assert determine_exit_code(result) == 2
 
 
-def test_cross_directory_shard_reconciliation_preserves_unattributed_runtime_failure() -> None:
+def test_cross_directory_shard_reconciliation_preserves_unattributed_runtime_failure(tmp_path: Path) -> None:
     """Caller provenance must preserve a runtime failure without durable result evidence."""
     with ExitStack() as stack:
-        validated_targets = {}
-        result = create_initial_audit_result()
-        result.files_scanned = 2
-        result.has_errors = True
-        result.success = False
-        for shard_index in range(1, 3):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
-            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
-            shard_path.write_bytes(b"shard")
-            validated_targets.update(
-                _snapshot_validated_shard_target(
-                    str(shard_path),
-                    family_group="trusted-stream:model-a",
-                    family_group_policy="stream_staging",
-                )
-            )
-            result.file_metadata[str(shard_path)] = FileMetadataModel(
-                analysis_incomplete=True,
-                scan_outcome="inconclusive",
-                scan_outcome_reason="missing_model_shards",
-                scan_outcome_reasons=["missing_model_shards"],
-            )
+        result, validated_targets = _create_failed_streaming_shard_result(stack, tmp_path, files_scanned=2)
 
         assert (
             _reconcile_cross_directory_shard_coverage(
@@ -1729,31 +1679,10 @@ def test_cross_directory_shard_reconciliation_preserves_unattributed_runtime_fai
         assert determine_exit_code(result) == 2
 
 
-def test_cross_directory_shard_reconciliation_preserves_independent_operational_error() -> None:
+def test_cross_directory_shard_reconciliation_preserves_independent_operational_error(tmp_path: Path) -> None:
     """Clearing a shard gap must retain an unrelated explicit operational failure."""
     with ExitStack() as stack:
-        validated_targets = {}
-        result = create_initial_audit_result()
-        result.files_scanned = 3
-        result.has_errors = True
-        result.success = False
-        for shard_index in range(1, 3):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
-            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
-            shard_path.write_bytes(b"shard")
-            validated_targets.update(
-                _snapshot_validated_shard_target(
-                    str(shard_path),
-                    family_group="trusted-stream:model-a",
-                    family_group_policy="stream_staging",
-                )
-            )
-            result.file_metadata[str(shard_path)] = FileMetadataModel(
-                analysis_incomplete=True,
-                scan_outcome="inconclusive",
-                scan_outcome_reason="missing_model_shards",
-                scan_outcome_reasons=["missing_model_shards"],
-            )
+        result, validated_targets = _create_failed_streaming_shard_result(stack, tmp_path, files_scanned=3)
         result.file_metadata["failed-download"] = FileMetadataModel(
             operational_error=True,
             operational_error_reason="download_failed",
@@ -3249,19 +3178,7 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_uses_snapshot_alias(
     cache_hub = tmp_path / "hf-hub"
     monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
     cache_root = cache_hub / "models--test--model"
-    blobs_dir = cache_root / "blobs"
-    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
-    model_link = snapshot_dir / "model.onnx"
-    sidecar_link = snapshot_dir / "model.onnx_data"
-    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    snapshot_dir, _, _ = _write_onnx_cache_snapshot(tmp_path, cache_root)
 
     result = scan_model_streaming(
         file_generator=iterate_files_streaming(snapshot_dir),
@@ -3304,19 +3221,9 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_
     cache_hub = tmp_path / "hf-hub"
     monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
     cache_root = cache_hub / "models--test--model"
-    blobs_dir = cache_root / "blobs"
-    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    snapshot_dir, model_blob, sidecar_blob = _write_onnx_cache_snapshot(tmp_path, cache_root)
     model_link = snapshot_dir / "model.onnx"
     sidecar_link = snapshot_dir / "model.onnx_data"
-    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
 
     yielded_paths = {path for path, _is_last in iterate_files_streaming(snapshot_dir)}
     assert yielded_paths == {model_link, sidecar_link}
@@ -3383,19 +3290,9 @@ def test_scan_model_streaming_hf_cache_context_only_onnx_external_data_contribut
     cache_hub = tmp_path / "hf-hub"
     monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
     cache_root = cache_hub / "models--test--model"
-    blobs_dir = cache_root / "blobs"
-    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    snapshot_dir, model_blob, sidecar_blob = _write_onnx_cache_snapshot(tmp_path, cache_root)
     model_link = snapshot_dir / "model.onnx"
     sidecar_link = snapshot_dir / "model.onnx_data"
-    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
     expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
 
     result = scan_model_streaming(
@@ -3423,17 +3320,7 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_rejects_nested_cache_l
     cache_hub = tmp_path / "hf-hub"
     monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
     fake_cache_root = cache_hub / "scratch" / "models--test--model"
-    blobs_dir = fake_cache_root / "blobs"
-    snapshot_dir = fake_cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
-    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    snapshot_dir, _, _ = _write_onnx_cache_snapshot(tmp_path, fake_cache_root)
 
     result = scan_model_streaming(
         file_generator=iterate_files_streaming(snapshot_dir),
@@ -4467,17 +4354,7 @@ def _assert_symlinked_hf_onnx_cache_root(
     monkeypatch.setenv("HF_HUB_CACHE", str(link_hub))
 
     cache_root = link_hub / "models--test--model"
-    blobs_dir = cache_root / "blobs"
-    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
-    (snapshot_dir / case_filename).symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    snapshot_dir, _, _ = _write_onnx_cache_snapshot(tmp_path, cache_root, model_name=case_filename)
 
     result = scan_model_directory_or_file(
         str(snapshot_dir),

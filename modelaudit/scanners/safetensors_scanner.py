@@ -670,15 +670,7 @@ class SafeTensorsScanner(BaseScanner):
     @staticmethod
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:
         """Mark malformed safetensors framing as an explicit inconclusive scan."""
-        result.metadata["analysis_incomplete"] = True
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-
-        reasons = result.metadata.get("scan_outcome_reasons")
-        if not isinstance(reasons, list):
-            reasons = []
-            result.metadata["scan_outcome_reasons"] = reasons
-        if reason not in reasons:
-            reasons.append(reason)
+        BaseScanner._mark_inconclusive_metadata_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
@@ -811,16 +803,14 @@ class SafeTensorsScanner(BaseScanner):
         def track_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             nonlocal duplicate_key_count, duplicate_key_preview_truncated_count, duplicate_key_utf8_bytes
             parsed: dict[str, Any] = {}
-            seen: set[str] = set()
             for key, value in pairs:
-                if key in seen:
+                if key in parsed:
                     preview, key_utf8_bytes, preview_truncated = _safetensors_name_preview(key)
                     duplicate_key_count += 1
                     duplicate_key_utf8_bytes += key_utf8_bytes
                     duplicate_key_preview_truncated_count += int(preview_truncated)
                     if len(duplicate_keys) < _DUPLICATE_JSON_KEY_DETAIL_LIMIT:
                         duplicate_keys.append(preview)
-                seen.add(key)
                 parsed[key] = value
             return parsed
 
@@ -2318,21 +2308,6 @@ class SafeTensorsScanner(BaseScanner):
 
         name_lower = name.lower()
         return any(pattern in name_lower for pattern in suspicious_patterns)
-
-    def _calculate_json_depth(self, obj: Any, current_depth: int = 0) -> int:
-        """Calculate maximum depth of JSON object"""
-        if isinstance(obj, dict):
-            if not obj:
-                return current_depth
-            return max(self._calculate_json_depth(v, current_depth + 1) for v in obj.values())
-
-        if isinstance(obj, list):
-            if not obj:
-                return current_depth
-            return max(self._calculate_json_depth(v, current_depth + 1) for v in obj)
-
-        # For primitive types (str, int, float, bool, None)
-        return current_depth
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract SafeTensors metadata."""

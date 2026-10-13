@@ -249,14 +249,7 @@ class CatBoostScanner(BaseScanner):
 
     def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
         """Mark CatBoost analysis as incomplete for aggregate exit-code handling."""
-        existing_reasons = result.metadata.get("scan_outcome_reasons")
-        reasons = existing_reasons if isinstance(existing_reasons, list) else []
-        if reason not in reasons:
-            reasons.append(reason)
-
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = reasons
-        result.metadata["analysis_incomplete"] = True
+        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     def _parse_sections(
         self,

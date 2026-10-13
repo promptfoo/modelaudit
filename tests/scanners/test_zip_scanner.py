@@ -45,6 +45,7 @@ from modelaudit.scanners.zip_scanner import (
 )
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import (
     create_mock_mxnet_symbol,
     create_mock_onnx,
@@ -85,8 +86,7 @@ def _assert_inconclusive_zip_aggregate_not_cached(
     expected_security_findings: bool = False,
     **scan_kwargs: Any,
 ) -> None:
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -132,8 +132,6 @@ def _assert_inconclusive_zip_aggregate_not_cached(
         )
         assert cached_parent is None
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def _assert_inconclusive_zip_scan_not_cached(
@@ -148,8 +146,7 @@ def _assert_inconclusive_zip_scan_not_cached(
         "min_cache_file_size": 0,
         **scan_kwargs,
     }
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = ZipScanner(config=scan_config).scan_with_cache(str(path))
         second = ZipScanner(config=scan_config).scan_with_cache(str(path))
 
@@ -167,8 +164,6 @@ def _assert_inconclusive_zip_scan_not_cached(
         )
         assert cached_parent is None
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def _build_malicious_tf_metagraph() -> bytes:

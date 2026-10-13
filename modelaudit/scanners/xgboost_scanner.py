@@ -466,14 +466,7 @@ class XGBoostScanner(BaseScanner):
 
     def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
         """Mark XGBoost analysis as incomplete so callers fail closed."""
-        existing_reasons = result.metadata.get("scan_outcome_reasons")
-        reasons = existing_reasons if isinstance(existing_reasons, list) else []
-        if reason not in reasons:
-            reasons.append(reason)
-
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = reasons
-        result.metadata["analysis_incomplete"] = True
+        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     def _finish_scan_result(self, result: ScanResult) -> None:
         """Fail closed on inconclusive scans while preserving clean valid models."""

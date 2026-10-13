@@ -139,10 +139,6 @@ class UnifiedMLContext:
 
     def analyze_architecture_patterns(self):
         """Analyze layer patterns to determine architecture."""
-        # Count layer types
-        layer_type_counts: dict[str, int] = {}
-        for pattern in self.layer_patterns:
-            layer_type_counts[pattern.layer_type] = layer_type_counts.get(pattern.layer_type, 0) + 1
         lowered_layer_types = tuple(str(layer.layer_type).lower() for layer in self.layer_patterns)
 
         # Transformer detection

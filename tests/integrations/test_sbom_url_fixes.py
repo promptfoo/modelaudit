@@ -116,12 +116,7 @@ class TestSBOMURLFixes:
         def risk_by_ref(sbom: dict[str, Any]) -> dict[str, str]:
             components = sbom["components"]
             assert isinstance(components, list)
-            return {
-                component["bom-ref"]: next(
-                    prop["value"] for prop in component["properties"] if prop["name"] == "risk_score"
-                )
-                for component in components
-            }
+            return _component_property_values(components, "risk_score")
 
         first_risks = risk_by_ref(first_sbom)
         second_risks = risk_by_ref(second_sbom)
@@ -157,12 +152,7 @@ class TestSBOMURLFixes:
                 sbom_json = generate_sbom_pydantic(input_paths, scan_result)
             components = json.loads(sbom_json)["components"]
             return (
-                {
-                    component["bom-ref"]: next(
-                        prop["value"] for prop in component["properties"] if prop["name"] == "risk_score"
-                    )
-                    for component in components
-                },
+                _component_property_values(components, "risk_score"),
                 sbom_json,
             )
 
@@ -806,6 +796,67 @@ def test_oversized_source_refs_preserve_risk_and_content_identity(legacy: bool, 
     } == {("1", "0", ("a" * 64,) if content_hashes else ()), ("2", "5", ("b" * 64,) if content_hashes else ())}
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("case", ["missing", "copyright", "members", "serializer", "licenses"])
+def test_sbom_entrypoint_metadata_contracts(legacy: bool, case: str) -> None:
+    from pydantic import field_serializer
+
+    class SerializedMetadata(FileMetadataModel):
+        @field_serializer("license")
+        def serialize_license(self, value: str | None) -> str:
+            return "Apache-2.0"
+
+    path = "https://models.example/model.pkl"
+    result = create_mock_scan_result()
+    metadata: dict[str, FileMetadataModel] = {
+        "copyright": FileMetadataModel(copyright_notices=[{"holder": ""}, {"holder": "Example"}]),
+        "members": FileMetadataModel(member_file_hashes={"weights": {"file_size": 1}}),
+        "serializer": SerializedMetadata(license="MIT"),
+        "licenses": FileMetadataModel(
+            license="MIT",
+            license_info=[{"spdx_id": "MIT", "name": "Ignored"}, {"name": "Apache-2.0"}, {"name": "MIT"}],
+        ),
+    }
+    if case != "missing":
+        result.file_metadata[path] = metadata[case]
+    output = generate_sbom([path], result) if legacy else generate_sbom_pydantic([path], result)
+    component: dict[str, Any] = json.loads(output)["components"][0]
+    props = {prop["name"]: prop["value"] for prop in component["properties"]}
+    if case == "missing":
+        assert props.get("security:scanned") == ("true" if legacy else None)
+    elif case == "copyright":
+        assert props["copyright_holders"] == (", Example" if legacy else "Example")
+    elif case == "serializer":
+        assert component["licenses"] == [{"expression": "Apache-2.0" if legacy else "MIT"}]
+    elif case == "licenses":
+        assert component["licenses"] == [{"expression": "MIT OR Apache-2.0"}]
+    else:
+        record = json.loads(props["modelaudit:member_file_hashes"])["weights"]
+        assert record["file_size"] == 1
+        assert record["path_segments"] == []
+        assert ("file_hashes" in record) is legacy
+        assert ("hash_complete" in record) is legacy
+
+
+def _sbom_for_generator(generator: str, paths: list[str], result: ModelAuditResultModel, tmp_path: Path) -> str:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    if generator == "legacy":
+        return generate_sbom(paths, result.model_dump(mode="python"))
+    if generator == "pydantic":
+        return generate_sbom_pydantic(paths, result)
+    target = tmp_path / "scan.sbom.json"
+    _write_scan_sbom(str(target), result, paths, _ScanPathState(), scan_and_delete=True)
+    return target.read_text()
+
+
+def _component_property_values(components: list[dict[str, Any]], property_name: str) -> dict[str, str]:
+    return {
+        component["bom-ref"]: next(prop["value"] for prop in component["properties"] if prop["name"] == property_name)
+        for component in components
+    }
+
+
 def _sbom_property_values(
     input_paths: Any, result: ModelAuditResultModel, legacy_generator: bool, property_name: str
 ) -> dict[str, str]:
@@ -813,10 +864,7 @@ def _sbom_property_values(
         sbom_json = generate_sbom(input_paths, result.model_dump(mode="python"))
     else:
         sbom_json = generate_sbom_pydantic(input_paths, result)
-    return {
-        component["bom-ref"]: next(prop["value"] for prop in component["properties"] if prop["name"] == property_name)
-        for component in json.loads(sbom_json)["components"]
-    }
+    return _component_property_values(json.loads(sbom_json)["components"], property_name)
 
 
 @pytest.mark.parametrize(
@@ -830,13 +878,10 @@ def _sbom_property_values(
     ],
 )
 def test_cli_signed_stream_sbom_preserves_model_classification(source: str, tmp_path: Path) -> None:
-    from modelaudit.cli import _ScanPathState, _write_scan_sbom
-
     result = create_initial_audit_result()
     result.assets = [AssetModel(path=source, type="pickle", size=3)]
-    output = tmp_path / "scan.sbom.json"
-    _write_scan_sbom(str(output), result, [source], _ScanPathState(), scan_and_delete=True)
-    assert json.loads(output.read_text())["components"][0]["type"] == "machine-learning-model"
+    output = _sbom_for_generator("cli", [source], result, tmp_path)
+    assert json.loads(output)["components"][0]["type"] == "machine-learning-model"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark")
@@ -867,8 +912,6 @@ def test_sbom_local_query_filename_keeps_literal_classification(tmp_path: Path) 
 def test_sbom_deleted_local_paths_keep_literal_classification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator: str, relative: bool, name: str, expected: str
 ) -> None:
-    from modelaudit.cli import _ScanPathState, _write_scan_sbom
-
     monkeypatch.chdir(tmp_path)
     path = Path(name) if relative else tmp_path / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -877,14 +920,7 @@ def test_sbom_deleted_local_paths_keep_literal_classification(
     result = create_initial_audit_result()
     result.assets = [AssetModel(path=str(path), type="pickle", size=5, is_streamed=True)]
     result.file_metadata[str(path)] = FileMetadataModel(file_size=5, scanner="pickle")
-    if generator == "legacy":
-        output = generate_sbom([str(path)], result.model_dump(mode="python"))
-    elif generator == "pydantic":
-        output = generate_sbom_pydantic([str(path)], result)
-    else:
-        target = tmp_path / "scan.sbom.json"
-        _write_scan_sbom(str(target), result, [str(path)], _ScanPathState(), scan_and_delete=True)
-        output = target.read_text()
+    output = _sbom_for_generator(generator, [str(path)], result, tmp_path)
     assert json.loads(output)["components"][0]["type"] == expected
 
 
@@ -908,19 +944,10 @@ def test_sbom_deleted_local_paths_keep_literal_classification(
 def test_sbom_public_source_types_preserve_cli_boundary(
     tmp_path: Path, generator: str, extension: str, kind: str, template: str, cli_uses_extension: bool
 ) -> None:
-    from modelaudit.cli import _ScanPathState, _write_scan_sbom
-
     source = template.format(extension=extension)
     result = create_initial_audit_result()
     result.assets = [AssetModel(path=source, type="pickle", size=3, is_streamed=True)]
-    if generator == "legacy":
-        output = generate_sbom([source], result.model_dump(mode="python"))
-    elif generator == "pydantic":
-        output = generate_sbom_pydantic([source], result)
-    else:
-        target = tmp_path / "scan.sbom.json"
-        _write_scan_sbom(str(target), result, [source], _ScanPathState(), scan_and_delete=True)
-        output = target.read_text()
+    output = _sbom_for_generator(generator, [source], result, tmp_path)
     # Public generators historically classify the literal input; the CLI first normalizes its sources.
     expected = kind if generator == "cli" and cli_uses_extension else "file"
     assert json.loads(output)["components"][0]["type"] == expected
@@ -929,7 +956,6 @@ def test_sbom_public_source_types_preserve_cli_boundary(
 @pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark")
 @pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
 def test_sbom_directory_owner_risk_uses_historical_finding_location(tmp_path: Path, generator: str) -> None:
-    from modelaudit.cli import _ScanPathState, _write_scan_sbom
     from modelaudit.core import scan_model_directory_or_file
 
     root = tmp_path / "owner?revision=main"
@@ -939,14 +965,7 @@ def test_sbom_directory_owner_risk_uses_historical_finding_location(tmp_path: Pa
     )
     scanned = scan_model_directory_or_file(str(root), cache_enabled=False)
     result = ModelAuditResultModel.model_validate_json(scanned.model_dump_json())
-    if generator == "legacy":
-        output = generate_sbom([str(root)], result.model_dump())
-    elif generator == "pydantic":
-        output = generate_sbom_pydantic([str(root)], result)
-    else:
-        target = tmp_path / "scan.sbom.json"
-        _write_scan_sbom(str(target), result, [str(root)], _ScanPathState(), scan_and_delete=True)
-        output = target.read_text()
+    output = _sbom_for_generator(generator, [str(root)], result, tmp_path)
     components = json.loads(output)["components"]
     assert components
     # The owner and child findings historically associate only the child with this component.
@@ -957,21 +976,12 @@ def test_sbom_directory_owner_risk_uses_historical_finding_location(tmp_path: Pa
 
 @pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
 def test_sbom_risk_preserves_direct_api_and_cli_source_boundary(tmp_path: Path, generator: str) -> None:
-    from modelaudit.cli import _ScanPathState, _write_scan_sbom
-
     source = "s3://bucket/model.pkl?token=synthetic"
     result = create_initial_audit_result()
     result.issues = [
         Issue(message="Existing finding", severity=IssueSeverity.CRITICAL, location="s3://bucket/model.pkl")
     ]
-    if generator == "legacy":
-        output = generate_sbom([source], result.model_dump())
-    elif generator == "pydantic":
-        output = generate_sbom_pydantic([source], result)
-    else:
-        target = tmp_path / "scan.sbom.json"
-        _write_scan_sbom(str(target), result, [source], _ScanPathState(), scan_and_delete=True)
-        output = target.read_text()
+    output = _sbom_for_generator(generator, [source], result, tmp_path)
     component = json.loads(output)["components"][0]
     assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == (
         "5" if generator == "cli" else "0"
@@ -1226,10 +1236,7 @@ def test_mlflow_saved_result_keeps_colliding_source_previews(monkeypatch: pytest
         exports.append(components)
         result.issues[0].severity = IssueSeverity.CRITICAL
         output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
-        risk_by_path = {
-            c["bom-ref"]: next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score")
-            for c in json.loads(output)["components"]
-        }
+        risk_by_path = _component_property_values(json.loads(output)["components"], "risk_score")
         assert risk_by_path == {paths[0]: "5", paths[1]: "1"}
     assert exports[0] == exports[1] == exports[2]
 

@@ -567,28 +567,12 @@ fn set_expr(stack: &mut [StringLexFrame], depth: usize, grouping_depth: usize) {
     *stack.last_mut().unwrap() = StringLexFrame::FormattedExpression(depth, grouping_depth);
 }
 
-fn string_lex_frame(bytes: &[u8], quote: usize) -> Option<(StringLexFrame, usize)> {
-    let formatted = string_quote_prefix(bytes, quote)?;
-    let delimiter = bytes[quote];
-    let width = if bytes.get(quote..quote + 3) == Some([delimiter; 3].as_slice()) {
-        3
-    } else {
-        1
-    };
-    Some((StringLexFrame::String(delimiter, width, formatted), width))
-}
-
 fn string_lex_frame_with_lookbehind(
     bytes: &[u8],
     quote: usize,
     lookbehind: &[u8],
     preceding_backslash_odd: bool,
 ) -> Option<(StringLexFrame, usize)> {
-    let current_backslashes = bytes[..quote]
-        .iter()
-        .rev()
-        .take_while(|byte| **byte == b'\\')
-        .count();
     let (context, contextual_quote) = if quote >= 3 || lookbehind.is_empty() {
         (Cow::Borrowed(bytes), quote)
     } else {
@@ -599,10 +583,7 @@ fn string_lex_frame_with_lookbehind(
         let contextual_quote = lookbehind.len() + quote;
         (Cow::Owned(contextual), contextual_quote)
     };
-    if current_backslashes != quote {
-        return string_lex_frame(context.as_ref(), contextual_quote);
-    }
-    if (current_backslashes % 2 == 1) ^ preceding_backslash_odd {
+    if trailing_backslash_odd_at(bytes, quote, preceding_backslash_odd) {
         return None;
     }
     let formatted = string_quote_prefix_unescaped(context.as_ref(), contextual_quote)?;
@@ -738,13 +719,6 @@ fn unquoted_url_apostrophe_ends_url(bytes: &[u8], quote: usize) -> bool {
         && url_call_expression_starts(bytes, quote + 1).0
 }
 
-fn string_quote_prefix(bytes: &[u8], quote: usize) -> Option<bool> {
-    if quote_is_escaped(bytes, quote) {
-        return None;
-    }
-    string_quote_prefix_unescaped(bytes, quote)
-}
-
 fn string_quote_prefix_unescaped(bytes: &[u8], quote: usize) -> Option<bool> {
     let mut prefix_start = quote;
     while prefix_start > 0
@@ -766,16 +740,6 @@ fn string_quote_prefix_unescaped(bytes: &[u8], quote: usize) -> Option<bool> {
         return None;
     }
     Some(prefix.contains(&b'f'))
-}
-
-fn quote_is_escaped(bytes: &[u8], quote: usize) -> bool {
-    bytes[..quote]
-        .iter()
-        .rev()
-        .take_while(|byte| **byte == b'\\')
-        .count()
-        % 2
-        == 1
 }
 
 fn url_code_boundary_starts(bytes: &[u8], start: usize) -> (bool, usize) {
@@ -973,12 +937,12 @@ fn base64_candidate_start_offsets(token: &str, compact: &[u8]) -> Vec<usize> {
     offsets
 }
 
-fn decode_base64(bytes: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.is_empty() {
         return None;
     }
     let mut values = [0u8; 4];
-    let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut decoded = Vec::with_capacity(bytes.len().div_ceil(4) * 3);
     for chunk in bytes.chunks(4) {
         if chunk.len() == 1 {
             return None;
@@ -1120,12 +1084,7 @@ fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
 fn starts_with_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u8]) -> bool {
     haystack
         .get(start..start.saturating_add(needle.len()))
-        .is_some_and(|candidate| {
-            candidate
-                .iter()
-                .zip(needle)
-                .all(|(actual, expected)| actual.to_ascii_lowercase() == *expected)
-        })
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
 }
 
 pub(crate) fn is_suspicious_magic_method(value: &str) -> bool {
@@ -2023,18 +1982,7 @@ mod tests {
     }
 
     fn scan_two_overlapping_windows(value: &str) -> Vec<String> {
-        const WINDOW_CHARS: usize = 8192;
-        const NEXT_WINDOW_START: usize = WINDOW_CHARS - 256;
-
-        let (mut matches, continuation) =
-            suspicious_string_matches_window(&value[..WINDOW_CHARS], None, NEXT_WINDOW_START);
-        let (next_matches, _) = suspicious_string_matches_window(
-            &value[NEXT_WINDOW_START..],
-            continuation,
-            value.len() - NEXT_WINDOW_START,
-        );
-        matches.extend(next_matches);
-        matches
+        scan_windows_split_inside_lexical_unit(value, 8192 - 256, 8192)
     }
 
     fn scan_windows_split_inside_lexical_unit(

@@ -181,7 +181,7 @@ def _read_header_text(file_path: str, max_lines: int) -> str | None:
     decoded_header = header_sample.decode("utf-8", errors="ignore")
     if not has_more_bytes:
         return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
-    if not _is_explicit_license_file(file_path):
+    if Path(file_path).name.lower() not in LICENSE_FILES:
         return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
 
     # Explicit license files keep the richer line-oriented behavior so long
@@ -246,10 +246,6 @@ LICENSE_FILES = {
     "terms",
     "terms.txt",
 }
-
-
-def _is_explicit_license_file(file_path: str) -> bool:
-    return Path(file_path).name.lower() in LICENSE_FILES
 
 
 # Dataset file patterns that often lack proper licensing
@@ -596,31 +592,19 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
             if not info.get("isOsiApproved", True):
                 incompatible_files.append(file_path)
 
-    if deprecated_files:
-        warnings.append(
-            {
-                "type": "license_warning",
-                "severity": "error" if strict else "warning",
-                "message": (f"Deprecated licenses detected ({len(deprecated_files)} files)."),
-                "details": {
-                    "files": deprecated_files[:5],
-                    "total_count": len(deprecated_files),
-                },
-            }
-        )
-
-    if incompatible_files:
-        warnings.append(
-            {
-                "type": "license_warning",
-                "severity": "error" if strict else "warning",
-                "message": (f"Incompatible licenses detected ({len(incompatible_files)} files)."),
-                "details": {
-                    "files": incompatible_files[:5],
-                    "total_count": len(incompatible_files),
-                },
-            }
-        )
+    for label, files in (("Deprecated", deprecated_files), ("Incompatible", incompatible_files)):
+        if files:
+            warnings.append(
+                {
+                    "type": "license_warning",
+                    "severity": "error" if strict else "warning",
+                    "message": f"{label} licenses detected ({len(files)} files).",
+                    "details": {
+                        "files": files[:5],
+                        "total_count": len(files),
+                    },
+                }
+            )
 
     return warnings
 

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
+from types import TracebackType
 
 import pytest
 from pickle_test_helpers import (
@@ -50,6 +51,43 @@ pytestmark = pytest.mark.skipif(
 
 OperandBuilder = Callable[[bytes], bytes]
 MemoOpcodeBuilder = Callable[[int], bytes]
+
+
+_SYSTEM_RESULT_CHILD_CODE = """
+import pickle
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+result = pickle.loads(payload)
+if result != 0:
+    raise SystemExit(result)
+if not marker.exists():
+    raise SystemExit("marker was not written")
+"""
+
+
+class _PreservedSysPath:
+    def __enter__(self) -> list[str]:
+        self.original_sys_path = list(sys.path)
+        return self.original_sys_path
+
+    def __exit__(
+        self, _exc_type: type[BaseException] | None, _exc: BaseException | None, _tb: TracebackType | None
+    ) -> None:
+        sys.path[:] = self.original_sys_path
+
+
+def _run_pickle_child(child_code: str, marker: Path, payload: bytes) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(marker), payload.hex()],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def _install_mailbox_entrypoint_gap(monkeypatch: pytest.MonkeyPatch, blocked_entrypoint: str, message: str) -> None:
@@ -330,60 +368,6 @@ def _calls_subprocess_run_under_cpython(payload: bytes, monkeypatch: pytest.Monk
     return result == "oracle-called" and bool(calls)
 
 
-def _has_critical_subprocess_run_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "subprocess"
-        and finding.details.get("name") == "run"
-        for finding in report.findings
-    )
-
-
-def _has_critical_atexit_register_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "atexit"
-        and finding.details.get("name") == "register"
-        for finding in report.findings
-    )
-
-
-def _has_critical_mailcap_findmatch_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "mailcap"
-        and finding.details.get("name") == "findmatch"
-        for finding in report.findings
-    )
-
-
-def _has_critical_builtins_map_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "builtins"
-        and finding.details.get("name") == "map"
-        for finding in report.findings
-    )
-
-
-def _has_critical_builtins_filter_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "builtins"
-        and finding.details.get("name") == "filter"
-        for finding in report.findings
-    )
-
-
-def _has_critical_builtins_hasattr_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "builtins"
-        and finding.details.get("name") == "hasattr"
-        for finding in report.findings
-    )
-
-
 def _has_suspicious_magic_method_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.WARNING
@@ -460,273 +444,12 @@ def _has_critical_call_graph_file_write_finding(
     )
 
 
-def _has_critical_builtins_staticmethod_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "builtins"
-        and finding.details.get("name") == "staticmethod"
-        for finding in report.findings
-    )
-
-
-def _has_critical_builtins_property_get_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "builtins"
-        and finding.details.get("name") == "property.__get__"
-        for finding in report.findings
-    )
-
-
-def _has_critical_builtins_classmethod_get_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "builtins"
-        and finding.details.get("name") == "classmethod.__get__"
-        for finding in report.findings
-    )
-
-
-def _has_critical_private_functools_partial_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "_functools"
-        and finding.details.get("name") == "partial"
-        for finding in report.findings
-    )
-
-
-def _has_critical_private_functools_reduce_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "_functools"
-        and finding.details.get("name") == "reduce"
-        for finding in report.findings
-    )
-
-
-def _has_critical_functools_wrapper_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "functools"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_logging_filterer_filter_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "logging"
-        and finding.details.get("name") == "Filterer.filter"
-        for finding in report.findings
-    )
-
-
-def _has_critical_inspect_getmembers_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "inspect"
-        and finding.details.get("name") == "getmembers"
-        for finding in report.findings
-    )
-
-
-def _has_critical_itertools_accumulate_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "itertools"
-        and finding.details.get("name") == "accumulate"
-        for finding in report.findings
-    )
-
-
-def _has_critical_itertools_dropwhile_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "itertools"
-        and finding.details.get("name") == "dropwhile"
-        for finding in report.findings
-    )
-
-
-def _has_critical_itertools_filterfalse_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "itertools"
-        and finding.details.get("name") == "filterfalse"
-        for finding in report.findings
-    )
-
-
-def _has_critical_itertools_groupby_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "itertools"
-        and finding.details.get("name") == "groupby"
-        for finding in report.findings
-    )
-
-
-def _has_critical_itertools_starmap_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "itertools"
-        and finding.details.get("name") == "starmap"
-        for finding in report.findings
-    )
-
-
-def _has_critical_itertools_takewhile_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "itertools"
-        and finding.details.get("name") == "takewhile"
-        for finding in report.findings
-    )
-
-
-def _has_critical_dataclasses_create_fn_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "dataclasses"
-        and finding.details.get("name") == "_create_fn"
-        for finding in report.findings
-    )
-
-
-def _has_critical_setuptools_distutils_spawn_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "setuptools._distutils.spawn"
-        and finding.details.get("name") == "spawn"
-        for finding in report.findings
-    )
-
-
-def _has_critical_site_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "site"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_unittest_loader_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "unittest.loader"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_pipes_template_copy_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "pipes"
-        and finding.details.get("name") == "Template.copy"
-        for finding in report.findings
-    )
-
-
-def _has_critical_operator_call_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "operator"
-        and finding.details.get("name") == "call"
-        for finding in report.findings
-    )
-
-
 def _has_critical_operator_setitem_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
         and finding.rule_code == "DANGEROUS_CALL"
         and finding.details.get("module") == "operator"
         and finding.details.get("name") == "setitem"
-        for finding in report.findings
-    )
-
-
-def _has_critical_typing_eval_type_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "typing"
-        and finding.details.get("name") == "_eval_type"
-        for finding in report.findings
-    )
-
-
-def _has_critical_typing_get_type_hints_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "typing"
-        and finding.details.get("name") == "get_type_hints"
-        for finding in report.findings
-    )
-
-
-def _has_critical_weakref_finalize_finding(report: PickleReport) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "weakref"
-        and finding.details.get("name") == "finalize"
-        for finding in report.findings
-    )
-
-
-def _has_critical_sched_scheduler_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "sched"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_contextlib_exitstack_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "contextlib"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_contextvars_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "contextvars"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_types_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "types"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_unittest_mock_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "unittest.mock"
-        and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_concurrent_futures_finding(report: PickleReport, name: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.details.get("module") == "concurrent.futures"
-        and finding.details.get("name") == name
         for finding in report.findings
     )
 
@@ -2905,7 +2628,7 @@ def test_scan_bytes_matches_cpython_oracle_for_adversarial_stack_global(
     reaches_subprocess_run = _calls_subprocess_run_under_cpython(case.payload, monkeypatch)
 
     report = scan_bytes(case.payload, source=f"{case.name}.pkl", options=case.options)
-    scanner_reports_subprocess_run = _has_critical_subprocess_run_finding(report)
+    scanner_reports_subprocess_run = _has_critical_global_finding(report, "subprocess", "run")
 
     if reaches_subprocess_run:
         assert report.verdict == SafetyVerdict.MALICIOUS
@@ -2941,7 +2664,7 @@ def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) ->
     report = scan_bytes(payload, source="mailcap-findmatch-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_mailcap_findmatch_finding(report)
+    assert _has_critical_global_finding(report, "mailcap", "findmatch")
 
     assert not marker.exists()
     pickle.loads(payload)
@@ -2955,7 +2678,7 @@ def test_scan_bytes_blocks_atexit_register_exit_callback_rce(tmp_path: Path) -> 
     report = scan_bytes(payload, source="atexit-register-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_atexit_register_finding(report)
+    assert _has_critical_global_finding(report, "atexit", "register")
 
     assert not marker.exists()
     subprocess.run(
@@ -2978,7 +2701,7 @@ def test_scan_bytes_blocks_weakref_finalize_reclaim_callback_rce(tmp_path: Path)
     report = scan_bytes(payload, source="weakref-finalize-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_weakref_finalize_finding(report)
+    assert _has_critical_global_finding(report, "weakref", "finalize")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -2995,8 +2718,8 @@ def test_scan_bytes_blocks_sched_scheduler_queued_callback_rce(tmp_path: Path) -
     report = scan_bytes(payload, source="sched-scheduler-run-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_sched_scheduler_finding(report, "scheduler.enter")
-    assert _has_critical_sched_scheduler_finding(report, "scheduler.run")
+    assert _has_critical_global_finding(report, "sched", "scheduler.enter")
+    assert _has_critical_global_finding(report, "sched", "scheduler.run")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3011,8 +2734,8 @@ def test_scan_bytes_blocks_contextlib_exitstack_cleanup_callback_rce(tmp_path: P
     report = scan_bytes(payload, source="contextlib-exitstack-close-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.callback")
-    assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.close")
+    assert _has_critical_global_finding(report, "contextlib", "ExitStack.callback")
+    assert _has_critical_global_finding(report, "contextlib", "ExitStack.close")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3038,7 +2761,7 @@ def test_scan_bytes_blocks_contextlib_exitstack_enter_context_dunder_enter_rce(t
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_suspicious_magic_method_finding(report)
-    assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.enter_context")
+    assert _has_critical_global_finding(report, "contextlib", "ExitStack.enter_context")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3053,7 +2776,7 @@ def test_scan_bytes_blocks_contextvars_context_run_callback_rce(tmp_path: Path) 
     report = scan_bytes(payload, source="contextvars-context-run-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_contextvars_finding(report, "Context.run")
+    assert _has_critical_global_finding(report, "contextvars", "Context.run")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3068,7 +2791,7 @@ def test_scan_bytes_blocks_types_methodtype_bound_method_rce(tmp_path: Path) -> 
 
     control_report = scan_bytes(control_payload, source="types-methodtype-bound-method-control.pkl")
     assert control_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_types_finding(control_report, "MethodType")
+    assert _has_critical_global_finding(control_report, "types", "MethodType")
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -3078,7 +2801,7 @@ def test_scan_bytes_blocks_types_methodtype_bound_method_rce(tmp_path: Path) -> 
     report = scan_bytes(payload, source="types-methodtype-bound-method-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_types_finding(report, "MethodType")
+    assert _has_critical_global_finding(report, "types", "MethodType")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3106,7 +2829,7 @@ def test_scan_bytes_blocks_types_dynamicclassattribute_get_descriptor_rce(tmp_pa
     report = scan_bytes(payload, source="types-dynamicclassattribute-get-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_types_finding(report, "DynamicClassAttribute.__get__")
+    assert _has_critical_global_finding(report, "types", "DynamicClassAttribute.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3132,7 +2855,7 @@ def test_scan_bytes_blocks_functools_cached_property_get_descriptor_rce(tmp_path
     report = scan_bytes(payload, source="functools-cached-property-get-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_functools_wrapper_finding(report, "cached_property.__get__")
+    assert _has_critical_global_finding(report, "functools", "cached_property.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3147,7 +2870,7 @@ def test_scan_bytes_blocks_functools_cmp_to_key_comparison_rce(tmp_path: Path) -
 
     control_report = scan_bytes(control_payload, source="functools-cmp-to-key-control.pkl")
     assert control_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_functools_wrapper_finding(control_report, "cmp_to_key")
+    assert _has_critical_global_finding(control_report, "functools", "cmp_to_key")
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -3158,7 +2881,7 @@ def test_scan_bytes_blocks_functools_cmp_to_key_comparison_rce(tmp_path: Path) -
     report = scan_bytes(payload, source="functools-cmp-to-key-operator-lt-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_functools_wrapper_finding(report, "cmp_to_key")
+    assert _has_critical_global_finding(report, "functools", "cmp_to_key")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3183,7 +2906,7 @@ def test_scan_bytes_blocks_logging_filterer_filter_callback_rce(tmp_path: Path) 
     report = scan_bytes(payload, source="logging-filterer-filter-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_logging_filterer_filter_finding(report)
+    assert _has_critical_global_finding(report, "logging", "Filterer.filter")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3320,9 +3043,7 @@ def test_scan_bytes_blocks_logging_file_handler_fragmented_pth_rce(tmp_path: Pat
     pth_path = tmp_path / "logging_filehandler_exec.pth"
     marker = tmp_path / "logging_filehandler_pth_rce_marker"
     payload = _logging_file_handler_pth_payload(pth_path, marker)
-    original_sys_path = list(sys.path)
-
-    try:
+    with _PreservedSysPath():
         report = scan_bytes(payload, source="logging-file-handler-pth-rce.pkl")
 
         assert report.verdict == SafetyVerdict.MALICIOUS
@@ -3340,8 +3061,6 @@ def test_scan_bytes_blocks_logging_file_handler_fragmented_pth_rce(tmp_path: Pat
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-logging-pth"
-    finally:
-        sys.path[:] = original_sys_path
 
 
 @pytest.mark.parametrize(
@@ -3450,9 +3169,7 @@ def test_scan_bytes_blocks_numpy_savetxt_fragmented_pth_rce(tmp_path: Path, writ
         writer_module=writer_module,
         include_write=True,
     )
-    original_sys_path = list(sys.path)
-
-    try:
+    with _PreservedSysPath() as original_sys_path:
         control_report = scan_bytes(control_payload, source=f"numpy-savetxt-{case_name}-control.pkl")
         assert control_report.verdict == SafetyVerdict.CLEAN
 
@@ -3483,8 +3200,6 @@ def test_scan_bytes_blocks_numpy_savetxt_fragmented_pth_rce(tmp_path: Path, writ
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-numpy-savetxt"
-    finally:
-        sys.path[:] = original_sys_path
 
 
 @pytest.mark.skipif(not _module_available("dotenv"), reason="python-dotenv is unavailable")
@@ -4198,9 +3913,7 @@ def test_scan_bytes_blocks_posixpath_writer_and_site_dict_lookup_pth_rce(tmp_pat
         tmp_path,
         include_write=True,
     )
-    original_sys_path = list(sys.path)
-
-    try:
+    with _PreservedSysPath():
         control_report = scan_bytes(control_payload, source="posixpath-site-dict-control.pkl")
         assert control_report.verdict == SafetyVerdict.CLEAN
 
@@ -4223,8 +3936,6 @@ def test_scan_bytes_blocks_posixpath_writer_and_site_dict_lookup_pth_rce(tmp_pat
         assert result is None
         assert pth_path.read_text() == expected_line
         assert marker.read_text() == "owned-by-posixpath-site-dict"
-    finally:
-        sys.path[:] = original_sys_path
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="dotenv.cli.run_command uses POSIX os.execvpe in this proof")
@@ -4460,14 +4171,7 @@ for _ in range(100):
 if not marker.exists():
     raise SystemExit("marker was not written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(marker), payload.hex()],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _run_pickle_child(child_code, marker, payload)
     assert marker.read_text() == "fsspec-registry-owned"
 
 
@@ -4509,14 +4213,7 @@ if process.returncode != 0:
 if not marker.exists():
     raise SystemExit("marker was not written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(marker), payload.hex()],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _run_pickle_child(child_code, marker, payload)
     assert marker.read_text() == "pydantic-dynamic-import-owned"
 
 
@@ -4544,27 +4241,8 @@ def test_scan_bytes_blocks_pydantic_dotted_getattr_alias_rce(tmp_path: Path) -> 
     )
 
     assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-marker = Path(sys.argv[1])
-payload = bytes.fromhex(sys.argv[2])
-result = pickle.loads(payload)
-if result != 0:
-    raise SystemExit(result)
-if not marker.exists():
-    raise SystemExit("marker was not written")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(marker), payload.hex()],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    child_code = _SYSTEM_RESULT_CHILD_CODE
+    _run_pickle_child(child_code, marker, payload)
     assert marker.read_text() == "pydantic-dotted-os-alias-owned"
 
 
@@ -4584,27 +4262,8 @@ def test_scan_bytes_blocks_random_os_import_alias_prefix_rce(tmp_path: Path) -> 
     assert _has_critical_call_graph_finding(report, "random", "_os.system", "os.system")
 
     assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-marker = Path(sys.argv[1])
-payload = bytes.fromhex(sys.argv[2])
-result = pickle.loads(payload)
-if result != 0:
-    raise SystemExit(result)
-if not marker.exists():
-    raise SystemExit("marker was not written")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(marker), payload.hex()],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    child_code = _SYSTEM_RESULT_CHILD_CODE
+    _run_pickle_child(child_code, marker, payload)
     assert marker.read_text() == "random-os-alias-owned"
 
 
@@ -4632,27 +4291,8 @@ def test_scan_bytes_blocks_import_reference_limit_padding_rce(tmp_path: Path) ->
     )
 
     assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-marker = Path(sys.argv[1])
-payload = bytes.fromhex(sys.argv[2])
-result = pickle.loads(payload)
-if result != 0:
-    raise SystemExit(result)
-if not marker.exists():
-    raise SystemExit("marker was not written")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(marker), payload.hex()],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    child_code = _SYSTEM_RESULT_CHILD_CODE
+    _run_pickle_child(child_code, marker, payload)
     assert marker.read_text() == "import-ref-limit-owned"
 
 
@@ -4711,27 +4351,8 @@ def test_scan_bytes_blocks_call_graph_exception_poisoning_rce(tmp_path: Path) ->
     assert _has_critical_call_graph_finding(poison_after_report, "random", "_os.system", "os.system")
 
     assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-marker = Path(sys.argv[1])
-payload = bytes.fromhex(sys.argv[2])
-result = pickle.loads(payload)
-if result != 0:
-    raise SystemExit(result)
-if not marker.exists():
-    raise SystemExit("marker was not written")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(marker), payload.hex()],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    child_code = _SYSTEM_RESULT_CHILD_CODE
+    _run_pickle_child(child_code, marker, payload)
     assert marker.read_text() == "call-graph-poison-owned"
 
 
@@ -4947,9 +4568,7 @@ def test_scan_bytes_blocks_codecs_open_fragmented_pth_rce(tmp_path: Path) -> Non
     pth_path = tmp_path / "codecs_open_exec.pth"
     marker = tmp_path / "codecs_open_pth_rce_marker"
     payload = _codecs_open_pth_payload(pth_path, marker)
-    original_sys_path = list(sys.path)
-
-    try:
+    with _PreservedSysPath():
         report = scan_bytes(payload, source="codecs-open-pth-rce.pkl")
 
         assert report.verdict == SafetyVerdict.MALICIOUS
@@ -4967,8 +4586,6 @@ def test_scan_bytes_blocks_codecs_open_fragmented_pth_rce(tmp_path: Path) -> Non
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-codecs-pth"
-    finally:
-        sys.path[:] = original_sys_path
 
 
 @pytest.mark.parametrize("writer_method", ["DictWriter.writerow", "DictWriter.writerows"])
@@ -4986,9 +4603,7 @@ def test_scan_bytes_blocks_csv_tempfile_fragmented_pth_rce(tmp_path: Path, write
         include_write=True,
         writer_method=writer_method,
     )
-    original_sys_path = list(sys.path)
-
-    try:
+    with _PreservedSysPath() as original_sys_path:
         control_report = scan_bytes(control_payload, source=f"csv-tempfile-{writer_method}-control.pkl")
         assert control_report.verdict == SafetyVerdict.MALICIOUS
         assert _has_critical_global_finding(control_report, "tempfile", "NamedTemporaryFile")
@@ -5026,8 +4641,6 @@ def test_scan_bytes_blocks_csv_tempfile_fragmented_pth_rce(tmp_path: Path, write
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-csv-tempfile"
-    finally:
-        sys.path[:] = original_sys_path
 
 
 @pytest.mark.parametrize(
@@ -5072,9 +4685,7 @@ def test_scan_bytes_blocks_mailbox_singlefile_pth_writes(
         marker_content=marker_content,
         include_add=True,
     )
-    original_sys_path = list(sys.path)
-
-    try:
+    with _PreservedSysPath() as original_sys_path:
         control_report = scan_bytes(control_payload, source=f"mailbox-{case_name}-control.pkl")
         assert control_report.verdict == SafetyVerdict.CLEAN
 
@@ -5105,8 +4716,6 @@ def test_scan_bytes_blocks_mailbox_singlefile_pth_writes(
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == marker_content
-    finally:
-        sys.path[:] = original_sys_path
 
 
 def test_scan_bytes_preserves_mailbox_add_detection_when_constructor_analysis_unavailable(
@@ -5268,7 +4877,7 @@ def test_scan_bytes_blocks_inspect_getmembers_descriptor_rce(tmp_path: Path) -> 
     report = scan_bytes(payload, source="inspect-getmembers-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_inspect_getmembers_finding(report)
+    assert _has_critical_global_finding(report, "inspect", "getmembers")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5292,7 +4901,7 @@ def test_scan_bytes_blocks_builtins_hasattr_descriptor_rce(tmp_path: Path) -> No
     report = scan_bytes(payload, source="builtins-hasattr-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_hasattr_finding(report)
+    assert _has_critical_global_finding(report, "builtins", "hasattr")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6482,7 +6091,7 @@ def test_scan_bytes_blocks_builtins_staticmethod_descriptor_rce(tmp_path: Path) 
 
     control_report = scan_bytes(control_payload, source="builtins-staticmethod-descriptor-control.pkl")
     assert control_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_staticmethod_finding(control_report)
+    assert _has_critical_global_finding(control_report, "builtins", "staticmethod")
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6492,7 +6101,7 @@ def test_scan_bytes_blocks_builtins_staticmethod_descriptor_rce(tmp_path: Path) 
     report = scan_bytes(payload, source="builtins-staticmethod-descriptor-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_staticmethod_finding(report)
+    assert _has_critical_global_finding(report, "builtins", "staticmethod")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6516,7 +6125,7 @@ def test_scan_bytes_blocks_builtins_property_get_descriptor_rce(tmp_path: Path) 
     report = scan_bytes(payload, source="builtins-property-get-descriptor-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_property_get_finding(report)
+    assert _has_critical_global_finding(report, "builtins", "property.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6531,7 +6140,7 @@ def test_scan_bytes_blocks_builtins_classmethod_get_descriptor_rce(tmp_path: Pat
 
     control_report = scan_bytes(control_payload, source="builtins-classmethod-get-descriptor-control.pkl")
     assert control_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_classmethod_get_finding(control_report)
+    assert _has_critical_global_finding(control_report, "builtins", "classmethod.__get__")
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6542,7 +6151,7 @@ def test_scan_bytes_blocks_builtins_classmethod_get_descriptor_rce(tmp_path: Pat
     report = scan_bytes(payload, source="builtins-classmethod-get-descriptor-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_classmethod_get_finding(report)
+    assert _has_critical_global_finding(report, "builtins", "classmethod.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6557,7 +6166,7 @@ def test_scan_bytes_blocks_private_functools_partial_rce(tmp_path: Path) -> None
 
     control_report = scan_bytes(control_payload, source="private-functools-partial-control.pkl")
     assert control_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_private_functools_partial_finding(control_report)
+    assert _has_critical_global_finding(control_report, "_functools", "partial")
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6568,7 +6177,7 @@ def test_scan_bytes_blocks_private_functools_partial_rce(tmp_path: Path) -> None
     report = scan_bytes(payload, source="private-functools-partial-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_private_functools_partial_finding(report)
+    assert _has_critical_global_finding(report, "_functools", "partial")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6583,7 +6192,7 @@ def test_scan_bytes_blocks_private_functools_reduce_rce(tmp_path: Path) -> None:
 
     control_report = scan_bytes(control_payload, source="private-functools-reduce-control.pkl")
     assert control_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_private_functools_reduce_finding(control_report)
+    assert _has_critical_global_finding(control_report, "_functools", "reduce")
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6594,7 +6203,7 @@ def test_scan_bytes_blocks_private_functools_reduce_rce(tmp_path: Path) -> None:
     report = scan_bytes(payload, source="private-functools-reduce-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_private_functools_reduce_finding(report)
+    assert _has_critical_global_finding(report, "_functools", "reduce")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6618,7 +6227,7 @@ def test_scan_bytes_blocks_functools_callable_wrapper_rce(tmp_path: Path, factor
 
     control_report = scan_bytes(control_payload, source=f"functools-{factory_name}-wrapper-control.pkl")
     assert control_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_functools_wrapper_finding(control_report, factory_name)
+    assert _has_critical_global_finding(control_report, "functools", factory_name)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6628,7 +6237,7 @@ def test_scan_bytes_blocks_functools_callable_wrapper_rce(tmp_path: Path, factor
     report = scan_bytes(payload, source=f"functools-{factory_name}-wrapper-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_functools_wrapper_finding(report, factory_name)
+    assert _has_critical_global_finding(report, "functools", factory_name)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6643,7 +6252,7 @@ def test_scan_bytes_blocks_unittest_mock_side_effect_rce(tmp_path: Path) -> None
     report = scan_bytes(payload, source="unittest-mock-side-effect-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_unittest_mock_finding(report, "Mock")
+    assert _has_critical_global_finding(report, "unittest.mock", "Mock")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6658,8 +6267,8 @@ def test_scan_bytes_blocks_threadpool_executor_submitted_callback_rce(tmp_path: 
     report = scan_bytes(payload, source="threadpool-executor-submit-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_concurrent_futures_finding(report, "ThreadPoolExecutor.submit")
-    assert _has_critical_concurrent_futures_finding(report, "ThreadPoolExecutor.shutdown")
+    assert _has_critical_global_finding(report, "concurrent.futures", "ThreadPoolExecutor.submit")
+    assert _has_critical_global_finding(report, "concurrent.futures", "ThreadPoolExecutor.shutdown")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6683,8 +6292,8 @@ def test_scan_bytes_blocks_processpool_executor_submitted_callback_rce(tmp_path:
     report = scan_bytes(payload, source="processpool-executor-submit-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_concurrent_futures_finding(report, "ProcessPoolExecutor.submit")
-    assert _has_critical_concurrent_futures_finding(report, "ProcessPoolExecutor.shutdown")
+    assert _has_critical_global_finding(report, "concurrent.futures", "ProcessPoolExecutor.submit")
+    assert _has_critical_global_finding(report, "concurrent.futures", "ProcessPoolExecutor.shutdown")
 
     script_path = tmp_path / "run_processpool_payload.py"
     script_path.write_text(
@@ -6714,9 +6323,7 @@ def test_scan_bytes_blocks_site_addsitedir_pth_execution_rce(tmp_path: Path) -> 
         include_addsitedir=False,
     )
     payload = _site_addsitedir_pth_payload(pth_path, marker, include_addsitedir=True)
-    original_sys_path = list(sys.path)
-
-    try:
+    with _PreservedSysPath():
         control_report = scan_bytes(control_payload, source="site-addsitedir-pth-control.pkl")
         assert control_report.verdict == SafetyVerdict.MALICIOUS
         assert _has_critical_global_finding(control_report, "pathlib", "Path.write_text")
@@ -6732,13 +6339,11 @@ def test_scan_bytes_blocks_site_addsitedir_pth_execution_rce(tmp_path: Path) -> 
         report = scan_bytes(payload, source="site-addsitedir-pth-rce.pkl")
 
         assert report.verdict == SafetyVerdict.MALICIOUS
-        assert _has_critical_site_finding(report, "addsitedir")
+        assert _has_critical_global_finding(report, "site", "addsitedir")
 
         result = pickle.loads(payload)
         assert result is None
         assert marker.exists()
-    finally:
-        sys.path[:] = original_sys_path
 
 
 def test_scan_bytes_blocks_unittest_loader_discover_import_execution_rce(tmp_path: Path) -> None:
@@ -6771,7 +6376,7 @@ def test_scan_bytes_blocks_unittest_loader_discover_import_execution_rce(tmp_pat
         report = scan_bytes(payload, source="unittest-loader-discover-rce.pkl")
 
         assert report.verdict == SafetyVerdict.MALICIOUS
-        assert _has_critical_unittest_loader_finding(report, "TestLoader.discover")
+        assert _has_critical_global_finding(report, "unittest.loader", "TestLoader.discover")
 
         result = pickle.loads(payload)
         assert type(result).__module__ == "unittest.suite"
@@ -6813,8 +6418,8 @@ def test_scan_bytes_blocks_unittest_mock_patch_start_import_execution_rce(tmp_pa
         report = scan_bytes(payload, source="unittest-mock-patch-start-rce.pkl")
 
         assert report.verdict == SafetyVerdict.MALICIOUS
-        assert _has_critical_unittest_mock_finding(report, "patch")
-        assert _has_critical_unittest_mock_finding(report, "_patch.start")
+        assert _has_critical_global_finding(report, "unittest.mock", "patch")
+        assert _has_critical_global_finding(report, "unittest.mock", "_patch.start")
 
         result = pickle.loads(payload)
         assert result == 2
@@ -6851,7 +6456,7 @@ def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path)
     report = scan_bytes(payload, source="dataclasses-create-fn-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_dataclasses_create_fn_finding(report)
+    assert _has_critical_global_finding(report, "dataclasses", "_create_fn")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6880,7 +6485,7 @@ def test_scan_bytes_blocks_pipes_template_copy_pipeline_rce(tmp_path: Path) -> N
     report = scan_bytes(payload, source="pipes-template-copy-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_pipes_template_copy_finding(report)
+    assert _has_critical_global_finding(report, "pipes", "Template.copy")
 
     assert not marker.exists()
     pickle.loads(payload)
@@ -6895,7 +6500,7 @@ def test_scan_bytes_blocks_operator_call_public_alias_rce(tmp_path: Path) -> Non
     report = scan_bytes(payload, source="operator-call-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_operator_call_finding(report)
+    assert _has_critical_global_finding(report, "operator", "call")
 
     import operator
 
@@ -6915,7 +6520,7 @@ def test_scan_bytes_blocks_builtins_map_forced_iteration_rce(tmp_path: Path) -> 
     report = scan_bytes(payload, source="builtins-map-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_map_finding(report)
+    assert _has_critical_global_finding(report, "builtins", "map")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6930,7 +6535,7 @@ def test_scan_bytes_blocks_builtins_filter_forced_iteration_rce(tmp_path: Path) 
     report = scan_bytes(payload, source="builtins-filter-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_builtins_filter_finding(report)
+    assert _has_critical_global_finding(report, "builtins", "filter")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6945,7 +6550,7 @@ def test_scan_bytes_blocks_itertools_accumulate_binary_function_rce(tmp_path: Pa
     report = scan_bytes(payload, source="itertools-accumulate-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_itertools_accumulate_finding(report)
+    assert _has_critical_global_finding(report, "itertools", "accumulate")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6960,7 +6565,7 @@ def test_scan_bytes_blocks_itertools_dropwhile_forced_iteration_rce(tmp_path: Pa
     report = scan_bytes(payload, source="itertools-dropwhile-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_itertools_dropwhile_finding(report)
+    assert _has_critical_global_finding(report, "itertools", "dropwhile")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6975,7 +6580,7 @@ def test_scan_bytes_blocks_itertools_filterfalse_forced_iteration_rce(tmp_path: 
     report = scan_bytes(payload, source="itertools-filterfalse-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_itertools_filterfalse_finding(report)
+    assert _has_critical_global_finding(report, "itertools", "filterfalse")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6990,7 +6595,7 @@ def test_scan_bytes_blocks_itertools_groupby_key_function_rce(tmp_path: Path) ->
     report = scan_bytes(payload, source="itertools-groupby-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_itertools_groupby_finding(report)
+    assert _has_critical_global_finding(report, "itertools", "groupby")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -7008,7 +6613,7 @@ def test_scan_bytes_blocks_itertools_starmap_forced_iteration_rce(tmp_path: Path
     report = scan_bytes(payload, source="itertools-starmap-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_itertools_starmap_finding(report)
+    assert _has_critical_global_finding(report, "itertools", "starmap")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -7023,7 +6628,7 @@ def test_scan_bytes_blocks_itertools_takewhile_forced_iteration_rce(tmp_path: Pa
     report = scan_bytes(payload, source="itertools-takewhile-tuple-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_itertools_takewhile_finding(report)
+    assert _has_critical_global_finding(report, "itertools", "takewhile")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -7038,7 +6643,7 @@ def test_scan_bytes_blocks_typing_eval_type_forward_ref_rce(tmp_path: Path) -> N
     report = scan_bytes(payload, source="typing-eval-type-forward-ref-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_typing_eval_type_finding(report)
+    assert _has_critical_global_finding(report, "typing", "_eval_type")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -7053,7 +6658,7 @@ def test_scan_bytes_blocks_typing_get_type_hints_annotation_rce(tmp_path: Path) 
     report = scan_bytes(payload, source="typing-get-type-hints-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_typing_get_type_hints_finding(report)
+    assert _has_critical_global_finding(report, "typing", "get_type_hints")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -7082,7 +6687,7 @@ def test_scan_bytes_blocks_setuptools_distutils_spawn_rce(tmp_path: Path) -> Non
     report = scan_bytes(payload, source="setuptools-distutils-spawn-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_setuptools_distutils_spawn_finding(report)
+    assert _has_critical_global_finding(report, "setuptools._distutils.spawn", "spawn")
 
     assert not marker.exists()
     pickle.loads(payload)

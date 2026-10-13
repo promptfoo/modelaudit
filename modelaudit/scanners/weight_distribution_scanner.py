@@ -726,42 +726,6 @@ class WeightDistributionScanner(BaseScanner):
                 seen_storages.add(storage_identity)
         return array.T
 
-    def _python_tensor_nbytes(self, value: Any) -> int | None:
-        max_bytes = self._remaining_tensor_bytes()
-        stack: list[tuple[Any, bool]] = [(value, False)]
-        active_containers: set[int] = set()
-        scalar_count = 0
-        max_itemsize = 1
-
-        while stack:
-            item, exiting = stack.pop()
-            if isinstance(item, (list, tuple)):
-                item_id = id(item)
-                if exiting:
-                    active_containers.remove(item_id)
-                    continue
-                if item_id in active_containers:
-                    return None
-                active_containers.add(item_id)
-                stack.append((item, True))
-                stack.extend((child, False) for child in reversed(item))
-                continue
-            if isinstance(item, bool):
-                itemsize = 1
-            elif isinstance(item, complex):
-                itemsize = 16
-            elif isinstance(item, float) or (isinstance(item, int) and -(2**63) <= item < 2**63):
-                itemsize = 8
-            else:
-                return None
-            scalar_count += 1
-            max_itemsize = max(max_itemsize, itemsize)
-            estimated_nbytes = scalar_count * max_itemsize
-            if max_bytes is not None and estimated_nbytes > max_bytes:
-                return estimated_nbytes
-
-        return scalar_count * max_itemsize
-
     @staticmethod
     def _python_tensor_has_matrix_shape(value: Any) -> bool:
         if not isinstance(value, (list, tuple)) or not value:

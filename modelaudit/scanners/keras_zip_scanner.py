@@ -53,6 +53,8 @@ from .archive_dispatch import (
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .keras_utils import (
+    _DANGEROUS_CONFIG_MODULE_ROOTS,
+    _keras_exact_module_policy,
     check_custom_loss_config,
     check_custom_metric_config,
     check_lambda_dict_function,
@@ -74,40 +76,6 @@ from .zip_scanner import (
 _SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
 _SAFE_ALLOWLISTED_REGISTERED_OBJECTS: frozenset[str] = frozenset({"notequal"})
 
-# Importable module roots that are explicitly dangerous when referenced in config.json.
-_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
-    {
-        "os",
-        "sys",
-        "subprocess",
-        "builtins",
-        "__builtin__",
-        "importlib",
-        "shutil",
-        "socket",
-        "http",
-        "pickle",
-        "marshal",
-        "ctypes",
-        "code",
-        "codeop",
-        "compileall",
-        "runpy",
-        "webbrowser",
-        "tempfile",
-        "signal",
-        "multiprocessing",
-        "threading",
-        "pty",
-        "commands",
-        "pdb",
-        "profile",
-        "trace",
-        "pip",
-        "setuptools",
-        "distutils",
-    }
-)
 _DANGEROUS_LAMBDA_MODULE_TOKENS = frozenset(
     {
         "__builtin__",
@@ -135,28 +103,7 @@ _DANGEROUS_LAMBDA_FUNCTION_MODULE_ROOTS = {
 
 # Native extension modules are not packages. Only known executable symbols are
 # critical; other exact-module references remain subject to callable warnings.
-_DANGEROUS_EXACT_MODULE_SYMBOLS: dict[str, frozenset[str]] = {
-    "_ctypes": frozenset({"dlopen"}),
-    "_frozen_importlib": frozenset({"__import__", "_find_and_load", "_find_and_load_unlocked"}),
-    "_imp": frozenset({"create_builtin", "create_dynamic", "exec_builtin", "exec_dynamic", "load_dynamic"}),
-    "_interpreters": frozenset({"call", "exec"}),
-    "_io": frozenset({"open"}),
-    "_operator": frozenset({"attrgetter", "methodcaller"}),
-    "_pickle": frozenset({"load", "loads"}),
-    "_posixsubprocess": frozenset({"fork_exec"}),
-    "_socket": frozenset({"socket"}),
-    "_thread": frozenset({"start_new", "start_new_thread"}),
-    "_winapi": frozenset({"CreateProcess", "ShellExecute"}),
-    "_xxsubinterpreters": frozenset({"run_string"}),
-    "io": frozenset({"open"}),
-    "nt": frozenset({"popen", "startfile", "system"}),
-    "operator": frozenset({"attrgetter", "methodcaller"}),
-    "posix": frozenset({"popen", "system"}),
-}
-_DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES: dict[str, tuple[str, ...]] = {
-    "nt": ("exec", "spawn"),
-    "posix": ("exec", "spawn"),
-}
+_DANGEROUS_EXACT_MODULE_SYMBOLS, _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES = _keras_exact_module_policy()
 
 _NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
     {
@@ -349,10 +296,6 @@ def _content_routable_hdf5_userblock_segments(prefix: bytes) -> tuple[bytes, ...
 
     candidate = prefix.rstrip(b"\x00")
     return (candidate,) if candidate else ()
-
-
-def _redact_url_for_display(url: str) -> str:
-    return redact_url_for_finding(url)
 
 
 try:
@@ -577,12 +520,6 @@ class KerasZipScanner(BaseScanner):
                 if isinstance(value, str) and value.strip():
                     module_references.append(value.strip())
         return module_references
-
-    def _layer_uses_allowlisted_module(self, layer: dict[str, Any]) -> bool:
-        return any(
-            self._is_allowlisted_keras_module(module_value)
-            for module_value in self._iter_layer_module_references(layer)
-        )
 
     def _layer_uses_non_allowlisted_module(self, layer: dict[str, Any]) -> bool:
         return any(
@@ -1066,14 +1003,7 @@ class KerasZipScanner(BaseScanner):
     @staticmethod
     def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
         """Mark the scan as incomplete without converting it into a security finding."""
-        existing_reasons = result.metadata.get("scan_outcome_reasons")
-        reasons = existing_reasons if isinstance(existing_reasons, list) else []
-        if reason not in reasons:
-            reasons.append(reason)
-
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = reasons
-        result.metadata["analysis_incomplete"] = True
+        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     def _new_config_traversal_state(self) -> _ConfigTraversalState:
         return _ConfigTraversalState(
@@ -2739,7 +2669,7 @@ class KerasZipScanner(BaseScanner):
                 details={
                     "cve_id": "CVE-2025-12060",
                     "context": redact_evidence_string(context),
-                    "urls": [_redact_url_for_display(origin)],
+                    "urls": [redact_url_for_finding(origin)],
                     "cvss": 8.8,
                     "cwe": "CWE-22",
                     "description": (

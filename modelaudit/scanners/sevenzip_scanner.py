@@ -50,22 +50,19 @@ class _ExtractionBudgetExceeded(Exception):
         file_name: str,
         *,
         cumulative_bytes: int,
-        total_limit: int,
         file_bytes: int,
         file_limit: int,
     ) -> None:
         super().__init__(f"Extraction budget exceeded while extracting {file_name}")
         self.file_name = file_name
         self.cumulative_bytes = cumulative_bytes
-        self.total_limit = total_limit
         self.file_bytes = file_bytes
         self.file_limit = file_limit
 
 
 class _HeaderProbeBuffer:
-    def __init__(self, limit: int, *, raise_on_limit: bool = True) -> None:
+    def __init__(self, limit: int) -> None:
         self._limit = limit
-        self._raise_on_limit = raise_on_limit
         self._buffer = io.BytesIO()
 
     def write(self, data: bytes | bytearray) -> int:
@@ -74,7 +71,7 @@ class _HeaderProbeBuffer:
         remaining = self._limit - self.size()
         if remaining > 0:
             self._buffer.write(data[:remaining])
-        if self.size() >= self._limit and self._raise_on_limit:
+        if self.size() >= self._limit:
             raise _HeaderProbeComplete
         return len(data)
 
@@ -95,18 +92,14 @@ class _HeaderProbeBuffer:
 
 
 class _HeaderProbeFactory:
-    def __init__(self, limit: int, *, raise_on_limit: bool = True) -> None:
+    def __init__(self, limit: int) -> None:
         self._limit = limit
-        self._raise_on_limit = raise_on_limit
         self.products: dict[str, _HeaderProbeBuffer] = {}
 
     def create(self, filename: str) -> _HeaderProbeBuffer:
-        probe = _HeaderProbeBuffer(self._limit, raise_on_limit=self._raise_on_limit)
+        probe = _HeaderProbeBuffer(self._limit)
         self.products[filename] = probe
         return probe
-
-    def get(self, filename: str) -> _HeaderProbeBuffer | None:
-        return self.products.get(filename)
 
 
 class _BudgetedExtractionFile:
@@ -134,14 +127,13 @@ class _BudgetedExtractionFile:
             raise _ExtractionBudgetExceeded(
                 self._file_name,
                 cumulative_bytes=projected_total_size,
-                total_limit=self._max_total_size,
                 file_bytes=projected_file_size,
                 file_limit=self._max_file_size,
             )
 
         self._file.write(data)
         self._written = projected_file_size
-        self._budget.record_extract_bytes(chunk_size)
+        self._budget.cumulative_extract_bytes += chunk_size
         return chunk_size
 
     def flush(self) -> None:
@@ -200,17 +192,6 @@ class _RecursiveScanBudget:
     cumulative_entries: int = 0
     cumulative_extract_bytes: int = 0
     limit_exceeded: bool = False
-
-    def record_entries(self, entry_count: int) -> int:
-        self.cumulative_entries += entry_count
-        return self.cumulative_entries
-
-    def record_extract_bytes(self, extracted_size: int) -> int:
-        self.cumulative_extract_bytes += extracted_size
-        return self.cumulative_extract_bytes
-
-    def abort_due_to_limit(self) -> None:
-        self.limit_exceeded = True
 
     def should_stop(self) -> bool:
         return self.limit_exceeded
@@ -556,7 +537,7 @@ class SevenZipScanner(BaseScanner):
 
             # Check per-archive entry limit
             if entry_limit_exceeded:
-                budget.abort_due_to_limit()
+                budget.limit_exceeded = True
                 result.add_check(
                     name="Archive Entry Limit",
                     passed=False,
@@ -581,9 +562,10 @@ class SevenZipScanner(BaseScanner):
                 return result
 
             # Check cumulative entry count across nesting depths
-            cumulative_entries = budget.record_entries(len(file_names))
+            budget.cumulative_entries += len(file_names)
+            cumulative_entries = budget.cumulative_entries
             if cumulative_entries > self.max_cumulative_entries:
-                budget.abort_due_to_limit()
+                budget.limit_exceeded = True
                 result.add_check(
                     name="Cumulative Entry Limit",
                     passed=False,
@@ -935,7 +917,7 @@ class SevenZipScanner(BaseScanner):
             with suppress(Exception):
                 archive.reset()
 
-        probe = probe_factory.get(file_name)
+        probe = probe_factory.products.get(file_name)
         if probe is None:
             probe = next(iter(probe_factory.products.values()), None)
         if probe is None:
@@ -1092,10 +1074,6 @@ class SevenZipScanner(BaseScanner):
             executable_probe_incomplete=executable_probe_outcome == "incomplete",
         )
 
-    def _member_probe_detected_format(self, archive: Any, file_name: str) -> str | None:
-        """Read only enough bytes to confirm whether a member has a scannable nested format."""
-        return self._member_probe_result(archive, file_name).detected_format
-
     def _check_path_traversal(self, file_names: list[str], archive_path: str, result: ScanResult) -> list[str]:
         """Check for path traversal vulnerabilities and return only safe entries."""
         safe_entries: list[str] = []
@@ -1207,7 +1185,7 @@ class SevenZipScanner(BaseScanner):
 
         projected_cumulative_bytes = budget.cumulative_extract_bytes + known_extract_bytes
         if known_extract_bytes > 0 and projected_cumulative_bytes > self.max_total_extract_size:
-            budget.abort_due_to_limit()
+            budget.limit_exceeded = True
             self._add_cumulative_extraction_size_check(
                 result,
                 archive_path,
@@ -1275,9 +1253,10 @@ class SevenZipScanner(BaseScanner):
 
                             # Check cumulative extraction size
                             if extraction_factory is None:
-                                cumulative_extract_bytes = budget.record_extract_bytes(extracted_size)
+                                budget.cumulative_extract_bytes += extracted_size
+                                cumulative_extract_bytes = budget.cumulative_extract_bytes
                                 if cumulative_extract_bytes > self.max_total_extract_size:
-                                    budget.abort_due_to_limit()
+                                    budget.limit_exceeded = True
                                     scan_complete = False
                                     self._add_cumulative_extraction_size_check(
                                         result,
@@ -1343,7 +1322,7 @@ class SevenZipScanner(BaseScanner):
                         )
 
             except _ExtractionBudgetExceeded as e:
-                budget.abort_due_to_limit()
+                budget.limit_exceeded = True
                 scan_complete = False
                 if e.file_bytes > e.file_limit:
                     result.add_check(

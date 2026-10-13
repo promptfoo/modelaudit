@@ -113,6 +113,23 @@ def _call_graph_fingerprint_metadata(
     }
 
 
+def _private_fingerprint_result(fingerprint_metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+
+def _result_with_fingerprints(metadata: dict[str, Any], fingerprint_metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "checks": [],
+        "issues": [],
+        "metadata": metadata,
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+
 def _source_independent_call_graph_fingerprint_metadata(*, critical_references: bool = False) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "reusable": True,
@@ -2059,6 +2076,68 @@ def _stub_darwin_select(queue: Any) -> type[Any]:
     return StubDarwinSelect
 
 
+class _StubDarwinQueue:
+    closed = False
+
+    def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+        return []
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _assert_darwin_attribute_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    event_index: int,
+    event_flags: int,
+    expected_changed: bool,
+) -> None:
+    class EventQueue:
+        def __init__(self) -> None:
+            self.registered_events: list[Any] = []
+            self.pending = True
+
+        def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            if changes is not None:
+                self.registered_events.extend(changes)
+                return []
+            if self.pending:
+                self.pending = False
+                event = self.registered_events[event_index]
+                return [SimpleNamespace(ident=event[0][0], fflags=event_flags, flags=0)]
+            return []
+
+        def close(self) -> None:
+            return None
+
+    file_path = _make_cacheable_file(tmp_path)
+    queue = EventQueue()
+    select_stub = _stub_darwin_select(queue)
+    opened_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+
+    open_path = _record_opened_descriptors(opened_descriptors)
+
+    monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
+    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
+    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
+
+    monitor = scan_results_cache_module._DarwinPathMonitor(
+        str(file_path),
+        ((str(tmp_path), 0, 0, 0, 0, 0),),
+    )
+
+    assert len(queue.registered_events) == 2
+    assert queue.registered_events[0][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
+    assert queue.registered_events[1][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
+    monitor.discard_validated_file_attribute_event()
+    assert monitor.changed() is expected_changed
+    monitor.close()
+    assert sorted(closed_descriptors) == opened_descriptors
+
+
 def _install_portable_darwin_monitor(
     file_path: Path,
     queue: Any,
@@ -2172,7 +2251,8 @@ def test_darwin_path_monitor_allows_read_between_capture_and_store(
 
         def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
             if changes is not None:
-                self.registered_events.extend(changes)
+                # Each monitor opens a fresh kqueue, so old descriptor registrations expire.
+                self.registered_events = list(changes)
                 return []
             if self.pending_file_attributes:
                 self.pending_file_attributes -= 1
@@ -2216,160 +2296,28 @@ def test_darwin_path_monitor_ignores_file_access_time_attribute_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FileAccessQueue:
-        def __init__(self) -> None:
-            self.registered_events: list[Any] = []
-            self.pending = True
-
-        def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            if changes is not None:
-                self.registered_events.extend(changes)
-                return []
-            if self.pending:
-                self.pending = False
-                file_event = self.registered_events[0]
-                return [SimpleNamespace(ident=file_event[0][0], fflags=64, flags=0)]
-            return []
-
-        def close(self) -> None:
-            return None
-
-    file_path = _make_cacheable_file(tmp_path)
-    queue = FileAccessQueue()
-    select_stub = _stub_darwin_select(queue)
-    opened_descriptors: list[int] = []
-    closed_descriptors: list[int] = []
-
-    open_path = _record_opened_descriptors(opened_descriptors)
-
-    monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
-    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
-    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
-
-    monitor = scan_results_cache_module._DarwinPathMonitor(
-        str(file_path),
-        ((str(tmp_path), 0, 0, 0, 0, 0),),
-    )
-
-    assert len(queue.registered_events) == 2
-    assert queue.registered_events[0][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
-    assert queue.registered_events[1][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
-    monitor.discard_validated_file_attribute_event()
-    assert monitor.changed() is False
-    monitor.close()
-    assert sorted(closed_descriptors) == opened_descriptors
+    _assert_darwin_attribute_event(tmp_path, monkeypatch, event_index=0, event_flags=64, expected_changed=False)
 
 
 def test_darwin_path_monitor_reports_ancestor_attribute_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class AttributeAwareQueue:
-        def __init__(self) -> None:
-            self.registered_events: list[Any] = []
-            self.pending = True
-
-        def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            if changes is not None:
-                self.registered_events.extend(changes)
-                return []
-            if self.pending:
-                self.pending = False
-                ancestor_event = self.registered_events[1]
-                return [SimpleNamespace(ident=ancestor_event[0][0], fflags=64, flags=0)]
-            return []
-
-        def close(self) -> None:
-            return None
-
-    file_path = _make_cacheable_file(tmp_path)
-    queue = AttributeAwareQueue()
-    select_stub = _stub_darwin_select(queue)
-    opened_descriptors: list[int] = []
-    closed_descriptors: list[int] = []
-
-    open_path = _record_opened_descriptors(opened_descriptors)
-
-    monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
-    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
-    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
-
-    monitor = scan_results_cache_module._DarwinPathMonitor(
-        str(file_path),
-        ((str(tmp_path), 0, 0, 0, 0, 0),),
-    )
-
-    assert len(queue.registered_events) == 2
-    assert queue.registered_events[0][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
-    assert queue.registered_events[1][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
-    monitor.discard_validated_file_attribute_event()
-    assert monitor.changed() is True
-    monitor.close()
-    assert sorted(closed_descriptors) == opened_descriptors
+    _assert_darwin_attribute_event(tmp_path, monkeypatch, event_index=1, event_flags=64, expected_changed=True)
 
 
 def test_darwin_path_monitor_preserves_non_attribute_file_events(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class MixedFileEventQueue:
-        def __init__(self) -> None:
-            self.registered_events: list[Any] = []
-            self.pending = True
-
-        def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            if changes is not None:
-                self.registered_events.extend(changes)
-                return []
-            if self.pending:
-                self.pending = False
-                file_event = self.registered_events[0]
-                return [
-                    SimpleNamespace(
-                        ident=file_event[0][0],
-                        fflags=select_stub.KQ_NOTE_ATTRIB | select_stub.KQ_NOTE_DELETE,
-                        flags=0,
-                    )
-                ]
-            return []
-
-        def close(self) -> None:
-            return None
-
-    file_path = _make_cacheable_file(tmp_path)
-    queue = MixedFileEventQueue()
-    select_stub = _stub_darwin_select(queue)
-    opened_descriptors: list[int] = []
-    closed_descriptors: list[int] = []
-
-    open_path = _record_opened_descriptors(opened_descriptors)
-
-    monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
-    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
-    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
-
-    monitor = scan_results_cache_module._DarwinPathMonitor(
-        str(file_path),
-        ((str(tmp_path), 0, 0, 0, 0, 0),),
-    )
-
-    monitor.discard_validated_file_attribute_event()
-    assert monitor.changed() is True
-    monitor.close()
-    assert sorted(closed_descriptors) == opened_descriptors
+    # Combine KQ_NOTE_ATTRIB and KQ_NOTE_DELETE.
+    _assert_darwin_attribute_event(tmp_path, monkeypatch, event_index=0, event_flags=64 | 8, expected_changed=True)
 
 
 def test_darwin_path_monitor_normalizes_relative_file_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class StubQueue:
-        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            return []
-
-        def close(self) -> None:
-            return None
-
     file_path = _make_cacheable_file(tmp_path)
     opened_paths: list[str] = []
     closed_descriptors: list[int] = []
@@ -2379,7 +2327,7 @@ def test_darwin_path_monitor_normalizes_relative_file_path(
         return 100 + len(opened_paths)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(StubQueue()))
+    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(_StubDarwinQueue()))
     monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
     monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
 
@@ -2397,14 +2345,9 @@ def test_darwin_path_monitor_closes_descriptors_when_registration_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FailingQueue:
-        closed = False
-
+    class FailingQueue(_StubDarwinQueue):
         def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
             raise OSError("registration failed")
-
-        def close(self) -> None:
-            self.closed = True
 
     file_path = _make_cacheable_file(tmp_path)
     queue = FailingQueue()
@@ -2430,16 +2373,7 @@ def test_darwin_path_monitor_closes_descriptors_when_registration_fails(
 def test_darwin_path_monitor_closes_queue_when_path_setup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class StubQueue:
-        closed = False
-
-        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            return []
-
-        def close(self) -> None:
-            self.closed = True
-
-    queue = StubQueue()
+    queue = _StubDarwinQueue()
     monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
 
     def fail_abspath(_path: str) -> str:
@@ -2456,16 +2390,7 @@ def test_darwin_path_monitor_closes_queue_when_path_setup_fails(
 def test_darwin_path_monitor_closes_queue_on_retained_keyboard_interrupt_during_path_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class StubQueue:
-        closed = False
-
-        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            return []
-
-        def close(self) -> None:
-            self.closed = True
-
-    queue = StubQueue()
+    queue = _StubDarwinQueue()
     monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
 
     def interrupt_abspath(_path: str) -> str:
@@ -2484,15 +2409,6 @@ def test_darwin_path_monitor_closes_descriptor_when_callback_registration_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class StubQueue:
-        closed = False
-
-        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            return []
-
-        def close(self) -> None:
-            self.closed = True
-
     class FailingCallbackStack:
         def __enter__(self) -> FailingCallbackStack:
             return self
@@ -2504,7 +2420,7 @@ def test_darwin_path_monitor_closes_descriptor_when_callback_registration_fails(
             raise MemoryError("callback registration failed")
 
     file_path = _make_cacheable_file(tmp_path)
-    queue = StubQueue()
+    queue = _StubDarwinQueue()
     closed_descriptors: list[int] = []
     monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
     monkeypatch.setattr(scan_results_cache_module, "ExitStack", FailingCallbackStack)
@@ -2522,15 +2438,6 @@ def test_darwin_path_monitor_does_not_double_close_when_stack_transfer_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class StubQueue:
-        closed = False
-
-        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
-            return []
-
-        def close(self) -> None:
-            self.closed = True
-
     class FailingTransferStack:
         def __init__(self) -> None:
             self.callbacks: list[tuple[Callable[[int], None], int]] = []
@@ -2549,7 +2456,7 @@ def test_darwin_path_monitor_does_not_double_close_when_stack_transfer_fails(
             raise MemoryError("stack transfer failed")
 
     file_path = _make_cacheable_file(tmp_path)
-    queue = StubQueue()
+    queue = _StubDarwinQueue()
     opened_descriptors: list[int] = []
     closed_descriptors: list[int] = []
 
@@ -3543,11 +3450,7 @@ def test_scan_cache_invalidates_symlink_sensitive_parent_search_context(
         module_sources={"cache_switch_module": clean_source_path},
     )
     fingerprint_metadata["search_context"] = cache._source_search_context()
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+    scan_result = _private_fingerprint_result(fingerprint_metadata)
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3574,16 +3477,12 @@ def test_scan_cache_invalidates_when_loaded_module_override_appears(
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {str(first_source.absolute()): hashlib.sha256(first_source.read_bytes()).hexdigest()},
-                module_sources={"cache_switch_module": str(first_source.absolute())},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {str(first_source.absolute()): hashlib.sha256(first_source.read_bytes()).hexdigest()},
+            module_sources={"cache_switch_module": str(first_source.absolute())},
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3613,16 +3512,12 @@ def test_scan_cache_invalidates_when_loaded_parent_package_can_redirect_child(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     first_source_path = str(first_source.absolute())
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {first_source_path: hashlib.sha256(first_source.read_bytes()).hexdigest()},
-                module_sources={"cache_pkg.child": first_source_path},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {first_source_path: hashlib.sha256(first_source.read_bytes()).hexdigest()},
+            module_sources={"cache_pkg.child": first_source_path},
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3664,17 +3559,13 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     first_source_path = str(first_source.absolute())
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {first_source_path: hashlib.sha256(first_source.read_bytes()).hexdigest()},
-                module_sources={"cache_pkg.child": first_source_path},
-                loaded_package_paths={"cache_pkg": [package_path]},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {first_source_path: hashlib.sha256(first_source.read_bytes()).hexdigest()},
+            module_sources={"cache_pkg.child": first_source_path},
+            loaded_package_paths={"cache_pkg": [package_path]},
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3717,17 +3608,13 @@ def test_scan_cache_invalidates_loaded_package_importer_semantics_change(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     source = str(source_path.absolute())
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
-                module_sources={"cache_pkg.child": source},
-                loaded_package_paths={"cache_pkg": [package_path]},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+            module_sources={"cache_pkg.child": source},
+            loaded_package_paths={"cache_pkg": [package_path]},
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3760,17 +3647,13 @@ def test_scan_cache_rejects_custom_importer_on_matching_loaded_parent_package_pa
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     source = str(source_path.absolute())
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
-                module_sources={"cache_pkg.child": source},
-                loaded_package_paths={"cache_pkg": [package_path]},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+            module_sources={"cache_pkg.child": source},
+            loaded_package_paths={"cache_pkg": [package_path]},
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3800,17 +3683,13 @@ def test_scan_cache_invalidates_when_loaded_module_disappears(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     source = str(source_path.absolute())
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
-                module_sources={"loaded_then_removed": source},
-                loaded_module_sources={"loaded_then_removed": source},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+            module_sources={"loaded_then_removed": source},
+            loaded_module_sources={"loaded_then_removed": source},
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3960,11 +3839,7 @@ def test_scan_cache_rejects_file_finder_subclass_importer(
     version_context = build_cache_version_context({})
     fingerprint_metadata = _call_graph_fingerprint_metadata()
     assert any(path_entry in identity for identity in fingerprint_metadata["resolution_context"]["path_importers"])
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+    scan_result = _private_fingerprint_result(fingerprint_metadata)
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -3997,11 +3872,7 @@ def test_scan_cache_rejects_custom_file_finder_loader_change(
     version_context = build_cache_version_context({})
     fingerprint_metadata = _call_graph_fingerprint_metadata()
     assert any(path_entry in identity for identity in fingerprint_metadata["resolution_context"]["path_importers"])
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+    scan_result = _private_fingerprint_result(fingerprint_metadata)
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4046,11 +3917,7 @@ def test_scan_cache_rejects_resolution_metadata_without_current_picklescan_helpe
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": _call_graph_fingerprint_metadata()},
-    }
+    scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata())
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4080,16 +3947,11 @@ def test_scan_cache_revalidates_sources_after_standard_importer_cache_population
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     source = str(source_path.absolute())
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
-                module_sources={module: source},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {source: hashlib.sha256(source_path.read_bytes()).hexdigest()}, module_sources={module: source}
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4168,11 +4030,7 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
             parent_module: {"search_path": [path_entry], "path_importers": []}
         }
 
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+    scan_result = _private_fingerprint_result(fingerprint_metadata)
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
     )
@@ -4274,11 +4132,7 @@ def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+    scan_result = _private_fingerprint_result(fingerprint_metadata)
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4327,11 +4181,7 @@ def test_scan_cache_revalidates_sources_when_namespace_precedence_changes(
     file_path = _make_cacheable_file(tmp_path, "namespace-precedence.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+    scan_result = _private_fingerprint_result(fingerprint_metadata)
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
     )
@@ -4371,16 +4221,11 @@ def test_cache_module_validation_does_not_execute_custom_path_hooks(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     source = str(source_path.absolute())
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
-                module_sources={"direct_resolution": source},
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {source: hashlib.sha256(source_path.read_bytes()).hexdigest()}, module_sources={"direct_resolution": source}
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4406,13 +4251,7 @@ def test_scan_cache_invalidates_when_import_resolution_hooks_change(
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata({str(missing_source.absolute()): None})
-        },
-    }
+    scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata({str(missing_source.absolute()): None}))
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4470,15 +4309,9 @@ def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Pat
     assert picklescan_fingerprint == extension_fingerprint
     assert isinstance(extension_fingerprint, str)
     assert extension_fingerprint.startswith(f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:")
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {str(extension_path.absolute()): extension_fingerprint}
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata({str(extension_path.absolute()): extension_fingerprint})
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4660,21 +4493,17 @@ def test_scan_cache_invalidates_when_read_fingerprint_directory_changes(tmp_path
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     expected_fingerprint = cache._bounded_read_fingerprint(bytecode_dir, 64 * 1024, True)
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                read_fingerprints={
-                    str(bytecode_dir): {
-                        "read_limit": 64 * 1024,
-                        "require_complete": True,
-                        "fingerprint": expected_fingerprint,
-                    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            read_fingerprints={
+                str(bytecode_dir): {
+                    "read_limit": 64 * 1024,
+                    "require_complete": True,
+                    "fingerprint": expected_fingerprint,
                 }
-            )
-        },
-    }
+            }
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4692,11 +4521,7 @@ def test_scan_cache_rejects_legacy_fingerprint_metadata_without_read_records(tmp
     version_context = build_cache_version_context({})
     fingerprint_metadata = _call_graph_fingerprint_metadata()
     fingerprint_metadata.pop("read_fingerprints")
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+    scan_result = _private_fingerprint_result(fingerprint_metadata)
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4709,11 +4534,7 @@ def test_scan_cache_rejects_oversized_source_fingerprint_sets(tmp_path: Path) ->
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     fingerprints: dict[str, str | None] = {str(tmp_path / f"candidate-{index}.py"): None for index in range(4097)}
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {"call_graph_source_fingerprints": _call_graph_fingerprint_metadata(fingerprints)},
-    }
+    scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata(fingerprints))
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4834,12 +4655,7 @@ def test_scan_cache_accepts_source_independent_call_graph_metadata_under_unreusa
         "callable_invocations": [],
         **metadata_extra,
     }
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "metadata": metadata,
-        "_private_metadata": {"call_graph_source_fingerprints": _source_independent_call_graph_fingerprint_metadata()},
-    }
+    scan_result = _result_with_fingerprints(metadata, _source_independent_call_graph_fingerprint_metadata())
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4867,17 +4683,15 @@ def test_scan_cache_rejects_malformed_source_independent_call_graph_metadata(
         fingerprint_metadata["resolution_context"] = {}
     else:
         fingerprint_metadata["source_independent"] = False
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "metadata": {
+    scan_result = _result_with_fingerprints(
+        {
             "pickle_report_status": "complete",
             "pickle_verdict": "clean",
             "import_references": [],
             "callable_invocations": [],
         },
-        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
-    }
+        fingerprint_metadata,
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4913,12 +4727,7 @@ def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
         "callable_invocations": [],
         **metadata_update,
     }
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "metadata": metadata,
-        "_private_metadata": {"call_graph_source_fingerprints": _source_independent_call_graph_fingerprint_metadata()},
-    }
+    scan_result = _result_with_fingerprints(metadata, _source_independent_call_graph_fingerprint_metadata())
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -4987,22 +4796,18 @@ def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returnin
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     source_fingerprint = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "metadata": {
+    scan_result = _result_with_fingerprints(
+        {
             "pickle_report_status": "complete",
             "pickle_verdict": "clean",
             "import_references": [{"module": "helper", "name": "entrypoint"}],
             "callable_invocations": [{"module": "helper", "name": "entrypoint"}],
         },
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {str(source_path.absolute()): source_fingerprint},
-                module_sources={"helper": str(source_path.absolute())},
-            )
-        },
-    }
+        _call_graph_fingerprint_metadata(
+            {str(source_path.absolute()): source_fingerprint},
+            module_sources={"helper": str(source_path.absolute())},
+        ),
+    )
     expected_cached_result = {key: value for key, value in scan_result.items() if key != "_private_metadata"}
 
     assert cache.store_result(
@@ -5027,15 +4832,11 @@ def test_scan_cache_validates_private_fingerprints_without_public_metadata(tmp_p
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {str(source_path.absolute()): hashlib.sha256(source_path.read_bytes()).hexdigest()}
-            )
-        },
-    }
+    scan_result = _private_fingerprint_result(
+        _call_graph_fingerprint_metadata(
+            {str(source_path.absolute()): hashlib.sha256(source_path.read_bytes()).hexdigest()}
+        )
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -5054,21 +4855,17 @@ def test_scan_cache_by_key_invalidates_private_call_graph_source_fingerprint_cha
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
-    scan_result = {
-        "checks": [],
-        "issues": [],
-        "metadata": {
+    scan_result = _result_with_fingerprints(
+        {
             "pickle_report_status": "complete",
             "pickle_verdict": "clean",
             "import_references": [{"module": "helper", "name": "entrypoint"}],
             "callable_invocations": [{"module": "helper", "name": "entrypoint"}],
         },
-        "_private_metadata": {
-            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {str(source_path.absolute()): hashlib.sha256(source_path.read_bytes()).hexdigest()}
-            )
-        },
-    }
+        _call_graph_fingerprint_metadata(
+            {str(source_path.absolute()): hashlib.sha256(source_path.read_bytes()).hexdigest()}
+        ),
+    )
 
     assert cache.store_result(
         str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
@@ -5117,7 +4914,14 @@ def test_scan_cache_private_metadata_cannot_override_cache_bookkeeping(tmp_path:
     assert "unrecognized" not in cache_entry["cache_metadata"]
 
 
-def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> None:
+def _assert_dict_result_cacheability(
+    tmp_path: Path,
+    result_for_scan: Callable[[int], dict[str, Any]],
+    *,
+    cacheable: bool,
+    count_key: str = "scan_count",
+) -> None:
+    """Exercise dictionary-result caching without changing the supplied payload."""
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
@@ -5126,47 +4930,40 @@ def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> No
     @cached_scan()
     def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
         calls["count"] += 1
+        return result_for_scan(calls["count"])
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    expected_calls = 1 if cacheable else 2
+    assert first[count_key] == 1
+    assert second[count_key] == expected_calls
+    assert calls["count"] == expected_calls
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == int(cacheable)
+    if cacheable:
+        assert second == first
+
+
+def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> None:
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [],
             "issues": [{"message": "Scan timeout after 1 seconds", "severity": "warning"}],
-            "timeout_count": calls["count"],
+            "timeout_count": scan_count,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["timeout_count"] == 1
-    assert second["timeout_count"] == 2
-    assert calls["count"] == 2
-
-    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
-    assert cache_manager.get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False, count_key="timeout_count")
 
 
 def test_cached_scan_skips_persisting_operational_failures_from_checks(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [{"message": "Scan timeout after 1 seconds", "status": "failed"}],
             "issues": [],
-            "timeout_count": calls["count"],
+            "timeout_count": scan_count,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["timeout_count"] == 1
-    assert second["timeout_count"] == 2
-    assert calls["count"] == 2
-
-    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
-    assert cache_manager.get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False, count_key="timeout_count")
 
 
 @pytest.mark.parametrize(
@@ -5183,28 +4980,15 @@ def test_cached_scan_skips_persisting_incomplete_metadata(
     tmp_path: Path,
     metadata: dict[str, Any],
 ) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [],
             "issues": [],
             "metadata": metadata,
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
 
 @pytest.mark.parametrize("collection_name", ["issues", "checks"])
@@ -5231,14 +5015,8 @@ def test_cached_scan_skips_persisting_incomplete_record_details(
     details: dict[str, Any],
 ) -> None:
     """Issue/check-only incomplete coverage must be rescanned instead of replayed."""
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
 
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         record = {
             "message": "Incomplete coverage retained only in record details",
             "status": "failed",
@@ -5248,18 +5026,12 @@ def test_cached_scan_skips_persisting_incomplete_record_details(
             "checks": [],
             "issues": [],
             "success": True,
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
         }
         result[collection_name] = [record]
         return result
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
 
 @pytest.mark.parametrize("collection_name", ["issues", "checks"])
@@ -5268,14 +5040,8 @@ def test_cached_scan_skips_persisting_skipped_bare_analysis_incomplete_record_de
     collection_name: str,
 ) -> None:
     """Skipped bare incomplete coverage records must be rescanned unless they are runtime skips."""
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
 
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         record = {
             "message": "Scanner skipped before completing coverage",
             "status": "skipped",
@@ -5285,30 +5051,18 @@ def test_cached_scan_skips_persisting_skipped_bare_analysis_incomplete_record_de
             "checks": [],
             "issues": [],
             "success": True,
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
         }
         result[collection_name] = [record]
         return result
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
 
 def test_cached_scan_persists_clean_runtime_version_skipped_check(tmp_path: Path) -> None:
     """Clean runtime-version applicability skipped checks are stable enough to cache."""
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
 
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [
                 {
@@ -5324,29 +5078,17 @@ def test_cached_scan_persists_clean_runtime_version_skipped_check(tmp_path: Path
             ],
             "issues": [],
             "metadata": {},
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
             "success": True,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 1
-    assert calls["count"] == 1
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=True)
 
 
 def test_cached_scan_skips_issue_with_runtime_version_skip_details(tmp_path: Path) -> None:
     """Runtime-version skip metadata only exempts skipped checks, not issue records."""
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
 
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [],
             "issues": [
@@ -5362,29 +5104,17 @@ def test_cached_scan_skips_issue_with_runtime_version_skip_details(tmp_path: Pat
                 }
             ],
             "metadata": {},
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
             "success": True,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
 
 def test_cached_scan_skips_skipped_check_with_explicit_incomplete_reason(tmp_path: Path) -> None:
     """Skipped checks with explicit outcome markers must still bypass cache."""
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
 
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [
                 {
@@ -5398,28 +5128,15 @@ def test_cached_scan_skips_skipped_check_with_explicit_incomplete_reason(tmp_pat
             ],
             "issues": [],
             "metadata": {},
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
             "success": True,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
 
 def test_cached_scan_persists_clean_result_with_benign_details(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [
                 {
@@ -5430,42 +5147,23 @@ def test_cached_scan_persists_clean_result_with_benign_details(tmp_path: Path) -
             ],
             "issues": [],
             "metadata": {},
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
             "success": True,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second == first
-    assert calls["count"] == 1
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=True)
 
 
 def test_cached_scan_skips_persisting_bare_unsuccessful_results(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [],
             "issues": [],
             "success": False,
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
 
 def test_cached_scan_normalizes_and_skips_persisting_bare_unsuccessful_scan_result(tmp_path: Path) -> None:
@@ -5603,26 +5301,14 @@ def test_cached_scan_skips_persisting_memory_mapped_scan_errors(tmp_path: Path) 
 
 
 def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [],
             "issues": [{"message": "Not a valid zip file: /tmp/example.zip", "severity": "warning"}],
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first == second
-    assert calls["count"] == 1
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=True)
 
 
 def test_cached_scan_does_not_persist_missing_associated_weights(tmp_path: Path) -> None:
@@ -6372,38 +6058,18 @@ def _count_scan(calls: dict[str, int], path: str, config: dict[str, Any] | None 
 
 
 def _assert_uncached_os_error(tmp_path: Path, case_message: str) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [],
             "issues": [{"message": case_message, "severity": "warning"}],
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
 
 def _assert_uncached_missing_package(tmp_path: Path, case_message: str) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
+    def result_for_scan(scan_count: int) -> dict[str, Any]:
         return {
             "checks": [
                 {
@@ -6412,13 +6078,52 @@ def _assert_uncached_missing_package(tmp_path: Path, case_message: str) -> None:
                 }
             ],
             "issues": [],
-            "scan_count": calls["count"],
+            "scan_count": scan_count,
         }
 
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
+    _assert_dict_result_cacheability(tmp_path, result_for_scan, cacheable=False)
 
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+def test_darwin_read_attribute_queue_tracks_new_descriptor_after_capture_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_monitor = ScanResultsCache._monitor_ancestor_identity
+    original_matches = ScanResultsCache._ancestor_identity_matches
+    monitor_descriptors: list[int] = []
+    held_descriptors: list[int] = []
+    pending_ancestor_change = False
+    injected_changes = 0
+
+    def monitor_with_descriptor_reuse(file_path: str, identity: AncestorIdentity) -> AncestorIdentity:
+        nonlocal pending_ancestor_change
+        if len(monitor_descriptors) == 1:
+            # Occupy the released descriptor as another concurrent reader could.
+            held_descriptors.append(os.open(file_path, os.O_RDONLY))
+        monitored = original_monitor(file_path, identity)
+        descriptor = getattr(monitored.monitor, "_file_descriptor", None)
+        assert isinstance(descriptor, int)
+        monitor_descriptors.append(descriptor)
+        if len(monitor_descriptors) == 1:
+            pending_ancestor_change = True
+        return monitored
+
+    def matches_after_transient_change(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
+        nonlocal pending_ancestor_change, injected_changes
+        if pending_ancestor_change:
+            pending_ancestor_change = False
+            injected_changes += 1
+            return False
+        return original_matches(expected, current)
+
+    monkeypatch.setattr(ScanResultsCache, "_monitor_ancestor_identity", staticmethod(monitor_with_descriptor_reuse))
+    monkeypatch.setattr(ScanResultsCache, "_ancestor_identity_matches", staticmethod(matches_after_transient_change))
+    try:
+        test_darwin_path_monitor_allows_read_between_capture_and_store(tmp_path, monkeypatch)
+    finally:
+        for descriptor in held_descriptors:
+            os.close(descriptor)
+
+    assert injected_changes == 1
+    assert len(monitor_descriptors) >= 2
+    assert monitor_descriptors[0] != monitor_descriptors[1]

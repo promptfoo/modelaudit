@@ -77,19 +77,6 @@ class SecureFileHasher:
             logger.debug(f"Large file ({file_size / 1024**3:.1f}GB), using enhanced fingerprint for {file_path}")
             return self._secure_enhanced_fingerprint_with_stat(file_path, file_stat)
 
-    def _secure_full_hash(self, file_path: str) -> str:
-        """
-        Compute cryptographically secure full file hash using Blake2b.
-
-        Args:
-            file_path: Path to file to hash
-
-        Returns:
-            Hash string with 'secure:' prefix
-        """
-        file_stat = os.stat(file_path)
-        return self._secure_full_hash_with_stat(file_path, file_stat)
-
     def _secure_full_hash_with_stat(self, file_path: str, file_stat: os.stat_result) -> str:
         """
         Compute cryptographically secure full file hash using Blake2b with stat reuse.
@@ -136,23 +123,6 @@ class SecureFileHasher:
         logger.debug(f"Full hash of {file_path} ({file_size / 1024**2:.1f}MB) took {hash_time:.2f}s")
 
         return f"secure:{hash_hex}"
-
-    def _secure_enhanced_fingerprint(self, file_path: str, file_size: int) -> str:
-        """
-        Compute security-conscious fingerprint for very large files.
-
-        Hashes significant portions distributed throughout the file
-        to make tampering detectable while being faster than full hash.
-
-        Args:
-            file_path: Path to file to hash
-            file_size: Size of file in bytes
-
-        Returns:
-            Hash string with 'fingerprint:' prefix
-        """
-        file_stat = os.stat(file_path)
-        return self._secure_enhanced_fingerprint_with_stat(file_path, file_stat)
 
     def _secure_enhanced_fingerprint_with_stat(self, file_path: str, file_stat: os.stat_result) -> str:
         """

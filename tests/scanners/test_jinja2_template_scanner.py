@@ -49,6 +49,15 @@ def _jinja_detection_checks(result: ScanResult) -> list[Check]:
     return [check for check in result.checks if check.name == "Jinja2 Template Injection Detection"]
 
 
+def _set_sandbox_worker_unavailable(monkeypatch: pytest.MonkeyPatch, scanner: Jinja2TemplateScanner) -> None:
+    """Exercise static fallback without starting the sandbox worker."""
+    monkeypatch.setattr(
+        scanner,
+        "_test_template_safety_with_budget",
+        lambda _template_content: ("worker_unavailable", "AssertionError"),
+    )
+
+
 def test_directory_scan_preserves_path_sensitive_yaml_routing(tmp_path: Path) -> None:
     misc_dir = tmp_path / "misc"
     model_dir = tmp_path / "model"
@@ -1356,11 +1365,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text("Hello, {{ name }}! Welcome to {{ site }}.", encoding="utf-8")
 
         scanner = Jinja2TemplateScanner()
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         _assert_benign_sandbox_failure_clean(scanner, template_file)
 
     def test_unavailable_sandbox_worker_fails_closed_for_ast_sandbox_probe_risk(
@@ -1494,11 +1499,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text(template_content, encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": budget})
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         result = scanner.scan(str(template_file))
 
         assert result.success is False
@@ -1543,11 +1544,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text(template_content, encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         result = scanner.scan(str(template_file))
 
         assert result.success is False
@@ -1792,11 +1789,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text(template_content, encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": budget})
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         result = scanner.scan(str(template_file))
 
         assert result.success is True
@@ -2282,11 +2275,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text(f'{{{{ range("{numeric_text}"|int)|list }}}}', encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         result = scanner.scan(str(template_file))
 
         assert result.success is True
@@ -2303,11 +2292,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text("{{ range(200000)|list }}", encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 1_000_000})
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         result = scanner.scan(str(template_file))
 
         assert result.success is False
@@ -2334,11 +2319,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text("{{ range(99999, 100000)|list }}", encoding="utf-8")
 
         scanner = Jinja2TemplateScanner()
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         _assert_benign_sandbox_failure_clean(scanner, template_file)
 
     def test_unavailable_sandbox_worker_fails_closed_for_static_render_amplification(
@@ -2351,11 +2332,7 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file.write_text("{{ 'A' * 1000000 }}", encoding="utf-8")
 
         scanner = Jinja2TemplateScanner()
-        monkeypatch.setattr(
-            scanner,
-            "_test_template_safety_with_budget",
-            lambda _template_content: ("worker_unavailable", "AssertionError"),
-        )
+        _set_sandbox_worker_unavailable(monkeypatch, scanner)
         result = scanner.scan(str(template_file))
 
         assert result.success is False
@@ -2738,11 +2715,7 @@ def _assert_static_range_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     template_file.write_text(source_text, encoding="utf-8")
 
     scanner = Jinja2TemplateScanner()
-    monkeypatch.setattr(
-        scanner,
-        "_test_template_safety_with_budget",
-        lambda _template_content: ("worker_unavailable", "AssertionError"),
-    )
+    _set_sandbox_worker_unavailable(monkeypatch, scanner)
     result = scanner.scan(str(template_file))
 
     assert result.success is False
@@ -2783,11 +2756,7 @@ def _assert_sandbox_range_budget(
     template_file.write_text(template_content, encoding="utf-8")
 
     scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
-    monkeypatch.setattr(
-        scanner,
-        "_test_template_safety_with_budget",
-        lambda _template_content: ("worker_unavailable", "AssertionError"),
-    )
+    _set_sandbox_worker_unavailable(monkeypatch, scanner)
     result = scanner.scan(str(template_file))
 
     assert result.success is False
@@ -2840,11 +2809,7 @@ def _assert_clean_sandbox_range(
     template_file.write_text(template_content, encoding="utf-8")
 
     scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
-    monkeypatch.setattr(
-        scanner,
-        "_test_template_safety_with_budget",
-        lambda _template_content: ("worker_unavailable", "AssertionError"),
-    )
+    _set_sandbox_worker_unavailable(monkeypatch, scanner)
     result = scanner.scan(str(template_file))
 
     assert result.success is True

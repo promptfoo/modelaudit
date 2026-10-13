@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
 from modelaudit.scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
+from modelaudit.utils.file.detection import _skip_xml_doctype_declaration as _skip_doctype_declaration
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -41,20 +42,6 @@ _OPENVINO_NATIVE_LIBRARY_SUFFIX = re.compile(r"(?:\.so(?:\.\d+)*|\.dll|\.dylib|\
 _URL_REFERENCE_PATTERN = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
 
 
-def _local_tag_name(tag: str) -> str:
-    """Return an XML tag's namespace-stripped local name."""
-    return tag.rsplit("}", 1)[-1].lower()
-
-
-def _is_contained_in(child: Path, parent: Path) -> bool:
-    """Return True when child resolves under parent directory."""
-    try:
-        child.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
 def _companion_filename_key(filename: str) -> str:
     return unicodedata.normalize("NFC", filename).casefold()
 
@@ -79,30 +66,6 @@ def _same_stem_companion(path: Path, suffix: str) -> Path:
     return expected_path
 
 
-def _skip_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int | None:
-    """Skip a DOCTYPE declaration without expanding entities."""
-    index = start_offset + len(b"<!DOCTYPE")
-    bracket_depth = 0
-    quote_char: int | None = None
-
-    while index < len(xml_prefix):
-        byte = xml_prefix[index]
-        if quote_char is not None:
-            if byte == quote_char:
-                quote_char = None
-        elif byte in {ord("'"), ord('"')}:
-            quote_char = byte
-        elif byte == ord("["):
-            bracket_depth += 1
-        elif byte == ord("]") and bracket_depth > 0:
-            bracket_depth -= 1
-        elif byte == ord(">") and bracket_depth == 0:
-            return index + 1
-        index += 1
-
-    return None
-
-
 def _get_doctype_root_tag(xml_prefix: bytes, start_offset: int) -> str | None:
     """Return the root element name declared by a DOCTYPE declaration."""
     index = start_offset + len(b"<!DOCTYPE")
@@ -116,7 +79,8 @@ def _get_doctype_root_tag(xml_prefix: bytes, start_offset: int) -> str | None:
 
     if index == name_start:
         return None
-    return _local_tag_name(xml_prefix[name_start:index].decode("utf-8", "ignore"))
+    # Return an XML tag's namespace-stripped local name.
+    return xml_prefix[name_start:index].decode("utf-8", "ignore").rsplit("}", 1)[-1].lower()
 
 
 def _looks_like_openvino_xml_prefix(xml_prefix: bytes) -> bool:
@@ -164,13 +128,13 @@ def _looks_like_openvino_xml_prefix(xml_prefix: bytes) -> bool:
         return False
 
     root_tag = xml_prefix[index + 1 : tag_end].decode("utf-8", "ignore")
-    return _local_tag_name(root_tag) in _OPENVINO_ROOT_TAGS
+    return root_tag.rsplit("}", 1)[-1].lower() in _OPENVINO_ROOT_TAGS
 
 
 def _iter_element_attributes(layer: Any) -> Iterator[tuple[str, str, str]]:
     """Yield normalized attributes from a layer and its nested config nodes."""
     for element in layer.iter():
-        element_tag = _local_tag_name(str(element.tag))
+        element_tag = str(element.tag).rsplit("}", 1)[-1].lower()
         for attr_name, attr_value in element.attrib.items():
             normalized_value = str(attr_value).strip()
             if normalized_value:
@@ -349,7 +313,7 @@ class OpenVinoScanner(BaseScanner):
                 xml_prefix = xml_file.read(cls.CAN_HANDLE_MAX_PARSE_BYTES)
                 try:
                     for _event, element in DefusedET.iterparse(BytesIO(xml_prefix), events=("start",)):
-                        return _local_tag_name(str(element.tag)) in _OPENVINO_ROOT_TAGS
+                        return str(element.tag).rsplit("}", 1)[-1].lower() in _OPENVINO_ROOT_TAGS
                 except Exception:
                     return _looks_like_openvino_xml_prefix(xml_prefix)
         except Exception:
@@ -370,7 +334,8 @@ class OpenVinoScanner(BaseScanner):
             bin_path = Path(os.path.splitext(path)[0] + ".bin")
         if bin_path.is_symlink():
             resolved_bin_path = bin_path.resolve(strict=False)
-            if not _is_contained_in(resolved_bin_path, model_dir):
+            # Return True when child resolves under parent directory.
+            if not resolved_bin_path.is_relative_to(model_dir):
                 result.add_check(
                     name="OpenVINO Weights Symlink Boundary Check",
                     passed=False,
@@ -429,7 +394,7 @@ class OpenVinoScanner(BaseScanner):
         if version:
             result.metadata["ir_version"] = version
 
-        for layer in (element for element in root.iter() if _local_tag_name(str(element.tag)) == "layer"):
+        for layer in (element for element in root.iter() if str(element.tag).rsplit("}", 1)[-1].lower() == "layer"):
             layer_type = layer.attrib.get("type", "").strip().lower()
             layer_name = layer.attrib.get("name", "")
             if layer_type in {"python", "custom"}:

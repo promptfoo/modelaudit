@@ -114,14 +114,6 @@ def _read_bounded(path: str, limit: int) -> tuple[bytes, bool]:
     return (data[:limit], len(data) > limit)
 
 
-def _has_cntkv2_core_markers(prefix: bytes) -> bool:
-    return all(marker in prefix for marker in _CNTK_V2_REQUIRED_MARKERS)
-
-
-def _has_cntkv2_structure_markers(prefix: bytes) -> bool:
-    return any(marker in prefix for marker in _CNTK_V2_STRUCTURE_MARKERS)
-
-
 def _detect_cntk_variant(prefix: bytes, extension: str) -> tuple[str, str]:
     if extension in _CNTK_EXCLUDED_EXTENSIONS:
         return "unsupported_cntk_variant", "model_extension_excluded_for_xgboost_overlap"
@@ -131,8 +123,8 @@ def _detect_cntk_variant(prefix: bytes, extension: str) -> tuple[str, str]:
             return "legacy_v1", "legacy_bcn_and_bversion_markers"
         return "unsupported_cntk_variant", "legacy_marker_without_bversion_marker"
 
-    if _has_cntkv2_core_markers(prefix):
-        if _has_cntkv2_structure_markers(prefix):
+    if all(marker in prefix for marker in _CNTK_V2_REQUIRED_MARKERS):
+        if any(marker in prefix for marker in _CNTK_V2_STRUCTURE_MARKERS):
             return "cntk_v2", "protobuf_core_and_structure_markers"
         return "unsupported_cntk_variant", "protobuf_core_markers_without_structure_markers"
 
@@ -163,12 +155,8 @@ def _extract_candidate_strings(data: bytes) -> tuple[list[str], bool]:
     return candidates, False
 
 
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _snippet(text: str, max_length: int = 180) -> str:
-    normalized = _normalize(text)
+    normalized = re.sub(r"\s+", " ", text).strip()
     if len(normalized) <= max_length:
         return normalized
     return normalized[: max_length - 3] + "..."
@@ -179,10 +167,6 @@ def _is_known_safe_metadata_entry(text: str) -> bool:
     if lowered in _KNOWN_SAFE_METADATA_KEYS:
         return True
     return bool(re.fullmatch(r"(?:parameter|placeholder|times|plus|compositefunction)\d+", lowered))
-
-
-def _has_external_load_reference(text: str) -> bool:
-    return bool(_PATH_OR_LIBRARY_RE.search(text) and _LOAD_CONTEXT_RE.search(text))
 
 
 def _collect_split_external_load_references(strings: list[str]) -> list[str]:
@@ -240,7 +224,10 @@ def _collect_security_evidence(strings: list[str]) -> dict[str, list[str]]:
         if _is_known_safe_metadata_entry(text):
             continue
 
-        if _has_external_load_reference(text) and len(evidence["external_load_reference"]) < _MAX_EVIDENCE_PER_CATEGORY:
+        if (
+            bool(_PATH_OR_LIBRARY_RE.search(text) and _LOAD_CONTEXT_RE.search(text))
+            and len(evidence["external_load_reference"]) < _MAX_EVIDENCE_PER_CATEGORY
+        ):
             evidence["external_load_reference"].append(_snippet(text))
         if (
             _has_command_network_execution(text)

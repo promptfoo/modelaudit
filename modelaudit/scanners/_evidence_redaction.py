@@ -1,4 +1,4 @@
-"""Helpers for storing scanner evidence without embedded secrets."""
+"""Credential normalization for detection, classification, and evidence grouping."""
 
 from __future__ import annotations
 
@@ -681,10 +681,6 @@ def _r_raw_assignment_replacements(text: str) -> list[tuple[int, int]]:
     return replacements
 
 
-def _redact_r_raw_assignments(text: str) -> str:
-    return _replace_spans(text, _r_raw_assignment_replacements(text))
-
-
 def _redact_leftward_assignment_expressions(text: str) -> str:
     replacements: list[tuple[int, int]] = []
     non_code_spans = _r_non_code_spans(text)
@@ -1149,21 +1145,19 @@ def _redacted_query_key(key: str) -> str | None:
         assignment = decoded[assignment_match.start() :].lstrip("?&;")
         if assignment.lower().startswith("amp;"):
             assignment = assignment[4:]
-        candidate_key = _normalize_query_key(re.split(r"[:=]", assignment, maxsplit=1)[0].strip())
+        query_key = re.split(r"[:=]", assignment, maxsplit=1)[0].strip()
+        candidate_key = BRACKETED_QUERY_KEY_SUFFIX_RE.sub("", query_key).lower()
+        del query_key
         return candidate_key if _is_sensitive_detail_key(candidate_key) else "credential"
 
     if _decoded_component_contains_sensitive_assignment(decoded):
         return "credential"
 
-    return decoded if _is_sensitive_detail_key(_normalize_query_key(decoded)) else None
+    return decoded if _is_sensitive_detail_key(BRACKETED_QUERY_KEY_SUFFIX_RE.sub("", decoded).lower()) else None
 
 
 def _query_key_is_sensitive(key: str) -> bool:
     return _redacted_query_key(key) is not None
-
-
-def _normalize_query_key(key: str) -> str:
-    return BRACKETED_QUERY_KEY_SUFFIX_RE.sub("", key).lower()
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
@@ -1310,7 +1304,6 @@ def _parameterized_authorization_value_end(
     start: int,
     *,
     fstring: bool = False,
-    stop_at_newline: bool = True,
     require_continuation_indent: bool = True,
 ) -> int:
     quote: str | None = None
@@ -1350,21 +1343,20 @@ def _parameterized_authorization_value_end(
         elif char in "&|}]":
             return index
         elif char in "\r\n":
-            if stop_at_newline:
-                continuation_index = index + 1
-                if char == "\r" and continuation_index < len(text) and text[continuation_index] == "\n":
-                    continuation_index += 1
-                continuation_end = _parameterized_authorization_continuation_end(
-                    text,
-                    index,
-                    continuation_index,
-                    require_indent=require_continuation_indent,
-                )
-                if continuation_end is None:
-                    return index
-                continuation_limit = continuation_end
-                index = continuation_index
-                continue
+            continuation_index = index + 1
+            if char == "\r" and continuation_index < len(text) and text[continuation_index] == "\n":
+                continuation_index += 1
+            continuation_end = _parameterized_authorization_continuation_end(
+                text,
+                index,
+                continuation_index,
+                require_indent=require_continuation_indent,
+            )
+            if continuation_end is None:
+                return index
+            continuation_limit = continuation_end
+            index = continuation_index
+            continue
         elif char == ";":
             if SHELL_OPERATOR_COMMAND_RE.match(text, index) is not None:
                 return index
@@ -1385,7 +1377,6 @@ def _redact_parameterized_authorization_values(
     *,
     fstring: bool = False,
     prefix_re: re.Pattern[str] = PARAMETERIZED_AUTHORIZATION_PREFIX_RE,
-    stop_at_newline: bool = True,
     require_continuation_indent: bool = True,
 ) -> str:
     redacted_chunks: list[str] = []
@@ -1396,7 +1387,6 @@ def _redact_parameterized_authorization_values(
             text,
             match.end(),
             fstring=fstring,
-            stop_at_newline=stop_at_newline,
             require_continuation_indent=require_continuation_indent,
         )
         trailing_start = value_end
@@ -1801,7 +1791,10 @@ def _redact_embedded_structured_containers(text: str) -> str:
         if (
             redacted_container is None
             and REDACTED_EVIDENCE_VALUE not in container_text
-            and _contains_sensitive_key_literal(container_text)
+            and any(
+                _is_sensitive_detail_key(match.group("key"))
+                for match in EMBEDDED_SENSITIVE_KEY_RE.finditer(container_text)
+            )
         ):
             redacted_container = REDACTED_EVIDENCE_VALUE
         if redacted_container is not None and redacted_container != container_text:
@@ -1816,10 +1809,6 @@ def _redact_embedded_structured_containers(text: str) -> str:
 
     redacted_chunks.append(text[last_index:])
     return "".join(redacted_chunks)
-
-
-def _contains_sensitive_key_literal(text: str) -> bool:
-    return any(_is_sensitive_detail_key(match.group("key")) for match in EMBEDDED_SENSITIVE_KEY_RE.finditer(text))
 
 
 def _redact_scalar_unquoted_assignment(match: re.Match[str]) -> str:
@@ -1998,10 +1987,6 @@ def _is_simple_sensitive_assignment_value(value: str) -> bool:
     return _is_simple_sensitive_assignment_tokens(significant)
 
 
-def _contains_sensitive_unpacking_target(target: str) -> bool:
-    return any(SENSITIVE_ASSIGNMENT_TARGET_RE.search(item) is not None for item in target.split(","))
-
-
 def _assignment_boundary_start(text: str, assignment_start: int, value_start: int) -> int:
     boundary = assignment_start
     while boundary > value_start and text[boundary - 1] in " \t":
@@ -2115,7 +2100,7 @@ def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
     matches.extend(
         match
         for match in UNPACKING_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text)
-        if _contains_sensitive_unpacking_target(match.group("target"))
+        if any(SENSITIVE_ASSIGNMENT_TARGET_RE.search(item) is not None for item in match.group("target").split(","))
     )
     assignment_starts = sorted(
         {
@@ -2208,14 +2193,6 @@ def _delimited_item_ranges(
             ranges.append((item_start, index))
             item_start = index + 1
     return []
-
-
-def _call_argument_ranges(
-    tokens: list[tokenize.TokenInfo],
-    depths: list[int],
-    open_paren_index: int,
-) -> list[tuple[int, int]]:
-    return _delimited_item_ranges(tokens, depths, open_paren_index)
 
 
 def _significant_tokens(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenInfo]:
@@ -3059,7 +3036,7 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
         ):
             continue
 
-        argument_ranges = _call_argument_ranges(tokens, depths, open_paren_index)
+        argument_ranges = _delimited_item_ranges(tokens, depths, open_paren_index)
         arguments = [
             _argument_keyword_and_value(tokens[argument_start:argument_end])
             for argument_start, argument_end in argument_ranges
@@ -3320,7 +3297,10 @@ def _redact_python_expression_assignments(text: str) -> str:
         elif (
             not source_target_is_sensitive
             and not literal_target_is_sensitive
-            and not ("," in target and _contains_sensitive_unpacking_target(target))
+            and not (
+                "," in target
+                and any(SENSITIVE_ASSIGNMENT_TARGET_RE.search(item) is not None for item in target.split(","))
+            )
         ):
             continue
 
@@ -3627,7 +3607,7 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     if parseable_python_evidence:
         redacted = _redact_authorization_in_python_strings(redacted)
     if r_evidence:
-        redacted = _redact_r_raw_assignments(redacted)
+        redacted = _replace_spans(redacted, _r_raw_assignment_replacements(redacted))
         redacted = _redact_leftward_assignment_expressions(redacted)
         redacted = _redact_rightward_assignment_expressions(redacted)
     redacted = _redact_sensitive_literal_pairs(redacted)
@@ -3900,17 +3880,15 @@ def redact_evidence_string(
     return finalize(f"{safe_redacted_prefix[: max_chars - 3]}...")
 
 
-def _strip_bracket_suffixes(key: str) -> str:
-    return re.sub(r"(?:\[[^\[\]]{0,32}\])+$", "", key)
-
-
 def _canonicalize_detail_key(key: str) -> str:
     normalized_key = unicodedata.normalize("NFKC", key).casefold()
-    return re.sub(r"[^a-z0-9]+", "", _strip_bracket_suffixes(normalized_key))
+    return re.sub(r"[^a-z0-9]+", "", re.sub(r"(?:\[[^\[\]]{0,32}\])+$", "", normalized_key))
 
 
 def _is_sensitive_detail_key(key: str) -> bool:
-    normalized = _strip_bracket_suffixes(unicodedata.normalize("NFKC", key).casefold())
+    normalized_key = unicodedata.normalize("NFKC", key).casefold()
+    normalized = re.sub(r"(?:\[[^\[\]]{0,32}\])+$", "", normalized_key)
+    del normalized_key
     canonical = _canonicalize_detail_key(key)
     return (
         normalized in SENSITIVE_QUERY_KEYS
@@ -3929,7 +3907,7 @@ def is_sensitive_evidence_key(key: str) -> bool:
     """Return whether a field name identifies a credential-bearing value."""
     if len(key) > MAX_SENSITIVE_EVIDENCE_KEY_CHARS:
         return True
-    normalized = unicodedata.normalize("NFKC", _strip_bracket_suffixes(key)).casefold()
+    normalized = unicodedata.normalize("NFKC", re.sub(r"(?:\[[^\[\]]{0,32}\])+$", "", key)).casefold()
     normalized_container = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
     return (
         _is_sensitive_detail_key(normalized)

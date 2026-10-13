@@ -56,7 +56,6 @@ class EntropyAnalyzer:
 
         # Try to interpret as float32 array
         float_values = []
-        valid_floats = 0
 
         for i in range(0, len(data) - 3, 4):
             with suppress(struct.error, ValueError):
@@ -64,8 +63,8 @@ class EntropyAnalyzer:
                 # Check if it's a reasonable float (not NaN or Inf)
                 if -1e10 < value < 1e10 and not math.isnan(value) and not math.isinf(value):
                     float_values.append(value)
-                    valid_floats += 1
 
+        valid_floats = len(float_values)
         float_ratio = valid_floats / (len(data) // 4) if len(data) >= 4 else 0
 
         # Calculate entropy of float values

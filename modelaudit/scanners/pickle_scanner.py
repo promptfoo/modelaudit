@@ -29,7 +29,6 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
 from ..scanner_results import (
-    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     FILE_HASHES_BYTES_HASHED_METADATA_KEY,
     FILE_HASHES_COMPLETE_METADATA_KEY,
     Check,
@@ -630,7 +629,6 @@ class _NullTextWriter:
 
 @dataclass(frozen=True)
 class _PickleSetitemAnalysis:
-    saw_setitem: bool
     confirmed_dangerous_target: bool
     suspicious_entry_on_unknown_target: bool
     parse_incomplete: bool
@@ -682,17 +680,15 @@ def _dangerous_function_exports_from_suspicious_globals() -> frozenset[str]:
     return frozenset(exports)
 
 
-def _dangerous_modules_from_suspicious_globals() -> frozenset[str]:
-    return frozenset(module for module, functions in SUSPICIOUS_GLOBALS.items() if functions == "*")
-
-
 # Kept as compatibility exports for callers/tests that inspect the policy. Values
 # are derived from the shared suspicious-symbol table, with a small alias layer
 # for historical fully-qualified names under wildcard modules.
 ALWAYS_DANGEROUS_FUNCTIONS: frozenset[str] = (
     _dangerous_function_exports_from_suspicious_globals() | _DANGEROUS_FUNCTION_EXPORT_ALIASES
 )
-ALWAYS_DANGEROUS_MODULES: frozenset[str] = _dangerous_modules_from_suspicious_globals()
+ALWAYS_DANGEROUS_MODULES: frozenset[str] = frozenset(
+    (module for module, functions in SUSPICIOUS_GLOBALS.items() if functions == "*")
+)
 ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "collections": ["Counter", "OrderedDict", "defaultdict", "deque"],
     "numpy": ["dtype", "ndarray", "scalar"],
@@ -957,6 +953,31 @@ def _legacy_pytorch_storage_record_from_pid(
     )
 
 
+def _legacy_pytorch_memo_key(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        key = value
+    elif isinstance(value, str):
+        try:
+            key = int(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return key if key >= 0 else None
+
+
+def _pop_legacy_pytorch_marked_tuple(stack: list[object], marker: object) -> tuple[object, ...] | None:
+    items: list[object] = []
+    while stack:
+        item = stack.pop()
+        if item is marker:
+            return tuple(reversed(items)) if len(items) <= 16 else None
+        items.append(item)
+    return None
+
+
 def _legacy_pytorch_storage_records(
     data: bytes,
     storage_keys: tuple[str, ...],
@@ -967,29 +988,6 @@ def _legacy_pytorch_storage_records(
     stack: list[object] = []
     records: dict[str, _LegacyPyTorchStorageRecord] = {}
     expected_keys = set(storage_keys)
-
-    def pop_marked_tuple() -> tuple[object, ...] | None:
-        items: list[object] = []
-        while stack:
-            item = stack.pop()
-            if item is marker:
-                return tuple(reversed(items)) if len(items) <= 16 else None
-            items.append(item)
-        return None
-
-    def memo_key(value: object) -> int | None:
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, int):
-            key = value
-        elif isinstance(value, str):
-            try:
-                key = int(value)
-            except ValueError:
-                return None
-        else:
-            return None
-        return key if key >= 0 else None
 
     try:
         for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
@@ -1022,7 +1020,7 @@ def _legacy_pytorch_storage_records(
             elif opcode_name == "EMPTY_TUPLE":
                 stack.append(())
             elif opcode_name == "TUPLE":
-                tuple_value = pop_marked_tuple()
+                tuple_value = _pop_legacy_pytorch_marked_tuple(stack, marker)
                 if tuple_value is None:
                     stack.clear()
                 else:
@@ -1044,7 +1042,7 @@ def _legacy_pytorch_storage_records(
             elif opcode_name == "NEWFALSE":
                 stack.append(False)
             elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                key = memo_key(arg)
+                key = _legacy_pytorch_memo_key(arg)
                 if key is not None:
                     if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES and key not in memo:
                         return None
@@ -1054,13 +1052,13 @@ def _legacy_pytorch_storage_records(
                     return None
                 memo[len(memo)] = stack[-1] if stack else unknown
             elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-                key = memo_key(arg)
+                key = _legacy_pytorch_memo_key(arg)
                 stack.append(memo.get(key, unknown) if key is not None else unknown)
             elif opcode_name == "POP":
                 if stack:
                     stack.pop()
             elif opcode_name == "POP_MARK":
-                pop_marked_tuple()
+                _pop_legacy_pytorch_marked_tuple(stack, marker)
             elif opcode_name == "DUP":
                 if stack:
                     stack.append(stack[-1])
@@ -1100,29 +1098,6 @@ def _legacy_pytorch_storage_persistent_id_records(
     stack: list[object] = []
     records: list[_LegacyPyTorchStoragePersistentIdRecord] = []
 
-    def pop_marked_tuple() -> tuple[object, ...] | None:
-        items: list[object] = []
-        while stack:
-            item = stack.pop()
-            if item is marker:
-                return tuple(reversed(items)) if len(items) <= 16 else None
-            items.append(item)
-        return None
-
-    def memo_key(value: object) -> int | None:
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, int):
-            key = value
-        elif isinstance(value, str):
-            try:
-                key = int(value)
-            except ValueError:
-                return None
-        else:
-            return None
-        return key if key >= 0 else None
-
     try:
         for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
             if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
@@ -1154,7 +1129,7 @@ def _legacy_pytorch_storage_persistent_id_records(
             elif opcode_name == "EMPTY_TUPLE":
                 stack.append(())
             elif opcode_name == "TUPLE":
-                tuple_value = pop_marked_tuple()
+                tuple_value = _pop_legacy_pytorch_marked_tuple(stack, marker)
                 stack.append(tuple_value if tuple_value is not None else unknown)
             elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
                 tuple_size = int(opcode_name[-1])
@@ -1173,7 +1148,7 @@ def _legacy_pytorch_storage_persistent_id_records(
             elif opcode_name == "NEWFALSE":
                 stack.append(False)
             elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                key = memo_key(arg)
+                key = _legacy_pytorch_memo_key(arg)
                 if key is not None:
                     if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES and key not in memo:
                         break
@@ -1183,13 +1158,13 @@ def _legacy_pytorch_storage_persistent_id_records(
                     break
                 memo[len(memo)] = stack[-1] if stack else unknown
             elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-                key = memo_key(arg)
+                key = _legacy_pytorch_memo_key(arg)
                 stack.append(memo.get(key, unknown) if key is not None else unknown)
             elif opcode_name == "POP":
                 if stack:
                     stack.pop()
             elif opcode_name == "POP_MARK":
-                pop_marked_tuple()
+                _pop_legacy_pytorch_marked_tuple(stack, marker)
             elif opcode_name == "DUP":
                 if stack:
                     stack.append(stack[-1])
@@ -1720,7 +1695,10 @@ def _is_passive_literal_ast(tree: ast.Module) -> bool:
     )
 
 
-def _has_adjacent_python_string_tokens(text: str) -> bool:
+def _has_adjacent_python_string_tokens(text: str, *, literal_string_spans: list[tuple[int, int]] | None = None) -> bool:
+    line_starts = [0]
+    if literal_string_spans is not None:
+        line_starts.extend(match.end() for match in re.finditer("\n", text))
     previous_type: int | None = None
     ignored_types = {tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT}
     try:
@@ -1729,19 +1707,70 @@ def _has_adjacent_python_string_tokens(text: str) -> bool:
                 continue
             if token.type == tokenize.STRING and previous_type == tokenize.STRING:
                 return True
+            if (
+                literal_string_spans is not None
+                and token.type == tokenize.STRING
+                and token.string.startswith(("'", '"'))
+                and not token.string.startswith(token.string[0] * 3)
+            ):
+                token_start = line_starts[token.start[0] - 1] + token.start[1]
+                literal_end = line_starts[token.end[0] - 1] + token.end[1] - 1
+                first_escape = token.string.find("\\")
+                if first_escape < 0:
+                    literal_string_spans.append((token_start + 1, literal_end))
+                else:
+                    literal_string_spans.append((token_start + 1, token_start + first_escape))
+                    last_escape = token.string.rfind("\\")
+                    if token.string[last_escape + 1 : last_escape + 2] in {
+                        "a",
+                        "b",
+                        "f",
+                        "n",
+                        "r",
+                        "t",
+                        "v",
+                        "\\",
+                        "'",
+                        '"',
+                    }:
+                        # The suffix follows a complete simple escape, never its consumed character.
+                        literal_string_spans.append((token_start + last_escape + 2, literal_end))
             previous_type = token.type
     except (IndentationError, tokenize.TokenError):
         return True
     return False
 
 
-def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int) -> bool:
+def _pickle_literal_url_is_proven_inert(
+    text: str,
+    url_start: int,
+    url_end: int,
+    *,
+    inert_url_context: tuple[str, frozenset[tuple[int, int]]] | None = None,
+    charge_work: Callable[[int], None] | None = None,
+) -> bool:
+    if charge_work is not None:
+        charge_work(0)
     if (
         max(url_start, len(text) - url_end) > _MAX_PICKLE_LITERAL_URL_CONTEXT_CHARS
         or url_end - url_start > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS
-        or _has_active_shell_substitution(text)
     ):
         return False
+    if (
+        inert_url_context is not None
+        and inert_url_context[0] is text
+        and (url_start, url_end) in inert_url_context[1]
+        and len(text) - (url_end - url_start) + len("https://example.invalid/")
+        <= _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS
+    ):
+        return True
+    if charge_work is not None:
+        charge_work(len(text))
+    if _has_active_shell_substitution(text):
+        return False
+    if charge_work is not None:
+        # Slices, padding comparisons/copies and the two concatenations.
+        charge_work(5 * len(text) + 2 * len("https://example.invalid/"))
     scan_text = (
         _trim_repeated_literal_padding(text[:url_start])
         + "https://example.invalid/"
@@ -1749,27 +1778,50 @@ def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int)
     )
     if len(scan_text) > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS:
         return False
+    if charge_work is not None:
+        charge_work(2 * (len(text) - url_end))
     adjacent = _PICKLE_ADJACENT_SHELL_BOUNDARY_RE.match(text[url_end:]) is not None
-    if not adjacent and _PICKLE_LITERAL_URL_TEXT_RE.fullmatch(scan_text.strip()) is not None:
-        return True
+    if not adjacent:
+        if charge_work is not None:
+            charge_work(2 * len(scan_text))
+        if _PICKLE_LITERAL_URL_TEXT_RE.fullmatch(scan_text.strip()) is not None:
+            return True
+    if charge_work is not None:
+        charge_work(len(scan_text))
     try:
         tree = ast.parse(scan_text)
     except (MemoryError, RecursionError, SyntaxError, ValueError):
-        if adjacent or _has_unquoted_shell_control_grammar(scan_text):
+        if adjacent:
             return False
+        if charge_work is not None:
+            charge_work(len(scan_text))
+        if _has_unquoted_shell_control_grammar(scan_text):
+            return False
+        if charge_work is not None:
+            charge_work(2 * len(scan_text) + 1)
         prose = b" " + scan_text.encode("utf-8")
-        return all(
-            _is_doc_only_network_reference(
+        if charge_work is not None:
+            charge_work(len(prose))
+        for match in _PICKLE_LITERAL_URL_RE.finditer(prose):
+            if charge_work is not None:
+                charge_work(len(prose))
+            if not _is_doc_only_network_reference(
                 prose,
                 match_index=match.start(),
                 token_len=len(match.group()),
                 context="pickle-metadata.txt",
                 requires_call=False,
                 requires_explicit_prefix=True,
-            )
-            for match in _PICKLE_LITERAL_URL_RE.finditer(prose)
-        )
-    return not _has_adjacent_python_string_tokens(scan_text) and _is_passive_literal_ast(tree)
+            ):
+                return False
+        return True
+    if charge_work is not None:
+        charge_work(len(scan_text))
+    if _has_adjacent_python_string_tokens(scan_text):
+        return False
+    if charge_work is not None:
+        charge_work(len(scan_text))
+    return _is_passive_literal_ast(tree)
 
 
 def _inert_literal_url_stripped_scan_view(data: bytes) -> bytes:
@@ -1898,10 +1950,6 @@ def _raw_call_token_should_report(
     return _contains_validated_code_call_literal(data, label.decode("ascii"))
 
 
-def _position_in_spans(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
-    return any(start <= position < end for start, end in spans)
-
-
 def _line_looks_like_documentation(data: bytes, position: int) -> bool:
     line_start = data.rfind(b"\n", 0, position) + 1
     line_end = data.find(b"\n", position)
@@ -1918,7 +1966,7 @@ def _line_looks_like_documentation(data: bytes, position: int) -> bool:
 
 
 def _is_documentation_match(data: bytes, position: int, spans: tuple[tuple[int, int], ...]) -> bool:
-    return _position_in_spans(position, spans) or _line_looks_like_documentation(data, position)
+    return any((start <= position < end for start, end in spans)) or _line_looks_like_documentation(data, position)
 
 
 def _contains_non_documentation_token(
@@ -1934,16 +1982,6 @@ def _contains_non_documentation_token(
         if not _is_documentation_match(data, index, documentation_spans):
             return True
         start = index + len(token)
-
-
-def _contains_non_documentation_pattern(
-    data: bytes,
-    pattern: bytes,
-    documentation_spans: tuple[tuple[int, int], ...],
-) -> bool:
-    return any(
-        not _is_documentation_match(data, match.start(), documentation_spans) for match in re.finditer(pattern, data)
-    )
 
 
 def _contains_call_token(
@@ -2002,20 +2040,9 @@ def _contains_module_attr(
     documentation_spans: tuple[tuple[int, int], ...] = (),
 ) -> bool:
     pattern = rb"(?<![A-Za-z0-9_])" + re.escape(module) + rb"\s*\.\s*" + re.escape(attr) + rb"(?![A-Za-z0-9_])"
-    return _contains_non_documentation_pattern(data, pattern, documentation_spans)
-
-
-def _contains_pickle_global_reference(
-    data: bytes,
-    module: bytes,
-    attr: bytes,
-    documentation_spans: tuple[tuple[int, int], ...],
-) -> bool:
-    return _contains_non_documentation_token(data, b"c" + module + b"\n" + attr + b"\n", documentation_spans)
-
-
-def _contains_any_seed(data: bytes, seeds: tuple[bytes, ...]) -> bool:
-    return _contains_any_seed_lowered(data.lower(), seeds)
+    return any(
+        not _is_documentation_match(data, match.start(), documentation_spans) for match in re.finditer(pattern, data)
+    )
 
 
 def _seed_possible_from_present_bytes(seed: bytes, present_bytes: frozenset[int] | None) -> bool:
@@ -2163,13 +2190,6 @@ def _has_rule_for_import_reference(result: ScanResult, rule_code: str, import_re
     )
 
 
-def _has_issue_for_import_reference(result: ScanResult, import_reference: str) -> bool:
-    return any(
-        issue.details.get("associated_global", issue.details.get("import_reference")) == import_reference
-        for issue in result.issues
-    )
-
-
 def _append_raw_indicator(
     indicators: list[tuple[str, dict[str, Any]]],
     label: str,
@@ -2205,20 +2225,6 @@ def _result_has_rebuild_tensor_global(result: ScanResult) -> bool:
     return False
 
 
-def _pickle_has_parsed_rebuild_tensor_literal(data: bytes) -> bool:
-    try:
-        for opcode, arg, _position in pickletools.genops(data):
-            if opcode.name in _PICKLE_LITERAL_OPCODE_NAMES and (
-                isinstance(arg, str)
-                and "_rebuild_tensor" in arg
-                and not _is_primarily_documentation(arg.encode("utf-8", errors="ignore"))
-            ):
-                return True
-    except Exception:
-        return False
-    return False
-
-
 def _analyze_pickle_setitem_entries(
     data: bytes,
     *,
@@ -2228,7 +2234,6 @@ def _analyze_pickle_setitem_entries(
     stack: list[tuple[str, str | None]] = []
     memo: dict[int, tuple[str, str | None]] = {}
     mark = ("mark", None)
-    saw_setitem = False
     confirmed_dangerous_target = False
     suspicious_entry_on_unknown_target = False
     parse_incomplete = False
@@ -2326,7 +2331,6 @@ def _analyze_pickle_setitem_entries(
                 callable_value = values[0] if values else ("unknown", None)
                 stack.append(collapse_callable_result(callable_value))
             elif name == "SETITEM":
-                saw_setitem = True
                 value = pop()
                 key = pop()
                 target = stack[-1] if stack else ("unknown", None)
@@ -2335,7 +2339,6 @@ def _analyze_pickle_setitem_entries(
                 if target[0] == "unknown" and (is_interesting_entry(key) or is_interesting_entry(value)):
                     suspicious_entry_on_unknown_target = True
             elif name == "SETITEMS":
-                saw_setitem = True
                 values = pop_to_mark()
                 target = stack[-1] if stack else ("unknown", None)
                 if is_confirmed_dangerous_target(target):
@@ -2388,7 +2391,6 @@ def _analyze_pickle_setitem_entries(
     except Exception:
         parse_incomplete = True
     return _PickleSetitemAnalysis(
-        saw_setitem=saw_setitem,
         confirmed_dangerous_target=confirmed_dangerous_target,
         suspicious_entry_on_unknown_target=suspicious_entry_on_unknown_target,
         parse_incomplete=parse_incomplete,
@@ -2416,20 +2418,6 @@ def _pickle_has_rebuild_tensor_setitem_abuse(data: bytes) -> bool:
     )
 
 
-def _pickle_has_dangerous_system_setitem_abuse(data: bytes) -> bool:
-    return _pickle_has_setitem_abuse_for_entries(
-        data,
-        global_needles=("os.system", "posix.system", "nt.system"),
-    )
-
-
-def _result_parse_was_incomplete(result: ScanResult) -> bool:
-    if result.metadata.get("parsing_failed") is True or result.metadata.get("analysis_incomplete") is True:
-        return True
-    status = result.metadata.get("pickle_report_status")
-    return isinstance(status, str) and status != "complete"
-
-
 def _metadata_pickle_read_limit(configured_limit: Any) -> tuple[int | None, str | None]:
     try:
         read_limit = int(configured_limit)
@@ -2446,19 +2434,15 @@ def _metadata_pickle_read_limit(configured_limit: Any) -> tuple[int | None, str 
 def _is_dangerous_module(module: str) -> bool:
     """Return whether a module path is always dangerous."""
     normalized = module.strip()
-    if _is_safe_module_policy_path(normalized):
+    if any(normalized == safe or normalized.startswith(f"{safe}.") for safe in _SAFE_MODULE_POLICY_PREFIXES):
         return False
     return normalized in ALWAYS_DANGEROUS_MODULES or any(
         normalized.startswith(f"{dangerous}.") for dangerous in ALWAYS_DANGEROUS_MODULES
     )
 
 
-def _is_safe_module_policy_path(module: str) -> bool:
-    return any(module == safe or module.startswith(f"{safe}.") for safe in _SAFE_MODULE_POLICY_PREFIXES)
-
-
 def _suspicious_global_policy_matches(module: str, name: str) -> bool:
-    if _is_safe_module_policy_path(module):
+    if any(module == safe or module.startswith(f"{safe}.") for safe in _SAFE_MODULE_POLICY_PREFIXES):
         return False
 
     suspicious = SUSPICIOUS_GLOBALS.get(module)
@@ -2569,10 +2553,6 @@ def _joblib_numpy_array_validated_raw_span_control_references(path_obj: Path) ->
     if sanitized is None:
         return frozenset()
     return frozenset(sanitized.validated_control_occurrences)
-
-
-def _joblib_numpy_array_wrapper_has_validated_raw_span(path_obj: Path) -> bool:
-    return _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE in _joblib_numpy_array_validated_raw_span_control_references(path_obj)
 
 
 def _joblib_numpy_array_wrapper_origin_is_trusted() -> bool:
@@ -3459,37 +3439,6 @@ class PickleScanner(BaseScanner):
                 result.metadata["pickle_verdict"] = "clean"
 
     @staticmethod
-    def _remove_private_actionable_failed_check_entries(
-        result: ScanResult,
-        entries_to_remove: list[dict[str, str]],
-    ) -> None:
-        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
-        if not entries_to_remove or not isinstance(private_failed_checks, list):
-            return
-
-        unmatched_entries = list(entries_to_remove)
-        filtered_entries: list[Any] = []
-        for entry in private_failed_checks:
-            if isinstance(entry, dict):
-                matched_index = next(
-                    (
-                        index
-                        for index, candidate in enumerate(unmatched_entries)
-                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
-                    ),
-                    None,
-                )
-                if matched_index is not None:
-                    del unmatched_entries[matched_index]
-                    continue
-            filtered_entries.append(entry)
-
-        if filtered_entries:
-            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
-        else:
-            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
-
-    @staticmethod
     def _mark_legacy_pytorch_storage_layout_incomplete(
         result: ScanResult,
         layout: _LegacyPyTorchStreamLayout,
@@ -3735,19 +3684,6 @@ class PickleScanner(BaseScanner):
         result.metadata["trusted_incomplete_tail_reason"] = "joblib_pickle_tail"
 
     @staticmethod
-    def _remove_trusted_joblib_numpy_array_wrapper_findings(result: ScanResult) -> None:
-        def is_trusted_wrapper_finding(finding: Any) -> bool:
-            details = getattr(finding, "details", {})
-            return (
-                getattr(finding, "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
-                and isinstance(details, dict)
-                and details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
-            )
-
-        result.issues = [issue for issue in result.issues if not is_trusted_wrapper_finding(issue)]
-        result.checks = [check for check in result.checks if not is_trusted_wrapper_finding(check)]
-
-    @staticmethod
     def _downgrade_pickle_parse_error_findings(result: ScanResult) -> None:
         for issue in result.issues:
             if issue.rule_code == "S901" and issue.details.get("category") == "parse_error":
@@ -3887,13 +3823,6 @@ class PickleScanner(BaseScanner):
                 min(self.max_file_read_size, _PYTORCH_LEGACY_INITIAL_LAYOUT_PROBE_BYTES),
             )
         return min(probe_limit, self._legacy_pytorch_control_probe_size(total_size))
-
-    def _read_legacy_pytorch_preamble_probe(self, path: str, file_size: int) -> bytes:
-        probe_size = self._legacy_pytorch_preamble_probe_size(file_size)
-        if probe_size <= 0:
-            return b""
-        with open(path, "rb") as handle:
-            return self._read_stream_bytes(handle, probe_size)
 
     def _root_expensive_raw_scan_limit(self) -> int:
         limit = self.config.get("pickle_expensive_raw_scan_limit_bytes", _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES)
@@ -4583,7 +4512,10 @@ class PickleScanner(BaseScanner):
                 module == "__main__"
                 and not bool(reference.get("is_dangerous"))
                 and not _has_rule_for_import_reference(result, "S207", import_reference)
-                and not _has_issue_for_import_reference(result, import_reference)
+                and not any(
+                    issue.details.get("associated_global", issue.details.get("import_reference")) == import_reference
+                    for issue in result.issues
+                )
             ):
                 result.add_check(
                     name="Pickle BUILD State Safety Check",
@@ -4675,13 +4607,18 @@ class PickleScanner(BaseScanner):
         if _contains_non_documentation_token(lower, b"__import__", documentation_spans):
             _append_raw_indicator(indicators, "__import__", "builtins.__import__")
         for module_token, attr_token, associated_global in _RAW_PICKLE_GLOBAL_REFERENCES:
-            if _contains_pickle_global_reference(lower, module_token, attr_token, documentation_spans):
+            if _contains_non_documentation_token(
+                lower, b"c" + module_token + b"\n" + attr_token + b"\n", documentation_spans
+            ):
                 _append_raw_indicator(indicators, associated_global)
         for module_token, attr_token, associated_global in _RAW_TEXT_MODULE_ATTR_INDICATORS:
             if _contains_module_attr(lower, module_token, attr_token, documentation_spans):
                 _append_raw_indicator(indicators, associated_global)
         for pattern, label, associated_global in _RAW_TEXT_REGEX_INDICATORS:
-            if _contains_non_documentation_pattern(lower, pattern, documentation_spans):
+            if any(
+                not _is_documentation_match(lower, match.start(), documentation_spans)
+                for match in re.finditer(pattern, lower)
+            ):
                 _append_raw_indicator(indicators, label, associated_global)
         for token, label, associated_global in _RAW_TEXT_TOKEN_INDICATORS:
             if _contains_non_documentation_token(lower, token, documentation_spans):
@@ -5105,7 +5042,6 @@ class PickleScanner(BaseScanner):
             return
 
         no_setitem_abuse = _PickleSetitemAnalysis(
-            saw_setitem=False,
             confirmed_dangerous_target=False,
             suspicious_entry_on_unknown_target=False,
             parse_incomplete=False,

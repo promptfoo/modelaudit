@@ -5,9 +5,11 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Literal
+
+from modelaudit._size_format import _format_size_scaled
 
 logger = logging.getLogger("modelaudit.progress")
 
@@ -97,12 +99,7 @@ class ProgressStats:
 
     def format_bytes(self, bytes_val: int) -> str:
         """Format bytes in human-readable format."""
-        bytes_float = float(bytes_val)
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if bytes_float < 1024.0:
-                return f"{bytes_float:.1f} {unit}"
-            bytes_float /= 1024.0
-        return f"{bytes_float:.1f} PB"
+        return _format_size_scaled(bytes_val)
 
     def format_time(self, seconds: float) -> str:
         """Format time duration in human-readable format."""
@@ -116,6 +113,10 @@ class ProgressStats:
             hours = int(seconds // 3600)
             minutes = int((seconds % 3600) // 60)
             return f"{hours}h {minutes}m"
+
+
+# Keep snapshot fields fixed to the base schema if callers replace the constructor.
+_PROGRESS_STATS_FIELDS = tuple(field.name for field in fields(ProgressStats))
 
 
 # Type alias for progress callback functions
@@ -399,18 +400,5 @@ class ProgressTracker:
         """Get current progress statistics."""
         with self._lock:
             # Return a copy to avoid race conditions
-            stats_copy = ProgressStats(
-                start_time=self.stats.start_time,
-                last_update_time=self.stats.last_update_time,
-                bytes_processed=self.stats.bytes_processed,
-                total_bytes=self.stats.total_bytes,
-                items_processed=self.stats.items_processed,
-                total_items=self.stats.total_items,
-                current_phase=self.stats.current_phase,
-                bytes_per_second=self.stats.bytes_per_second,
-                items_per_second=self.stats.items_per_second,
-                estimated_time_remaining=self.stats.estimated_time_remaining,
-                current_item=self.stats.current_item,
-                status_message=self.stats.status_message,
-            )
+            stats_copy = ProgressStats(**{name: getattr(self.stats, name) for name in _PROGRESS_STATS_FIELDS})
             return stats_copy

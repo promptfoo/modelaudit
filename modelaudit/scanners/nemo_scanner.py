@@ -32,7 +32,7 @@ from .archive_member_security import (
     is_python_archive_member_name,
     scan_archive_member_for_known_risks,
 )
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, _scanner_stat_identity
 from .tar_scanner import (
     TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON,
     TAR_DECOMPRESSION_RATIO_LIMIT_INCOMPLETE_REASON,
@@ -1193,14 +1193,11 @@ class _NemoConfigTraversalLimit(Exception):
         self.reason = reason
 
 
-def _redact_config_evidence(value: str) -> str:
-    """Bound attacker-controlled config evidence before storing diagnostics."""
-    return redact_evidence_string(value, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
-
-
 def _append_config_path(path_prefix: str, component: str) -> str:
     separator = "" if not path_prefix or component.startswith("[") else "."
-    return _redact_config_evidence(f"{path_prefix}{separator}{component}")
+    # Bound attacker-controlled config evidence before storing diagnostics.
+    evidence_path = f"{path_prefix}{separator}{component}"
+    return redact_evidence_string(evidence_path, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
 
 
 def _find_suspicious_target_pattern(target: str) -> str | None:
@@ -1246,10 +1243,6 @@ def _is_dangerous_callable_target(callable_target: str) -> bool:
             and callable_target.endswith(_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES)
         )
     )
-
-
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 def _is_nested_coverage_only_incomplete_reason(reason: str) -> bool:
@@ -1366,15 +1359,7 @@ class NemoScanner(BaseScanner):
             return TarScanner.can_handle(path)
         return is_nemo_archive(path)
 
-    @staticmethod
-    def _archive_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
-        return (
-            stat_result.st_dev,
-            stat_result.st_ino,
-            stat_result.st_size,
-            stat_result.st_mtime_ns,
-            stat_result.st_ctime_ns,
-        )
+    _archive_identity = staticmethod(_scanner_stat_identity)
 
     @classmethod
     def _archive_source_changed(
@@ -1613,9 +1598,9 @@ class NemoScanner(BaseScanner):
             result.finish(success=False)
             return
 
-        if result.metadata.get(
-            _INCONCLUSIVE_METADATA_KEY
-        ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
+        if result.metadata.get(_INCONCLUSIVE_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME and not any(
+            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues
+        ):
             result.finish(success=False)
             return
 
@@ -2229,7 +2214,7 @@ class NemoScanner(BaseScanner):
         message: str,
     ) -> None:
         """Record bounded YAML traversal failures without retaining raw config evidence."""
-        display_config_file = _redact_config_evidence(config_file)
+        display_config_file = redact_evidence_string(config_file, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
         max_traversal_nodes = (
             _HYDRA_DYNAMIC_CONFIG_SCAN_NODES
             if reason == "nemo_helper_config_traversal_node_limit"
@@ -3629,9 +3614,9 @@ class NemoScanner(BaseScanner):
         config_root: Any,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
-        display_target = _redact_config_evidence(target)
-        display_config_path = _redact_config_evidence(config_path)
-        display_config_name = _redact_config_evidence(config_name)
+        display_target = redact_evidence_string(target, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_path = redact_evidence_string(config_path, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_name = redact_evidence_string(config_name, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
         callable_target = _unwrap_target_call_aliases(target)
         # Escaped interpolation openers can become active after repeated OmegaConf/Hydra resolution passes.
         if _HYDRA_INTERPOLATION_OPENER in target:
@@ -4104,12 +4089,12 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
     ) -> None:
-        display_target = _redact_config_evidence(target)
-        display_argument_name = _redact_config_evidence(argument_name)
-        display_argument_path = _redact_config_evidence(argument_path)
-        display_argument_value = _redact_config_evidence(argument_value)
-        display_config_path = _redact_config_evidence(config_path)
-        display_config_name = _redact_config_evidence(config_name)
+        display_target = redact_evidence_string(target, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_argument_name = redact_evidence_string(argument_name, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_argument_path = redact_evidence_string(argument_path, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_argument_value = redact_evidence_string(argument_value, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_path = redact_evidence_string(config_path, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_name = redact_evidence_string(config_name, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
         result.add_check(
             name=f"{CVE_2025_23304_ID}: Dangerous Hydra helper argument",
             passed=False,
@@ -4187,9 +4172,9 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
     ) -> None:
-        display_target = _redact_config_evidence(target)
-        display_config_path = _redact_config_evidence(config_path)
-        display_config_name = _redact_config_evidence(config_name)
+        display_target = redact_evidence_string(target, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_path = redact_evidence_string(config_path, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_name = redact_evidence_string(config_name, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
         result.add_check(
             name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
             passed=False,

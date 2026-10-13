@@ -88,7 +88,8 @@ _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
 _PROTO0_GLOBAL_OR_INST_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"[ci][A-Za-z_][A-Za-z0-9_.]*")
-_REPEATED_PROTO0_INT_STREAM_RE = re.compile(rb"(?:I[+-]?\d+\n\.)+")
+# Bound each match's repetition stack; callers continue from the exact end.
+_REPEATED_TRIVIAL_STREAM_RE = re.compile(rb"(?:(?:N|I[+-]?\d+\n)\.[ \t\r\n\x00]*){1,4096}")
 _PROTO0_GLOBAL_NAME_START_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
 _PROTO0_GLOBAL_NAME_BYTES = _PROTO0_GLOBAL_NAME_START_BYTES | frozenset(b"0123456789.")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
@@ -780,31 +781,8 @@ class PickleScanner:
                 probe_budget_exhausted = any(
                     notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in discovery_notices
                 )
-                if (
-                    not _is_pytorch_zip_archive(
-                        entries,
-                        discovered_pickle_entries=pickle_entries,
-                    )
-                    and not probe_budget_exhausted
-                ):
+                if not pickle_entries and not probe_budget_exhausted:
                     return None
-                if not pickle_entries:
-                    if probe_budget_exhausted:
-                        return _combine_pytorch_zip_reports(
-                            source=source,
-                            size=size,
-                            entry_count=len(entries),
-                            pickle_entries=[],
-                            member_reports=[],
-                            extra_notices=discovery_notices,
-                        )
-                    return _pytorch_zip_notice_report(
-                        source=source,
-                        size=size,
-                        message="PyTorch ZIP archive does not contain pickle members to scan",
-                        code="pytorch_zip_no_pickle_members",
-                        details={"analysis_incomplete": True},
-                    )
 
                 reports: list[PickleReport] = []
                 skipped_notices: list[Notice] = list(discovery_notices)
@@ -1046,21 +1024,6 @@ def _check_pytorch_zip_deadline(deadline: float) -> None:
         raise _PytorchZipDeadlineExceeded
 
 
-def _is_pytorch_zip_archive(
-    entries: list[zipfile.ZipInfo],
-    *,
-    discovered_pickle_entries: list[zipfile.ZipInfo] | None = None,
-) -> bool:
-    names = [entry.filename for entry in entries if not entry.is_dir()]
-    has_data_pickle = any(_is_data_pickle_member(name) for name in names)
-    if not _has_pytorch_zip_metadata(entries):
-        return False
-    if has_data_pickle:
-        return True
-    has_pickle_members = any(name.lower().endswith(_PICKLE_MEMBER_SUFFIXES) for name in names)
-    return has_pickle_members or bool(discovered_pickle_entries)
-
-
 def _discover_pytorch_zip_pickle_entries(
     archive: zipfile.ZipFile,
     entries: list[zipfile.ZipInfo],
@@ -1121,76 +1084,45 @@ def _discover_pytorch_zip_pickle_entries(
     deferred_expanded_probe_entries: list[zipfile.ZipInfo] = []
     deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
     probed_member_count = 0
-    for candidate_index, entry in enumerate(candidates):
-        _check_pytorch_zip_deadline(deadline)
-        try:
-            entry_id = id(entry)
-            storage_probe_bytes = None
-            if entry_id in storage_entries.trusted_entry_ids:
-                # Preserve the legacy trusted probe for every member before spending the shared
-                # discovery budget on expanded coverage.
-                storage_probe_bytes = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-            elif entry_id in storage_entries.storage_probe_entry_ids:
-                storage_probe_bytes = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
-            if storage_probe_bytes is not None:
-                needs_deferred_expanded_probe = [False]
-                needs_deferred_padding_probe = [False]
-                looks_like_pickle = _trusted_storage_zip_entry_looks_like_pickle(
-                    archive,
-                    entry,
-                    probe_bytes_remaining,
-                    deadline,
-                    nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
-                    max_probe_bytes=storage_probe_bytes,
-                    defer_expanded_probe=needs_deferred_expanded_probe,
-                    defer_padding_probe=needs_deferred_padding_probe,
-                )
-            else:
-                needs_deferred_expanded_probe = [False]
-                needs_deferred_padding_probe = [False]
-                looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining, deadline)
-            if looks_like_pickle:
-                add_entry(entry)
-            elif entry_id in storage_entries.expanded_trust_entry_ids or needs_deferred_expanded_probe[0]:
-                deferred_expanded_probe_entries.append(entry)
-            elif needs_deferred_padding_probe[0]:
-                deferred_padding_probe_entries.append(entry)
-            probed_member_count += 1
-        except _PytorchZipNulPaddingVerificationBudgetExceeded as error:
-            notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
-        except _PickleDiscoveryProbeBudgetExceeded:
-            notices.append(
-                _pytorch_zip_pickle_discovery_probe_budget_notice(
-                    source=source,
-                    probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
-                    probed_member_count=probed_member_count,
-                    skipped_entries=remaining_probe_entries(
-                        candidates[candidate_index:],
-                        deferred_expanded_probe_entries,
-                        deferred_padding_probe_entries,
-                    ),
-                )
-            )
-            break
-        except Exception as error:
-            notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
-    else:
-        for expanded_index, entry in enumerate(deferred_expanded_probe_entries):
+    entry_groups = (candidates, deferred_expanded_probe_entries, deferred_padding_probe_entries)
+    budget_exhausted = False
+    for phase, probe_entries in enumerate(entry_groups):
+        for entry_index, entry in enumerate(probe_entries):
             _check_pytorch_zip_deadline(deadline)
             try:
+                entry_id = id(entry)
+                needs_deferred_expanded_probe = [False]
                 needs_deferred_padding_probe = [False]
-                if _trusted_storage_zip_entry_looks_like_pickle(
-                    archive,
-                    entry,
-                    probe_bytes_remaining,
-                    deadline,
-                    nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
-                    max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
-                    defer_padding_probe=needs_deferred_padding_probe,
-                ):
+                storage_probe_bytes = None
+                if phase > 0 or entry_id in storage_entries.storage_probe_entry_ids:
+                    storage_probe_bytes = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
+                if phase == 0 and entry_id in storage_entries.trusted_entry_ids:
+                    # Preserve the legacy trusted probe for every member before spending the shared
+                    # discovery budget on expanded coverage.
+                    storage_probe_bytes = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                if storage_probe_bytes is None:
+                    looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining, deadline)
+                else:
+                    looks_like_pickle = _trusted_storage_zip_entry_looks_like_pickle(
+                        archive,
+                        entry,
+                        probe_bytes_remaining,
+                        deadline,
+                        nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
+                        max_probe_bytes=storage_probe_bytes,
+                        defer_expanded_probe=needs_deferred_expanded_probe if phase == 0 else None,
+                        defer_padding_probe=needs_deferred_padding_probe if phase < 2 else None,
+                    )
+                if looks_like_pickle:
                     add_entry(entry)
-                elif needs_deferred_padding_probe[0]:
+                elif phase == 0 and (
+                    entry_id in storage_entries.expanded_trust_entry_ids or needs_deferred_expanded_probe[0]
+                ):
+                    deferred_expanded_probe_entries.append(entry)
+                elif phase < 2 and needs_deferred_padding_probe[0]:
                     deferred_padding_probe_entries.append(entry)
+                if phase == 0:
+                    probed_member_count += 1
             except _PytorchZipNulPaddingVerificationBudgetExceeded as error:
                 notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
             except _PickleDiscoveryProbeBudgetExceeded:
@@ -1199,42 +1131,19 @@ def _discover_pytorch_zip_pickle_entries(
                         source=source,
                         probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
                         probed_member_count=probed_member_count,
-                        skipped_entries=remaining_probe_entries(
-                            deferred_expanded_probe_entries[expanded_index:],
-                            deferred_padding_probe_entries,
+                        skipped_entries=(
+                            probe_entries[entry_index:]
+                            if phase == 2
+                            else remaining_probe_entries(probe_entries[entry_index:], *entry_groups[phase + 1 :])
                         ),
                     )
                 )
+                budget_exhausted = True
                 break
             except Exception as error:
                 notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
-        else:
-            for padding_index, entry in enumerate(deferred_padding_probe_entries):
-                _check_pytorch_zip_deadline(deadline)
-                try:
-                    if _trusted_storage_zip_entry_looks_like_pickle(
-                        archive,
-                        entry,
-                        probe_bytes_remaining,
-                        deadline,
-                        nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
-                        max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
-                    ):
-                        add_entry(entry)
-                except _PytorchZipNulPaddingVerificationBudgetExceeded as error:
-                    notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
-                except _PickleDiscoveryProbeBudgetExceeded:
-                    notices.append(
-                        _pytorch_zip_pickle_discovery_probe_budget_notice(
-                            source=source,
-                            probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
-                            probed_member_count=probed_member_count,
-                            skipped_entries=deferred_padding_probe_entries[padding_index:],
-                        )
-                    )
-                    break
-                except Exception as error:
-                    notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
+        if budget_exhausted:
+            break
 
     pickle_entries = [
         *explicit_pickle_entries,
@@ -2538,6 +2447,11 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(
     cursor = 0
     stream = io.BytesIO(sample)
     while cursor < len(sample):
+        # Scalar-only streams cannot contain nested byte or string literals.
+        scalar_end = _repeated_trivial_stream_offset(sample, cursor)
+        if scalar_end != cursor:
+            cursor = scalar_end
+            continue
         if (
             cursor + 1 < len(sample)
             and sample[cursor : cursor + 1] == b"#"
@@ -3521,21 +3435,13 @@ def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> boo
 
 
 def _repeated_trivial_stream_offset(sample: bytes, offset: int) -> int:
-    original_offset = offset
     sample_length = len(sample)
     while offset < sample_length:
-        if offset + 2 <= sample_length and sample[offset : offset + 2] == b"N.":
-            offset += 2
-        elif offset < sample_length and sample[offset : offset + 1] == b"I":
-            match = _REPEATED_PROTO0_INT_STREAM_RE.match(sample, offset)
-            if match is None:
-                break
-            offset = match.end()
-        else:
+        match = _REPEATED_TRIVIAL_STREAM_RE.match(sample, offset)
+        if match is None:
             break
-        while offset < sample_length and sample[offset] in _PROTO0_1_IGNORABLE_TRAILING_BYTES:
-            offset += 1
-    return offset if offset != original_offset else original_offset
+        offset = match.end()
+    return offset
 
 
 def _repeated_none_stream_trailing(sample: bytes) -> bytes | None:
@@ -5079,17 +4985,12 @@ def _without_unproven_oversized_frame_tamper(
     verdict = report.verdict
     if verdict == SafetyVerdict.SUSPICIOUS and not findings:
         verdict = SafetyVerdict.CLEAN
-    return PickleReport(
-        source=report.source,
-        status=report.status,
+    return replace(
+        report,
         verdict=verdict,
         findings=findings,
         notices=notices,
-        errors=report.errors,
-        coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -5118,13 +5019,11 @@ def _with_unbounded_stream_notice(
     status = ScanStatus.INCONCLUSIVE
     verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
-    return PickleReport(
-        source=report.source,
+    return replace(
+        report,
         status=status,
         verdict=verdict,
-        findings=report.findings,
         notices=notices,
-        errors=report.errors,
         coverage=CoverageSummary(
             bytes_scanned=report.coverage.bytes_scanned,
             bytes_total=None,
@@ -5133,8 +5032,6 @@ def _with_unbounded_stream_notice(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -5170,13 +5067,11 @@ def _with_known_stream_notice(
     status = ScanStatus.INCONCLUSIVE
     verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
-    return PickleReport(
-        source=report.source,
+    return replace(
+        report,
         status=status,
         verdict=verdict,
-        findings=report.findings,
         notices=notices,
-        errors=report.errors,
         coverage=CoverageSummary(
             bytes_scanned=report.coverage.bytes_scanned,
             bytes_total=bytes_total,
@@ -5185,8 +5080,6 @@ def _with_known_stream_notice(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -5224,12 +5117,10 @@ def _with_short_read_error(
         "stream_bytes_read": error.bytes_read,
         "stream_expected_size": error.expected_size,
     }
-    return PickleReport(
-        source=report.source,
+    return replace(
+        report,
         status=ScanStatus.ERROR,
         verdict=verdict,
-        findings=report.findings,
-        notices=report.notices,
         errors=errors,
         coverage=CoverageSummary(
             bytes_scanned=max(report.coverage.bytes_scanned, error.bytes_read),
@@ -5239,8 +5130,6 @@ def _with_short_read_error(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -5394,9 +5283,9 @@ def _with_canonical_pytorch_storage_persistent_id_metadata(
     single_storage_key = next(iter(trusted_storage_keys)) if len(trusted_storage_keys) == 1 else None
 
     findings = tuple(
-        _finding_with_details(
+        replace(
             finding,
-            _canonical_pytorch_storage_persistent_id_details(
+            details=_canonical_pytorch_storage_persistent_id_details(
                 finding.details,
                 proven_canonical_storage_ids=proven_canonical_storage_ids,
                 rust_canonical_storage_ids=rust_canonical_storage_ids,
@@ -5417,17 +5306,10 @@ def _with_canonical_pytorch_storage_persistent_id_metadata(
             )
             for reference in import_references
         ]
-    return PickleReport(
-        source=report.source,
-        status=report.status,
-        verdict=report.verdict,
+    return replace(
+        report,
         findings=findings,
-        notices=report.notices,
-        errors=report.errors,
-        coverage=report.coverage,
         metadata=metadata,
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -5487,17 +5369,6 @@ def _canonical_pytorch_storage_persistent_id_details(
     normalized.pop("pytorch_storage_persistent_id", None)
     normalized.pop("pytorch_storage_key", None)
     return normalized
-
-
-def _finding_with_details(finding: Finding, details: Mapping[str, Any]) -> Finding:
-    return Finding(
-        message=finding.message,
-        severity=finding.severity,
-        location=finding.location,
-        rule_code=finding.rule_code,
-        details=details,
-        why=finding.why,
-    )
 
 
 def _call_graph_enrichment_is_redundant(report: PickleReport) -> bool:
@@ -6010,17 +5881,11 @@ def _without_proven_safe_getattr_reconstruction_findings(
     )
     if len(findings) == len(report.findings):
         return report
-    return PickleReport(
-        source=report.source,
-        status=report.status,
+    return replace(
+        report,
         verdict=_verdict_for_findings(report.status, findings),
         findings=findings,
-        notices=report.notices,
-        errors=report.errors,
-        coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -6392,16 +6257,12 @@ def _without_proven_safe_import_findings(
             verdict = SafetyVerdict.CLEAN
         else:
             verdict = SafetyVerdict.UNKNOWN
-    return PickleReport(
-        source=report.source,
-        status=report.status,
+    return replace(
+        report,
         verdict=verdict,
         findings=findings,
-        notices=report.notices,
-        errors=report.errors,
-        coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
-        duration_s=report.duration_s,
+        private_metadata={},
     )
 
 
@@ -6973,21 +6834,16 @@ def _with_call_graph_enrichment_errors(
         ),
     )
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
-    return PickleReport(
-        source=report.source,
+    return replace(
+        report,
         status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
         verdict=(
             report.verdict
             if report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
             else SafetyVerdict.UNKNOWN
         ),
-        findings=report.findings,
-        notices=report.notices,
         errors=errors,
-        coverage=report.coverage,
         metadata=metadata,
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -6999,17 +6855,10 @@ def _with_call_graph_source_fingerprint_metadata(
         return report
     private_metadata = dict(report.private_metadata)
     private_metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY] = dict(source_fingerprints)
-    return PickleReport(
-        source=report.source,
-        status=report.status,
-        verdict=report.verdict,
-        findings=report.findings,
-        notices=report.notices,
-        errors=report.errors,
-        coverage=report.coverage,
+    return replace(
+        report,
         metadata=report.to_dict()["metadata"],
         private_metadata=private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -7044,21 +6893,16 @@ def _with_unanalyzed_call_graph_notices(
         ),
     )
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
-    return PickleReport(
-        source=report.source,
+    return replace(
+        report,
         status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
         verdict=(
             report.verdict
             if report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
             else SafetyVerdict.UNKNOWN
         ),
-        findings=report.findings,
         notices=notices,
-        errors=report.errors,
-        coverage=report.coverage,
         metadata=metadata,
-        private_metadata=report.private_metadata,
-        duration_s=report.duration_s,
     )
 
 
@@ -7228,14 +7072,10 @@ def _append_untrusted_import_findings(report: PickleReport, additional_findings:
     """Append untrusted import evidence without losing an existing malicious verdict."""
     if not additional_findings:
         return report
-    return PickleReport(
-        source=report.source,
-        status=report.status,
+    return replace(
+        report,
         verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
         findings=(*report.findings, *additional_findings),
-        notices=report.notices,
-        errors=report.errors,
-        coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
-        duration_s=report.duration_s,
+        private_metadata={},
     )

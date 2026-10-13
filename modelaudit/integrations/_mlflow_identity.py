@@ -3,7 +3,7 @@
 import re
 from urllib.parse import unquote
 
-from modelaudit.detectors.network_comm import _redact_urls_in_text
+from modelaudit.detectors.network_comm import _URL_IN_TEXT_PATTERN, redact_url_for_finding
 from modelaudit.integrations._sarif_identity_urls import redact_cloud_error_for_display, redact_url_for_display
 from modelaudit.scanners._evidence_redaction import (
     MAX_PERCENT_DECODE_PASSES,
@@ -118,7 +118,9 @@ def _redact_mlflow_error_for_display(error: object) -> str:
         or _MLFLOW_PROTOCOL_RELATIVE_URL_RE.search(redacted)
     )
     if contains_url:
-        redacted = redact_cloud_error_for_display(_redact_urls_in_text(redacted))
+        redacted = redact_cloud_error_for_display(
+            _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), redacted)
+        )
     redacted = _MLFLOW_PROTOCOL_RELATIVE_URL_RE.sub(_redact_protocol_relative_url, redacted)
     redacted = _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
     redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)

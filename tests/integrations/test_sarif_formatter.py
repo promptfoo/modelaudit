@@ -206,6 +206,19 @@ class TestFormatSarifOutput:
         assert [rule["id"] for rule in run["tool"]["driver"]["rules"]] == ["S104"]
 
 
+def _assert_incomplete_invocation(run: dict[str, Any], *, has_findings: bool = False) -> None:
+    invocation = run["invocations"][0]
+    assert invocation["exitCode"] == (1 if has_findings else 2)
+    assert invocation["exitCodeDescription"] == (
+        "Security issues detected; scan coverage incomplete" if has_findings else "Scan outcome was inconclusive"
+    )
+    assert invocation["executionSuccessful"] is False
+    assert invocation["properties"]["processCompleted"] is True
+    assert invocation["properties"]["securityCoverageComplete"] is False
+    assert invocation["properties"]["incompleteCoverage"] is True
+    assert invocation["properties"]["operationalErrors"] is False
+
+
 class TestCreateRun:
     """Tests for _create_run function."""
 
@@ -320,14 +333,7 @@ class TestCreateRun:
 
         run = _create_run(result, ["/test"], verbose=False)
 
-        invocation = run["invocations"][0]
-        assert invocation["exitCode"] == 2
-        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
-        assert invocation["executionSuccessful"] is False
-        assert invocation["properties"]["processCompleted"] is True
-        assert invocation["properties"]["securityCoverageComplete"] is False
-        assert invocation["properties"]["incompleteCoverage"] is True
-        assert invocation["properties"]["operationalErrors"] is False
+        _assert_incomplete_invocation(run)
 
     def test_invocation_properties_mark_issue_only_incomplete_coverage_without_findings(self) -> None:
         """Issue-only coverage gaps should be unsuccessful SARIF invocations."""
@@ -351,12 +357,7 @@ class TestCreateRun:
 
         run = _create_run(result, ["/test"], verbose=False)
 
-        invocation = run["invocations"][0]
-        assert invocation["exitCode"] == 2
-        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
-        assert invocation["executionSuccessful"] is False
-        assert invocation["properties"]["securityCoverageComplete"] is False
-        assert invocation["properties"]["incompleteCoverage"] is True
+        _assert_incomplete_invocation(run)
 
     def test_invocation_properties_mark_check_only_incomplete_coverage_without_findings(self) -> None:
         """Check-only coverage gaps should be unsuccessful SARIF invocations."""
@@ -377,12 +378,7 @@ class TestCreateRun:
 
         run = _create_run(result, ["/test"], verbose=False)
 
-        invocation = run["invocations"][0]
-        assert invocation["exitCode"] == 2
-        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
-        assert invocation["executionSuccessful"] is False
-        assert invocation["properties"]["securityCoverageComplete"] is False
-        assert invocation["properties"]["incompleteCoverage"] is True
+        _assert_incomplete_invocation(run)
 
     def test_invocation_properties_mark_incomplete_coverage_with_security_findings(self) -> None:
         """Security exit 1 should not hide incomplete coverage in SARIF."""
@@ -402,14 +398,7 @@ class TestCreateRun:
 
         run = _create_run(result, ["/test"], verbose=False)
 
-        invocation = run["invocations"][0]
-        assert invocation["exitCode"] == 1
-        assert invocation["exitCodeDescription"] == "Security issues detected; scan coverage incomplete"
-        assert invocation["executionSuccessful"] is False
-        assert invocation["properties"]["processCompleted"] is True
-        assert invocation["properties"]["securityCoverageComplete"] is False
-        assert invocation["properties"]["incompleteCoverage"] is True
-        assert invocation["properties"]["operationalErrors"] is False
+        _assert_incomplete_invocation(run, has_findings=True)
         assert run["results"][0]["message"]["text"] == "Dangerous pickle global"
 
     def test_invocation_properties_mark_issue_only_incomplete_coverage_with_security_findings(self) -> None:
@@ -435,12 +424,7 @@ class TestCreateRun:
 
         run = _create_run(result, ["/test"], verbose=False)
 
-        invocation = run["invocations"][0]
-        assert invocation["exitCode"] == 1
-        assert invocation["exitCodeDescription"] == "Security issues detected; scan coverage incomplete"
-        assert invocation["executionSuccessful"] is False
-        assert invocation["properties"]["securityCoverageComplete"] is False
-        assert invocation["properties"]["incompleteCoverage"] is True
+        _assert_incomplete_invocation(run, has_findings=True)
         assert [item["message"]["text"] for item in run["results"]] == [
             "DVC output resolution incomplete",
             "Dangerous pickle global",
@@ -780,12 +764,24 @@ class TestHelperFunctions:
         name = _get_rule_name(issue)
         assert name == "Something"
 
-    def test_get_rule_short_description_pickle(self):
-        """Test short description for pickle issues."""
-        issue = Issue(message="Unsafe pickle deserialization", severity=IssueSeverity.WARNING, timestamp=time.time())
+    @pytest.mark.parametrize(
+        "message, expected_terms",
+        [
+            ("Unsafe pickle deserialization", ("pickle",)),
+            ("Dangerous import os.system", ("import",)),
+            ("eval() call detected", ("execution",)),
+            ("Network communication detected", ("network",)),
+            ("API key exposed", ("secret", "key")),
+            ("License violation detected", ("license",)),
+            ("Blacklisted model name", ("blacklist",)),
+        ],
+        ids=["pickle", "import", "exec", "network", "secret", "license", "blacklist"],
+    )
+    def test_get_rule_short_description(self, message: str, expected_terms: tuple[str, ...]) -> None:
+        issue = Issue(message=message, severity=IssueSeverity.WARNING, timestamp=time.time())
 
         desc = _get_rule_short_description(issue)
-        assert "pickle" in desc.lower()
+        assert any(term in desc.lower() for term in expected_terms), (message, desc, expected_terms)
 
     def test_get_rule_short_description_reuses_lowered_message(self):
         """Short-description matching should normalize the issue message once."""
@@ -802,48 +798,6 @@ class TestHelperFunctions:
 
         assert _get_rule_short_description(issue) == "Potential secrets or keys exposed"
         assert message.lower_calls == 1
-
-    def test_get_rule_short_description_import(self):
-        """Test short description for import issues."""
-        issue = Issue(message="Dangerous import os.system", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        desc = _get_rule_short_description(issue)
-        assert "import" in desc.lower()
-
-    def test_get_rule_short_description_exec(self):
-        """Test short description for exec/eval issues."""
-        issue = Issue(message="eval() call detected", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        desc = _get_rule_short_description(issue)
-        assert "execution" in desc.lower()
-
-    def test_get_rule_short_description_network(self):
-        """Test short description for network issues."""
-        issue = Issue(message="Network communication detected", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        desc = _get_rule_short_description(issue)
-        assert "network" in desc.lower()
-
-    def test_get_rule_short_description_secret(self):
-        """Test short description for secret issues."""
-        issue = Issue(message="API key exposed", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        desc = _get_rule_short_description(issue)
-        assert "secret" in desc.lower() or "key" in desc.lower()
-
-    def test_get_rule_short_description_license(self):
-        """Test short description for license issues."""
-        issue = Issue(message="License violation detected", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        desc = _get_rule_short_description(issue)
-        assert "license" in desc.lower()
-
-    def test_get_rule_short_description_blacklist(self):
-        """Test short description for blacklist issues."""
-        issue = Issue(message="Blacklisted model name", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        desc = _get_rule_short_description(issue)
-        assert "blacklist" in desc.lower()
 
     def test_get_rule_short_description_generic(self):
         """Test short description for generic issues."""
@@ -878,51 +832,24 @@ class TestHelperFunctions:
         assert _severity_to_rank(IssueSeverity.INFO) == 30.0
         assert _severity_to_rank(IssueSeverity.DEBUG) == 10.0
 
-    def test_get_tags_for_issue_pickle(self):
-        """Test tags include pickle-related tags."""
-        issue = Issue(message="Pickle deserialization issue", severity=IssueSeverity.WARNING, timestamp=time.time())
+    @pytest.mark.parametrize(
+        "message, expected_tags",
+        [
+            ("Pickle deserialization issue", ("security", "ml-model", "pickle", "deserialization")),
+            ("eval() call detected", ("code-execution",)),
+            ("Network URL detected", ("network",)),
+            ("API key exposed", ("secrets",)),
+            ("License compliance issue", ("license",)),
+            ("CVE-2024-12345 vulnerability", ("vulnerability",)),
+        ],
+        ids=["pickle", "code_execution", "network", "secrets", "license", "cve"],
+    )
+    def test_get_tags_for_issue(self, message: str, expected_tags: tuple[str, ...]) -> None:
+        issue = Issue(message=message, severity=IssueSeverity.WARNING, timestamp=time.time())
 
         tags = _get_tags_for_issue(issue)
-
-        assert "security" in tags
-        assert "ml-model" in tags
-        assert "pickle" in tags
-        assert "deserialization" in tags
-
-    def test_get_tags_for_issue_code_execution(self) -> None:
-        """Test tags for code execution issues."""
-        issue = Issue(message="eval() call detected", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        tags = _get_tags_for_issue(issue)
-        assert "code-execution" in tags
-
-    def test_get_tags_for_issue_network(self):
-        """Test tags for network issues."""
-        issue = Issue(message="Network URL detected", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        tags = _get_tags_for_issue(issue)
-        assert "network" in tags
-
-    def test_get_tags_for_issue_secrets(self):
-        """Test tags for secrets issues."""
-        issue = Issue(message="API key exposed", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        tags = _get_tags_for_issue(issue)
-        assert "secrets" in tags
-
-    def test_get_tags_for_issue_license(self):
-        """Test tags for license issues."""
-        issue = Issue(message="License compliance issue", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        tags = _get_tags_for_issue(issue)
-        assert "license" in tags
-
-    def test_get_tags_for_issue_cve(self):
-        """Test tags for CVE issues."""
-        issue = Issue(message="CVE-2024-12345 vulnerability", severity=IssueSeverity.WARNING, timestamp=time.time())
-
-        tags = _get_tags_for_issue(issue)
-        assert "vulnerability" in tags
+        for tag in expected_tags:
+            assert tag in tags
 
     def test_normalize_path_to_uri(self):
         """Test path normalization to URI."""
@@ -1781,7 +1708,7 @@ def test_directory_owner_preserves_parent_finding_and_check_identities(tmp_path:
 @pytest.mark.parametrize("owner_path", ["/proc/self/fd/11", "/synthetic/staged-owner", "."])
 def test_directory_owner_identity_keeps_message_rules_and_evidence(tmp_path: Path, owner_path: str) -> None:
     from modelaudit.core import _normalize_directory_owner_scan_result_for_reporting
-    from modelaudit.utils.helpers.finding_identity import finding_identity
+    from modelaudit.finding_identity import finding_identity
 
     report_path = str(tmp_path / "owner")
     scanned = ScanResult(scanner_name="jax_checkpoint")
@@ -1812,7 +1739,7 @@ def test_directory_owner_identity_keeps_message_rules_and_evidence(tmp_path: Pat
     ],
 )
 def test_malformed_or_evidence_owned_identity_metadata_is_ignored(metadata: object) -> None:
-    from modelaudit.utils.helpers.finding_identity import finding_identity
+    from modelaudit.finding_identity import finding_identity
 
     issue = Issue(
         message="original",

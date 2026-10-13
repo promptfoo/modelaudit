@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
+- Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit. Continue supplemental stream checks after call-graph coverage gaps, and keep operational failures unsuccessful even with trusted padding.
+- Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
+- Make the nested archive test fixture portable to Windows.
+
+## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
+
+### Security
+
+- Require GitPython 3.2.0 or newer in the `mlflow`, `all-ci`, and `all` extras and lockfile to fix `Remote.pull()` refspec option injection ([GHSA-f9j4-qggq-h239](https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-f9j4-qggq-h239)).
+- Require AnyIO 4.14.2 or newer in published package dependencies as well as the lockfile.
+
 ### Changed
 
 - Include original credential values and configured debug paths in scan evidence, diagnostics, and exported reports while retaining detections and output bounds.
@@ -16,9 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
-- Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit. Continue supplemental stream checks after call-graph coverage gaps, and keep operational failures unsuccessful even with trusted padding.
+- Avoid repeatedly decoding literal-free scalar pickle streams during nested PyTorch storage discovery, preserving nested payload detection and scan limits.
+- Preserve UTF-8 pickle GLOBAL discovery in numeric PyTorch storage operands on Python 3.10–3.12.
+- Avoid incomplete PyTorch ZIP storage discovery for benign complete literals, verified padding, and impossible length-prefixed tensor bytes when no hidden payload is present.
+- Preserve hidden-pickle detection across storage probe limits, nested literals, long global names, and memoized operands; report incomplete coverage without discarding suspicious or malicious verdicts when inspection limits are reached.
+- Preserve benign Unicode metadata when checking line continuations without retaining a per-character copy.
+- Avoid duplicate padding charges when PyTorch ZIP storage probing retries a CRC mismatch.
+- Bound repeated PyTorch literal URL validation and report incomplete coverage when its shared allowance is exhausted.
+- Bound malformed PyTorch GLOBAL recovery across fallback passes and preserve benign protocol-0 FLOAT operands.
 - Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
+- Avoid false incomplete pickle scans when Python lazily refreshes an import-directory cache after a change made before scanning.
+
+### Features
+
+- preserve raw evidence in scan output and diagnostics ([#1870](https://github.com/promptfoo/modelaudit/issues/1870)) ([86c40e4](https://github.com/promptfoo/modelaudit/commit/86c40e49b97fcc6b87b6cc44ef5e7fa15f715844))
+
+### Bug Fixes
+
+- avoid PyTorch storage prefix discovery gaps ([#1853](https://github.com/promptfoo/modelaudit/issues/1853)) ([fd02475](https://github.com/promptfoo/modelaudit/commit/fd024759e36f50da5d36d1d5923ad1c4cabb160d))
+- **deps:** enforce GitPython and AnyIO security floors ([#1857](https://github.com/promptfoo/modelaudit/issues/1857)) ([b80c705](https://github.com/promptfoo/modelaudit/commit/b80c70516e446b48ef3e86d94910db9000539ecb))
+- **picklescan:** bound repeated scalar probe work ([#1878](https://github.com/promptfoo/modelaudit/issues/1878)) ([3b63c24](https://github.com/promptfoo/modelaudit/commit/3b63c240906122cbd95f573baa3c82901a38b0cf))
+- refresh importer snapshots between pickle scans ([#1877](https://github.com/promptfoo/modelaudit/issues/1877)) ([9b60dd2](https://github.com/promptfoo/modelaudit/commit/9b60dd239f7b0bd20a6016afda97275c7b40bb4f))
+- **safetensors:** preserve native FDICT-shaped headers ([#1863](https://github.com/promptfoo/modelaudit/issues/1863)) ([2a5185a](https://github.com/promptfoo/modelaudit/commit/2a5185a32a3993ac6188b20a04fe6cec7cc2eddc))
 
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
 

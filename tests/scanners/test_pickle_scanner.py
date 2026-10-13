@@ -44,6 +44,7 @@ from modelaudit.scanners.pickle_scanner import (
     _rebuild_tensor_indicators_are_documentation_literals,
     is_suspicious_global,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_mock_pytorch_zip
 from tests.helpers.cache import private_actionable_failed_checks as _private_actionable_failed_checks
 from tests.helpers.file_creators import ReadTrackingBuffer, SystemCommandPayload
@@ -693,8 +694,7 @@ def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
     assert leaked_secret not in caplog.text
     assert "<redacted>" in str(result.metadata)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregate = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -707,8 +707,6 @@ def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
         assert "raw_detector_analysis_incomplete" in metadata["scan_outcome_reasons"]
         assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_pickle_raw_jit_detector_exception_marks_scan_inconclusive(
@@ -979,8 +977,7 @@ def test_nested_probe_limit_operational_semantics_and_cache_policy(tmp_path: Pat
         for check in direct_result.checks
     )
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregate_result = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -994,8 +991,6 @@ def test_nested_probe_limit_operational_semantics_and_cache_policy(tmp_path: Pat
         assert metadata["scan_outcome_reasons"] == ["nested_probe_limit"]
         assert determine_exit_code(aggregate_result) == 1
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_stream_treats_negative_size_as_unknown_size() -> None:

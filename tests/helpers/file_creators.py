@@ -395,48 +395,6 @@ def create_mock_manifest(path: Path, content: dict[str, Any] | None = None) -> P
     return path
 
 
-def create_mock_safetensors(path: Path) -> Path:
-    """Create a mock safetensors file for testing.
-
-    Requires safetensors package to be installed.
-
-    Args:
-        path: Where to create the file
-
-    Returns:
-        Path to created file
-    """
-    import numpy as np
-    from safetensors.numpy import save_file
-
-    data = {"tensor1": np.arange(10, dtype=np.float32)}
-    save_file(data, str(path))
-    return path
-
-
-def create_mock_h5(path: Path, *, keras_style: bool = False) -> Path:
-    """Create a mock HDF5 file for testing.
-
-    Requires h5py package to be installed.
-
-    Args:
-        path: Where to create the file
-        keras_style: Whether to create Keras-style structure
-
-    Returns:
-        Path to created file
-    """
-    import h5py
-
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=[1.0, 2.0, 3.0])
-        if keras_style:
-            f.attrs["keras_version"] = "2.13.0"
-            model_config = f.create_group("model_config")
-            model_config.attrs["class_name"] = "Sequential"
-    return path
-
-
 def write_hf_cachedir_tag(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(

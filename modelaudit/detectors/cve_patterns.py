@@ -89,32 +89,32 @@ def analyze_cve_patterns(content: str, binary_content: bytes = b"") -> list[CVEA
     # Check CVE-2020-13092 patterns
     cve_2020_matches = _check_cve_2020_13092_multiline(content, binary_content)
     if cve_2020_matches:
-        attributions.append(_create_cve_2020_13092_attribution(cve_2020_matches))
+        attributions.append(_create_cve_attribution("CVE-2020-13092", cve_2020_matches))
 
     # Check CVE-2024-34997 patterns
     cve_2024_matches = _check_cve_2024_34997_multiline(content, binary_content)
     if cve_2024_matches:
-        attributions.append(_create_cve_2024_34997_attribution(cve_2024_matches))
+        attributions.append(_create_cve_attribution("CVE-2024-34997", cve_2024_matches))
 
     # Check CVE-2026-24747 patterns
     cve_2026_matches = _check_cve_2026_24747_multiline(content, binary_content)
     if cve_2026_matches:
-        attributions.append(_create_cve_2026_24747_attribution(cve_2026_matches))
+        attributions.append(_create_cve_attribution("CVE-2026-24747", cve_2026_matches))
 
     # Check CVE-2022-45907 patterns
     cve_2022_matches = _check_cve_2022_45907_multiline(content, binary_content)
     if cve_2022_matches:
-        attributions.append(_create_cve_2022_45907_attribution(cve_2022_matches))
+        attributions.append(_create_cve_attribution("CVE-2022-45907", cve_2022_matches))
 
     # Check CVE-2024-5480 patterns
     cve_5480_matches = _check_cve_2024_5480_multiline(content, binary_content)
     if cve_5480_matches:
-        attributions.append(_create_cve_2024_5480_attribution(cve_5480_matches))
+        attributions.append(_create_cve_attribution("CVE-2024-5480", cve_5480_matches))
 
     # Check CVE-2024-48063 patterns
     cve_48063_matches = _check_cve_2024_48063_multiline(content, binary_content)
     if cve_48063_matches:
-        attributions.append(_create_cve_2024_48063_attribution(cve_48063_matches))
+        attributions.append(_create_cve_attribution("CVE-2024-48063", cve_48063_matches))
 
     return attributions
 
@@ -268,16 +268,6 @@ def _check_cve_2024_34997_multiline(content: str, binary_content: bytes) -> list
     return matches
 
 
-def _create_cve_2020_13092_attribution(matches: list[str]) -> CVEAttribution:
-    """Create CVE-2020-13092 attribution with matched patterns."""
-    return _create_cve_attribution("CVE-2020-13092", matches)
-
-
-def _create_cve_2024_34997_attribution(matches: list[str]) -> CVEAttribution:
-    """Create CVE-2024-34997 attribution with matched patterns."""
-    return _create_cve_attribution("CVE-2024-34997", matches)
-
-
 def _check_cve_2026_24747_multiline(content: str, binary_content: bytes) -> list[str]:
     """
     Check for CVE-2026-24747 using multi-line aware detection.
@@ -346,11 +336,6 @@ def _check_cve_2026_24747_multiline(content: str, binary_content: bytes) -> list
     return matches
 
 
-def _create_cve_2026_24747_attribution(matches: list[str]) -> CVEAttribution:
-    """Create CVE-2026-24747 attribution with matched patterns."""
-    return _create_cve_attribution("CVE-2026-24747", matches)
-
-
 def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list[str]:
     """
     Check for CVE-2022-45907 using multi-line aware detection.
@@ -387,11 +372,6 @@ def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list
             matches.append("parse_type_line with eval (high risk)")
 
     return matches
-
-
-def _create_cve_2022_45907_attribution(matches: list[str]) -> CVEAttribution:
-    """Create CVE-2022-45907 attribution with matched patterns."""
-    return _create_cve_attribution("CVE-2022-45907", matches)
 
 
 def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[str]:
@@ -442,11 +422,6 @@ def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[
     return matches
 
 
-def _create_cve_2024_5480_attribution(matches: list[str]) -> CVEAttribution:
-    """Create CVE-2024-5480 attribution with matched patterns."""
-    return _create_cve_attribution("CVE-2024-5480", matches)
-
-
 def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list[str]:
     """
     Check for CVE-2024-48063 using multi-line aware detection.
@@ -483,11 +458,6 @@ def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list
             matches.append("RemoteModule with __reduce__ (high risk)")
 
     return matches
-
-
-def _create_cve_2024_48063_attribution(matches: list[str]) -> CVEAttribution:
-    """Create CVE-2024-48063 attribution with matched patterns."""
-    return _create_cve_attribution("CVE-2024-48063", matches)
 
 
 def _create_cve_attribution(cve_id: str, matches: list[str]) -> CVEAttribution:
@@ -637,48 +607,6 @@ def enhance_scan_result_with_cve(scan_result: Any, detected_patterns: list[str],
         highest_cvss = max(attr.cvss for attr in cve_attributions)
         highest_cve = next(attr for attr in cve_attributions if attr.cvss == highest_cvss)
         scan_result.metadata["primary_cve"] = highest_cve.cve_id
-
-
-# Helper functions for enhanced CVE analysis integration
-
-
-def _get_cve_description(cve_id: str) -> str:
-    """Get CVE description."""
-    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
-    return str(info.get("description", "Unknown CVE"))
-
-
-def _get_cve_severity(cve_id: str) -> str:
-    """Get CVE severity."""
-    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
-    return str(info.get("severity", "UNKNOWN"))
-
-
-def _get_cve_cvss(cve_id: str) -> float:
-    """Get CVE CVSS score."""
-    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
-    cvss_value = info.get("cvss", 0.0)
-    if isinstance(cvss_value, int | float):
-        return float(cvss_value)
-    return 0.0
-
-
-def _get_cve_cwe(cve_id: str) -> str:
-    """Get CVE CWE classification."""
-    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
-    return str(info.get("cwe", "CWE-UNKNOWN"))
-
-
-def _get_cve_affected_versions(cve_id: str) -> str:
-    """Get CVE affected versions."""
-    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
-    return str(info.get("affected_versions", "Unknown versions"))
-
-
-def _get_cve_remediation(cve_id: str) -> str:
-    """Get CVE remediation guidance."""
-    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
-    return str(info.get("remediation", "No remediation guidance available"))
 
 
 def format_cve_report(attributions: list[CVEAttribution]) -> str:

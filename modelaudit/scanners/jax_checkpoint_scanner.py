@@ -31,7 +31,8 @@ from ..utils.file.detection import (
     is_jax_json_checkpoint_file,
 )
 from ._evidence_redaction import redact_evidence_string
-from .base import BaseScanner, IssueSeverity, ScanResult
+from ._pickle_memo import _coerce_memo_key
+from .base import BaseScanner, IssueSeverity, ScanResult, _scanner_int_config
 
 JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_xgboost_json_overlap"
 JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_jinja_json_overlap"
@@ -321,14 +322,7 @@ class JaxCheckpointScanner(BaseScanner):
             re.compile(r"jax\.pmap.*os\.system", re.IGNORECASE),
         ]
 
-    def _get_int_config(self, key: str, default: int, minimum: int = 0) -> int:
-        """Return a bounded integer config value with safe fallback."""
-        raw_value = self.config.get(key, default)
-        try:
-            parsed = int(raw_value)
-        except (TypeError, ValueError):
-            parsed = default
-        return max(parsed, minimum)
+    _get_int_config = _scanner_int_config
 
     @classmethod
     def _looks_like_documentation_context(cls, context: str) -> bool:
@@ -1141,12 +1135,6 @@ class JaxCheckpointScanner(BaseScanner):
             parsed_opcode = False
             observed_security_relevant_opcode = False
 
-            def _memo_index(value: Any) -> int | None:
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    return None
-
             def _apply_probe_stack_effect(opcode_info: Any) -> bool:
                 if opcode_info.name == "MARK":
                     stack.append(marker)
@@ -1191,7 +1179,7 @@ class JaxCheckpointScanner(BaseScanner):
                     if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                         if not stack:
                             return False
-                        memo_index = _memo_index(arg)
+                        memo_index = _coerce_memo_key(arg)
                         if memo_index is not None:
                             memo_indices.add(memo_index)
                             next_memo_index = max(next_memo_index, memo_index + 1)
@@ -1201,7 +1189,7 @@ class JaxCheckpointScanner(BaseScanner):
                         memo_indices.add(next_memo_index)
                         next_memo_index += 1
                     elif opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
-                        memo_index = _memo_index(arg)
+                        memo_index = _coerce_memo_key(arg)
                         if memo_index is None or memo_index not in memo_indices:
                             return False
                     if not _apply_probe_stack_effect(opcode):
@@ -1729,13 +1717,6 @@ class JaxCheckpointScanner(BaseScanner):
                 if len(pickle_stack) > self._PICKLE_STACK_STATE_LIMIT:
                     del pickle_stack[: -self._PICKLE_STACK_STATE_LIMIT]
 
-            def _memo_key(value: Any) -> int | None:
-                """Coerce a memo opcode argument to an integer key."""
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    return None
-
             def _memoize_pickle_value(memo_index: int) -> None:
                 """Store the current stack top in the bounded pickle memo model."""
                 nonlocal next_pickle_memo_index, sticky_memo_limit_reported
@@ -1836,12 +1817,12 @@ class JaxCheckpointScanner(BaseScanner):
                         _memoize_pickle_value(next_pickle_memo_index)
                         continue
                     if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                        memo_index = _memo_key(arg)
+                        memo_index = _coerce_memo_key(arg)
                         if memo_index is not None:
                             _memoize_pickle_value(memo_index)
                         continue
                     if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
-                        memo_index = _memo_key(arg)
+                        memo_index = _coerce_memo_key(arg)
                         if memo_index is None:
                             continue
                         if memo_index in pickle_memo:

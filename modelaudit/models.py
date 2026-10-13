@@ -5,10 +5,12 @@ JSON structure that ModelAudit currently outputs for backward compatibility.
 """
 
 import time
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
+from .finding_identity import finding_identity
 from .scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
     Check,
@@ -18,9 +20,7 @@ from .scanner_results import (
     ScanResult,
     normalize_unclassified_scan_failure,
 )
-from .utils.helpers.finding_identity import finding_identity
-
-# We'll use forward references and rebuild models after imports
+from .scanner_results import _normalized_record_value as _normalized_enum_value
 
 
 def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
@@ -94,25 +94,9 @@ def _metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_inco
     return False
 
 
-def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
-    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
-        return True
-    reason = _metadata_value(metadata, "scan_outcome_reason")
-    if isinstance(reason, str):
-        return bool(reason)
-
-    reasons = _metadata_value(metadata, "scan_outcome_reasons")
-    if isinstance(reasons, str):
-        return bool(reasons)
-    if isinstance(reasons, (list, tuple, set, frozenset)):
-        return any(bool(reason) for reason in reasons)
-
-    return False
-
-
 def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
     """Return True when record details explicitly identify incomplete coverage."""
-    if _metadata_has_scan_outcome_or_reason_marker(metadata):
+    if _metadata_has_incomplete_coverage(metadata, allow_bare_analysis_incomplete=False):
         return True
     return _metadata_value(metadata, "analysis_incomplete") is True
 
@@ -127,7 +111,7 @@ def _details_have_incomplete_coverage(
     if allow_bare_analysis_incomplete:
         if _metadata_has_explicit_incomplete_coverage_marker(details):
             return True
-    elif _metadata_has_scan_outcome_or_reason_marker(details):
+    elif _metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=False):
         return True
     if _depth >= 4:
         return False
@@ -158,19 +142,21 @@ def _details_have_incomplete_coverage(
     return False
 
 
-def _record_is_clean_runtime_version_skip(record: Any) -> bool:
-    details = _metadata_value(record, "details")
-    status = _metadata_value(record, "status")
-    status_value = getattr(status, "value", status)
+def _details_are_clean_runtime_version_skip(details: Any, status: Any) -> bool:
     if not (
-        isinstance(status_value, str)
-        and status_value.lower().split(".", 1)[-1] == "skipped"
+        _normalized_enum_value(status) == "skipped"
         and _metadata_value(details, "analysis_incomplete") is True
-        and not _metadata_has_scan_outcome_or_reason_marker(details)
+        and not _metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=False)
     ):
         return False
 
     return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
+def _record_is_clean_runtime_version_skip(record: Any) -> bool:
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    return _details_are_clean_runtime_version_skip(details, status)
 
 
 def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
@@ -207,24 +193,12 @@ def _record_has_incomplete_coverage(
     return _details_have_incomplete_coverage(_metadata_value(record, "details"))
 
 
-def _normalized_enum_value(value: Any) -> str | None:
-    raw_value = getattr(value, "value", value)
-    if not isinstance(raw_value, str):
-        return None
-    return raw_value.lower().split(".", 1)[-1]
-
-
 def _record_has_security_severity(record: Any) -> bool:
     severity = _metadata_value(record, "severity")
     return _normalized_enum_value(severity) in {
         IssueSeverity.WARNING.value,
         IssueSeverity.CRITICAL.value,
     }
-
-
-def _issues_have_security_findings(records: list[Any]) -> bool:
-    """Return True when incoming issue records contain WARNING/CRITICAL findings."""
-    return any(_record_has_security_severity(record) for record in records)
 
 
 def _checks_have_failed_security_findings(checks: list[Any]) -> bool:
@@ -674,8 +648,11 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
         incoming_issues = results_dict.get("issues", [])
         incoming_checks = results_dict.get("checks", [])
+        # Incoming issue records contain security findings at WARNING/CRITICAL severity.
         incoming_has_security_findings = (
-            _issues_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False
+            any(_record_has_security_severity(record) for record in incoming_issues)
+            if isinstance(incoming_issues, list)
+            else False
         )
         incoming_has_incomplete_coverage = _metadata_has_incomplete_coverage(results_dict.get("metadata")) or any(
             (
@@ -939,48 +916,37 @@ def create_audit_result_model(aggregated_results: dict[str, Any]) -> ModelAuditR
     )
 
 
-def convert_issues_to_models(issues: list[Any]) -> list["Issue"]:
-    """Convert list of issue dicts or objects to Issue instances."""
+_FindingModel = TypeVar("_FindingModel", Issue, Check)
+
+
+def _convert_finding_models(records: list[Any], model_type: Callable[[], type[_FindingModel]]) -> list[_FindingModel]:
+    """Convert supported finding dictionaries and objects in order, skipping unknown types."""
     import time
 
+    # Defer model lookup to preserve legacy bindings when serializers rebind module globals.
     result = []
-    for issue in issues:
-        if isinstance(issue, dict):
-            # Ensure required fields are present
-            issue_dict = issue.copy()
-            if "timestamp" not in issue_dict:
-                issue_dict["timestamp"] = time.time()
-            result.append(Issue(**issue_dict))
-        elif hasattr(issue, "to_dict"):
-            result.append(Issue(**issue.to_dict()))
-        elif isinstance(issue, Issue):
-            result.append(issue)
-        else:
-            # Skip unknown issue types
-            continue
+    for record in records:
+        if isinstance(record, dict):
+            # Copy before supplying the timestamp, matching the public converter contract.
+            record_dict = record.copy()
+            if "timestamp" not in record_dict:
+                record_dict["timestamp"] = time.time()
+            result.append(model_type()(**record_dict))
+        elif hasattr(record, "to_dict"):
+            result.append(model_type()(**record.to_dict()))
+        elif isinstance(record, model_type()):
+            result.append(record)
     return result
+
+
+def convert_issues_to_models(issues: list[Any]) -> list["Issue"]:
+    """Convert list of issue dicts or objects to Issue instances."""
+    return _convert_finding_models(issues, lambda: Issue)
 
 
 def convert_checks_to_models(checks: list[Any]) -> list["Check"]:
     """Convert list of check dicts or objects to Check instances."""
-    import time
-
-    result = []
-    for check in checks:
-        if isinstance(check, dict):
-            # Ensure required fields are present
-            check_dict = check.copy()
-            if "timestamp" not in check_dict:
-                check_dict["timestamp"] = time.time()
-            result.append(Check(**check_dict))
-        elif hasattr(check, "to_dict"):
-            result.append(Check(**check.to_dict()))
-        elif isinstance(check, Check):
-            result.append(check)
-        else:
-            # Skip unknown check types
-            continue
-    return result
+    return _convert_finding_models(checks, lambda: Check)
 
 
 def convert_assets_to_models(assets: list[Any]) -> list[AssetModel]:
@@ -1134,16 +1100,4 @@ class ScannerPerformanceMetrics(BaseModel):
 
 def rebuild_models() -> None:
     """Rebuild models with proper type references after all imports are available."""
-    try:
-        # Update the global namespace so forward references work
-        globals()["Issue"] = Issue
-        globals()["Check"] = Check
-
-        # Rebuild models that use forward references
-        ModelAuditResultModel.model_rebuild()
-
-    except ImportError:
-        # If scanner models aren't available, just use Any
-        globals()["Issue"] = Any
-        globals()["Check"] = Any
-        ModelAuditResultModel.model_rebuild()
+    ModelAuditResultModel.model_rebuild()

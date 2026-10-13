@@ -43,6 +43,7 @@ from modelaudit.utils.file.detection import (
     detect_file_format_from_magic,
 )
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.cli_output import parse_click_json_output
 from tests.helpers.file_creators import (
     _encode_protobuf_varint as _proto_varint,
@@ -261,6 +262,8 @@ _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES = (
     pytest.param(_sentencepiece_model_proto_with_byte_pieces_without_fallback, id="byte-pieces-without-fallback"),
 )
 _SENTENCEPIECE_MALFORMED_TAILS = (
+    pytest.param(b"\x1a\x02\x08\x00", id="normalizer-wrong-inner-wire"),
+    pytest.param(_unknown_sentencepiece_field(b"cos\nsystem\n(S'echo scanner-only'\ntR."), id="unknown-field-global"),
     pytest.param(b"\x12\x80", id="truncated-length-varint"),
     pytest.param(b"\x80", id="truncated-tag-varint"),
     pytest.param(_proto_field(2, 2, _proto_varint(4) + b"x"), id="truncated-length-payload"),
@@ -533,9 +536,10 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(tokenizer_model))
 
-    def test_can_handle_rejects_strong_sentencepiece_with_well_formed_tail(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("tail", [b"\x12\x00", b"\x1a\x00", b"\x22\x02\x08\x00", b"\x2a\x02\x08\x00"])
+    def test_can_handle_rejects_strong_sentencepiece_with_well_formed_tail(self, tmp_path: Path, tail: bytes) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
-        tokenizer_model.write_bytes(_sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(0)))
+        tokenizer_model.write_bytes(_sentencepiece_model_proto() + tail)
 
         assert not XGBoostScanner.can_handle(str(tokenizer_model))
 
@@ -2833,8 +2837,7 @@ class TestXGBoostFailClosedEndToEnd:
         json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
         cache_dir = tmp_path / "cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(json_file, cache_dir)
 
             for result in (first, second):
@@ -2845,16 +2848,13 @@ class TestXGBoostFailClosedEndToEnd:
                 assert any("Invalid XGBoost JSON structure" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_malformed_xgboost_json_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
         json_file = tmp_path / "booster.json"
         json_file.write_text('{"version":[1,7,4],"learner":{"gradient_booster":')
         cache_dir = tmp_path / "cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(json_file, cache_dir)
 
             for result in (first, second):
@@ -2865,16 +2865,13 @@ class TestXGBoostFailClosedEndToEnd:
                 assert any("Invalid JSON format" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_missing_ubjson_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
         ubj_file = tmp_path / "model.ubj"
         ubj_file.write_bytes(b"\x7b\x55")
         cache_dir = tmp_path / "cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
                 first, second = _scan_twice_with_cache(ubj_file, cache_dir)
 
@@ -2885,8 +2882,6 @@ class TestXGBoostFailClosedEndToEnd:
                 assert any("Cannot scan UBJ file" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_undecodable_ubjson_core_is_inconclusive_not_security_finding(self, tmp_path: Path) -> None:
         pytest.importorskip("ubjson", reason="ubjson not installed")
@@ -2912,8 +2907,7 @@ class TestXGBoostFailClosedEndToEnd:
         bst_file.write_bytes(_xgboost_ubjson_probe())
         cache_dir = tmp_path / "cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
                 first, second = _scan_twice_with_cache(bst_file, cache_dir)
 
@@ -2925,8 +2919,6 @@ class TestXGBoostFailClosedEndToEnd:
                 assert any("Cannot scan UBJ file" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_pickle_spoof_core_preserves_pickle_scan_and_is_uncached(self, tmp_path: Path) -> None:
         spoof_file = tmp_path / "spoof.bst"
@@ -2938,8 +2930,7 @@ class TestXGBoostFailClosedEndToEnd:
         assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "xgboost_binary_pickle_spoof" in direct.metadata["scan_outcome_reasons"]
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(spoof_file, cache_dir)
 
             for result in (first, second):
@@ -2952,8 +2943,6 @@ class TestXGBoostFailClosedEndToEnd:
                 )
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_directory_dedup_preserves_filename_sensitive_spoof_detection(self, tmp_path: Path) -> None:
         payload = pickle.dumps({"safe": True}, protocol=4)
@@ -2993,8 +2982,7 @@ class TestXGBoostFailClosedEndToEnd:
         binary_file.write_bytes(b"abcdefghijklmnopqrstuvwxyzabcde")
         cache_dir = tmp_path / "cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(binary_file, cache_dir)
 
             for result in (first, second):
@@ -3004,8 +2992,6 @@ class TestXGBoostFailClosedEndToEnd:
                 assert any("too small" in str(issue.message).lower() for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_marker_only_xgboost_binary_core_fails_closed(self, tmp_path: Path) -> None:
         binary_file = tmp_path / "custom.bst"
@@ -3045,8 +3031,7 @@ class TestXGBoostFailClosedEndToEnd:
         binary_file.write_bytes(b"abcdefghijklmnopqrstuvwxyzabcdef")
         cache_dir = tmp_path / "cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(binary_file, cache_dir)
 
             for result in (first, second):
@@ -3056,8 +3041,6 @@ class TestXGBoostFailClosedEndToEnd:
                 assert any("expected XGBoost binary signature" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
 
 class TestXGBoostScannerConfiguration:

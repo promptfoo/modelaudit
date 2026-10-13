@@ -8,7 +8,12 @@ from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import _is_torch7_signature as is_torch7_signature
-from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, is_sensitive_evidence_key, redact_evidence_string
+from ._evidence_redaction import (
+    REDACTED_EVIDENCE_VALUE,
+    _statement_value_end,
+    is_sensitive_evidence_key,
+    redact_evidence_string,
+)
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -290,28 +295,7 @@ class Torch7Scanner(BaseScanner):
 
     @staticmethod
     def _statement_end(text: str, start: int) -> int:
-        quote: str | None = None
-        escaped = False
-        depth = 0
-        for index in range(start, len(text)):
-            character = text[index]
-            if quote is not None:
-                if escaped:
-                    escaped = False
-                elif character == "\\":
-                    escaped = True
-                elif character == quote:
-                    quote = None
-                continue
-            if character in {"'", '"'}:
-                quote = character
-            elif character in "([{":
-                depth += 1
-            elif character in ")]}" and depth > 0:
-                depth -= 1
-            elif character in ";\r\n" and depth == 0:
-                return index
-        return len(text)
+        return _statement_value_end(text, start)
 
     def _analyze_execution_primitives(self, path: str, strings: list[str], result: ScanResult) -> None:
         critical_hits: list[str] = []

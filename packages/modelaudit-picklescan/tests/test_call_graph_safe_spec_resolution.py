@@ -59,6 +59,42 @@ def test_cross_view_file_identity_keeps_posix_ctime() -> None:
     ) != call_graph._cross_view_file_stat_identity(cast(os.stat_result, replaced))
 
 
+def _unloaded_builtin_module() -> str:
+    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
+    if module is None:
+        pytest.skip("all builtin modules are already loaded")
+    assert module is not None
+    return module
+
+
+def _unloaded_frozen_module() -> str:
+    frozen_names: Iterable[str] = getattr(_imp, "_frozen_module_names", lambda: ())()
+    module = next(
+        (
+            name
+            for name in frozen_names
+            if name not in call_graph._TRUSTED_LOADED_INTERPRETER_MODULES
+            and name not in sys.modules
+            and call_graph._interpreter_module_origin_without_import_hooks(name) == "frozen"
+        ),
+        None,
+    )
+    if module is None:
+        pytest.skip("all frozen modules were loaded when call_graph initialized")
+    assert module is not None
+    return module
+
+
+def _trusted_tempfile_namespace() -> dict[str, Any]:
+    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
+    if baseline is None:
+        pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
+    assert baseline is not None
+    loaded_module = baseline[0][1]
+    assert type(loaded_module) is ModuleType
+    return cast(dict[str, Any], ModuleType.__getattribute__(loaded_module, "__dict__"))
+
+
 def _posixpath_text_regex_cache_name() -> str:
     for name in ("_varsub", "_varprog"):
         if name in posixpath.expandvars.__code__.co_names:
@@ -140,6 +176,15 @@ def _refresh_zipimporter_directory_files(
 
 
 @contextmanager
+def _isolated_call_graph_caches() -> Iterator[None]:
+    _clear_call_graph_caches()
+    try:
+        yield
+    finally:
+        _clear_call_graph_caches()
+
+
+@contextmanager
 def _standard_import_runtime(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -159,11 +204,8 @@ def _standard_import_runtime(
         if trusted_site_package_root is not None:
             context.setattr(call_graph, "_TRUSTED_SITE_PACKAGE_PATHS", (trusted_site_package_root.resolve(),))
             context.setattr(call_graph, "_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS", ())
-        _clear_call_graph_caches()
-        try:
+        with _isolated_call_graph_caches():
             yield
-        finally:
-            _clear_call_graph_caches()
 
 
 class _FailIfExecutedFinder:
@@ -383,15 +425,11 @@ def test_loaded_module_cannot_forge_builtin_or_frozen_origin(
     loaded_module = ModuleType(module)
     loaded_module.__spec__ = ModuleSpec(module, loader, origin=origin)
     monkeypatch.setitem(sys.modules, module, loaded_module)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._find_module_spec_without_imports(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_loaded_trusted_interpreter_module_replacement_fails_closed(
@@ -402,9 +440,7 @@ def test_loaded_trusted_interpreter_module_replacement_fails_closed(
     replacement = ModuleType(module)
     replacement.__spec__ = ModuleSpec(module, cast(Any, BuiltinImporter), origin="built-in")
     monkeypatch.setitem(sys.modules, module, replacement)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
@@ -414,8 +450,6 @@ def test_loaded_trusted_interpreter_module_replacement_fails_closed(
             finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "_io.BytesIO"
             for finding in report.findings
         )
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_cached_interpreter_origin_cannot_hide_module_replacement(
@@ -425,9 +459,7 @@ def test_cached_interpreter_origin_cannot_hide_module_replacement(
     name = "BytesIO"
     replacement = ModuleType(module)
     replacement.__spec__ = ModuleSpec(module, cast(Any, BuiltinImporter), origin="built-in")
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
         assert call_graph.import_only_module_requires_origin_review(module, name) is False
 
@@ -435,8 +467,6 @@ def test_cached_interpreter_origin_cannot_hide_module_replacement(
 
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
         assert call_graph.import_only_module_requires_origin_review(module, name) is True
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_shared_source_snapshot_detects_interpreter_module_replacement(
@@ -591,8 +621,7 @@ def test_loaded_interpreter_reference_mutation_cannot_remain_allowlisted(
         with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="source changed"):
             call_graph._ensure_shared_source_snapshot_stable(report_generation)
 
-    _clear_call_graph_caches()
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
         assert call_graph.import_only_reference_is_proven_trusted(module, name) is False
         report = package_api.scan_bytes(
@@ -605,8 +634,6 @@ def test_loaded_interpreter_reference_mutation_cannot_remain_allowlisted(
             and finding.details.get("import_reference") == "_frozen_importlib.ModuleSpec"
             for finding in report.findings
         )
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_loaded_parent_package_namespace_hook_is_not_executed(
@@ -624,9 +651,7 @@ def test_loaded_parent_package_namespace_hook_is_not_executed(
     package = HostilePackage("modelaudit_tp_hostile_parent")
     ModuleType.__getattribute__(package, "__dict__")["__path__"] = []
     monkeypatch.setitem(sys.modules, package.__name__, package)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         report = package_api.scan_bytes(
             b"cmodelaudit_tp_hostile_parent.child\nThing\n.",
             source="hostile-parent.pkl",
@@ -634,8 +659,6 @@ def test_loaded_parent_package_namespace_hook_is_not_executed(
         assert calls == []
         assert report.verdict == SafetyVerdict.SUSPICIOUS
         assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_loaded_filesystem_reference_replacement_cannot_reuse_cached_origin(
@@ -692,16 +715,12 @@ def test_loaded_trusted_reference_ignores_untrusted_cached_path_finder(
 
     monkeypatch.setattr(sys, "path", [evil_entry, *sys.path])
     monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
         report = package_api.scan_bytes(
             f"c{module}\n{name}\n.".encode(),
             source="loaded-module-untrusted-path.pkl",
         )
-    finally:
-        _clear_call_graph_caches()
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert calls == []
@@ -840,8 +859,7 @@ def test_loaded_trusted_function_global_mutation_is_not_allowlisted(
         raise AssertionError("mutated trusted function global executed")
 
     monkeypatch.setitem(namespace, "_gettempdir", hostile_gettempdir)
-    _clear_call_graph_caches()
-    try:
+    with _isolated_call_graph_caches():
         report = package_api.scan_bytes(b"ctempfile\ngettempdir\n)R.", source="mutated-gettempdir-global.pkl")
         assert report.verdict == SafetyVerdict.SUSPICIOUS
         assert any(
@@ -849,8 +867,6 @@ def test_loaded_trusted_function_global_mutation_is_not_allowlisted(
             and finding.details.get("import_reference") == "tempfile.gettempdir"
             for finding in report.findings
         )
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -858,13 +874,7 @@ def test_loaded_trusted_function_global_mutation_is_not_allowlisted(
 def test_loaded_trusted_function_transitive_global_mutation_is_not_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
-    if baseline is None:
-        pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
-    assert baseline is not None
-    loaded_module = baseline[0][1]
-    assert type(loaded_module) is ModuleType
-    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace = _trusted_tempfile_namespace()
     calls: list[str] = []
 
     def hostile_default_tempdir() -> str:
@@ -882,13 +892,7 @@ def test_loaded_trusted_function_transitive_global_mutation_is_not_allowlisted(
 def test_loaded_trusted_function_module_attribute_mutation_is_not_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
-    if baseline is None:
-        pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
-    assert baseline is not None
-    loaded_module = baseline[0][1]
-    assert type(loaded_module) is ModuleType
-    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace = _trusted_tempfile_namespace()
     os_module = namespace["_os"]
     assert type(os_module) is ModuleType
     os_namespace = ModuleType.__getattribute__(os_module, "__dict__")
@@ -910,13 +914,7 @@ def test_loaded_trusted_function_module_attribute_mutation_is_not_allowlisted(
 def test_loaded_trusted_function_instance_attribute_shadow_is_not_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
-    if baseline is None:
-        pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
-    assert baseline is not None
-    loaded_module = baseline[0][1]
-    assert type(loaded_module) is ModuleType
-    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace = _trusted_tempfile_namespace()
     os_module = namespace["_os"]
     assert type(os_module) is ModuleType
     os_namespace = ModuleType.__getattribute__(os_module, "__dict__")
@@ -966,13 +964,7 @@ assert calls == []
 def test_loaded_trusted_tempdir_cache_transition_remains_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
-    if baseline is None:
-        pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
-    assert baseline is not None
-    loaded_module = baseline[0][1]
-    assert type(loaded_module) is ModuleType
-    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace = _trusted_tempfile_namespace()
     gettempdir = namespace["gettempdir"]
     assert isinstance(gettempdir, FunctionType)
     monkeypatch.setitem(namespace, "tempdir", None)
@@ -1048,13 +1040,7 @@ def test_loaded_trusted_tempdir_rejects_hostile_posixpath_regex_cache(
 def test_loaded_trusted_function_builtin_mutation_is_not_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
-    if baseline is None:
-        pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
-    assert baseline is not None
-    loaded_module = baseline[0][1]
-    assert type(loaded_module) is ModuleType
-    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace = _trusted_tempfile_namespace()
     helper = namespace["_get_default_tempdir"]
     assert isinstance(helper, FunctionType)
     builtins_namespace = object.__getattribute__(helper, "__builtins__")
@@ -1184,13 +1170,9 @@ def test_loaded_module_metadata_comparison_does_not_execute_values(
         }
     )
     monkeypatch.setitem(sys.modules, module, replacement)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         report = package_api.scan_bytes(b"cstatistics\nmean\n)R.", source="hostile-module-name.pkl")
         assert report.verdict == SafetyVerdict.SUSPICIOUS
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -1216,14 +1198,10 @@ def test_loaded_module_origin_value_cannot_execute_during_resolution(
     loaded_module = ModuleType(module)
     loaded_module.__spec__ = ModuleSpec(module, loader=None, origin=cast(Any, HostileOrigin()))
     monkeypatch.setitem(sys.modules, module, loaded_module)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -1231,28 +1209,18 @@ def test_loaded_module_origin_value_cannot_execute_during_resolution(
 def test_unloaded_builtin_with_pristine_import_runtime_remains_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
         assert call_graph._call_graph_source_unavailable_reason(module) is None
         assert call_graph._import_module_can_execute_user_code(module) is False
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_unrelated_import_runtime_attribute_does_not_block_unloaded_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
     marker = object()
     type.__setattr__(ModuleSpec, "_modelaudit_test_marker", marker)
@@ -1270,31 +1238,21 @@ def test_unrelated_import_runtime_attribute_does_not_block_unloaded_builtin(
 def test_unrelated_importlib_global_does_not_block_unloaded_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     frozen_importlib = call_graph._FROZEN_IMPORTLIB_MODULE
     assert type(frozen_importlib) is ModuleType
     namespace = ModuleType.__getattribute__(frozen_importlib, "__dict__")
     monkeypatch.setitem(namespace, "_modelaudit_test_marker", object())
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is True
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_added_importlib_shadow_global_blocks_resolution_without_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     frozen_importlib = call_graph._FROZEN_IMPORTLIB_MODULE
     assert type(frozen_importlib) is ModuleType
     namespace = ModuleType.__getattribute__(frozen_importlib, "__dict__")
@@ -1307,15 +1265,11 @@ def test_added_importlib_shadow_global_blocks_resolution_without_execution(
 
     monkeypatch.setitem(namespace, "getattr", hostile_getattr)
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -1323,10 +1277,7 @@ def test_added_importlib_shadow_global_blocks_resolution_without_execution(
 def test_hostile_meta_path_container_blocks_resolution_without_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     calls: list[str] = []
 
     class HostileMetaPath(list[object]):
@@ -1335,14 +1286,10 @@ def test_hostile_meta_path_container_blocks_resolution_without_execution(
             raise AssertionError("hostile sys.meta_path was iterated")
 
     monkeypatch.setattr(sys, "meta_path", HostileMetaPath([BuiltinImporter, FrozenImporter, PathFinder]))
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -1361,14 +1308,10 @@ def test_hostile_import_path_container_blocks_resolution_without_execution(
 
     original = cast(list[object], getattr(sys, attribute))
     monkeypatch.setattr(sys, attribute, HostilePathState(original))
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind("statistics") is None
         assert call_graph._call_graph_source_unavailable_reason("statistics") == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code("statistics") is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -1385,14 +1328,10 @@ def test_hostile_path_importer_cache_blocks_resolution_without_execution(
             raise AssertionError("hostile sys.path_importer_cache was accessed")
 
     monkeypatch.setattr(sys, "path_importer_cache", HostileImporterCache(sys.path_importer_cache))
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind("statistics") is None
         assert call_graph._call_graph_source_unavailable_reason("statistics") == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code("statistics") is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -2310,6 +2249,72 @@ def test_file_finder_resolution_retries_one_stale_directory_snapshot(
         call_graph._cached_file_finder_resolution_summary.cache_clear()
 
 
+@pytest.mark.parametrize("change_during_scan", [False, True], ids=["before-scan", "during-scan"])
+@pytest.mark.parametrize("dangerous", [False, True], ids=["benign", "dangerous"])
+def test_scan_bytes_distinguishes_previous_file_finder_state_from_in_scan_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change_during_scan: bool,
+    dangerous: bool,
+) -> None:
+    payload = pickle.dumps((complex(1, 2), os.system) if dangerous else complex(1, 2), protocol=4)
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec("unrelated_module") is None
+
+    def change_directory() -> None:
+        (tmp_path / "unrelated.txt").write_text("not Python source", encoding="utf-8")
+        directory_stat = tmp_path.stat()
+        os.utime(tmp_path, ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns + 2_000_000_000))
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module="unrelated_module",
+        importer_cache={**sys.path_importer_cache, path_entry: finder},
+        search_path=[path_entry, *sys.path],
+    ):
+        previous_report = package_api.scan_bytes(payload)
+        assert previous_report.status == ScanStatus.COMPLETE, previous_report.to_dict()
+        if not change_during_scan:
+            change_directory()
+
+        original_begin_report = package_api._begin_shared_source_report
+        refreshes = 0
+
+        def begin_report_with_lazy_finder_refresh() -> int | None:
+            nonlocal refreshes
+            generation = original_begin_report()
+            if change_during_scan:
+                change_directory()
+            # Standard import machinery refreshes its cache lazily; the directory
+            # may already have changed before this scan's source snapshot began.
+            assert finder.find_spec("unrelated_module") is None
+            refreshes += 1
+            return generation
+
+        monkeypatch.setattr(package_api, "_begin_shared_source_report", begin_report_with_lazy_finder_refresh)
+        report = package_api.scan_bytes(payload)
+
+    assert refreshes == 1
+    assert report.coverage.raw_scan_complete is True
+    assert report.coverage.opcode_scan_complete is True
+    if change_during_scan:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert any(
+            error.details.get("source_stability_reason") == "resolution_context_changed" for error in report.errors
+        )
+    else:
+        assert report.status == ScanStatus.COMPLETE, report.to_dict()
+        assert not report.errors
+    if dangerous:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.details.get("import_reference") in {"nt.system", "posix.system"} for finding in report.findings
+        )
+    else:
+        assert report.verdict == (SafetyVerdict.UNKNOWN if change_during_scan else SafetyVerdict.CLEAN)
+
+
 @pytest.mark.parametrize("mutation", ["remove", "add"])
 def test_file_finder_identity_revalidates_in_place_cache_mutation(
     tmp_path: Path,
@@ -2507,8 +2512,7 @@ def test_importer_context_preserves_symlink_sensitive_parent_components(
     finder = FileFinder(clean_entry, *_standard_file_finder_loader_details())
     monkeypatch.setitem(sys.path_importer_cache, clean_entry, finder)
     monkeypatch.setitem(sys.path_importer_cache, poisoned_entry, finder)
-    _clear_call_graph_caches()
-    try:
+    with _isolated_call_graph_caches():
         monkeypatch.setattr(sys, "path", [clean_entry])
         clean_search_context = call_graph._source_search_context()
         clean_importer_context = call_graph._path_importer_resolution_context(sys.path)
@@ -2518,8 +2522,6 @@ def test_importer_context_preserves_symlink_sensitive_parent_components(
         assert call_graph._source_search_context() != clean_search_context
         assert call_graph._path_importer_resolution_context(sys.path) != clean_importer_context
         assert call_graph._file_finder_resolution_identity(finder, poisoned_entry) is None
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_invalidated_file_finder_is_resolved_without_mutating_live_state(
@@ -2743,14 +2745,10 @@ def test_metadata_pathfinder_hook_removal_keeps_startup_distribution_roots_stabl
     )
     monkeypatch.setattr(call_graph, "distribution", hostile_distribution)
     monkeypatch.delattr(PathFinder, "find_distributions")
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is True
         assert call_graph._installed_distribution_roots("probe") == (tmp_path.resolve(),)
         report = package_api.scan_bytes(b"cbuiltins\nprint\n.", source="metadata-finder-removed.pkl")
-    finally:
-        _clear_call_graph_caches()
 
     assert runtime_distribution_calls == []
     assert report.status == ScanStatus.COMPLETE
@@ -2804,13 +2802,9 @@ def test_replaced_metadata_pathfinder_hook_blocks_without_execution(
         raise AssertionError("mutated metadata finder was executed")
 
     monkeypatch.setattr(PathFinder, "find_distributions", hostile_find_distributions)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
         assert call_graph._trusted_module_origin_kind("statistics") is None
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -2878,13 +2872,9 @@ def test_in_place_io_open_mutation_blocks_resolution_without_execution(
         raise AssertionError("mutated _io.open was executed")
 
     monkeypatch.setitem(io_namespace, "open", hostile_open)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
         assert call_graph._trusted_module_origin_kind("statistics") is None
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -2996,10 +2986,7 @@ def test_cached_origin_is_rejected_after_import_runtime_mutation() -> None:
 
 
 def test_in_place_importer_code_mutation_blocks_unloaded_builtin() -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     descriptor = type.__getattribute__(BuiltinImporter, "__dict__")["find_spec"]
     function = descriptor.__func__
     original_code = function.__code__
@@ -3028,10 +3015,7 @@ def test_in_place_importer_code_mutation_blocks_unloaded_builtin() -> None:
 def test_in_place_import_runtime_dependency_mutation_blocks_unloaded_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     frozen_importlib = sys.modules["_frozen_importlib"]
     frozen_namespace = ModuleType.__getattribute__(frozen_importlib, "__dict__")
     thread_module = frozen_namespace["_thread"]
@@ -3043,15 +3027,11 @@ def test_in_place_import_runtime_dependency_mutation_blocks_unloaded_builtin(
         raise AssertionError("mutated import runtime dependency was executed")
 
     monkeypatch.setitem(thread_namespace, "RLock", hostile_rlock)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -3059,10 +3039,7 @@ def test_in_place_import_runtime_dependency_mutation_blocks_unloaded_builtin(
 def test_in_place_import_runtime_builtins_mutation_blocks_unloaded_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     builtins_namespace = call_graph._IMPORT_RUNTIME_BUILTINS
     assert type(builtins_namespace) is dict
     calls: list[object] = []
@@ -3073,15 +3050,11 @@ def test_in_place_import_runtime_builtins_mutation_blocks_unloaded_builtin(
         return bool(cast(Any, original_hasattr)(value, name))
 
     monkeypatch.setitem(builtins_namespace, "hasattr", hostile_hasattr)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -3089,10 +3062,7 @@ def test_in_place_import_runtime_builtins_mutation_blocks_unloaded_builtin(
 def test_in_place_import_runtime_class_mutation_blocks_unloaded_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     frozen_importlib = sys.modules["_frozen_importlib"]
     frozen_namespace = ModuleType.__getattribute__(frozen_importlib, "__dict__")
     module_lock = frozen_namespace["_ModuleLock"]
@@ -3144,10 +3114,7 @@ def test_in_place_file_finder_code_mutation_blocks_filesystem_resolution() -> No
 
 
 def test_hostile_importer_keyword_defaults_fail_closed_without_execution() -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     descriptor = type.__getattribute__(BuiltinImporter, "__dict__")["find_spec"]
     function = descriptor.__func__
     original_keyword_defaults = function.__kwdefaults__
@@ -3179,10 +3146,7 @@ def test_hostile_importer_keyword_defaults_fail_closed_without_execution() -> No
 def test_poisoned_import_lock_blocks_unloaded_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     module_name = module
     bootstrap = call_graph._FROZEN_IMPORTLIB_MODULE
     assert type(bootstrap) is ModuleType
@@ -3209,14 +3173,10 @@ def test_poisoned_import_lock_blocks_unloaded_builtin(
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
     monkeypatch.setitem(module_locks, PoisonedKey(), PoisonedLock())
     calls.clear()
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
     assert calls == []
 
@@ -3224,10 +3184,7 @@ def test_poisoned_import_lock_blocks_unloaded_builtin(
 def test_unloaded_builtin_with_mutated_importer_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     builtin_calls: list[str] = []
     is_builtin_calls: list[str] = []
     original_builtin_find_spec = type.__getattribute__(BuiltinImporter, "__dict__")["find_spec"]
@@ -3255,48 +3212,18 @@ def test_unloaded_builtin_with_mutated_importer_fails_closed(
 def test_unloaded_frozen_module_with_pristine_import_runtime_remains_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    frozen_names = getattr(_imp, "_frozen_module_names", lambda: ())()
-    module = next(
-        (
-            name
-            for name in frozen_names
-            if name not in call_graph._TRUSTED_LOADED_INTERPRETER_MODULES
-            and name not in sys.modules
-            and call_graph._interpreter_module_origin_without_import_hooks(name) == "frozen"
-        ),
-        None,
-    )
-    if module is None:
-        pytest.skip("all frozen modules were loaded when call_graph initialized")
-    assert module is not None
+    module = _unloaded_frozen_module()
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
         assert call_graph._call_graph_source_unavailable_reason(module) is None
         assert call_graph._import_module_can_execute_user_code(module) is False
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_unloaded_frozen_module_with_mutated_importer_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    frozen_names = getattr(_imp, "_frozen_module_names", lambda: ())()
-    module = next(
-        (
-            name
-            for name in frozen_names
-            if name not in call_graph._TRUSTED_LOADED_INTERPRETER_MODULES
-            and name not in sys.modules
-            and call_graph._interpreter_module_origin_without_import_hooks(name) == "frozen"
-        ),
-        None,
-    )
-    if module is None:
-        pytest.skip("all frozen modules were loaded when call_graph initialized")
-    assert module is not None
+    module = _unloaded_frozen_module()
     frozen_calls: list[str] = []
     find_frozen_calls: list[str] = []
     original_frozen_find_spec = type.__getattribute__(FrozenImporter, "__dict__")["find_spec"]
@@ -3323,20 +3250,7 @@ def test_unloaded_frozen_module_with_mutated_importer_fails_closed(
 
 
 def test_in_place_importer_closure_code_mutation_blocks_unloaded_frozen() -> None:
-    frozen_names = getattr(_imp, "_frozen_module_names", lambda: ())()
-    module = next(
-        (
-            name
-            for name in frozen_names
-            if name not in call_graph._TRUSTED_LOADED_INTERPRETER_MODULES
-            and name not in sys.modules
-            and call_graph._interpreter_module_origin_without_import_hooks(name) == "frozen"
-        ),
-        None,
-    )
-    if module is None:
-        pytest.skip("all frozen modules were loaded when call_graph initialized")
-    assert module is not None
+    module = _unloaded_frozen_module()
     descriptor = type.__getattribute__(FrozenImporter, "__dict__")["get_code"]
     wrapper = descriptor.__func__
     inner = next(
@@ -3366,21 +3280,14 @@ def test_in_place_importer_closure_code_mutation_blocks_unloaded_frozen() -> Non
 def test_late_loaded_builtin_with_canonical_spec_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = next((name for name in sys.builtin_module_names if name not in sys.modules), None)
-    if module is None:
-        pytest.skip("all builtin modules are already loaded")
-    assert module is not None
+    module = _unloaded_builtin_module()
     loaded_module = ModuleType(module)
     loaded_module.__spec__ = ModuleSpec(module, cast(Any, BuiltinImporter), origin="built-in")
     monkeypatch.setitem(sys.modules, module, loaded_module)
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
         assert call_graph._import_module_can_execute_user_code(module) is True
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_loaded_extension_export_does_not_fall_through_module_getattr(
@@ -3424,13 +3331,9 @@ def test_loaded_extension_export_does_not_fall_through_module_getattr(
         "opcode": "REDUCE",
         "positional_arg_count": 3,
     }
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         bypasses_getattr = call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "encode")
         findings = call_graph.find_dangerous_call_graphs([reference], [reference])
-    finally:
-        _clear_call_graph_caches()
 
     assert bypasses_getattr is True
     assert findings == ()
@@ -3471,13 +3374,9 @@ def test_loaded_dangerous_builtin_cannot_impersonate_trusted_extension_export(
         "opcode": "REDUCE",
         "positional_arg_count": 1,
     }
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         bypasses_getattr = call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "_reconstruct")
         findings = call_graph.find_dangerous_call_graphs([reference], [reference])
-    finally:
-        _clear_call_graph_caches()
 
     assert bypasses_getattr is False
     assert len(findings) == 1
@@ -3524,9 +3423,7 @@ def test_loaded_extension_export_does_not_hide_legacy_dotted_module_getattr(
         "import_reference": f"{module_name}.encode.missing",
         "opcode": "GLOBAL",
     }
-    _clear_call_graph_caches()
-
-    try:
+    with _isolated_call_graph_caches():
         bypasses_exact_export = call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "encode")
         findings = call_graph.find_dangerous_call_graphs([reference], [])
         payload = f"c{module_name}\nencode.missing\n.".encode()
@@ -3534,8 +3431,6 @@ def test_loaded_extension_export_does_not_hide_legacy_dotted_module_getattr(
         runtime_calls = cast(list[str], namespace["calls"])
         assert runtime_calls == []
         loaded = pickle.loads(payload)
-    finally:
-        _clear_call_graph_caches()
 
     assert bypasses_exact_export is True
     assert loaded is None

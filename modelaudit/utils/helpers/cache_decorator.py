@@ -13,7 +13,7 @@ import zipfile
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from ...cache.optimized_config import get_config_extractor
+from ...cache.optimized_config import _extract_config_and_path, get_config_extractor
 from ..file.hdf5 import find_hdf5_signature_offset
 
 logger = logging.getLogger(__name__)
@@ -605,48 +605,6 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
         return wrapper  # type: ignore[return-value]
 
     return decorator
-
-
-def _extract_config_and_path(args: tuple, kwargs: dict) -> tuple[dict[str, Any] | None, str | None]:
-    """
-    Extract config dict and file path from function arguments.
-
-    Supports various argument patterns:
-    - func(path: str, config: dict = None)
-    - func(self, path: str) where self.config exists
-    - func(path: str, **kwargs) where config is in kwargs
-
-    Args:
-        args: Positional arguments
-        kwargs: Keyword arguments
-
-    Returns:
-        Tuple of (config_dict, file_path)
-    """
-    config = None
-    file_path = None
-
-    # Try to extract file path
-    if args:
-        # Check if first arg looks like self (has attributes)
-        if hasattr(args[0], "__dict__") and hasattr(args[0], "config"):
-            # This is a method call: self.scan(path)
-            config = getattr(args[0], "config", {})
-            file_path = args[1] if len(args) > 1 else kwargs.get("path")
-        else:
-            # This is a function call: scan_file(path, config=None)
-            file_path = args[0]
-            config = args[1] if len(args) > 1 else kwargs.get("config")
-    else:
-        # All arguments are keyword arguments
-        file_path = kwargs.get("path")
-        config = kwargs.get("config")
-
-    # Ensure config is a dict
-    if config is None or not isinstance(config, dict):
-        config = {}
-
-    return config, file_path
 
 
 def scan_with_cache(scan_func: Callable) -> Callable:

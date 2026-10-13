@@ -55,6 +55,7 @@ from .core_results import (
     results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
 )
+from .finding_identity import finding_identity, preserve_finding_identity
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import _sarif_source_identifier_key, format_sarif_output
 from .integrations.source_serialization import serialize_source_text, serialize_source_value
@@ -95,7 +96,6 @@ from .utils.helpers.auto_defaults import (
     generate_auto_defaults,
     parse_size_string,
 )
-from .utils.helpers.finding_identity import finding_identity, preserve_finding_identity
 from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
@@ -585,16 +585,8 @@ def _posix_fd_has_extended_acl(output_path: str, fd: int) -> bool:
         ) from exc
 
 
-def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> int:
-    """Pin a Windows output parent so path-based replacement cannot be redirected."""
-    import ctypes
-    import ctypes.wintypes as wintypes
-
-    class FileAttributeTagInfo(ctypes.Structure):
-        _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
-
-    ctypes_windows: Any = ctypes
-    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+def _configure_windows_create_file(kernel32: Any, wintypes: Any) -> Any:
+    """Apply the shared CreateFileW ABI before acquiring an output handle."""
     create_file = kernel32.CreateFileW
     create_file.argtypes = (
         wintypes.LPCWSTR,
@@ -606,6 +598,20 @@ def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> 
         wintypes.HANDLE,
     )
     create_file.restype = wintypes.HANDLE
+    return create_file
+
+
+def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> int:
+    """Pin a Windows output parent so path-based replacement cannot be redirected."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = _configure_windows_create_file(kernel32, wintypes)
 
     file_traverse = 0x0020
     file_read_attributes = 0x0080
@@ -718,17 +724,7 @@ def _open_windows_output_parent_lock(output_path: str, absolute_path: Path, pare
 
     ctypes_windows: Any = ctypes
     kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
+    create_file = _configure_windows_create_file(kernel32, wintypes)
 
     delete_access = 0x00010000
     file_read_attributes = 0x0080
@@ -803,17 +799,7 @@ def _open_windows_output_temp_file(
 
     ctypes_windows: Any = ctypes
     kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
+    create_file = _configure_windows_create_file(kernel32, wintypes)
 
     generic_write = 0x40000000
     delete_access = 0x00010000
@@ -860,17 +846,7 @@ def _open_windows_existing_output_file(output_path: str, absolute_path: Path) ->
 
     ctypes_windows: Any = ctypes
     kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
+    create_file = _configure_windows_create_file(kernel32, wintypes)
 
     file_write_data = 0x0002
     file_read_attributes = 0x0080
@@ -2671,6 +2647,20 @@ def _scanner_selection_overrides(runtime: _ScanRuntimeConfig) -> dict[str, Any]:
     return {SCANNER_SELECTION_CONFIG_KEY: runtime.scanner_selection}
 
 
+def _streaming_scan_options(runtime: _ScanRuntimeConfig, blacklist: tuple[str, ...]) -> dict[str, Any]:
+    """Return the common scanner options without source-specific streaming controls."""
+    return {
+        "blacklist_patterns": list(blacklist) if blacklist else None,
+        "max_file_size": runtime.max_file_size,
+        "max_total_size": runtime.max_total_size,
+        "strict_license": runtime.strict_license,
+        "skip_file_types": runtime.skip_non_model_files,
+        "use_hf_whitelist": runtime.use_hf_whitelist,
+        "cache_enabled": runtime.cache_enabled,
+        "cache_dir": runtime.cache_dir,
+    }
+
+
 def _show_scan_runtime_defaults(
     runtime: _ScanRuntimeConfig,
     expanded_paths: list[str],
@@ -3076,7 +3066,6 @@ def _create_path_progress_callback(
     actual_path: str,
 ) -> Any | None:
     """Build the legacy spinner callback or enhanced tracker callback for one path."""
-    progress_callback = None
     if spinner and not progress_tracker:
 
         def update_progress(message: str, percentage: float, spinner_bound: Any = spinner) -> None:
@@ -3085,7 +3074,7 @@ def _create_path_progress_callback(
         return update_progress
 
     if not progress_tracker:
-        return progress_callback
+        return None
 
     try:
         from .progress import ProgressPhase
@@ -3194,14 +3183,7 @@ def _scan_local_or_downloaded_path(
                 delete_after_scan=False,
                 scan_root=actual_path,
                 progress_callback=progress_callback,
-                blacklist_patterns=list(blacklist) if blacklist else None,
-                max_file_size=runtime.max_file_size,
-                max_total_size=runtime.max_total_size,
-                strict_license=runtime.strict_license,
-                skip_file_types=runtime.skip_non_model_files,
-                use_hf_whitelist=runtime.use_hf_whitelist,
-                cache_enabled=runtime.cache_enabled,
-                cache_dir=runtime.cache_dir,
+                **_streaming_scan_options(runtime, blacklist),
                 **_scanner_selection_overrides(runtime),
             )
             path_state.record_non_shard_result_errors(streaming_result)
@@ -3358,33 +3340,34 @@ def _resolve_scan_source_for_path(
         path_state.mark_non_shard_error(audit_result)
         return None
 
-    if is_huggingface_file_url(path):
+    is_hf_file = is_huggingface_file_url(path)
+    if dry_run and (is_hf_file or is_huggingface_url(path)):
         display_path = _display_path(path)
-        if dry_run:
-            try:
-                preview = _build_huggingface_file_dry_run_preview(path, runtime)
-                source_model_id, source_model_source = extract_model_id_from_path(path)
-                path_state.record_dry_run_preview(preview)
-                return _SourceDispatchResult(
-                    actual_path=path,
-                    local_scan_required=False,
-                    source_model_id=source_model_id,
-                    source_model_source=source_model_source,
-                )
-            except Exception as exc:
-                raw_error = str(exc)
-                error_msg = _display_error(raw_error, path)
-                logger.error(f"Failed to preview Hugging Face file {display_path}: {error_msg}")
-                click.echo(f"Error previewing file from {display_path}: {error_msg}", err=True)
-                _record_huggingface_acquisition_error(
-                    audit_result,
-                    path_state,
-                    path=path,
-                    error_msg=error_msg,
-                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
-                )
-                return None
+        source_kind = "file" if is_hf_file else "model"
+        try:
+            preview = (
+                _build_huggingface_file_dry_run_preview(path, runtime)
+                if is_hf_file
+                else _build_huggingface_model_dry_run_preview(path, runtime)
+            )
+            path_state.record_dry_run_preview(preview)
+            return _SourceDispatchResult(actual_path=path, local_scan_required=False)
+        except Exception as exc:
+            raw_error = str(exc)
+            error_msg = _display_error(raw_error, path)
+            logger.error(f"Failed to preview Hugging Face {source_kind} {display_path}: {error_msg}")
+            click.echo(f"Error previewing {source_kind} from {display_path}: {error_msg}", err=True)
+            _record_huggingface_acquisition_error(
+                audit_result,
+                path_state,
+                path=path,
+                error_msg=error_msg,
+                classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
+            )
+            return None
 
+    if is_hf_file:
+        display_path = _display_path(path)
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
@@ -3459,31 +3442,6 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_url(path):
         display_path = _display_path(path)
-        if dry_run:
-            try:
-                preview = _build_huggingface_model_dry_run_preview(path, runtime)
-                source_model_id, source_model_source = extract_model_id_from_path(path)
-                path_state.record_dry_run_preview(preview)
-                return _SourceDispatchResult(
-                    actual_path=path,
-                    local_scan_required=False,
-                    source_model_id=source_model_id,
-                    source_model_source=source_model_source,
-                )
-            except Exception as exc:
-                raw_error = str(exc)
-                error_msg = _display_error(raw_error, path)
-                logger.error(f"Failed to preview Hugging Face model {display_path}: {error_msg}")
-                click.echo(f"Error previewing model from {display_path}: {error_msg}", err=True)
-                _record_huggingface_acquisition_error(
-                    audit_result,
-                    path_state,
-                    path=path,
-                    error_msg=error_msg,
-                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
-                )
-                return None
-
         hf_stream_kwargs: dict[str, Any] = {}
         if runtime.scan_and_delete:
             if runtime.scannable_extensions is not None:
@@ -3625,14 +3583,7 @@ def _resolve_scan_source_for_path(
                                 # ancestor-swap races against streamed path strings.
                                 delete_after_scan=False,
                                 scan_root=str(stream_hf_cache_root),
-                                blacklist_patterns=list(blacklist) if blacklist else None,
-                                max_file_size=runtime.max_file_size,
-                                max_total_size=runtime.max_total_size,
-                                strict_license=runtime.strict_license,
-                                skip_file_types=runtime.skip_non_model_files,
-                                use_hf_whitelist=runtime.use_hf_whitelist,
-                                cache_enabled=runtime.cache_enabled,
-                                cache_dir=runtime.cache_dir,
+                                **_streaming_scan_options(runtime, blacklist),
                                 **streaming_kwargs,
                             )
                         except _HuggingFaceAcquisitionError:
@@ -3657,8 +3608,6 @@ def _resolve_scan_source_for_path(
                     actual_path=path,
                     local_scan_required=False,
                     temp_path=temp_dir,
-                    source_model_id=source_model_id,
-                    source_model_source=source_model_source,
                 )
 
             download_spinner = None
@@ -3779,14 +3728,7 @@ def _resolve_scan_source_for_path(
                     shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
-                    blacklist_patterns=list(blacklist) if blacklist else None,
-                    max_file_size=runtime.max_file_size,
-                    max_total_size=runtime.max_total_size,
-                    strict_license=runtime.strict_license,
-                    skip_file_types=runtime.skip_non_model_files,
-                    use_hf_whitelist=runtime.use_hf_whitelist,
-                    cache_enabled=runtime.cache_enabled,
-                    cache_dir=runtime.cache_dir,
+                    **_streaming_scan_options(runtime, blacklist),
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
@@ -3921,14 +3863,7 @@ def _resolve_scan_source_for_path(
                     shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
-                    blacklist_patterns=list(blacklist) if blacklist else None,
-                    max_file_size=runtime.max_file_size,
-                    max_total_size=runtime.max_total_size,
-                    strict_license=runtime.strict_license,
-                    skip_file_types=runtime.skip_non_model_files,
-                    use_hf_whitelist=runtime.use_hf_whitelist,
-                    cache_enabled=runtime.cache_enabled,
-                    cache_dir=runtime.cache_dir,
+                    **_streaming_scan_options(runtime, blacklist),
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
@@ -4229,8 +4164,6 @@ def auth() -> None:
 @click.option("-k", "--api-key", help="Login using an API key.")
 def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
     """Login"""
-    import time
-
     start_time = time.time()
     try:
         token = None
@@ -4281,8 +4214,6 @@ def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
 @auth.command()
 def logout() -> None:
     """Logout"""
-    import time
-
     start_time = time.time()
     email = get_user_email()
     api_key = cloud_config.get_api_key()
@@ -4303,8 +4234,6 @@ def logout() -> None:
 @auth.command()
 def whoami() -> None:
     """Show current user information"""
-    import time
-
     start_time = time.time()
     try:
         email = get_user_email()
@@ -4350,8 +4279,6 @@ def cache() -> None:
 @click.option("--dry-run", is_flag=True, help="Show what would be cleared without actually clearing")
 def clear(cache_dir: str | None, dry_run: bool) -> None:
     """Clear the entire scan results cache"""
-    import time
-
     start_time = time.time()
     from .cache import get_cache_manager
 
@@ -4433,8 +4360,6 @@ def clear(cache_dir: str | None, dry_run: bool) -> None:
 @click.option("--dry-run", is_flag=True, help="Show what would be cleaned without actually cleaning")
 def cleanup(cache_dir: str | None, max_age: int, dry_run: bool) -> None:
     """Clean up old cache entries"""
-    import time
-
     start_time = time.time()
     from .cache import get_cache_manager
 
@@ -4495,8 +4420,6 @@ def cleanup(cache_dir: str | None, max_age: int, dry_run: bool) -> None:
 @click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
 def stats(cache_dir: str | None) -> None:
     """Show cache statistics"""
-    import time
-
     start_time = time.time()
     from .cache import get_cache_manager
 
@@ -5050,33 +4973,24 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
     available_scanners = _registry.get_available_scanners()
     total_scanners = len(_registry.get_scanner_classes())  # Total possible scanners
-    authenticated = config.is_authenticated()
+    authenticated = bool(config.is_authenticated())
 
-    if authenticated:
-        auth_label = style_text("  Promptfoo Cloud:", fg="bright_black")
-        auth_value = style_text("Logged in", fg="green", bold=True)
-        output_lines.append(f"{auth_label} {auth_value}")
-        # Show enhanced scanner count for authenticated users
-        scanner_label = style_text("  Enhanced Scanners:", fg="bright_black")
-        scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg="green", bold=True)
-        output_lines.append(f"{scanner_label} {scanner_value}")
-    else:
-        auth_label = style_text("  Promptfoo Cloud:", fg="bright_black")
-        auth_value = style_text("Not logged in", fg="yellow", bold=True)
-        output_lines.append(f"{auth_label} {auth_value}")
-        # Show limited scanner info for unauthenticated users
-        scanner_label = style_text("  Basic Scanners:", fg="bright_black")
-        scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg="yellow", bold=True)
-        output_lines.append(f"{scanner_label} {scanner_value}")
+    auth_color = "green" if authenticated else "yellow"
+    auth_label = style_text("  Promptfoo Cloud:", fg="bright_black")
+    auth_value = style_text("Logged in" if authenticated else "Not logged in", fg=auth_color, bold=True)
+    output_lines.append(f"{auth_label} {auth_value}")
+    scanner_label = style_text("  Enhanced Scanners:" if authenticated else "  Basic Scanners:", fg="bright_black")
+    scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg=auth_color, bold=True)
+    output_lines.append(f"{scanner_label} {scanner_value}")
 
-        # Add gentle encouragement to login (only if we have failures or limited functionality)
-        if len(available_scanners) < total_scanners:
-            output_lines.append("")
-            tip_icon = "💡"
-            tip_text = "Login for enhanced scanning with cloud models and fewer false positives"
-            login_cmd = style_text("modelaudit auth login", fg="cyan", bold=True)
-            output_lines.append(f"  {tip_icon} {tip_text}")
-            output_lines.append(f"     Run {login_cmd} to get started")
+    # Encourage login when unauthenticated users have limited scanner availability.
+    if not authenticated and len(available_scanners) < total_scanners:
+        output_lines.append("")
+        tip_icon = "💡"
+        tip_text = "Login for enhanced scanning with cloud models and fewer false positives"
+        login_cmd = style_text("modelaudit auth login", fg="cyan", bold=True)
+        output_lines.append(f"  {tip_icon} {tip_text}")
+        output_lines.append(f"     Run {login_cmd} to get started")
 
     # Add model information if available
     if "file_metadata" in results:
@@ -5208,83 +5122,45 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     output_lines.append("" + "─" * 60)
 
     if visible_issues:
-        # Show issue counts with icons
-        summary_parts = []
-        if severity_counts["critical"] > 0:
-            summary_parts.append(
-                "  "
-                + style_text(
-                    f"🚨 {severity_counts['critical']} Critical",
-                    fg="red",
-                    bold=True,
-                ),
-            )
-        if severity_counts["warning"] > 0:
-            summary_parts.append(
-                "  "
-                + style_text(
-                    f"⚠️  {severity_counts['warning']} Warning{'s' if severity_counts['warning'] > 1 else ''}",
-                    fg="yellow",
-                ),
-            )
-        if severity_counts["info"] > 0:
-            summary_parts.append(
-                "  " + style_text(f"[i] {severity_counts['info']} Info", fg="blue"),
-            )
-        if verbose and severity_counts["debug"] > 0:
-            summary_parts.append(
-                "  " + style_text(f"🐛 {severity_counts['debug']} Debug", fg="cyan"),
-            )
-
-        output_lines.extend(summary_parts)
+        # Show issue counts in severity order, with debug counts only in verbose mode.
+        for severity, icon, label, color in (
+            ("critical", "🚨", "Critical", "red"),
+            ("warning", "⚠️ ", "Warning", "yellow"),
+            ("info", "[i]", "Info", "blue"),
+            ("debug", "🐛", "Debug", "cyan"),
+        ):
+            if severity == "debug" and not verbose:
+                continue
+            count = severity_counts[severity]
+            if count > 0:
+                if severity == "warning" and count > 1:
+                    label += "s"
+                bold = {"bold": True} if severity == "critical" else {}
+                output_lines.append("  " + style_text(f"{icon} {count} {label}", fg=color, **bold))
 
         # Group issues by severity for better organization
         output_lines.append("")
 
-        # Display critical issues first
-        critical_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "critical"]
-        if critical_issues:
-            output_lines.append(
-                style_text("  🚨 Critical Issues", fg="red", bold=True),
-            )
+        displayed_group = False
+        for severity, title, color in (
+            ("critical", "  🚨 Critical Issues", "red"),
+            ("warning", "  ⚠️  Warnings", "yellow"),
+            ("info", "  [i] Information", "blue"),
+            ("debug", "  🐛 Debug", "cyan"),
+        ):
+            if severity == "debug" and not verbose:
+                continue
+            group = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == severity]
+            if not group:
+                continue
+            if displayed_group:
+                output_lines.append("")
+            output_lines.append(style_text(title, fg=color, bold=True))
             output_lines.append("  " + "─" * 40)
-            for issue in critical_issues:
-                _format_issue(issue, output_lines, "critical")
+            for issue in group:
+                _format_issue(issue, output_lines, severity)
                 output_lines.append("")
-
-        # Display warnings
-        warning_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "warning"]
-        if warning_issues:
-            if critical_issues:
-                output_lines.append("")
-            output_lines.append(style_text("  ⚠️  Warnings", fg="yellow", bold=True))
-            output_lines.append("  " + "─" * 40)
-            for issue in warning_issues:
-                _format_issue(issue, output_lines, "warning")
-                output_lines.append("")
-
-        # Display info issues
-        info_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "info"]
-        if info_issues:
-            if critical_issues or warning_issues:
-                output_lines.append("")
-            output_lines.append(style_text("  [i] Information", fg="blue", bold=True))
-            output_lines.append("  " + "─" * 40)
-            for issue in info_issues:
-                _format_issue(issue, output_lines, "info")
-                output_lines.append("")
-
-        # Display debug issues if verbose
-        if verbose:
-            debug_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "debug"]
-            if debug_issues:
-                if critical_issues or warning_issues or info_issues:
-                    output_lines.append("")
-                output_lines.append(style_text("  🐛 Debug", fg="cyan", bold=True))
-                output_lines.append("  " + "─" * 40)
-                for issue in debug_issues:
-                    _format_issue(issue, output_lines, "debug")
-                    output_lines.append("")
+            displayed_group = True
     else:
         # Check if no files were scanned to show appropriate message
         files_scanned = results.get("files_scanned", 0)
@@ -5319,76 +5195,49 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     has_critical_findings = any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues)
     has_warning_findings = any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues)
     has_security_findings = has_critical_findings or has_warning_findings
+    guidance = None
     if has_operational_errors:
-        status_icon = "❌"
-        if has_acquisition_errors:
-            status_msg = "MODEL ACQUISITION BLOCKED" if has_blocked_acquisition else "MODEL ACQUISITION FAILED"
-        else:
-            status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
         status_color = "red"
-        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
         if has_acquisition_errors:
-            guidance = (
-                "No model artifacts were scanned for blocked Hugging Face source(s)."
-                if has_blocked_acquisition
-                else "No model artifacts were scanned for failed Hugging Face source(s)."
-            )
+            acquisition_status = "blocked" if has_blocked_acquisition else "failed"
+            status_msg = f"❌ MODEL ACQUISITION {acquisition_status.upper()}"
+            guidance = f"No model artifacts were scanned for {acquisition_status} Hugging Face source(s)."
         else:
+            status_msg = "❌ SCAN COMPLETED WITH OPERATIONAL ERRORS"
             guidance = "Review warnings above and use --verbose for troubleshooting details."
-        output_lines.append(f"  {style_text(guidance, fg='yellow')}")
     # Determine overall status
     elif has_security_findings:
         if has_critical_findings:
-            status_icon = "❌"
-            status_msg = "CRITICAL SECURITY ISSUES FOUND"
+            status_msg = "❌ CRITICAL SECURITY ISSUES FOUND"
             status_color = "red"
-        elif has_warning_findings:
-            status_icon = "⚠️"
-            status_msg = "WARNINGS DETECTED"
+        else:
+            status_msg = "⚠️ WARNINGS DETECTED"
             status_color = "yellow"
         if has_incomplete_coverage:
             status_msg += "; COVERAGE INCOMPLETE"
-        status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
-        output_lines.append(f"  {status_line}")
     elif is_dry_run:
-        output_lines.append(f"  {style_text('✅ DRY RUN PREVIEW COMPLETE', fg='green', bold=True)}")
+        status_msg = "✅ DRY RUN PREVIEW COMPLETE"
+        status_color = "green"
     # Check if no files were scanned
     elif files_scanned == 0:
-        status_icon = "❌"
-        status_msg = "NO FILES SCANNED"
+        status_msg = "❌ NO FILES SCANNED"
         status_color = "red"
-        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
-        output_lines.append(
-            f"  {style_text('Warning: No model files were found at the specified location.', fg='yellow')}"
-        )
+        guidance = "Warning: No model files were found at the specified location."
     elif has_incomplete_coverage:
-        status_icon = "⚠️"
-        status_msg = "SCAN COVERAGE INCOMPLETE"
+        status_msg = "⚠️ SCAN COVERAGE INCOMPLETE"
         status_color = "yellow"
-        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
-        output_lines.append(f"  {style_text('Some selected files could not be fully analyzed.', fg='yellow')}")
+        guidance = "Some selected files could not be fully analyzed."
     elif visible_issues:
-        if has_critical_findings:
-            status_icon = "❌"
-            status_msg = "CRITICAL SECURITY ISSUES FOUND"
-            status_color = "red"
-        elif has_warning_findings:
-            status_icon = "⚠️"
-            status_msg = "WARNINGS DETECTED"
-            status_color = "yellow"
-        else:
-            # Only info/debug issues
-            status_icon = "[i]"
-            status_msg = "INFORMATIONAL FINDINGS"
-            status_color = "blue"
-        status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
-        output_lines.append(f"  {status_line}")
+        # Only info/debug issues
+        status_msg = "[i] INFORMATIONAL FINDINGS"
+        status_color = "blue"
     else:
-        status_icon = "✅"
-        status_msg = "NO ISSUES FOUND"
+        status_msg = "✅ NO ISSUES FOUND"
         status_color = "green"
-        status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
-        output_lines.append(f"  {status_line}")
+
+    output_lines.append(f"  {style_text(status_msg, fg=status_color, bold=True)}")
+    if guidance is not None:
+        output_lines.append(f"  {style_text(guidance, fg='yellow')}")
 
     output_lines.append("═" * 80)
 
@@ -5611,8 +5460,6 @@ def _display_failure_details(summary: dict[str, Any]) -> None:
 )
 def metadata(path: str, output_format: str, output: str | None, security_only: bool, trust_loaders: bool) -> None:
     """Extract and display model metadata."""
-    import time
-
     start_time = time.time()
     from .metadata_extractor import ModelMetadataExtractor
 
@@ -5746,9 +5593,6 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
 )
 def doctor(show_failed: bool) -> None:
     """Diagnose scanner availability and dependencies"""
-    import sys
-    import time
-
     from .scanners import _registry
 
     start_time = time.time()
@@ -5910,8 +5754,6 @@ def rules_command(rule_code: str | None, list_rules: bool, category: str | None,
 
 def _get_platform_info() -> dict[str, Any]:
     """Get platform information for debug output."""
-    import platform
-
     return {
         "os": sys.platform,
         "release": platform.release(),
@@ -5985,63 +5827,29 @@ def _get_dependency_versions() -> dict[str, Any]:
     Uses importlib.metadata to get versions WITHOUT importing modules.
     This avoids mutex/threading issues from ML framework initialization.
     """
-    from importlib.metadata import PackageNotFoundError, version
+    from importlib.metadata import version
 
-    def _get_version(package_name: str) -> str | None:
-        """Get package version from metadata without importing the module."""
-        try:
-            return version(package_name)
-        except PackageNotFoundError:
-            return None
-        except Exception:
-            return None
-
-    # Core dependencies (should always be installed)
-    core = {
-        "click": _get_version("click"),
-        "pyyaml": _get_version("pyyaml"),
-        "requests": _get_version("requests"),
-        "platformdirs": _get_version("platformdirs"),
+    package_groups = {
+        # Core dependencies (should always be installed)
+        "core": ("click", "pyyaml", "requests", "platformdirs"),
+        # ML framework dependencies (optional, scanner-specific)
+        "mlFrameworks": ("numpy", "torch", "tensorflow", "onnx", "jax", "flax"),
+        # Format/serialization dependencies (optional)
+        "serialization": ("h5py", "safetensors", "msgpack", "joblib"),
+        # Utility dependencies (optional)
+        "utilities": ("huggingface_hub", "posthog", "jinja2", "py7zr", "xgboost"),
     }
-
-    # ML framework dependencies (optional, scanner-specific)
-    ml_frameworks = {
-        "numpy": _get_version("numpy"),
-        "torch": _get_version("torch"),
-        "tensorflow": _get_version("tensorflow"),
-        "onnx": _get_version("onnx"),
-        "jax": _get_version("jax"),
-        "flax": _get_version("flax"),
-    }
-
-    # Format/serialization dependencies (optional)
-    serialization = {
-        "h5py": _get_version("h5py"),
-        "safetensors": _get_version("safetensors"),
-        "msgpack": _get_version("msgpack"),
-        "joblib": _get_version("joblib"),
-    }
-
-    # Utility dependencies (optional)
-    utilities = {
-        "huggingface_hub": _get_version("huggingface-hub"),
-        "posthog": _get_version("posthog"),
-        "jinja2": _get_version("jinja2"),
-        "py7zr": _get_version("py7zr"),
-        "xgboost": _get_version("xgboost"),
-    }
-
-    # Filter out None values for cleaner output
-    def filter_installed(deps: dict[str, str | None]) -> dict[str, str]:
-        return {k: v for k, v in deps.items() if v is not None}
-
-    result: dict[str, Any] = {
-        "core": filter_installed(core),
-        "mlFrameworks": filter_installed(ml_frameworks),
-        "serialization": filter_installed(serialization),
-        "utilities": filter_installed(utilities),
-    }
-
+    result: dict[str, Any] = {}
+    for group, package_names in package_groups.items():
+        result[group] = {}
+        for package_name in package_names:
+            distribution_name = "huggingface-hub" if package_name == "huggingface_hub" else package_name
+            try:
+                package_version = version(distribution_name)
+            except Exception:
+                continue
+            if package_version is not None:
+                result[group][package_name] = package_version
     return result
 
 
@@ -6254,8 +6062,6 @@ def debug(output_json: bool, verbose: bool) -> None:
         modelaudit debug --json             # Raw JSON for scripting
         modelaudit debug --verbose          # Include detailed scanner errors
     """
-    import time
-
     start_time = time.time()
     # Build debug info dictionary
     debug_info: dict[str, Any] = {

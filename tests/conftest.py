@@ -4,14 +4,13 @@ import importlib.util
 import logging
 import os
 import pickle
-import shutil
 import sys
 import tempfile
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -135,8 +134,6 @@ def pytest_runtest_setup(item):
 
         # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
         allowed_test_files = [
-            "test_retry.py",  # Retry keyword compatibility
-            "test_evidence.py",  # Bounded evidence presentation
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
             "test_pickle_binunicode8_setitem.py",
@@ -225,6 +222,8 @@ def pytest_runtest_setup(item):
             "test_tensorrt_scanner.py",  # TensorRT scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_jinja2_template_scanner.py",  # Jinja2 template parse fallback regression tests
+            "test_retry.py",  # Retry keyword compatibility
+            "test_evidence.py",  # Bounded evidence presentation
             "test_evidence_redaction.py",  # Shared scanner evidence redaction tests
             "test_evidence_redaction_authorization_continuation.py",  # Folded auth-header redaction regressions
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
@@ -278,6 +277,7 @@ def pytest_runtest_setup(item):
             "test_sbom_url_fixes.py",  # SBOM URL handling and credential-redaction regressions
         ]
         allowed_test_nodeids = [
+            "tests/test_false_positive_fixes.py::TestFalsePositiveFixes::test_bert_model_no_false_positive_executables",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_vulnerable_pytorch_prereleases",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_allows_torch_load_for_stable_patched_pytorch",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_pytorch_version",
@@ -335,44 +335,6 @@ def requires_symlinks():
 
 
 @pytest.fixture
-def sample_results():
-    """Return a sample results dictionary for testing."""
-    return {
-        "path": "/path/to/model",
-        "files_scanned": 5,
-        "bytes_scanned": 1024,
-        "duration": 0.5,
-        "start_time": 1000.0,
-        "finish_time": 1000.5,
-        "issues": [
-            {
-                "message": "Test issue 1",
-                "severity": "warning",
-                "location": "test1.pkl",
-                "details": {"test": "value1"},
-                "timestamp": 1000.1,
-            },
-            {
-                "message": "Test issue 2",
-                "severity": "error",
-                "location": "test2.pkl",
-                "details": {"test": "value2"},
-                "timestamp": 1000.2,
-            },
-            {
-                "message": "Test issue 3",
-                "severity": "info",
-                "location": "test3.pkl",
-                "details": {"test": "value3"},
-                "timestamp": 1000.3,
-            },
-        ],
-        "success": True,
-        "has_errors": True,
-    }
-
-
-@pytest.fixture
 def temp_model_dir(tmp_path):
     """Create a temporary directory with various model files for testing."""
     model_dir = tmp_path / "models"
@@ -420,33 +382,6 @@ class ProgressCallbackRecorder:
     def __call__(self, message: str, percentage: float) -> None:
         self.messages.append(message)
         self.percentages.append(percentage)
-
-
-@pytest.fixture
-def temp_dir():
-    """Create a temporary directory for tests."""
-    temp_path = tempfile.mkdtemp()
-    yield Path(temp_path)
-    shutil.rmtree(temp_path, ignore_errors=True)
-
-
-@pytest.fixture
-def mock_malicious_pickle_data():
-    """Provide mock malicious pickle data for testing."""
-    return {
-        "os_system": b"cos\nsystem\nq\x00.",
-        "eval_call": b"cbuiltins\neval\nq\x00.",
-        "subprocess_call": b"csubprocess\ncall\nq\x00.",
-    }
-
-
-@pytest.fixture
-def performance_markers():
-    """Markers for performance-related tests."""
-    return {
-        "max_scan_time": 1.0,  # Maximum scan time in seconds
-        "max_validation_time": 0.001,  # Maximum validation time in seconds
-    }
 
 
 # Configure pytest to handle missing optional dependencies gracefully
@@ -621,47 +556,6 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture
-def mock_scanner_registry():
-    """Mock scanner registry to avoid loading heavy ML dependencies."""
-    with patch("modelaudit.scanners.SCANNER_REGISTRY") as mock_registry:
-        # Create lightweight mock scanners
-        mock_pickle_scanner = Mock()
-        mock_pickle_scanner.can_handle.return_value = True
-        mock_pickle_scanner.scan.return_value = Mock(issues=[], files_scanned=1)
-
-        mock_registry.__iter__.return_value = [mock_pickle_scanner]
-        yield mock_registry
-
-
-@pytest.fixture
-def mock_ml_dependencies():
-    """Mock heavy ML dependencies to prevent imports during unit tests."""
-    mocks = {}
-
-    # Mock TensorFlow
-    mock_tf = MagicMock()
-    mock_tf.__version__ = "2.13.0"
-    mocks["tensorflow"] = mock_tf
-
-    # Mock Keras
-    mock_keras = MagicMock()
-    mock_keras.__version__ = "2.13.0"
-    mocks["keras"] = mock_keras
-
-    # Mock PyTorch
-    mock_torch = MagicMock()
-    mock_torch.__version__ = "2.6.0"
-    mocks["torch"] = mock_torch
-
-    # Mock pandas/pyarrow that causes the crash
-    mock_pandas = MagicMock()
-    mocks["pandas"] = mock_pandas
-
-    with patch.dict("sys.modules", mocks):
-        yield mocks
-
-
-@pytest.fixture
 def mock_cli_scan_command():
     """Mock the CLI scan command to avoid heavy dependency loading."""
     # Mock the core scan function that the CLI actually uses
@@ -702,57 +596,3 @@ def mock_cli_scan_command():
 
         mock_scan.return_value = mock_model
         yield mock_scan
-
-
-# =============================================================================
-# Common file creation fixtures
-# =============================================================================
-# Tests should use tmp_path for temporary files;
-# pytest handles tmp_path cleanup automatically.
-@pytest.fixture
-def safe_pickle_file(tmp_path):
-    """Create a safe pickle file for testing."""
-    path = tmp_path / "safe_model.pkl"
-    data = {"model": "test", "weights": [1.0, 2.0, 3.0]}
-    with open(path, "wb") as f:
-        pickle.dump(data, f)
-    return path
-
-
-@pytest.fixture
-def malicious_pickle_file(tmp_path):
-    """Create a malicious pickle file for testing detection."""
-    path = tmp_path / "malicious.pkl"
-    # os.system payload
-    path.write_bytes(b"cos\nsystem\n(S'echo pwned'\ntR.")
-    return path
-
-
-@pytest.fixture
-def mock_pytorch_zip(tmp_path):
-    """Create a mock PyTorch ZIP model file."""
-    path = tmp_path / "model.pt"
-    with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("version", "3")
-        data = pickle.dumps({"model": "pytorch_test"})
-        zf.writestr("data.pkl", data)
-    return path
-
-
-@pytest.fixture
-def model_directory(tmp_path):
-    """Create a directory with various model files for comprehensive testing."""
-    model_dir = tmp_path / "models"
-    model_dir.mkdir()
-
-    # Create pickle file
-    pickle_path = model_dir / "model.pkl"
-    with open(pickle_path, "wb") as f:
-        pickle.dump({"weights": [1, 2, 3]}, f)
-
-    # Create a subdirectory
-    sub_dir = model_dir / "subdir"
-    sub_dir.mkdir()
-    (sub_dir / "config.json").write_text('{"name": "test"}')
-
-    return model_dir

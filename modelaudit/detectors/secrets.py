@@ -484,10 +484,6 @@ def _canonical_basic_auth_header_name(value: str) -> str | None:
     return BASIC_AUTH_HEADER_NAMES.get(normalized)
 
 
-def _is_basic_auth_header_name(value: str) -> bool:
-    return _canonical_basic_auth_header_name(value) is not None
-
-
 def _normalize_basic_auth_structured_key(value: object) -> str | None:
     if isinstance(value, bytes):
         try:
