@@ -11342,8 +11342,9 @@ def test_scan_bytes_fails_closed_when_native_extension_appears_during_source_ana
         ),
         (
             "subprocess",
-            "selectors",
-            "class SelectSelector: pass\nclass PollSelector: pass\n",
+            # subprocess imports selectors only on POSIX; signal is unconditional.
+            "signal" if sys.platform == "win32" else "selectors",
+            "" if sys.platform == "win32" else "class SelectSelector: pass\nclass PollSelector: pass\n",
         ),
     ],
 )
