@@ -6153,6 +6153,11 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
     if type(module) is not ModuleType or type(_IMPORT_RUNTIME_BUILTINS) is not dict:
         return False
     namespace = ModuleType.__getattribute__(module, "__dict__")
+    callback_builtins = _loaded_reference_state_without_hooks(module, "__builtins__")
+    _track_loaded_interpreter_reference_state("string", "__builtins__", callback_builtins)
+    # MAKE_FUNCTION obtains each nested convert callback's builtins from these globals.
+    if not callback_builtins[0] or callback_builtins[1] is not _IMPORT_RUNTIME_BUILTINS:
+        return False
     sentinel = namespace.get("_sentinel_dict")
     if type(sentinel) is not dict or sentinel:
         return False

@@ -27,6 +27,7 @@ from importlib.machinery import (
 )
 from importlib.util import find_spec
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import FunctionType
 from typing import Any
 from unittest.mock import create_autospec
@@ -9617,6 +9618,63 @@ else:
     )
 
 
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template runtime qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("mutation", ["canonical", "before_import", "after_import", "after_first_scan"])
+def test_template_nested_callback_builtins_are_authenticated(tmp_path: Path, method_name: str, mutation: str) -> None:
+    marker = tmp_path / "nested_callback_marker"
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$missing")) + b"R"
+    mapping = (
+        _global_operand("collections", "defaultdict")
+        + _args_tuple(_global_operand("collections", "defaultdict"))
+        + b"R"
+    )
+    payload = b"\x80\x04" + _global_operand("string", method_name) + _args_tuple(receiver, mapping) + b"R."
+    child_code = """
+import builtins
+import pickle
+import string
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+mutation = sys.argv[3]
+string.Template("warm").substitute({})
+def changed_str(value):
+    marker.write_text("nested-str-called")
+    return "hook-result"
+def replace_callback_builtins():
+    string.__dict__["__builtins__"] = dict(vars(builtins), str=changed_str)
+if mutation == "before_import":
+    replace_callback_builtins()
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes, shared_source_sensitive_caches
+if mutation == "after_import":
+    replace_callback_builtins()
+
+with shared_source_sensitive_caches():
+    if mutation == "after_first_scan":
+        before = scan_bytes(payload)
+        assert before.status == ScanStatus.COMPLETE, before
+        assert before.verdict == SafetyVerdict.CLEAN, before
+        replace_callback_builtins()
+    report = scan_bytes(payload)
+assert not marker.exists(), "the scanner executed the nested callback"
+if mutation == "canonical":
+    assert report.status == ScanStatus.COMPLETE, report
+    assert report.verdict == SafetyVerdict.CLEAN, report
+    assert pickle.loads(payload) == "defaultdict(None, {})"
+    assert not marker.exists()
+else:
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert report.verdict != SafetyVerdict.CLEAN, report
+    assert any(error.category == "call_graph_analysis_error" for error in report.errors), report
+    assert pickle.loads(payload) == "hook-result"
+    assert marker.read_text() == "nested-str-called"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), mutation])
+
+
 def test_scan_bytes_blocks_formatter_vformat_defaultdict_factory_rce(tmp_path: Path) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -10464,16 +10522,59 @@ def _assert_format_protocol_dispatch(name: str) -> None:
     assert findings[0].call_path == ("ipaddress.IPv4Address.__format__", "builtins.__import__")
 
 
+def test_isolated_child_does_not_inherit_crowded_worker_directory(tmp_path: Path) -> None:
+    crowded = tmp_path / "crowded-worker"
+    workspace = crowded / "case"
+    workspace.mkdir(parents=True)
+    for index in range(call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES + 1):
+        (crowded / f"unrelated-entry-{index}").touch()
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$missing")) + b"R"
+    payload = b"\x80\x04" + _global_operand("string", "Template.safe_substitute") + _args_tuple(receiver, b"}") + b"R."
+    child_code = """
+import os
+import string
+import sys
+
+# uv overlay interpreters may omit cwd; model ordinary Python -c lookup explicitly.
+sys.path.insert(0, "")
+def prime_cwd_finder():
+    try:
+        __import__("_modelaudit_missing_cwd_budget_probe")
+    except ModuleNotFoundError:
+        pass
+    else:
+        raise AssertionError("the missing-module probe unexpectedly exists")
+
+prime_cwd_finder()
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+payload = bytes.fromhex(sys.argv[1])
+report = scan_bytes(payload)
+assert report.status == ScanStatus.COMPLETE, report
+assert report.verdict == SafetyVerdict.CLEAN, report
+os.chdir(sys.argv[2])
+prime_cwd_finder()
+limited = scan_bytes(payload)
+assert limited.status == ScanStatus.INCONCLUSIVE, limited
+assert limited.verdict != SafetyVerdict.CLEAN, limited
+assert any(notice.code == "call_graph_source_unavailable" for notice in limited.notices), limited
+"""
+    _assert_isolated_python(workspace, [sys.executable, "-c", child_code, payload.hex(), str(crowded)])
+
+
 def _assert_isolated_python(tmp_path: Path, command: list[str]) -> None:
-    result = subprocess.run(
-        command,
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    # A shared pytest worker parent can exceed the import-cache inspection budget.
+    with TemporaryDirectory(prefix="isolated-python-", dir=tmp_path) as cwd:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
     assert result.returncode == 0, result.stderr
 
 
