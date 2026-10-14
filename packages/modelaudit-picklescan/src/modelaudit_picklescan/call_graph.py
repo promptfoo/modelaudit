@@ -2115,44 +2115,47 @@ def find_dangerous_call_graphs(
             continue
 
         try:
-            if (
-                module == "string"
-                and name
-                in {"Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"}
-                and reference.get("invocation_import_reference")
-                and _template_uses_reviewed_lazy_pattern()
-                and reference.get("template_receiver_state_unmodified") is not True
-                and analysis_limit_error is None
-            ):
-                analysis_limit_error = _CallGraphAnalysisLimitError(
-                    "string.Template receiver state cannot be proven unchanged"
-                )
-            if (
-                module == "string"
-                and name in {"Template.substitute", "Template.safe_substitute"}
-                and reference.get("invocation_import_reference")
-                and _template_uses_reviewed_lazy_pattern()
-                and reference.get("template_mapping_callbacks_complete") is not True
-                and analysis_limit_error is None
-            ):
-                # Missing mapping coverage must not hide independent Template sinks.
-                analysis_limit_error = _CallGraphAnalysisLimitError(
-                    "string.Template mapping callbacks cannot be proven covered"
-                )
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
             entrypoints = error.partial_entrypoints
+        template_entrypoints = {f"{module}.{name}", *entrypoints} & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+            "string.Template.is_valid",
+            "string.Template.get_identifiers",
+        }
+        template_mapping_entrypoints = template_entrypoints & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+        }
+        if (
+            template_entrypoints
+            and reference.get("invocation_import_reference")
+            and _template_uses_reviewed_lazy_pattern()
+        ):
+            if reference.get("template_receiver_state_unmodified") is not True and analysis_limit_error is None:
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template receiver state cannot be proven unchanged"
+                )
+            if (
+                template_mapping_entrypoints
+                and reference.get("template_mapping_callbacks_complete") is not True
+                and analysis_limit_error is None
+            ):
+                # Resolved aliases need the same proof; retain their original report identity.
+                # Missing coverage must not hide independent Template sinks.
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template mapping callbacks cannot be proven covered"
+                )
         if not entrypoints:
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
         try:
             path_for = (
                 partial(_find_sink_path, keyword_arg_names=_complete_keyword_arg_names(reference))
-                if module == "string"
-                and name in {"Template.substitute", "Template.safe_substitute"}
-                and reference.get("invocation_import_reference")
+                if template_mapping_entrypoints and reference.get("invocation_import_reference")
                 else _find_sink_path
             )
             sink_path = _first_matching_path(entrypoints, path_for)
@@ -3142,7 +3145,11 @@ def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
 
 
 def _function_owner_matches_trusted_source(
-    function: FunctionType, *, expected_module: str, code: CodeType | None = None
+    function: FunctionType,
+    *,
+    expected_module: str,
+    code: CodeType | None = None,
+    expected_qualname: str | None = None,
 ) -> bool:
     globals_namespace = function.__globals__
     if type(globals_namespace) is not dict:
@@ -3157,6 +3164,10 @@ def _function_owner_matches_trusted_source(
         code_path = Path((function.__code__ if code is None else code).co_filename).resolve()
     except (OSError, RuntimeError, ValueError):
         return False
+    if expected_qualname is not None:
+        return code_path == source_path and _function_code_matches_trusted_source(
+            function, source_path, code=code, expected_qualname=expected_qualname
+        )
     if code is None:
         return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
     return code_path == source_path and _function_code_matches_trusted_source(function, source_path, code=code)
@@ -3180,10 +3191,18 @@ def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> boo
 
 
 def _function_code_matches_trusted_source(
-    function: FunctionType, source_path: Path, *, code: CodeType | None = None
+    function: FunctionType,
+    source_path: Path,
+    *,
+    code: CodeType | None = None,
+    expected_qualname: str | None = None,
 ) -> bool:
     code = function.__code__ if code is None else code
-    return any(candidate == code for candidate in _trusted_source_code_objects(str(source_path)))
+    return any(
+        candidate == code
+        for candidate in _trusted_source_code_objects(str(source_path))
+        if expected_qualname is None or getattr(candidate, "co_qualname", None) == expected_qualname
+    )
 
 
 @_register_source_sensitive_cache
@@ -6592,8 +6611,11 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
         code = function.__code__
         if (
             not _template_code_metadata_is_hook_free(code)
+            or code.co_name != name
             or getattr(code, "co_qualname", None) != f"Template.{name}"
-            or not _function_owner_matches_trusted_source(function, expected_module="string", code=code)
+            or not _function_owner_matches_trusted_source(
+                function, expected_module="string", code=code, expected_qualname=f"Template.{name}"
+            )
             or not _template_function_runtime_is_canonical(function, module, name, sentinel, code=code)
             or function.__code__ is not code
         ):

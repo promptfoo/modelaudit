@@ -9821,9 +9821,10 @@ assert pickle.loads(payload) == (True if method_name == "Template.is_valid" else
         ("Template.safe_substitute", True),
     ],
 )
+@pytest.mark.parametrize("alias_module", ["string", "logging"])
 @pytest.mark.parametrize("receiver_prefix", [False, True])
 def test_scan_bytes_detects_uncached_template_pattern_import(
-    tmp_path: Path, method_name: str, unknown_mapping: bool, receiver_prefix: bool
+    tmp_path: Path, method_name: str, unknown_mapping: bool, receiver_prefix: bool, alias_module: str
 ) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -9843,6 +9844,7 @@ def test_scan_bytes_detects_uncached_template_pattern_import(
             + _args_tuple(receiver, _global_operand("builtins", "help"))
             + b"R."
         )
+    payload = payload.replace(_global_operand("string", method_name), _global_operand(alias_module, method_name), 1)
     if receiver_prefix:
         assert payload[:2] == b"\x80\x04"
         payload = payload[:2] + b"]Na0" + payload[2:]
@@ -9852,6 +9854,8 @@ import string
 import sys
 from pathlib import Path
 
+if sys.argv[7] == "logging":
+    import logging
 from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
 
 module_dir = Path(sys.argv[1])
@@ -9863,14 +9867,15 @@ assert original_pattern is vars(string)["_TemplatePattern"]
 sys.path.insert(0, str(module_dir))
 report = scan_bytes(payload, source="uncached-template-no-placeholder.pkl")
 assert report.verdict == SafetyVerdict.MALICIOUS, report
-if sys.argv[6] == "True":
+if sys.argv[6] == "True" or sys.argv[7] != "string":
     assert report.status == ScanStatus.INCONCLUSIVE, report
     assert any("receiver state cannot be proven unchanged" in error.message for error in report.errors), report
     invocation = next(
         item for item in report.metadata["callable_invocations"]
-        if item.get("module") == "string" and item.get("name") == method_name
+        if item.get("module") == sys.argv[7] and item.get("name") == method_name
     )
-    assert invocation["template_receiver_state_unmodified"] is False, invocation
+    expected_proof = False if sys.argv[7] == "string" else None
+    assert invocation.get("template_receiver_state_unmodified") is expected_proof, invocation
 elif sys.argv[5] == "True":
     assert report.status == ScanStatus.INCONCLUSIVE, report
     assert any("mapping callbacks cannot be proven covered" in error.message for error in report.errors), report
@@ -9905,6 +9910,7 @@ assert marker.read_text() == "imported"
             method_name,
             str(unknown_mapping),
             str(receiver_prefix),
+            alias_module,
         ],
     )
     assert marker.read_text() == "imported"
@@ -9922,13 +9928,14 @@ def test_template_unknown_or_nonempty_keywords_keep_import_edge(
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template keyword imports are deferred in Python 3.14")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 @pytest.mark.parametrize("import_opcode", ["GLOBAL", "STACK_GLOBAL"])
+@pytest.mark.parametrize("alias_module", ["string", "logging"])
 def test_template_partial_keyword_state_preserves_import_finding(
-    tmp_path: Path, method_name: str, import_opcode: str
+    tmp_path: Path, method_name: str, import_opcode: str, alias_module: str
 ) -> None:
     method = (
-        b"cstring\n" + method_name.encode("ascii") + b"\n"
+        b"c" + alias_module.encode("ascii") + b"\n" + method_name.encode("ascii") + b"\n"
         if import_opcode == "GLOBAL"
-        else _unicode_operand("string") + _unicode_operand(method_name) + b"\x93"
+        else _unicode_operand(alias_module) + _unicode_operand(method_name) + b"\x93"
     )
     receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$value")) + b"R"
     keywords = b"}" + _unicode_operand("value") + _unicode_operand("mapped") + b"s"
@@ -9936,11 +9943,13 @@ def test_template_partial_keyword_state_preserves_import_finding(
     state = _args_tuple(method, _args_tuple(receiver, b"}"), keywords, b"N")
     payload = b"\x80\x04" + partial + state + b"b)R."
     control_receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain text")) + b"R"
-    control_payload = b"\x80\x04" + method + _args_tuple(control_receiver, b"}") + b"R."
+    control_method = method if alias_module == "string" else _global_operand("string", method_name)
+    control_payload = b"\x80\x04" + control_method + _args_tuple(control_receiver, b"}") + b"R."
     marker = tmp_path / "partial_keyword_marker"
     child_code = """
 import collections
 import functools
+import logging
 import pickle
 import string
 import sys
@@ -13843,3 +13852,142 @@ else:
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), str(lookup), method_name]
     )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template mapping qualification is Python 3.14-specific")
+@pytest.mark.parametrize("alias_module", ["logging", "template_reexport"])
+@pytest.mark.parametrize("import_opcode", ["GLOBAL", "STACK_GLOBAL"])
+@pytest.mark.parametrize(
+    "method_name", ["Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"]
+)
+def test_template_reexports_require_native_coverage_proof(
+    tmp_path: Path, alias_module: str, method_name: str, import_opcode: str
+) -> None:
+    module_dir = tmp_path / "reexports"
+    module_dir.mkdir()
+    (module_dir / "template_reexport.py").write_text("from string import Template\n")
+    mapping_method = method_name in {"Template.substitute", "Template.safe_substitute"}
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$x")) + b"R"
+    args = (receiver, _global_operand("builtins", "help")) if mapping_method else (receiver,)
+    method = (
+        b"c" + alias_module.encode("ascii") + b"\n" + method_name.encode("ascii") + b"\n"
+        if import_opcode == "GLOBAL"
+        else _global_operand(alias_module, method_name)
+    )
+    payload = b"\x80\x04" + method + _args_tuple(*args) + b"R."
+    control_receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain")) + b"R"
+    control_args = (control_receiver, b"}") if mapping_method else (control_receiver,)
+    control = b"\x80\x04" + _global_operand("string", method_name) + _args_tuple(*control_args) + b"R."
+    marker = tmp_path / "alias_mapping_marker"
+    child_code = """
+import _sitebuiltins
+import importlib
+import pickle
+import string
+import sys
+from pathlib import Path
+
+module_dir, alias_module, method_name, marker_path, payload_hex, control_hex = sys.argv[1:]
+sys.path.insert(0, module_dir)
+alias = importlib.import_module(alias_module)
+assert alias.Template is string.Template
+string.Template("warm").substitute({})
+marker = Path(marker_path)
+def subscription_hook(self, key):
+    marker.write_text(key)
+    return "mapped"
+_sitebuiltins._Helper.__getitem__ = subscription_hook
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+control_report = scan_bytes(bytes.fromhex(control_hex))
+assert control_report.status == ScanStatus.COMPLETE, control_report
+assert control_report.verdict == SafetyVerdict.CLEAN, control_report
+assert not marker.exists()
+payload = bytes.fromhex(payload_hex)
+report = scan_bytes(payload)
+assert not marker.exists(), "scanning executed the alias mapping hook"
+result = pickle.loads(payload)
+if method_name in {"Template.substitute", "Template.safe_substitute"}:
+    assert result == "mapped"
+    assert marker.read_text() == "x"
+else:
+    assert result == (True if method_name == "Template.is_valid" else ["x"])
+    assert not marker.exists()
+invocation = next(item for item in report.metadata["callable_invocations"]
+                  if item.get("module") == alias_module and item.get("name") == method_name)
+assert invocation.get("template_receiver_state_unmodified") is not True, invocation
+assert invocation.get("template_mapping_callbacks_complete") is not True, invocation
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any(error.category == "call_graph_analysis_error"
+           and "receiver state cannot be proven unchanged" in error.message
+           for error in report.errors), report
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            alias_module,
+            method_name,
+            str(marker),
+            payload.hex(),
+            control.hex(),
+        ],
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template mapping qualification is Python 3.14-specific")
+@pytest.mark.parametrize("retag_name", [False, True])
+def test_template_method_code_must_match_its_selected_trusted_method(tmp_path: Path, retag_name: bool) -> None:
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$!$x")) + b"R"
+    payload = (
+        b"\x80\x04"
+        + _global_operand("string", "Template.substitute")
+        + _args_tuple(receiver, _global_operand("builtins", "help"))
+        + b"R."
+    )
+    marker = tmp_path / "retagged_method_marker"
+    child_code = """
+import _sitebuiltins
+import pickle
+import string
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+retag_name = sys.argv[3] == "True"
+string.Template("warm").substitute({})
+original_code = string.Template.substitute.__code__
+replacement = string.Template.safe_substitute.__code__.replace(co_qualname="Template.substitute")
+if retag_name:
+    replacement = replacement.replace(co_name="substitute")
+string.Template.substitute.__code__ = replacement
+def subscription_hook(self, key):
+    marker.write_text(key)
+    return "mapped"
+_sitebuiltins._Helper.__getitem__ = subscription_hook
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+report = scan_bytes(payload)
+assert not marker.exists(), "scanning executed the transplanted method"
+assert pickle.loads(payload) == "$!mapped"
+assert marker.read_text() == "x"
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any(error.category == "call_graph_analysis_error" for error in report.errors), report
+# The original method still rejects the invalid placeholder before any lookup.
+marker.unlink()
+string.Template.substitute.__code__ = original_code
+try:
+    pickle.loads(payload)
+except ValueError:
+    pass
+else:
+    raise AssertionError("canonical substitute did not reject the invalid placeholder")
+assert not marker.exists()
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), str(retag_name)])
