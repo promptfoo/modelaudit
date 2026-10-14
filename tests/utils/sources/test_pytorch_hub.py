@@ -1,6 +1,7 @@
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote
 
@@ -22,6 +23,38 @@ from modelaudit.utils.sources.pytorch_hub import (
     is_cleartext_pytorch_hub_url,
     is_pytorch_hub_url,
 )
+
+
+def _mock_hub_requests() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    head = patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+    get = patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+    return lambda test: head(get(test))
+
+
+def _mock_hub_download() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    check = patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+    requests = _mock_hub_requests()
+    return lambda test: check(requests(test))
+
+
+def _mock_hub_extension_download() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    extensions = patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+    download = _mock_hub_download()
+    return lambda test: extensions(download(test))
+
+
+def _html_response(html: str) -> MagicMock:
+    response = MagicMock(text=html)
+    response.raise_for_status = lambda: None
+    return response
+
+
+def _streaming_response(chunks: Iterable[bytes], **attributes: Any) -> MagicMock:
+    response = MagicMock(**attributes)
+    response.__enter__.return_value = response
+    response.iter_content.return_value = chunks
+    response.raise_for_status = lambda: None
+    return response
 
 
 class TestPytorchHubURLDetection:
@@ -68,24 +101,17 @@ def test_cleartext_pytorch_hub_detection_rejects_hostname_near_matches(url: str)
     assert not is_cleartext_pytorch_hub_url(url)
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_success(
     mock_get: MagicMock,
     mock_head: MagicMock,
     mock_check: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
+    file_resp = _streaming_response([b"abc"])
     file_resp.status_code = 200
     file_resp.headers = {"content-length": "3"}
-    file_resp.iter_content.return_value = [b"abc"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -181,10 +207,7 @@ def test_extract_weight_urls_rejects_normalized_paths_outside_models(mock_extens
     assert _extract_weight_urls(html) == ["https://download.pytorch.org/models/model.onnx"]
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_downloads_supported_non_pt_links(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -193,13 +216,8 @@ def test_download_pytorch_hub_model_downloads_supported_non_pt_links(
     tmp_path: Path,
 ) -> None:
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.onnx">onnx</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
-    file_resp.iter_content.return_value = [b"abc"]
-    file_resp.raise_for_status = lambda: None
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.onnx">onnx</a>')
+    file_resp = _streaming_response([b"abc"])
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -217,10 +235,7 @@ def test_download_pytorch_hub_model_downloads_supported_non_pt_links(
     assert (tmp_path / "resnet50.onnx").read_bytes() == b"abc"
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_rejects_html_artifact_response(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -230,13 +245,12 @@ def test_download_pytorch_hub_model_rejects_html_artifact_response(
 ) -> None:
     weight_url = "https://download.pytorch.org/models/model.onnx"
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">onnx</a>'
-    html_resp.raise_for_status = lambda: None
-    artifact_resp = MagicMock(status_code=200, headers={"content-type": "text/html; charset=utf-8"})
-    artifact_resp.__enter__.return_value = artifact_resp
-    artifact_resp.iter_content.return_value = [b"<!doctype html><title>Not found</title>"]
-    artifact_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">onnx</a>')
+    artifact_resp = _streaming_response(
+        [b"<!doctype html><title>Not found</title>"],
+        status_code=200,
+        headers={"content-type": "text/html; charset=utf-8"},
+    )
     mock_get.side_effect = [html_resp, artifact_resp]
 
     head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": "44"})
@@ -252,9 +266,7 @@ def test_download_pytorch_hub_model_rejects_html_artifact_response(
     assert not (tmp_path / "model.onnx").exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_rejects_unrecognized_ambiguous_text_artifact(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -263,13 +275,8 @@ def test_download_pytorch_hub_model_rejects_unrecognized_ambiguous_text_artifact
 ) -> None:
     weight_url = "https://download.pytorch.org/models/README.txt"
     payload = b"Documentation, not a LightGBM model."
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">docs</a>'
-    html_resp.raise_for_status = lambda: None
-    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
-    artifact_resp.__enter__.return_value = artifact_resp
-    artifact_resp.iter_content.return_value = [payload]
-    artifact_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">docs</a>')
+    artifact_resp = _streaming_response([payload], status_code=200, headers={"content-length": str(len(payload))})
     mock_get.side_effect = [html_resp, artifact_resp]
 
     head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
@@ -285,10 +292,7 @@ def test_download_pytorch_hub_model_rejects_unrecognized_ambiguous_text_artifact
     assert not (tmp_path / "README.txt").exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_accepts_canonical_mxnet_symbol_json(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -299,12 +303,8 @@ def test_download_pytorch_hub_model_accepts_canonical_mxnet_symbol_json(
     mock_extensions.return_value = {".json"}
     weight_url = "https://download.pytorch.org/models/model-symbol.json"
     payload = b'{"nodes": [], "arg_nodes": [], "heads": []}'
-    html_resp = MagicMock(text=f'<a href="{weight_url}">MXNet</a>')
-    html_resp.raise_for_status = lambda: None
-    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
-    artifact_resp.__enter__.return_value = artifact_resp
-    artifact_resp.iter_content.return_value = [payload]
-    artifact_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">MXNet</a>')
+    artifact_resp = _streaming_response([payload], status_code=200, headers={"content-length": str(len(payload))})
     mock_get.side_effect = [html_resp, artifact_resp]
 
     mock_head.return_value = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
@@ -319,10 +319,7 @@ def test_download_pytorch_hub_model_accepts_canonical_mxnet_symbol_json(
     assert (tmp_path / "model-symbol.json").read_bytes() == payload
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_rejects_generic_unrecognized_json(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -333,12 +330,8 @@ def test_download_pytorch_hub_model_rejects_generic_unrecognized_json(
     mock_extensions.return_value = {".json"}
     weight_url = "https://download.pytorch.org/models/metadata.json"
     payload = b'{"description": "not a model"}'
-    html_resp = MagicMock(text=f'<a href="{weight_url}">metadata</a>')
-    html_resp.raise_for_status = lambda: None
-    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
-    artifact_resp.__enter__.return_value = artifact_resp
-    artifact_resp.iter_content.return_value = [payload]
-    artifact_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">metadata</a>')
+    artifact_resp = _streaming_response([payload], status_code=200, headers={"content-length": str(len(payload))})
     mock_get.side_effect = [html_resp, artifact_resp]
 
     mock_head.return_value = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
@@ -353,9 +346,7 @@ def test_download_pytorch_hub_model_rejects_generic_unrecognized_json(
     assert not (tmp_path / "metadata.json").exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_accepts_recognized_lightgbm_text_artifact(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -369,13 +360,8 @@ def test_download_pytorch_hub_model_accepts_recognized_lightgbm_text_artifact(
         b"Tree=0\nnum_leaves=2\nsplit_feature=0\nsplit_gain=1.0\nthreshold=0.5\n"
         b"decision_type=<=\nleft_child=-1\nright_child=-2\nleaf_value=0.1 0.2\n"
     )
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">LightGBM</a>'
-    html_resp.raise_for_status = lambda: None
-    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
-    artifact_resp.__enter__.return_value = artifact_resp
-    artifact_resp.iter_content.return_value = [payload]
-    artifact_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">LightGBM</a>')
+    artifact_resp = _streaming_response([payload], status_code=200, headers={"content-length": str(len(payload))})
     mock_get.side_effect = [html_resp, artifact_resp]
 
     head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
@@ -391,9 +377,7 @@ def test_download_pytorch_hub_model_accepts_recognized_lightgbm_text_artifact(
     assert (tmp_path / "model.txt").read_bytes() == payload
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_downloaded_hub_pickle_is_scanned_for_malicious_calls(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -404,13 +388,8 @@ def test_downloaded_hub_pickle_is_scanned_for_malicious_calls(
 
     weight_url = "https://download.pytorch.org/models/malicious.pkl"
     payload = b"cos\nsystem\n(S'echo modelaudit'\ntR."
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">pickle</a>'
-    html_resp.raise_for_status = lambda: None
-    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
-    artifact_resp.__enter__.return_value = artifact_resp
-    artifact_resp.iter_content.return_value = [payload]
-    artifact_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">pickle</a>')
+    artifact_resp = _streaming_response([payload], status_code=200, headers={"content-length": str(len(payload))})
     mock_get.side_effect = [html_resp, artifact_resp]
 
     head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
@@ -427,10 +406,7 @@ def test_downloaded_hub_pickle_is_scanned_for_malicious_calls(
     assert any("os.system" in issue.message for issue in result.issues)
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_strips_query_from_local_filename(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -440,13 +416,8 @@ def test_download_pytorch_hub_model_strips_query_from_local_filename(
 ) -> None:
     weight_url = "https://download.pytorch.org/models/resnet50.onnx?download=1"
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">onnx</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
-    file_resp.iter_content.return_value = [b"abc"]
-    file_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">onnx</a>')
+    file_resp = _streaming_response([b"abc"])
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -466,8 +437,7 @@ def test_download_pytorch_hub_model_strips_query_from_local_filename(
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_retains_signed_query_in_errors(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -476,9 +446,7 @@ def test_download_pytorch_hub_model_retains_signed_query_in_errors(
 ) -> None:
     weight_url = "https://download.pytorch.org/models/resnet50.onnx?token=top-secret"
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">onnx</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">onnx</a>')
     file_resp = MagicMock()
     file_resp.__enter__.return_value = file_resp
     file_resp.status_code = 403
@@ -497,10 +465,7 @@ def test_download_pytorch_hub_model_retains_signed_query_in_errors(
     assert not (tmp_path / "resnet50.onnx").exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_rejects_external_artifact_redirect(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -510,9 +475,7 @@ def test_download_pytorch_hub_model_rejects_external_artifact_redirect(
 ) -> None:
     weight_url = "https://download.pytorch.org/models/resnet50.onnx"
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">onnx</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">onnx</a>')
     redirect_resp = MagicMock()
     redirect_resp.__enter__.return_value = redirect_resp
     redirect_resp.status_code = 302
@@ -540,10 +503,7 @@ def test_download_pytorch_hub_model_rejects_external_artifact_redirect(
     assert not (tmp_path / "resnet50.onnx").exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_follows_trusted_artifact_redirect(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -554,18 +514,13 @@ def test_download_pytorch_hub_model_follows_trusted_artifact_redirect(
     weight_url = "https://download.pytorch.org/models/resnet50.onnx"
     redirected_url = "https://download.pytorch.org/models/releases/resnet50.onnx"
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">onnx</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">onnx</a>')
     redirect_resp = MagicMock()
     redirect_resp.__enter__.return_value = redirect_resp
     redirect_resp.status_code = 302
     redirect_resp.headers = {"location": "/models/releases/resnet50.onnx"}
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    file_resp = _streaming_response([b"model"])
     file_resp.status_code = 200
-    file_resp.iter_content.return_value = [b"model"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, redirect_resp, file_resp]
 
     head_resp = MagicMock()
@@ -584,10 +539,7 @@ def test_download_pytorch_hub_model_follows_trusted_artifact_redirect(
     mock_get.assert_any_call(redirected_url, stream=True, timeout=30, allow_redirects=False)
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_rejects_format_changing_redirect(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -598,9 +550,7 @@ def test_download_pytorch_hub_model_rejects_format_changing_redirect(
     weight_url = "https://download.pytorch.org/models/model.onnx"
     redirected_url = "https://download.pytorch.org/models/model.pkl"
     mock_extensions.return_value = {".onnx", ".pkl"}
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">onnx</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">onnx</a>')
     redirect_resp = MagicMock()
     redirect_resp.__enter__.return_value = redirect_resp
     redirect_resp.status_code = 302
@@ -668,10 +618,7 @@ def test_open_trusted_artifact_response_allows_equivalent_pytorch_suffix_redirec
     )
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_preserves_nested_artifacts_with_same_basename(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -680,25 +627,14 @@ def test_download_pytorch_hub_model_preserves_nested_artifacts_with_same_basenam
     tmp_path: Path,
 ) -> None:
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = (
+    html_resp = _html_response(
         '<a href="https://download.pytorch.org/models/foo/model.onnx">foo</a>'
         '<a href="https://download.pytorch.org/models/bar/model.onnx">bar</a>'
         '<a href="https://download.pytorch.org/models/backups/model.onnx">backup</a>'
     )
-    html_resp.raise_for_status = lambda: None
-    foo_resp = MagicMock()
-    foo_resp.__enter__.return_value = foo_resp
-    foo_resp.iter_content.return_value = [b"foo"]
-    foo_resp.raise_for_status = lambda: None
-    bar_resp = MagicMock()
-    bar_resp.__enter__.return_value = bar_resp
-    bar_resp.iter_content.return_value = [b"bar"]
-    bar_resp.raise_for_status = lambda: None
-    backup_resp = MagicMock()
-    backup_resp.__enter__.return_value = backup_resp
-    backup_resp.iter_content.return_value = [b"backup"]
-    backup_resp.raise_for_status = lambda: None
+    foo_resp = _streaming_response([b"foo"])
+    bar_resp = _streaming_response([b"bar"])
+    backup_resp = _streaming_response([b"backup"])
     mock_get.side_effect = [html_resp, foo_resp, bar_resp, backup_resp]
 
     head_resp = MagicMock()
@@ -721,10 +657,7 @@ def test_download_pytorch_hub_model_preserves_nested_artifacts_with_same_basenam
     assert (tmp_path / "backups" / "model.onnx").read_bytes() == b"backup"
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_uniquifies_query_variant_artifact_paths(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -733,20 +666,12 @@ def test_download_pytorch_hub_model_uniquifies_query_variant_artifact_paths(
     tmp_path: Path,
 ) -> None:
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = (
+    html_resp = _html_response(
         '<a href="https://download.pytorch.org/models/model.onnx?variant=one">one</a>'
         '<a href="https://download.pytorch.org/models/model.onnx?variant=two">two</a>'
     )
-    html_resp.raise_for_status = lambda: None
-    one_resp = MagicMock()
-    one_resp.__enter__.return_value = one_resp
-    one_resp.iter_content.return_value = [b"one"]
-    one_resp.raise_for_status = lambda: None
-    two_resp = MagicMock()
-    two_resp.__enter__.return_value = two_resp
-    two_resp.iter_content.return_value = [b"two"]
-    two_resp.raise_for_status = lambda: None
+    one_resp = _streaming_response([b"one"])
+    two_resp = _streaming_response([b"two"])
     mock_get.side_effect = [html_resp, one_resp, two_resp]
 
     head_resp = MagicMock()
@@ -764,10 +689,7 @@ def test_download_pytorch_hub_model_uniquifies_query_variant_artifact_paths(
     assert (tmp_path / "__modelaudit_duplicate_2" / "model.onnx").read_bytes() == b"two"
 
 
-@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_extension_download()
 def test_download_pytorch_hub_model_rejects_symlinked_cache_parent(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -776,9 +698,7 @@ def test_download_pytorch_hub_model_rejects_symlinked_cache_parent(
     tmp_path: Path,
 ) -> None:
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/nested/model.onnx">onnx</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/nested/model.onnx">onnx</a>')
     mock_get.return_value = html_resp
 
     head_resp = MagicMock()
@@ -806,18 +726,14 @@ def test_download_pytorch_hub_model_rejects_symlinked_cache_parent(
     mock_get.assert_called_once_with("https://pytorch.org/hub/pytorch_vision_resnet/", timeout=10)
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_rejects_known_total_over_max_size(
     mock_get: MagicMock,
     mock_head: MagicMock,
     mock_check: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
     mock_get.return_value = html_resp
 
     head_resp = MagicMock()
@@ -839,9 +755,7 @@ def test_download_pytorch_hub_model_rejects_known_total_over_max_size(
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_cleans_temp_dir_after_preflight_size_rejection(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -849,9 +763,7 @@ def test_download_pytorch_hub_model_cleans_temp_dir_after_preflight_size_rejecti
     mock_mkdtemp: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
     mock_get.return_value = html_resp
 
     head_resp = MagicMock()
@@ -873,21 +785,15 @@ def test_download_pytorch_hub_model_cleans_temp_dir_after_preflight_size_rejecti
     assert not temp_dir.exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
     mock_get: MagicMock,
     mock_head: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
+    file_resp = _streaming_response([b"abc", b"def"])
     file_resp.headers = {"content-length": "3"}
-    file_resp.iter_content.return_value = [b"abc", b"def"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -906,8 +812,7 @@ def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
     assert not (tmp_path / "resnet50.pth").exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_rolls_back_cache_on_cumulative_size_rejection(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -915,20 +820,12 @@ def test_download_pytorch_hub_model_rolls_back_cache_on_cumulative_size_rejectio
 ) -> None:
     first_url = "https://download.pytorch.org/models/first.pth"
     second_url = "https://download.pytorch.org/models/second.pth"
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{first_url}">first</a><a href="{second_url}">second</a>')
 
-    first_resp = MagicMock()
-    first_resp.__enter__.return_value = first_resp
+    first_resp = _streaming_response([b"new"])
     first_resp.headers = {"content-length": "3"}
-    first_resp.iter_content.return_value = [b"new"]
-    first_resp.raise_for_status = lambda: None
-    second_resp = MagicMock()
-    second_resp.__enter__.return_value = second_resp
+    second_resp = _streaming_response([b"two"])
     second_resp.headers = {"content-length": "3"}
-    second_resp.iter_content.return_value = [b"two"]
-    second_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, first_resp, second_resp]
 
     head_resp = MagicMock()
@@ -953,8 +850,7 @@ def test_download_pytorch_hub_model_rolls_back_cache_on_cumulative_size_rejectio
     assert not list(tmp_path.glob(".modelaudit_pth_stage_*"))
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 @pytest.mark.parametrize(
     "commit_error",
     [OSError("simulated second-file commit failure"), KeyboardInterrupt("simulated commit interruption")],
@@ -968,17 +864,12 @@ def test_download_pytorch_hub_model_rolls_back_cache_on_commit_failure(
 ) -> None:
     first_url = "https://download.pytorch.org/models/nested/first.pth"
     second_url = "https://download.pytorch.org/models/nested/second.pth"
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{first_url}">first</a><a href="{second_url}">second</a>')
 
     file_responses = []
     for payload in (b"new-first", b"new-second"):
-        file_resp = MagicMock()
-        file_resp.__enter__.return_value = file_resp
+        file_resp = _streaming_response([payload])
         file_resp.headers = {}
-        file_resp.iter_content.return_value = [payload]
-        file_resp.raise_for_status = lambda: None
         file_responses.append(file_resp)
     mock_get.side_effect = [html_resp, *file_responses]
 
@@ -1083,9 +974,7 @@ def test_open_directory_fd_closes_on_exception(monkeypatch: pytest.MonkeyPatch) 
     assert closed == [123]
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_replaces_cache_hardlink_atomically(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -1093,13 +982,8 @@ def test_download_pytorch_hub_model_replaces_cache_hardlink_atomically(
     tmp_path: Path,
 ) -> None:
     weight_url = "https://download.pytorch.org/models/model.pth"
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">weight</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock(status_code=200, headers={"content-length": "3"})
-    file_resp.__enter__.return_value = file_resp
-    file_resp.iter_content.return_value = [b"new"]
-    file_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">weight</a>')
+    file_resp = _streaming_response([b"new"], status_code=200, headers={"content-length": "3"})
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": "3"})
@@ -1123,9 +1007,7 @@ def test_download_pytorch_hub_model_replaces_cache_hardlink_atomically(
     assert outside_file.read_bytes() == b"old"
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_pins_symlinked_cache_root(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -1133,13 +1015,8 @@ def test_download_pytorch_hub_model_pins_symlinked_cache_root(
     tmp_path: Path,
 ) -> None:
     weight_url = "https://download.pytorch.org/models/model.pth"
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">weight</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock(status_code=200, headers={"content-length": "3"})
-    file_resp.__enter__.return_value = file_resp
-    file_resp.iter_content.return_value = [b"new"]
-    file_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">weight</a>')
+    file_resp = _streaming_response([b"new"], status_code=200, headers={"content-length": "3"})
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": "3"})
@@ -1174,9 +1051,7 @@ def test_download_pytorch_hub_model_pins_symlinked_cache_root(
     assert not (outside_cache / "model.pth").exists()
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_allows_exact_cumulative_limit(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -1187,17 +1062,12 @@ def test_download_pytorch_hub_model_allows_exact_cumulative_limit(
         "https://download.pytorch.org/models/first.pth",
         "https://download.pytorch.org/models/second.pth",
     ]
-    html_resp = MagicMock()
-    html_resp.text = "".join(f'<a href="{url}">weight</a>' for url in urls)
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response("".join(f'<a href="{url}">weight</a>' for url in urls))
 
     file_responses = []
     for payload in (b"one", b"two"):
-        file_resp = MagicMock()
-        file_resp.__enter__.return_value = file_resp
+        file_resp = _streaming_response([payload])
         file_resp.headers = {"content-length": "3"}
-        file_resp.iter_content.return_value = [payload]
-        file_resp.raise_for_status = lambda: None
         file_responses.append(file_resp)
     mock_get.side_effect = [html_resp, *file_responses]
 
@@ -1221,18 +1091,14 @@ def test_download_pytorch_hub_model_allows_exact_cumulative_limit(
     assert head_resp.close.call_count == 2
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_handles_huge_advertised_size(
     mock_get: MagicMock,
     mock_head: MagicMock,
     mock_check: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
     mock_get.return_value = html_resp
 
     head_resp = MagicMock()
@@ -1251,21 +1117,15 @@ def test_download_pytorch_hub_model_handles_huge_advertised_size(
     mock_get.assert_called_once_with("https://pytorch.org/hub/pytorch_vision_resnet/", timeout=10)
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_preserves_existing_cache_file_after_size_rejection(
     mock_get: MagicMock,
     mock_head: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
+    file_resp = _streaming_response([b"abc", b"def"])
     file_resp.headers = {}
-    file_resp.iter_content.return_value = [b"abc", b"def"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -1288,23 +1148,16 @@ def test_download_pytorch_hub_model_preserves_existing_cache_file_after_size_rej
     assert not list(tmp_path.glob(".*.part"))
 
 
-@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_download()
 def test_download_pytorch_hub_model_does_not_follow_existing_cache_symlink(
     mock_get: MagicMock,
     mock_head: MagicMock,
     mock_check: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
+    file_resp = _streaming_response([b"abc"])
     file_resp.headers = {"content-length": "3"}
-    file_resp.iter_content.return_value = [b"abc"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -1333,22 +1186,16 @@ def test_download_pytorch_hub_model_does_not_follow_existing_cache_symlink(
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_streaming_enforces_max_size_and_cleans_temp_dir(
     mock_get: MagicMock,
     mock_head: MagicMock,
     mock_mkdtemp: MagicMock,
     tmp_path: Path,
 ) -> None:
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
+    file_resp = _streaming_response([b"abc", b"def"])
     file_resp.headers = {"content-length": "3"}
-    file_resp.iter_content.return_value = [b"abc", b"def"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -1379,17 +1226,14 @@ def test_extract_weight_urls_deduplicates_repeated_links() -> None:
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_streaming_rejects_known_total_before_temp_dir(
     mock_get: MagicMock,
     mock_head: MagicMock,
     mock_mkdtemp: MagicMock,
 ) -> None:
     weight_url = "https://download.pytorch.org/models/resnet50.pth"
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">link</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{weight_url}">link</a>')
     mock_get.return_value = html_resp
 
     head_resp = MagicMock()
@@ -1412,8 +1256,7 @@ def test_download_pytorch_hub_model_streaming_rejects_known_total_before_temp_di
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_streaming_enforces_cumulative_actual_size(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -1425,17 +1268,12 @@ def test_download_pytorch_hub_model_streaming_enforces_cumulative_actual_size(
     mock_mkdtemp.return_value = str(stream_dir)
     first_url = "https://download.pytorch.org/models/first.pth"
     second_url = "https://download.pytorch.org/models/second.pth"
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
-    html_resp.raise_for_status = lambda: None
+    html_resp = _html_response(f'<a href="{first_url}">first</a><a href="{second_url}">second</a>')
 
     file_responses = []
     for payload in (b"abc", b"def"):
-        file_resp = MagicMock()
-        file_resp.__enter__.return_value = file_resp
+        file_resp = _streaming_response([payload])
         file_resp.headers = {"content-length": "1"}
-        file_resp.iter_content.return_value = [payload]
-        file_resp.raise_for_status = lambda: None
         file_responses.append(file_resp)
     mock_get.side_effect = [html_resp, *file_responses]
 
@@ -1460,8 +1298,7 @@ def test_download_pytorch_hub_model_streaming_enforces_cumulative_actual_size(
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_streaming_allows_exact_size_limit(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -1471,14 +1308,9 @@ def test_download_pytorch_hub_model_streaming_allows_exact_size_limit(
     stream_dir = tmp_path / "stream"
     stream_dir.mkdir()
     mock_mkdtemp.return_value = str(stream_dir)
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/resnet50.pth">link</a>')
+    file_resp = _streaming_response([b"abc", b"def"])
     file_resp.headers = {"content-length": "6"}
-    file_resp.iter_content.return_value = [b"abc", b"def"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -1500,8 +1332,7 @@ def test_download_pytorch_hub_model_streaming_allows_exact_size_limit(
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
-@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@_mock_hub_requests()
 def test_download_pytorch_hub_model_streaming_deduplicates_links_before_budget_check(
     mock_get: MagicMock,
     mock_head: MagicMock,
@@ -1512,14 +1343,9 @@ def test_download_pytorch_hub_model_streaming_deduplicates_links_before_budget_c
     stream_dir.mkdir()
     mock_mkdtemp.return_value = str(stream_dir)
     weight_url = "https://download.pytorch.org/models/resnet50.pth"
-    html_resp = MagicMock()
-    html_resp.text = f'<a href="{weight_url}">first</a><a href="{weight_url}">second</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    html_resp = _html_response(f'<a href="{weight_url}">first</a><a href="{weight_url}">second</a>')
+    file_resp = _streaming_response([b"abc"])
     file_resp.headers = {"content-length": "3"}
-    file_resp.iter_content.return_value = [b"abc"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
@@ -1554,17 +1380,12 @@ def test_download_pytorch_hub_model_streaming_resolves_view_on_github_source(
     mock_mkdtemp.return_value = str(stream_dir)
     source_url = "https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py"
     weight_url = "https://download.pytorch.org/models/resnet18-f37072fd.pth"
-    page_resp = MagicMock()
-    page_resp.text = f'<a href="{source_url}">View on GitHub</a>'
-    page_resp.raise_for_status = lambda: None
+    page_resp = _html_response(f'<a href="{source_url}">View on GitHub</a>')
     source_resp = MagicMock()
     source_resp.iter_content.return_value = [f'url = "{weight_url}"'.encode()]
     source_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
+    file_resp = _streaming_response([b"weights"])
     file_resp.headers = {}
-    file_resp.iter_content.return_value = [b"weights"]
-    file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [page_resp, source_resp, file_resp]
 
     yielded = [
@@ -1596,9 +1417,7 @@ def test_download_pytorch_hub_model_streaming_enforces_acquisition_timeout(
     mock_mkdtemp.return_value = str(stream_dir)
     now = [0.0]
     weight_url = "https://download.pytorch.org/models/resnet50.pth"
-    page_resp = MagicMock()
-    page_resp.text = f'<a href="{weight_url}">link</a>'
-    page_resp.raise_for_status = lambda: None
+    page_resp = _html_response(f'<a href="{weight_url}">link</a>')
     file_resp = MagicMock()
     file_resp.__enter__.return_value = file_resp
     file_resp.headers = {}
@@ -1817,13 +1636,8 @@ def test_download_pytorch_hub_model_streaming_preserves_nested_non_pt_artifact(
     mock_extensions: MagicMock,
 ) -> None:
     mock_extensions.return_value = {".onnx"}
-    html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/nested/model.onnx">onnx</a>'
-    html_resp.raise_for_status = lambda: None
-    file_resp = MagicMock()
-    file_resp.__enter__.return_value = file_resp
-    file_resp.iter_content.return_value = [b"model"]
-    file_resp.raise_for_status = lambda: None
+    html_resp = _html_response('<a href="https://download.pytorch.org/models/nested/model.onnx">onnx</a>')
+    file_resp = _streaming_response([b"model"])
     mock_get.side_effect = [html_resp, file_resp]
 
     downloads = download_pytorch_hub_model_streaming(

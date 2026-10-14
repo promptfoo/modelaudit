@@ -13,6 +13,7 @@ from collections.abc import Callable
 from functools import partial
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +29,7 @@ from modelaudit.utils.file.detection import (
     _XML_MODEL_SIGNATURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    PROTO0_1_MAX_PROBE_BYTES,
     TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
 )
 from modelaudit.utils.helpers.retry import RetryError
@@ -57,6 +59,12 @@ from modelaudit.utils.sources.cloud_storage import (
 from tests.helpers import create_mock_coreml
 
 
+def _cloud_download_patches() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    analyze = patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    filesystem = patch("fsspec.filesystem")
+    return lambda test: analyze(filesystem(test))
+
+
 async def mock_analyze(_url: str) -> dict[str, object]:
     return {
         "type": "file",
@@ -64,6 +72,17 @@ async def mock_analyze(_url: str) -> dict[str, object]:
         "name": "model.pt",
         "human_size": "1.0 KB",
         "estimated_time": "1 second",
+    }
+
+
+def _single_file_directory_metadata(path: str, name: str, size: int, human_size: str) -> dict[str, object]:
+    return {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": size,
+        "human_size": human_size,
+        "estimated_time": "instant",
+        "files": [{"path": path, "name": name, "size": size, "human_size": human_size}],
     }
 
 
@@ -487,8 +506,7 @@ class TestCloudURLDetection:
         mock_filesystem.assert_called_once_with(expected_protocol, **expected_args)
         fs.info.assert_called_once_with(expected_path)
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_from_https_provider_uses_normalized_fsspec_path(
         self,
         mock_filesystem: MagicMock,
@@ -926,6 +944,12 @@ def test_filter_scannable_files_handles_native_query_text_before_extension() -> 
             id="config-only-keras-zip",
         ),
         pytest.param("weights.payload", make_safetensors_payload(), "safetensors", id="safetensors"),
+        pytest.param(
+            "framed-pickle.payload",
+            struct.pack("<Q", 2) + b"{}" + b'cos\nsystem\n(S"echo pwned"\ntR.',
+            "safetensors",
+            id="safetensors-pickle-tail",
+        ),
         pytest.param("cntk.payload", b"\x0a\x07version\x0a\x03uidCompositeFunction", "cntk", id="cntk"),
         pytest.param(
             "lightgbm.payload",
@@ -1561,6 +1585,7 @@ def test_filter_scannable_cloud_files_reuses_complete_budgeted_zip_prefix() -> N
     assert transferred == [len(payload)]
 
 
+@pytest.mark.parametrize("pad_beyond_prefix", [False, True])
 @pytest.mark.parametrize(
     ("model_entry", "expected_format"),
     [
@@ -1571,10 +1596,12 @@ def test_filter_scannable_cloud_files_reuses_complete_budgeted_zip_prefix() -> N
 def test_filter_scannable_cloud_files_reuses_partial_prefix_at_exact_zip_budget(
     model_entry: dict[str, bytes],
     expected_format: str | None,
+    pad_beyond_prefix: bool,
 ) -> None:
     url = "s3://bucket/models/archive.payload"
     payload = make_zip_payload(
         {
+            **({"docs/padding.txt": b"x" * (PROTO0_1_MAX_PROBE_BYTES + 1)} if pad_beyond_prefix else {}),
             **{f"docs/{index}.txt": b"benign text" for index in range(120)},
             **model_entry,
         }
@@ -1584,6 +1611,7 @@ def test_filter_scannable_cloud_files_reuses_partial_prefix_at_exact_zip_budget(
     fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
     files = [{"path": url, "name": "archive.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
 
+    assert (len(payload) > PROTO0_1_MAX_PROBE_BYTES) is pad_beyond_prefix
     expected = [] if expected_format is None else [{**files[0], "content_detected_format": expected_format}]
     assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == expected
     assert transferred[0] <= len(payload)
@@ -1714,6 +1742,7 @@ def test_filter_scannable_cloud_files_skips_benign_zip_content() -> None:
             id="generic-config-zip",
         ),
         pytest.param("framing-only.payload", struct.pack("<Q", 4) + b"\x00" * 8, id="malformed-safetensors"),
+        pytest.param("array-header.payload", struct.pack("<Q", 2) + b"[]", id="safetensors-array-header"),
         pytest.param("cntk-notes.payload", b"\x0a\x07version\x0a\x03uid", id="cntk-near-match"),
         pytest.param(
             "lightgbm-notes.payload",
@@ -1754,8 +1783,7 @@ def test_filter_scannable_cloud_files_skips_benign_content_near_matches(
     assert _filter_scannable_cloud_files(files, fs=fs) == []
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_download_from_cloud_selective_includes_content_routed_tflite(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -1769,21 +1797,7 @@ def test_download_from_cloud_selective_includes_content_routed_tflite(
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(tflite_payload)
     configure_remote_open_payloads(fs, {tflite_url: tflite_payload})
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": len(tflite_payload),
-        "human_size": "24 B",
-        "estimated_time": "instant",
-        "files": [
-            {
-                "path": tflite_url,
-                "name": "evil.payload",
-                "size": len(tflite_payload),
-                "human_size": "24 B",
-            }
-        ],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(tflite_url, "evil.payload", len(tflite_payload), "24 B")
 
     result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
 
@@ -1793,8 +1807,7 @@ def test_download_from_cloud_selective_includes_content_routed_tflite(
     assert fs.get.call_args.args[0] == tflite_url
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_download_from_cloud_selective_skips_benign_unsupported_content(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -1807,21 +1820,9 @@ def test_download_from_cloud_selective_skips_benign_unsupported_content(
     fs.info.return_value = {"type": "directory"}
     configure_remote_open_payloads(fs, {preview_url: preview_payload})
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": len(preview_payload),
-        "human_size": "24 B",
-        "estimated_time": "instant",
-        "files": [
-            {
-                "path": preview_url,
-                "name": "preview.png",
-                "size": len(preview_payload),
-                "human_size": "24 B",
-            }
-        ],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(
+        preview_url, "preview.png", len(preview_payload), "24 B"
+    )
 
     with pytest.raises(ValueError, match="No scannable model files found"):
         download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
@@ -1830,8 +1831,7 @@ def test_download_from_cloud_selective_skips_benign_unsupported_content(
     fs.get.assert_not_called()
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_download_from_cloud_selective_fails_closed_when_skipped_content_cannot_be_inspected(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -1843,14 +1843,7 @@ def test_download_from_cloud_selective_fails_closed_when_skipped_content_cannot_
     fs.info.return_value = {"type": "directory"}
     fs.open.side_effect = PermissionError(f"denied {hidden_url}")
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": 8,
-        "human_size": "8 B",
-        "estimated_time": "instant",
-        "files": [{"path": hidden_url, "name": "evil.payload", "size": 8, "human_size": "8 B"}],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(hidden_url, "evil.payload", 8, "8 B")
 
     with pytest.raises(ValueError) as excinfo:
         download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
@@ -1863,8 +1856,7 @@ def test_download_from_cloud_selective_fails_closed_when_skipped_content_cannot_
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_selective_cloud_download_caps_content_sniffing_at_max_size(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -1878,14 +1870,7 @@ def test_selective_cloud_download_caps_content_sniffing_at_max_size(
     fs = make_fs_mock()
     fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": 1,
-        "human_size": "1 B",
-        "estimated_time": "instant",
-        "files": [{"path": hidden_url, "name": "hidden.payload", "size": 1, "human_size": "1 B"}],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(hidden_url, "hidden.payload", 1, "1 B")
 
     with pytest.raises(ValueError) as excinfo:
         if streaming:
@@ -1909,8 +1894,7 @@ def test_selective_cloud_download_caps_content_sniffing_at_max_size(
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("probe_failure", ["size-proof", "prefix-extension"])
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_selective_cloud_download_preserves_prefix_only_pickle_route_after_optional_probe_failure(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -1923,14 +1907,9 @@ def test_selective_cloud_download_preserves_prefix_only_pickle_route_after_optio
     payload = make_incomplete_pickle_probe_payload(malicious=True)
     fs, transferred = _optional_probe_failure_fs(payload, probe_failure)
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": len(payload),
-        "human_size": f"{len(payload)} B",
-        "estimated_time": "instant",
-        "files": [{"path": file_url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(
+        file_url, "evil.payload", len(payload), f"{len(payload)} B"
+    )
     max_size = _CLOUD_CONTENT_SNIFF_BYTES + len(payload)
 
     if streaming:
@@ -1953,8 +1932,7 @@ def test_selective_cloud_download_preserves_prefix_only_pickle_route_after_optio
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("probe_failure", ["size-proof", "prefix-extension"])
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_selective_cloud_download_fails_closed_for_benign_near_match_after_optional_probe_failure(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -1967,21 +1945,9 @@ def test_selective_cloud_download_fails_closed_for_benign_near_match_after_optio
     payload = make_incomplete_pickle_probe_payload(malicious=False)
     fs, transferred = _optional_probe_failure_fs(payload, probe_failure)
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": len(payload),
-        "human_size": f"{len(payload)} B",
-        "estimated_time": "instant",
-        "files": [
-            {
-                "path": file_url,
-                "name": "preview.payload",
-                "size": len(payload),
-                "human_size": f"{len(payload)} B",
-            }
-        ],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(
+        file_url, "preview.payload", len(payload), f"{len(payload)} B"
+    )
     max_size = _CLOUD_CONTENT_SNIFF_BYTES + len(payload)
 
     with pytest.raises(ValueError, match="unable to inspect skipped object"):
@@ -2000,8 +1966,7 @@ def test_selective_cloud_download_fails_closed_for_benign_near_match_after_optio
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_selective_cloud_download_counts_content_probes_toward_total_budget(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -2015,21 +1980,9 @@ def test_selective_cloud_download_counts_content_probes_toward_total_budget(
     fs.info.return_value = {"type": "file", "size": len(payload)}
     configure_remote_open_payloads(fs, {model_url: payload})
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": len(payload),
-        "human_size": f"{len(payload)} B",
-        "estimated_time": "instant",
-        "files": [
-            {
-                "path": model_url,
-                "name": "model.payload",
-                "size": len(payload),
-                "human_size": f"{len(payload)} B",
-            }
-        ],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(
+        model_url, "model.payload", len(payload), f"{len(payload)} B"
+    )
 
     with pytest.raises(ValueError, match="exceeds maximum allowed size"):
         if streaming:
@@ -2047,8 +2000,7 @@ def test_selective_cloud_download_counts_content_probes_toward_total_budget(
     fs.get.assert_not_called()
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_download_from_cloud_streaming_selective_includes_content_routed_tflite(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -2060,21 +2012,7 @@ def test_download_from_cloud_streaming_selective_includes_content_routed_tflite(
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(tflite_payload)
     configure_remote_open_payloads(fs, {tflite_url: tflite_payload})
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": len(tflite_payload),
-        "human_size": "24 B",
-        "estimated_time": "instant",
-        "files": [
-            {
-                "path": tflite_url,
-                "name": "evil.payload",
-                "size": len(tflite_payload),
-                "human_size": "24 B",
-            }
-        ],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(tflite_url, "evil.payload", len(tflite_payload), "24 B")
 
     streamed = list(download_from_cloud_streaming(url, show_progress=False))
 
@@ -2177,8 +2115,7 @@ def test_download_from_cloud_uses_normalized_https_object_path(mock_fs: MagicMoc
     assert result.read_bytes() == b"data"
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_download_from_cloud_preserves_normalized_directory_hierarchy(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -2198,14 +2135,7 @@ def test_download_from_cloud_preserves_normalized_directory_hierarchy(
     fs.walk.return_value = [(canonical_base, [], [model_url])]
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
     mock_fs_class.return_value = fs
-    mock_analyze.return_value = {
-        "type": "directory",
-        "file_count": 1,
-        "total_size": 4,
-        "human_size": "4 B",
-        "estimated_time": "instant",
-        "files": [{"path": model_url, "name": "model.pkl", "size": 4, "human_size": "4 B"}],
-    }
+    mock_analyze.return_value = _single_file_directory_metadata(model_url, "model.pkl", 4, "4 B")
 
     result = download_from_cloud(
         base_url,
@@ -2224,8 +2154,7 @@ def test_download_from_cloud_preserves_normalized_directory_hierarchy(
     assert (tmp_path / "nested" / "model.pkl").read_bytes() == b"data"
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_download_from_cloud_separates_object_from_same_name_prefix(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -2295,8 +2224,7 @@ def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock,
     assert mock_fs.call_count == 3
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
+@_cloud_download_patches()
 def test_download_from_cloud_isolates_selective_directory_cache_by_scanner_selection(
     mock_fs_class: MagicMock,
     mock_analyze: AsyncMock,
@@ -3528,8 +3456,7 @@ class TestDiskSpaceCheckingForCloud:
 
     @patch("modelaudit.utils.sources.cloud_storage.get_cloud_object_size")
     @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_insufficient_disk_space(
         self,
         mock_fs_class: MagicMock,
@@ -3622,8 +3549,7 @@ class TestDiskSpaceCheckingForCloud:
 class TestCloudPathSecurity:
     """Test path-safety behavior for cloud downloads."""
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_rejects_empty_single_file_basename_before_get(
         self,
         mock_fs_class: MagicMock,
@@ -3648,8 +3574,7 @@ class TestCloudPathSecurity:
         fs.get.assert_not_called()
 
     @pytest.mark.parametrize("url", ["s3://bucket/.", "s3://bucket/.."])
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_encodes_dot_single_file_basename(
         self,
         mock_fs_class: MagicMock,
@@ -3677,8 +3602,7 @@ class TestCloudPathSecurity:
         assert result.read_bytes() == b"data"
 
     @pytest.mark.parametrize("max_size", [None, 4])
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_rejects_symlink_destination_before_write(
         self,
         mock_fs_class: MagicMock,
@@ -3967,8 +3891,7 @@ class TestCloudPathSecurity:
             assert not any(ord(character) < 32 or character in '<>:"/\\|?*' for character in component)
             assert component.split(".", 1)[0].casefold() not in reserved_stems
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_rejects_symlink_destination_swap_before_commit(
         self,
         mock_fs_class: MagicMock,
@@ -4011,8 +3934,7 @@ class TestCloudPathSecurity:
         assert local_path.is_symlink()
         assert not list(download_dir.glob(".modelaudit-*"))
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_rejects_nested_parent_symlink_swap_before_commit(
         self,
         mock_fs_class: MagicMock,
@@ -4039,21 +3961,7 @@ class TestCloudPathSecurity:
 
         fs.get.side_effect = swap_parent
         mock_fs_class.return_value = fs
-        mock_analyze.return_value = {
-            "type": "directory",
-            "file_count": 1,
-            "total_size": 4,
-            "human_size": "4 B",
-            "estimated_time": "instant",
-            "files": [
-                {
-                    "path": f"{url}/subdir/model.pkl",
-                    "name": "model.pkl",
-                    "size": 4,
-                    "human_size": "4 B",
-                }
-            ],
-        }
+        mock_analyze.return_value = _single_file_directory_metadata(f"{url}/subdir/model.pkl", "model.pkl", 4, "4 B")
 
         with pytest.raises(ValueError, match="escaped parent directory"):
             download_from_cloud(
@@ -4068,8 +3976,7 @@ class TestCloudPathSecurity:
         assert not (outside_dir / "model.pkl").exists()
         assert (download_dir / "subdir").is_symlink()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_encodes_dot_components_as_object_key_text(
         self,
         mock_fs_class: MagicMock,
@@ -4081,21 +3988,9 @@ class TestCloudPathSecurity:
         fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
         mock_fs_class.return_value = fs
 
-        mock_analyze.return_value = {
-            "type": "directory",
-            "file_count": 1,
-            "total_size": 1024,
-            "human_size": "1.0 KB",
-            "estimated_time": "instant",
-            "files": [
-                {
-                    "path": "s3://bucket/models/../secrets/evil.pkl",
-                    "name": "evil.pkl",
-                    "size": 1024,
-                    "human_size": "1.0 KB",
-                }
-            ],
-        }
+        mock_analyze.return_value = _single_file_directory_metadata(
+            "s3://bucket/models/../secrets/evil.pkl", "evil.pkl", 1024, "1.0 KB"
+        )
 
         result = download_from_cloud(
             "s3://bucket/models",
@@ -4115,8 +4010,7 @@ class TestCloudPathSecurity:
         assert ".." not in final_paths[0].relative_to(tmp_path).parts
         assert final_paths[0].read_bytes() == b"data"
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_separates_directory_destination_aliases(
         self,
         mock_fs_class: MagicMock,
@@ -4157,8 +4051,7 @@ class TestCloudPathSecurity:
         assert len({path.relative_to(tmp_path) for path in final_paths}) == 2
         assert fs.get.call_count == 2
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_separates_destination_alias_when_refreshing_cache(
         self,
         mock_fs_class: MagicMock,
@@ -4215,8 +4108,7 @@ class TestCloudPathSecurity:
         assert (cached_path / "old-model.pkl").read_bytes() == b"old"
         assert fs.get.call_count == 2
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_separates_prefix_alias_when_refreshing_cache(
         self,
         mock_fs_class: MagicMock,
@@ -4274,8 +4166,7 @@ class TestCloudPathSecurity:
         assert (cached_path / "old-model.pkl").read_bytes() == b"old"
         assert fs.get.call_count == 2
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_refresh_migrates_legacy_cache_with_nested_symlink_without_touching_target(
         self,
         mock_fs_class: MagicMock,
@@ -4338,8 +4229,7 @@ class TestCloudPathSecurity:
         assert (result / "subdir" / "model.pkl").read_bytes() == b"new"
         assert outside_marker.read_text(encoding="utf-8") == "keep"
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_separates_directory_destination_aliases(
         self,
         mock_fs_class: MagicMock,
@@ -4371,8 +4261,7 @@ class TestCloudPathSecurity:
         assert relative_suffixes[0] != relative_suffixes[1]
         assert fs.get.call_count == 2
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_preserves_benign_nested_directory_files(
         self,
         mock_fs_class: MagicMock,
@@ -4416,8 +4305,7 @@ class TestCloudPathSecurity:
         assert all(path.name.startswith(".modelaudit-") for path in download_destinations)
         assert len({path.name for path in download_destinations}) == 2
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_preserves_benign_nested_directory_files(
         self,
         mock_fs_class: MagicMock,
@@ -4458,8 +4346,7 @@ class TestCloudPathSecurity:
         assert len({path.name for path in download_destinations}) == 2
         assert not temp_dir.exists()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_continues_when_size_cannot_be_determined(
         self,
         mock_fs_class: MagicMock,
@@ -4487,8 +4374,7 @@ class TestCloudPathSecurity:
         assert result.name == "model.bin"
         fs.get.assert_called_once()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_with_zero_max_size_remains_uncapped(
         self,
         mock_fs_class: MagicMock,
@@ -4524,8 +4410,7 @@ class TestCloudPathSecurity:
         assert not temporary_path.exists()
         fs.open.assert_not_called()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     @pytest.mark.parametrize("metadata_size", [0, 1])
     def test_download_with_max_size_fails_when_size_cannot_be_determined(
         self,
@@ -4556,8 +4441,7 @@ class TestCloudPathSecurity:
         fs.get.assert_not_called()
 
     @pytest.mark.parametrize("prefix_size", [2048, "unknown"])
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_with_max_size_applies_to_selected_directory_files(
         self,
         mock_fs_class: MagicMock,
@@ -4604,8 +4488,7 @@ class TestCloudPathSecurity:
         fs.open.assert_any_call(model_url, "rb")
         fs.get.assert_not_called()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_with_max_size_rejects_selected_directory_total_over_limit(
         self,
         mock_fs_class: MagicMock,
@@ -4638,8 +4521,7 @@ class TestCloudPathSecurity:
 
         fs.get.assert_not_called()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_with_max_size_rejects_underreported_transfer_without_retry(
         self,
         mock_fs_class: MagicMock,
@@ -4672,8 +4554,7 @@ class TestCloudPathSecurity:
         assert not (tmp_path / "model.bin").exists()
 
     @patch("modelaudit.utils.helpers.retry.time.sleep")
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_with_max_size_counts_failed_attempts_against_budget(
         self,
         mock_fs_class: MagicMock,
@@ -4706,8 +4587,7 @@ class TestCloudPathSecurity:
         mock_sleep.assert_called_once()
         assert not (tmp_path / "model.bin").exists()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_download_with_max_size_rejects_late_object_size_over_limit(
         self,
         mock_fs_class: MagicMock,
@@ -4735,8 +4615,7 @@ class TestCloudPathSecurity:
 
         fs.get.assert_not_called()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_download_encodes_dot_components_as_object_key_text(
         self,
         mock_fs_class: MagicMock,
@@ -4745,21 +4624,9 @@ class TestCloudPathSecurity:
         fs = make_fs_mock()
         mock_fs_class.return_value = fs
 
-        mock_analyze.return_value = {
-            "type": "directory",
-            "file_count": 1,
-            "total_size": 1024,
-            "human_size": "1.0 KB",
-            "estimated_time": "instant",
-            "files": [
-                {
-                    "path": "s3://bucket/models/../secrets/evil.pkl",
-                    "name": "evil.pkl",
-                    "size": 1024,
-                    "human_size": "1.0 KB",
-                }
-            ],
-        }
+        mock_analyze.return_value = _single_file_directory_metadata(
+            "s3://bucket/models/../secrets/evil.pkl", "evil.pkl", 1024, "1.0 KB"
+        )
 
         downloads = list(
             download_from_cloud_streaming(
@@ -4777,8 +4644,7 @@ class TestCloudPathSecurity:
         assert ".." not in final_path.parts
         assert final_path.name == "evil.pkl"
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_download_with_max_size_fails_when_size_cannot_be_determined(
         self,
         mock_fs_class: MagicMock,
@@ -4800,8 +4666,7 @@ class TestCloudPathSecurity:
 
         fs.get.assert_not_called()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_download_with_zero_max_size_remains_uncapped(
         self,
         mock_fs_class: MagicMock,
@@ -4824,8 +4689,7 @@ class TestCloudPathSecurity:
         fs.open.assert_not_called()
 
     @pytest.mark.parametrize("prefix_size", [2048, "unknown"])
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_download_with_max_size_applies_to_selected_directory_files(
         self,
         mock_fs_class: MagicMock,
@@ -4871,8 +4735,7 @@ class TestCloudPathSecurity:
         fs.open.assert_any_call(model_url, "rb")
         fs.get.assert_not_called()
 
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_download_with_max_size_rejects_underreported_transfer_without_retry(
         self,
         mock_fs_class: MagicMock,
@@ -4897,8 +4760,7 @@ class TestCloudPathSecurity:
         fs.get.assert_not_called()
 
     @patch("modelaudit.utils.helpers.retry.time.sleep")
-    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-    @patch("fsspec.filesystem")
+    @_cloud_download_patches()
     def test_streaming_download_with_max_size_counts_failed_attempts_against_budget(
         self,
         mock_fs_class: MagicMock,
