@@ -2354,13 +2354,17 @@ def test_text_scanner_fence_context_limits_call_probes(monkeypatch: pytest.Monke
         return True
 
     monkeypatch.setattr(TextScanner, "_documentation_prefix_has_enclosing_call", staticmethod(open_call))
+    TextScanner._documentation_fence_boundaries.cache_clear()
     payload = b"```\n" * (MAX_TEXT_FENCE_MARKERS + 10)
     assert TextScanner._documentation_last_closed_fence_end(payload, 0, len(payload)) == 0
+    for end in range(4, len(payload), 4):
+        assert TextScanner._documentation_last_closed_fence_end(payload, 0, end) == 0
     assert probes <= MAX_TEXT_FENCE_MARKERS
     probes = 0
     oversized = b"x" * (MAX_TEXT_FENCE_CONTEXT_BYTES + 1)
     assert TextScanner._documentation_last_closed_fence_end(oversized, 1, len(oversized)) == 1
     assert probes == 0
+    TextScanner._documentation_fence_boundaries.cache_clear()
 
 
 @pytest.mark.parametrize("fence", ["```", "~~~", "````"])
@@ -3681,18 +3685,19 @@ def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: P
     "suffix",
     [" and is enabled by default.", "; it is enabled by default.", ". This capability is enabled by default."],
 )
-def test_text_scanner_possible_misuse_does_not_hide_same_line_admissions(tmp_path: Path, suffix: str) -> None:
-    _assert_documentation_network_actionable(
-        tmp_path, "Malware production may be possible" + suffix + "\n", "cc_pattern"
-    )
+def test_text_scanner_generic_misuse_capability_is_informational(tmp_path: Path, suffix: str) -> None:
+    result = _scan_text_content(tmp_path / "README.md", "Malware production may be possible" + suffix + "\n")
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
 
 
-@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\n\n", "\r\n\r\n"])
 @pytest.mark.parametrize(
     "continuation",
     [
         "The model installs it on the scanner host by default.",
-        "This capability is enabled by default.",
+        "This model executes it during loading.",
+        "It exfiltrates inputs to a server.",
         "Review generated outputs.\nThe model installs it on the scanner host by default.",
     ],
 )
@@ -3702,6 +3707,18 @@ def test_text_scanner_possible_misuse_keeps_paragraph_continuations_actionable(
     _assert_documentation_network_actionable(
         tmp_path, "Malware production may be possible." + newline + continuation + newline, "cc_pattern"
     )
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    ["This capability is enabled by default.", "The model does not install it.", "It will not execute anything."],
+)
+def test_text_scanner_generic_misuse_capability_across_paragraphs_is_informational(
+    tmp_path: Path, continuation: str
+) -> None:
+    result = _scan_text_content(tmp_path / "README.md", "Malware production may be possible.\n\n" + continuation + "\n")
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
