@@ -13197,3 +13197,68 @@ def test_click_lazy_file_compatibility_declines_changed_source(
     assert call_graph._call_graph_entrypoints_for_reference(
         "click.utils", "LazyFile", {"opcode": "REDUCE", "positional_arg_count": 0}
     ) == ("click.utils.__getattr__",)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template mapping qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("mapping_kind", ["template-instance", "template-class", "help"])
+@pytest.mark.parametrize("template", ["$x", "$" + "{x}", "plain text", "$$name"])
+def test_template_mapping_subscription_hooks_are_not_silently_covered(
+    tmp_path: Path, method_name: str, mapping_kind: str, template: str
+) -> None:
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand(template)) + b"R"
+    setup = b"\x80\x04" + receiver + b"\x940"
+    mapping = {
+        "template-instance": b"h\x00",
+        "template-class": _global_operand("string", "Template"),
+        "help": _global_operand("builtins", "help"),
+    }[mapping_kind]
+    payload = setup + _global_operand("string", method_name) + _args_tuple(b"h\x00", mapping) + b"R."
+    marker = tmp_path / "subscription_marker"
+    child_code = """
+import _sitebuiltins
+import pickle
+import string
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+mapping_kind = sys.argv[3]
+template = sys.argv[4]
+string.Template("warm").substitute({})
+def subscription_hook(self, key):
+    assert key == "x", key
+    marker.write_text("mapping-called")
+    return "mapped"
+if mapping_kind == "template-instance":
+    string.Template.__getitem__ = subscription_hook
+elif mapping_kind == "template-class":
+    string.Template.__class_getitem__ = classmethod(subscription_hook)
+else:
+    _sitebuiltins._Helper.__getitem__ = subscription_hook
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+report = scan_bytes(payload, source="template-mapping-hook.pkl")
+assert not marker.exists(), "scanning executed a subscription hook"
+if template in {"$x", "$" + "{x}"}:
+    # Prove execution independently before asserting the scanner regression.
+    assert pickle.loads(payload) == "mapped"
+    assert marker.read_text() == "mapping-called"
+    print("subscription oracle executed; scan:", report.status.value, report.verdict.value, flush=True)
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert report.verdict != SafetyVerdict.CLEAN, report
+    assert any(
+        error.category == "call_graph_analysis_error"
+        and "mapping callbacks cannot be proven covered" in error.message
+        for error in report.errors
+    ), report
+else:
+    assert report.status == ScanStatus.COMPLETE, report
+    assert report.verdict == SafetyVerdict.CLEAN, report
+    assert pickle.loads(payload) == template.replace("$$", "$")
+    assert not marker.exists()
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), mapping_kind, template]
+    )
