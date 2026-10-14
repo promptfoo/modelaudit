@@ -31,6 +31,7 @@ PYTHON_EXECUTION_NAMES = frozenset(
     | {prefix + suffix for prefix in ("exec", "spawn") for suffix in ("l", "le", "lp", "lpe", "v", "ve", "vp", "vpe")}
     | {"posix_spawn", "posix_spawnp", "startfile"}
     | {"CDLL", "PyDLL", "WinDLL", "OleDLL", "cdll", "pydll", "windll", "oledll", "LoadLibrary", "dlopen"}
+    | {"Unpickler", "_Unpickler"}
 )
 URL_RISK_TERMS = (
     NetworkCommDetector.INFORMATIONAL_URL_RISK_TERMS
@@ -308,6 +309,26 @@ def _has_unsafe_deserialization_call(nodes: list[ast.AST]) -> bool:
 def _has_execution_reference(nodes: list[ast.AST]) -> bool:
     if _has_unsafe_deserialization_call(nodes):
         return True
+    for node in nodes:
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, (ast.Name, ast.Attribute)):
+                return True
+            name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+            if (
+                name == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                and node.args[1].value in PYTHON_EXECUTION_NAMES
+            ):
+                return True
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+            and node.slice.value in PYTHON_EXECUTION_NAMES
+        ):
+            return True
     literal_targets: set[ast.Name] = set()
     writes: dict[str, list[ast.Name]] = {}
     rebound: set[str] = set()
@@ -439,16 +460,22 @@ def _python_url_spans(source: bytes) -> list[tuple[int, int]]:
 
 
 def _command_executes_script(words: list[str]) -> bool:
-    while words and words[0] in {"$", ">", ">>>"}:
+    while words and words[0] in {"$", ">>>"}:
         words = words[1:]
     if words[:2] in (["command", "-v"], ["command", "-V"]):
         return False
     wrapped = False
-    while words and (
-        words[0] in {"env", "command", "exec", "nohup", "--"} or re.match(r"[A-Za-z_]\w*=", words[0]) is not None
-    ):
-        wrapped = True
-        words = words[1:]
+    while words:
+        redirection = re.match(r"^(?:\d+)?(?:<<<|<<-|<<|<>|>>|>|<)(.*)$", words[0])
+        if redirection is not None:
+            if not redirection[1] and len(words) < 2:
+                return True
+            words = words[1 if redirection[1] else 2 :]
+        elif words[0] in {"env", "command", "exec", "nohup", "--"} or re.match(r"[A-Za-z_]\w*=", words[0]):
+            wrapped = True
+            words = words[1:]
+        else:
+            break
     if not words or _setup_command_urls(words) is not None:
         return False
     command = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -664,22 +691,25 @@ def _prose_executes_script(text: str) -> bool:
         if count >= MAX_FENCES:
             return True
         end = text.find("\n", match.end())
-        command = text[match.end() : end if end >= 0 else len(text)].strip()
-        if len(command) > MAX_EXAMPLE_BYTES:
-            return True
-        call = re.match(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(", command)
-        if call and any(name in PYTHON_EXECUTION_NAMES for name in call.group(1).split(".")):
-            return True
-        try:
-            shlex.split(command)
-        except ValueError:
-            # An apostrophe in ordinary prose is not an execution instruction.
-            first = command.split(maxsplit=1)[0].strip("\"'") if command else ""
-            if _command_executes_script([first]):
+        commands = [text[match.end() : end if end >= 0 else len(text)].strip()]
+        if end >= 0:
+            commands.append(text[end + 1 :].lstrip().partition("\n")[0].strip())
+        for command in commands:
+            if len(command) > MAX_EXAMPLE_BYTES:
                 return True
-        else:
-            if _example_executes_script(command.encode(), b""):
+            call = re.match(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(", command)
+            if call and any(name in PYTHON_EXECUTION_NAMES for name in call.group(1).split(".")):
                 return True
+            try:
+                shlex.split(command)
+            except ValueError:
+                # An apostrophe in ordinary prose is not an execution instruction.
+                first = command.split(maxsplit=1)[0].strip("\"'") if command else ""
+                if _command_executes_script([first]):
+                    return True
+            else:
+                if _example_executes_script(command.encode(), b""):
+                    return True
     return False
 
 
