@@ -64,6 +64,7 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
+    DefaultDictNoFactory,
     DynamicType {
         type_name: Option<String>,
         memo_index: Option<i64>,
@@ -126,6 +127,7 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
             callable.symbol(),
             item_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
         ),
+        Some(StackValue::DefaultDictNoFactory) => "defaultdict(factory=None)".to_string(),
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }

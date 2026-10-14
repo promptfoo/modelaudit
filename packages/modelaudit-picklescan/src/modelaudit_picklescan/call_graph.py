@@ -2124,6 +2124,18 @@ def find_dangerous_call_graphs(
                 and reference.get("template_receiver_state_unmodified") is not True
             ):
                 raise _CallGraphAnalysisLimitError("string.Template receiver state cannot be proven unchanged")
+            if (
+                module == "string"
+                and name in {"Template.substitute", "Template.safe_substitute"}
+                and reference.get("invocation_import_reference")
+                and _template_uses_reviewed_lazy_pattern()
+                and reference.get("template_mapping_callbacks_complete") is not True
+                and analysis_limit_error is None
+            ):
+                # Missing mapping coverage must not hide independent Template sinks.
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template mapping callbacks cannot be proven covered"
+                )
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
@@ -2423,7 +2435,7 @@ def find_unanalyzed_callable_call_graph_references(
         if reason is None and _interpreter_module_origin_without_import_hooks(module) == "frozen":
             state = _current_loaded_interpreter_reference_state(module, name)
             _track_loaded_interpreter_reference_state(module, name, state)
-            if state[0] and type(state[1]) is FunctionType:
+            if not state[0] or type(state[1]) is FunctionType:
                 # Frozen origin authenticates the module, not coverage of its Python body.
                 reason = "source_unavailable"
         if reason is None:
@@ -3422,7 +3434,9 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    seen_invocations: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
+    seen_invocations: set[
+        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None]
+    ] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -3438,6 +3452,7 @@ def _iter_call_graph_references(
             _optional_bool_reference_detail(item.get("build_uses_slot_state")),
             _complete_keyword_arg_names(item),
             _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
+            _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
         )
         if invocation_key in seen_invocations:
             continue
@@ -3501,7 +3516,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
+    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None]] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -3524,6 +3539,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 _optional_bool_reference_detail(item.get("build_uses_slot_state")),
                 _complete_keyword_arg_names(item),
                 _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
+                _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
             )
             if reference_key in seen:
                 continue
@@ -4516,7 +4532,7 @@ def _zipimport_archive_files_match(archive: str, files: object) -> bool:
     return archive_files is not None and files == archive_files
 
 
-def _zipimport_restore_missing_directory_cache(
+def _zipimport_read_missing_directory_files(
     instance_state: dict[str, object],
     archive: str,
     prefix: str,
@@ -4538,8 +4554,9 @@ def _zipimport_restore_missing_directory_cache(
     files = _zipimport_read_bounded_archive_files(archive)
     if files is None:
         return None
-    # Never replace a concurrently populated or poisoned entry.
-    return files if dict.setdefault(directory_cache, archive, files) is files else None
+    # Keep speculative metadata private. Publishing it would leave stale shared
+    # importer state when a subsequent disk or finder check rejects this identity.
+    return files if not dict.__contains__(directory_cache, archive) else None
 
 
 def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | None:
@@ -4561,15 +4578,19 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
     if type(archive) is not str or type(prefix) is not str or not _zipimport_runtime_is_trusted():
         return None
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
-    if dict.__contains__(directory_cache, archive):
-        files = dict.__getitem__(directory_cache, archive)
+    missing_cache = not dict.__contains__(directory_cache, archive)
+    if missing_cache:
+        files = _zipimport_read_missing_directory_files(instance_state, archive, prefix, cache_key)
+        # The private read authenticates the exact modern archive/prefix shape.
+        # Constructing another importer here would populate the shared cache.
+        expected_state = {"archive": archive, "prefix": prefix}
     else:
-        files = _zipimport_restore_missing_directory_cache(instance_state, archive, prefix, cache_key)
+        files = dict.__getitem__(directory_cache, archive)
+        try:
+            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+        except (AttributeError, ImportError, OSError, TypeError):
+            return None
     if not _zipimport_files_are_safe(files):
-        return None
-    try:
-        expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-    except (AttributeError, ImportError, OSError, TypeError):
         return None
     if not (
         type(expected_state) is dict
@@ -4581,7 +4602,12 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
         and dict.get(instance_state, "_files", files) is files
         and dict.get(expected_state, "_files", files) is files
         and _zipimport_archive_files_match(archive, files)
-        and _zipimport_directory_cache_files(archive) is files
+        and (
+            not dict.__contains__(directory_cache, archive)
+            if missing_cache
+            else _zipimport_directory_cache_files(archive) is files
+        )
+        and _zipimport_runtime_is_trusted()
         and object.__getattribute__(finder, "__dict__") is instance_state
         and type(dict.get(instance_state, "archive")) is str
         and dict.get(instance_state, "archive") == archive

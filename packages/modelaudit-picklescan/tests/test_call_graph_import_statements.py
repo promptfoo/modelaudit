@@ -9802,9 +9802,19 @@ assert pickle.loads(payload) == (True if method_name == "Template.is_valid" else
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template pattern became lazy in Python 3.14")
 @pytest.mark.parametrize(
-    "method_name", ["Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"]
+    ("method_name", "unknown_mapping"),
+    [
+        ("Template.substitute", False),
+        ("Template.safe_substitute", False),
+        ("Template.is_valid", False),
+        ("Template.get_identifiers", False),
+        ("Template.substitute", True),
+        ("Template.safe_substitute", True),
+    ],
 )
-def test_scan_bytes_detects_uncached_template_pattern_import(tmp_path: Path, method_name: str) -> None:
+def test_scan_bytes_detects_uncached_template_pattern_import(
+    tmp_path: Path, method_name: str, unknown_mapping: bool
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "re_import_marker"
@@ -9815,13 +9825,21 @@ def test_scan_bytes_detects_uncached_template_pattern_import(tmp_path: Path, met
     payload = _builtins_help_defaultdict_template_payload(
         method_name, "plain text", with_mapping=method_name in {"Template.substitute", "Template.safe_substitute"}
     )
+    if unknown_mapping:
+        receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$x")) + b"R"
+        payload = (
+            b"\x80\x04"
+            + _global_operand("string", method_name)
+            + _args_tuple(receiver, _global_operand("builtins", "help"))
+            + b"R."
+        )
     child_code = """
 import pickle
 import string
 import sys
 from pathlib import Path
 
-from modelaudit_picklescan import SafetyVerdict, scan_bytes
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
 
 module_dir = Path(sys.argv[1])
 marker = Path(sys.argv[2])
@@ -9832,6 +9850,9 @@ assert original_pattern is vars(string)["_TemplatePattern"]
 sys.path.insert(0, str(module_dir))
 report = scan_bytes(payload, source="uncached-template-no-placeholder.pkl")
 assert report.verdict == SafetyVerdict.MALICIOUS, report
+if sys.argv[5] == "True":
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert any("mapping callbacks cannot be proven covered" in error.message for error in report.errors), report
 assert any(
     finding.details.get("call_path") == (
         "string." + method_name,
@@ -9853,7 +9874,16 @@ assert marker.read_text() == "imported"
 """
     _assert_isolated_python(
         tmp_path,
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), method_name],
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            method_name,
+            str(unknown_mapping),
+        ],
     )
     assert marker.read_text() == "imported"
 
@@ -13197,3 +13227,206 @@ def test_click_lazy_file_compatibility_declines_changed_source(
     assert call_graph._call_graph_entrypoints_for_reference(
         "click.utils", "LazyFile", {"opcode": "REDUCE", "positional_arg_count": 0}
     ) == ("click.utils.__getattr__",)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template mapping qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("mapping_kind", ["template-instance", "template-class", "help"])
+@pytest.mark.parametrize("template", ["$x", "$" + "{x}", "plain text", "$$name"])
+def test_template_mapping_subscription_hooks_are_not_silently_covered(
+    tmp_path: Path, method_name: str, mapping_kind: str, template: str
+) -> None:
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand(template)) + b"R"
+    setup = b"\x80\x04" + receiver + b"\x940"
+    mapping = {
+        "template-instance": b"h\x00",
+        "template-class": _global_operand("string", "Template"),
+        "help": _global_operand("builtins", "help"),
+    }[mapping_kind]
+    payload = setup + _global_operand("string", method_name) + _args_tuple(b"h\x00", mapping) + b"R."
+    marker = tmp_path / "subscription_marker"
+    child_code = """
+import _sitebuiltins
+import pickle
+import string
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+mapping_kind = sys.argv[3]
+template = sys.argv[4]
+string.Template("warm").substitute({})
+def subscription_hook(self, key):
+    assert key == "x", key
+    marker.write_text("mapping-called")
+    return "mapped"
+if mapping_kind == "template-instance":
+    string.Template.__getitem__ = subscription_hook
+elif mapping_kind == "template-class":
+    string.Template.__class_getitem__ = classmethod(subscription_hook)
+else:
+    _sitebuiltins._Helper.__getitem__ = subscription_hook
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+report = scan_bytes(payload, source="template-mapping-hook.pkl")
+assert not marker.exists(), "scanning executed a subscription hook"
+if template in {"$x", "$" + "{x}"}:
+    # Prove execution independently before asserting the scanner regression.
+    assert pickle.loads(payload) == "mapped"
+    assert marker.read_text() == "mapping-called"
+    print("subscription oracle executed; scan:", report.status.value, report.verdict.value, flush=True)
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert report.verdict != SafetyVerdict.CLEAN, report
+    assert any(
+        error.category == "call_graph_analysis_error"
+        and "mapping callbacks cannot be proven covered" in error.message
+        for error in report.errors
+    ), report
+else:
+    assert report.status == ScanStatus.COMPLETE, report
+    assert report.verdict == SafetyVerdict.CLEAN, report
+    assert pickle.loads(payload) == template.replace("$$", "$")
+    assert not marker.exists()
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), mapping_kind, template]
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template mapping qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("none_argument", [False, True])
+def test_template_defaultdict_without_factory_remains_covered(
+    tmp_path: Path, method_name: str, none_argument: bool
+) -> None:
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$missing")) + b"R"
+    mapping = _global_operand("collections", "defaultdict") + (_args_tuple(b"N") if none_argument else b")") + b"R"
+    payload = b"\x80\x04" + _global_operand("string", method_name) + _args_tuple(receiver, mapping) + b"R."
+    child_code = """
+import pickle
+import string
+import sys
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+payload = bytes.fromhex(sys.argv[1])
+report = scan_bytes(payload)
+assert report.status == ScanStatus.COMPLETE, report
+assert report.verdict == SafetyVerdict.CLEAN, report
+try:
+    result = pickle.loads(payload)
+except KeyError:
+    assert sys.argv[2] == "Template.substitute"
+else:
+    assert sys.argv[2] == "Template.safe_substitute"
+    assert result == "$missing"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex(), method_name])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template mapping qualification is Python 3.14-specific")
+@pytest.mark.parametrize("proof", [None, False, "true", 1])
+@pytest.mark.parametrize("unproven_first", [False, True])
+def test_template_mapping_incomplete_metadata_survives_normalization(
+    tmp_path: Path, proof: object, unproven_first: bool
+) -> None:
+    child_code = """
+import ast
+import string
+import sys
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import call_graph
+
+proof = ast.literal_eval(sys.argv[1])
+record = {
+    "opcode": "REDUCE", "module": "string", "name": "Template.safe_substitute",
+    "positional_arg_count": 2, "keyword_args_complete": True, "keyword_arg_names": [],
+    "template_receiver_state_unmodified": True,
+    "template_mapping_callbacks_complete": True,
+}
+unproven = dict(record)
+if proof is None:
+    unproven.pop("template_mapping_callbacks_complete")
+else:
+    unproven["template_mapping_callbacks_complete"] = proof
+records = [unproven, record] if sys.argv[2] == "True" else [record, unproven]
+try:
+    call_graph.find_dangerous_call_graphs([], records)
+except call_graph._CallGraphAnalysisLimitError as error:
+    assert "mapping callbacks cannot be proven covered" in str(error), error
+else:
+    raise AssertionError("incomplete mapping metadata was discarded")
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, repr(proof), str(unproven_first)])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template mapping qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize(
+    ("template", "substitute_lookup", "safe_lookup"),
+    [
+        ("$9", False, False),
+        ("$" + "{}", False, False),
+        ("$!$x", False, True),
+        ("$" + "{!$x}", False, True),
+        ("$x$!", True, True),
+        ("$é", False, False),
+        ("$_X2", True, True),
+        ("$" + "{_X2}", True, True),
+    ],
+)
+def test_template_mapping_proof_matches_actual_placeholder_reachability(
+    tmp_path: Path, method_name: str, template: str, substitute_lookup: bool, safe_lookup: bool
+) -> None:
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand(template)) + b"R"
+    payload = (
+        b"\x80\x04"
+        + _global_operand("string", method_name)
+        + _args_tuple(receiver, _global_operand("builtins", "help"))
+        + b"R."
+    )
+    lookup = safe_lookup if method_name == "Template.safe_substitute" else substitute_lookup
+    marker = tmp_path / "lookup_marker"
+    child_code = """
+import _sitebuiltins
+import pickle
+import string
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+expected_lookup = sys.argv[3] == "True"
+method_name = sys.argv[4]
+string.Template("warm").substitute({})
+def subscription_hook(self, key):
+    marker.write_text(key)
+    return "mapped"
+_sitebuiltins._Helper.__getitem__ = subscription_hook
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+report = scan_bytes(payload)
+assert not marker.exists()
+try:
+    pickle.loads(payload)
+except ValueError:
+    assert method_name == "Template.substitute"
+assert marker.exists() == expected_lookup
+invocation = next(
+    item for item in report.metadata["callable_invocations"]
+    if item.get("module") == "string" and item.get("name") == method_name
+)
+assert invocation["template_mapping_callbacks_complete"] is (not expected_lookup), invocation
+if expected_lookup:
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert report.verdict != SafetyVerdict.CLEAN, report
+else:
+    assert report.status == ScanStatus.COMPLETE, report
+    assert report.verdict == SafetyVerdict.CLEAN, report
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), str(lookup), method_name]
+    )

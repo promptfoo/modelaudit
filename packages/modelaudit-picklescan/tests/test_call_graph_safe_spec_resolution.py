@@ -1613,8 +1613,11 @@ def test_zipimporter_identity_survives_normal_cache_invalidation(
     assert before is not None
 
     finder.invalidate_caches()
+    cache_was_missing = root not in directory_cache
 
     assert call_graph._zipimporter_resolution_identity(finder, entry) == before
+    if cache_was_missing:
+        assert root not in directory_cache, "identity validation published speculative metadata"
     assert type(zipimporter.find_spec(finder, "trusted_module")) is ModuleSpec
 
 
@@ -4019,3 +4022,91 @@ def _poison_zipimport_unpack(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
 
     monkeypatch.setitem(zipimport_namespace, "_unpack_uint32", poisoned_unpack)
     return calls
+
+
+@pytest.mark.parametrize("source_available", [False, True])
+@pytest.mark.parametrize("reference_kind", ["unavailable", "python", "native"])
+def test_frozen_invoked_reference_requires_callable_body_coverage(
+    monkeypatch: pytest.MonkeyPatch, source_available: bool, reference_kind: str
+) -> None:
+    def python_callable() -> None:
+        pass
+
+    states: dict[str, tuple[bool, object | None]] = {
+        "unavailable": (False, None),
+        "python": (True, python_callable),
+        "native": (True, len),
+    }
+    monkeypatch.setattr(
+        call_graph,
+        "_call_graph_entrypoints_for_reference",
+        lambda *_args: ("ntpath.abspath",) if source_available else (),
+    )
+    monkeypatch.setattr(call_graph, "_call_graph_source_unavailable_reason", lambda _module: None)
+    monkeypatch.setattr(call_graph, "_interpreter_module_origin_without_import_hooks", lambda _module: "frozen")
+    monkeypatch.setattr(
+        call_graph, "_current_loaded_interpreter_reference_state", lambda *_args: states[reference_kind]
+    )
+    invocation = {"module": "ntpath", "name": "abspath", "opcode": "REDUCE", "positional_arg_count": 1}
+    references = call_graph.find_unanalyzed_callable_call_graph_references([invocation])
+    if source_available or reference_kind == "native":
+        assert references == ()
+    else:
+        assert references == (
+            call_graph.UnanalyzedCallGraphReference(
+                module="ntpath", name="abspath", import_reference="ntpath.abspath", reason="source_unavailable"
+            ),
+        )
+        for payload, verdict in (
+            (b"\x80\x04N.", SafetyVerdict.UNKNOWN),
+            (b"\x80\x04cbuiltins\neval\n\x8c\x011\x85R.", SafetyVerdict.MALICIOUS),
+        ):
+            report = package_api._with_unanalyzed_call_graph_notices(
+                package_api.scan_bytes(payload, enrich_call_graph=False), references
+            )
+            assert report.status == ScanStatus.INCONCLUSIVE
+            assert report.verdict == verdict
+            assert report.metadata["analysis_incomplete"] is True
+            assert report.notices[-1].code == "call_graph_source_unavailable"
+            assert report.notices[-1].details["reason"] == "source_unavailable"
+
+
+@pytest.mark.parametrize("mutation", ["replace-archive", "remove-archive", "finder-state"])
+@pytest.mark.parametrize("competing_cache", ["absent", "poison", "replacement"])
+def test_zipimporter_rejected_private_read_does_not_publish_or_remove_shared_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, competing_cache: str
+) -> None:
+    archive_path = tmp_path / "private-read.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    state.pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    original_reader = call_graph._zipimport_read_bounded_archive_files
+    replacement: object = None if competing_cache == "poison" else {}
+    first_read = True
+
+    def mutate_after_bounded_read(archive: str) -> dict[str, object] | None:
+        nonlocal first_read
+        files = original_reader(archive)
+        if first_read:
+            first_read = False
+            if mutation == "replace-archive":
+                _write_zipimporter_archive(archive_path, "replacement_module", include_module=True)
+            elif mutation == "remove-archive":
+                archive_path.unlink()
+            else:
+                state["prefix"] = "changed/"
+            if competing_cache != "absent":
+                directory_cache[entry] = replacement
+        return files
+
+    monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", mutate_after_bounded_read)
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    if competing_cache == "absent":
+        assert entry not in directory_cache
+    else:
+        assert directory_cache[entry] is replacement
