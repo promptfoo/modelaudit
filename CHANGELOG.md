@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Separate physical ONNX weight-storage checks from logical expanded-view admission, preserving per-view and cumulative limits without repeatedly copying source payloads.
 - Preserve immutable constants captured by effective ONNX function graph bindings during recurrent weight proofs, including defaults, overrides and forwarded graphs.
 - Reuse successful and rejected ONNX vector-control proofs across Expand, axes and Reshape analysis, including recurrent state proofs, so each immutable tensor payload is read once.
 - Bound primary Einsum weight orientation with the shared literal-equation cache before decoding, including resolved Expand and repeated function consumers.

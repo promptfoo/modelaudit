@@ -40624,3 +40624,140 @@ class TestOnnxBoundGraphConstantCaptures:
         )
         if not incomplete:
             assert plan.coverage_gaps == {}
+
+
+class TestOnnxExpandedViewAdmission:
+    @pytest.mark.parametrize("route", ["onnx", "weights"])
+    @pytest.mark.parametrize("mode", ["complete", "total", "per_view", "storage", "typed", "views"])
+    def test_logical_view_checks_do_not_reinspect_physical_payload(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, mode: str
+    ) -> None:
+        import sys
+
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        weight = (
+            helper.make_tensor("W", TensorProto.FLOAT, [64, 1], [1.0] * 64)
+            if mode == "typed"
+            else tensor("W", np.ones((64, 1), np.float32))
+        )
+        tensors = [tensor("prior", prior), weight]
+        nodes = [helper.make_node("MatMul", ["X", "prior"], ["known"])]
+        outputs = [value("known", [1, 64])]
+        for index, width in enumerate((67, 66, 65) if mode == "views" else (66, 65, 64)):
+            tensors.append(tensor(f"shape{index}", np.array([64, width], np.int64)))
+            nodes.append(helper.make_node("Expand", ["W", f"shape{index}"], [f"expanded{index}"]))
+            for duplicate in range(2):
+                name = f"Y{index}_{duplicate}"
+                nodes.append(helper.make_node("MatMul", ["X", f"expanded{index}"], [name]))
+                outputs.append(value(name, [1, width]))
+        model = helper.make_model(
+            helper.make_graph(nodes, "separate_storage_and_view_admission", [value("X", [1, 64])], outputs, tensors),
+            opset_imports=[helper.make_opsetid("", 18)],
+            ir_version=10,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        assert actual[0][0, 0] == 50
+        assert all(np.array_equal(output, np.full_like(output, 64)) for output in actual[1:])
+        if mode == "storage":
+            # Preserve the independent physical-storage guard even when declared
+            # logical dimensions and all expanded views fit the per-array limit.
+            model.graph.initializer[1].raw_data += bytes(20000)
+        path = _save_onnx_model(model, tmp_path / "expanded-admission.onnx")
+        total_limit = 49664 if mode == "total" else 66304
+        array_limit = 16384 if mode == "views" else 16640 if mode == "per_view" else 20000
+        assert path.stat().st_size < total_limit
+        config = {"max_array_size": array_limit, "max_weight_distribution_total_bytes": total_limit}
+        storage_reads: list[int] = []
+        specs: list[Any] = []
+        charged: list[int] = []
+        materialized: list[str] = []
+        plans: list[Any] = []
+        original_storage = onnx_scanner_module._onnx_inline_storage_nbytes
+        original_weight_storage = WeightDistributionScanner._onnx_inline_storage_nbytes
+        original_analysis = WeightDistributionScanner._analyze_onnx_weight_specs
+        original_to_array = onnx.numpy_helper.to_array
+        original_plan = onnx_scanner_module._build_onnx_weight_analysis_plan
+
+        def record_storage(initializer: Any) -> int:
+            if initializer.name == "W" and sys._getframe(1).f_code.co_name == "inline_storage_fits_budget":
+                storage_reads.append(id(initializer))
+            return original_storage(initializer)
+
+        def record_weight_storage(onnx_module: Any, initializer: Any) -> int:
+            if initializer.name == "W" and sys._getframe(1).f_code.co_name == "pre_materialization_check":
+                storage_reads.append(id(initializer))
+            return original_weight_storage(onnx_module, initializer)
+
+        def record_analysis(scanner: Any, selected: list[Any]) -> list[tuple[dict[str, Any], Any]]:
+            specs.extend(selected)
+            charged.append(scanner.retained_tensor_bytes)
+            return original_analysis(scanner, selected)
+
+        def record_materialization(initializer: Any, *args: Any, **kwargs: Any) -> Any:
+            if initializer.name == "W" and sys._getframe(1).f_code.co_name == "_build_onnx_weight_analysis_plan":
+                materialized.append(initializer.name)
+            return original_to_array(initializer, *args, **kwargs)
+
+        def record_plan(*args: Any, **kwargs: Any) -> Any:
+            plan = original_plan(*args, **kwargs)
+            plans.append(plan)
+            return plan
+
+        with monkeypatch.context() as patch:
+            patch.setattr(onnx_scanner_module, "_onnx_inline_storage_nbytes", record_storage)
+            patch.setattr(WeightDistributionScanner, "_onnx_inline_storage_nbytes", staticmethod(record_weight_storage))
+            patch.setattr(WeightDistributionScanner, "_analyze_onnx_weight_specs", record_analysis)
+            patch.setattr(onnx.numpy_helper, "to_array", record_materialization)
+            patch.setattr(onnx_scanner_module, "_build_onnx_weight_analysis_plan", record_plan)
+            scanner = OnnxScanner(config) if route == "onnx" else WeightDistributionScanner(config)
+            result = scanner.scan(str(path))
+        widths = {
+            "complete": [66, 65, 64],
+            "typed": [66, 65, 64],
+            "total": [66, 64],
+            "per_view": [65, 64],
+            "storage": [],
+            "views": [],
+        }[mode]
+        assert len(storage_reads) == 1, "Expanded views must not repeat the physical payload inspection"
+        assert materialized == (["W"] if widths else [])
+        assert [spec.context["initializer"] for spec in specs] == ["prior"] + ["W"] * len(widths)
+        assert [spec.weights.shape for spec in specs] == [(64, 64)] + [(64, width) for width in widths]
+        assert [spec.analysis_id for spec in specs] == list(range(1 + len(widths)))
+        assert [spec.context["consumer_count"] for spec in specs[1:]] == [2] * len(widths)
+        assert charged == [prior.nbytes + sum(64 * width * 4 for width in widths)]
+        np.testing.assert_array_equal(specs[0].weights, prior)
+        for spec in specs[1:]:
+            np.testing.assert_array_equal(spec.weights, np.ones(spec.weights.shape, np.float32))
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        incomplete = mode not in {"complete", "typed"}
+        assert len(plans) == 1
+        assert plans[0].oversized_initializers_skipped == int(incomplete)
+        assert result.success is not incomplete, result.metadata
+        if incomplete:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        if incomplete and route == "onnx":
+            cache_dir = tmp_path / "cache"
+            reset_cache_manager()
+            try:
+                for _ in range(2):
+                    aggregate = scan_model_directory_or_file(
+                        str(path),
+                        cache_enabled=True,
+                        cache_dir=str(cache_dir),
+                        min_cache_file_size=0,
+                        max_array_size=array_limit,
+                        max_weight_distribution_total_bytes=total_limit,
+                    )
+                    assert aggregate.success is False
+                    assert aggregate.issues
+                    assert determine_exit_code(aggregate) == 2
+                stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+                assert stats["total_entries"] == stats["cache_hits"] == 0
+            finally:
+                reset_cache_manager()

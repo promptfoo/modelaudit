@@ -1560,6 +1560,9 @@ class WeightDistributionScanner(BaseScanner):
                 np=np,
                 max_array_size=None,
                 pre_materialization_check=pre_materialization_check,
+                pre_view_check=lambda name, nbytes: self._tensor_fits_budget(
+                    "onnx_initializer_size_limit", name, tensor_nbytes=nbytes
+                ),
                 retain_array_check=lambda name, nbytes: self._tensor_fits_budget(
                     "onnx_initializer_size_limit",
                     name,

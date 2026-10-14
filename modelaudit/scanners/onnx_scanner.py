@@ -1895,6 +1895,7 @@ def _build_onnx_weight_analysis_plan(
     np: Any,
     max_array_size: int | None,
     pre_materialization_check: Callable[[Any, str, int], bool] | None = None,
+    pre_view_check: Callable[[str, int], bool] | None = None,
     retain_array_check: Callable[[str, int], bool] | None = None,
 ) -> _OnnxWeightAnalysisPlan:
     """Build a bounded, semantically oriented plan for ONNX weight analysis."""
@@ -14144,11 +14145,17 @@ def _build_onnx_weight_analysis_plan(
                         ),
                     )
                 )
-                if (max_array_size is not None and max_array_size > 0 and logical_bytes > max_array_size) or (
-                    logical_bytes > estimated_bytes
-                    and pre_materialization_check is not None
-                    and not pre_materialization_check(initializer, bounded_name, logical_bytes)
-                ):
+                view_fits_budget = not (
+                    max_array_size is not None and max_array_size > 0 and logical_bytes > max_array_size
+                )
+                if view_fits_budget and logical_bytes > estimated_bytes:
+                    if pre_view_check is not None:
+                        # Logical views reuse the source payload. Reinspect live
+                        # byte limits without materializing its storage again.
+                        view_fits_budget = pre_view_check(bounded_name, logical_bytes)
+                    elif pre_materialization_check is not None:
+                        view_fits_budget = pre_materialization_check(initializer, bounded_name, logical_bytes)
+                if not view_fits_budget:
                     if not oversized_view_skipped:
                         plan.oversized_initializers_skipped += 1
                         oversized_view_skipped = True
@@ -17194,6 +17201,9 @@ class OnnxScanner(BaseScanner):
             np=np,
             max_array_size=max_array_size,
             pre_materialization_check=inline_storage_fits_budget,
+            pre_view_check=lambda name, nbytes: wd_scanner._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=nbytes
+            ),
             retain_array_check=lambda name, nbytes: wd_scanner._tensor_fits_budget(
                 "onnx_initializer_size_limit", name, tensor_nbytes=nbytes, retain=True
             ),
