@@ -2122,8 +2122,11 @@ def find_dangerous_call_graphs(
                 and reference.get("invocation_import_reference")
                 and _template_uses_reviewed_lazy_pattern()
                 and reference.get("template_receiver_state_unmodified") is not True
+                and analysis_limit_error is None
             ):
-                raise _CallGraphAnalysisLimitError("string.Template receiver state cannot be proven unchanged")
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template receiver state cannot be proven unchanged"
+                )
             if (
                 module == "string"
                 and name in {"Template.substitute", "Template.safe_substitute"}

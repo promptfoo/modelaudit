@@ -9821,8 +9821,9 @@ assert pickle.loads(payload) == (True if method_name == "Template.is_valid" else
         ("Template.safe_substitute", True),
     ],
 )
+@pytest.mark.parametrize("receiver_prefix", [False, True])
 def test_scan_bytes_detects_uncached_template_pattern_import(
-    tmp_path: Path, method_name: str, unknown_mapping: bool
+    tmp_path: Path, method_name: str, unknown_mapping: bool, receiver_prefix: bool
 ) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -9842,6 +9843,9 @@ def test_scan_bytes_detects_uncached_template_pattern_import(
             + _args_tuple(receiver, _global_operand("builtins", "help"))
             + b"R."
         )
+    if receiver_prefix:
+        assert payload[:2] == b"\x80\x04"
+        payload = payload[:2] + b"]Na0" + payload[2:]
     child_code = """
 import pickle
 import string
@@ -9859,7 +9863,15 @@ assert original_pattern is vars(string)["_TemplatePattern"]
 sys.path.insert(0, str(module_dir))
 report = scan_bytes(payload, source="uncached-template-no-placeholder.pkl")
 assert report.verdict == SafetyVerdict.MALICIOUS, report
-if sys.argv[5] == "True":
+if sys.argv[6] == "True":
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert any("receiver state cannot be proven unchanged" in error.message for error in report.errors), report
+    invocation = next(
+        item for item in report.metadata["callable_invocations"]
+        if item.get("module") == "string" and item.get("name") == method_name
+    )
+    assert invocation["template_receiver_state_unmodified"] is False, invocation
+elif sys.argv[5] == "True":
     assert report.status == ScanStatus.INCONCLUSIVE, report
     assert any("mapping callbacks cannot be proven covered" in error.message for error in report.errors), report
 assert any(
@@ -9892,6 +9904,7 @@ assert marker.read_text() == "imported"
             payload.hex(),
             method_name,
             str(unknown_mapping),
+            str(receiver_prefix),
         ],
     )
     assert marker.read_text() == "imported"
