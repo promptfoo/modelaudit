@@ -5136,7 +5136,14 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
     ],
 )
 def test_routine_documented_examples_are_informational(tmp_path: Path, content: str, crlf: bool) -> None:
-    _assert_model_card_endpoint_informational(tmp_path, content.replace("\n", "\r\n") if crlf else content)
+    path = tmp_path / "model_card.md"
+    path.write_bytes((content.replace("\n", "\r\n") if crlf else content).encode())
+    result = TextScanner().scan(str(path))
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
 
 
 @pytest.mark.parametrize(
