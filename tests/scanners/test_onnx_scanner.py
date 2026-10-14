@@ -39224,3 +39224,227 @@ class TestOnnxLoopConsumerProofAdmission:
             prior_weights,
             coverage_reason="lineages_per_value_limit",
         )
+
+
+class TestOnnxEinsumEquationBudgets:
+    @staticmethod
+    def _model(equations: list[bytes], *, local_function: bool) -> tuple[Any, Any, list[Any]]:
+        from onnx.reference import ReferenceEvaluator
+
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[3, 7] = 1000.0
+        source_names = [f"source{index}" for index in range(33)]
+        equation_nodes = []
+        previous = "value" if local_function else "state"
+        for index in range(len(equations)):
+            output = f"stage{index}"
+            equation_nodes.append(
+                helper.make_node("Einsum", [previous], [output], name=f"equation{index}", equation="i->i")
+            )
+            previous = output
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Project",
+                    ["value"],
+                    [previous],
+                    equation_nodes,
+                    opset_imports=[helper.make_opsetid("", 13)],
+                )
+            )
+            body_nodes = [helper.make_node("Project", ["state"], ["projected"], domain="local")]
+            previous = "projected"
+        else:
+            body_nodes = equation_nodes
+        body_nodes = [
+            *body_nodes,
+            helper.make_node("Concat", [previous, "append"], ["next_state"], axis=0),
+            helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+        ]
+        body = helper.make_graph(
+            body_nodes,
+            "growing_vector_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [None]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [None]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["known_X", "known_weight"], ["known_Y"]),
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+            ],
+            "bounded_einsum_equations",
+            [helper.make_tensor_value_info("known_X", TensorProto.FLOAT, [1, 64])],
+            [
+                helper.make_tensor_value_info("known_Y", TensorProto.FLOAT, [1, 64]),
+                helper.make_tensor_value_info("final_state", TensorProto.FLOAT, [None]),
+            ],
+            initializer=[
+                onnx.numpy_helper.from_array(prior_weights, name="known_weight"),
+                *[onnx.numpy_helper.from_array(np.zeros(1, np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.ones(1, np.float32), name="append"),
+                onnx.numpy_helper.from_array(np.array(3, np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, np.bool_), name="initial_condition"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [1])],
+        )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        values: Any = ReferenceEvaluator(model).run(None, {"known_X": np.ones((1, 64), np.float32)})
+        np.testing.assert_array_equal(values[1], np.array([0, 1, 1, 1], np.float32))
+        if local_function:
+            owned_nodes = list(model.functions[0].node)
+        else:
+            loop = next(node for node in model.graph.node if node.op_type == "Loop")
+            owned_body = next(attribute.g for attribute in loop.attribute if attribute.name == "body")
+            owned_nodes = [node for node in owned_body.node if node.op_type == "Einsum"]
+        for node, equation in zip(owned_nodes, equations, strict=True):
+            attribute = next(attribute for attribute in node.attribute if attribute.name == "equation")
+            attribute.s = equation
+        return model, prior_weights, owned_nodes
+
+    @staticmethod
+    def _scan_profiled(model: Any, tmp_path: Path) -> tuple[Any, dict[str, Any]]:
+        path = _save_onnx_model(model, tmp_path / "equation-profile.onnx")
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        observations: dict[str, Any] = {
+            "queries": 0,
+            "materialized": [],
+            "metadata_sizes": [],
+            "cache_peak": 0,
+            "shapes": [],
+        }
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            name = frame.f_code.co_name
+            if name not in {"parsed_einsum_equation", "einsum_output_shape"}:
+                return
+            if Path(frame.f_code.co_filename).resolve() != scanner_path or event != "return":
+                return
+            if name == "einsum_output_shape":
+                if isinstance(arg, tuple):
+                    observations["shapes"].append(arg)
+                return
+            observations["queries"] += 1
+            payload = frame.f_locals.get("equation_bytes")
+            if isinstance(payload, bytes):
+                observations["materialized"].append(len(payload))
+            serialized_size = frame.f_locals.get("serialized_size")
+            if isinstance(serialized_size, int):
+                observations["metadata_sizes"].append(serialized_size)
+            cache = frame.f_locals.get("einsum_equation_cache", {})
+            observations["cache_peak"] = max(observations["cache_peak"], len(cache))
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            result = WeightDistributionScanner().scan(str(path))
+        finally:
+            sys.setprofile(previous_profile)
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        return result, observations
+
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize("padding", [0, 24])
+    def test_replayed_literal_equation_is_decoded_once_with_current_shapes(
+        self,
+        tmp_path: Path,
+        local_function: bool,
+        padding: int,
+    ) -> None:
+        equation = b" " * padding + b"i->i"
+        model, prior_weights, _nodes = self._model([equation], local_function=local_function)
+        result, observed = self._scan_profiled(model, tmp_path)
+
+        assert result.success is True, result.metadata
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert observed["queries"] > 1
+        assert observed["materialized"] == [len(equation)]
+        assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 1
+        assert {(1,), (2,), (3,)} <= set(observed["shapes"])
+        assert all(len(shape) == 1 for shape in observed["shapes"])
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(model, tmp_path, False, prior_weights)
+
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize("failure", ["oversized", "invalid_utf8"])
+    def test_rejected_literal_equation_is_cached_and_preserves_findings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        local_function: bool,
+        failure: str,
+    ) -> None:
+        equation = b" " * 128 + b"i->i" if failure == "oversized" else b"\xff"
+        model, prior_weights, _nodes = self._model([equation], local_function=local_function)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES", 64)
+        result, observed = self._scan_profiled(model, tmp_path)
+        reason = "einsum_equation_byte_limit" if failure == "oversized" else "einsum_equation_decode_failure"
+
+        assert result.success is False
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][reason] >= 1
+        assert observed["queries"] > 1
+        assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 1
+        assert observed["materialized"] == ([] if failure == "oversized" else [1])
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            True,
+            prior_weights,
+            coverage_reason=reason,
+        )
+
+    @pytest.mark.parametrize("limit", ["aggregate_bytes", "negative_entries"])
+    def test_equation_admission_has_aggregate_byte_and_entry_bounds(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        limit: str,
+    ) -> None:
+        equations = [b"i->i"] * 3 if limit == "aggregate_bytes" else [b" " * 128 + b"i->i"] * 6
+        model, prior_weights, nodes = self._model(equations, local_function=False)
+        if limit == "aggregate_bytes":
+            byte_limit = sum(node.attribute[0].ByteSize() for node in nodes[:2])
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_BYTE_LIMIT", byte_limit)
+            reason = "einsum_equation_byte_limit"
+        else:
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_WORK_LIMIT", 9)
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES", 64)
+            reason = "einsum_equation_work_limit"
+        result, observed = self._scan_profiled(model, tmp_path)
+
+        assert result.success is False
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][reason] >= 1
+        if limit == "aggregate_bytes":
+            assert observed["queries"] > 2
+            assert sum(observed["metadata_sizes"]) == byte_limit
+            assert observed["materialized"] == [4, 4]
+        else:
+            assert observed["queries"] > 3
+            assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 3
+            assert observed["materialized"] == []
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            True,
+            prior_weights,
+            coverage_reason=reason,
+        )

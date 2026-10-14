@@ -176,6 +176,9 @@ _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
 _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
+_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
+_ONNX_EINSUM_EQUATION_BYTE_LIMIT = 4 * _ONNX_STRUCTURE_STRING_MAX_BYTES
+_ONNX_EINSUM_EQUATION_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -5611,18 +5614,92 @@ def _build_onnx_weight_analysis_plan(
         graph_external_reference_cache[cache_key] = (graph, reference_names)
         return reference_names
 
+    einsum_equation_cache: dict[int, tuple[Any, tuple[tuple[str, ...], str] | None]] = {}
+    einsum_equation_work_remaining = _ONNX_EINSUM_EQUATION_WORK_LIMIT
+    einsum_equation_bytes_remaining = _ONNX_EINSUM_EQUATION_BYTE_LIMIT
+
+    def parsed_einsum_equation(node: Any) -> tuple[tuple[str, ...], str] | None:
+        nonlocal einsum_equation_work_remaining, einsum_equation_bytes_remaining
+        cached = einsum_equation_cache.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        if einsum_equation_work_remaining <= 0:
+            plan.coverage_gaps.setdefault("einsum_equation_work_limit", 1)
+            return None
+        if einsum_equation_bytes_remaining <= 0 or _ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES <= 0:
+            einsum_equation_work_remaining -= 1
+            einsum_equation_cache[id(node)] = (node, None)
+            plan.coverage_gaps.setdefault("einsum_equation_byte_limit", 1)
+            return None
+        attributes = getattr(node, "attribute", ())
+        work = 1 + len(attributes) + len(getattr(node, "input", ()))
+        if work > einsum_equation_work_remaining:
+            # Negative owners also consume an entry; exhaustion retains nothing.
+            einsum_equation_work_remaining -= 1
+            einsum_equation_cache[id(node)] = (node, None)
+            plan.coverage_gaps.setdefault("einsum_equation_work_limit", 1)
+            return None
+        einsum_equation_work_remaining -= work
+        # Nodes and literal attributes are immutable during a plan. Referenced
+        # equations remain unsupported, so this key does not depend on bindings.
+        einsum_equation_cache[id(node)] = (node, None)
+        attribute = next((item for item in attributes if item.name == "equation"), None)
+        if attribute is None or int(getattr(attribute, "type", 0)) != int(onnx.AttributeProto.STRING):
+            return None
+        try:
+            byte_size = getattr(attribute, "ByteSize", None)
+            if not callable(byte_size):
+                raise ValueError("Equation attribute size is unavailable")
+            serialized_size = int(byte_size())
+            if serialized_size < 0:
+                raise ValueError("Equation attribute size is invalid")
+        except Exception:
+            plan.coverage_gaps.setdefault("einsum_equation_decode_failure", 1)
+            return None
+        if (
+            serialized_size > _ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES
+            or serialized_size > einsum_equation_bytes_remaining
+        ):
+            plan.coverage_gaps.setdefault("einsum_equation_byte_limit", 1)
+            return None
+        # AttributeProto.s can materialize a fresh bytes object. Reserve its
+        # serialized upper bound before field access, decoding or normalization.
+        einsum_equation_bytes_remaining -= serialized_size
+        if getattr(attribute, "ref_attr_name", "") or not _onnx_has_singular_field(attribute, "s"):
+            return None
+        try:
+            equation_bytes = bytes(attribute.s)
+            equation = equation_bytes.decode("utf-8")
+        except (AttributeError, TypeError, UnicodeDecodeError):
+            plan.coverage_gaps.setdefault("einsum_equation_decode_failure", 1)
+            return None
+        if "..." in equation or equation.count("->") != 1:
+            return None
+        input_expression, output_expression = (part.strip() for part in equation.split("->", 1))
+        input_count = len(node_input_names(node))
+        # An extra term proves a count mismatch without allocating every comma
+        # fragment in a malformed equation.
+        input_terms = tuple(term.strip() for term in input_expression.split(",", input_count))
+        if len(input_terms) != input_count:
+            return None
+        if len(output_expression) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+            return None
+        if len(set(output_expression)) != len(output_expression):
+            return None
+        parsed = (input_terms, output_expression)
+        einsum_equation_cache[id(node)] = (node, parsed)
+        return parsed
+
     def einsum_output_shape(
         node: Any,
         input_shapes_by_name: dict[str, tuple[int, ...] | None],
     ) -> tuple[int, ...] | None:
-        equation = _onnx_text_attribute(node, "equation")
-        if equation is None or "..." in equation or equation.count("->") != 1:
+        parsed = parsed_einsum_equation(node)
+        if parsed is None:
             return None
-        input_expression, output_expression = (part.strip() for part in equation.split("->", 1))
-        input_terms = [term.strip() for term in input_expression.split(",")]
-        input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
-        if len(input_terms) != len(input_names) or len(set(output_expression)) != len(output_expression):
-            return None
+        input_terms, output_expression = parsed
+        input_names = node_input_names(node)
         label_dimensions: dict[str, int] = {}
         for term, input_name in zip(input_terms, input_names, strict=False):
             input_shape = input_shapes_by_name.get(input_name)
