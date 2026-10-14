@@ -39640,3 +39640,336 @@ class TestOnnxReplayRuntimeInputTypes:
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model, tmp_path, True, prior_weights, coverage_reason="lineages_per_value_limit"
         )
+
+
+class TestOnnxScan8MutableDefaultBatchProofs:
+    @pytest.mark.parametrize("output_kind", ["state", "stacked"])
+    @pytest.mark.parametrize(
+        "mode", ["mutable", "identity", "function", "immutable", "immutable_function", "declared_zero", "declared_one"]
+    )
+    def test_scan8_batch_extents_require_immutable_or_proven_shapes(
+        self, tmp_path: Path, output_kind: str, mode: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        incomplete = mode in {"mutable", "identity", "function"}
+        immutable = mode in {"immutable", "immutable_function"}
+        batch = 1 if mode == "declared_one" else 0
+        target_name = "initial_state" if output_kind == "state" else "sequence"
+        target_tail = [64, 64] if output_kind == "state" else [1]
+        target = np.zeros((batch, *target_tail), np.float32)
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        returned_weights = np.zeros((64, 64), np.float32)
+        returned_weights[:5, 0] = 20
+        body_nodes = [
+            helper.make_node("Constant", [], ["returned_weight"], value=tensor("", returned_weights)),
+        ]
+        if output_kind == "state":
+            body_outputs = [value("returned_weight", [64, 64])]
+        else:
+            body_nodes.insert(0, helper.make_node("Identity", ["state"], ["next_state"]))
+            body_outputs = [value("next_state", [64, 64]), value("returned_weight", [64, 64])]
+        body = helper.make_graph(
+            body_nodes,
+            "scan8_constant_matrix_body",
+            [value("state", [64, 64]), value("item", [])],
+            body_outputs,
+        )
+        aliases = []
+        functions = []
+        actual_target = target_name
+        if mode in {"identity", "function", "immutable_function"}:
+            actual_target = "selected_input"
+            if mode == "identity":
+                aliases.append(helper.make_node("Identity", [target_name], [actual_target]))
+            else:
+                functions.append(
+                    helper.make_function(
+                        "local",
+                        "Alias",
+                        ["source"],
+                        ["selected"],
+                        [helper.make_node("Identity", ["source"], ["selected"])],
+                        [helper.make_opsetid("", 8)],
+                    )
+                )
+                aliases.append(helper.make_node("Alias", [target_name], [actual_target], domain="local"))
+        state_input = actual_target if output_kind == "state" else "initial_state"
+        sequence_input = actual_target if output_kind == "stacked" else "sequence"
+        outputs = ["weight"] if output_kind == "state" else ["unused_state", "weight"]
+        actual_batch = 1 if incomplete or mode == "declared_one" else 0
+        inputs = [value("A", [1, 64]), value("X", [1, 64])]
+        if not immutable:
+            inputs.append(value(target_name, [None, *target_tail] if incomplete else [batch, *target_tail]))
+        other_name = "sequence" if output_kind == "state" else "initial_state"
+        other_tail = [1] if output_kind == "state" else [64, 64]
+        inputs.append(value(other_name, [None, *other_tail]))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    *aliases,
+                    helper.make_node(
+                        "Scan", ["lengths", state_input, sequence_input], outputs, body=body, num_scan_inputs=1
+                    ),
+                    helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+                ],
+                "scan8_mutable_default_batch",
+                inputs,
+                [
+                    value("known", [1, 64]),
+                    value("Y", [None, 1, 64] if output_kind == "state" else [None, None, 1, 64]),
+                ],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor(target_name, target),
+                    tensor("lengths", np.ones(actual_batch, np.int64)),
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 8), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        if incomplete:
+            # The standalone route must not replace an absent runtime rank with
+            # the initializer's empty default. The ordinary scanner may also
+            # reject this missing declaration, and must remain inconclusive.
+            next(item for item in model.graph.input if item.name == target_name).type.tensor_type.ClearField("shape")
+
+        # Scan8 is not implemented by the installed reference evaluator. Execute
+        # this exact body once for the nonempty runtime override; no body executes
+        # for the independently proven zero-batch controls.
+        if actual_batch:
+            runtime: Any = ReferenceEvaluator(body, opsets={"": 8}).run(
+                None, {"state": np.zeros((64, 64), np.float32), "item": np.float32(0)}
+            )
+            np.testing.assert_array_equal(runtime[-1], returned_weights)
+            actual_weight = runtime[-1][None, ...]
+            if output_kind == "stacked":
+                actual_weight = actual_weight[:, None, ...]
+            np.testing.assert_array_equal(
+                np.ones((1, 64), np.float32) @ actual_weight,
+                np.broadcast_to(returned_weights.sum(axis=0), (*actual_weight.shape[:-2], 1, 64)),
+            )
+        else:
+            actual_weight = np.empty((0, 64, 64) if output_kind == "state" else (0, 1, 64, 64), np.float32)
+            assert (np.ones((1, 64), np.float32) @ actual_weight).size == 0
+
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        if incomplete:
+            assert plan.exclusion_counts.get("empty_weight_view", 0) == 0
+        elif batch == 0:
+            assert plan.exclusion_counts.get("empty_weight_view", 0) > 0
+        else:
+            assert any(
+                spec.weights.size and np.array_equal(spec.weights.reshape(-1, 64, 64)[0], returned_weights)
+                for spec in plan.specs
+            )
+        path = _save_onnx_model(model, tmp_path / "scan8-default-batch.onnx")
+        result = WeightDistributionScanner().scan(str(path))
+        assert result.success is not incomplete, result.metadata
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) >= 1
+        assert bool(TestWeightDistributionCoverage._coverage_checks(result)) is incomplete
+        ordinary = OnnxScanner().scan(str(path))
+        assert ordinary.success is not incomplete, ordinary.metadata
+        if incomplete:
+            assert ordinary.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            reset_cache_manager()
+            try:
+                for _ in range(2):
+                    aggregate = scan_model_directory_or_file(
+                        str(path), cache_enabled=True, cache_dir=str(tmp_path / "cache"), min_cache_file_size=0
+                    )
+                    assert aggregate.success is False
+                    assert determine_exit_code(aggregate) == 2
+                stats = get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()
+                assert stats["total_entries"] == stats["cache_hits"] == 0
+            finally:
+                reset_cache_manager()
+
+
+class TestOnnxFiniteReplayConstantAdmission:
+    @staticmethod
+    def _model(form: str, local_function: bool, matrix: bool) -> tuple[Any, Any, Any]:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        target = [64, 1] if matrix else [64]
+        functions = []
+        shape_nodes = []
+        if form == "custom":
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Constant",
+                    [],
+                    ["actual_shape"],
+                    [helper.make_node("Constant", [], ["actual_shape"], value_ints=[64, 1])],
+                    [helper.make_opsetid("", 18)],
+                    attributes=["value_ints"],
+                )
+            )
+            shape_nodes = [helper.make_node("Constant", [], ["shape"], domain="local", value_ints=[64])]
+        elif form == "tensor":
+            shape_nodes = [helper.make_node("Constant", [], ["shape"], value=tensor("", np.asarray(target, np.int64)))]
+        elif form == "ints":
+            shape_nodes = [helper.make_node("Constant", [], ["shape"], value_ints=target)]
+        consumers = [
+            *shape_nodes,
+            helper.make_node("Reshape", ["state", "shape"], ["weight"]),
+            helper.make_node("MatMul", ["X", "weight"], ["body_y"]),
+        ]
+        if local_function:
+            formals = ["state", "X", "shape"] if form == "initializer" else ["state", "X"]
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Consume",
+                    formals,
+                    ["body_y"],
+                    consumers,
+                    [helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+                )
+            )
+            consumers = [helper.make_node("Consume", formals, ["body_y"], domain="local")]
+        sources = [f"replacement_{index}" for index in range(33)]
+        body_y_shape = [1, 1] if matrix else [1]
+        body = helper.make_graph(
+            [
+                *consumers,
+                helper.make_node("Sum", sources, ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "body_constant_vector_proof",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+            ],
+            [
+                value("condition_out", [], TensorProto.BOOL),
+                value("next_state", None),
+                value("body_y", body_y_shape),
+            ],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        initializers = [
+            tensor("prior", prior_weights),
+            tensor("two", np.int64(2)),
+            tensor("condition", np.bool_(True)),
+            *[tensor(name, np.ones((64, 1), np.float32)) for name in sources],
+        ]
+        if form == "initializer":
+            initializers.append(tensor("shape", np.asarray(target, np.int64)))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Loop", ["two", "condition", "initial"], ["final", "Y"], body=body),
+                ],
+                "body_constant_replay",
+                [value("A", [1, 64]), value("X", [1, 64]), value("initial", [64])],
+                [value("known", [1, 64]), value("Y", [2, *body_y_shape])],
+                initializer=initializers,
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        # The carried rank changes from vector to matrix, as in the unchanged
+        # initializer-backed regression. Qualify values with the actual runtime.
+        onnx.checker.check_model(model)
+        actual: Any = ReferenceEvaluator(model).run(
+            None,
+            {
+                "A": np.ones((1, 64), np.float32),
+                "X": np.ones((1, 64), np.float32),
+                "initial": np.zeros(64, np.float32),
+            },
+        )
+        np.testing.assert_array_equal(actual[1].reshape(-1), [0, 33 * 64])
+        actual_body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+        constant = None
+        if form != "initializer":
+            graph = (
+                next(function for function in model.functions if function.name == "Consume")
+                if local_function
+                else actual_body
+            )
+            constant = next(node for node in graph.node if node.op_type == "Constant")
+        return model, constant, prior_weights
+
+    @pytest.mark.parametrize("form", ["initializer", "tensor", "ints"])
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize("matrix", [False, True])
+    def test_body_constants_match_initializer_vector_proofs(
+        self, tmp_path: Path, form: str, local_function: bool, matrix: bool
+    ) -> None:
+        model, _constant, prior_weights = self._model(form, local_function, matrix)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, matrix, prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+
+    @pytest.mark.parametrize("kind", ["wrong_type", "unresolved", "custom"])
+    @pytest.mark.parametrize("local_function", [False, True])
+    def test_unproven_constant_controls_keep_deferred_coverage(
+        self, tmp_path: Path, kind: str, local_function: bool
+    ) -> None:
+        model, constant, prior_weights = self._model(
+            "custom" if kind == "custom" else "ints", local_function, kind == "custom"
+        )
+        if kind == "wrong_type":
+            constant.attribute[0].type = onnx.AttributeProto.FLOATS
+        elif kind == "unresolved":
+            constant.attribute[0].ref_attr_name = "missing_shape"
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, True, prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+
+    def test_replay_constant_budget_refuses_repeated_copy_before_allocation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sys
+
+        model, constant, prior_weights = self._model("ints", False, False)
+        constant.attribute[0].ints[:] = [64, *([1] * 127)]
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 200)
+        denials: list[tuple[int, int]] = []
+        replay_copies = 0
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            nonlocal replay_copies
+            if event == "return" and frame.f_code.co_name == "replay_constant_tensor":
+                work = frame.f_locals.get("copy_work")
+                remaining = frame.f_locals.get("exact_loop_replay_work_remaining")
+                if isinstance(work, int) and isinstance(remaining, int) and arg is None and work > remaining:
+                    denials.append((work, remaining))
+            if event == "call" and frame.f_code.co_name == "_copy_onnx_repeated_constant_values":
+                parent = frame.f_back
+                while parent is not None:
+                    if parent.f_code.co_name == "replay_constant_tensor":
+                        replay_copies += 1
+                        break
+                    parent = parent.f_back
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                model, onnx=onnx, np=np, max_array_size=64 * 1024
+            )
+        finally:
+            sys.setprofile(previous_profile)
+        assert denials and all(work == 128 and 0 <= remaining < work for work, remaining in denials)
+        assert replay_copies == 0
+        assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, True, prior_weights, coverage_reason="lineages_per_value_limit"
+        )

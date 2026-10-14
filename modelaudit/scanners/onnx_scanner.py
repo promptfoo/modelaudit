@@ -8910,6 +8910,61 @@ def _build_onnx_weight_analysis_plan(
                         tainted_shapes: dict[str, tuple[int, ...] | None] = {graph_input_name: initial_shape}
                         tainted_data_types: dict[str, int | None] = {graph_input_name: initial_data_type}
 
+                        def replay_constant_tensor(
+                            constant_node: Any,
+                            attribute_resolver: Callable[[Any], Any | None],
+                        ) -> Any | None:
+                            nonlocal exact_loop_replay_work_remaining, exact_loop_replay_work_exhausted
+                            attributes: Any = getattr(constant_node, "attribute", ())
+                            outputs: Any = getattr(constant_node, "output", ())
+                            metadata_work = 1 + len(attributes) + len(outputs)
+                            if metadata_work > exact_loop_replay_work_remaining:
+                                exact_loop_replay_work_exhausted = True
+                                return None
+                            exact_loop_replay_work_remaining -= metadata_work
+                            if (
+                                not builtin_operator(constant_node, "Constant")
+                                or bool(getattr(constant_node, "input", ()))
+                                or len(outputs) != 1
+                                or not outputs[0]
+                                or len(attributes) != 1
+                            ):
+                                return None
+                            attribute = attributes[0]
+                            kinds = {
+                                "value": (onnx.AttributeProto.TENSOR, "t"),
+                                "value_int": (onnx.AttributeProto.INT, "i"),
+                                "value_ints": (onnx.AttributeProto.INTS, None),
+                                "value_float": (onnx.AttributeProto.FLOAT, "f"),
+                                "value_floats": (onnx.AttributeProto.FLOATS, None),
+                            }
+                            kind = kinds.get(str(attribute.name))
+                            resolved = attribute_resolver(attribute)
+                            if (
+                                kind is None
+                                or resolved is None
+                                or bool(getattr(resolved, "ref_attr_name", ""))
+                                or int(getattr(resolved, "type", 0)) != int(kind[0])
+                                or (kind[1] is not None and not _onnx_has_singular_field(resolved, kind[1]))
+                            ):
+                                return None
+                            copy_work = (
+                                len(resolved.ints)
+                                if attribute.name == "value_ints"
+                                else len(resolved.floats)
+                                if attribute.name == "value_floats"
+                                else 0
+                                if attribute.name == "value"
+                                else 1
+                            )
+                            if copy_work > exact_loop_replay_work_remaining:
+                                exact_loop_replay_work_exhausted = True
+                                return None
+                            exact_loop_replay_work_remaining -= copy_work
+                            # Dense value reuses its TensorProto. Repeated/scalar
+                            # forms are copied only after shared replay admission.
+                            return resolved_constant_node_tensor(constant_node, lambda _attribute: resolved)
+
                         def output_data_type(
                             replay_node: Any,
                             output_index: int,
@@ -9306,17 +9361,19 @@ def _build_onnx_weight_analysis_plan(
                                 function_standard_domain = (
                                     getattr(function_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                                 )
-                                if function_standard_domain and function_node.op_type == "Constant":
-                                    constant_tensor = resolved_constant_node_tensor(
-                                        function_node,
-                                        lambda attribute: attribute,
-                                    )
-                                    if constant_tensor is not None:
-                                        for output_name in function_outputs:
-                                            function_constants[output_name] = constant_tensor
-                                            local_tainted_shapes.pop(output_name, None)
-                                            local_data_types.pop(output_name, None)
+                                if builtin_operator(function_node, "Constant"):
+                                    if id(function_node) not in live_node_ids:
                                         continue
+                                    if not has_registered_standard_operator(function_node, function_versions):
+                                        return None
+                                    constant_tensor = replay_constant_tensor(function_node, function_attribute)
+                                    if constant_tensor is None:
+                                        return None
+                                    for output_name in function_outputs:
+                                        function_constants[output_name] = constant_tensor
+                                        local_tainted_shapes.pop(output_name, None)
+                                        local_data_types.pop(output_name, None)
+                                    continue
                                 nested_function = functions.get(function_key)
                                 if nested_function is not None or any(
                                     True
@@ -9602,6 +9659,15 @@ def _build_onnx_weight_analysis_plan(
                                             return None
                                         if nested_consumes_weight_rank:
                                             return True, None
+                                continue
+                            if standard_operator and body_node.op_type == "Constant":
+                                constant_tensor = replay_constant_tensor(body_node, resolve_attribute)
+                                if constant_tensor is None:
+                                    return None
+                                for output_name in body_outputs:
+                                    subgraph_constants[output_name] = constant_tensor
+                                    tainted_shapes.pop(output_name, None)
+                                    tainted_data_types.pop(output_name, None)
                                 continue
                             if not tainted_inputs:
                                 continue
@@ -12226,9 +12292,13 @@ def _build_onnx_weight_analysis_plan(
                 value_shape = known_value_shapes.get(value_name) if value_name in proven_value_ranks else None
                 if value_shape:
                     return value_shape[0]
+                if graph_input_is_runtime_overridable(value_name, graph_input_names, constants):
+                    return -1
                 initializer_shape = constant_initializer_shape(constants, value_name)
                 if initializer_shape:
                     return initializer_shape[0]
+                if value_name in dynamic_values:
+                    return -1
                 data_lineages = [
                     lineage
                     for lineage in value_lineages.get(value_name, {}).values()
@@ -13400,6 +13470,12 @@ def _build_onnx_weight_analysis_plan(
                     per_output_weight_lineage_gap_summary,
                     per_output_rank_promotable_lineage_gap_summary,
                 ) = bounded_lineages(per_output_lineages)
+                mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
+                output_is_dynamic = (
+                    subgraph_output_dynamic[output_index]
+                    if mapped_subgraph_output and per_output_lineages
+                    else has_dynamic_input or (not per_output_lineages and name not in constant_output_names)
+                )
                 if per_output_lineages:
                     value_lineages[name] = per_output_lineages
                     input_lineage_limit_gap_count_for_output = (
@@ -13559,7 +13635,10 @@ def _build_onnx_weight_analysis_plan(
                         set_known_value_rank(name, inferred_output_rank, proven=inferred_output_rank_proven)
                     elif clear_output_rank:
                         clear_known_value_rank(name)
-                    elif (lineage_shape := resolved_lineage_shape(per_output_lineages.values())) is not None:
+                    elif (
+                        not output_is_dynamic
+                        and (lineage_shape := resolved_lineage_shape(per_output_lineages.values())) is not None
+                    ):
                         set_known_value_shape(name, lineage_shape, proven=True)
                 else:
                     value_lineages.pop(name, None)
@@ -13584,12 +13663,6 @@ def _build_onnx_weight_analysis_plan(
                     elif clear_output_rank:
                         clear_known_value_rank(name)
 
-                mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
-                output_is_dynamic = (
-                    subgraph_output_dynamic[output_index]
-                    if mapped_subgraph_output and per_output_lineages
-                    else has_dynamic_input or (not per_output_lineages and name not in constant_output_names)
-                )
                 if output_is_dynamic:
                     dynamic_values.add(name)
                 else:
