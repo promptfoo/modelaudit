@@ -10216,6 +10216,7 @@ payload = bytes.fromhex(sys.argv[3])
 control_payload = bytes.fromhex(sys.argv[4])
 module_name = sys.argv[5]
 shape = sys.argv[6]
+method_name = sys.argv[7]
 sys.path.insert(0, str(module_dir))
 
 control = scan_bytes(control_payload)
@@ -10278,6 +10279,7 @@ assert any(
             control_payload.hex(),
             module_name,
             shape,
+            method_name,
         ],
     )
     assert marker.read_text() == "sibling-called"
