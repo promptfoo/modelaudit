@@ -742,6 +742,9 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"|\b(?:detect(?:ing|ion|s)?|mitigat(?:e|ing|ion)|resistan(?:ce|t)|robust(?:ness)?)\s+"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\b"
+    rb"|\b"
+    + GENERIC_CC_BENIGN_TERM_PATTERN
+    + rb"\s+(?:production|generation|creation)\s+(?:may|might|could)\s+be\s+possible\b"
     rb")",
     re.IGNORECASE,
 )
@@ -2070,14 +2073,24 @@ class TextScanner(BaseScanner):
             return False
         if cls._documentation_multiline_return_contains_position(payload, position):
             return True
-        if cls._documentation_open_call_contains_position(payload, position):
-            return True
-        if cls._documentation_multiline_literal_contains_position(payload, position):
-            return True
         if cls._documentation_position_is_in_actionable_markdown_link_context(payload, position):
             return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
+        if cls._documentation_open_call_contains_position(payload, position):
+            return True
+        if cls._documentation_multiline_literal_contains_position(payload, position):
+            return True
+        prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
+        line_start, line_end, _ = cls._documentation_line_bounds(payload, position)
+        url_span = cls._documentation_bare_url_span_at_position(payload, position, line_start, line_end)
+        html_position = url_span[0] if url_span is not None else position
+        html_prefix = payload[max(0, html_position - MAX_TEXT_FINDING_CONTEXT_BYTES) : html_position]
+        html_link = DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN.search(html_prefix)
+        if html_link is not None:
+            tag_line_start = html_prefix.rfind(b"\n", 0, html_link.start()) + 1
+            if not html_prefix[tag_line_start : html_link.start()].strip():
+                return False
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return not cls._documentation_truncated_prefix_after_closed_xml_config_is_passive(payload, position)
         line_parts = cls._finding_line_parts(payload, finding)
@@ -2093,7 +2106,6 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_python_definition_contains_finding(payload, position):
             return True
-        prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         passive_markdown_link = cls._documentation_prefix_is_passive_markdown_link(prefix)
         return (
             cls._documentation_assignment_is_actionable(prefix)

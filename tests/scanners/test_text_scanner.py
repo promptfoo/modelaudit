@@ -3507,6 +3507,68 @@ def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: P
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: Path) -> None:
+    result = _scan_text_content(
+        tmp_path / "README.md", "* **Misuse:** Malware production may be possible; review generated outputs.\n"
+    )
+
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'label = "malware production may be possible"\n',
+        "Malware production may be possible.\nThis model installs malware.\n",
+    ],
+)
+def test_text_scanner_possible_misuse_prose_does_not_hide_actionable_cc_content(tmp_path: Path, content: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, content, "cc_pattern")
+
+
+def test_text_scanner_arxiv_identifier_is_not_a_telnet_port(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    result = _scan_text_content(text_path, "---\ntags:\n- arxiv:2310.06825\n---\n# Model card\n")
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(check.details.get("type") == "suspicious_port" for check in result.checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "Sources), miscellaneous (e.g. papers,\nnotes). See ",
+        "**Benchmarks:** HLE (Humanity's Last Exam) evaluates reasoning.\n\nSee ",
+        '```python\noutput = model(\n    "a multiline\nexample",\n)\n```\n\n* ',
+    ],
+)
+def test_text_scanner_documentation_links_after_prose_or_closed_examples_are_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_model_card_endpoint_informational(tmp_path, prefix + "[guide](https://docs.example.com/reference)\n")
+
+
+@pytest.mark.parametrize("tag,attribute", [("img", "src"), ("a", "href")])
+def test_text_scanner_multiline_documentation_html_links_are_informational(
+    tmp_path: Path, tag: str, attribute: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, f'<{tag}\n    {attribute}="https://docs.example.com/reference"\n>\n'
+    )
+
+
+@pytest.mark.parametrize("tag,attribute", [("script", "src"), ("iframe", "src"), ("link", "href")])
+def test_text_scanner_multiline_executable_html_urls_remain_actionable(
+    tmp_path: Path, tag: str, attribute: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f'<{tag}\n    {attribute}="https://evil.example/payload.sh"\n>\n'
+    )
+
+
 def test_text_scanner_backdoor_indicator_assignment_remains_actionable(tmp_path: Path) -> None:
     _assert_indirect_network_call(
         tmp_path, ('status = "backdoor indicators"\n'), ("cc_pattern"), ("pattern"), ("backdoor")
