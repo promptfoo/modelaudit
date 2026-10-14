@@ -2151,7 +2151,7 @@ class TextScanner(BaseScanner):
         if html_link is not None:
             tag_line_start = html_prefix.rfind(b"\n", 0, html_link.start()) + 1
             if not html_prefix[tag_line_start : html_link.start()].strip():
-                surrounding_prefix = html_prefix[: html_link.start()]
+                surrounding_prefix = html_prefix[: html_link.start()].rstrip(b" \t\r\n")
                 return (
                     cls._documentation_assignment_is_actionable(surrounding_prefix)
                     or cls._documentation_markdown_link_config_is_actionable(surrounding_prefix)

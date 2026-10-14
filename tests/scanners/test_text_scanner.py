@@ -3706,6 +3706,28 @@ def test_text_scanner_passive_html_in_config_remains_actionable(
     )
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
+@pytest.mark.parametrize("open_assignment", [True, False])
+def test_text_scanner_passive_html_assignment_context_handles_line_endings(
+    tmp_path: Path, newline: str, tag: str, attribute: str, open_assignment: bool
+) -> None:
+    path = tmp_path / "model_card.md"
+    prefix = 'endpoint = "' if open_assignment else 'endpoint = "local"'
+    content = f'{prefix}\n<{tag}\n    {attribute}="https://docs.example.com/reference">\n'
+    path.write_bytes(content.replace("\n", newline).encode())
+
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+
+    assert checks
+    if open_assignment:
+        assert any(check.severity == IssueSeverity.WARNING for check in checks)
+    else:
+        assert all(check.severity == IssueSeverity.INFO for check in checks)
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert determine_exit_code(aggregate) == int(open_assignment)
+
+
 @pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
 def test_text_scanner_passive_html_after_closed_config_is_informational(
     tmp_path: Path, tag: str, attribute: str
