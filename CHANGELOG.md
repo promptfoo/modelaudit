@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Exclude unused function graph arguments from finite ONNX replay while retaining unknown results for unresolved used bindings and scopes.
+- Keep unknown Cast targets and unproven pooling samples from suppressing ONNX weight-coverage gaps.
+- Bound retained ONNX function opset maps before construction and preserve incomplete coverage when a scope exceeds the aggregate budget.
 - Reject unresolved ONNX function overrides and invalid Squeeze rank proofs without consuming capture budgets for unused graph arguments across reentry, dependency, and reachability traversal.
 - Keep local-function graph captures reachable during ONNX weight analysis, and prevent invalid transform bindings from establishing weight-coverage exclusions.
 - Bound and reuse ONNX repeated Constant attribute copies and opset environments, and resolve caller-bound weight-transform attributes while preserving findings and incomplete-coverage outcomes.

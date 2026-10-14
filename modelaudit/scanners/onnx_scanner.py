@@ -174,6 +174,7 @@ _ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYT
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
 _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
@@ -2218,15 +2219,30 @@ def _build_onnx_weight_analysis_plan(
         graph_constants.update(local_constants)
         return graph_constants
 
-    function_opset_cache: dict[int, tuple[Any, dict[str, int]]] = {}
+    function_opset_cache: dict[int, tuple[Any, dict[str, int] | None]] = {}
+    function_opset_work_remaining = _ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT
 
-    def function_opset_versions(function: Any, caller_opset_versions: dict[str, int]) -> dict[str, int]:
+    def function_opset_versions(function: Any, caller_opset_versions: dict[str, int]) -> dict[str, int] | None:
+        nonlocal function_opset_work_remaining
         cached = function_opset_cache.get(id(function))
         if cached is None or cached[0] is not function:
-            explicit_versions = _opset_versions_by_domain(getattr(function, "opset_import", ()))
+            imports = getattr(function, "opset_import", ())
+            work = len(imports) + 1
+            if work > function_opset_work_remaining:
+                plan.coverage_gaps.setdefault("function_opset_environment_work_limit", 1)
+                # Failed owners also cost a cache entry. Once none fit, reject in
+                # constant time without retaining more negative entries.
+                if function_opset_work_remaining > 0:
+                    function_opset_work_remaining -= 1
+                    function_opset_cache[id(function)] = (function, None)
+                return None
+            function_opset_work_remaining -= work
+            explicit_versions: dict[str, int] | None = _opset_versions_by_domain(imports)
             function_opset_cache[id(function)] = (function, explicit_versions)
         else:
             explicit_versions = cached[1]
+        if explicit_versions is None:
+            return None
         return explicit_versions or caller_opset_versions
 
     function_attribute_references: dict[int, frozenset[str] | None] = {}
@@ -3528,6 +3544,8 @@ def _build_onnx_weight_analysis_plan(
                         if function is not None:
                             function_attributes = bound_function_attributes(function, node, resolve_work_attribute)
                             function_versions = function_opset_versions(function, opset_versions or {})
+                            if function_versions is None:
+                                return True
                             if subgraph_has_potential_weight_consumer(
                                 function, function_versions, attribute_bindings=function_attributes
                             ):
@@ -3791,6 +3809,9 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_constants,
                 )
                 function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
                 function_context_shapes: dict[str, tuple[int, ...]] = {}
                 for input_index, input_name in enumerate(function_actuals):
                     if input_index >= len(getattr(function, "input", ())):
@@ -4530,6 +4551,9 @@ def _build_onnx_weight_analysis_plan(
                 mapped_outputs: set[str] = set()
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    tainted.update(body_outputs)
+                    continue
                 function_captures = graph_external_reference_names(function, function_attributes)
                 if dependency_names_exceeded_limit(function_captures):
                     tainted.update(body_outputs)
@@ -4786,6 +4810,9 @@ def _build_onnx_weight_analysis_plan(
             if function is not None:
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    potential_weight_consumer_cache[cache_key] = True
+                    return True
                 if subgraph_has_potential_weight_consumer(
                     function,
                     function_versions,
@@ -4866,6 +4893,9 @@ def _build_onnx_weight_analysis_plan(
             if function is not None:
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    potential_weight_consumer_dependency_cache[cache_key] = dependency_collection_limit
+                    return dependency_collection_limit
                 if subgraph_has_potential_weight_consumer(
                     function,
                     function_versions,
@@ -5147,6 +5177,8 @@ def _build_onnx_weight_analysis_plan(
             if not body_outputs_live_after and function is not None:
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    return finish(True)
                 function_has_weight_consumer = subgraph_has_potential_weight_consumer(
                     function,
                     function_versions,
@@ -5231,6 +5263,8 @@ def _build_onnx_weight_analysis_plan(
                     function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 if function_versions is None:
                     function_versions = function_opset_versions(function, opset_versions)
+                    if function_versions is None:
+                        return finish(True)
                 if function_has_weight_consumer is None:
                     function_has_weight_consumer = subgraph_has_potential_weight_consumer(
                         function,
@@ -5405,15 +5439,38 @@ def _build_onnx_weight_analysis_plan(
             return None
         return output_rank
 
+    def graph_capture_attribute_is_resolved(attribute: Any, resolved: Any | None) -> bool:
+        if resolved is None or bool(getattr(resolved, "ref_attr_name", "")):
+            return False
+        if getattr(attribute, "ref_attr_name", ""):
+            expected_type = int(getattr(attribute, "type", 0))
+            if expected_type == 0 or int(getattr(resolved, "type", 0)) != expected_type:
+                return False
+        return int(getattr(resolved, "type", 0)) != int(onnx.AttributeProto.GRAPH) or _onnx_has_singular_field(
+            resolved, "g"
+        )
+
     graph_external_reference_cache: dict[tuple[Any, ...], tuple[Any, frozenset[str]]] = {}
     graph_external_reference_in_progress: set[tuple[Any, ...]] = set()
     graph_external_function_owners = {id(function) for function in functions.values()}
     graph_external_function_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
     def graph_external_reference_names(
-        graph: Any, attribute_bindings: dict[str, Any] | None = None, *, depth: int = 0
+        graph: Any,
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        depth: int = 0,
+        require_resolved_bindings: bool = False,
+        capture_opset_versions: dict[str, int] | None = None,
     ) -> frozenset[str]:
         nonlocal graph_external_function_work_remaining
+        capture_opset_key = None
+        if require_resolved_bindings:
+            if capture_opset_versions is None:
+                return dependency_collection_limit
+            capture_opset_key = opset_cache_key(capture_opset_versions)
+            if capture_opset_key is None:
+                return dependency_collection_limit
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
@@ -5430,14 +5487,16 @@ def _build_onnx_weight_analysis_plan(
                 or bool(getattr(binding, "ref_attr_name", ""))
             )
         )
-        cache_key = (id(graph), attribute_key, depth)
+        cache_key = (id(graph), attribute_key, depth, require_resolved_bindings, capture_opset_key)
         if depth > 6 or cache_key in graph_external_reference_in_progress:
             return frozenset({dependency_collection_limit_marker})
         cached_reference_names = graph_external_reference_cache.get(cache_key)
         if cached_reference_names is not None and cached_reference_names[0] is graph:
             return cached_reference_names[1]
-        if id(graph) in graph_external_function_owners:
+        if id(graph) in graph_external_function_owners or require_resolved_bindings:
             work = max(len(getattr(graph, "input", ())) + len(getattr(graph, "output", ())) + len(graph.node), 1)
+            if require_resolved_bindings:
+                work += len(getattr(graph, "initializer", ())) + len(getattr(graph, "sparse_initializer", ()))
             if work <= graph_external_function_work_remaining:
                 for function_node in graph.node:
                     work += len(function_node.input) + len(function_node.output) + len(function_node.attribute)
@@ -5485,14 +5544,39 @@ def _build_onnx_weight_analysis_plan(
                         else attribute
                     ),
                 )
-                referenced_names.update(graph_external_reference_names(function, function_attributes, depth=depth + 1))
+                nested_capture_opsets = capture_opset_versions
+                if require_resolved_bindings and capture_opset_versions is not None:
+                    nested_capture_opsets = function_opset_versions(function, capture_opset_versions)
+                    if nested_capture_opsets is None:
+                        graph_external_reference_in_progress.discard(cache_key)
+                        graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                        return dependency_collection_limit
+                referenced_names.update(
+                    graph_external_reference_names(
+                        function,
+                        function_attributes,
+                        depth=depth + 1,
+                        require_resolved_bindings=require_resolved_bindings,
+                        capture_opset_versions=nested_capture_opsets,
+                    )
+                )
             for attribute in direct_graph_attributes(graph_node, function):
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = (attribute_bindings or {}).get(reference_name) if reference_name else attribute
+                if require_resolved_bindings and not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
+                    graph_external_reference_in_progress.discard(cache_key)
+                    graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                    return dependency_collection_limit
                 if resolved_attribute is not None:
                     for subgraph in _iter_attribute_graphs(resolved_attribute):
                         referenced_names.update(
-                            graph_external_reference_names(subgraph, attribute_bindings, depth=depth + 1)
+                            graph_external_reference_names(
+                                subgraph,
+                                attribute_bindings,
+                                depth=depth + 1,
+                                require_resolved_bindings=require_resolved_bindings,
+                                capture_opset_versions=capture_opset_versions,
+                            )
                         )
         reference_names = frozenset(referenced_names - produced_names - local_names)
         if dependency_collection_limit_marker in referenced_names:
@@ -6057,11 +6141,21 @@ def _build_onnx_weight_analysis_plan(
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineage:
+        effective_cast_data_type = None
+        if node.op_type == "Cast":
+            effective_cast_data_type = (
+                cast_output_data_type(node, resolve_attribute)
+                if resolve_attribute is not None or cast_target_data_type is None
+                else cast_target_data_type
+            )
+            if effective_cast_data_type is not None and not valid_cast_data_type(effective_cast_data_type):
+                effective_cast_data_type = None
+
         def unresolved_transform(reason: str) -> _OnnxWeightLineage:
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=None,
-                data_type=lineage.data_type,
+                data_type=effective_cast_data_type if node.op_type == "Cast" else lineage.data_type,
                 transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason or reason,
             )
@@ -6084,11 +6178,7 @@ def _build_onnx_weight_analysis_plan(
         if node.op_type == "Identity":
             return lineage
         if node.op_type == "Cast":
-            target_data_type = (
-                cast_output_data_type(node, resolve_attribute)
-                if resolve_attribute is not None or cast_target_data_type is None
-                else cast_target_data_type
-            )
+            target_data_type = effective_cast_data_type
             if target_data_type is None:
                 return unresolved_transform("invalid_cast_target")
             if target_data_type == lineage.data_type:
@@ -7487,6 +7577,61 @@ def _build_onnx_weight_analysis_plan(
                     return False
             return inference
 
+        def pooling_has_nonempty_samples(node: Any) -> bool:
+            input_shape = proven_value_shape(str(node.input[0])) if node.input else None
+            if (
+                input_shape is None
+                or not 3 <= len(input_shape) <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+                or any(dimension <= 0 for dimension in input_shape)
+            ):
+                return False
+            spatial_rank = len(input_shape) - 2
+            kernel_shape = None
+            dilations = (1,) * spatial_rank
+            pads = (0,) * (2 * spatial_rank)
+            padding_mode = b"NOTSET"
+            explicit_pads = False
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name in {"kernel_shape", "strides", "dilations", "pads"}:
+                    resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INTS))
+                    expected_size = 2 * spatial_rank if attribute.name == "pads" else spatial_rank
+                    if resolved is None or len(resolved.ints) != expected_size:
+                        return False
+                    values = tuple(int(value) for value in resolved.ints)
+                    if any(value < (0 if attribute.name == "pads" else 1) for value in values):
+                        return False
+                    if attribute.name == "kernel_shape":
+                        kernel_shape = values
+                    elif attribute.name == "dilations":
+                        dilations = values
+                    elif attribute.name == "pads":
+                        pads = values
+                        explicit_pads = True
+                elif attribute.name == "auto_pad":
+                    resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.STRING), "s")
+                    if resolved is None or resolved.s not in {b"", b"NOTSET", b"VALID", b"SAME_UPPER", b"SAME_LOWER"}:
+                        return False
+                    padding_mode = resolved.s
+                elif attribute.name == "ceil_mode":
+                    resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INT), "i")
+                    if resolved is None or int(resolved.i) not in {0, 1}:
+                        return False
+            if kernel_shape is None or (explicit_pads and padding_mode not in {b"", b"NOTSET"}):
+                return False
+            if has_no_padding(node):
+                # Every emitted unpadded window starts at an actual input sample.
+                return True
+            if any(dilation != 1 for dilation in dilations):
+                return False
+            if padding_mode in {b"SAME_UPPER", b"SAME_LOWER"}:
+                return True
+            # Unit-dilation windows intersect the input when each explicit pad
+            # is smaller than the kernel. Ceil mode drops starts in right padding.
+            return all(
+                pads[index] < kernel and pads[index + spatial_rank] < kernel
+                for index, kernel in enumerate(kernel_shape)
+            )
+
         def aggregation_preserves_shape_control(node: Any) -> bool:
             if not node.input or not value_is_proven_nonempty_uniform(str(node.input[0])):
                 return False
@@ -7501,7 +7646,7 @@ def _build_onnx_weight_analysis_plan(
                             return False
                         includes_padding = bool(resolved.i)
                 # Ceil-only overhang is excluded from the divisor, unlike explicit padding.
-                return not includes_padding or has_no_padding(node)
+                return pooling_has_nonempty_samples(node) and (not includes_padding or has_no_padding(node))
             if not has_no_padding(node):
                 return False
             if node.op_type == "Conv":
@@ -8353,6 +8498,25 @@ def _build_onnx_weight_analysis_plan(
                     )
                     nested_reference_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
+                    def resolved_replay_function_reference(body_node: Any) -> tuple[Any, frozenset[str] | None] | None:
+                        replay_function = functions.get(_operator_identifier(body_node))
+                        if replay_function is None:
+                            return None
+                        replay_versions = function_opset_versions(replay_function, opset_versions)
+                        if replay_versions is None:
+                            return replay_function, None
+                        replay_bindings = bound_function_attributes(replay_function, body_node, resolve_attribute)
+                        replay_captures = graph_external_reference_names(
+                            replay_function,
+                            replay_bindings,
+                            require_resolved_bindings=True,
+                            capture_opset_versions=replay_versions,
+                        )
+                        return (
+                            replay_function,
+                            None if dependency_names_exceeded_limit(replay_captures) else replay_captures,
+                        )
+
                     def bounded_nested_external_reference_names(
                         graph: Any,
                         external_reference_cache: dict[int, tuple[Any, frozenset[str] | None]],
@@ -8391,9 +8555,20 @@ def _build_onnx_weight_analysis_plan(
                             produced_names.update(
                                 str(output_name) for output_name in getattr(graph_node, "output", ()) if output_name
                             )
-                            for attribute in getattr(graph_node, "attribute", ()):
+                            function_reference = resolved_replay_function_reference(graph_node)
+                            nested_function = function_reference[0] if function_reference is not None else None
+                            if function_reference is not None:
+                                function_captures = function_reference[1]
+                                if function_captures is None:
+                                    return None
+                                if len(function_captures) > nested_reference_work_remaining:
+                                    nested_reference_work_remaining = 0
+                                    return None
+                                nested_reference_work_remaining -= len(function_captures)
+                                referenced_names.update(function_captures)
+                            for attribute in direct_graph_attributes(graph_node, nested_function):
                                 resolved_attribute = resolve_attribute(attribute)
-                                if resolved_attribute is None:
+                                if not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
                                     return None
                                 for subgraph in _iter_attribute_graphs(resolved_attribute):
                                     subgraph_references = bounded_nested_external_reference_names(
@@ -8419,15 +8594,27 @@ def _build_onnx_weight_analysis_plan(
                         cached_references = attribute_reference_cache.get(cache_key)
                         if cached_references is not None and cached_references[0] is body_node:
                             return cached_references[1]
-                        references = tuple(
-                            (
-                                nested_graph,
-                                bounded_nested_external_reference_names(nested_graph, external_reference_cache),
-                            )
-                            for attribute in getattr(body_node, "attribute", ())
-                            if (resolved_attribute := resolve_attribute(attribute)) is not None
-                            for nested_graph in _iter_attribute_graphs(resolved_attribute)
-                        )
+                        function_reference = resolved_replay_function_reference(body_node)
+                        references: tuple[tuple[Any, frozenset[str] | None], ...]
+                        if function_reference is not None:
+                            references = (function_reference,)
+                        else:
+                            graph_references: list[tuple[Any, frozenset[str] | None]] = []
+                            for attribute in direct_graph_attributes(body_node, None):
+                                resolved_attribute = resolve_attribute(attribute)
+                                if not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
+                                    graph_references.append((body_node, None))
+                                    break
+                                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                                    graph_references.append(
+                                        (
+                                            nested_graph,
+                                            bounded_nested_external_reference_names(
+                                                nested_graph, external_reference_cache
+                                            ),
+                                        )
+                                    )
+                            references = tuple(graph_references)
                         attribute_reference_cache[cache_key] = (body_node, references)
                         return references
 
@@ -9092,6 +9279,8 @@ def _build_onnx_weight_analysis_plan(
                                     resolve_attribute,
                                 )
                                 function_versions = function_opset_versions(function, opset_versions)
+                                if function_versions is None:
+                                    return None
                                 function_has_weight_consumer = subgraph_has_potential_weight_consumer(
                                     function,
                                     function_versions,
@@ -9116,10 +9305,15 @@ def _build_onnx_weight_analysis_plan(
                                         tainted_shapes[output_name] = tainted_shapes[input_name]
                                         tainted_data_types[output_name] = tainted_data_types.get(input_name)
                                 continue
-                            nested_attribute_references = nested_attribute_graph_references(
-                                body_node,
-                                attribute_reference_cache,
-                                external_reference_cache,
+                            # Local-function captures have a liveness-aware path below.
+                            nested_attribute_references = (
+                                ()
+                                if function is not None
+                                else nested_attribute_graph_references(
+                                    body_node,
+                                    attribute_reference_cache,
+                                    external_reference_cache,
+                                )
                             )
                             tainted_shape_names = set(tainted_shapes)
                             has_tainted_nested_capture = any(
@@ -10777,8 +10971,17 @@ def _build_onnx_weight_analysis_plan(
                                 )
 
             function = functions.get(function_key)
-            if function is not None and function_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
-                plan.record_coverage_gap("function_call_depth_limit")
+            function_versions = None
+            function_scope_error = None
+            if function is not None:
+                if function_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                    function_scope_error = "function_call_depth_limit"
+                    plan.record_coverage_gap(function_scope_error)
+                else:
+                    function_versions = function_opset_versions(function, opset_versions)
+                    if function_versions is None:
+                        function_scope_error = "function_opset_environment_work_limit"
+            if function is not None and function_scope_error is not None:
                 for input_index, input_name in enumerate(node.input):
                     for initializer_index, lineage in value_lineages.get(str(input_name), {}).items():
                         record_unresolved_lineage(
@@ -10787,7 +10990,7 @@ def _build_onnx_weight_analysis_plan(
                                 shape=None,
                                 data_type=lineage.data_type,
                                 transforms=lineage.transforms,
-                                unresolved_reason="function_call_depth_limit",
+                                unresolved_reason=function_scope_error,
                             ),
                             node,
                             current_node_index,
@@ -10795,7 +10998,7 @@ def _build_onnx_weight_analysis_plan(
                             collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                         )
                 function = None
-            if function is not None:
+            if function is not None and function_versions is not None:
                 function_bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
                 function_bound_constants: dict[str, Any] = {}
                 function_bound_dynamic: set[str] = set()
@@ -10901,7 +11104,7 @@ def _build_onnx_weight_analysis_plan(
                         inherited_weight_lineage_limit_gap_summaries=value_weight_lineage_limit_gap_summaries,
                         inherited_rank_promotable_lineage_limit_gap_counts=value_rank_promotable_lineage_limit_gap_counts,
                         inherited_rank_promotable_lineage_limit_gap_summaries=value_rank_promotable_lineage_limit_gap_summaries,
-                        opset_versions=function_opset_versions(function, opset_versions),
+                        opset_versions=function_versions,
                         bound_lineages=function_bound_lineages,
                         bound_constants=function_bound_constants,
                         bound_dynamic_values=function_bound_dynamic,

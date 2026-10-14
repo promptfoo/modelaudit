@@ -37742,12 +37742,13 @@ class TestOnnxOpsetEnvironmentWork:
         return model
 
     @staticmethod
-    def _observe(model: Any) -> tuple[Any, dict[str, Any]]:
+    def _observe(model: Any, *, max_array_size: int = 4096) -> tuple[Any, dict[str, Any]]:
         observations: dict[str, Any] = {
             "keys": [],
             "sorts": [],
             "function_environments": [],
             "function_builds": [],
+            "function_cache_costs": [],
         }
 
         def observe(frame: Any, event: str, arg: Any) -> None:
@@ -37760,6 +37761,10 @@ class TestOnnxOpsetEnvironmentWork:
                 elif event == "c_call" and arg is sorted:
                     observations["sorts"].append(frame.f_locals["opset_versions"])
             elif name == "function_opset_versions" and event == "return":
+                cache = frame.f_locals["function_opset_cache"]
+                observations["function_cache_costs"].append(
+                    sum(1 + (len(versions) if versions is not None else 0) for _owner, versions in cache.values())
+                )
                 observations["function_environments"].append(
                     (frame.f_locals["function"], frame.f_locals["caller_opset_versions"], arg)
                 )
@@ -37771,7 +37776,9 @@ class TestOnnxOpsetEnvironmentWork:
         previous_profile = sys.getprofile()
         try:
             sys.setprofile(observe)
-            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=4096)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                model, onnx=onnx, np=np, max_array_size=max_array_size
+            )
         finally:
             sys.setprofile(previous_profile)
         return plan, observations
@@ -38276,3 +38283,351 @@ class TestOnnxFinalReviewBindingAndSqueeze:
         if extent != 2:
             onnx.checker.check_model(model, full_check=True)
         self._assert_standalone_contract(model, tmp_path, extent == 2, prior_weights)
+
+
+class TestOnnxFunctionOpsetRetention:
+    @staticmethod
+    def _model(import_counts: list[int], order: list[int]) -> tuple[Any, Any]:
+        functions = [
+            helper.make_function(
+                "local",
+                f"F{index}",
+                ["A", "W"],
+                ["Y"],
+                [helper.make_node("MatMul", ["A", "W"], ["Y"])],
+                [
+                    helper.make_opsetid("", 18),
+                    *[helper.make_opsetid(f"unused.{position}", 1) for position in range(count - 1)],
+                ],
+            )
+            for index, count in enumerate(import_counts)
+        ]
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        nodes = [helper.make_node("MatMul", ["A", "prior"], ["known"])]
+        nodes.extend(
+            helper.make_node(f"F{index}", ["X", "W"], [f"Y{position}"], domain="local")
+            for position, index in enumerate(order)
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "primary_function_opset_retention",
+                [
+                    helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 64]),
+                    helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2]),
+                ],
+                [
+                    helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64]),
+                    *[
+                        helper.make_tensor_value_info(f"Y{position}", TensorProto.FLOAT, [1, 2])
+                        for position in range(len(order))
+                    ],
+                ],
+                initializer=[
+                    onnx.numpy_helper.from_array(prior_weights, name="prior"),
+                    onnx.numpy_helper.from_array(np.ones((2, 2), np.float32), name="W"),
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        return model, prior_weights
+
+    @staticmethod
+    def _assert_contract(model: Any, tmp_path: Path, incomplete: bool) -> None:
+        path = _save_onnx_model(model, tmp_path / "function-opset-retention.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result = scanner_type().scan(str(path))
+            assert result.success is not incomplete
+            assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+            gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            assert bool(gaps.get("function_opset_environment_work_limit", 0)) is incomplete
+            assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+            coverage_checks = TestWeightDistributionCoverage._coverage_checks(result)
+            assert bool(coverage_checks) is incomplete
+            assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
+        if incomplete:
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("limit,incomplete", [(7, True), (64, False)])
+    def test_primary_calls_bound_cumulative_map_retention_before_construction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int, incomplete: bool
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT", limit)
+        model, prior_weights = self._model([3] * 6, [0, 1, 2, 3, 4, 5, 0, 1, 5])
+        plan, observations = TestOnnxOpsetEnvironmentWork._observe(model, max_array_size=64 * 1024)
+        # Ordinary primary calls do not enter the reachability key-budget path.
+        assert observations["keys"] == []
+        assert max(observations["function_cache_costs"]) <= limit
+        builds = [function.name for function in observations["function_builds"]]
+        assert builds == (["F0"] if incomplete else [f"F{index}" for index in range(6)])
+        for function, _caller, environment in observations["function_environments"]:
+            if incomplete and function.name != "F0":
+                assert environment is None
+            else:
+                assert environment == {"": 18, "unused.0": 1, "unused.1": 1}
+        assert bool(plan.coverage_gaps.get("function_opset_environment_work_limit", 0)) is incomplete
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        self._assert_contract(model, tmp_path, incomplete)
+
+    def test_rejected_large_scope_is_cached_without_blocking_later_small_scopes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT", 5)
+        model, prior_weights = self._model([8, 1, 1, 1], [0, 0, 1, 2, 3, 0, 1])
+        plan, observations = TestOnnxOpsetEnvironmentWork._observe(model, max_array_size=64 * 1024)
+        assert observations["keys"] == []
+        assert max(observations["function_cache_costs"]) == 5
+        assert [function.name for function in observations["function_builds"]] == ["F1", "F2"]
+        for function, _caller, environment in observations["function_environments"]:
+            if function.name in {"F0", "F3"}:
+                assert environment is None
+            else:
+                assert environment == {"": 18}
+        assert plan.coverage_gaps["function_opset_environment_work_limit"] == 1
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        self._assert_contract(model, tmp_path, True)
+
+    def test_reentry_map_rejection_preserves_conservative_coverage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT", 1)
+        model = TestOnnxOpsetEnvironmentWork._model()
+        plan, observations = TestOnnxOpsetEnvironmentWork._observe(model)
+        assert observations["function_builds"] == []
+        assert observations["function_environments"]
+        assert all(environment is None for _function, _caller, environment in observations["function_environments"])
+        assert max(observations["function_cache_costs"]) <= 1
+        assert plan.coverage_gaps["function_opset_environment_work_limit"] == 1
+        path = _save_onnx_model(model, tmp_path / "reentry-opset-retention.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result = scanner_type().scan(str(path))
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert (
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][
+                    "function_opset_environment_work_limit"
+                ]
+                == 1
+            )
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxRejectedCastAndPoolingProofs:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+
+    @pytest.mark.parametrize(
+        "target", ["float", "int64", "missing", "wrong_type", "missing_value", "unresolved_reference"]
+    )
+    def test_unknown_cast_target_does_not_exempt_integer_source(self, tmp_path: Path, target: str) -> None:
+        value, tensor = self._value, self._tensor
+        dtype = TensorProto.INT64 if target == "int64" else TensorProto.FLOAT
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        cast = helper.make_node("Cast", ["W"], ["view"], to=dtype)
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    cast,
+                    helper.make_node("MatMul", ["X", "view"], ["Y"]),
+                ],
+                "unknown_cast_output_dtype",
+                [value("A", [1, 64]), value("X", [1, 2], dtype)],
+                [value("known", [1, 64]), value("Y", [1, 2], dtype)],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("W", np.arange(4, dtype=np.int64).reshape(2, 2)),
+                ],
+            ),
+            opset_imports=[helper.make_opsetid("", 18)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        cast = model.graph.node[1]
+        if target == "missing":
+            del cast.attribute[:]
+        elif target == "wrong_type":
+            cast.attribute[0].CopyFrom(helper.make_attribute("to", 1.0))
+        elif target in {"missing_value", "unresolved_reference"}:
+            cast.attribute[0].ClearField("i")
+            if target == "unresolved_reference":
+                cast.attribute[0].ref_attr_name = "missing"
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, target not in {"float", "int64"}, prior_weights
+        )
+
+    @pytest.mark.parametrize(
+        "mode", ["empty_dilated", "unit_dilation", "absent_dilation", "no_padding", "bad_dilation_type"]
+    )
+    def test_pooling_uniformity_requires_nonempty_samples(self, tmp_path: Path, mode: str) -> None:
+        value, tensor = self._value, self._tensor
+        extent = 3 if mode == "no_padding" else 1
+        dilation = 2 if mode in {"empty_dilated", "no_padding"} else 1
+        pad = 0 if mode == "no_padding" else 1
+        output_extent = 1 if dilation == 2 else 2
+        attrs: dict[str, Any] = {"kernel_shape": [2], "pads": [pad, pad]}
+        if mode != "absent_dilation":
+            attrs["dilations"] = [dilation]
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Shape", ["source"], ["dimensions"]),
+                    helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
+                    helper.make_node("AveragePool", ["expanded"], ["pooled"], **attrs),
+                    helper.make_node("MatMul", ["X", "pooled"], ["Y"]),
+                ],
+                "pooling_sampling_proof",
+                [value("A", [1, 64]), value("runtime", []), value("X", [1, 1])],
+                [value("known", [1, 64]), value("Y", [1, 1, output_extent])],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("source", np.zeros((1, 1, extent), np.float32)),
+                ],
+            ),
+            opset_imports=[helper.make_opsetid("", 19)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        if mode == "bad_dilation_type":
+            pool = model.graph.node[3]
+            next(attribute for attribute in pool.attribute if attribute.name == "dilations").CopyFrom(
+                helper.make_attribute("dilations", [1.0])
+            )
+        incomplete = mode in {"empty_dilated", "bad_dilation_type"}
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        assert bool(plan.coverage_gaps) is incomplete
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "pooling-nonempty-samples.onnx")
+        result = WeightDistributionScanner().scan(str(path))
+        assert result.success is not incomplete
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        coverage_checks = TestWeightDistributionCoverage._coverage_checks(result)
+        assert bool(coverage_checks) is incomplete
+        assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
+        assert OnnxScanner().scan(str(path)).success is not incomplete
+        if mode == "empty_dilated":
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxFiniteReplayUnusedFunctionGraphs:
+    @pytest.mark.parametrize("trip_count,incomplete", [(2, False), (3, True)])
+    @pytest.mark.parametrize("unused_argument", [False, True])
+    def test_unused_graph_argument_preserves_finite_scalar_rank_proof(
+        self, tmp_path: Path, trip_count: int, incomplete: bool, unused_argument: bool
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        tensor = TestOnnxShapeContinuity._t
+        function = helper.make_function(
+            "local",
+            "Update",
+            ["S", "axes"],
+            ["N"],
+            [helper.make_node("Unsqueeze", ["S", "axes"], ["N"])],
+            [helper.make_opsetid("", 13)],
+            attributes=["unused"] if unused_argument else [],
+        )
+        call = helper.make_node("Update", ["state", "axes"], ["next_state"], domain="local")
+        if unused_argument:
+            argument = helper.make_graph(
+                [helper.make_node("Identity", ["state"], ["ignored"])],
+                "unused_capture",
+                [],
+                [value("ignored", None)],
+            )
+            call.attribute.append(helper.make_attribute("unused", argument))
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
+                call,
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "finite_scalar_rank_body",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+            ],
+            [value("condition_out", [], TensorProto.BOOL), value("next_state", None)],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node(
+                        "Loop", ["trip_count", "initial_condition", "initial_state"], ["final_state"], body=body
+                    ),
+                    helper.make_node("Identity", ["dummy"], ["Y"]),
+                ],
+                "finite_replay_unused_graph",
+                [value("A", [1, 64]), value("activation", [1, 1])],
+                [value("known", [1, 64]), value("Y", [])],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("initial_state", np.float32(1)),
+                    tensor("axes", np.array([0], np.int64)),
+                    tensor("trip_count", np.int64(trip_count)),
+                    tensor("initial_condition", np.bool_(True)),
+                    tensor("dummy", np.float32(0)),
+                ],
+            ),
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        # This fixture deliberately changes carried rank, matching the existing
+        # finite-rank regression; qualify actual per-iteration values below.
+        onnx.checker.check_model(model)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined)
+        loop = next(node for node in inlined.graph.node if node.op_type == "Loop")
+        runtime_body = deepcopy(next(attribute.g for attribute in loop.attribute if attribute.name == "body"))
+        runtime_body.output.append(value("body_y", [1, 1]))
+        state = np.asarray(1, np.float32)
+        activation = np.array([[-2]], np.float32)
+        slope_ranks = []
+        for iteration in range(trip_count):
+            slope_ranks.append(state.ndim)
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 13}).run(
+                None,
+                {
+                    "iteration": np.int64(iteration),
+                    "condition_in": np.bool_(True),
+                    "state": state,
+                    "axes": np.array([0], np.int64),
+                    "activation": activation,
+                },
+            )
+            np.testing.assert_array_equal(actual[1], np.expand_dims(state, 0))
+            np.testing.assert_array_equal(actual[2], activation)
+            state = actual[1]
+        assert slope_ranks == list(range(trip_count))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        assert bool(plan.coverage_gaps.get("lineages_per_value_limit", 0)) is incomplete
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "finite-replay-unused-graph.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result = scanner_type().scan(str(path))
+            assert result.success is not incomplete
+            assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+            gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            assert bool(gaps.get("lineages_per_value_limit", 0)) is incomplete
+            assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        if incomplete:
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
