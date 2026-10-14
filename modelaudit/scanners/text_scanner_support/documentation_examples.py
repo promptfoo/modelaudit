@@ -7,18 +7,23 @@ or of code downloaded by a reader. Other findings in each example stay intact.
 import ast
 import re
 import shlex
+from bisect import bisect_right
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 from modelaudit.detectors.network_comm import NetworkCommDetector
 
 MAX_EXAMPLE_BYTES = 16 * 1024
+MAX_DOCUMENTATION_BYTES = 256 * 1024
 MAX_FENCES = 128
 PARSED_FENCE_LANGUAGES = frozenset({b"", b"sh", b"bash", b"shell", b"console", b"terminal", b"py", b"python"})
 FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r\n]*?)[ \t]*\r?$")
 INDENTED_CODE_BLOCK_PATTERN = re.compile(rb"(?m)^(?: {4}|\t)[^\n]*\n?(?:(?: {4}|\t)[^\n]*\n?|[ \t]*\n)*")
 BACKTICK_PATTERN = re.compile(rb"`+")
-EXECUTION_DIRECTIVE_PATTERN = re.compile(r"\b(?:run|execute|invoke|launch|source)[ \t]+", re.IGNORECASE)
+QUOTE_PREFIX_PATTERN = re.compile(rb" {0,3}>[ \t]?")
+EXECUTION_DIRECTIVE_PATTERN = re.compile(
+    r"\b(?:run|execute|invoke|launch|source)(?:[ \t]*[:\uff1a\u2014\u2013-][ \t\r\n]*|[ \t\r\n]+)", re.IGNORECASE
+)
 URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
 PYTHON_EXECUTION_NAMES = frozenset(
@@ -166,6 +171,24 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
     return None
 
 
+def _without_shell_comment(command: bytes) -> bytes:
+    quote: int | None = None
+    escaped = False
+    for index, value in enumerate(command):
+        if escaped:
+            escaped = False
+        elif value == ord("\\") and quote != ord("'"):
+            escaped = True
+        elif quote is not None:
+            if value == quote:
+                quote = None
+        elif value in {ord("'"), ord('"')}:
+            quote = value
+        elif value == ord("#") and (index == 0 or command[index - 1] in b" \t"):
+            return command[:index]
+    return command
+
+
 def _shell_url_spans(source: bytes) -> list[tuple[int, int]]:
     # A backslash in a shell comment does not continue the command. Keep
     # ambiguous comment/quote combinations out of this narrow exception.
@@ -185,6 +208,7 @@ def _shell_url_spans(source: bytes) -> list[tuple[int, int]]:
         if not command.strip():
             offset += len(line)
             continue
+        command = _without_shell_comment(command)
         if any(char in command for char in b"$`;&|<>\\"):
             return []
         try:
@@ -221,18 +245,62 @@ def _literal_api_url(node: ast.expr) -> ast.Constant | None:
     return None
 
 
+def _has_execution_reference(nodes: list[ast.AST]) -> bool:
+    literal_targets: set[ast.Name] = set()
+    writes: dict[str, list[ast.Name]] = {}
+    rebound: set[str] = set()
+    module = nodes[0] if nodes and isinstance(nodes[0], ast.Module) else None
+    for statement in module.body if module else []:
+        if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Constant):
+            literal_targets.update(target for target in statement.targets if isinstance(target, ast.Name))
+    for node in nodes:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            writes.setdefault(node.id, []).append(node)
+        elif isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)
+        ):
+            if node.name:
+                rebound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            rebound.add(node.rest)
+        elif isinstance(node, ast.arg):
+            rebound.add(node.arg)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"globals", "locals", "vars"}
+        ):
+            rebound.add("*")
+        elif isinstance(node, ast.alias):
+            rebound.add(node.asname or node.name.split(".")[0])
+    literal_names = {
+        name: min((target.lineno, target.col_offset) for target in targets)
+        for name, targets in writes.items()
+        if name not in rebound and all(target in literal_targets for target in targets)
+    }
+    if "*" in rebound:
+        literal_names.clear()
+    return any(
+        (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in PYTHON_EXECUTION_NAMES)
+        or (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in PYTHON_EXECUTION_NAMES
+            and (node.id not in literal_names or (node.lineno, node.col_offset) < literal_names[node.id])
+        )
+        or (isinstance(node, ast.Attribute) and node.attr in PYTHON_EXECUTION_NAMES)
+        or (isinstance(node, ast.alias) and node.name.split(".")[0] in PYTHON_EXECUTION_NAMES)
+        for node in nodes
+    )
+
+
 def _python_url_spans(source: bytes) -> list[tuple[int, int]]:
     try:
         tree = ast.parse(source.decode("utf-8"))
     except (UnicodeDecodeError, SyntaxError, ValueError, RecursionError):
         return []
     nodes = list(ast.walk(tree))
-    if any(
-        (isinstance(node, ast.Name) and node.id in PYTHON_EXECUTION_NAMES)
-        or (isinstance(node, ast.Attribute) and node.attr in PYTHON_EXECUTION_NAMES)
-        or (isinstance(node, ast.alias) and node.name.split(".")[0] in PYTHON_EXECUTION_NAMES)
-        for node in nodes
-    ):
+    if _has_execution_reference(nodes):
         return []
 
     literals: dict[ast.Constant, str] = {}
@@ -373,12 +441,7 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
             if language:
                 return True
         else:
-            executes_script = any(
-                (isinstance(node, ast.Name) and node.id in PYTHON_EXECUTION_NAMES)
-                or (isinstance(node, ast.Attribute) and node.attr in PYTHON_EXECUTION_NAMES)
-                or (isinstance(node, ast.alias) and node.name.split(".")[0] in PYTHON_EXECUTION_NAMES)
-                for node in nodes
-            )
+            executes_script = _has_execution_reference(nodes)
             if (
                 language
                 or executes_script
@@ -423,6 +486,11 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
     return False
 
 
+def _ends_with_execution_directive(prefix: str) -> bool:
+    prefix += " "
+    return any(match.end() == len(prefix) for match in EXECUTION_DIRECTIVE_PATTERN.finditer(prefix))
+
+
 def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
     delimiter_count = 0
     html_regions: list[tuple[int, int]] = []
@@ -458,8 +526,8 @@ def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int
                 return True
             source = payload[left.end() : right.start()].replace(b"\r", b" ").replace(b"\n", b" ").strip()
             prefix = payload[max(start, left.start() - 64) : left.start()]
-            command_context = re.search(rb"\s|[();|&]", source) is not None or re.search(
-                rb"\b(?:run|execute|invoke|launch|source)[ \t]*$", prefix, re.IGNORECASE
+            command_context = re.search(rb"\s|[();|&]", source) is not None or _ends_with_execution_directive(
+                prefix.decode("utf-8", errors="replace")
             )
             if command_context and _example_executes_script(source, b""):
                 return True
@@ -512,9 +580,7 @@ class _HTMLCodeExamples(HTMLParser):
             return
         if tag in {"pre", "code"}:
             if not self.tags:
-                self.command_context = (
-                    re.search(r"\b(?:run|execute|invoke|launch|source)[ \t]*$", self.before, re.IGNORECASE) is not None
-                )
+                self.command_context = _ends_with_execution_directive(self.before)
                 self.language = b""
             self.command_context |= tag == "pre"
             for attribute, value in attrs:
@@ -588,8 +654,7 @@ def _outside_fence_examples_execute_script(payload: bytes, regions: list[tuple[i
     return _inline_examples_execute_script(payload, inline_regions)
 
 
-def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
-    """Return URL spans only inside complete, recognized Markdown fences."""
+def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
     opening: re.Match[bytes] | None = None
     executes_script = False
@@ -638,3 +703,55 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
     if executes_script:
         spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
     return tuple(spans)
+
+
+def _without_blockquote_prefixes(payload: bytes) -> tuple[bytes, list[tuple[int, int]]] | None:
+    normalized = bytearray()
+    removals: list[tuple[int, int]] = []
+    removed = 0
+    opening: re.Match[bytes] | None = None
+    opening_depth = 0
+    for line in payload.splitlines(keepends=True):
+        cursor = depth = 0
+        if opening is None or opening_depth:
+            while match := QUOTE_PREFIX_PATTERN.match(line, cursor):
+                cursor = match.end()
+                depth += 1
+                if opening is not None and depth == opening_depth:
+                    break
+            if opening is not None and depth < opening_depth:
+                return None
+        if cursor:
+            removed += cursor
+            removals.append((len(normalized), removed))
+        normalized_line = line[cursor:]
+        fence = FENCE_PATTERN.fullmatch(normalized_line.rstrip(b"\r\n"))
+        if fence is not None:
+            if opening is None:
+                opening, opening_depth = fence, depth
+            elif (
+                not fence.group("language")
+                and fence.group("fence")[:1] == opening.group("fence")[:1]
+                and len(fence.group("fence")) >= len(opening.group("fence"))
+            ):
+                opening = None
+        normalized.extend(normalized_line)
+    return bytes(normalized), removals
+
+
+def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
+    """Return original URL spans only after bounded Markdown example analysis."""
+    if len(payload) > MAX_DOCUMENTATION_BYTES:
+        return ()
+    result = _without_blockquote_prefixes(payload)
+    if result is None:
+        return ()
+    normalized, removals = result
+    spans = _routine_documentation_url_spans(normalized)
+    starts = [start for start, _removed in removals]
+
+    def original(position: int) -> int:
+        index = bisect_right(starts, position) - 1
+        return position + (removals[index][1] if index >= 0 else 0)
+
+    return tuple((original(start), original(end)) for start, end in spans)
