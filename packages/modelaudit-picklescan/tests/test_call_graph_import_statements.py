@@ -9993,6 +9993,121 @@ finally:
     assert marker.read_text() == "keyword-import-called"
 
 
+def test_first_matching_path_preserves_later_partial_sink_after_earlier_limit() -> None:
+    expected = ("second", "builtins.eval")
+
+    def path_for(entrypoint: str) -> tuple[str, ...] | None:
+        if entrypoint == "first":
+            raise call_graph._CallGraphAnalysisLimitError("first coverage error")
+        raise call_graph._CallGraphAnalysisLimitError("second coverage error", partial_path=expected)
+
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="first coverage error") as caught:
+        call_graph._first_matching_path(("first", "second"), path_for)
+
+    assert caught.value.partial_path == expected
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template runtime qualification starts in Python 3.14")
+@pytest.mark.parametrize(
+    "method_name", ["Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"]
+)
+@pytest.mark.parametrize("shape", ["direct", "wrapped", "deep"])
+def test_template_authentication_error_preserves_sibling_sink(tmp_path: Path, method_name: str, shape: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "template_sibling_fixture"
+    template_call = f"string.{method_name}(string.Template(''))"
+
+    def entry_source(name: str, target: str) -> str:
+        return f"def {name}(code):\n    {template_call}\n    return {target}(code)\n\n"
+
+    source = "import string\n\n"
+    if shape == "wrapped":
+        source += "def entry(code):\n    return wrapped(code)\n\n"
+        source += "def safe_entry(code):\n    return safe_wrapped(code)\n\n"
+        source += entry_source("wrapped", "other")
+        source += entry_source("safe_wrapped", "benign")
+    else:
+        source += entry_source("entry", "other")
+        source += entry_source("safe_entry", "benign")
+    if shape == "deep":
+        source += "def other(code):\n    return hop1(code)\n\n"
+        for index in range(1, 4):
+            target = f"hop{index + 1}" if index < 3 else "eval"
+            source += f"def hop{index}(code):\n    return {target}(code)\n\n"
+    else:
+        source += "def other(code):\n    return eval(code)\n\n"
+    source += "def benign(code):\n    return 'safe'\n"
+    (module_dir / f"{module_name}.py").write_text(source, encoding="utf-8")
+    marker = tmp_path / "sibling_eval_marker"
+    code = f"__import__('pathlib').Path({str(marker)!r}).write_text('sibling-called')"
+    payload = _global_call_payload(module_name, "entry", _unicode_operand(code))
+    control_payload = _global_call_payload(module_name, "safe_entry", _unicode_operand("safe"))
+    child_code = """
+import pickle
+import re
+import string
+import sys
+from pathlib import Path
+
+string.Template.pattern = re.compile("nomatch")
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, Severity, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+control_payload = bytes.fromhex(sys.argv[4])
+module_name = sys.argv[5]
+shape = sys.argv[6]
+sys.path.insert(0, str(module_dir))
+
+control = scan_bytes(control_payload)
+assert control.status == ScanStatus.INCONCLUSIVE, control
+assert control.verdict in {SafetyVerdict.UNKNOWN, SafetyVerdict.SUSPICIOUS}, control
+assert any("cached string.Template runtime" in error.message for error in control.errors), control
+assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in control.findings), control
+assert not marker.exists()
+assert pickle.loads(control_payload) == "safe"
+assert not marker.exists()
+
+report = scan_bytes(payload)
+assert not marker.exists(), "scanning executed the sibling sink"
+assert pickle.loads(payload) == len("sibling-called")
+assert marker.read_text() == "sibling-called"
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict == SafetyVerdict.MALICIOUS, report
+assert any("cached string.Template runtime" in error.message for error in report.errors), report
+expected = [f"{module_name}.entry"]
+if shape == "wrapped":
+    expected.append(f"{module_name}.wrapped")
+expected.append(f"{module_name}.other")
+if shape == "deep":
+    expected.extend(f"{module_name}.hop{index}" for index in range(1, 4))
+expected.append("builtins.eval")
+assert any(
+    finding.rule_code == "DANGEROUS_CALL_GRAPH"
+    and finding.severity == Severity.CRITICAL
+    and finding.details.get("call_path") == tuple(expected)
+    for finding in report.findings
+), report
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            control_payload.hex(),
+            module_name,
+            shape,
+        ],
+    )
+    assert marker.read_text() == "sibling-called"
+
+
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-pattern qualification starts in Python 3.14")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 @pytest.mark.parametrize("warm_after_import", [False, True])

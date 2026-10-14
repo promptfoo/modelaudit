@@ -3401,7 +3401,7 @@ def _first_matching_path(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            path = error.partial_path
         except Exception:
             continue
         if path is not None:
@@ -6167,19 +6167,33 @@ def _find_matching_call_path(
     queue: deque[tuple[str, tuple[str, ...]]] = deque([(start, (start,))])
     visited = {start}
     import_execution_fallback_path: tuple[str, ...] | None = None
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path = queue.popleft()
         sink = sink_for(function_name)
         if sink is not None:
+            if analysis_limit_error is not None:
+                raise _CallGraphAnalysisLimitError(
+                    str(analysis_limit_error), partial_path=path
+                ) from analysis_limit_error
             return path
         resolved_function = _resolve_function_target(function_name)
         if resolved_function is not None and resolved_function != function_name:
             sink = sink_for(resolved_function)
             if sink is not None:
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
 
-        calls = _calls_for_function(function_name)
+        try:
+            calls = _calls_for_function(function_name)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            continue
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6197,17 +6211,30 @@ def _find_matching_call_path(
                     if import_execution_fallback_allowed and import_execution_fallback_path is None:
                         import_execution_fallback_path = (*path, sink)
                     continue
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
 
         if sink_for is _rce_sink:
             for call in sorted(bounded_calls, key=_short_sink_call_priority):
-                short_sink_path = _find_short_matching_call_path(
-                    call, sink_for, ignored_direct_import_from=ignored_direct_import_from
-                )
+                try:
+                    short_sink_path = _find_short_matching_call_path(
+                        call, sink_for, ignored_direct_import_from=ignored_direct_import_from
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    short_sink_path = error.partial_path
                 if short_sink_path is not None:
                     sink = short_sink_path[-1]
                     if _is_tcl_interpreter_dispatch_call(sink) or _is_import_execution_sink(sink):
                         continue
+                    if analysis_limit_error is not None:
+                        raise _CallGraphAnalysisLimitError(
+                            str(analysis_limit_error), partial_path=(*path, *short_sink_path)
+                        ) from analysis_limit_error
                     return (*path, *short_sink_path)
 
         for call in bounded_calls:
@@ -6218,6 +6245,10 @@ def _find_matching_call_path(
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved)))
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_path=import_execution_fallback_path
+        ) from analysis_limit_error
     return import_execution_fallback_path
 
 
@@ -6238,10 +6269,16 @@ def _find_short_matching_call_path(
 ) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...], int]] = deque([(start, (start,), 0)])
     visited = {start}
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path, depth = queue.popleft()
-        calls = _calls_for_function(function_name)
+        try:
+            calls = _calls_for_function(function_name)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            continue
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6251,6 +6288,10 @@ def _find_short_matching_call_path(
             if sink is not None:
                 if _is_import_execution_sink(sink):
                     continue
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
             if depth >= _MAX_SHORT_SINK_DEPTH:
                 continue
@@ -6259,6 +6300,8 @@ def _find_short_matching_call_path(
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved), depth + 1))
+    if analysis_limit_error is not None:
+        raise analysis_limit_error
     return None
 
 
