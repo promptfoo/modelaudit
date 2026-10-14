@@ -30,6 +30,7 @@ PYTHON_EXECUTION_NAMES = frozenset(
     {"exec", "eval", "compile", "__import__", "subprocess", "system", "popen", "runpy", "run_path", "run_module"}
     | {prefix + suffix for prefix in ("exec", "spawn") for suffix in ("l", "le", "lp", "lpe", "v", "ve", "vp", "vpe")}
     | {"posix_spawn", "posix_spawnp", "startfile"}
+    | {"CDLL", "PyDLL", "WinDLL", "OleDLL", "cdll", "pydll", "windll", "oledll", "LoadLibrary", "dlopen"}
 )
 URL_RISK_TERMS = (
     NetworkCommDetector.INFORMATIONAL_URL_RISK_TERMS
@@ -450,12 +451,36 @@ def _command_executes_script(words: list[str]) -> bool:
         words = words[1:]
     if not words or _setup_command_urls(words) is not None:
         return False
-    command = words[0].rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    command = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if (
+        not wrapped
+        and words[0].lower() == command
+        and re.fullmatch(r"(?:python[23]?|pypy3?)(?:\.\d+)?\.exe", command) is not None
+        and words[1:] in (["--version"], ["-V"], ["--help"], ["-h"])
+    ):
+        return False
     if (
         "$" in words[0]
         or (wrapped and command.startswith("-"))
         or command.endswith(
-            (".py", ".pyw", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd")
+            (
+                ".py",
+                ".pyw",
+                ".sh",
+                ".bash",
+                ".zsh",
+                ".js",
+                ".mjs",
+                ".cjs",
+                ".rb",
+                ".pl",
+                ".php",
+                ".ps1",
+                ".bat",
+                ".cmd",
+                ".exe",
+                ".com",
+            )
         )
     ):
         return True
