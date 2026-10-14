@@ -21,6 +21,7 @@ from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FI
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
@@ -3331,6 +3332,14 @@ class TextScanner(BaseScanner):
         classification_limit_sources: set[str] = set()
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
+        filename = os.path.basename(path).lower()
+        routine_url_spans = (
+            routine_documentation_url_spans(payload)
+            if findings
+            and os.path.splitext(filename)[1] in {".md", ".markdown"}
+            and (cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename))
+            else ()
+        )
         documentation_image_example_spans = (
             official_readme_urlopen_image_example_spans(payload)
             if allow_documentation_image_examples and documentation_sidecar and findings
@@ -3366,12 +3375,27 @@ class TextScanner(BaseScanner):
                 if retargeted_finding is None:
                     continue
                 finding = retargeted_finding
-            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(
-                path,
-                payload,
-                finding,
-                allow_documentation_image_examples=allow_documentation_image_examples,
-                documentation_image_example_spans=documentation_image_example_spans,
+            position = finding.get("position")
+            routine_example = (
+                isinstance(position, int)
+                and any(start <= position < end for start, end in routine_url_spans)
+                and (
+                    cls._documentation_network_command_is_correlatable(finding)
+                    or (
+                        finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES
+                        and finding.get("severity") not in {"HIGH", "CRITICAL"}
+                    )
+                )
+            )
+            if not retarget_incomplete and (
+                routine_example
+                or cls._sidecar_network_finding_is_informational(
+                    path,
+                    payload,
+                    finding,
+                    allow_documentation_image_examples=allow_documentation_image_examples,
+                    documentation_image_example_spans=documentation_image_example_spans,
+                )
             ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
