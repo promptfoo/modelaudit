@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep complete streamed pickle analysis available for oversized remote source URLs across Python versions, preserving SBOM findings and source associations.
 ### Fixed
 
+- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
+- Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit. Continue supplemental stream checks after call-graph coverage gaps, and keep operational failures unsuccessful even with trusted padding.
 - Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
 - Make the nested archive test fixture portable to Windows.
 
