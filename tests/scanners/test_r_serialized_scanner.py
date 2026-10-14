@@ -13,14 +13,21 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners import r_serialized_scanner as r_scanner_module
 from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, _r_non_code_spans
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
 from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_for_skip_filter,
     detect_format_from_extension,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.cache import check_by_name as _check_by_name
+
+
+def _single_check_status(result: ScanResult, name: str) -> CheckStatus:
+    checks = _check_by_name(result, name)
+    assert len(checks) == 1
+    return checks[0].status
 
 
 def _write_raw_r_serialized(path: Path, body: str, *, workspace_header: bool = False) -> None:
@@ -122,9 +129,7 @@ def test_scan_benign_rds_model_does_not_raise_critical(tmp_path: Path) -> None:
     assert result.success is True
     assert all(check.severity != IssueSeverity.CRITICAL for check in result.checks)
 
-    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
-    assert len(symbol_checks) == 1
-    assert symbol_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Executable Symbol Context Analysis") == CheckStatus.PASSED
 
 
 def test_scan_bounded_r_serialized_payload_is_inconclusive(tmp_path: Path) -> None:
@@ -143,8 +148,7 @@ def test_scan_read_failure_is_operationally_inconclusive_and_not_cached(tmp_path
     _write_raw_r_serialized(path, "safe\nmodel\nweights")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with patch.object(
             RSerializedScanner,
             "_read_payload_for_analysis",
@@ -180,8 +184,6 @@ def test_scan_read_failure_is_operationally_inconclusive_and_not_cached(tmp_path
             assert metadata["operational_error_reason"] == "r_serialized_read_failed"
             assert core.determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
@@ -194,8 +196,7 @@ def test_scan_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with patch(
             "modelaudit.utils.helpers.cache_decorator.should_bypass_cache_for_read_failure_aware_file",
             return_value=False,
@@ -229,8 +230,6 @@ def test_scan_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
         assert core.determine_exit_code(aggregate) == 2
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_renamed_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
@@ -243,8 +242,7 @@ def test_scan_renamed_read_failure_bypasses_stale_clean_cache(tmp_path: Path) ->
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with patch(
             "modelaudit.utils.helpers.cache_decorator.should_bypass_cache_for_read_failure_aware_file",
             return_value=False,
@@ -278,8 +276,6 @@ def test_scan_renamed_read_failure_bypasses_stale_clean_cache(tmp_path: Path) ->
         assert core.determine_exit_code(aggregate) == 2
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_unreadable_path_is_operationally_inconclusive(
@@ -339,8 +335,7 @@ def test_scan_string_extraction_ceiling_is_exit2_and_not_cached(tmp_path: Path) 
     _write_raw_r_serialized(path, "feature_000\nfeature_001\nfeature_002\nfeature_003")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = core.scan_model_directory_or_file(
             str(path),
             r_max_extracted_strings=2,
@@ -366,8 +361,6 @@ def test_scan_string_extraction_ceiling_is_exit2_and_not_cached(tmp_path: Path) 
                 issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
             )
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_dense_text_payload_still_reports_stuffing_warning(tmp_path: Path) -> None:
@@ -444,9 +437,7 @@ def test_scan_joins_function_expressions_split_across_printable_runs(tmp_path: P
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED
 
 
 def test_scan_invalid_utf8_comment_gap_does_not_suppress_credential_detection(tmp_path: Path) -> None:
@@ -458,9 +449,7 @@ def test_scan_invalid_utf8_comment_gap_does_not_suppress_credential_detection(tm
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
 
 
 def test_scan_detects_executable_call_split_at_printable_chunk_boundary(tmp_path: Path) -> None:
@@ -497,13 +486,9 @@ def test_scan_benign_rdata_workspace_passes_signature_and_context_checks(tmp_pat
 
     result = RSerializedScanner().scan(str(path))
 
-    signature_checks = _check_by_name(result, "R Serialization Signature")
-    assert len(signature_checks) == 1
-    assert signature_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "R Serialization Signature") == CheckStatus.PASSED
 
-    payload_checks = _check_by_name(result, "Serialized Expression Payload Detection")
-    assert len(payload_checks) == 1
-    assert payload_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Serialized Expression Payload Detection") == CheckStatus.PASSED
 
 
 def test_scan_detects_malicious_expression_and_bypass_noise(tmp_path: Path) -> None:
@@ -533,13 +518,9 @@ def test_scan_detects_malicious_expression_and_bypass_noise(tmp_path: Path) -> N
     assert payload_checks[0].status == CheckStatus.FAILED
     assert payload_checks[0].severity == IssueSeverity.CRITICAL
 
-    network_checks = _check_by_name(result, "Embedded Network Indicator Detection")
-    assert len(network_checks) == 1
-    assert network_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Embedded Network Indicator Detection") == CheckStatus.FAILED
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
 
 
 def test_scan_redacts_embedded_network_indicator_urls(tmp_path: Path) -> None:
@@ -654,9 +635,7 @@ def test_scan_redacts_and_detects_rightward_assignment_expressions(tmp_path: Pat
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     sample = symbol_checks[0].details["examples"][0]["sample"]
     assert 'base::system("curl")' in sample
@@ -674,9 +653,7 @@ def test_scan_redacts_and_detects_leftward_assignment_expressions(tmp_path: Path
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     sample = symbol_checks[0].details["examples"][0]["sample"]
     assert 'base::system("curl")' in sample
@@ -797,9 +774,7 @@ def test_scan_recovers_after_malformed_raw_prefix(tmp_path: Path) -> None:
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     sample = symbol_checks[0].details["examples"][0]["sample"]
     assert "LATER_RAW_SECRET" not in sample
@@ -822,9 +797,7 @@ def test_scan_detects_and_redacts_multiline_credential_assignments(tmp_path: Pat
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     sample = symbol_checks[0].details["examples"][0]["sample"]
     assert "<redacted>" in sample
@@ -841,9 +814,7 @@ def test_scan_redacts_indented_multiline_credential_assignment(tmp_path: Path) -
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     sample = symbol_checks[0].details["examples"][0]["sample"]
     assert "FIRST_SECRET" not in sample
@@ -871,9 +842,7 @@ def test_scan_detects_long_rightward_raw_credential_identifier(tmp_path: Path) -
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     sample = symbol_checks[0].details["examples"][0]["sample"]
     assert "LONG_RIGHTWARD_RAW_SECRET" not in sample
@@ -1145,9 +1114,7 @@ def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, 
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED
 
 
 @pytest.mark.parametrize(
@@ -1399,9 +1366,7 @@ def test_scan_batches_repeated_named_argument_validation(tmp_path: Path) -> None
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED
 
 
 def test_scan_deep_repeat_prefix_is_bounded_without_recursion_error(tmp_path: Path) -> None:
@@ -1410,9 +1375,7 @@ def test_scan_deep_repeat_prefix_is_bounded_without_recursion_error(tmp_path: Pa
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED
 
 
 def test_scan_expression_depth_ceiling_is_inconclusive(tmp_path: Path) -> None:
@@ -1425,9 +1388,7 @@ def test_scan_expression_depth_ceiling_is_inconclusive(tmp_path: Path) -> None:
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "r_serialized_expression_depth_incomplete" in result.metadata["scan_outcome_reasons"]
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED
     ceiling_checks = _check_by_name(result, "R Expression Analysis Ceiling")
     assert len(ceiling_checks) == 1
     assert ceiling_checks[0].details["scan_outcome_reason"] == "r_serialized_expression_depth_incomplete"
@@ -1445,9 +1406,7 @@ def test_scan_expression_depth_ceiling_preserves_earlier_credential_detection(tm
 
     assert result.success is False
     assert "r_serialized_expression_depth_incomplete" in result.metadata["scan_outcome_reasons"]
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
 
 
 def test_scan_deep_subscript_nesting_does_not_raise_recursion_error(tmp_path: Path) -> None:
@@ -1485,9 +1444,7 @@ def test_scan_continuation_ceiling_preserves_visible_credential_assignment(tmp_p
 
     assert result.success is False
     assert "r_serialized_continuation_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
 
 
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
@@ -1508,9 +1465,7 @@ def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path)
     critical_checks = [check for check in result.checks if check.severity == IssueSeverity.CRITICAL]
     assert critical_checks == []
 
-    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
-    assert len(symbol_checks) == 1
-    assert symbol_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Executable Symbol Context Analysis") == CheckStatus.PASSED
 
 
 def test_scan_corrupt_gzip_stream_is_handled_fail_closed(tmp_path: Path) -> None:
@@ -1524,9 +1479,7 @@ def test_scan_corrupt_gzip_stream_is_handled_fail_closed(tmp_path: Path) -> None
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "r_serialized_decode_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "operational_error" not in result.metadata
-    decompression_checks = _check_by_name(result, "R Serialized Decompression")
-    assert len(decompression_checks) == 1
-    assert decompression_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "R Serialized Decompression") == CheckStatus.FAILED
 
 
 def test_scan_xz_memory_limited_stream_is_handled_fail_closed(tmp_path: Path) -> None:
@@ -1538,9 +1491,7 @@ def test_scan_xz_memory_limited_stream_is_handled_fail_closed(tmp_path: Path) ->
     result = scanner.scan(str(path))
 
     assert result.success is False
-    decompression_checks = _check_by_name(result, "R Serialized Decompression")
-    assert len(decompression_checks) == 1
-    assert decompression_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "R Serialized Decompression") == CheckStatus.FAILED
 
 
 def test_scan_benign_xz_stream_passes_decompression_checks(tmp_path: Path) -> None:
@@ -1551,9 +1502,7 @@ def test_scan_benign_xz_stream_passes_decompression_checks(tmp_path: Path) -> No
     result = RSerializedScanner().scan(str(path))
 
     assert result.success is True
-    decompression_checks = _check_by_name(result, "R Serialized Decompression")
-    assert len(decompression_checks) == 1
-    assert decompression_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "R Serialized Decompression") == CheckStatus.PASSED
 
 
 def test_scan_truncated_xz_stream_is_handled_fail_closed(tmp_path: Path) -> None:
@@ -1565,9 +1514,7 @@ def test_scan_truncated_xz_stream_is_handled_fail_closed(tmp_path: Path) -> None
     result = RSerializedScanner().scan(str(path))
 
     assert result.success is False
-    decompression_checks = _check_by_name(result, "R Serialized Decompression")
-    assert len(decompression_checks) == 1
-    assert decompression_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "R Serialized Decompression") == CheckStatus.FAILED
 
 
 def test_scan_concatenated_xz_streams_preserve_later_malicious_payloads(tmp_path: Path) -> None:
@@ -1695,17 +1642,13 @@ def _assert_r_equal_assignment_detected(tmp_path: Path, assignment: str, filenam
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
 
 
 def _assert_unterminated_r_assignment(path: Path, secret: str) -> None:
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     sample = symbol_checks[0].details["examples"][0]["sample"]
     assert secret not in sample
@@ -1717,6 +1660,4 @@ def _assert_r_credential_control(path: Path, text: str) -> None:
 
     result = RSerializedScanner().scan(str(path))
 
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED

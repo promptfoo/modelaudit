@@ -21,11 +21,33 @@ def _address_info(
     family: socket.AddressFamily | None = None,
     socket_type: socket.SocketKind = socket.SOCK_STREAM,
     protocol: int = socket.IPPROTO_TCP,
+    sockaddr: tuple[object, ...] | None = None,
 ) -> list[tuple[int, int, int, str, tuple[object, ...]]]:
     resolved_family = family or (socket.AF_INET6 if ":" in address else socket.AF_INET)
-    socket_address: tuple[object, ...]
-    socket_address = (address, port, 0, 0) if resolved_family == socket.AF_INET6 else (address, port)
-    return [(resolved_family, socket_type, protocol, "", socket_address)]
+    if sockaddr is None:
+        sockaddr = (address, port, 0, 0) if resolved_family == socket.AF_INET6 else (address, port)
+    return [(resolved_family, socket_type, protocol, "", sockaddr)]
+
+
+def _webhook(name: str) -> WebhookProgressHook:
+    return WebhookProgressHook(
+        name=name,
+        webhook_url="https://hooks.example.com/modelaudit",
+        retry_attempts=1,
+        allowed_hosts={"hooks.example.com"},
+    )
+
+
+def _email_hook(name: str, smtp_host: str = "smtp.example.com") -> EmailProgressHook:
+    return EmailProgressHook(
+        name=name,
+        smtp_host=smtp_host,
+        smtp_port=587,
+        username="user",
+        password="pass",
+        from_email="scanner@example.com",
+        to_emails=["security@example.com"],
+    )
 
 
 def _stats() -> ProgressStats:
@@ -152,41 +174,6 @@ def test_unicode_url_matches_punycode_allowlist(
     assert mock_post.call_args.kwargs["headers"]["Host"] == punycode_host
 
 
-@pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.5", "192.168.1.10"])
-def test_webhook_rejects_private_dns_resolution_before_connect(
-    monkeypatch: pytest.MonkeyPatch,
-    address: str,
-) -> None:
-    monkeypatch.setattr("socket.getaddrinfo", lambda *_args, **_kwargs: _address_info(address))
-    hook = WebhookProgressHook(
-        name="dns-rebinding",
-        webhook_url="https://hooks.example.com/modelaudit",
-        retry_attempts=1,
-        allowed_hosts={"hooks.example.com"},
-    )
-
-    with patch("modelaudit.progress.hooks._post_to_pinned_address") as mock_post:
-        assert hook._send_webhook({"event_type": "progress"}) is False
-    mock_post.assert_not_called()
-
-
-def test_webhook_rejects_mixed_public_and_private_dns_answers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "socket.getaddrinfo",
-        lambda *_args, **_kwargs: _address_info() + _address_info("10.0.0.5"),
-    )
-    hook = WebhookProgressHook(
-        name="split-dns",
-        webhook_url="https://hooks.example.com/modelaudit",
-        retry_attempts=1,
-        allowed_hosts={"hooks.example.com"},
-    )
-
-    with patch("modelaudit.progress.hooks._post_to_pinned_address") as mock_post:
-        assert hook._send_webhook({"event_type": "progress"}) is False
-    mock_post.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "hostname",
     [
@@ -255,69 +242,35 @@ def test_webhook_accepts_public_ipv4_embedded_destination(hostname: str) -> None
 
 
 @pytest.mark.parametrize(
-    "address_info",
+    ("hook_name", "address_info"),
     [
-        _address_info(family=cast(socket.AddressFamily, -1)),
-        _address_info(socket_type=socket.SOCK_DGRAM),
-        _address_info(port=444),
-        [
-            (
-                socket.AF_INET,
-                socket.SOCK_STREAM,
-                socket.IPPROTO_TCP,
-                "",
-                ("2606:2800:220:1:248:1893:25c8:1946", 443),
-            )
-        ],
-        [
-            (
-                socket.AF_INET6,
-                socket.SOCK_STREAM,
-                socket.IPPROTO_TCP,
-                "",
-                ("93.184.216.34", 443, 0, 0),
-            )
-        ],
-        [
-            (
-                socket.AF_INET,
-                socket.SOCK_STREAM,
-                socket.IPPROTO_TCP,
-                "",
-                ("93.184.216.34", 443, 0, 0),
-            )
-        ],
-        [
-            (
-                socket.AF_INET6,
-                socket.SOCK_STREAM,
-                socket.IPPROTO_TCP,
-                "",
-                ("2606:2800:220:1:248:1893:25c8:1946", 443, 1, 0),
-            )
-        ],
-        [
-            (
-                socket.AF_INET6,
-                socket.SOCK_STREAM,
-                socket.IPPROTO_TCP,
-                "",
-                ("2606:2800:220:1:248:1893:25c8:1946", 443, 0, 1),
-            )
-        ],
+        pytest.param("dns-rebinding", _address_info("127.0.0.1"), id="127.0.0.1"),
+        pytest.param("dns-rebinding", _address_info("10.0.0.5"), id="10.0.0.5"),
+        pytest.param("dns-rebinding", _address_info("192.168.1.10"), id="192.168.1.10"),
+        pytest.param("split-dns", _address_info() + _address_info("10.0.0.5"), id="split-dns"),
+        ("invalid-dns", _address_info(family=cast(socket.AddressFamily, -1))),
+        ("invalid-dns", _address_info(socket_type=socket.SOCK_DGRAM)),
+        ("invalid-dns", _address_info(port=444)),
+        ("invalid-dns", _address_info(family=socket.AF_INET, sockaddr=("2606:2800:220:1:248:1893:25c8:1946", 443))),
+        ("invalid-dns", _address_info(family=socket.AF_INET6, sockaddr=("93.184.216.34", 443, 0, 0))),
+        ("invalid-dns", _address_info(family=socket.AF_INET, sockaddr=("93.184.216.34", 443, 0, 0))),
+        (
+            "invalid-dns",
+            _address_info(family=socket.AF_INET6, sockaddr=("2606:2800:220:1:248:1893:25c8:1946", 443, 1, 0)),
+        ),
+        (
+            "invalid-dns",
+            _address_info(family=socket.AF_INET6, sockaddr=("2606:2800:220:1:248:1893:25c8:1946", 443, 0, 1)),
+        ),
     ],
 )
-def test_webhook_rejects_malformed_resolver_answers(
+def test_webhook_rejects_non_public_or_malformed_dns_answers(
     monkeypatch: pytest.MonkeyPatch,
+    hook_name: str,
     address_info: list[tuple[int, int, int, str, tuple[object, ...]]],
 ) -> None:
     monkeypatch.setattr("socket.getaddrinfo", lambda *_args, **_kwargs: address_info)
-    hook = WebhookProgressHook(
-        name="invalid-dns",
-        webhook_url="https://hooks.example.com/modelaudit",
-        retry_attempts=1,
-        allowed_hosts={"hooks.example.com"},
-    )
+    hook = _webhook(hook_name)
     with patch("modelaudit.progress.hooks._post_to_pinned_address") as mock_post:
         assert hook._send_webhook({"event_type": "progress"}) is False
     mock_post.assert_not_called()
@@ -327,12 +280,7 @@ def test_webhook_uses_one_dns_snapshot_during_rebinding(monkeypatch: pytest.Monk
     resolver = MagicMock(side_effect=[_address_info(), _address_info("127.0.0.1")])
     monkeypatch.setattr("socket.getaddrinfo", resolver)
     with patch("modelaudit.progress.hooks._post_to_pinned_address", return_value=200) as mock_post:
-        hook = WebhookProgressHook(
-            name="rebind",
-            webhook_url="https://hooks.example.com/modelaudit",
-            retry_attempts=1,
-            allowed_hosts={"hooks.example.com"},
-        )
+        hook = _webhook("rebind")
         assert hook._send_webhook({"event_type": "progress"}) is True
 
     assert resolver.call_count == 1
@@ -348,12 +296,7 @@ def test_webhook_falls_back_across_validated_public_addresses(monkeypatch: pytes
         "modelaudit.progress.hooks._post_to_pinned_address",
         side_effect=[http.client.HTTPException("first address failed"), 200],
     ) as mock_post:
-        hook = WebhookProgressHook(
-            name="fallback",
-            webhook_url="https://hooks.example.com/modelaudit",
-            retry_attempts=1,
-            allowed_hosts={"hooks.example.com"},
-        )
+        hook = _webhook("fallback")
         assert hook._send_webhook({"event_type": "progress"}) is True
 
     assert [item.kwargs["resolved_address"][1] for item in mock_post.call_args_list] == [
@@ -365,12 +308,7 @@ def test_webhook_falls_back_across_validated_public_addresses(monkeypatch: pytes
 def test_webhook_rejects_redirect_without_retrying_other_address(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("socket.getaddrinfo", lambda *_args, **_kwargs: _address_info())
     with patch("modelaudit.progress.hooks._post_to_pinned_address", return_value=302) as mock_post:
-        hook = WebhookProgressHook(
-            name="redirect",
-            webhook_url="https://hooks.example.com/modelaudit",
-            retry_attempts=1,
-            allowed_hosts={"hooks.example.com"},
-        )
+        hook = _webhook("redirect")
         assert hook._send_webhook({"event_type": "progress"}) is False
     mock_post.assert_called_once()
 
@@ -516,29 +454,13 @@ def test_email_rejects_private_smtp_host_before_connect(monkeypatch: pytest.Monk
         patch("modelaudit.progress.hooks._connect_pinned_smtp") as mock_connect,
         pytest.raises(ValueError, match="not a permitted public egress"),
     ):
-        EmailProgressHook(
-            name="smtp-ssrf",
-            smtp_host="10.0.0.5",
-            smtp_port=587,
-            username="user",
-            password="pass",
-            from_email="scanner@example.com",
-            to_emails=["security@example.com"],
-        )
+        _email_hook("smtp-ssrf", smtp_host="10.0.0.5")
     mock_connect.assert_not_called()
 
 
 def test_email_requires_allowed_smtp_host() -> None:
     with pytest.raises(ValueError, match="not allowed"):
-        EmailProgressHook(
-            name="smtp-missing-allowlist",
-            smtp_host="smtp.example.com",
-            smtp_port=587,
-            username="user",
-            password="pass",
-            from_email="scanner@example.com",
-            to_emails=["security@example.com"],
-        )
+        _email_hook("smtp-missing-allowlist")
 
 
 def test_email_allowed_host_uses_pinned_address_and_preserves_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -589,15 +511,7 @@ def test_email_unicode_host_uses_idna2008_destination(monkeypatch: pytest.Monkey
     smtp_server = MagicMock()
 
     with patch("modelaudit.progress.hooks._connect_pinned_smtp", return_value=smtp_server) as mock_connect:
-        hook = EmailProgressHook(
-            name="smtp-idn",
-            smtp_host="faß.de",
-            smtp_port=587,
-            username="user",
-            password="pass",
-            from_email="scanner@example.com",
-            to_emails=["security@example.com"],
-        )
+        hook = _email_hook("smtp-idn", smtp_host="faß.de")
         assert hook._send_email("ModelAudit Scan", "body") is True
 
     assert hook.smtp_host == "xn--fa-hia.de"
@@ -608,15 +522,7 @@ def test_email_unicode_host_uses_idna2008_destination(monkeypatch: pytest.Monkey
 def test_email_rejects_private_dns_resolution_before_connect(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MODELAUDIT_PROGRESS_SMTP_ALLOWED_HOSTS", "smtp.example.com")
     monkeypatch.setattr("socket.getaddrinfo", lambda *_args, **_kwargs: _address_info("192.168.1.10", 587))
-    hook = EmailProgressHook(
-        name="smtp-dns-rebinding",
-        smtp_host="smtp.example.com",
-        smtp_port=587,
-        username="user",
-        password="pass",
-        from_email="scanner@example.com",
-        to_emails=["security@example.com"],
-    )
+    hook = _email_hook("smtp-dns-rebinding")
     with patch("modelaudit.progress.hooks._connect_pinned_smtp") as mock_connect:
         assert hook._send_email("ModelAudit Scan", "body") is False
     mock_connect.assert_not_called()
@@ -628,15 +534,7 @@ def test_email_uses_one_dns_snapshot_during_rebinding(monkeypatch: pytest.Monkey
     monkeypatch.setattr("socket.getaddrinfo", resolver)
     smtp_server = MagicMock()
     with patch("modelaudit.progress.hooks._connect_pinned_smtp", return_value=smtp_server) as mock_connect:
-        hook = EmailProgressHook(
-            name="smtp-rebind",
-            smtp_host="smtp.example.com",
-            smtp_port=587,
-            username="user",
-            password="pass",
-            from_email="scanner@example.com",
-            to_emails=["security@example.com"],
-        )
+        hook = _email_hook("smtp-rebind")
         assert hook._send_email("ModelAudit Scan", "body") is True
     assert resolver.call_count == 1
     assert mock_connect.call_args.args[2][1] == "93.184.216.34"
@@ -655,15 +553,7 @@ def test_email_falls_back_and_closes_failed_server(monkeypatch: pytest.MonkeyPat
         "modelaudit.progress.hooks._connect_pinned_smtp",
         side_effect=[failed_server, successful_server],
     ) as mock_connect:
-        hook = EmailProgressHook(
-            name="smtp-fallback",
-            smtp_host="smtp.example.com",
-            smtp_port=587,
-            username="user",
-            password="pass",
-            from_email="scanner@example.com",
-            to_emails=["security@example.com"],
-        )
+        hook = _email_hook("smtp-fallback")
         assert hook._send_email("ModelAudit Scan", "body") is True
 
     assert [item.args[2][1] for item in mock_connect.call_args_list] == ["93.184.216.34", "93.184.216.35"]

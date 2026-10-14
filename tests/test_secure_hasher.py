@@ -1,7 +1,6 @@
 """Tests for secure_hasher.py including aggregate hash computation."""
 
 import hashlib
-import tempfile
 from pathlib import Path
 
 from modelaudit.utils.helpers.secure_hasher import (
@@ -99,60 +98,58 @@ def test_compute_aggregate_hash_realistic_sha256():
     assert result == expected
 
 
-def test_secure_file_hasher_basic():
+def test_secure_file_hasher_basic(tmp_path: Path) -> None:
     """Test basic SecureFileHasher functionality."""
     hasher = SecureFileHasher()
 
-    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-        f.write("Test content")
-        temp_file = f.name
+    path = tmp_path / "input.txt"
+    path.touch(mode=0o600)
+    path.write_text("Test content")
+    temp_file = str(path)
 
-    try:
-        result = hasher.hash_file(temp_file)
+    result = hasher.hash_file(temp_file)
 
-        # Should have prefix
-        assert result.startswith("secure:")
-        # Should be valid hash
-        hash_part = result.replace("secure:", "")
-        assert len(hash_part) == 64
-    finally:
-        Path(temp_file).unlink()
+    # Should have prefix
+    assert result.startswith("secure:")
+    # Should be valid hash
+    hash_part = result.replace("secure:", "")
+    assert len(hash_part) == 64
+    # Verify that hashing preserved the input and released its handle.
+    Path(temp_file).unlink()
 
 
-def test_hash_file_secure_convenience():
+def test_hash_file_secure_convenience(tmp_path: Path) -> None:
     """Test convenience function for secure hashing."""
-    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-        f.write("Test content")
-        temp_file = f.name
+    path = tmp_path / "input.txt"
+    path.touch(mode=0o600)
+    path.write_text("Test content")
+    temp_file = str(path)
 
-    try:
-        result = hash_file_secure(temp_file)
+    result = hash_file_secure(temp_file)
 
-        assert result.startswith("secure:")
-        hash_part = result.replace("secure:", "")
-        assert len(hash_part) == 64
-    finally:
-        Path(temp_file).unlink()
+    assert result.startswith("secure:")
+    hash_part = result.replace("secure:", "")
+    assert len(hash_part) == 64
+    Path(temp_file).unlink()
 
 
-def test_verify_file_hash():
+def test_verify_file_hash(tmp_path: Path) -> None:
     """Test hash verification."""
-    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-        f.write("Test content")
-        temp_file = f.name
+    path = tmp_path / "input.txt"
+    path.touch(mode=0o600)
+    path.write_text("Test content")
+    temp_file = str(path)
 
-    try:
-        # Hash the file
-        file_hash = hash_file_secure(temp_file)
+    # Hash the file
+    file_hash = hash_file_secure(temp_file)
 
-        # Verify should succeed
-        assert verify_file_hash(temp_file, file_hash) is True
+    # Verify should succeed
+    assert verify_file_hash(temp_file, file_hash) is True
 
-        # Wrong hash should fail
-        wrong_hash = "secure:" + "0" * 64
-        assert verify_file_hash(temp_file, wrong_hash) is False
-    finally:
-        Path(temp_file).unlink()
+    # Wrong hash should fail
+    wrong_hash = "secure:" + "0" * 64
+    assert verify_file_hash(temp_file, wrong_hash) is False
+    Path(temp_file).unlink()
 
 
 def test_compute_aggregate_hash_with_model_scan():

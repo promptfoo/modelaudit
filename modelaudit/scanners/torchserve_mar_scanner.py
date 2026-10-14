@@ -2537,47 +2537,11 @@ class TorchServeMarScanner(BaseScanner):
                 return merged
 
             @staticmethod
-            def _merge_generator_aliases(
-                left: _DynamicGeneratorAliases,
-                right: _DynamicGeneratorAliases,
-            ) -> _DynamicGeneratorAliases:
-                merged: _DynamicGeneratorAliases = {}
-                for name in left.keys() | right.keys():
-                    alternatives = _merge_dynamic_ast_alternatives(left.get(name), right.get(name))
-                    if alternatives:
-                        merged[name] = alternatives
-                return merged
-
-            @staticmethod
-            def _merge_lambda_aliases(
-                left: _DynamicLambdaAliases,
-                right: _DynamicLambdaAliases,
-            ) -> _DynamicLambdaAliases:
-                merged: _DynamicLambdaAliases = {}
-                for name in left.keys() | right.keys():
-                    alternatives = _merge_dynamic_ast_alternatives(left.get(name), right.get(name))
-                    if alternatives:
-                        merged[name] = alternatives
-                return merged
-
-            @staticmethod
-            def _merge_literal_iterable_aliases(
-                left: _DynamicLiteralIterableAliases,
-                right: _DynamicLiteralIterableAliases,
-            ) -> _DynamicLiteralIterableAliases:
-                merged: _DynamicLiteralIterableAliases = {}
-                for name in left.keys() | right.keys():
-                    alternatives = _merge_dynamic_ast_alternatives(left.get(name), right.get(name))
-                    if alternatives:
-                        merged[name] = alternatives
-                return merged
-
-            @staticmethod
-            def _merge_function_aliases(
-                left: _DynamicFunctionAliases,
-                right: _DynamicFunctionAliases,
-            ) -> _DynamicFunctionAliases:
-                merged: _DynamicFunctionAliases = {}
+            def _merge_ast_aliases(
+                left: dict[str, _DynamicAstAlternatives[_DynamicAstNode]],
+                right: dict[str, _DynamicAstAlternatives[_DynamicAstNode]],
+            ) -> dict[str, _DynamicAstAlternatives[_DynamicAstNode]]:
+                merged: dict[str, _DynamicAstAlternatives[_DynamicAstNode]] = {}
                 for name in left.keys() | right.keys():
                     alternatives = _merge_dynamic_ast_alternatives(left.get(name), right.get(name))
                     if alternatives:
@@ -2602,11 +2566,11 @@ class TorchServeMarScanner(BaseScanner):
                     self._merge_possible_aliases(left[2], right[2]),
                     self._merge_import_aliases(left[3], right[3]),
                     left[4] & right[4],
-                    self._merge_generator_aliases(left[5], right[5]),
+                    self._merge_ast_aliases(left[5], right[5]),
                     self._merge_static_truthiness_aliases(left[6], right[6]),
-                    self._merge_lambda_aliases(left[7], right[7]),
-                    self._merge_literal_iterable_aliases(left[8], right[8]),
-                    self._merge_function_aliases(left[9], right[9]),
+                    self._merge_ast_aliases(left[7], right[7]),
+                    self._merge_ast_aliases(left[8], right[8]),
+                    self._merge_ast_aliases(left[9], right[9]),
                 )
 
             def _merge_state_list(self, states: list[_DynamicAliasState]) -> _DynamicAliasState:

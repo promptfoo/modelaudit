@@ -111,6 +111,16 @@ __all__ = [
 ]
 
 
+def _huggingface_request_timeout(repo_id: str, deadline: float | None) -> float:
+    """Bound a request timeout by the end-to-end acquisition deadline."""
+    if deadline is None:
+        return 30.0
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    return min(30.0, remaining)
+
+
 @dataclass
 class _HuggingFaceProbeBudget:
     remaining_bytes: int
@@ -134,12 +144,7 @@ class _HuggingFaceProbeBudget:
 
     def request_timeout(self, repo_id: str) -> float:
         """Return a per-request timeout bounded by the overall acquisition deadline."""
-        if self.deadline is None:
-            return 30.0
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        return min(30.0, remaining)
+        return _huggingface_request_timeout(repo_id, self.deadline)
 
     def check_deadline(self, repo_id: str) -> None:
         """Fail when the end-to-end acquisition deadline has expired."""
@@ -2002,6 +2007,65 @@ def _read_huggingface_probe(
     return _read_huggingface_prefix(repo_id, filename, revision, budget, max_bytes)
 
 
+def _read_huggingface_probe_range_payload(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    start_offset: int,
+    read_size: int,
+    file_size: int,
+    range_kind: Literal["tail", "range"],
+) -> bytes:
+    """Read and validate an already-reserved bounded remote range."""
+    import requests
+    from huggingface_hub import hf_hub_url
+    from huggingface_hub.utils import build_hf_headers
+
+    end_offset = start_offset + read_size - 1
+    file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+    headers = build_hf_headers(
+        token=None,
+        headers={
+            "Range": f"bytes={start_offset}-{end_offset}",
+            "Accept-Encoding": "identity",
+        },
+    )
+    with requests.get(
+        file_url,
+        headers=headers,
+        stream=True,
+        timeout=budget.request_timeout(repo_id),
+        allow_redirects=True,
+    ) as response:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=read_size):
+            budget.check_deadline(repo_id)
+            if not chunk:
+                continue
+            budget.transferred_bytes += len(chunk)
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= read_size:
+                break
+        payload = b"".join(chunks)[:read_size]
+        content_range = getattr(response, "headers", {}).get("Content-Range", "")
+        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+        if getattr(response, "status_code", None) != 206 or match is None:
+            raise ValueError(f"{range_kind} Hugging Face response omitted a valid Content-Range")
+        reported_start, reported_end, reported_size = (int(value) for value in match.groups())
+        if (
+            reported_start != start_offset
+            or reported_end != end_offset
+            or reported_size != file_size
+            or len(payload) != read_size
+        ):
+            raise ValueError(f"{range_kind} Hugging Face response reported an inconsistent Content-Range")
+    return payload
+
+
 def _read_huggingface_tail(
     repo_id: str,
     filename: str,
@@ -2024,51 +2088,9 @@ def _read_huggingface_tail(
 
     budget.reserve(repo_id, read_size)
     try:
-        import requests
-        from huggingface_hub import hf_hub_url
-        from huggingface_hub.utils import build_hf_headers
-
-        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
-        headers = build_hf_headers(
-            token=None,
-            headers={
-                "Range": f"bytes={start_offset}-{file_size - 1}",
-                "Accept-Encoding": "identity",
-            },
+        return _read_huggingface_probe_range_payload(
+            repo_id, filename, revision, budget, start_offset, read_size, file_size, "tail"
         )
-        with requests.get(
-            file_url,
-            headers=headers,
-            stream=True,
-            timeout=budget.request_timeout(repo_id),
-            allow_redirects=True,
-        ) as response:
-            response.raise_for_status()
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=read_size):
-                budget.check_deadline(repo_id)
-                if not chunk:
-                    continue
-                budget.transferred_bytes += len(chunk)
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= read_size:
-                    break
-            tail = b"".join(chunks)[:read_size]
-            content_range = getattr(response, "headers", {}).get("Content-Range", "")
-            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
-            if getattr(response, "status_code", None) != 206 or match is None:
-                raise ValueError("tail Hugging Face response omitted a valid Content-Range")
-            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
-            if (
-                reported_start != start_offset
-                or reported_end != file_size - 1
-                or reported_size != file_size
-                or len(tail) != read_size
-            ):
-                raise ValueError("tail Hugging Face response reported an inconsistent Content-Range")
-        return tail
     except Exception as exc:
         raise ValueError(
             "Hugging Face selective filtering incomplete: unable to inspect skipped file "
@@ -2105,54 +2127,13 @@ def _read_huggingface_range(
     if remote_size <= 0:
         return b"".join(chunks)[:read_size]
 
-    remote_end = remote_start + remote_size - 1
     budget.reserve(repo_id, remote_size)
     try:
-        import requests
-        from huggingface_hub import hf_hub_url
-        from huggingface_hub.utils import build_hf_headers
-
-        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
-        headers = build_hf_headers(
-            token=None,
-            headers={
-                "Range": f"bytes={remote_start}-{remote_end}",
-                "Accept-Encoding": "identity",
-            },
+        chunks.append(
+            _read_huggingface_probe_range_payload(
+                repo_id, filename, revision, budget, remote_start, remote_size, file_size, "range"
+            )
         )
-        with requests.get(
-            file_url,
-            headers=headers,
-            stream=True,
-            timeout=budget.request_timeout(repo_id),
-            allow_redirects=True,
-        ) as response:
-            response.raise_for_status()
-            remote_chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=remote_size):
-                budget.check_deadline(repo_id)
-                if not chunk:
-                    continue
-                budget.transferred_bytes += len(chunk)
-                remote_chunks.append(chunk)
-                total += len(chunk)
-                if total >= remote_size:
-                    break
-            remote_payload = b"".join(remote_chunks)[:remote_size]
-            content_range = getattr(response, "headers", {}).get("Content-Range", "")
-            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
-            if getattr(response, "status_code", None) != 206 or match is None:
-                raise ValueError("range Hugging Face response omitted a valid Content-Range")
-            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
-            if (
-                reported_start != remote_start
-                or reported_end != remote_end
-                or reported_size != file_size
-                or len(remote_payload) != remote_size
-            ):
-                raise ValueError("range Hugging Face response reported an inconsistent Content-Range")
-            chunks.append(remote_payload)
         return b"".join(chunks)[:read_size]
     except Exception as exc:
         raise ValueError(
@@ -2167,9 +2148,19 @@ def _detect_huggingface_media_route(
     revision: str,
     budget: _HuggingFaceProbeBudget,
     prefix: bytes,
-    find_media_end: Callable[[int, Callable[[int, int], bytes]], int | None],
 ) -> str | None:
-    """Route media using a structural reader with shared bounded remote ranges."""
+    """Route PNG chunk framing or JPEG markers using shared bounded remote reads."""
+    from modelaudit.utils.file.detection import _PNG_SIGNATURE, _find_png_end_with_reader
+
+    if prefix.startswith(_PNG_SIGNATURE):
+        find_media_end = _find_png_end_with_reader
+    else:
+        from modelaudit.utils.file.detection import _find_jpeg_end_with_reader
+
+        if not prefix.startswith(b"\xff\xd8"):
+            return None
+        find_media_end = _find_jpeg_end_with_reader
+
     from modelaudit.utils.file.detection import (
         MEDIA_ROUTE_READ_BYTES,
         MEDIA_ROUTE_TAIL_READ_BYTES,
@@ -2232,36 +2223,6 @@ def _detect_huggingface_media_route(
     except ValueError:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
-
-
-def _detect_huggingface_png_media_route(
-    repo_id: str,
-    filename: str,
-    revision: str,
-    budget: _HuggingFaceProbeBudget,
-    prefix: bytes,
-) -> str | None:
-    """Return a PNG media route by walking chunk framing with sparse range reads."""
-    from modelaudit.utils.file.detection import _PNG_SIGNATURE, _find_png_end_with_reader
-
-    if not prefix.startswith(_PNG_SIGNATURE):
-        return None
-    return _detect_huggingface_media_route(repo_id, filename, revision, budget, prefix, _find_png_end_with_reader)
-
-
-def _detect_huggingface_jpeg_media_route(
-    repo_id: str,
-    filename: str,
-    revision: str,
-    budget: _HuggingFaceProbeBudget,
-    prefix: bytes,
-) -> str | None:
-    """Return a JPEG media route by walking marker structure with sparse range reads."""
-    from modelaudit.utils.file.detection import _find_jpeg_end_with_reader
-
-    if not prefix.startswith(b"\xff\xd8"):
-        return None
-    return _detect_huggingface_media_route(repo_id, filename, revision, budget, prefix, _find_jpeg_end_with_reader)
 
 
 def _looks_like_safetensors_prefix(
@@ -2987,9 +2948,7 @@ def _detect_huggingface_content_route_format(
         return mxnet_route
 
     if remote_path.suffix.lower() in _MEDIA_ROUTING_SUFFIXES:
-        media_route = _detect_huggingface_png_media_route(repo_id, filename, revision, budget, prefix)
-        if media_route is None:
-            media_route = _detect_huggingface_jpeg_media_route(repo_id, filename, revision, budget, prefix)
+        media_route = _detect_huggingface_media_route(repo_id, filename, revision, budget, prefix)
         if media_route is None:
             media_tail = _read_huggingface_tail(
                 repo_id,
@@ -4479,14 +4438,7 @@ def _verify_huggingface_selection_within_max_size(
                 raise ValueError(
                     f"Cannot verify max-size for {repo_id}: downloaded selected file symlink target escaped: {filename}"
                 )
-        if not file_path.is_file():
-            raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
-        try:
-            file_size = file_path.stat().st_size
-        except OSError as exc:
-            raise ValueError(
-                f"Cannot verify max-size for {repo_id}: downloaded selected file unreadable: {filename}"
-            ) from exc
+        file_size = _get_downloaded_huggingface_file_size(repo_id, file_path, filename)
         total_size += file_size
         if total_size > size_limit:
             raise ValueError(
@@ -5113,10 +5065,7 @@ def get_model_info(
     try:
         repo_info_kwargs: dict[str, Any] = {"files_metadata": True}
         if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-            repo_info_kwargs["timeout"] = min(30.0, remaining)
+            repo_info_kwargs["timeout"] = _huggingface_request_timeout(repo_id, deadline)
         if requested_revision is not None:
             repo_info_kwargs["revision"] = requested_revision
         model_info = api.repo_info(repo_id, **repo_info_kwargs)
@@ -5194,11 +5143,9 @@ def _get_model_size_with_deadline(
     """Return model size without allowing the optional lookup to outlive acquisition."""
     if deadline is None:
         return get_model_size(repo_id, revision=revision)
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    request_timeout = _huggingface_request_timeout(repo_id, deadline)
     try:
-        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": min(30.0, remaining)}
+        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": request_timeout}
         if revision is not None:
             operation_kwargs["revision"] = revision
         worker_result = _run_huggingface_worker_with_deadline(
@@ -5371,11 +5318,7 @@ def plan_huggingface_model_download(
     if deadline is None and timeout_seconds is not None:
         deadline = time.monotonic() + timeout_seconds
 
-    listing_timeout = 30.0
-    if deadline is not None:
-        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-        if listing_timeout <= 0:
-            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    listing_timeout = _huggingface_request_timeout(repo_id, deadline)
     repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
         repo_id,
         listing_timeout,
@@ -5452,11 +5395,7 @@ def plan_huggingface_streaming_download(
     size_limit = _normalize_download_size_limit(max_size)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
-    listing_timeout = 30.0
-    if deadline is not None:
-        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-        if listing_timeout <= 0:
-            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    listing_timeout = _huggingface_request_timeout(repo_id, deadline)
     repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
         repo_id,
         listing_timeout,
@@ -6019,22 +5958,13 @@ def download_model_streaming(
                 if cache_dir is not None:
                     download_kwargs["cache_dir"] = str(cache_dir / "huggingface")
                 download_kwargs["local_dir"] = str(download_path)
-                local_path = _run_huggingface_download_with_deadline(
-                    "hf_hub_download",
-                    download_kwargs,
-                    deadline,
-                    repo_id,
-                    direct_download=hf_hub_download,
-                )
-            else:
-                # Use HF default cache
-                local_path = _run_huggingface_download_with_deadline(
-                    "hf_hub_download",
-                    download_kwargs,
-                    deadline,
-                    repo_id,
-                    direct_download=hf_hub_download,
-                )
+            local_path = _run_huggingface_download_with_deadline(
+                "hf_hub_download",
+                download_kwargs,
+                deadline,
+                repo_id,
+                direct_download=hf_hub_download,
+            )
             downloaded_path = Path(local_path)
             if download_path is not None:
                 intended_path = Path(os.path.abspath(download_path.joinpath(*PurePosixPath(filename).parts)))
@@ -6180,70 +6110,44 @@ def download_model_streaming(
                     for external_filename in external_data_files:
                         if deadline is not None and time.monotonic() >= deadline:
                             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-                        if external_filename in selected_file_set:
-                            downloaded_selected_path = downloaded_selected_paths.get(external_filename)
-                            if downloaded_selected_path is not None and downloaded_selected_path.is_file():
-                                continue
-                            external_path = prefetched_selected_paths.get(external_filename)
-                            if external_path is None or not external_path.is_file():
-                                if size_limit is not None:
-                                    advertised_size = selected_sizes[external_filename]
-                                    projected_total = downloaded_total_size + advertised_size
-                                    if projected_total > size_limit:
-                                        raise ValueError(
-                                            f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
-                                            f"external_data file {external_filename} would total {projected_total} "
-                                            f"bytes, exceeding max size {size_limit} bytes"
-                                        )
-                                external_path = download_stream_file(external_filename)
-                                if size_limit is not None:
-                                    external_file_size = _get_downloaded_huggingface_file_size(
-                                        repo_id,
-                                        external_path,
-                                        external_filename,
+                        selected_external = external_filename in selected_file_set
+                        downloaded_selected_path = (
+                            downloaded_selected_paths.get(external_filename) if selected_external else None
+                        )
+                        if downloaded_selected_path is not None and downloaded_selected_path.is_file():
+                            continue
+                        external_paths = prefetched_selected_paths if selected_external else downloaded_context_paths
+                        external_path = external_paths.get(external_filename)
+                        if external_path is None or not external_path.is_file():
+                            source_label = "selected ONNX" if selected_external else "ONNX"
+                            if size_limit is not None:
+                                advertised_sizes = selected_sizes if selected_external else external_data_sizes
+                                projected_total = downloaded_total_size + advertised_sizes[external_filename]
+                                if projected_total > size_limit:
+                                    raise ValueError(
+                                        f"Cannot download {repo_id}: downloaded bytes plus {source_label} "
+                                        f"external_data file {external_filename} would total {projected_total} "
+                                        f"bytes, exceeding max size {size_limit} bytes"
                                     )
-                                    projected_total = downloaded_total_size + external_file_size
-                                    if projected_total > size_limit:
-                                        raise ValueError(
-                                            f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
-                                            f"external_data file {external_filename} would total {projected_total} "
-                                            f"bytes, exceeding max size {size_limit} bytes"
-                                        )
-                                    downloaded_total_size = projected_total
-                                if downloaded_selected_path is None:
-                                    prefetched_selected_paths[external_filename] = external_path
-                            if downloaded_selected_path is not None:
-                                downloaded_selected_paths[external_filename] = external_path
-                                continue
-                            continue
-                        external_path = downloaded_context_paths.get(external_filename)
-                        if external_path is not None and external_path.is_file():
-                            continue
-                        if size_limit is not None:
-                            advertised_size = external_data_sizes[external_filename]
-                            projected_total = downloaded_total_size + advertised_size
-                            if projected_total > size_limit:
-                                raise ValueError(
-                                    f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
-                                    f"{external_filename} would total {projected_total} bytes, exceeding max size "
-                                    f"{size_limit} bytes"
+                            external_path = download_stream_file(external_filename)
+                            if size_limit is not None:
+                                external_file_size = _get_downloaded_huggingface_file_size(
+                                    repo_id,
+                                    external_path,
+                                    external_filename,
                                 )
-                        external_path = download_stream_file(external_filename)
-                        if size_limit is not None:
-                            external_file_size = _get_downloaded_huggingface_file_size(
-                                repo_id,
-                                external_path,
-                                external_filename,
-                            )
-                            projected_total = downloaded_total_size + external_file_size
-                            if projected_total > size_limit:
-                                raise ValueError(
-                                    f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
-                                    f"{external_filename} would total {projected_total} bytes, exceeding max size "
-                                    f"{size_limit} bytes"
-                                )
-                            downloaded_total_size = projected_total
-                        downloaded_context_paths[external_filename] = external_path
+                                projected_total = downloaded_total_size + external_file_size
+                                if projected_total > size_limit:
+                                    raise ValueError(
+                                        f"Cannot download {repo_id}: downloaded bytes plus {source_label} "
+                                        f"external_data file {external_filename} would total {projected_total} "
+                                        f"bytes, exceeding max size {size_limit} bytes"
+                                    )
+                                downloaded_total_size = projected_total
+                            if downloaded_selected_path is None:
+                                external_paths[external_filename] = external_path
+                        if downloaded_selected_path is not None:
+                            downloaded_selected_paths[external_filename] = external_path
 
             return downloaded_file
 
@@ -6385,11 +6289,7 @@ def download_file_from_hf(
         repo_revision: str | None = None
         repo_listing_error: str | None = None
         if repository_file_inventory is not None:
-            listing_timeout = 30.0
-            if deadline is not None:
-                listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-                if listing_timeout <= 0:
-                    raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            listing_timeout = _huggingface_request_timeout(repo_id, deadline)
             repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
                 repo_id,
                 listing_timeout,

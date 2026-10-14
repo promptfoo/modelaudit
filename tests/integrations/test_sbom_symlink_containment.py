@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,28 @@ from modelaudit.integrations.sbom_generator import (
     generate_sbom_pydantic,
 )
 from modelaudit.models import FileHashesModel, FileMetadataModel, create_initial_audit_result
+
+
+def _generate_empty_sbom(path: Path, use_pydantic: bool) -> str:
+    if use_pydantic:
+        return generate_sbom_pydantic([str(path)], create_initial_audit_result())
+    return generate_sbom([str(path)], {"issues": [], "file_metadata": {}})
+
+
+def _patch_open(monkeypatch: pytest.MonkeyPatch, before_open: Callable[[str], None]) -> None:
+    real_open = os.open
+
+    def open_file(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        before_open(path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", open_file)
 
 
 def _component_named(sbom_data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -125,25 +148,14 @@ def test_sbom_rejects_fifo_without_opening(
     scan_root.mkdir()
     fifo_path = scan_root / "model.bin"
     os.mkfifo(fifo_path)
-    real_open = os.open
 
-    def reject_fifo_open(
-        path: str,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
+    def reject_fifo_open(path: str) -> None:
         if path in {str(fifo_path), fifo_path.name}:
             raise AssertionError("SBOM hashing must reject a known FIFO before opening it")
-        return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "open", reject_fifo_open)
+    _patch_open(monkeypatch, reject_fifo_open)
 
-    if use_pydantic:
-        sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
-    else:
-        sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
+    sbom_text = _generate_empty_sbom(scan_root, use_pydantic)
 
     component = _component_named(json.loads(sbom_text), fifo_path.name)
     assert _sha256_values(component) == []
@@ -160,29 +172,18 @@ def test_sbom_omits_hash_when_file_becomes_directory_before_open(
     scan_root.mkdir()
     model_file = scan_root / "model.bin"
     model_file.write_bytes(b"regular before enumeration")
-    real_open = os.open
     replaced = False
 
-    def _replace_file_before_open(
-        path: str,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
+    def _replace_file_before_open(path: str) -> None:
         nonlocal replaced
         if path in {model_file.name, str(model_file)} and not replaced:
             replaced = True
             model_file.unlink()
             model_file.mkdir()
-        return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "open", _replace_file_before_open)
+    _patch_open(monkeypatch, _replace_file_before_open)
 
-    if use_pydantic:
-        sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
-    else:
-        sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
+    sbom_text = _generate_empty_sbom(scan_root, use_pydantic)
 
     component = _component_named(json.loads(sbom_text), model_file.name)
     assert replaced is True
@@ -269,24 +270,16 @@ def test_sbom_omits_hash_when_regular_file_becomes_outside_root_symlink_before_o
     outside_content = b"outside target must never be hashed after the file swap"
     outside_file.write_bytes(outside_content)
 
-    real_open = os.open
     swapped = False
 
-    def _swap_file_before_open(
-        path: str,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
+    def _swap_file_before_open(path: str) -> None:
         nonlocal swapped
         if path in {str(model_file), model_file.name} and not swapped:
             swapped = True
             model_file.unlink()
             model_file.symlink_to(outside_file)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "open", _swap_file_before_open)
+    _patch_open(monkeypatch, _swap_file_before_open)
 
     sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
     component = _component_named(sbom_data, "swapped.bin")
@@ -314,24 +307,16 @@ def test_sbom_hashing_stays_bound_to_open_parent_directory_during_swap(
     (outside_parent / model_file.name).write_bytes(outside_content)
     moved_parent = scan_root / "models-original"
 
-    real_open = os.open
     swapped = False
 
-    def _swap_parent_before_file_open(
-        path: str,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
+    def _swap_parent_before_file_open(path: str) -> None:
         nonlocal swapped
         if path in {model_file.name, str(model_file)} and not swapped:
             swapped = True
             parent.rename(moved_parent)
             parent.symlink_to(outside_parent, target_is_directory=True)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "open", _swap_parent_before_file_open)
+    _patch_open(monkeypatch, _swap_parent_before_file_open)
 
     sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
     component = _component_named(sbom_data, model_file.name)
@@ -484,20 +469,12 @@ def test_sbom_preserves_recorded_hash_for_trusted_streamed_asset(
         "assets": [{"path": str(streamed_path), "type": "pickle", "is_streamed": True}],
         "file_metadata": {str(streamed_path): metadata},
     }
-    real_open = os.open
 
-    def _reject_late_streamed_path_open(
-        path: str,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
+    def _reject_late_streamed_path_open(path: str) -> None:
         if path == str(streamed_path):
             raise AssertionError("missing streamed paths must use trusted metadata without reopening")
-        return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "open", _reject_late_streamed_path_open)
+    _patch_open(monkeypatch, _reject_late_streamed_path_open)
 
     sbom_data: dict[str, Any] = json.loads(generate_sbom([str(streamed_path)], results))
     component = _component_named(sbom_data, streamed_path.name)
@@ -548,10 +525,7 @@ def test_sbom_enumeration_stays_bound_to_replaced_scan_root(
     if real_fwalk is not None:
         monkeypatch.setattr(os, "fwalk", _replace_root_before_fwalk)
 
-    if use_pydantic:
-        sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
-    else:
-        sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
+    sbom_text = _generate_empty_sbom(scan_root, use_pydantic)
     sbom_data: dict[str, Any] = json.loads(sbom_text)
 
     assert outside_hash not in json.dumps(sbom_data)
@@ -570,50 +544,25 @@ def test_sbom_enumeration_stays_bound_to_replaced_scan_root(
     reason="execute-only directory descriptors are unavailable",
 )
 @pytest.mark.parametrize("use_pydantic", [False, True])
-def test_sbom_hashes_single_file_beneath_execute_only_parent(
+@pytest.mark.parametrize("scan_directory", [False, True], ids=["single_file", "directory"])
+def test_sbom_hashes_beneath_execute_only_parent(
     tmp_path: Path,
     use_pydantic: bool,
+    scan_directory: bool,
 ) -> None:
     parent = tmp_path / "execute-only"
-    parent.mkdir()
-    model_file = parent / "model.bin"
-    content = b"readable file beneath an execute-only parent"
-    model_file.write_bytes(content)
-    parent.chmod(0o111)
-    try:
-        if use_pydantic:
-            sbom_text = generate_sbom_pydantic([str(model_file)], create_initial_audit_result())
-        else:
-            sbom_text = generate_sbom([str(model_file)], {"issues": [], "file_metadata": {}})
-    finally:
-        parent.chmod(0o700)
-
-    component = _component_named(json.loads(sbom_text), model_file.name)
-    assert _sha256_values(component) == [hashlib.sha256(content).hexdigest()]
-    assert _property_value(component, "size") == str(len(content))
-
-
-@pytest.mark.skipif(
-    os.name == "nt" or not (hasattr(os, "O_PATH") or hasattr(os, "O_SEARCH")),
-    reason="execute-only directory descriptors are unavailable",
-)
-@pytest.mark.parametrize("use_pydantic", [False, True])
-def test_sbom_hashes_directory_beneath_execute_only_parent(
-    tmp_path: Path,
-    use_pydantic: bool,
-) -> None:
-    parent = tmp_path / "execute-only"
-    scan_root = parent / "models"
+    scan_root = parent / "models" if scan_directory else parent
     scan_root.mkdir(parents=True)
     model_file = scan_root / "model.bin"
-    content = b"readable scan root beneath an execute-only parent"
+    content = (
+        b"readable scan root beneath an execute-only parent"
+        if scan_directory
+        else b"readable file beneath an execute-only parent"
+    )
     model_file.write_bytes(content)
     parent.chmod(0o111)
     try:
-        if use_pydantic:
-            sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
-        else:
-            sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
+        sbom_text = _generate_empty_sbom(scan_root if scan_directory else model_file, use_pydantic)
     finally:
         parent.chmod(0o700)
 

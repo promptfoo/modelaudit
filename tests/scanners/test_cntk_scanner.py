@@ -7,6 +7,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.cntk_scanner import DISCOVERY_ASSUMPTIONS, CntkScanner
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.cache import scan_without_cache as _scan_without_cache
 
 
@@ -208,8 +209,7 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
     assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -227,8 +227,6 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
             assert "cntk_bounded_read_incomplete" in aggregate.file_metadata[str(path)]["scan_outcome_reasons"]
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
@@ -246,8 +244,7 @@ def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
     direct = CntkScanner().scan(str(path))
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -264,8 +261,6 @@ def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
         for aggregate in (first, second):
             _assert_cntk_read_failure(direct, aggregate, path)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_cntk_scanner_signature_read_failure_is_inconclusive(
@@ -283,8 +278,7 @@ def test_cntk_scanner_signature_read_failure_is_inconclusive(
     result = CntkScanner().scan(str(path))
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -301,8 +295,6 @@ def test_cntk_scanner_signature_read_failure_is_inconclusive(
         for aggregate in (first, second):
             _assert_cntk_read_failure(result, aggregate, path)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_cntk_scanner_marks_late_string_payload_inconclusive(
@@ -328,8 +320,7 @@ def test_cntk_scanner_marks_late_string_payload_inconclusive(
     assert budget_checks[0].details["analysis_incomplete"] is True
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -347,8 +338,6 @@ def test_cntk_scanner_marks_late_string_payload_inconclusive(
             assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_cntk_scanner_inconclusive_warning_signal_is_not_successful(

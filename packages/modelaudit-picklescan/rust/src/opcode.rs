@@ -3,6 +3,7 @@ use std::borrow::Cow;
 pub(crate) const MAX_PROTOCOL0_LINE_OPERAND_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum ArgValue {
     None,
     Int(i64),
@@ -34,19 +35,6 @@ impl ArgValue {
         }
     }
 
-    pub(crate) fn raw_bytes<'payload>(
-        &'payload self,
-        payload: &'payload [u8],
-    ) -> Option<Cow<'payload, [u8]>> {
-        match self {
-            ArgValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
-                Some(Cow::Borrowed(&payload[*start..*end]))
-            }
-            ArgValue::DecodedString { bytes, .. } => Some(Cow::Borrowed(bytes.as_slice())),
-            _ => None,
-        }
-    }
-
     pub(crate) fn text<'payload>(&self, payload: &'payload [u8]) -> Cow<'payload, str> {
         match self {
             ArgValue::Text(value) => Cow::Owned(value.clone()),
@@ -64,19 +52,9 @@ impl ArgValue {
         }
     }
 
-    pub(crate) fn global_parts(&self, payload: &[u8]) -> (String, String) {
+    pub(crate) fn global_parts(&self) -> (String, String) {
         match self {
             ArgValue::Global { module, name } => (module.clone(), name.clone()),
-            ArgValue::Text(_)
-            | ArgValue::DecodedString { .. }
-            | ArgValue::TextSpan { .. }
-            | ArgValue::Bytes { .. } => {
-                let value = self.text(payload);
-                let mut parts = value.splitn(2, ' ');
-                let module = parts.next().unwrap_or_default().to_string();
-                let name = parts.next().unwrap_or_default().to_string();
-                (module, name)
-            }
             _ => ("".to_string(), "".to_string()),
         }
     }
@@ -158,313 +136,200 @@ pub(crate) fn parse_opcode(
     let op = payload[index];
     let mut cursor = index + 1;
 
-    let parsed = match op {
-        b'I' => ParsedOpcode {
-            name: "INT",
-            arg: ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
-            pos: index,
-            next: cursor,
-        },
-        b'J' => ParsedOpcode {
-            name: "BININT",
-            arg: ArgValue::Int(read_i32_le(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        b'K' => ParsedOpcode {
-            name: "BININT1",
-            arg: ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        b'M' => ParsedOpcode {
-            name: "BININT2",
-            arg: ArgValue::Int(read_u16_le(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        b'L' => ParsedOpcode {
-            name: "LONG",
-            arg: ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
-            pos: index,
-            next: cursor,
-        },
+    let (name, arg) = match op {
+        b'I' => (
+            "INT",
+            ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
+        ),
+        b'J' => (
+            "BININT",
+            ArgValue::Int(read_i32_le(payload, &mut cursor, limit)? as i64),
+        ),
+        b'K' => (
+            "BININT1",
+            ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
+        ),
+        b'M' => (
+            "BININT2",
+            ArgValue::Int(read_u16_le(payload, &mut cursor, limit)? as i64),
+        ),
+        b'L' => (
+            "LONG",
+            ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
+        ),
         0x8a => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
             let (start, end) = read_fixed_width_span(payload, &mut cursor, limit, len, "long1")?;
-            ParsedOpcode {
-                name: "LONG1",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("LONG1", ArgValue::Bytes { start, end })
         }
         0x8b => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
             let (start, end) = read_fixed_width_span(payload, &mut cursor, limit, len, "long4")?;
-            ParsedOpcode {
-                name: "LONG4",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("LONG4", ArgValue::Bytes { start, end })
         }
         b'S' => {
             let literal = read_line_bytes(payload, &mut cursor, limit)?;
             let bytes = parse_pickle_string_literal_bytes(&literal);
-            ParsedOpcode {
-                name: "STRING",
-                arg: ArgValue::DecodedString {
+            (
+                "STRING",
+                ArgValue::DecodedString {
                     text: String::from_utf8_lossy(&bytes).to_string(),
                     bytes,
                 },
-                pos: index,
-                next: cursor,
-            }
+            )
         }
         b'T' => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
             let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "string4")?;
-            ParsedOpcode {
-                name: "BINSTRING",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("BINSTRING", ArgValue::Bytes { start, end })
         }
         b'U' => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
             let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "string1")?;
-            ParsedOpcode {
-                name: "SHORT_BINSTRING",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("SHORT_BINSTRING", ArgValue::Bytes { start, end })
         }
         b'B' => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
             let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytes4")?;
-            ParsedOpcode {
-                name: "BINBYTES",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("BINBYTES", ArgValue::Bytes { start, end })
         }
         b'C' => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
             let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytes1")?;
-            ParsedOpcode {
-                name: "SHORT_BINBYTES",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("SHORT_BINBYTES", ArgValue::Bytes { start, end })
         }
         0x8e => {
             let len = read_u64_len(payload, &mut cursor, limit, index, "bytes8")?;
             let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytes8")?;
-            ParsedOpcode {
-                name: "BINBYTES8",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("BINBYTES8", ArgValue::Bytes { start, end })
         }
         0x96 => {
             let len = read_u64_len(payload, &mut cursor, limit, index, "bytearray8")?;
             let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytearray8")?;
-            ParsedOpcode {
-                name: "BYTEARRAY8",
-                arg: ArgValue::Bytes { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("BYTEARRAY8", ArgValue::Bytes { start, end })
         }
-        0x97 => simple_opcode("NEXT_BUFFER", index, cursor),
-        0x98 => simple_opcode("READONLY_BUFFER", index, cursor),
-        b'N' => simple_opcode("NONE", index, cursor),
-        0x88 => simple_opcode("NEWTRUE", index, cursor),
-        0x89 => simple_opcode("NEWFALSE", index, cursor),
-        b'V' => ParsedOpcode {
-            name: "UNICODE",
-            arg: ArgValue::Text(read_line_raw_unicode(payload, &mut cursor, limit)?),
-            pos: index,
-            next: cursor,
-        },
+        0x97 => ("NEXT_BUFFER", ArgValue::None),
+        0x98 => ("READONLY_BUFFER", ArgValue::None),
+        b'N' => ("NONE", ArgValue::None),
+        0x88 => ("NEWTRUE", ArgValue::None),
+        0x89 => ("NEWFALSE", ArgValue::None),
+        b'V' => (
+            "UNICODE",
+            ArgValue::Text(read_line_raw_unicode(payload, &mut cursor, limit)?),
+        ),
         0x8c => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
             let (start, end) =
                 read_variable_span(payload, &mut cursor, limit, len, "unicodestring1")?;
-            ParsedOpcode {
-                name: "SHORT_BINUNICODE",
-                arg: ArgValue::TextSpan { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("SHORT_BINUNICODE", ArgValue::TextSpan { start, end })
         }
         b'X' => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
             let (start, end) =
                 read_variable_span(payload, &mut cursor, limit, len, "unicodestring4")?;
-            ParsedOpcode {
-                name: "BINUNICODE",
-                arg: ArgValue::TextSpan { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("BINUNICODE", ArgValue::TextSpan { start, end })
         }
         0x8d => {
             let len = read_u64_len(payload, &mut cursor, limit, index, "unicodestring8")?;
             let (start, end) =
                 read_variable_span(payload, &mut cursor, limit, len, "unicodestring8")?;
-            ParsedOpcode {
-                name: "BINUNICODE8",
-                arg: ArgValue::TextSpan { start, end },
-                pos: index,
-                next: cursor,
-            }
+            ("BINUNICODE8", ArgValue::TextSpan { start, end })
         }
-        b'F' => ParsedOpcode {
-            name: "FLOAT",
-            arg: ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
-            pos: index,
-            next: cursor,
-        },
-        b'G' => ParsedOpcode {
-            name: "BINFLOAT",
-            arg: {
-                let (start, end) = read_fixed_width_span(payload, &mut cursor, limit, 8, "float8")?;
-                ArgValue::Bytes { start, end }
-            },
-            pos: index,
-            next: cursor,
-        },
-        b']' => simple_opcode("EMPTY_LIST", index, cursor),
-        b'a' => simple_opcode("APPEND", index, cursor),
-        b'e' => simple_opcode("APPENDS", index, cursor),
-        b'l' => simple_opcode("LIST", index, cursor),
-        b')' => simple_opcode("EMPTY_TUPLE", index, cursor),
-        b't' => simple_opcode("TUPLE", index, cursor),
-        0x85 => simple_opcode("TUPLE1", index, cursor),
-        0x86 => simple_opcode("TUPLE2", index, cursor),
-        0x87 => simple_opcode("TUPLE3", index, cursor),
-        b'}' => simple_opcode("EMPTY_DICT", index, cursor),
-        b'd' => simple_opcode("DICT", index, cursor),
-        b's' => simple_opcode("SETITEM", index, cursor),
-        b'u' => simple_opcode("SETITEMS", index, cursor),
-        0x8f => simple_opcode("EMPTY_SET", index, cursor),
-        0x90 => simple_opcode("ADDITEMS", index, cursor),
-        0x91 => simple_opcode("FROZENSET", index, cursor),
-        b'0' => simple_opcode("POP", index, cursor),
-        b'2' => simple_opcode("DUP", index, cursor),
-        b'(' => simple_opcode("MARK", index, cursor),
-        b'1' => simple_opcode("POP_MARK", index, cursor),
-        b'g' => ParsedOpcode {
-            name: "GET",
-            arg: ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
-            pos: index,
-            next: cursor,
-        },
-        b'h' => ParsedOpcode {
-            name: "BINGET",
-            arg: ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        b'j' => ParsedOpcode {
-            name: "LONG_BINGET",
-            arg: ArgValue::Int(read_u32_le(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        b'p' => ParsedOpcode {
-            name: "PUT",
-            arg: ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
-            pos: index,
-            next: cursor,
-        },
-        b'q' => ParsedOpcode {
-            name: "BINPUT",
-            arg: ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        b'r' => ParsedOpcode {
-            name: "LONG_BINPUT",
-            arg: ArgValue::Int(read_u32_le(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        0x94 => simple_opcode("MEMOIZE", index, cursor),
-        0x82 => ParsedOpcode {
-            name: "EXT1",
-            arg: ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        0x83 => ParsedOpcode {
-            name: "EXT2",
-            arg: ArgValue::Int(read_u16_le(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        0x84 => ParsedOpcode {
-            name: "EXT4",
-            arg: ArgValue::Int(read_u32_le(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
+        b'F' => (
+            "FLOAT",
+            ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
+        ),
+        b'G' => ("BINFLOAT", {
+            let (start, end) = read_fixed_width_span(payload, &mut cursor, limit, 8, "float8")?;
+            ArgValue::Bytes { start, end }
+        }),
+        b']' => ("EMPTY_LIST", ArgValue::None),
+        b'a' => ("APPEND", ArgValue::None),
+        b'e' => ("APPENDS", ArgValue::None),
+        b'l' => ("LIST", ArgValue::None),
+        b')' => ("EMPTY_TUPLE", ArgValue::None),
+        b't' => ("TUPLE", ArgValue::None),
+        0x85 => ("TUPLE1", ArgValue::None),
+        0x86 => ("TUPLE2", ArgValue::None),
+        0x87 => ("TUPLE3", ArgValue::None),
+        b'}' => ("EMPTY_DICT", ArgValue::None),
+        b'd' => ("DICT", ArgValue::None),
+        b's' => ("SETITEM", ArgValue::None),
+        b'u' => ("SETITEMS", ArgValue::None),
+        0x8f => ("EMPTY_SET", ArgValue::None),
+        0x90 => ("ADDITEMS", ArgValue::None),
+        0x91 => ("FROZENSET", ArgValue::None),
+        b'0' => ("POP", ArgValue::None),
+        b'2' => ("DUP", ArgValue::None),
+        b'(' => ("MARK", ArgValue::None),
+        b'1' => ("POP_MARK", ArgValue::None),
+        b'g' => (
+            "GET",
+            ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
+        ),
+        b'h' => (
+            "BINGET",
+            ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
+        ),
+        b'j' => (
+            "LONG_BINGET",
+            ArgValue::Int(read_u32_le(payload, &mut cursor, limit)? as i64),
+        ),
+        b'p' => (
+            "PUT",
+            ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
+        ),
+        b'q' => (
+            "BINPUT",
+            ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
+        ),
+        b'r' => (
+            "LONG_BINPUT",
+            ArgValue::Int(read_u32_le(payload, &mut cursor, limit)? as i64),
+        ),
+        0x94 => ("MEMOIZE", ArgValue::None),
+        0x82 => (
+            "EXT1",
+            ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
+        ),
+        0x83 => (
+            "EXT2",
+            ArgValue::Int(read_u16_le(payload, &mut cursor, limit)? as i64),
+        ),
+        0x84 => (
+            "EXT4",
+            ArgValue::Int(read_u32_le(payload, &mut cursor, limit)? as i64),
+        ),
         b'c' => {
             let module = read_line_text(payload, &mut cursor, limit)?;
             let name = read_line_text(payload, &mut cursor, limit)?;
-            ParsedOpcode {
-                name: "GLOBAL",
-                arg: ArgValue::Global { module, name },
-                pos: index,
-                next: cursor,
-            }
+            ("GLOBAL", ArgValue::Global { module, name })
         }
-        0x93 => simple_opcode("STACK_GLOBAL", index, cursor),
-        b'R' => simple_opcode("REDUCE", index, cursor),
-        b'b' => simple_opcode("BUILD", index, cursor),
+        0x93 => ("STACK_GLOBAL", ArgValue::None),
+        b'R' => ("REDUCE", ArgValue::None),
+        b'b' => ("BUILD", ArgValue::None),
         b'i' => {
             let module = read_line_text(payload, &mut cursor, limit)?;
             let name = read_line_text(payload, &mut cursor, limit)?;
-            ParsedOpcode {
-                name: "INST",
-                arg: ArgValue::Global { module, name },
-                pos: index,
-                next: cursor,
-            }
+            ("INST", ArgValue::Global { module, name })
         }
-        b'o' => simple_opcode("OBJ", index, cursor),
-        0x81 => simple_opcode("NEWOBJ", index, cursor),
-        0x92 => simple_opcode("NEWOBJ_EX", index, cursor),
-        0x80 => ParsedOpcode {
-            name: "PROTO",
-            arg: ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
-            pos: index,
-            next: cursor,
-        },
-        b'.' => simple_opcode("STOP", index, cursor),
+        b'o' => ("OBJ", ArgValue::None),
+        0x81 => ("NEWOBJ", ArgValue::None),
+        0x92 => ("NEWOBJ_EX", ArgValue::None),
+        0x80 => (
+            "PROTO",
+            ArgValue::Int(read_u8(payload, &mut cursor, limit)? as i64),
+        ),
+        b'.' => ("STOP", ArgValue::None),
         0x95 => {
             let frame_len = read_u64_len(payload, &mut cursor, limit, index, "frame")?;
-            ParsedOpcode {
-                name: "FRAME",
-                arg: ArgValue::UInt(frame_len),
-                pos: index,
-                next: cursor,
-            }
+            ("FRAME", ArgValue::UInt(frame_len))
         }
-        b'P' => ParsedOpcode {
-            name: "PERSID",
-            arg: ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
-            pos: index,
-            next: cursor,
-        },
-        b'Q' => simple_opcode("BINPERSID", index, cursor),
+        b'P' => (
+            "PERSID",
+            ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
+        ),
+        b'Q' => ("BINPERSID", ArgValue::None),
         _ => {
             return Err(ParseError::new(format!(
                 "at position {}, opcode {} unknown",
@@ -473,16 +338,12 @@ pub(crate) fn parse_opcode(
             )))
         }
     };
-    Ok(parsed)
-}
-
-fn simple_opcode(name: &'static str, pos: usize, next: usize) -> ParsedOpcode {
-    ParsedOpcode {
+    Ok(ParsedOpcode {
         name,
-        arg: ArgValue::None,
-        pos,
-        next,
-    }
+        arg,
+        pos: index,
+        next: cursor,
+    })
 }
 
 fn python_byte_literal(byte: u8) -> String {
@@ -616,11 +477,6 @@ fn read_line_bytes_kind(
                     .at(report_index)
             }
         })?;
-    if line_end.saturating_sub(*cursor) > MAX_PROTOCOL0_LINE_OPERAND_BYTES {
-        return Err(ParseError::protocol0_line_operand_limit(
-            read_kind, line_end,
-        ));
-    }
     let value = payload[*cursor..line_end].to_vec();
     *cursor = line_end + 1;
     Ok(value)
@@ -701,46 +557,6 @@ fn decode_python_string_escape(value: &[u8]) -> Vec<u8> {
         }
 
         match value[index + 1] {
-            b'\\' => {
-                decoded.push(b'\\');
-                index += 2;
-            }
-            b'\'' => {
-                decoded.push(b'\'');
-                index += 2;
-            }
-            b'"' => {
-                decoded.push(b'"');
-                index += 2;
-            }
-            b'a' => {
-                decoded.push(0x07);
-                index += 2;
-            }
-            b'b' => {
-                decoded.push(0x08);
-                index += 2;
-            }
-            b'f' => {
-                decoded.push(0x0c);
-                index += 2;
-            }
-            b'n' => {
-                decoded.push(b'\n');
-                index += 2;
-            }
-            b'r' => {
-                decoded.push(b'\r');
-                index += 2;
-            }
-            b't' => {
-                decoded.push(b'\t');
-                index += 2;
-            }
-            b'v' => {
-                decoded.push(0x0b);
-                index += 2;
-            }
             b'x' if index + 4 <= value.len() => {
                 if let Some(byte) = decode_hex_byte(value[index + 2], value[index + 3]) {
                     decoded.push(byte);
@@ -765,7 +581,16 @@ fn decode_python_string_escape(value: &[u8]) -> Vec<u8> {
                 index += 1 + octal_len;
             }
             other => {
-                decoded.push(other);
+                decoded.push(match other {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    _ => other,
+                });
                 index += 2;
             }
         }
@@ -800,6 +625,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_arguments_and_positions_after_operand_reads() {
+        use ArgValue::*;
+        let cases: &[(&[u8], &str, ArgValue)] = &[
+            (b"N", "NONE", None),
+            (b"J\xff\xff\xff\xff", "BININT", Int(-1)),
+            (b"\x95\x05\0\0\0\0\0\0\0", "FRAME", UInt(5)),
+            (b"I-12\n", "INT", Text("-12".into())),
+            (b"V\\u00e9\n", "UNICODE", Text("é".into())),
+            (
+                b"X\x02\0\0\0\xc3\xa9",
+                "BINUNICODE",
+                TextSpan { start: 7, end: 9 },
+            ),
+            (b"C\x02\xff\0", "SHORT_BINBYTES", Bytes { start: 4, end: 6 }),
+            (
+                b"S'\\xff\\0'\n",
+                "STRING",
+                DecodedString {
+                    text: "�\0".into(),
+                    bytes: vec![255, 0],
+                },
+            ),
+            (
+                b"cos\nsystem\n",
+                "GLOBAL",
+                Global {
+                    module: "os".into(),
+                    name: "system".into(),
+                },
+            ),
+        ];
+        for (data, name, arg) in cases {
+            let payload = [b"??".as_slice(), data, b"."].concat();
+            let opcode = parse_opcode(&payload, 2, payload.len()).expect(name);
+            assert_eq!(
+                (opcode.name, opcode.pos, opcode.next),
+                (*name, 2, data.len() + 2)
+            );
+            assert_eq!(&opcode.arg, arg, "{name}");
+        }
+    }
+
+    #[test]
+    fn parse_errors_preserve_messages_and_positions() {
+        let cases: &[(&[u8], usize, &str, Option<usize>)] = &[
+            (b"?K", 2, "not enough data in stream to read uint1", Some(2)),
+            (
+                b"?C\x02x.",
+                4,
+                "expected 2 bytes in a bytes1, but only 1 remain",
+                Some(4),
+            ),
+            (
+                b"?cos\nsystem\n.",
+                11,
+                "no newline found when trying to read stringnl",
+                Some(11),
+            ),
+            (
+                b"?Vabc\n.",
+                5,
+                "no newline found when trying to read unicodestringnl",
+                Some(5),
+            ),
+            (b"?Z", 2, "at position 1, opcode b'Z' unknown", None),
+            (b"?", 1, "unexpected end of pickle stream", None),
+        ];
+        for (payload, limit, message, report_index) in cases {
+            let error = parse_opcode(payload, 1, *limit).err().expect("parse error");
+            assert_eq!(error.message, *message);
+            assert_eq!(error.exception_type, "ValueError");
+            assert_eq!(error.report_index, *report_index);
+            assert_eq!(error.kind, ParseErrorKind::Generic);
+        }
+    }
+
+    #[test]
+    fn decode_string_ordinary_and_malformed_escapes() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (
+                br#"\\\'\"\a\b\f\n\r\t\v\z"#,
+                b"\\'\"\x07\x08\x0c\n\r\t\x0bz",
+            ),
+            (br"\x", b"x"),
+            (br"\x4", b"x4"),
+            (br"\xGG", br"\xGG"),
+            (br"\x\n", b"\\x\n"),
+            (br"\x00\xff", b"\0\xff"),
+            (br"\377\400\777\1234", b"\xff\0\xffS4"),
+            (b"trailing\\", b"trailing\\"),
+            (b"\\\xff", b"\xff"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(decode_python_string_escape(input), *expected, "{input:?}");
+        }
+    }
+
+    #[test]
     fn parse_global_operands_and_positions() {
         let payload = b"cos\nsystem\n.";
         let opcode = parse_opcode(payload, 0, payload.len()).expect("GLOBAL opcode");
@@ -808,7 +731,7 @@ mod tests {
         assert_eq!(opcode.pos, 0);
         assert_eq!(opcode.next, 11);
         assert_eq!(
-            opcode.arg.global_parts(payload),
+            opcode.arg.global_parts(),
             ("os".to_string(), "system".to_string())
         );
     }
@@ -820,7 +743,7 @@ mod tests {
 
         assert_eq!(opcode.name, "INST");
         assert_eq!(
-            opcode.arg.global_parts(payload),
+            opcode.arg.global_parts(),
             ("module with space".to_string(), "callable name".to_string())
         );
     }

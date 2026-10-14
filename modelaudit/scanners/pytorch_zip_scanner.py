@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from copy import copy, deepcopy
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -62,7 +63,7 @@ from .archive_member_security import (
     executable_archive_member_name_rule_code,
     probe_executable_archive_member_signature,
 )
-from .base import BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import (
     _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS,
     _PICKLE_LITERAL_URL_TEXT_RE,
@@ -2069,27 +2070,16 @@ class PyTorchZipScanner(BaseScanner):
         """Rewrite extracted nested ZIP paths back to archive provenance."""
         archive_location = f"{archive_path}:{member_name}"
 
-        for issue in nested_result.issues:
-            issue.location = rewrite_extracted_member_location(
-                issue.location,
+        findings: Iterator[Issue | Check] = chain(nested_result.issues, nested_result.checks)
+        for finding in findings:
+            finding.location = rewrite_extracted_member_location(
+                finding.location,
                 temp_path,
                 archive_location,
                 preserve_non_delimited_suffix=False,
             )
-            existing_entry = issue.details.get("zip_entry")
-            issue.details["zip_entry"] = (
-                f"{member_name}:{existing_entry}" if isinstance(existing_entry, str) and existing_entry else member_name
-            )
-
-        for check in nested_result.checks:
-            check.location = rewrite_extracted_member_location(
-                check.location,
-                temp_path,
-                archive_location,
-                preserve_non_delimited_suffix=False,
-            )
-            existing_entry = check.details.get("zip_entry")
-            check.details["zip_entry"] = (
+            existing_entry = finding.details.get("zip_entry")
+            finding.details["zip_entry"] = (
                 f"{member_name}:{existing_entry}" if isinstance(existing_entry, str) and existing_entry else member_name
             )
 
@@ -6427,20 +6417,6 @@ class PyTorchZipScanner(BaseScanner):
                 return None
             return span
         return None
-
-    @staticmethod
-    def _raw_nested_literal_payload_for_recursive_scan(
-        value: bytes, literal_start: int, literal_end: int, *, work_budget_remaining: list[int] | None = None
-    ) -> bytes:
-        if work_budget_remaining is None:
-            work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
-        scan_start, scan_end = PyTorchZipScanner._raw_nested_literal_payload_bounds_for_recursive_scan(
-            value,
-            literal_start,
-            literal_end,
-            work_budget_remaining=work_budget_remaining,
-        )
-        return value[scan_start:scan_end]
 
     @staticmethod
     def _raw_nested_literal_payload_bounds_for_recursive_scan(

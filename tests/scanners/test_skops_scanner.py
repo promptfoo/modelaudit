@@ -15,6 +15,7 @@ from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.skops_scanner import SkopsScanner
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.scanners import (
     assert_preflighted_archive_survives_replacement,
     assert_skops_cve_clean,
@@ -474,8 +475,7 @@ class TestSkopsScannerEdgeCases:
         assert parse_checks[0].severity == IssueSeverity.INFO
         assert parse_checks[0].details["entry"] == entry_name
         cache_dir = tmp_path / "parse-cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
             for aggregate in (first, second):
                 metadata = aggregate.file_metadata[str(skops_file)]
@@ -483,8 +483,6 @@ class TestSkopsScannerEdgeCases:
                 assert determine_exit_code(aggregate) == 2
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
-        finally:
-            reset_cache_manager()
 
     @pytest.mark.parametrize(
         ("loader_name", "payload"),
@@ -723,8 +721,7 @@ class TestSkopsScannerEdgeCases:
         )
 
         cache_dir = tmp_path / f"unreadable-cache-{exception_type.__name__}"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
             for aggregate in (first, second):
                 metadata = aggregate.file_metadata[str(skops_file)]
@@ -739,8 +736,6 @@ class TestSkopsScannerEdgeCases:
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
             assert stats["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_unreadable_executable_member_name_remains_a_security_finding(
         self,
@@ -885,8 +880,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -904,8 +898,6 @@ class TestSkopsScannerEdgeCases:
                 assert not any("Error scanning ZIP entry README.md" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_archive_file_count_limit_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Core scans should fail closed and avoid caching when Skops file-count limits stop analysis."""
@@ -915,8 +907,7 @@ class TestSkopsScannerEdgeCases:
                 zf.writestr(f"file_{index}.bin", b"data")
 
         cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -934,8 +925,6 @@ class TestSkopsScannerEdgeCases:
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
             assert stats["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_archive_uncompressed_size_limit_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Core scans should fail closed and avoid caching when Skops aggregate size limits stop analysis."""
@@ -945,8 +934,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -963,8 +951,6 @@ class TestSkopsScannerEdgeCases:
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
             assert stats["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_not_zip_core_exits_one_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """A non-ZIP .skops path is incomplete Skops coverage, not a cacheable clean result."""
@@ -1004,8 +990,7 @@ class TestSkopsScannerEdgeCases:
 
         monkeypatch.setattr(SkopsScanner, "_scan_archive_members", fail_member_scan)
         cache_dir = tmp_path / "unexpected-failure-cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
             for aggregate in (first, second):
                 metadata = aggregate.file_metadata[str(skops_file)]
@@ -1017,8 +1002,6 @@ class TestSkopsScannerEdgeCases:
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
             assert stats["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_recursive_member_scan_reuses_preflighted_archive_after_path_replacement(
         self,
@@ -1047,8 +1030,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("step/0/content/0.npy", _make_numeric_npy())
 
         cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -1064,8 +1046,6 @@ class TestSkopsScannerEdgeCases:
                 assert not any("Skipped oversized ZIP entry" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] >= 1
-        finally:
-            reset_cache_manager()
 
     def test_small_benign_core_scan_still_caches(self, tmp_path: Path) -> None:
         """Clean Skops scans should still be cacheable."""
@@ -1075,8 +1055,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -1089,8 +1068,6 @@ class TestSkopsScannerEdgeCases:
             assert determine_exit_code(first) == 0
             assert determine_exit_code(second) == 0
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] >= 1
-        finally:
-            reset_cache_manager()
 
     def test_counts_embedded_member_bytes(self, tmp_path: Path) -> None:
         """Embedded member scans should contribute to total bytes_scanned."""
@@ -1230,8 +1207,7 @@ def _assert_skops_core_error_without_cache(
     skops_file.write_bytes(payload)
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first, second = _scan_twice_with_cache(skops_file, cache_dir)
 
         for result in (first, second):
@@ -1244,8 +1220,6 @@ def _assert_skops_core_error_without_cache(
         stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
         assert stats["cache_hits"] == 0
         assert stats["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def _assert_skops_malicious_loader_node(tmp_path: Path, schema: str, check_name: str) -> None:

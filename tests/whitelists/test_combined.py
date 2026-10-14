@@ -1,52 +1,67 @@
-"""Tests for combined whitelist functionality."""
+"""Tests for model whitelist contents and membership contracts."""
+
+from collections.abc import Callable
+
+import pytest
 
 from modelaudit.whitelists import (
     ALL_WHITELISTED_MODELS,
     ORGANIZATION_MODELS,
     POPULAR_MODELS,
+    is_from_trusted_organization,
+    is_popular_model,
     is_whitelisted_model,
 )
 
 
-class TestCombinedWhitelist:
-    """Tests for the combined whitelist."""
+@pytest.mark.parametrize(
+    ("models", "predicate", "minimum_count", "requires_author"),
+    [
+        pytest.param(POPULAR_MODELS, is_popular_model, 101, False, id="popular"),
+        pytest.param(ORGANIZATION_MODELS, is_from_trusted_organization, 5001, True, id="organizations"),
+        pytest.param(ALL_WHITELISTED_MODELS, is_whitelisted_model, 6000, False, id="combined"),
+    ],
+)
+def test_whitelist_contents(
+    models: set[str], predicate: Callable[[str | None], bool], minimum_count: int, requires_author: bool
+) -> None:
+    assert isinstance(models, set)
+    assert len(models) >= minimum_count
+    for model_id in sorted(models):
+        assert isinstance(model_id, str)
+        assert model_id
+        if requires_author:
+            assert "/" in model_id, model_id
+        assert predicate(model_id), model_id
+        assert predicate(f"{model_id}@main"), model_id
 
-    def test_all_whitelisted_models_is_union(self):
-        """Test that ALL_WHITELISTED_MODELS is the union of both whitelists."""
-        assert ALL_WHITELISTED_MODELS == POPULAR_MODELS | ORGANIZATION_MODELS
 
-    def test_all_whitelisted_models_count(self):
-        """Test that the combined whitelist has a significant number of models."""
-        # Should have at least 6000+ models (540 popular + 6900 org)
-        assert len(ALL_WHITELISTED_MODELS) >= 6000
+@pytest.mark.parametrize(
+    "predicate",
+    [is_popular_model, is_from_trusted_organization, is_whitelisted_model],
+    ids=["popular", "organizations", "combined"],
+)
+@pytest.mark.parametrize("model_id", [None, "", "unknown-author/unknown-model-12345"], ids=["none", "empty", "unknown"])
+def test_unknown_models(predicate: Callable[[str | None], bool], model_id: str | None) -> None:
+    assert not predicate(model_id)
 
-    def test_is_whitelisted_model_popular(self):
-        """Test that popular models are whitelisted."""
-        # Get a model from the popular whitelist
-        if POPULAR_MODELS:
-            popular_model = next(iter(POPULAR_MODELS))
-            assert is_whitelisted_model(popular_model)
 
-    def test_is_whitelisted_model_organization(self):
-        """Test that organization models are whitelisted."""
-        # Get a model from the organization whitelist
-        if ORGANIZATION_MODELS:
-            org_model = next(iter(ORGANIZATION_MODELS))
-            assert is_whitelisted_model(org_model)
+def test_combined_whitelist_is_union() -> None:
+    assert ALL_WHITELISTED_MODELS == POPULAR_MODELS | ORGANIZATION_MODELS
 
-    def test_is_whitelisted_model_unknown(self):
-        """Test that unknown models are not whitelisted."""
-        assert not is_whitelisted_model("unknown-author/unknown-model-12345")
 
-    def test_is_whitelisted_model_none(self):
-        """Test that None returns False."""
-        assert not is_whitelisted_model(None)
+@pytest.mark.parametrize("prefix", ["facebook/", "google/"], ids=["facebook", "google"])
+def test_trusted_organization_is_represented(prefix: str) -> None:
+    assert any(model_id.startswith(prefix) for model_id in ORGANIZATION_MODELS)
 
-    def test_is_whitelisted_model_empty_string(self):
-        """Test that empty string returns False."""
-        assert not is_whitelisted_model("")
 
-    def test_no_overlap_creates_larger_set(self):
-        """Test that combining sets creates a properly sized whitelist."""
-        # The combined set should be at least as large as the larger of the two
-        assert len(ALL_WHITELISTED_MODELS) >= max(len(POPULAR_MODELS), len(ORGANIZATION_MODELS))
+def test_known_organization_model() -> None:
+    assert is_from_trusted_organization("hf-internal-testing/tiny-random-BertModel")
+
+
+def test_popular_model_matching_is_case_sensitive() -> None:
+    known_model = min(POPULAR_MODELS)
+    wrong_case = known_model.upper()
+    assert wrong_case != known_model
+    assert wrong_case not in POPULAR_MODELS
+    assert not is_popular_model(wrong_case)

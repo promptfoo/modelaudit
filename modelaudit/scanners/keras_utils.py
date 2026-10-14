@@ -15,6 +15,41 @@ from modelaudit.detectors.suspicious_symbols import (
 from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .base import IssueSeverity, ScanResult
 
+# Importable module roots that are explicitly dangerous when referenced in config.json.
+_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
+    {
+        "os",
+        "sys",
+        "subprocess",
+        "builtins",
+        "__builtin__",
+        "importlib",
+        "shutil",
+        "socket",
+        "http",
+        "pickle",
+        "marshal",
+        "ctypes",
+        "code",
+        "codeop",
+        "compileall",
+        "runpy",
+        "webbrowser",
+        "tempfile",
+        "signal",
+        "multiprocessing",
+        "threading",
+        "pty",
+        "commands",
+        "pdb",
+        "profile",
+        "trace",
+        "pip",
+        "setuptools",
+        "distutils",
+    }
+)
+
 # Dangerous patterns to look for inside decoded Lambda bytecode / source
 _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "exec",

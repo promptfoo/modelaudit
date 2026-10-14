@@ -21,6 +21,7 @@ from modelaudit.scanners.text_scanner import (
     TextScanner,
 )
 from modelaudit.utils.helpers import cache_decorator
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import is_huggingface_rate_limit_error
 
 
@@ -234,8 +235,7 @@ def test_text_scanner_truncated_verified_huggingface_readme_preserves_actionable
     cache_dir = tmp_path / "cache"
 
     result = TextScanner(config).scan(str(path))
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregates = [
             scan_model_directory_or_file(
                 str(path),
@@ -266,8 +266,6 @@ def test_text_scanner_truncated_verified_huggingface_readme_preserves_actionable
             for aggregate in aggregates
         )
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
@@ -4802,8 +4800,7 @@ def test_text_metadata_read_failure_is_inconclusive_not_security_finding(
     monkeypatch.setattr(TextScanner, "_get_file_size", staticmethod(raise_os_error))
 
     direct = TextScanner().scan(str(text_path))
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregates = [
             scan_model_directory_or_file(
                 str(text_path),
@@ -4834,8 +4831,6 @@ def test_text_metadata_read_failure_is_inconclusive_not_security_finding(
             assert aggregate.file_metadata[str(text_path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_text_unreadable_path_preflight_is_operational_not_security_finding(
@@ -4890,8 +4885,7 @@ def test_text_metadata_read_failure_bypasses_stale_clean_cache(
     text_path.write_text("token\n" + "x" * 11_000, encoding="utf-8")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -4928,8 +4922,6 @@ def test_text_metadata_read_failure_bypasses_stale_clean_cache(
         assert aggregate.file_metadata[str(text_path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         assert aggregate.file_metadata[str(text_path)].get("operational_error_reason") == "text_metadata_read_failed"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize(

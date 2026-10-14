@@ -174,42 +174,24 @@ def test_check_merge():
     assert len(result1.issues) == 1  # Only failed checks create issues
 
 
-def test_info_debug_checks_not_counted_as_failures():
+def test_info_debug_checks_not_counted_as_failures() -> None:
     """Test that INFO and DEBUG severity checks don't count as failures."""
     result = ScanResult(scanner_name="test_scanner")
 
     # Add failed checks with different severities
-    result.add_check(
-        name="Debug Check",
-        passed=False,
-        message="Debug info",
-        severity=IssueSeverity.DEBUG,
-        location="/test/file.pkl",
-    )
-
-    result.add_check(
-        name="Info Check",
-        passed=False,
-        message="Informational finding",
-        severity=IssueSeverity.INFO,
-        location="/test/file.pkl",
-    )
-
-    result.add_check(
-        name="Warning Check",
-        passed=False,
-        message="Warning finding",
-        severity=IssueSeverity.WARNING,
-        location="/test/file.pkl",
-    )
-
-    result.add_check(
-        name="Critical Check",
-        passed=False,
-        message="Critical finding",
-        severity=IssueSeverity.CRITICAL,
-        location="/test/file.pkl",
-    )
+    for name, message, severity in (
+        ("Debug Check", "Debug info", IssueSeverity.DEBUG),
+        ("Info Check", "Informational finding", IssueSeverity.INFO),
+        ("Warning Check", "Warning finding", IssueSeverity.WARNING),
+        ("Critical Check", "Critical finding", IssueSeverity.CRITICAL),
+    ):
+        result.add_check(
+            name=name,
+            passed=False,
+            message=message,
+            severity=severity,
+            location="/test/file.pkl",
+        )
 
     # Verify all checks were added
     assert len(result.checks) == 4

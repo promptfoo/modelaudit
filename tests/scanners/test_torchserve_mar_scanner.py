@@ -22,6 +22,7 @@ from modelaudit.scanner_selection import normalize_scanner_selection_config
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.torchserve_mar_scanner import TorchServeMarScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_mock_pytorch_zip
 from tests.helpers.file_creators import SystemCommandPayload
 
@@ -73,6 +74,21 @@ def _create_mar_archive(
     return mar_path
 
 
+def _create_standard_mar_archive(
+    tmp_path: Path,
+    entries: Mapping[str, bytes] | Sequence[tuple[str, bytes]],
+    filename: str = "model.mar",
+    compression: int = zipfile.ZIP_STORED,
+) -> Path:
+    return _create_mar_archive(
+        tmp_path,
+        manifest={"model": {"handler": "handler.py", "serializedFile": "weights.bin"}},
+        entries=entries,
+        filename=filename,
+        compression=compression,
+    )
+
+
 def _build_malicious_pickle() -> bytes:
     import os as os_module
 
@@ -95,8 +111,7 @@ def _assert_inconclusive_aggregate_not_cached(
     cache_dir: Path,
     **scan_kwargs: Any,
 ) -> None:
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -140,15 +155,11 @@ def _assert_inconclusive_aggregate_not_cached(
             version_context=build_cache_version_context(top_level_config),
         )
         assert cached_parent is None
-    finally:
-        reset_cache_manager()
 
 
 def test_can_handle_valid_mar_archive(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "weights.bin": b"weights",
@@ -178,10 +189,8 @@ def test_can_handle_rejects_invalid_manifest_json(tmp_path: Path) -> None:
 
 
 def test_depth_limit_returns_inconclusive_exit_code_without_security_finding(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "weights.bin": b"weights",
@@ -559,10 +568,8 @@ def test_scan_does_not_classify_serialized_weight_signature_as_extra_file(tmp_pa
 
 
 def test_scan_flags_duplicate_handler_member_even_when_benign_copy_is_last(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('echo owned')\n"),
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
@@ -583,10 +590,8 @@ def test_scan_analyzes_readable_duplicate_handler_when_later_duplicate_is_unread
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('echo owned')\n"),
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
@@ -633,10 +638,8 @@ def test_unreadable_handler_returns_inconclusive_exit_code_and_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "weights.bin": b"weights",
@@ -658,10 +661,8 @@ def test_unreadable_handler_returns_inconclusive_exit_code_and_is_not_cached(
 
 
 def test_unparseable_handler_returns_inconclusive_exit_code_and_is_not_cached(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return (\n",
             "weights.bin": b"weights",
@@ -705,10 +706,8 @@ def test_scan_detects_aliased_getattr_wrapped_handler_execution_primitive(
     tmp_path: Path,
     handler_source: bytes,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": handler_source,
             "weights.bin": b"weights",
@@ -750,10 +749,8 @@ def test_scan_detects_dynamic_import_getattr_handler_execution_primitive(
     handler_source: bytes,
     dangerous_name: str,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={"handler.py": handler_source, "weights.bin": b"weights"},
         filename="dynamic_import_getattr_handler.mar",
     )
@@ -789,10 +786,8 @@ def test_scan_detects_dynamic_import_getattr_handler_execution_primitive(
     ],
 )
 def test_scan_detects_dynamic_handler_execution_bypasses(tmp_path: Path, handler_source: bytes) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={"handler.py": handler_source, "weights.bin": b"weights"},
         filename="dynamic_handler_bypass.mar",
     )
@@ -3048,10 +3043,8 @@ def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
 )
 def test_scan_detects_handler_execution_primitive(tmp_path: Path, handler_source: bytes, dangerous_name: str) -> None:
     handler_source = handler_source.replace(b"LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")).encode())
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={"handler.py": handler_source, "weights.bin": b"weights"},
         filename="os_process_launch_handler.mar",
     )
@@ -3068,10 +3061,8 @@ def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
     handler_source = (
         b"import runpy\ndef handle(data, context):\n    runpy.run_path = len\n    return runpy.run_path([])\n"
     )
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={"handler.py": handler_source, "weights.bin": b"weights"},
         filename="safe_replaced_runpy_handler.mar",
     )
@@ -3092,10 +3083,8 @@ def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
     ],
 )
 def test_scan_allows_shadowed_direct_handler_primitives(tmp_path: Path, handler_source: bytes) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={"handler.py": handler_source, "weights.bin": b"weights"},
         filename="safe_shadowed_direct_handler.mar",
     )
@@ -3145,10 +3134,8 @@ def test_scan_allows_benign_dunder_call_getattr_handler_access(tmp_path: Path) -
 
 
 def test_scan_accepts_clean_duplicate_handler_members(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
             ("handler.py", b"def handle(data, context):\n    return {'still_ok': True}\n"),
@@ -3164,10 +3151,8 @@ def test_scan_accepts_clean_duplicate_handler_members(tmp_path: Path) -> None:
 
 
 def test_non_handler_python_analysis_clean_handler_and_utils_has_no_failures(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
             "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
@@ -3229,10 +3214,8 @@ def test_non_handler_python_analysis_tracks_relative_import_relationships(tmp_pa
 
 
 def test_non_handler_python_analysis_detects_malicious_utils_module(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
             "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
@@ -3251,10 +3234,8 @@ def test_non_handler_python_analysis_detects_malicious_utils_module(tmp_path: Pa
 
 
 def test_non_handler_python_analysis_flags_duplicate_module_even_when_benign_copy_is_last(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n"),
             ("utils.py", b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n"),
@@ -3275,10 +3256,8 @@ def test_non_handler_python_analysis_flags_duplicate_module_even_when_benign_cop
 
 
 def test_non_handler_python_analysis_accepts_clean_duplicate_modules(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n"),
             ("utils.py", b"def transform(data):\n    return {'ok': True, 'data': data}\n"),
@@ -3298,10 +3277,8 @@ def test_non_handler_python_analysis_parses_each_helper_module_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
             "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
@@ -3387,10 +3364,8 @@ def test_non_handler_python_logger_initialization_does_not_trigger_import_time_e
 
 
 def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"import pkg\n\ndef handle(data, context):\n    return {'ok': True}\n",
             "pkg/__init__.py": b"import os\nos.system('echo owned')\n",
@@ -3409,10 +3384,8 @@ def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Pat
 
 
 def test_non_handler_python_analysis_without_extra_python_files_is_back_compatible(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
@@ -3426,10 +3399,8 @@ def test_non_handler_python_analysis_without_extra_python_files_is_back_compatib
 
 
 def test_non_handler_python_analysis_respects_entry_limit(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
@@ -3451,10 +3422,8 @@ def test_non_handler_python_analysis_respects_entry_limit(tmp_path: Path) -> Non
 
 
 def test_benign_mar_entry_limit_returns_inconclusive_exit_code(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
@@ -3479,10 +3448,8 @@ def test_benign_mar_entry_limit_returns_inconclusive_exit_code(tmp_path: Path) -
 
 
 def test_non_handler_python_analysis_respects_uncompressed_budget(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
@@ -3516,10 +3483,8 @@ def test_non_handler_python_analysis_handles_valueerror_from_ast_parse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
             "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
@@ -3564,10 +3529,8 @@ def test_non_handler_python_analysis_read_failure_is_reported_without_aborting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
             "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
@@ -3840,10 +3803,8 @@ def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
 
 
 def test_unreadable_symlink_target_returns_inconclusive_exit_code(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "weights.bin": b"weights",
@@ -3870,10 +3831,8 @@ def test_unreadable_symlink_target_returns_inconclusive_exit_code(tmp_path: Path
 
 
 def test_scan_allows_normalized_safe_member_names(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "subdir/../weights.bin": b"weights",
@@ -4222,10 +4181,8 @@ def test_unexpected_scan_failure_returns_inconclusive_exit_code_and_is_not_cache
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "weights.bin": b"weights",
@@ -4328,8 +4285,7 @@ def test_scan_does_not_cache_temporary_nested_archive_members(tmp_path: Path) ->
     )
     cache_dir = tmp_path / "nested-member-cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for _ in range(2):
             aggregate = core.scan_model_directory_or_file(
                 str(mar_path),
@@ -4341,8 +4297,6 @@ def test_scan_does_not_cache_temporary_nested_archive_members(tmp_path: Path) ->
             assert any(".mar:nested-cache.zip" in (issue.location or "") for issue in aggregate.issues)
 
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_detects_executable_content_inside_pytorch_extra_file(tmp_path: Path) -> None:
@@ -4378,10 +4332,8 @@ def test_scan_detects_executable_content_inside_pytorch_extra_file(tmp_path: Pat
 
 
 def test_core_routes_mar_to_dedicated_scanner(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "weights.bin": b"weights",
@@ -4444,10 +4396,8 @@ def handle(data, context):
     marker = "subprocess.Popen should not trigger from string"
     return {"marker": marker}
 """
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={"handler.py": handler_code, "weights.bin": b"weights"},
         filename="comments_only.mar",
     )
@@ -4466,10 +4416,8 @@ def handle(data, context):
     import subprocess as sp
     return sp.run(["echo", "real-call"])
 """
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={"handler.py": handler_code, "weights.bin": b"weights"},
         filename="bypass_attempt.mar",
     )
@@ -4504,10 +4452,8 @@ def test_manifest_read_is_bounded(tmp_path: Path) -> None:
 
 
 def test_scan_detects_suspicious_compression_ratio_in_valid_mar(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return data\n",
             "weights.bin": b"A" * (512 * 1024),
@@ -4642,10 +4588,8 @@ def test_scan_accepts_clean_requirements_txt(tmp_path: Path) -> None:
 
 
 def test_scan_flags_colliding_requirements_txt_member_even_when_benign_alias_is_last(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
             ("weights.bin", b"weights"),
@@ -4666,10 +4610,8 @@ def test_scan_flags_colliding_requirements_txt_member_even_when_benign_alias_is_
 
 
 def test_core_scan_keeps_colliding_requirements_alias_findings_flat(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
             ("weights.bin", b"weights"),
@@ -4690,10 +4632,8 @@ def test_core_scan_keeps_colliding_requirements_alias_findings_flat(tmp_path: Pa
 
 
 def test_scan_accepts_clean_colliding_requirements_txt_aliases(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
             ("weights.bin", b"weights"),
@@ -4736,10 +4676,8 @@ def test_scan_accepts_local_direct_url_requirement(tmp_path: Path) -> None:
 
 
 def test_scan_analyzes_local_included_requirements_files(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
@@ -4761,10 +4699,8 @@ def test_scan_analyzes_local_included_requirements_files(tmp_path: Path) -> None
 
 
 def test_scan_flags_colliding_local_requirements_include_even_when_benign_alias_is_last(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
             ("weights.bin", b"weights"),
@@ -4786,10 +4722,8 @@ def test_scan_flags_colliding_local_requirements_include_even_when_benign_alias_
 
 
 def test_scan_follows_local_requirements_include_beyond_entry_processing_cap(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
             ("weights.bin", b"weights"),
@@ -4813,10 +4747,8 @@ def test_scan_follows_local_requirements_include_beyond_entry_processing_cap(tmp
 
 
 def test_scan_accepts_clean_colliding_local_requirements_include_aliases(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries=[
             ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
             ("weights.bin", b"weights"),
@@ -4851,10 +4783,8 @@ def test_scan_flags_external_local_requirements_include_as_warning(
 
 
 def test_scan_accepts_clean_local_included_requirements_files(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
@@ -4918,11 +4848,9 @@ def test_scan_bounds_requirements_reads_to_dedicated_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     monkeypatch.setattr(TorchServeMarScanner, "MAX_REQUIREMENTS_TXT_BYTES", 128)
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
@@ -4952,10 +4880,8 @@ def test_scan_bounds_requirements_reads_to_dedicated_limit(
 
 
 def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
@@ -4971,10 +4897,8 @@ def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Pat
 
 
 def test_scan_only_analyzes_exact_requirements_txt_filename(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
@@ -5015,10 +4939,8 @@ def _assert_handler_without_system_call(handler_source: bytes) -> None:
 
 
 def _assert_getattr_handler_execution(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": source_bytes,
             "weights.bin": b"weights",
@@ -5046,10 +4968,8 @@ def _assert_editable_git_warning(tmp_path: Path, requirements: bytes, filename: 
 
 
 def _assert_inert_python_metadata(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
             "utils.py": (source_bytes),
@@ -5064,10 +4984,8 @@ def _assert_inert_python_metadata(tmp_path: Path, source_bytes: bytes, filename:
 
 
 def _assert_safe_getattr_handler(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": (source_bytes),
             "weights.bin": b"weights",
@@ -5131,10 +5049,8 @@ def _assert_clean_requirements(tmp_path: Path, requirements: bytes, filename: st
 
 
 def _scan_mar_requirements(tmp_path: Path, requirements: bytes, filename: str) -> ScanResult:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    mar_path = _create_standard_mar_archive(
         tmp_path,
-        manifest=manifest,
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",

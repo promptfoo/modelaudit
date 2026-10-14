@@ -80,10 +80,7 @@ def scan_result_has_operational_error(scan_result: ScanResult) -> bool:
     """Return True when a scan result represents an operational failure."""
     metadata = scan_result.metadata or {}
     explicit_flag = metadata.get(OPERATIONAL_ERROR_METADATA_KEY)
-    if explicit_flag is not None:
-        return bool(explicit_flag) and not metadata_has_coverage_only_operational_error(metadata)
-
-    return False
+    return bool(explicit_flag) and not metadata_has_coverage_only_operational_error(metadata)
 
 
 def results_have_operational_error(results: ModelAuditResultModel) -> bool:
@@ -413,8 +410,6 @@ def add_scan_result_to_model(
     results.bytes_scanned += file_result.bytes_scanned
     normalize_unclassified_scan_failure(file_result)
 
-    if file_result.scanner_name and file_result.scanner_name not in scan_metadata.get("scanners", []):
-        scan_metadata.setdefault("scanners", []).append(file_result.scanner_name)
     if (
         file_result.scanner_name
         and file_result.scanner_name not in results.scanner_names
