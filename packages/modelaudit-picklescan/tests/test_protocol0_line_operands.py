@@ -15,11 +15,21 @@ from pickle_test_helpers import (
     _proto0_string_literal,
 )
 
-from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
 from modelaudit_picklescan import api as picklescan_api
 
 MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
 SCAN_LIMIT_OVERHEAD_BYTES = 16
+
+
+def _assert_report_state(report: PickleReport, status: ScanStatus, verdict: SafetyVerdict) -> None:
+    assert report.status == status
+    assert report.verdict == verdict
+
+
+def _assert_clean_report(report: PickleReport) -> None:
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
+    assert report.findings == ()
 
 
 def _overlong_protocol0_operand_body() -> bytes:
@@ -128,8 +138,7 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand(
         ),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "DANGEROUS_GLOBAL"
         and finding.details.get("module") == "os"
@@ -165,8 +174,7 @@ def test_scan_bytes_fails_closed_for_base64_nested_overlong_protocol0_line_opera
         ),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
         for finding in report.findings
@@ -267,8 +275,7 @@ def test_scan_bytes_detects_inline_encoded_protocol0_pickle_before_suffix(
         source=f"inline-{encoding}-nested-protocol0.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == expected_rule_code
         and finding.details.get("encoding") == encoding
@@ -287,8 +294,7 @@ def test_scan_bytes_detects_base64_pickle_after_long_protocol0_scalar(opcode: by
         source="base64-long-scalar-before-reduce.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "S601"
         and finding.details.get("encoding") == "base64"
@@ -317,8 +323,7 @@ def test_scan_bytes_detects_wrapped_base64_pickle_after_long_protocol0_scalar(
         source="wrapped-base64-long-scalar-before-reduce.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
@@ -336,8 +341,7 @@ def test_scan_bytes_detects_base64_pickle_at_each_decoded_offset(
         source="base64-long-scalar-decoded-offset.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
@@ -353,8 +357,7 @@ def test_scan_bytes_detects_base64_long_protocol0_pickle_in_byte_literals(
         source=f"base64-long-protocol0-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.details.get("module") == "os"
@@ -378,8 +381,7 @@ def test_scan_bytes_detects_base64_byte_literals_with_invalid_utf8_wrappers(
         source=f"wrapped-base64-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.details.get("module") == "os"
@@ -406,8 +408,7 @@ def test_scan_bytes_detects_over_budget_invalid_utf8_wrapped_base64_byte_literal
         options=ScanOptions(max_string_literal_scan_chars=scan_limit),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
@@ -445,9 +446,7 @@ def test_scan_bytes_keeps_benign_base64_byte_literals_clean(
         source=f"benign-base64-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -464,9 +463,7 @@ def test_scan_bytes_keeps_benign_base64_byte_literals_with_invalid_utf8_clean(
         source=f"benign-wrapped-base64-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -484,9 +481,7 @@ def test_scan_bytes_keeps_execution_like_encoded_byte_literal_text_clean(
         source=f"benign-{encoding}-execution-like-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -545,9 +540,7 @@ def test_scan_bytes_ignores_benign_suffix_after_padded_base64_pickle(
         source=f"base64-benign-raw-suffix-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize(
@@ -567,9 +560,7 @@ def test_scan_bytes_ignores_benign_wrapped_padded_base64_suffix(
         source=f"wrapped-base64-benign-suffix-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -608,8 +599,7 @@ def test_scan_bytes_preserves_raw_execution_inside_strict_base64_token(
         source=f"strict-base64-with-raw-persid-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
     assert any(
         finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
@@ -632,8 +622,7 @@ def test_scan_bytes_preserves_raw_execution_after_unpadded_base64_pickle(
         source=f"unpadded-base64-raw-suffix-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
 
 
@@ -649,9 +638,7 @@ def test_scan_bytes_keeps_multiple_benign_base64_tokens_clean(
         source=f"multiple-benign-base64-tokens-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -667,8 +654,7 @@ def test_scan_bytes_detects_malicious_base64_token_after_padded_token(
         source=f"padded-token-before-malicious-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_GLOBAL" for finding in report.findings)
 
 
@@ -683,9 +669,7 @@ def test_scan_bytes_keeps_repeated_raw_execution_near_matches_clean(
         source=f"repeated-raw-near-match-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -701,8 +685,7 @@ def test_scan_bytes_detects_malicious_token_after_unterminated_base64_scalar(
         source=f"unterminated-prefix-before-malicious-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
@@ -717,8 +700,7 @@ def test_scan_bytes_detects_binary_pickle_inside_unterminated_base64_scalar(
         source=f"unterminated-scalar-with-binary-pickle-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_GLOBAL" for finding in report.findings)
 
 
@@ -738,8 +720,7 @@ def test_scan_bytes_fails_closed_for_encoded_truncated_execution_prefixes(
         source=f"encoded-truncated-execution-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
     assert any(
         finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
@@ -771,9 +752,7 @@ def test_scan_bytes_keeps_encoded_execution_opcode_near_matches_clean(
         source=f"encoded-execution-near-match-{container.__name__}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_bounds_unterminated_protocol0_base64_scalar_runtime() -> None:
@@ -787,9 +766,7 @@ def test_scan_bytes_bounds_unterminated_protocol0_base64_scalar_runtime() -> Non
     elapsed = time.monotonic() - started
 
     assert elapsed < 2.0
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_bounds_strict_base64_junk_runtime() -> None:
@@ -804,9 +781,7 @@ def test_scan_bytes_bounds_strict_base64_junk_runtime() -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_bounds_valid_utf8_encoded_byte_literal_prefilter() -> None:
@@ -869,8 +844,7 @@ def test_scan_bytes_does_not_charge_contextual_probe_prefix_to_nested_limit(opco
         ),
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     encoded_findings = [finding for finding in report.findings if finding.rule_code == "S601"]
     assert encoded_findings
     assert all(
@@ -895,8 +869,7 @@ def test_scan_bytes_detects_lenient_base64_pickle_after_long_protocol0_scalar(
         source="lenient-base64-long-scalar-before-reduce.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
@@ -911,8 +884,7 @@ def test_scan_bytes_detects_sparse_lenient_base64_pickle_after_long_protocol0_sc
     )
 
     assert len(separated) > 1024 * 1024
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
@@ -1130,8 +1102,7 @@ def test_scan_file_keeps_float_storage_extension_like_bytes_clean(tmp_path: Path
 
     report = scan_file(model_path)
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
     assert tuple(report.metadata.get("pickle_files", ())) == ("archive/data.pkl",)
 
 
@@ -1166,9 +1137,7 @@ def test_scan_bytes_ignores_sparse_unterminated_protocol0_base64_scalar() -> Non
     )
 
     assert len(separated) > 1024 * 1024
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
     assert not any(notice.code == "nested_probe_limit_exceeded" for notice in report.notices)
 
 
@@ -1181,9 +1150,7 @@ def test_scan_bytes_ignores_large_unterminated_protocol0_base64_scalar() -> None
         source="unterminated-protocol0-base64-scalar.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
     assert not any(notice.code == "nested_probe_limit_exceeded" for notice in report.notices)
 
 
@@ -1197,9 +1164,7 @@ def test_scan_bytes_keeps_wrapped_benign_long_scalar_base64_pickle_clean(opcode:
         source="wrapped-benign-base64-long-scalar.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_fails_closed_for_long_scalar_base64_pickle_beyond_mid_scan_budget() -> None:
@@ -1212,8 +1177,7 @@ def test_scan_bytes_fails_closed_for_long_scalar_base64_pickle_beyond_mid_scan_b
         source="base64-long-scalar-beyond-mid-scan-budget.pkl",
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
         for finding in report.findings
@@ -1229,8 +1193,7 @@ def test_scan_bytes_detects_later_base64_pickle_after_lenient_benign_prefix() ->
         source="base64-later-pickle-after-lenient-prefix.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "S601"
         and finding.details.get("encoding") == "base64"
@@ -1249,9 +1212,7 @@ def test_scan_bytes_keeps_multiple_lenient_benign_base64_pickles_clean() -> None
         source="multiple-lenient-benign-base64-pickles.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize(
@@ -1271,8 +1232,7 @@ def test_scan_bytes_fails_closed_for_oversized_inline_encoded_protocol0_pickle(
         options=ScanOptions(max_nested_pickle_bytes=4),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == expected_rule_code
         and finding.details.get("encoding") == encoding
@@ -1345,8 +1305,7 @@ def test_scan_bytes_detects_leniently_decodable_inline_protocol0_pickle(
         source=f"lenient-inline-{case_name}-nested-protocol0.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == expected_rule_code
         and finding.details.get("encoding") == encoding
@@ -1364,8 +1323,7 @@ def test_scan_bytes_fails_closed_for_base64_pickle_across_probe_cap_gap() -> Non
         options=ScanOptions(max_nested_pickle_bytes=4),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "S601"
         and finding.details.get("encoding") == "base64"
@@ -1385,8 +1343,7 @@ def test_scan_bytes_detects_base64_pickle_beyond_probe_cap() -> None:
         source="base64-beyond-probe-cap-nested-protocol0.pkl",
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "S601"
         and finding.details.get("encoding") == "base64"
@@ -1412,9 +1369,7 @@ def test_scan_bytes_keeps_benign_encoded_pickle_beyond_probe_cap_clean(encoding:
         source=f"benign-{encoding}-beyond-probe-cap.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_ignores_incomplete_base64_near_match_beyond_probe_cap() -> None:
@@ -1425,9 +1380,7 @@ def test_scan_bytes_ignores_incomplete_base64_near_match_beyond_probe_cap() -> N
         source="incomplete-base64-beyond-probe-cap.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_ignores_repeated_protocol0_scalar_prefix_near_matches() -> None:
@@ -1436,9 +1389,7 @@ def test_scan_bytes_ignores_repeated_protocol0_scalar_prefix_near_matches() -> N
         source="repeated-protocol0-scalar-prefix-near-match.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
     assert not any(notice.code == "nested_probe_limit" for notice in report.notices)
 
 
@@ -1450,8 +1401,7 @@ def test_scan_bytes_keeps_raw_scan_for_lenient_whole_base64_near_match() -> None
         source="lenient-base64-with-raw-nested-protocol0.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "S213" for finding in report.findings)
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
@@ -1466,8 +1416,7 @@ def test_scan_bytes_fails_closed_when_encoded_prefix_hides_later_pickle_beyond_b
         options=ScanOptions(max_nested_pickle_bytes=4),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "S601"
         and finding.details.get("encoding") == "base64"
@@ -1501,8 +1450,7 @@ def test_scan_bytes_fails_closed_when_nested_overlong_protocol0_operand_hits_dep
         ),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == expected_rule_code
         and finding.details.get("analysis_incomplete") is True
@@ -1534,8 +1482,7 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand_afte
         ),
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.details.get("opcode") == "INST"
@@ -1575,8 +1522,7 @@ def test_scan_bytes_ignores_unstructured_nested_overlong_protocol0_near_match(
         ),
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
     assert not any(finding.rule_code == "S213" for finding in report.findings)
     assert not any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
 
@@ -1587,8 +1533,7 @@ def _assert_encoded_raw_scan(container: type[bytes] | type[bytearray], payload: 
         source=source,
     )
 
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
     assert any(
         finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True

@@ -143,9 +143,7 @@ pub(crate) fn flush_expansion_state(
 
 pub(crate) fn detect_expansion_findings_in_tail(
     tail: &[u8],
-    stream_offset: usize,
     read_offset: usize,
-    tail_prefix_len: usize,
     position_offset: usize,
 ) -> Vec<ExpansionHeuristicFinding> {
     let mut findings = Vec::new();
@@ -156,11 +154,7 @@ pub(crate) fn detect_expansion_findings_in_tail(
             Ok(opcode) => opcode,
             Err(_) => break,
         };
-        let local_position = if parsed.pos < tail_prefix_len {
-            stream_offset.saturating_add(parsed.pos)
-        } else {
-            read_offset.saturating_add(parsed.pos - tail_prefix_len)
-        };
+        let local_position = read_offset.saturating_add(parsed.pos);
         let should_finish_stream = record_expansion_state_opcode(
             &mut state,
             &parsed,

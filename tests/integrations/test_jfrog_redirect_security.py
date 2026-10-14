@@ -43,16 +43,18 @@ from tests.helpers.http import FakeStreamingResponse as _FakeStreamingResponse
         "https://0x08080808/artifacts/model.bin",
         "https://224.0.0.1/artifacts/model.bin",
         "https://[ff02::1]/artifacts/model.bin",
+        "https://storage.redirect.test/artifacts/model.bin",
     ],
 )
 @patch("modelaudit.utils.sources.jfrog.requests.get")
-def test_download_rejects_unsafe_ip_redirect_targets(
+def test_download_rejects_unsafe_redirect_targets(
     mock_get: MagicMock,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     location: str,
 ) -> None:
     monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+    monkeypatch.delenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", raising=False)
     redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": location})
     mock_get.return_value = redirect_response
 
@@ -68,18 +70,33 @@ def test_download_rejects_unsafe_ip_redirect_targets(
     assert not any(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize(
+    ("location", "allowed_host"),
+    [
+        ("https://10.0.0.8/artifacts/model.bin", "10.0.0.8"),
+        ("https://93.184.216.34/artifacts/model.bin", None),
+        ("https://[2606:4700:4700::1111]/artifacts/model.bin", None),
+        ("https://public.redirect.test/artifacts/model.bin", "public.redirect.test"),
+        ("https://storage.internal/artifacts/model.bin", "storage.internal"),
+    ],
+)
 @patch("modelaudit.utils.sources.jfrog.requests.get")
-def test_download_allows_explicit_private_redirect_host_without_credentials(
+def test_download_allows_safe_redirect_without_credentials(
     mock_get: MagicMock,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    location: str,
+    allowed_host: str | None,
 ) -> None:
     monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
-    monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", "10.0.0.8")
+    if allowed_host is None:
+        monkeypatch.delenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", raising=False)
+    else:
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", allowed_host)
     redirect_response = _FakeStreamingResponse(
         b"",
         status_code=302,
-        headers={"Location": "https://10.0.0.8/artifacts/model.bin"},
+        headers={"Location": location},
     )
     final_response = _FakeStreamingResponse(b"data")
     mock_get.side_effect = [redirect_response, final_response]
@@ -92,80 +109,10 @@ def test_download_allows_explicit_private_redirect_host_without_credentials(
 
     assert result.read_bytes() == b"data"
     assert mock_get.call_args_list[0].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
-    assert mock_get.call_args_list[1].args[0] == "https://10.0.0.8/artifacts/model.bin"
+    assert mock_get.call_args_list[1].args[0] == location
     assert mock_get.call_args_list[1].kwargs["headers"] == {}
     assert redirect_response.closed is True
     assert final_response.closed is True
-
-
-@patch("modelaudit.utils.sources.jfrog.requests.get")
-def test_download_allows_public_ip_redirect_without_credentials(
-    mock_get: MagicMock,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_public_ip_redirect_without_credentials(
-        mock_get, tmp_path, monkeypatch, ("https://93.184.216.34/artifacts/model.bin")
-    )
-
-
-@patch("modelaudit.utils.sources.jfrog.requests.get")
-def test_download_allows_public_ipv6_redirect_without_credentials(
-    mock_get: MagicMock,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_public_ip_redirect_without_credentials(
-        mock_get, tmp_path, monkeypatch, ("https://[2606:4700:4700::1111]/artifacts/model.bin")
-    )
-
-
-@patch("modelaudit.utils.sources.jfrog.requests.get")
-def test_download_rejects_untrusted_redirect_hostname_by_default(
-    mock_get: MagicMock,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
-    redirect_response = _FakeStreamingResponse(
-        b"",
-        status_code=302,
-        headers={"Location": "https://storage.redirect.test/artifacts/model.bin"},
-    )
-    mock_get.return_value = redirect_response
-
-    with pytest.raises(Exception, match="Refusing unsafe JFrog download target"):
-        download_artifact(
-            "https://company.jfrog.io/artifactory/repo/model.bin",
-            cache_dir=tmp_path,
-            api_token="test-token",
-        )
-
-    mock_get.assert_called_once()
-    assert redirect_response.closed is True
-    assert not any(tmp_path.iterdir())
-
-
-@patch("modelaudit.utils.sources.jfrog.requests.get")
-def test_download_allows_explicit_redirect_hostname_without_credentials(
-    mock_get: MagicMock,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_allowlisted_jfrog_redirect_without_credentials(
-        mock_get, tmp_path, monkeypatch, ("public.redirect.test"), ("https://public.redirect.test/artifacts/model.bin")
-    )
-
-
-@patch("modelaudit.utils.sources.jfrog.requests.get")
-def test_download_allows_explicit_private_redirect_hostname_without_credentials(
-    mock_get: MagicMock,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_allowlisted_jfrog_redirect_without_credentials(
-        mock_get, tmp_path, monkeypatch, ("storage.internal"), ("https://storage.internal/artifacts/model.bin")
-    )
 
 
 @patch("modelaudit.utils.sources.jfrog.requests.get")
@@ -248,52 +195,3 @@ def test_download_isolates_cookies_between_untrusted_redirect_origins(
     assert host_a_cookies is not host_b_cookies
     assert host_a_cookies.get("CDN_SESSION") == "host-a"
     assert host_b_cookies.get("CDN_SESSION") is None
-
-
-def _assert_allowlisted_jfrog_redirect_without_credentials(
-    mock_get: MagicMock,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    case_redirect_host: str,
-    case_redirect_url: str,
-) -> None:
-    monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
-    monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", case_redirect_host)
-    redirect_response = _FakeStreamingResponse(
-        b"",
-        status_code=302,
-        headers={"Location": case_redirect_url},
-    )
-    final_response = _FakeStreamingResponse(b"data")
-    mock_get.side_effect = [redirect_response, final_response]
-
-    result = download_artifact(
-        "https://company.jfrog.io/artifactory/repo/model.bin",
-        cache_dir=tmp_path,
-        api_token="test-token",
-    )
-
-    assert result.read_bytes() == b"data"
-    assert mock_get.call_args_list[1].kwargs["headers"] == {}
-
-
-def _assert_public_ip_redirect_without_credentials(
-    mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_redirect_url: str
-) -> None:
-    monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
-    redirect_response = _FakeStreamingResponse(
-        b"",
-        status_code=302,
-        headers={"Location": case_redirect_url},
-    )
-    final_response = _FakeStreamingResponse(b"data")
-    mock_get.side_effect = [redirect_response, final_response]
-
-    result = download_artifact(
-        "https://company.jfrog.io/artifactory/repo/model.bin",
-        cache_dir=tmp_path,
-        api_token="test-token",
-    )
-
-    assert result.read_bytes() == b"data"
-    assert mock_get.call_args_list[1].kwargs["headers"] == {}

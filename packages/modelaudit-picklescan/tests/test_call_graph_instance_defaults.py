@@ -38,10 +38,6 @@ def _botocore_process_provider_operand() -> bytes:
     return _process_provider_operand(module_name="botocore.credentials", class_name="ProcessProvider")
 
 
-def _botocore_process_provider_control_payload() -> bytes:
-    return b"\x80\x04" + _botocore_process_provider_operand() + b"."
-
-
 def _botocore_process_provider_rce_payload(marker: Path) -> tuple[bytes, str]:
     marker_content = "owned-by-botocore-process-provider"
     credential_json = '{"Version":1,"AccessKeyId":"A","SecretAccessKey":"S","AccountId":"1"}'
@@ -67,10 +63,6 @@ def _botocore_process_provider_rce_payload(marker: Path) -> tuple[bytes, str]:
 
 def _aiobotocore_process_provider_operand() -> bytes:
     return _process_provider_operand(module_name="aiobotocore.credentials", class_name="AioProcessProvider")
-
-
-def _aiobotocore_process_provider_control_payload() -> bytes:
-    return b"\x80\x04" + _aiobotocore_process_provider_operand() + b"."
 
 
 def _aiobotocore_anyio_backend_rce_payload(marker: Path) -> tuple[bytes, str]:
@@ -161,7 +153,7 @@ def test_call_graph_resolves_super_forwarded_constructor_default_instance_aliase
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
 def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None:
     marker = tmp_path / "botocore_process_provider_rce_marker"
-    control_payload = _botocore_process_provider_control_payload()
+    control_payload = b"\x80\x04" + _botocore_process_provider_operand() + b"."
     payload, marker_content = _botocore_process_provider_rce_payload(marker)
 
     control_report = scan_bytes(control_payload, source="botocore-process-provider-control.pkl")
@@ -197,7 +189,7 @@ def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
 def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None:
     marker = tmp_path / "aiobotocore_anyio_backend_rce_marker"
-    control_payload = _aiobotocore_process_provider_control_payload()
+    control_payload = b"\x80\x04" + _aiobotocore_process_provider_operand() + b"."
     payload, marker_content = _aiobotocore_anyio_backend_rce_payload(marker)
 
     control_report = scan_bytes(control_payload, source="aiobotocore-process-provider-control.pkl")

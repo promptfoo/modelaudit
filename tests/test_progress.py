@@ -3,6 +3,7 @@
 import os
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -148,9 +149,9 @@ class TestProgressReporters:
         reporter.report_completion(stats)
         reporter.report_error(Exception("Test error"), stats)
 
-    def test_file_reporter(self) -> None:
+    def test_file_reporter(self, tmp_path: Path) -> None:
         """Test file progress reporter."""
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".log") as f:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".log", dir=tmp_path) as f:
             log_file = f.name
 
         try:
@@ -188,24 +189,15 @@ class TestProgressHooks:
 
     def test_custom_function_hook(self) -> None:
         """Test custom function hook."""
-        start_calls = []
-        progress_calls = []
-        complete_calls = []
-
-        def on_start(stats):
-            start_calls.append(stats)
-
-        def on_progress(stats):
-            progress_calls.append(stats)
-
-        def on_complete(stats):
-            complete_calls.append(stats)
+        start_calls: list[ProgressStats] = []
+        progress_calls: list[ProgressStats] = []
+        complete_calls: list[ProgressStats] = []
 
         hook = CustomFunctionHook(
             name="test_hook",
-            on_start_func=on_start,
-            on_progress_func=on_progress,
-            on_complete_func=on_complete,
+            on_start_func=start_calls.append,
+            on_progress_func=progress_calls.append,
+            on_complete_func=complete_calls.append,
         )
 
         stats = ProgressStats()
@@ -245,12 +237,9 @@ class TestProgressHooks:
 
     def test_hook_enable_disable(self) -> None:
         """Test hook enable/disable functionality."""
-        calls = []
+        calls: list[ProgressStats] = []
 
-        def on_progress(stats):
-            calls.append(stats)
-
-        hook = CustomFunctionHook("test", on_progress_func=on_progress)
+        hook = CustomFunctionHook("test", on_progress_func=calls.append)
         manager = ProgressHookManager()
         manager.add_hook(hook)
 
@@ -279,14 +268,11 @@ class TestProgressHooks:
 class TestProgressIntegration:
     """Integration tests for progress tracking."""
 
-    def test_progress_with_mock_scanner(self) -> None:
+    def test_progress_with_mock_scanner(self, tmp_path: Path) -> None:
         """Test progress tracking with a mock scanner."""
 
         class MockScanner(BaseScanner):
             name = "mock"
-
-            def __init__(self, config=None):
-                super().__init__(config)
 
             @classmethod
             def can_handle(cls, path: str) -> bool:
@@ -314,8 +300,8 @@ class TestProgressIntegration:
                 return result
 
         # Create mock file
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            f.write(b"test data" * 128)  # 1024 bytes
+        with tempfile.NamedTemporaryFile(delete=False, dir=tmp_path) as f:
+            f.write(b"test data" * 128)  # 1152 bytes
             temp_file = f.name
 
         try:

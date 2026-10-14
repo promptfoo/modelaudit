@@ -1,7 +1,6 @@
 """Tests for CLI cache_dir option."""
 
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
@@ -10,34 +9,11 @@ from modelaudit.cli import cli
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 
 
-def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
-    """Create a mock ModelAuditResultModel for testing."""
+def create_mock_scan_result() -> ModelAuditResultModel:
+    """Create a successful one-file scan with no findings."""
     result = create_initial_audit_result()
-    result.success = kwargs.get("success", True)
-    result.has_errors = kwargs.get("has_errors", False)
-    result.bytes_scanned = kwargs.get("bytes_scanned", 1024)
-    result.files_scanned = kwargs.get("files_scanned", 1)
-
-    # Add issues if provided
-    if "issues" in kwargs:
-        import time
-
-        from modelaudit.scanners.base import Issue
-
-        issues = []
-        for issue_dict in kwargs["issues"]:
-            issue = Issue(
-                message=issue_dict.get("message", "Test issue"),
-                severity=issue_dict.get("severity", "warning"),
-                location=issue_dict.get("location"),
-                timestamp=time.time(),
-                details=issue_dict.get("details", {}),
-                why=None,
-                type=None,
-            )
-            issues.append(issue)
-        result.issues = issues
-
+    result.bytes_scanned = 1024
+    result.files_scanned = 1
     result.finalize_statistics()
     return result
 
@@ -71,7 +47,7 @@ class TestCacheDirOption:
         mock_download_path = tmp_path / "downloaded_model"
         mock_download_path.mkdir()
         mock_download_model.return_value = mock_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        mock_scan.return_value = create_mock_scan_result()
 
         runner = CliRunner()
 
@@ -102,7 +78,7 @@ class TestCacheDirOption:
         mock_download_path = tmp_path / "downloaded_model"
         mock_download_path.mkdir()
         mock_download_cloud.return_value = mock_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        mock_scan.return_value = create_mock_scan_result()
 
         runner = CliRunner()
 
@@ -134,7 +110,7 @@ class TestCacheDirOption:
         download_path = cache_dir / "model"
         download_path.mkdir(parents=True)
         mock_download_model.return_value = download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        mock_scan.return_value = create_mock_scan_result()
 
         runner = CliRunner()
 
@@ -163,7 +139,7 @@ class TestCacheDirOption:
         temp_download_path = tmp_path / "temp_model"
         temp_download_path.mkdir()
         mock_download_model.return_value = temp_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        mock_scan.return_value = create_mock_scan_result()
 
         runner = CliRunner()
 
@@ -217,7 +193,7 @@ class TestCacheDirOption:
         mock_download_path = tmp_path / "downloaded_model"
         mock_download_path.mkdir()
         mock_download_model.return_value = mock_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        mock_scan.return_value = create_mock_scan_result()
 
         cache_path = tmp_path / "my_cache"
         cache_path.mkdir()
@@ -249,7 +225,7 @@ class TestCacheDirOption:
         mock_download_path = tmp_path / "downloaded_model"
         mock_download_path.mkdir()
         mock_download_model.return_value = mock_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        mock_scan.return_value = create_mock_scan_result()
 
         cache_path = tmp_path / "my_cache"
         cache_path.mkdir()

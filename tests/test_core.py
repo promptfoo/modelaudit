@@ -73,6 +73,7 @@ from modelaudit.utils.file.hdf5 import (
 )
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import (
     create_mock_coreml,
     create_mock_gguf,
@@ -2017,39 +2018,15 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
     content = bytes(content_size)
     source_path = tmp_path / "dedup-asset.bin"
     source_path.write_bytes(content)
-    real_fdopen = os.fdopen
-    read_sizes: list[int] = []
-    now = 0.0
 
-    class RecordingReader:
-        def __init__(self, handle: Any) -> None:
-            self.handle = handle
+    def read_seconds(chunk: bytes) -> float:
+        if fixed_read_seconds is not None:
+            return fixed_read_seconds
+        if seconds_per_mib is not None:
+            return len(chunk) / core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE * seconds_per_mib
+        return 0.0
 
-        def __enter__(self) -> RecordingReader:
-            return self
-
-        def __exit__(self, *args: Any) -> Any:
-            return self.handle.__exit__(*args)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self.handle, name)
-
-        def read(self, size: int = -1) -> bytes:
-            nonlocal now
-            read_sizes.append(size)
-            chunk = cast(bytes, self.handle.read(size))
-            if fixed_read_seconds is not None:
-                now += fixed_read_seconds
-            elif seconds_per_mib is not None:
-                now += len(chunk) / core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE * seconds_per_mib
-            return chunk
-
-    def recording_fdopen(*args: Any, **kwargs: Any) -> RecordingReader:
-        return RecordingReader(real_fdopen(*args, **kwargs))
-
-    monkeypatch.setattr(core_module.os, "fdopen", recording_fdopen)
-    monkeypatch.setattr(core_module.time, "time", lambda: now)
-    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
+    read_sizes = _install_hash_read_clock(monkeypatch, read_seconds)
 
     assert core_module._calculate_file_hash(str(source_path), deadline=deadline) == hashlib.sha256(content).hexdigest()
     assert read_sizes == expected_read_sizes
@@ -2062,36 +2039,9 @@ def test_calculate_file_hash_uses_fine_reads_near_deadline(
     """Hashing must return to the deadline check after a bounded near-deadline read."""
     source_path = tmp_path / "deadline-asset.bin"
     source_path.write_bytes(b"x" * (core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE + 1))
-    real_fdopen = os.fdopen
-    read_sizes: list[int] = []
-    now = 0.0
-
-    class DeadlineReader:
-        def __init__(self, handle: Any) -> None:
-            self.handle = handle
-
-        def __enter__(self) -> DeadlineReader:
-            return self
-
-        def __exit__(self, *args: Any) -> Any:
-            return self.handle.__exit__(*args)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self.handle, name)
-
-        def read(self, size: int = -1) -> bytes:
-            nonlocal now
-            read_sizes.append(size)
-            chunk = cast(bytes, self.handle.read(size))
-            now += len(chunk) / core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE
-            return chunk
-
-    def deadline_fdopen(*args: Any, **kwargs: Any) -> DeadlineReader:
-        return DeadlineReader(real_fdopen(*args, **kwargs))
-
-    monkeypatch.setattr(core_module.os, "fdopen", deadline_fdopen)
-    monkeypatch.setattr(core_module.time, "time", lambda: now)
-    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
+    read_sizes = _install_hash_read_clock(
+        monkeypatch, lambda chunk: len(chunk) / core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE
+    )
 
     with pytest.raises(TimeoutError, match="File hashing timed out"):
         core_module._calculate_file_hash(str(source_path), deadline=0.5)
@@ -2106,36 +2056,9 @@ def test_calculate_file_hash_probes_before_coarse_read_at_deadline_boundary(
     """An unsampled read just outside the base window must stay bounded."""
     source_path = tmp_path / "deadline-boundary.bin"
     source_path.write_bytes(b"x" * (core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE + 1))
-    real_fdopen = os.fdopen
-    read_sizes: list[int] = []
-    now = 0.0
-
-    class BoundaryReader:
-        def __init__(self, handle: Any) -> None:
-            self.handle = handle
-
-        def __enter__(self) -> BoundaryReader:
-            return self
-
-        def __exit__(self, *args: Any) -> Any:
-            return self.handle.__exit__(*args)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self.handle, name)
-
-        def read(self, size: int = -1) -> bytes:
-            nonlocal now
-            read_sizes.append(size)
-            chunk = cast(bytes, self.handle.read(size))
-            now += core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 1.0
-            return chunk
-
-    def boundary_fdopen(*args: Any, **kwargs: Any) -> BoundaryReader:
-        return BoundaryReader(real_fdopen(*args, **kwargs))
-
-    monkeypatch.setattr(core_module.os, "fdopen", boundary_fdopen)
-    monkeypatch.setattr(core_module.time, "time", lambda: now)
-    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
+    read_sizes = _install_hash_read_clock(
+        monkeypatch, lambda _chunk: core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 1.0
+    )
 
     deadline = core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 0.5
     with pytest.raises(TimeoutError, match="File hashing timed out"):
@@ -2792,6 +2715,22 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def _require_msgpack() -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+
+def _pack_benign_flax_checkpoint() -> bytes:
+    return cast(bytes, flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+
+
+def _pack_malicious_flax_checkpoint() -> bytes:
+    return cast(
+        bytes,
+        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True),
+    )
+
+
 def _pack_flax_ndarray_ext_checkpoint(tensor_bytes: bytes, *, dtype: str = "float32") -> bytes:
     shape = (len(tensor_bytes) // 4,)
     ndarray_body = flax_msgpack_scanner.msgpack.packb((shape, dtype, tensor_bytes), use_bin_type=True)
@@ -3056,15 +2995,7 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
     outside_shard = outside_dir / "model-00002-of-00002.safetensors"
     outside_shard.write_bytes(b"outside-shard")
     (model_dir / outside_shard.name).symlink_to(outside_shard)
-    calls: list[str] = []
-    captured_configs: list[dict[str, Any]] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        captured_configs.append(dict(config or {}))
-        return _mock_sharded_scan_result(first_shard.stat().st_size)
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    captured_configs, calls = _record_shard_scans(monkeypatch, [first_shard])
 
     result = core_module.scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
     outside_path = str(outside_shard.resolve())
@@ -3084,19 +3015,28 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
     assert sum(issue.message == "Path traversal outside scanned directory" for issue in result.issues) == 1
 
 
+def _create_hf_snapshot_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_cache_name: str = "models--org--model",
+) -> tuple[Path, Path, Path]:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / model_cache_name
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    return cache_dir, snapshot, blobs_dir
+
+
 @pytest.mark.usefixtures("requires_symlinks")
 def test_savedmodel_owner_dispatches_trusted_hf_snapshot_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_tf_protos()
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--savedmodel"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch, model_cache_name="models--org--savedmodel")
     blob_path = blobs_dir / "savedmodel-blob"
     _write_safe_savedmodel(blob_path)
     alias = snapshot / "saved_model.pb"
@@ -3115,13 +3055,7 @@ def test_orbax_owner_dispatches_trusted_hf_snapshot_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--orbax"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch, model_cache_name="models--org--orbax")
     blob_path = blobs_dir / "metadata-blob"
     blob_path.write_text('{"version":1,"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
     alias = snapshot / "metadata.json"
@@ -3144,13 +3078,7 @@ def test_orbax_owner_dispatches_trusted_hf_snapshot_alias_when_strict_resolve_fa
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--orbax"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch, model_cache_name="models--org--orbax")
     metadata_blob = blobs_dir / "metadata-blob"
     metadata_blob.write_text('{"version":1,"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
     raw_target = Path("../../blobs") / metadata_blob.name
@@ -3193,13 +3121,7 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshots_dir = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshots_dir.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshots_dir, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
 
     blob_paths: list[Path] = []
     shard_links: list[Path] = []
@@ -3232,13 +3154,7 @@ def test_directory_scan_does_not_reresolve_trusted_hf_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A canonical HF target must not depend on a second raw readlink call."""
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
     blob_path = blobs_dir / "blob"
     blob_path.write_bytes(b"hf-model")
     alias = snapshot / "model.safetensors"
@@ -3255,11 +3171,8 @@ def test_directory_scan_does_not_reresolve_trusted_hf_alias(
                 raise OSError("trusted alias cannot be resolved again")
         return original_resolve(path, strict=strict)
 
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        return _mock_sharded_scan_result(blob_path.stat().st_size)
-
     monkeypatch.setattr(Path, "resolve", fail_redundant_resolve)
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    _record_shard_calls(monkeypatch, [blob_path])
 
     result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
 
@@ -3275,13 +3188,7 @@ def test_directory_scan_continues_when_hf_shard_alias_retargets_after_resolution
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A changing HF alias must not abort discovery before later malicious files."""
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
     blob_path = blobs_dir / "blob"
     blob_path.write_bytes(b"hf-shard")
     alias = snapshot / "model-00001-of-00001.safetensors"
@@ -3329,13 +3236,7 @@ def test_directory_scan_does_not_require_strict_hf_alias_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Valid relative aliases remain scannable when strict alias resolution is unavailable."""
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
     blob_path = blobs_dir / "blob"
     blob_path.write_bytes(b"hf-model")
     alias = snapshot / "model.safetensors"
@@ -3348,11 +3249,8 @@ def test_directory_scan_does_not_require_strict_hf_alias_resolution(
             raise OSError("strict relative symlink resolution is unavailable")
         return original_resolve(path, strict=strict)
 
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        return _mock_sharded_scan_result(blob_path.stat().st_size)
-
     monkeypatch.setattr(Path, "resolve", reject_strict_symlink_resolution)
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    _record_shard_calls(monkeypatch, [blob_path])
 
     result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
 
@@ -3397,13 +3295,7 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Hashing and dispatch must retain the target identity captured during discovery."""
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
     blob_one = blobs_dir / "blob-1"
     blob_two = blobs_dir / "blob-2"
     blob_one.write_bytes(b"one")
@@ -3450,26 +3342,14 @@ def test_directory_scan_allows_mixed_regular_and_hf_blob_shards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Family allowlisting must not depend on the first shard being an HF symlink."""
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshots_dir = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshots_dir.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshots_dir, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
     regular_shard = snapshots_dir / "model-00001-of-00002.safetensors"
     linked_shard = snapshots_dir / "model-00002-of-00002.safetensors"
     blob_path = blobs_dir / "blob-2"
     regular_shard.write_bytes(b"regular-shard")
     blob_path.write_bytes(b"linked-shard")
     linked_shard.symlink_to(Path("../../blobs") / blob_path.name)
-    calls: list[str] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        return _mock_sharded_scan_result(regular_shard.stat().st_size + blob_path.stat().st_size)
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    calls = _record_shard_calls(monkeypatch, [regular_shard, blob_path])
 
     result = core_module.scan_model_directory_or_file(str(snapshots_dir), cache_scan_results=False)
 
@@ -3496,13 +3376,7 @@ def test_directory_scan_keeps_nonsharded_hf_snapshot_aliases_deduplicated(
         snapshots_dir.mkdir(parents=True)
         (snapshots_dir / "model.safetensors").symlink_to(Path("../../blobs") / blob_path.name)
 
-    calls: list[str] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        return _mock_sharded_scan_result(blob_path.stat().st_size)
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    calls = _record_shard_calls(monkeypatch, [blob_path])
 
     result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
 
@@ -3633,13 +3507,7 @@ def test_directory_scan_deduplicates_hf_shard_aliases_against_raw_blobs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    cache_dir, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
     blob_paths: list[Path] = []
     for shard_index in range(1, 3):
         blob_path = blobs_dir / f"blob-{shard_index}.safetensors"
@@ -3661,13 +3529,7 @@ def test_directory_scan_handles_broken_hf_shard_alias_per_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    hf_home = tmp_path / "hf-home"
-    monkeypatch.setenv("HF_HOME", str(hf_home))
-    cache_dir = hf_home / "hub" / "models--org--model"
-    snapshot = cache_dir / "snapshots" / "abc123"
-    blobs_dir = cache_dir / "blobs"
-    snapshot.mkdir(parents=True)
-    blobs_dir.mkdir()
+    _, snapshot, blobs_dir = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
     blob_path = blobs_dir / "blob-1"
     blob_path.write_bytes(b"hf-shard-1")
     (snapshot / "model-00001-of-00002.safetensors").symlink_to(Path("../../blobs") / blob_path.name)
@@ -4277,13 +4139,7 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
         shard_path = tmp_path / f"model-{shard_index:05d}-of-00002.safetensors"
         shard_path.write_bytes(f"shard-{shard_index}".encode())
         shards.append(shard_path.resolve())
-    captured_configs: list[dict[str, Any]] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        captured_configs.append(dict(config or {}))
-        return _mock_sharded_scan_result(sum(shard.stat().st_size for shard in shards))
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    captured_configs, _ = _record_shard_scans(monkeypatch, shards)
 
     core_module.scan_model_directory_or_file(str(tmp_path))
     first_material_config = normalize_material_scan_config(captured_configs[0])
@@ -4354,8 +4210,7 @@ def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) 
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first_result = scan_file(str(shard_one), config=config)
         cached_result = scan_file(str(shard_one), config=config)
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
@@ -4374,8 +4229,6 @@ def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) 
             assert final_cache_entries == 0
         else:
             assert final_cache_entries >= cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_directory_scan_groups_shard_family_without_declared_total(
@@ -4387,15 +4240,7 @@ def test_directory_scan_groups_shard_family_without_declared_total(
         shard_path = tmp_path / f"checkpoint_{shard_index}.pt"
         shard_path.write_bytes(f"checkpoint-shard-{shard_index}".encode())
         shards.append(shard_path.resolve())
-    captured_configs: list[dict[str, Any]] = []
-    calls: list[str] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        captured_configs.append(dict(config or {}))
-        return _mock_sharded_scan_result(sum(shard.stat().st_size for shard in shards))
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    captured_configs, calls = _record_shard_scans(monkeypatch, shards)
 
     result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 
@@ -4490,8 +4335,7 @@ def test_scan_file_enforces_zip_entry_preflight_for_offset_zero_hdf5(tmp_path: P
         "max_zip_entries": 1,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for _ in range(2):
             result = scan_file(str(model_path), config=config)
 
@@ -4517,8 +4361,6 @@ def test_scan_file_enforces_zip_entry_preflight_for_offset_zero_hdf5(tmp_path: P
         )
         assert determine_exit_code(aggregate) == 1
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_keeps_within_limit_appended_zip_on_offset_zero_hdf5_route(tmp_path: Path) -> None:
@@ -5883,8 +5725,7 @@ def test_scan_file_does_not_route_benign_binary_padding_past_opcode_budget(tmp_p
         == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     )
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(near_match), config=config)
         second = scan_file(str(near_match), config=config)
 
@@ -5904,8 +5745,6 @@ def test_scan_file_does_not_route_benign_binary_padding_past_opcode_budget(tmp_p
                 issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
             ]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     nested_result = archive_dispatch.scan_nested_file(str(near_match), config={"cache_enabled": False})
     aggregate = scan_model_directory_or_file(str(near_match), cache_scan_results=False)
@@ -6258,8 +6097,7 @@ def test_scan_file_does_not_route_native_flax_suffix_lightgbm_near_match(tmp_pat
 
 
 def test_scan_file_treats_valid_flax_ndarray_tensor_bytes_as_data(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "flax_model.msgpack"
     checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27)))
@@ -6275,8 +6113,7 @@ def test_scan_file_treats_valid_flax_ndarray_tensor_bytes_as_data(tmp_path: Path
 
 
 def test_scan_file_treats_small_valid_flax_ndarray_tensor_bytes_as_data_by_default(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "small_flax_model.msgpack"
     checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27)))
@@ -6292,8 +6129,7 @@ def test_scan_file_treats_small_valid_flax_ndarray_tensor_bytes_as_data_by_defau
 
 
 def test_scan_file_treats_nested_flax_ndarray_tensor_bytes_as_data(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = _pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27))
     archive = tmp_path / "flax-bundle.zip"
@@ -6313,8 +6149,7 @@ def test_scan_file_flax_ndarray_timeout_fails_closed_and_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "timeout_flax_model.msgpack"
     checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"\0" * 32))
@@ -6334,8 +6169,7 @@ def test_scan_file_flax_ndarray_timeout_fails_closed_and_is_not_cached(
 
     monkeypatch.setattr(flax_msgpack_scanner._MsgpackStreamCursor, "skip", skip_and_timeout_afterwards)
     monkeypatch.setattr(flax_msgpack_scanner.FlaxMsgpackScanner, "_check_timeout", forced_timeout_after_tensor_skip)
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(
             str(checkpoint),
             config={
@@ -6352,14 +6186,11 @@ def test_scan_file_flax_ndarray_timeout_fails_closed_and_is_not_cached(
         assert result.metadata["operational_error_reason"] == "scan_timeout"
         assert any(check.name == "Scan Timeout Check" for check in result.checks)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("foreign_format", ["rknn", "torch7", "cntk", "lightgbm"])
 def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: Path, foreign_format: str) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     payload = tmp_path / f"overlap-{foreign_format}.jpg"
     if foreign_format == "rknn":
@@ -6378,9 +6209,7 @@ def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: 
         _write_malicious_cntk(payload)
     else:
         _write_malicious_lightgbm(payload)
-    payload.write_bytes(
-        payload.read_bytes() + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
-    )
+    payload.write_bytes(payload.read_bytes() + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(payload), config={"cache_scan_results": False})
 
@@ -6409,8 +6238,7 @@ def test_scan_file_prefers_strict_cntk_owner_over_inconclusive_flax_probe(tmp_pa
 
 
 def test_scan_file_preserves_inconclusive_flax_outcome_under_strict_cntk_owner(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     payload = tmp_path / "delayed-flax-cntk.jpg"
     _write_delayed_flax_cntk_overlap(payload)
@@ -6431,8 +6259,7 @@ def test_scan_file_preserves_inconclusive_flax_outcome_under_strict_cntk_owner(t
 
 
 def test_scan_file_preserves_inconclusive_flax_outcome_for_nested_strict_cntk_owner(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     nested_payload = tmp_path / "delayed-flax-cntk.jpg"
     _write_delayed_flax_cntk_overlap(nested_payload)
@@ -6452,14 +6279,11 @@ def test_scan_file_fails_closed_when_flax_overlap_scanner_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     payload = tmp_path / "unavailable-overlap.jpg"
     _write_malicious_lightgbm(payload)
-    payload.write_bytes(
-        payload.read_bytes() + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
-    )
+    payload.write_bytes(payload.read_bytes() + _pack_benign_flax_checkpoint())
     original_loader = core_module._registry.load_scanner_by_id
 
     def load_scanner_by_id(scanner_id: str) -> type[Any] | None:
@@ -6479,15 +6303,11 @@ def test_scan_file_fails_closed_when_flax_overlap_scanner_is_unavailable(
 
 
 def test_scan_file_preserves_foreign_findings_in_nested_flax_content_overlap(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     nested_payload = tmp_path / "nested-overlap.jpg"
     _write_malicious_lightgbm(nested_payload)
-    nested_payload.write_bytes(
-        nested_payload.read_bytes()
-        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
-    )
+    nested_payload.write_bytes(nested_payload.read_bytes() + _pack_benign_flax_checkpoint())
     archive = tmp_path / "overlap.zip"
     _create_misnamed_zip(archive, {"nested-overlap.jpg": nested_payload.read_bytes()})
 
@@ -6509,14 +6329,11 @@ def test_scan_file_preserves_selected_lightgbm_findings_in_flax_content_overlap(
     tmp_path: Path,
     scanner_config: dict[str, list[str]],
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     payload = tmp_path / "selected-overlap.jpg"
     _write_malicious_lightgbm(payload)
-    payload.write_bytes(
-        payload.read_bytes() + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
-    )
+    payload.write_bytes(payload.read_bytes() + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(payload), config={**scanner_config, "cache_scan_results": False})
 
@@ -6534,15 +6351,11 @@ def test_scan_file_preserves_selected_lightgbm_findings_in_flax_content_overlap(
 
 
 def test_scan_file_preserves_selected_nested_lightgbm_findings_in_flax_content_overlap(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     nested_payload = tmp_path / "selected-nested-overlap.jpg"
     _write_malicious_lightgbm(nested_payload)
-    nested_payload.write_bytes(
-        nested_payload.read_bytes()
-        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
-    )
+    nested_payload.write_bytes(nested_payload.read_bytes() + _pack_benign_flax_checkpoint())
     archive = tmp_path / "selected-overlap.zip"
     _create_misnamed_zip(archive, {"selected-nested-overlap.jpg": nested_payload.read_bytes()})
 
@@ -6622,12 +6435,11 @@ def test_scan_file_fails_closed_for_renamed_structural_msgpack_without_dependenc
 
 
 def test_scan_file_routes_renamed_flax_stream_with_malicious_trailing_object(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "stream.jpg"
     checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+        _pack_benign_flax_checkpoint()
         + flax_msgpack_scanner.msgpack.packb({"__reduce__": "os.system"}, use_bin_type=True)
     )
 
@@ -6639,16 +6451,12 @@ def test_scan_file_routes_renamed_flax_stream_with_malicious_trailing_object(tmp
 
 
 def test_scan_file_routes_renamed_flax_stream_with_later_checkpoint_object(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "stream-later-root.jpg"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb({"metadata": {"producer": "flax"}}, use_bin_type=True)
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
+        + _pack_malicious_flax_checkpoint()
     )
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
@@ -6663,16 +6471,11 @@ def test_scan_file_routes_renamed_flax_stream_with_leading_scalar_object(
     tmp_path: Path,
     leading_scalar: int | None,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / f"stream-leading-scalar-{leading_scalar}.jpg"
     checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb(leading_scalar, use_bin_type=True)
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
+        flax_msgpack_scanner.msgpack.packb(leading_scalar, use_bin_type=True) + _pack_malicious_flax_checkpoint()
     )
 
     assert file_detection.detect_file_format(str(checkpoint)) == "flax_msgpack"
@@ -6687,18 +6490,14 @@ def test_scan_file_routes_renamed_flax_stream_with_leading_scalar_object(
 
 
 def test_scan_file_ignores_oversized_pickle_frame_near_match_in_flax_overlap(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "frame-near-match.jpg"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb({}, use_bin_type=True)
         + flax_msgpack_scanner.msgpack.packb(4, use_bin_type=True)
         + flax_msgpack_scanner.msgpack.packb([-1, -1, -1, -1, -1], use_bin_type=True)
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
+        + _pack_benign_flax_checkpoint()
     )
 
     assert "pickle" in file_detection.detect_flax_msgpack_overlap_routes(
@@ -6714,17 +6513,10 @@ def test_scan_file_ignores_oversized_pickle_frame_near_match_in_flax_overlap(tmp
 
 @pytest.mark.parametrize("prefix", [b"I1\n.", b"cbuiltins\nstr\n.", b"\x80\x04."])
 def test_scan_file_routes_renamed_flax_stream_after_pickle_shaped_prefix(tmp_path: Path, prefix: bytes) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "stream-pickle-prefix.jpg"
-    checkpoint.write_bytes(
-        prefix
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(prefix + _pack_malicious_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -6757,17 +6549,10 @@ def test_scan_file_complete_pickle_does_not_merge_inconclusive_flax(tmp_path: Pa
 
 
 def test_scan_file_still_detects_flax_after_complete_pickle_prefix(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "complete-pickle-prefix.jpg"
-    checkpoint.write_bytes(
-        pickle.dumps(None, protocol=4)
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(pickle.dumps(None, protocol=4) + _pack_malicious_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -6777,14 +6562,10 @@ def test_scan_file_still_detects_flax_after_complete_pickle_prefix(tmp_path: Pat
 
 
 def test_scan_file_preserves_pickle_findings_in_protocol0_flax_overlap(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "stream-malicious-protocol0-prefix.jpg"
-    checkpoint.write_bytes(
-        _build_malicious_pickle(protocol=0)
-        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
-    )
+    checkpoint.write_bytes(_build_malicious_pickle(protocol=0) + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -6800,14 +6581,10 @@ def test_scan_file_routes_nested_renamed_flax_stream_with_delimiter_like_scalar(
     tmp_path: Path,
     leading_scalar: int,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
-    nested_payload = flax_msgpack_scanner.msgpack.packb(
-        leading_scalar, use_bin_type=True
-    ) + flax_msgpack_scanner.msgpack.packb(
-        {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-        use_bin_type=True,
+    nested_payload = (
+        flax_msgpack_scanner.msgpack.packb(leading_scalar, use_bin_type=True) + _pack_malicious_flax_checkpoint()
     )
     archive = tmp_path / f"nested-leading-scalar-{leading_scalar}.zip"
     _create_misnamed_zip(archive, {"payload.jpg": nested_payload})
@@ -6819,13 +6596,9 @@ def test_scan_file_routes_nested_renamed_flax_stream_with_delimiter_like_scalar(
 
 
 def test_scan_file_routes_nested_renamed_flax_stream_after_protocol0_pickle_prefix(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
-    nested_payload = b"cbuiltins\nstr\n." + flax_msgpack_scanner.msgpack.packb(
-        {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-        use_bin_type=True,
-    )
+    nested_payload = b"cbuiltins\nstr\n." + _pack_malicious_flax_checkpoint()
     archive = tmp_path / "nested-protocol0-prefix.zip"
     _create_misnamed_zip(archive, {"payload.jpg": nested_payload})
 
@@ -6851,17 +6624,10 @@ def test_scan_file_does_not_merge_pickle_failure_for_binary_header_like_flax_str
     tmp_path: Path,
     prefix: bytes,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "binary-header-like-flax.jpg"
-    checkpoint.write_bytes(
-        prefix
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(prefix + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -6871,17 +6637,10 @@ def test_scan_file_does_not_merge_pickle_failure_for_binary_header_like_flax_str
 
 
 def test_scan_file_selected_pickle_does_not_claim_binary_header_like_flax_stream(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "selected-binary-header-like-flax.jpg"
-    checkpoint.write_bytes(
-        b"\x80\x04"
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(b"\x80\x04" + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"scanners": ["pickle"], "cache_scan_results": False})
 
@@ -6890,13 +6649,9 @@ def test_scan_file_selected_pickle_does_not_claim_binary_header_like_flax_stream
 
 
 def test_scan_file_selected_pickle_does_not_claim_nested_binary_header_like_flax_stream(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
-    payload = b"\x80\x04" + flax_msgpack_scanner.msgpack.packb(
-        {"params": {"w": [1, 2, 3]}},
-        use_bin_type=True,
-    )
+    payload = b"\x80\x04" + _pack_benign_flax_checkpoint()
     archive = tmp_path / "selected-binary-header-like-flax.zip"
     _create_misnamed_zip(archive, {"payload.jpg": payload})
 
@@ -6928,21 +6683,14 @@ def test_scan_file_preserves_binary_pickle_findings_when_operand_crosses_probe_b
     opcode: bytes,
     operand: bytes,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / f"binary-pickle-{opcode.hex()}-boundary.jpg"
     malicious_prefix = b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR"
     padding_size = file_detection.PROTO0_1_MAX_PROBE_BYTES - len(malicious_prefix) - 1
     neutral_padding = (b"N0" * (padding_size // 2)) + (b"N" if padding_size % 2 else b"")
     pickle_stream = malicious_prefix + neutral_padding + opcode + operand + b"."
-    checkpoint.write_bytes(
-        pickle_stream
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(pickle_stream + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -6968,17 +6716,10 @@ def test_scan_file_preserves_unpickler_permitted_binary_pickle_findings(
     tmp_path: Path,
     pickle_stream: bytes,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "unpickler-permitted-overlap.jpg"
-    checkpoint.write_bytes(
-        pickle_stream
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(pickle_stream + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -6990,18 +6731,11 @@ def test_scan_file_preserves_unpickler_permitted_binary_pickle_findings(
 
 
 def test_scan_file_preserves_dangerous_list_setitem_binary_pickle_findings(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "list-setitem-overlap.jpg"
     pickle_stream = b"\x80\x04]NaK\x00cos\nsystem\n(S'id'\ntRs."
-    checkpoint.write_bytes(
-        pickle_stream
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(pickle_stream + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -7013,17 +6747,10 @@ def test_scan_file_preserves_dangerous_list_setitem_binary_pickle_findings(tmp_p
 
 
 def test_scan_file_preserves_binary_pickle_structural_tamper_in_flax_overlap(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "structural-tamper-overlap.jpg"
-    checkpoint.write_bytes(
-        b"\x80\x04\x80\x04K\x01."
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(b"\x80\x04\x80\x04K\x01." + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -7032,13 +6759,9 @@ def test_scan_file_preserves_binary_pickle_structural_tamper_in_flax_overlap(tmp
 
 
 def test_scan_file_preserves_nested_binary_pickle_structural_tamper_in_flax_overlap(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
-    payload = b"\x80\x04\x80\x04K\x01." + flax_msgpack_scanner.msgpack.packb(
-        {"params": {"w": [1, 2, 3]}},
-        use_bin_type=True,
-    )
+    payload = b"\x80\x04\x80\x04K\x01." + _pack_benign_flax_checkpoint()
     archive = tmp_path / "structural-tamper-overlap.zip"
     _create_misnamed_zip(archive, {"payload.jpg": payload})
 
@@ -7057,18 +6780,11 @@ def test_scan_file_preserves_selected_pickle_findings_in_flax_content_overlap(
     tmp_path: Path,
     scanner_config: dict[str, list[str]],
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "selected-list-setitem-overlap.jpg"
     pickle_stream = b"\x80\x04]NaK\x00cos\nsystem\n(S'id'\ntRs."
-    checkpoint.write_bytes(
-        pickle_stream
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(pickle_stream + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={**scanner_config, "cache_scan_results": False})
 
@@ -7105,18 +6821,10 @@ def test_scan_file_does_not_raise_for_deep_json_array_near_match(tmp_path: Path)
 
 
 def test_scan_file_fails_closed_for_ambiguous_json_looking_stream_before_later_flax_root(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "json-looking-padding.jpg"
-    checkpoint.write_bytes(
-        b"["
-        + b" " * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(b"[" + b" " * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100) + _pack_malicious_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
     aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
@@ -7130,16 +6838,11 @@ def test_scan_file_fails_closed_for_ambiguous_json_looking_stream_before_later_f
 def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past_analysis_limit(
     tmp_path: Path, suffix: str
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / f"stream-scalar-padding{suffix}"
     checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb(None, use_bin_type=True) * 4097
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
+        flax_msgpack_scanner.msgpack.packb(None, use_bin_type=True) * 4097 + _pack_malicious_flax_checkpoint()
     )
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
@@ -7156,8 +6859,7 @@ def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past
 
 
 def test_scan_file_routes_renamed_flax_state_wrapper_with_malicious_attribute(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "state-wrapper.jpg"
     checkpoint.write_bytes(
@@ -7194,8 +6896,7 @@ def test_scan_file_keeps_flax_analysis_when_payload_contains_embedded_format_sig
     suffix: str,
     embedded_bytes: bytes,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / f"embedded{suffix}"
     checkpoint.write_bytes(
@@ -7213,13 +6914,10 @@ def test_scan_file_keeps_flax_analysis_when_payload_contains_embedded_format_sig
 
 
 def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "malicious.flax"
-    checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
-    )
+    checkpoint.write_bytes(_pack_malicious_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -7645,11 +7343,10 @@ def test_scan_file_fails_closed_for_nested_printable_utf8_text_suffix_protobuf_c
 
 
 def test_scan_file_keeps_real_msgpack_fixture_owned_by_flax_scanner(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "checkpoint.jpg"
-    checkpoint.write_bytes(flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+    checkpoint.write_bytes(_pack_benign_flax_checkpoint())
 
     assert file_detection.detect_file_format(str(checkpoint)) == "flax_msgpack"
     assert file_detection.detect_file_format_from_magic(str(checkpoint)) == "flax_msgpack"
@@ -7673,8 +7370,7 @@ def test_scan_file_keeps_malformed_binary_control_owned_by_pytorch_binary_scanne
 
 
 def test_scan_file_routes_large_malicious_renamed_flax_msgpack_with_later_root_to_flax_scanner(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "malicious.jpg"
     checkpoint.write_bytes(
@@ -7700,8 +7396,7 @@ def test_scan_file_analyzes_renamed_flax_after_confirmed_root_exceeds_routing_bu
     tmp_path: Path,
     wrapped: bool,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     params = {f"f{i}": i for i in range(2100)}
     checkpoint_state: dict[str, object] = {"params": params} if not wrapped else {"state": {"params": params}}
@@ -7721,8 +7416,7 @@ def test_scan_file_analyzes_nested_renamed_flax_after_confirmed_root_exceeds_rou
     tmp_path: Path,
     wrapped: bool,
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     params = {f"f{i}": i for i in range(2100)}
     checkpoint_state: dict[str, object] = {"params": params} if not wrapped else {"state": {"params": params}}
@@ -7740,8 +7434,7 @@ def test_scan_file_analyzes_nested_renamed_flax_after_confirmed_root_exceeds_rou
 
 
 def test_scan_file_fails_closed_for_renamed_msgpack_routing_probe_limit(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "ambiguous.jpg"
     large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
@@ -7787,8 +7480,7 @@ def test_scan_file_fails_closed_when_renamed_msgpack_routing_read_cannot_complet
 
 
 def test_scan_file_fails_closed_for_small_renamed_msgpack_routing_probe_limit(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "ambiguous-small.jpg"
     large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
@@ -7810,8 +7502,7 @@ def test_scan_file_fails_closed_for_small_renamed_msgpack_routing_probe_limit(tm
 
 
 def test_scan_file_ambiguous_renamed_msgpack_result_is_not_cached(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / "ambiguous.jpg"
     large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
@@ -7829,16 +7520,13 @@ def test_scan_file_ambiguous_renamed_msgpack_result_is_not_cached(tmp_path: Path
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(checkpoint), config=config)
         second = scan_file(str(checkpoint), config=config)
 
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_missing_msgpack_result_is_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7852,16 +7540,13 @@ def test_scan_file_missing_msgpack_result_is_not_cached(tmp_path: Path, monkeypa
     }
     monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(checkpoint), config=config)
         second = scan_file(str(checkpoint), config=config)
 
         assert first.success is False
         assert second.success is False
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_missing_yaml_parser_result_is_not_cached(
@@ -7880,8 +7565,7 @@ def test_scan_file_missing_yaml_parser_result_is_not_cached(
     }
     monkeypatch.setattr(jinja2_template_scanner, "HAS_YAML", False)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(yaml_file), config=config)
         second = scan_file(str(yaml_file), config=config)
 
@@ -7891,8 +7575,6 @@ def test_scan_file_missing_yaml_parser_result_is_not_cached(
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_oversized_standalone_jinja_result_is_not_cached(tmp_path: Path) -> None:
@@ -7905,8 +7587,7 @@ def test_scan_file_oversized_standalone_jinja_result_is_not_cached(tmp_path: Pat
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(template_file), config=config)
         second = scan_file(str(template_file), config=config)
 
@@ -7916,8 +7597,6 @@ def test_scan_file_oversized_standalone_jinja_result_is_not_cached(tmp_path: Pat
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_jinja_sandbox_budget_result_is_not_cached(tmp_path: Path) -> None:
@@ -7933,8 +7612,7 @@ def test_scan_file_jinja_sandbox_budget_result_is_not_cached(tmp_path: Path) -> 
         "sandbox_render_timeout_seconds": 2,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(template_file), config=config)
         second = scan_file(str(template_file), config=config)
 
@@ -7945,8 +7623,6 @@ def test_scan_file_jinja_sandbox_budget_result_is_not_cached(tmp_path: Path) -> 
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert "jinja2_sandbox_render_budget_exceeded" in first.metadata["scan_outcome_reasons"]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(
         str(template_file),
@@ -7969,8 +7645,7 @@ def test_scan_file_unreadable_standalone_jinja_result_is_not_cached(tmp_path: Pa
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(template_file), config=config)
         second = scan_file(str(template_file), config=config)
 
@@ -7980,8 +7655,6 @@ def test_scan_file_unreadable_standalone_jinja_result_is_not_cached(tmp_path: Pa
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_still_routes_malicious_zip_with_local_header(tmp_path: Path) -> None:
@@ -8039,8 +7712,7 @@ def test_scan_file_prefers_hdf5_and_preserves_executable_zip_userblock(
     assert file_detection.detect_file_format(str(polyglot)) == EXECUTABLE_ZIP_POLYGLOT_FORMAT
     assert find_hdf5_signature_offset(str(polyglot)) == signature_offset
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for _ in range(2):
             result = scan_file(str(polyglot), config=config)
             assert result.scanner_name == "keras_h5"
@@ -8053,8 +7725,6 @@ def test_scan_file_prefers_hdf5_and_preserves_executable_zip_userblock(
             )
 
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_preserves_large_zip_userblock_outside_eocd_tail_window(
@@ -8496,8 +8166,7 @@ def test_scan_file_fails_closed_for_non_padding_between_concatenated_hdf5_userbl
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
     monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for _ in range(2):
             result = scan_file(str(polyglot), config=config)
 
@@ -8518,8 +8187,6 @@ def test_scan_file_fails_closed_for_non_padding_between_concatenated_hdf5_userbl
         assert "hdf5_userblock_zip_scan_failed" in metadata["scan_outcome_reasons"]
         assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("malicious", [False, True])
@@ -8721,12 +8388,9 @@ def test_scan_file_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_p
 
     assert find_hdf5_signature_offset(str(model_path)) == userblock_size
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(model_path), config=config)
         cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
-    finally:
-        reset_cache_manager()
 
     assert result.scanner_name == "keras_h5"
     assert result.success is False
@@ -8753,13 +8417,10 @@ def test_scan_file_fails_closed_for_ratio_limited_compressed_tar_inside_valid_hd
 
     cache_dir = tmp_path / "cache"
     cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         file_result = scan_file(str(model_path), config=cache_config)
         repeated_result = scan_file(str(model_path), config=cache_config)
         cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
-    finally:
-        reset_cache_manager()
 
     result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
     metadata = result.file_metadata[str(model_path)]
@@ -8811,13 +8472,10 @@ def test_scan_file_preserves_keras_finding_for_ratio_limited_tar_inside_valid_hd
 
     cache_dir = tmp_path / "cache"
     cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         file_result = scan_file(str(model_path), config=cache_config)
         repeated_result = scan_file(str(model_path), config=cache_config)
         cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
-    finally:
-        reset_cache_manager()
 
     aggregate_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
     metadata = aggregate_result.file_metadata[str(model_path)]
@@ -9297,13 +8955,10 @@ def test_compressed_tar_hdf5_ownership_limits_preserve_early_nemo_findings(
 
     assert classify_compressed_tar_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(model_path), config=config)
         repeated_result = scan_file(str(model_path), config=config)
         cache_entries = get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"]
-    finally:
-        reset_cache_manager()
 
     for file_result in (result, repeated_result):
         assert file_result.scanner_name == "keras_h5"
@@ -9547,8 +9202,7 @@ def test_scan_file_preserves_findings_without_cache_for_incomplete_raw_tar_hdf5_
     assert file_detection.detect_file_format(str(model_path)) == "nemo"
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregate = scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
@@ -9556,8 +9210,6 @@ def test_scan_file_preserves_findings_without_cache_for_incomplete_raw_tar_hdf5_
             min_cache_file_size=0,
         )
         cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
-    finally:
-        reset_cache_manager()
 
     metadata = aggregate.file_metadata[str(model_path)]
     assert aggregate.success is False
@@ -9633,8 +9285,7 @@ def test_scan_file_routes_compressed_tar_when_hdf5_signature_is_inside_gzip_extr
     assert classify_compressed_tar_prefix_ownership(str(model_path), signature_offset) == "incomplete"
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregate = scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
@@ -9642,8 +9293,6 @@ def test_scan_file_routes_compressed_tar_when_hdf5_signature_is_inside_gzip_extr
             min_cache_file_size=0,
         )
         cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
-    finally:
-        reset_cache_manager()
 
     metadata = aggregate.file_metadata[str(model_path)]
     assert "compressed" not in metadata.get("supplemental_scanners", [])
@@ -10143,6 +9792,7 @@ def test_scan_file_fails_closed_when_disguised_llamafile_route_probe_cannot_read
     result = scan_file(str(payload), config={"cache_scan_results": False})
 
     assert result.scanner_name == "unknown"
+    assert result.bytes_scanned == payload.stat().st_size
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["operational_error_reason"] == "llamafile_routing_incomplete"
@@ -10488,16 +10138,13 @@ def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailabl
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(disguised_keras), config=config)
         repeated = scan_file(str(disguised_keras), config=config)
 
         assert repeated.success is False
         assert repeated.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     assert result.scanner_name == "zip"
     assert result.success is False
@@ -10536,16 +10183,13 @@ def test_scan_file_bypasses_stale_cache_when_keras_zip_scanner_becomes_unavailab
     }
     keras_scanner_available = _switch_keras_availability(monkeypatch)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached = scan_file(str(disguised_keras), config=config)
         assert cached.success is True
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
 
         keras_scanner_available[0] = False
         unavailable = scan_file(str(disguised_keras), config=config)
-    finally:
-        reset_cache_manager()
 
     assert unavailable.scanner_name == "zip"
     assert unavailable.success is False
@@ -10573,16 +10217,13 @@ def test_scan_file_bypasses_stale_cache_when_pytorch_zip_scanner_becomes_unavail
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached = scan_file(str(model_path), config=config)
         assert cached.success is True
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
 
         pytorch_scanner_available = False
         unavailable = scan_file(str(model_path), config=config)
-    finally:
-        reset_cache_manager()
 
     assert unavailable.scanner_name == "zip"
     assert unavailable.success is False
@@ -10610,8 +10251,7 @@ def test_scan_file_bypasses_outer_archive_cache_when_nested_scanner_becomes_unav
     }
     keras_scanner_available = _switch_keras_availability(monkeypatch)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached = scan_file(str(outer_archive), config=config)
         assert cached.success is True
         assert "keras_zip" in cached.metadata["scanner_dependency_ids"]
@@ -10619,8 +10259,6 @@ def test_scan_file_bypasses_outer_archive_cache_when_nested_scanner_becomes_unav
 
         keras_scanner_available[0] = False
         unavailable = scan_file(str(outer_archive), config=config)
-    finally:
-        reset_cache_manager()
 
     assert unavailable.scanner_name == "zip"
     assert unavailable.success is False
@@ -11257,8 +10895,7 @@ def test_scan_file_large_confirmed_jax_foreign_overlap_is_inconclusive_not_cache
     model_path.write_text(json.dumps(payload), encoding="utf-8")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for aggregate in (
             scan_model_directory_or_file(
                 str(model_path),
@@ -11279,8 +10916,6 @@ def test_scan_file_large_confirmed_jax_foreign_overlap_is_inconclusive_not_cache
             assert core_module.determine_exit_code(aggregate) == 2
             assert foreign_owner in aggregate.scanner_names
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("suffix", [".ckpt", ".pickle"])
@@ -11337,8 +10972,7 @@ def test_scan_file_fails_closed_for_oversized_renamed_jax_json_and_does_not_cach
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(model_path), config=config)
         second = scan_file(str(model_path), config=config)
         near_match_result = scan_file(str(near_match_path), config={"cache_scan_results": False})
@@ -11351,8 +10985,6 @@ def test_scan_file_fails_closed_for_oversized_renamed_jax_json_and_does_not_cach
         assert near_match_result.scanner_name == "unknown"
         assert near_match_result.success is True
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 2
@@ -11552,8 +11184,7 @@ def test_scan_file_fails_closed_and_does_not_cache_bounded_jax_prefix_read_failu
         raise OSError("forced bounded prefix read failure")
 
     monkeypatch.setattr(JaxCheckpointScanner, "_scan_bounded_json_prefix_patterns", fail_prefix_read)
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
@@ -11575,8 +11206,6 @@ def test_scan_file_fails_closed_and_does_not_cache_bounded_jax_prefix_read_failu
             assert metadata["operational_error_reason"] == "jax_json_checkpoint_prefix_pattern_read_failed"
             assert any(check.name == "JSON Bounded Prefix Pattern Scan" for check in aggregate.checks)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_fails_closed_when_renamed_jax_json_root_is_past_routing_budget(tmp_path: Path) -> None:
@@ -11966,8 +11595,7 @@ def test_tensorflow_inconclusive_safetensors_overlap_fails_closed_without_hashin
     assert file_detection.detect_file_format(str(payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
     assert file_detection.should_defer_safetensors_header_limit_hash(str(payload), 16)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         direct = scan_file(str(payload), config=config)
         aggregate = scan_model_directory_or_file(
             str(payload),
@@ -11981,8 +11609,6 @@ def test_tensorflow_inconclusive_safetensors_overlap_fails_closed_without_hashin
         assert aggregate.success is False
         assert core_module.determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_valid_safetensors_framing_precedes_ambiguous_tensorflow_probe(tmp_path: Path) -> None:
@@ -12364,8 +11990,7 @@ def test_scan_file_incomplete_mxnet_routing_is_exit2_and_not_cached(
     )
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(disguised_symbol),
             cache_enabled=True,
@@ -12390,8 +12015,6 @@ def test_scan_file_incomplete_mxnet_routing_is_exit2_and_not_cached(
                 for check in aggregate.checks
             )
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_reuses_trusted_mxnet_content_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -12684,8 +12307,7 @@ def test_scan_file_xgboost_only_malformed_overlap_is_exit2_and_not_cached(tmp_pa
     )
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(model_path),
             scanners=["xgboost"],
@@ -12709,8 +12331,6 @@ def test_scan_file_xgboost_only_malformed_overlap_is_exit2_and_not_cached(tmp_pa
             assert core_module.determine_exit_code(aggregate) == 2
             assert "mxnet" in metadata["skipped_scanner_ids"]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_runs_xgboost_checks_for_bounded_probable_malformed_mxnet_overlap(
@@ -12903,8 +12523,7 @@ def test_scan_file_xgboost_only_overlap_is_clean_and_cached(tmp_path: Path) -> N
     )
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(model_path),
             scanners=["xgboost"],
@@ -12926,8 +12545,6 @@ def test_scan_file_xgboost_only_overlap_is_clean_and_cached(tmp_path: Path) -> N
             assert "xgboost_mxnet_symbol_overlap" not in metadata.get("scan_outcome_reasons", [])
             assert core_module.determine_exit_code(aggregate) == 0
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("version", ["[1,7,4]", '"malformed"'])
@@ -12951,8 +12568,7 @@ def test_scan_file_xgboost_only_oversized_renamed_overlap_is_not_clean_or_cached
     assert direct.success is False
     assert "max_file_read_size_exceeded" in direct.metadata["scan_outcome_reasons"]
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(model_path),
             scanners=["xgboost"],
@@ -12976,8 +12592,6 @@ def test_scan_file_xgboost_only_oversized_renamed_overlap_is_not_clean_or_cached
             assert "xgboost" in aggregate.scanner_names
             assert any(check.name == "File Size Limit" for check in aggregate.checks)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_inconclusive_params_routing_preserves_raw_findings(tmp_path: Path) -> None:
@@ -13053,8 +12667,7 @@ def test_scan_file_xgboost_mxnet_overlap_is_exit2_and_not_cached(tmp_path: Path)
     )
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
@@ -13079,8 +12692,6 @@ def test_scan_file_xgboost_mxnet_overlap_is_exit2_and_not_cached(tmp_path: Path)
                 for check in aggregate.checks
             )
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route(
@@ -15409,9 +15020,8 @@ def test_scan_file_keeps_s901_for_cached_hidden_onnx_evidence(tmp_path: Path, ru
         "cache_dir": str(cache_dir),
         "min_cache_file_size": 0,
     }
-    reset_cache_manager()
 
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first_result = scan_file(str(disguised_onnx), config=cache_config)
         second_result = scan_file(str(disguised_onnx), config=cache_config)
         format_checks = [_format_validation_check(first_result), _format_validation_check(second_result)]
@@ -15425,8 +15035,6 @@ def test_scan_file_keeps_s901_for_cached_hidden_onnx_evidence(tmp_path: Path, ru
             ACTIONABLE_FAILED_CHECKS_METADATA_KEY in result._private_metadata
             for result in (first_result, second_result)
         )
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_keeps_s901_for_truncated_pt_onnx(tmp_path: Path) -> None:
@@ -15835,8 +15443,7 @@ def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structu
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(ambiguous_onnx), config=config)
         repeated_result = scan_file(str(ambiguous_onnx), config=config)
 
@@ -15846,8 +15453,6 @@ def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structu
         assert result.issues == []
         assert result.metadata["tentative_protobuf_candidate_rejected"] is True
         assert "scan_outcome" not in result.metadata
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(ambiguous_onnx), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 0
@@ -15980,8 +15585,7 @@ def test_scan_file_fails_closed_for_oversized_renamed_tf_savedmodel_without_cach
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(disguised_savedmodel), config=config)
         second = scan_file(str(disguised_savedmodel), config=config)
 
@@ -15991,8 +15595,6 @@ def test_scan_file_fails_closed_for_oversized_renamed_tf_savedmodel_without_cach
         assert first.metadata["operational_error_reason"] == "savedmodel_parse_budget_exceeded"
         assert any("SavedModel exceeds bounded parse budget" in issue.message for issue in first.issues)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 2
@@ -16008,8 +15610,7 @@ def test_scan_file_fails_closed_for_incomplete_tf_protobuf_routing_without_cachi
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(ambiguous_payload), config=config)
         second = scan_file(str(ambiguous_payload), config=config)
 
@@ -16022,8 +15623,6 @@ def test_scan_file_fails_closed_for_incomplete_tf_protobuf_routing_without_cachi
         check = next(check for check in first.checks if check.name == "TensorFlow Protobuf Routing")
         assert "bounded structural probe reached its limit" in check.message
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(ambiguous_payload), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 2
@@ -16043,8 +15642,7 @@ def test_scan_file_keeps_versioned_oversized_protobuf_on_inconclusive_route_with
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(generic_payload), config=config)
         repeated_result = scan_file(str(generic_payload), config=config)
 
@@ -16053,8 +15651,6 @@ def test_scan_file_keeps_versioned_oversized_protobuf_on_inconclusive_route_with
         assert repeated_result.success is False
         assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(generic_payload), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 2
@@ -16071,8 +15667,7 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(disguised_metagraph), config=config)
         repeated_result = scan_file(str(disguised_metagraph), config=config)
 
@@ -16082,8 +15677,6 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
         assert result.metadata["operational_error_reason"] == "metagraph_parse_budget_exceeded"
         assert any("MetaGraph exceeds bounded parse budget" in issue.message for issue in result.issues)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 2
@@ -16101,8 +15694,7 @@ def test_scan_file_fails_closed_on_unparseable_tentative_onnx_candidate(tmp_path
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(malformed_payload), config=config)
         repeated_result = scan_file(str(malformed_payload), config=config)
 
@@ -16113,8 +15705,6 @@ def test_scan_file_fails_closed_on_unparseable_tentative_onnx_candidate(tmp_path
         assert result.metadata["scan_outcome"] == "inconclusive"
         assert "onnx_tentative_candidate_parse_incomplete" in result.metadata["scan_outcome_reasons"]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(malformed_payload), cache_scan_results=False)
     assert aggregate.success is False
@@ -16196,6 +15786,7 @@ def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(
     result = scan_file(str(unavailable_onnx))
 
     assert result.scanner_name == "unknown"
+    assert result.bytes_scanned == unavailable_onnx.stat().st_size
     assert result.success is False
     assert result.has_errors is False
     assert result.metadata["scan_outcome"] == "inconclusive"
@@ -16401,8 +15992,7 @@ def test_scan_file_unavailable_recognized_format_result_is_not_cached(
     monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
     monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(unavailable_onnx), config=config)
         second = scan_file(str(unavailable_onnx), config=config)
 
@@ -16411,8 +16001,72 @@ def test_scan_file_unavailable_recognized_format_result_is_not_cached(
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+
+
+def _warm_read_failure_cache(
+    monkeypatch: pytest.MonkeyPatch, model_path: Path, cache_dir: Path
+) -> ModelAuditResultModel:
+    with monkeypatch.context() as cache_setup:
+        cache_setup.setattr(
+            cache_decorator,
+            "should_bypass_cache_for_read_failure_aware_file",
+            lambda _path: False,
+        )
+        result = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+    return result
+
+
+def _install_cached_read_failure(monkeypatch: pytest.MonkeyPatch, model_path: Path, filename: str, reason: str) -> None:
+    real_open = open
+
+    def fail_cached_binary_read(
+        candidate: str | bytes | os.PathLike[str],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(candidate) == str(model_path):
+            if reason == "r_serialized_read_failed":
+                raise PermissionError(13, f"simulated transient {reason} read")
+            raise OSError(f"simulated transient {reason} read")
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+    if filename == "saved_model.pb":
+        real_bound_open = tf_savedmodel_scanner._open_bound_regular_file
+
+        @contextmanager
+        def fail_cached_savedmodel_read(
+            candidate: Path,
+            expected_stat: os.stat_result,
+        ) -> Iterator[Any]:
+            if candidate == model_path:
+                raise OSError(f"simulated transient {reason} read")
+            with real_bound_open(candidate, expected_stat) as stream:
+                yield stream
+
+        monkeypatch.setattr(
+            tf_savedmodel_scanner,
+            "_open_bound_regular_file",
+            fail_cached_savedmodel_read,
+        )
+    if filename.endswith(".npz"):
+        real_zip_file = zipfile.ZipFile
+
+        def fail_cached_zip_read(
+            candidate: str | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if str(candidate) == str(model_path):
+                raise OSError(f"simulated transient {reason} read")
+            return real_zip_file(candidate, *args, **kwargs)
+
+        monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_cached_zip_read)
 
 
 def test_single_file_scan_bypasses_stale_cache_when_owner_becomes_unreadable(
@@ -16447,20 +16101,8 @@ def test_single_file_scan_bypasses_stale_cache_when_owner_becomes_unreadable(
     )
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
-        with monkeypatch.context() as cache_setup:
-            cache_setup.setattr(
-                cache_decorator,
-                "should_bypass_cache_for_read_failure_aware_file",
-                lambda _path: False,
-            )
-            first = core_module.scan_model_directory_or_file(
-                str(model_path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
+        first = _warm_read_failure_cache(monkeypatch, model_path, cache_dir)
         assert core_module.determine_exit_code(first) == 0
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         assert cached_entries > 0
@@ -16486,8 +16128,6 @@ def test_single_file_scan_bypasses_stale_cache_when_owner_becomes_unreadable(
         assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
         assert core_module.determine_exit_code(second) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
@@ -16526,20 +16166,8 @@ def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
     _write_malicious_lightgbm(malicious)
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
-        with monkeypatch.context() as cache_setup:
-            cache_setup.setattr(
-                cache_decorator,
-                "should_bypass_cache_for_read_failure_aware_file",
-                lambda _path: False,
-            )
-            warm = core_module.scan_model_directory_or_file(
-                str(cached_clean),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
+        warm = _warm_read_failure_cache(monkeypatch, cached_clean, cache_dir)
         assert core_module.determine_exit_code(warm) == 0
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
 
@@ -16568,53 +16196,54 @@ def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
         assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert core_module.determine_exit_code(result) == 2
-    finally:
-        reset_cache_manager()
+
+
+_READ_FAILURE_CACHE_CASES: list[tuple[str, Callable[[Path], object], str, str, str]] = [
+    ("cached.mlmodel", create_mock_coreml, "coreml_read_failed", "CoreML File Read", "Failed to read CoreML file"),
+    (
+        "cached.safetensors",
+        _write_minimal_safetensors,
+        "safetensors_read_failed",
+        "SafeTensors File Read",
+        "Unable to read SafeTensors file",
+    ),
+    (
+        "cached.engine",
+        _write_safe_tensorrt,
+        "tensorrt_read_failed",
+        "TensorRT Engine Read",
+        "Error reading TensorRT engine",
+    ),
+    ("cached.npy", _write_minimal_numpy, "numpy_read_failed", "NumPy File Read", "Unable to read NumPy file"),
+    ("cached.npz", _write_safe_npz, "zip_analysis_incomplete", "ZIP File Scan", "Error scanning zip file"),
+    ("cached.pdmodel", _write_safe_paddle, "paddle_read_failed", "Paddle File Read", "Error reading file"),
+    (
+        "cached.bin",
+        _write_safe_pytorch_binary,
+        "pytorch_binary_read_failed",
+        "Binary File Read",
+        "Unable to read binary file",
+    ),
+    (
+        "saved_model.pb",
+        _write_safe_savedmodel,
+        "savedmodel_read_failed",
+        "SavedModel File Read",
+        "Unable to read TF SavedModel file",
+    ),
+    (
+        "cached.rds",
+        _write_safe_r_serialized,
+        "r_serialized_read_failed",
+        "R Serialized Read",
+        "Unable to read R serialized payload",
+    ),
+]
 
 
 @pytest.mark.parametrize(
     ("filename", "writer", "reason", "check_name", "message_fragment"),
-    [
-        ("cached.mlmodel", create_mock_coreml, "coreml_read_failed", "CoreML File Read", "Failed to read CoreML file"),
-        (
-            "cached.safetensors",
-            _write_minimal_safetensors,
-            "safetensors_read_failed",
-            "SafeTensors File Read",
-            "Unable to read SafeTensors file",
-        ),
-        (
-            "cached.engine",
-            _write_safe_tensorrt,
-            "tensorrt_read_failed",
-            "TensorRT Engine Read",
-            "Error reading TensorRT engine",
-        ),
-        ("cached.npy", _write_minimal_numpy, "numpy_read_failed", "NumPy File Read", "Unable to read NumPy file"),
-        ("cached.npz", _write_safe_npz, "zip_analysis_incomplete", "ZIP File Scan", "Error scanning zip file"),
-        ("cached.pdmodel", _write_safe_paddle, "paddle_read_failed", "Paddle File Read", "Error reading file"),
-        (
-            "cached.bin",
-            _write_safe_pytorch_binary,
-            "pytorch_binary_read_failed",
-            "Binary File Read",
-            "Unable to read binary file",
-        ),
-        (
-            "saved_model.pb",
-            _write_safe_savedmodel,
-            "savedmodel_read_failed",
-            "SavedModel File Read",
-            "Unable to read TF SavedModel file",
-        ),
-        (
-            "cached.rds",
-            _write_safe_r_serialized,
-            "r_serialized_read_failed",
-            "R Serialized Read",
-            "Unable to read R serialized payload",
-        ),
-    ],
+    _READ_FAILURE_CACHE_CASES,
 )
 def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails(
     tmp_path: Path,
@@ -16629,70 +16258,14 @@ def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_rea
     writer(model_path)
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
-        with monkeypatch.context() as cache_setup:
-            cache_setup.setattr(
-                cache_decorator,
-                "should_bypass_cache_for_read_failure_aware_file",
-                lambda _path: False,
-            )
-            first = core_module.scan_model_directory_or_file(
-                str(model_path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
+        first = _warm_read_failure_cache(monkeypatch, model_path, cache_dir)
         assert core_module.determine_exit_code(first) == 0
         assert first.success is True
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         assert cached_entries > 0
 
-        real_open = open
-
-        def fail_cached_binary_read(
-            candidate: str | bytes | os.PathLike[str],
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:
-            if str(candidate) == str(model_path):
-                if reason == "r_serialized_read_failed":
-                    raise PermissionError(13, f"simulated transient {reason} read")
-                raise OSError(f"simulated transient {reason} read")
-            return real_open(candidate, *args, **kwargs)
-
-        monkeypatch.setattr("builtins.open", fail_cached_binary_read)
-        if filename == "saved_model.pb":
-            real_bound_open = tf_savedmodel_scanner._open_bound_regular_file
-
-            @contextmanager
-            def fail_cached_savedmodel_read(
-                candidate: Path,
-                expected_stat: os.stat_result,
-            ) -> Iterator[Any]:
-                if candidate == model_path:
-                    raise OSError(f"simulated transient {reason} read")
-                with real_bound_open(candidate, expected_stat) as stream:
-                    yield stream
-
-            monkeypatch.setattr(
-                tf_savedmodel_scanner,
-                "_open_bound_regular_file",
-                fail_cached_savedmodel_read,
-            )
-        if filename.endswith(".npz"):
-            real_zip_file = zipfile.ZipFile
-
-            def fail_cached_zip_read(
-                candidate: str | os.PathLike[str],
-                *args: Any,
-                **kwargs: Any,
-            ) -> Any:
-                if str(candidate) == str(model_path):
-                    raise OSError(f"simulated transient {reason} read")
-                return real_zip_file(candidate, *args, **kwargs)
-
-            monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_cached_zip_read)
+        _install_cached_read_failure(monkeypatch, model_path, filename, reason)
 
         second = core_module.scan_model_directory_or_file(
             str(model_path),
@@ -16708,8 +16281,6 @@ def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_rea
         assert any(check.name == check_name and message_fragment in check.message for check in second.checks)
         assert core_module.determine_exit_code(second) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_single_file_scan_bypasses_stale_cache_when_numpy_header_read_fails_after_cache_warm(
@@ -16720,20 +16291,8 @@ def test_single_file_scan_bypasses_stale_cache_when_numpy_header_read_fails_afte
     _write_minimal_numpy(model_path)
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
-        with monkeypatch.context() as cache_setup:
-            cache_setup.setattr(
-                cache_decorator,
-                "should_bypass_cache_for_read_failure_aware_file",
-                lambda _path: False,
-            )
-            first = core_module.scan_model_directory_or_file(
-                str(model_path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
+        first = _warm_read_failure_cache(monkeypatch, model_path, cache_dir)
         assert core_module.determine_exit_code(first) == 0
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         assert cached_entries > 0
@@ -16759,53 +16318,11 @@ def test_single_file_scan_bypasses_stale_cache_when_numpy_header_read_fails_afte
         )
         assert core_module.determine_exit_code(second) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize(
     ("filename", "writer", "reason", "check_name", "message_fragment"),
-    [
-        ("cached.mlmodel", create_mock_coreml, "coreml_read_failed", "CoreML File Read", "Failed to read CoreML file"),
-        (
-            "cached.safetensors",
-            _write_minimal_safetensors,
-            "safetensors_read_failed",
-            "SafeTensors File Read",
-            "Unable to read SafeTensors file",
-        ),
-        (
-            "cached.engine",
-            _write_safe_tensorrt,
-            "tensorrt_read_failed",
-            "TensorRT Engine Read",
-            "Error reading TensorRT engine",
-        ),
-        ("cached.npy", _write_minimal_numpy, "numpy_read_failed", "NumPy File Read", "Unable to read NumPy file"),
-        ("cached.npz", _write_safe_npz, "zip_analysis_incomplete", "ZIP File Scan", "Error scanning zip file"),
-        ("cached.pdmodel", _write_safe_paddle, "paddle_read_failed", "Paddle File Read", "Error reading file"),
-        (
-            "cached.bin",
-            _write_safe_pytorch_binary,
-            "pytorch_binary_read_failed",
-            "Binary File Read",
-            "Unable to read binary file",
-        ),
-        (
-            "saved_model.pb",
-            _write_safe_savedmodel,
-            "savedmodel_read_failed",
-            "SavedModel File Read",
-            "Unable to read TF SavedModel file",
-        ),
-        (
-            "cached.rds",
-            _write_safe_r_serialized,
-            "r_serialized_read_failed",
-            "R Serialized Read",
-            "Unable to read R serialized payload",
-        ),
-    ],
+    _READ_FAILURE_CACHE_CASES,
 )
 def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails_with_security_finding(
     tmp_path: Path,
@@ -16824,70 +16341,14 @@ def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_
     malicious.write_bytes(_build_malicious_pickle())
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
-        with monkeypatch.context() as cache_setup:
-            cache_setup.setattr(
-                cache_decorator,
-                "should_bypass_cache_for_read_failure_aware_file",
-                lambda _path: False,
-            )
-            warm = core_module.scan_model_directory_or_file(
-                str(cached_clean),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
+        warm = _warm_read_failure_cache(monkeypatch, cached_clean, cache_dir)
         assert core_module.determine_exit_code(warm) == 0
         assert warm.success is True
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         assert cached_entries > 0
 
-        real_open = open
-
-        def fail_cached_binary_read(
-            candidate: str | bytes | os.PathLike[str],
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:
-            if str(candidate) == str(cached_clean):
-                if reason == "r_serialized_read_failed":
-                    raise PermissionError(13, f"simulated transient {reason} read")
-                raise OSError(f"simulated transient {reason} read")
-            return real_open(candidate, *args, **kwargs)
-
-        monkeypatch.setattr("builtins.open", fail_cached_binary_read)
-        if filename == "saved_model.pb":
-            real_bound_open = tf_savedmodel_scanner._open_bound_regular_file
-
-            @contextmanager
-            def fail_cached_savedmodel_read(
-                candidate: Path,
-                expected_stat: os.stat_result,
-            ) -> Iterator[Any]:
-                if candidate == cached_clean:
-                    raise OSError(f"simulated transient {reason} read")
-                with real_bound_open(candidate, expected_stat) as stream:
-                    yield stream
-
-            monkeypatch.setattr(
-                tf_savedmodel_scanner,
-                "_open_bound_regular_file",
-                fail_cached_savedmodel_read,
-            )
-        if filename.endswith(".npz"):
-            real_zip_file = zipfile.ZipFile
-
-            def fail_cached_zip_read(
-                candidate: str | os.PathLike[str],
-                *args: Any,
-                **kwargs: Any,
-            ) -> Any:
-                if str(candidate) == str(cached_clean):
-                    raise OSError(f"simulated transient {reason} read")
-                return real_zip_file(candidate, *args, **kwargs)
-
-            monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_cached_zip_read)
+        _install_cached_read_failure(monkeypatch, cached_clean, filename, reason)
 
         result = core_module.scan_model_directory_or_file(
             str(model_dir),
@@ -16903,8 +16364,6 @@ def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_
         assert any(check.name == check_name and message_fragment in check.message for check in result.checks)
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert core_module.determine_exit_code(result) == 2
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_unavailable_protobuf_candidate_analyzer_fails_closed_and_is_not_cached(
@@ -16925,8 +16384,7 @@ def test_scan_file_unavailable_protobuf_candidate_analyzer_fails_closed_and_is_n
     monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
     monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(candidate), config=config)
         second = scan_file(str(candidate), config=config)
 
@@ -16937,8 +16395,6 @@ def test_scan_file_unavailable_protobuf_candidate_analyzer_fails_closed_and_is_n
         check = next(check for check in first.checks if check.name == "Protobuf Model Routing")
         assert "tentative protobuf analysis was unavailable" in check.message
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_keeps_budget_exhausted_coreml_candidate_owned_by_extension(
@@ -16992,8 +16448,7 @@ def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(ambiguous_xml), config=config)
         second = scan_file(str(ambiguous_xml), config=config)
 
@@ -17002,8 +16457,6 @@ def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize(
@@ -17045,8 +16498,7 @@ def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(
         lambda _self, _path, _stat: pytest.fail("bounded SafeTensors failures must bypass cache validation hashing"),
     )
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(payload), config=config)
         second = scan_file(str(payload), config=config)
 
@@ -17055,8 +16507,6 @@ def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_bypasses_cache_hash_for_bounded_pytorch_zip_read_limit(
@@ -17085,16 +16535,13 @@ def test_scan_file_bypasses_cache_hash_for_bounded_pytorch_zip_read_limit(
         lambda _self, _path, _stat: pytest.fail("bounded PyTorch scans must bypass cache validation hashing"),
     )
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(model_path), config=config)
 
         assert result.success is True
         assert result.metadata["file_hashes"]["sha256_prefix"]
         assert "sha256" not in result.metadata["file_hashes"]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_bypasses_cache_hash_for_bounded_legacy_pytorch_read_limit(
@@ -17132,8 +16579,7 @@ def test_scan_file_bypasses_cache_hash_for_bounded_legacy_pytorch_read_limit(
         lambda _self, _path, _stat: pytest.fail("bounded legacy PyTorch scans must bypass cache validation hashing"),
     )
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(model_path), config=config)
 
         assert result.success is False
@@ -17143,8 +16589,6 @@ def test_scan_file_bypasses_cache_hash_for_bounded_legacy_pytorch_read_limit(
         assert "sha256" not in result.metadata["file_hashes"]
         assert any(issue.details.get("associated_global") in _SYSTEM_GLOBAL_NAMES for issue in result.issues)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("suffix", [".pt", ".bin"])
@@ -17276,8 +16720,7 @@ def test_scan_file_rar_inconclusive_result_is_not_cached(tmp_path: Path) -> None
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(rar_path), config=config)
         second = scan_file(str(rar_path), config=config)
 
@@ -17286,8 +16729,6 @@ def test_scan_file_rar_inconclusive_result_is_not_cached(tmp_path: Path) -> None
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_file_routes_readme_documentation_to_text_scanner(tmp_path: Path) -> None:
@@ -17665,13 +17106,10 @@ def _switch_keras_availability(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
 
 
 def _assert_flax_overlap_routed(tmp_path: Path, suffix: str) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / f"malicious{suffix}"
-    checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
-    )
+    checkpoint.write_bytes(_pack_malicious_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -17738,20 +17176,13 @@ def _assert_safetensors_pickle_stack_routing(tmp_path: Path, case_pickle_tail: b
 def _assert_late_pickle_stop_in_msgpack(
     tmp_path: Path, case_filename: str, case_pickle_prefix: bytes, case_pickle_suffix: bytes
 ) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
+    _require_msgpack()
 
     checkpoint = tmp_path / case_filename
     pickle_stream = (
         case_pickle_prefix + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + case_pickle_suffix
     )
-    checkpoint.write_bytes(
-        pickle_stream
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
+    checkpoint.write_bytes(pickle_stream + _pack_benign_flax_checkpoint())
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
@@ -17968,3 +17399,37 @@ def _record_shard_calls(
 
     monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
     return calls
+
+
+def _install_hash_read_clock(monkeypatch: pytest.MonkeyPatch, read_seconds: Callable[[bytes], float]) -> list[int]:
+    real_fdopen = os.fdopen
+    read_sizes: list[int] = []
+    now = 0.0
+
+    class TimedReader:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> TimedReader:
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal now
+            read_sizes.append(size)
+            chunk = cast(bytes, self.handle.read(size))
+            now += read_seconds(chunk)
+            return chunk
+
+    def timed_fdopen(*args: Any, **kwargs: Any) -> TimedReader:
+        return TimedReader(real_fdopen(*args, **kwargs))
+
+    monkeypatch.setattr(core_module.os, "fdopen", timed_fdopen)
+    monkeypatch.setattr(core_module.time, "time", lambda: now)
+    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
+    return read_sizes

@@ -35,9 +35,16 @@ from modelaudit.scanners.tar_scanner import (
     TarScanner,
 )
 from modelaudit.utils.file import detection as file_detection
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import SystemCommandPayload
 from tests.helpers.scanners import scan_nested_critical_finding as nested_scan
 from tests.helpers.scanners import scan_nested_unsuccessful
+
+
+def _add_tar_bytes(archive: tarfile.TarFile, name: str, payload: bytes | bytearray) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(payload)
+    archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
 
 def _tar_octal_field(value: int, width: int) -> bytes:
@@ -181,8 +188,7 @@ def _assert_inconclusive_aggregate_not_reused(
     expected_security_findings: bool = False,
     **scan_kwargs: Any,
 ) -> None:
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -211,8 +217,6 @@ def _assert_inconclusive_aggregate_not_reused(
         stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
         assert stats["cache_hits"] == 0
         assert stats["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 class TestTarScanner:
@@ -220,9 +224,7 @@ class TestTarScanner:
 
     def _scan_python_tar_member(self, archive_path: Path, payload: bytes | bytearray, member_name: str) -> ScanResult:
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo(member_name)
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, member_name, payload)
         result = self.scanner.scan(str(archive_path))
         return result
 
@@ -1299,9 +1301,7 @@ class TestTarScanner:
         payload = b"safe metadata"
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("metadata.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "metadata.txt", payload)
 
         assert archive_path.stat().st_size > 1024
 
@@ -1338,9 +1338,7 @@ class TestTarScanner:
         payload = b"evil"
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("../evil.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "../evil.txt", payload)
 
         assert archive_path.stat().st_size > 1024
 
@@ -1363,13 +1361,9 @@ class TestTarScanner:
         later_payload = b"later"
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("../huge.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "../huge.bin", payload)
 
-            later_info = tarfile.TarInfo("later.txt")
-            later_info.size = len(later_payload)
-            archive.addfile(later_info, tarfile.io.BytesIO(later_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "later.txt", later_payload)
 
         result = TarScanner(
             config={
@@ -1452,9 +1446,7 @@ class TestTarScanner:
         payload = b"A" * 128
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         result = TarScanner(config={"max_file_read_size": 1024, "max_entry_size": 64}).scan(str(archive_path))
 
@@ -1495,9 +1487,7 @@ class TestTarScanner:
         payload = b"B" * 10_000
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         result = TarScanner(
             config={
@@ -1519,9 +1509,7 @@ class TestTarScanner:
         payload = b"safe"
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("metadata.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "metadata.txt", payload)
 
         result = core.scan_file(
             str(archive_path),
@@ -1560,14 +1548,10 @@ class TestTarScanner:
 
         with tarfile.open(archive_path, "w:gz") as archive:
             first_payload = b"x" * 128
-            first_info = tarfile.TarInfo("large-weights.bin")
-            first_info.size = len(first_payload)
-            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "large-weights.bin", first_payload)
 
             config_payload = b"model:\n  _target_: torch.nn.Linear\n"
-            config_info = tarfile.TarInfo("model_config.yaml")
-            config_info.size = len(config_payload)
-            archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "model_config.yaml", config_payload)
 
         result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 
@@ -1595,9 +1579,7 @@ class TestTarScanner:
 
         with tarfile.open(archive_path, "w:gz") as archive:
             first_payload = b"x" * 128
-            first_info = tarfile.TarInfo("large-weights.bin")
-            first_info.size = len(first_payload)
-            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "large-weights.bin", first_payload)
 
             link_info = tarfile.TarInfo("model_config.yaml")
             link_info.type = tarfile.SYMTYPE
@@ -1605,9 +1587,7 @@ class TestTarScanner:
             archive.addfile(link_info)
 
             config_payload = f"model:\n  _target_: {target}\n".encode()
-            payload_info = tarfile.TarInfo("payload.yaml")
-            payload_info.size = len(config_payload)
-            archive.addfile(payload_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.yaml", config_payload)
 
         result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 
@@ -1639,9 +1619,7 @@ class TestTarScanner:
         original_read = gzip.GzipFile.read
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("huge.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "huge.bin", payload)
 
         tracked_read = _track_read_bytes(original_read, gzip_read_bytes)
 
@@ -1709,13 +1687,9 @@ class TestTarScanner:
 
         with tarfile.open(archive_path, "w") as archive:
             for index in range(2):
-                info = tarfile.TarInfo(f"benign-{index}.bin")
-                info.size = len(payload)
-                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+                _add_tar_bytes(archive, f"benign-{index}.bin", payload)
 
-            info = tarfile.TarInfo("over-budget-payload.pkl")
-            info.size = len(malicious_payload)
-            archive.addfile(info, tarfile.io.BytesIO(malicious_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "over-budget-payload.pkl", malicious_payload)
 
         def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
             dispatched_paths.append(Path(path))
@@ -1759,15 +1733,11 @@ class TestTarScanner:
 
         with tarfile.open(inner_path, "w") as archive:
             for index in range(2):
-                info = tarfile.TarInfo(f"inner-{index}.bin")
-                info.size = len(payload)
-                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+                _add_tar_bytes(archive, f"inner-{index}.bin", payload)
 
         inner_bytes = inner_path.read_bytes()
         with tarfile.open(outer_path, "w") as archive:
-            info = tarfile.TarInfo("inner.tar")
-            info.size = len(inner_bytes)
-            archive.addfile(info, tarfile.io.BytesIO(inner_bytes))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "inner.tar", inner_bytes)
 
         result = TarScanner(
             config={
@@ -1794,9 +1764,7 @@ class TestTarScanner:
         payload = b"safe"
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("metadata.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "metadata.txt", payload)
 
         def fail_scan(_self: TarScanner, _path: str) -> ScanResult:
             raise AssertionError("core max_file_size should reject before TarScanner.scan")
@@ -1885,9 +1853,7 @@ class TestTarScanner:
         content = b"A" * 10_000
         archive_path = tmp_path / "payload.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(content)
-            archive.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", content)
 
         read_sizes: list[int | None] = []
         original_read = tarfile.ExFileObject.read
@@ -1921,9 +1887,7 @@ class TestTarScanner:
         payload = b"B" * 128
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         result = scanner.scan(str(archive_path))
 
@@ -1945,13 +1909,9 @@ class TestTarScanner:
         later_payload = b"later"
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
-            later_info = tarfile.TarInfo("later.txt")
-            later_info.size = len(later_payload)
-            archive.addfile(later_info, tarfile.io.BytesIO(later_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "later.txt", later_payload)
 
         with tarfile.open(archive_path, "r:") as archive:
             first_member = archive.getmember("payload.bin")
@@ -2016,13 +1976,9 @@ class TestTarScanner:
         malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
-            later_info = tarfile.TarInfo("payload.txt")
-            later_info.size = len(malicious_payload)
-            archive.addfile(later_info, tarfile.io.BytesIO(malicious_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", malicious_payload)
 
         bytes_read = [0]
         original_read = tar_scanner_module._TarBoundedStream.read
@@ -2063,9 +2019,7 @@ class TestTarScanner:
         payload = b"ordinary metadata " * 10
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("notes.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "notes.txt", payload)
 
         _assert_inconclusive_aggregate_not_reused(
             archive_path,
@@ -2080,9 +2034,7 @@ class TestTarScanner:
         payload = b"ordinary metadata " * 10
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("symlink.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "symlink.txt", payload)
 
         reset_config()
         set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
@@ -2108,18 +2060,13 @@ class TestTarScanner:
         malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
 
         with tarfile.open(archive_path, "w") as archive:
-            nested = tarfile.TarInfo("payload.pkl")
-            nested.size = len(malicious_payload)
-            archive.addfile(nested, tarfile.io.BytesIO(malicious_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.pkl", malicious_payload)
 
             oversized = b"A" * 128
-            info = tarfile.TarInfo("large.bin")
-            info.size = len(oversized)
-            archive.addfile(info, tarfile.io.BytesIO(oversized))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "large.bin", oversized)
 
         cache_dir = tmp_path / "nested-member-cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             for _ in range(2):
                 aggregate = core.scan_model_directory_or_file(
                     str(archive_path),
@@ -2134,8 +2081,6 @@ class TestTarScanner:
                 assert any(issue.location == f"{archive_path}:payload.pkl" for issue in aggregate.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_oversized_hidden_payload_returns_inconclusive_without_detected_finding(self, tmp_path: Path) -> None:
         """A payload hidden above the extraction bound must not be reported as observed."""
@@ -2143,9 +2088,7 @@ class TestTarScanner:
         payload = b'cos\nsystem\n(S"echo pwned"\ntR.' + (b"A" * 128)
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", payload)
 
         _assert_inconclusive_aggregate_not_reused(
             archive_path,
@@ -2161,9 +2104,7 @@ class TestTarScanner:
         payload = b"C" * 128
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         result = scanner.scan(str(archive_path))
 
@@ -2188,9 +2129,7 @@ class TestTarScanner:
             large_member.size = len(large_data)
             archive.addfile(large_member, tarfile.io.BytesIO(large_data))  # type: ignore[attr-defined]
 
-            evil_member = tarfile.TarInfo("payload.txt")
-            evil_member.size = len(payload)
-            archive.addfile(evil_member, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", payload)
 
         result = scanner.scan(str(archive_path))
 
@@ -2242,9 +2181,7 @@ class TestTarScanner:
             large_member.size = len(large_data)
             archive.addfile(large_member, tarfile.io.BytesIO(large_data))  # type: ignore[attr-defined]
 
-            payload_member = tarfile.TarInfo("late-payload.pkl")
-            payload_member.size = len(pickle_payload)
-            archive.addfile(payload_member, tarfile.io.BytesIO(pickle_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "late-payload.pkl", pickle_payload)
 
         result = TarScanner(
             config={
@@ -2269,9 +2206,7 @@ class TestTarScanner:
         archive_path = tmp_path / "nested_scan_failure.tar"
         payload = b"ordinary member"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("member.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "member.bin", payload)
 
         def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
             raise RuntimeError("nested scanner unavailable")
@@ -2298,9 +2233,7 @@ class TestTarScanner:
         archive_path = tmp_path / "outer_scan_failure.tar"
         with tarfile.open(archive_path, "w") as archive:
             payload = b"ordinary member"
-            info = tarfile.TarInfo("member.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "member.bin", payload)
 
         def fail_tar_scan(_self: TarScanner, _path: str, depth: int = 0) -> ScanResult:
             raise RuntimeError(f"unexpected TAR stream failure at depth {depth}")
@@ -2328,9 +2261,7 @@ class TestTarScanner:
         malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
         with tarfile.open(archive_path, "w") as archive:
             for name, payload in (("payload.txt", malicious_payload), ("later.txt", b"unreadable later member")):
-                info = tarfile.TarInfo(name)
-                info.size = len(payload)
-                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+                _add_tar_bytes(archive, name, payload)
 
         monkeypatch.setattr(
             TarScanner,
@@ -2507,9 +2438,7 @@ class TestTarScanner:
             fifo.type = tarfile.FIFOTYPE
             archive.addfile(fifo)
 
-            info = tarfile.TarInfo("data.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "data.bin", payload)
 
         result = self.scanner.scan(str(archive_path))
 
@@ -2533,9 +2462,7 @@ class TestTarScanner:
             special.size = len(special_payload)
             archive.addfile(special, tarfile.io.BytesIO(special_payload))  # type: ignore[attr-defined]
 
-            later_info = tarfile.TarInfo("later.txt")
-            later_info.size = len(later_payload)
-            archive.addfile(later_info, tarfile.io.BytesIO(later_payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "later.txt", later_payload)
 
         result = self.scanner.scan(str(archive_path))
 
@@ -2548,9 +2475,7 @@ class TestTarScanner:
         archive_path = tmp_path / "seekable_preflight.tar"
         payload = b"A" * 1024
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         opened_modes: list[str] = []
         original_open = tarfile.open
@@ -2686,9 +2611,7 @@ class TestTarScanner:
                 ("config.json", json_data),
                 ("weights.pt", pt_data),
             ]:
-                info = tarfile.TarInfo(name)
-                info.size = len(data)
-                t.addfile(info, tarfile.io.BytesIO(data))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, name, data)
 
         result = self.scanner.scan(str(archive_path))
 
@@ -2710,9 +2633,7 @@ class TestTarScanner:
         payload = pickle.dumps({"key": "value"})
 
         with tarfile.open(archive_path, "w") as t:
-            info = tarfile.TarInfo(long_name)
-            info.size = len(payload)
-            t.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(t, long_name, payload)
 
         result = self.scanner.scan(str(archive_path))
 
@@ -2727,9 +2648,7 @@ class TestTarScanner:
         content = b"some content"
 
         with tarfile.open(archive_path, "w") as t:
-            info = tarfile.TarInfo("file.txt")
-            info.size = len(content)
-            t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+            _add_tar_bytes(t, "file.txt", content)
 
         full_data = archive_path.read_bytes()
         truncated_path = tmp_path / "truncated_cut.tar"
@@ -2759,9 +2678,7 @@ class TestTarScanner:
         payload = b"A" * 1_000_000
 
         with tarfile.open(archive_path, mode) as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
         result = scanner.scan(str(archive_path))
@@ -2781,9 +2698,7 @@ class TestTarScanner:
         payload = b"A" * 1_000_000
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
 
@@ -2824,9 +2739,7 @@ class TestTarScanner:
         payload = b"B" * 10_000
 
         with tarfile.open(archive_path, mode) as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         scanner = TarScanner(config={"compressed_max_decompressed_bytes": 1024})
         result = scanner.scan(str(archive_path))
@@ -2853,9 +2766,7 @@ class TestTarScanner:
         payload = b"safe-payload"
 
         with tarfile.open(archive_path, mode) as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         scanner = TarScanner(
             config={
@@ -3284,9 +3195,7 @@ class TestTarScanner:
         with tarfile.open(archive_path, "w") as archive:
             for index in range(2):
                 payload = f"payload-{index}".encode()
-                info = tarfile.TarInfo(f"payload-{index}.bin")
-                info.size = len(payload)
-                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+                _add_tar_bytes(archive, f"payload-{index}.bin", payload)
 
         result = TarScanner(config={"max_tar_entries": 1}).scan(str(archive_path))
 
@@ -3305,9 +3214,7 @@ class TestTarScanner:
         archive_path = tmp_path / "nested_failure.tar"
         with tarfile.open(archive_path, "w") as archive:
             payload = b"payload"
-            info = tarfile.TarInfo("member.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "member.bin", payload)
 
         scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_unsuccessful}
         audit_result = core.scan_model_directory_or_file(
@@ -3327,9 +3234,7 @@ class TestTarScanner:
         archive_path = tmp_path / "nested_critical.tar"
         with tarfile.open(archive_path, "w") as archive:
             payload = b"payload"
-            info = tarfile.TarInfo("model.pkl")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "model.pkl", payload)
 
         result = TarScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}).scan(str(archive_path))
 
@@ -3345,9 +3250,7 @@ class TestTarScanner:
         payload = b"C" * 1_000_000
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
         result = scanner.scan(str(archive_path))
@@ -3364,9 +3267,7 @@ class TestTarScanner:
         payload = b"D" * 10_000
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", payload)
 
         result = core.scan_file(
             str(archive_path),
@@ -3462,9 +3363,7 @@ class TestTarScanner:
         archive_path = tmp_path / "ancestor-link.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
             payload = b"x" * 128
-            info = tarfile.TarInfo("large.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "large.bin", payload)
 
             link = tarfile.TarInfo("alias")
             link.type = tarfile.SYMTYPE
@@ -3472,9 +3371,7 @@ class TestTarScanner:
             archive.addfile(link)
 
             config = b"model:\n  _target_: os.system\n"
-            info = tarfile.TarInfo("alias/model_config.yaml")
-            info.size = len(config)
-            archive.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "alias/model_config.yaml", config)
 
         result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 
@@ -3491,9 +3388,7 @@ class TestTarScanner:
         archive_path = tmp_path / "hardlinked-symlink.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
             payload = b"x" * 128
-            info = tarfile.TarInfo("large.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "large.bin", payload)
 
             directory_alias = tarfile.TarInfo("dir")
             directory_alias.type = tarfile.SYMTYPE
@@ -3511,9 +3406,7 @@ class TestTarScanner:
             archive.addfile(alias)
 
             config = b"model:\n  _target_: os.system\n"
-            info = tarfile.TarInfo("alias/model_config.yaml")
-            info.size = len(config)
-            archive.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "alias/model_config.yaml", config)
 
         result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 
@@ -3532,14 +3425,10 @@ class TestTarScanner:
         archive_path = tmp_path / f"linked-root-{member_type.hex()}.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
             payload = b"x" * 128
-            info = tarfile.TarInfo("large.bin")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "large.bin", payload)
 
             config = b"model:\n  _target_: os.system\n"
-            info = tarfile.TarInfo("payload.yaml")
-            info.size = len(config)
-            archive.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.yaml", config)
 
             alias = tarfile.TarInfo("alias")
             alias.type = tarfile.SYMTYPE
@@ -3585,24 +3474,16 @@ class TestTarScanner:
         inner_path = tmp_path / "inner.tar.gz"
         with tarfile.open(inner_path, "w:gz") as inner:
             payload = b"x" * 128
-            info = tarfile.TarInfo("large.bin")
-            info.size = len(payload)
-            inner.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(inner, "large.bin", payload)
             config = b"model:\n  _target_: os.system\n"
-            info = tarfile.TarInfo("model_config.yaml")
-            info.size = len(config)
-            inner.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+            _add_tar_bytes(inner, "model_config.yaml", config)
 
         outer_path = tmp_path / "outer.tar.gz"
         with tarfile.open(outer_path, "w:gz") as outer:
             root_config = b"model:\n  _target_: torch.nn.Linear\n"
-            info = tarfile.TarInfo("model_config.yaml")
-            info.size = len(root_config)
-            outer.addfile(info, tarfile.io.BytesIO(root_config))  # type: ignore[attr-defined]
+            _add_tar_bytes(outer, "model_config.yaml", root_config)
             nested = inner_path.read_bytes()
-            info = tarfile.TarInfo("inner.tar.gz")
-            info.size = len(nested)
-            outer.addfile(info, tarfile.io.BytesIO(nested))  # type: ignore[attr-defined]
+            _add_tar_bytes(outer, "inner.tar.gz", nested)
 
         result = core.scan_file(str(outer_path), config={"cache_enabled": False})
 
@@ -3640,14 +3521,10 @@ def _assert_truncated_nemo_tar_route(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     with tarfile.open(archive_path, "w:gz") as archive:
         first_payload = b"x" * 128
-        first_info = tarfile.TarInfo("large-weights.bin")
-        first_info.size = len(first_payload)
-        archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+        _add_tar_bytes(archive, "large-weights.bin", first_payload)
 
         config_payload = b"model:\n  _target_: os.system\n"
-        config_info = tarfile.TarInfo("model_config.yaml")
-        config_info.size = len(config_payload)
-        archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+        _add_tar_bytes(archive, "model_config.yaml", config_payload)
 
     result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 

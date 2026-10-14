@@ -489,19 +489,11 @@ class TelemetryClient:
 
     def _iter_result_issues(self, results: dict[str, Any]) -> list[dict[str, Any]]:
         """Normalize top-level issue records from scan results."""
-        normalized: list[dict[str, Any]] = []
-        for issue in results.get("issues", []):
-            if isinstance(issue, dict):
-                normalized.append(issue)
-        return normalized
+        return [issue for issue in results.get("issues", []) if isinstance(issue, dict)]
 
     def _iter_result_assets(self, results: dict[str, Any]) -> list[dict[str, Any]]:
         """Normalize asset records from scan results."""
-        normalized: list[dict[str, Any]] = []
-        for asset in results.get("assets", []):
-            if isinstance(asset, dict):
-                normalized.append(asset)
-        return normalized
+        return [asset for asset in results.get("assets", []) if isinstance(asset, dict)]
 
     def _count_values(self, values: list[str]) -> dict[str, int]:
         """Count values in a list, skipping empty items."""

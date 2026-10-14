@@ -22,24 +22,31 @@ def _block_numpy_import(monkeypatch: pytest.MonkeyPatch, *, include_scipy: bool 
     monkeypatch.setattr(builtins, "__import__", mock_import)
 
 
+@pytest.fixture
+def detector() -> AnomalyDetector:
+    """Create an anomaly detector instance."""
+    return AnomalyDetector()
+
+
+@pytest.fixture
+def base_profile() -> StatisticalProfile:
+    """Create a base profile for testing."""
+    return StatisticalProfile(
+        mean=0.0,
+        std=0.1,
+        min_val=-0.5,
+        max_val=0.5,
+        percentiles={1: -0.25, 5: -0.2, 25: -0.1, 50: 0.0, 75: 0.1, 95: 0.2, 99: 0.25},
+        skewness=0.0,
+        kurtosis=3.0,
+        entropy=7.5,
+        zero_ratio=0.01,
+        sparsity=0.05,
+    )
+
+
 class TestStatisticalProfile:
     """Tests for StatisticalProfile dataclass."""
-
-    @pytest.fixture
-    def base_profile(self):
-        """Create a base profile for testing."""
-        return StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={1: -0.25, 5: -0.2, 25: -0.1, 50: 0.0, 75: 0.1, 95: 0.2, 99: 0.25},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
 
     def test_create_profile(self, base_profile):
         """Test creating a statistical profile."""
@@ -47,43 +54,33 @@ class TestStatisticalProfile:
         assert base_profile.std == 0.1
         assert base_profile.entropy == 7.5
 
-    def test_is_anomalous_similar_profiles(self, base_profile):
+    def test_is_anomalous_similar_profiles(self, base_profile: StatisticalProfile) -> None:
         """Test similar profiles are not anomalous."""
-        similar = StatisticalProfile(
+        similar = replace(
+            base_profile,
             mean=0.01,
             std=0.11,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={1: -0.25, 5: -0.2, 25: -0.1, 50: 0.0, 75: 0.1, 95: 0.2, 99: 0.25},
+            percentiles=base_profile.percentiles.copy(),
             skewness=0.1,
             kurtosis=3.1,
-            entropy=7.5,
-            zero_ratio=0.01,
             sparsity=0.06,
         )
         is_anomalous, score = base_profile.is_anomalous(similar)
         assert is_anomalous is False
         assert score < 3.0
 
-    def test_is_anomalous_different_mean(self, base_profile):
+    def test_is_anomalous_different_mean(self, base_profile: StatisticalProfile) -> None:
         """Test profile with very different mean is anomalous."""
-        different = StatisticalProfile(
+        different = replace(
+            base_profile,
             mean=5.0,  # Very different mean
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={1: -0.25, 5: -0.2, 25: -0.1, 50: 0.0, 75: 0.1, 95: 0.2, 99: 0.25},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
+            percentiles=base_profile.percentiles.copy(),
         )
         is_anomalous, score = base_profile.is_anomalous(different)
         assert is_anomalous is True
         assert score > 3.0
 
-    def test_is_anomalous_zero_std(self):
+    def test_is_anomalous_zero_std(self, base_profile: StatisticalProfile) -> None:
         """Test with zero standard deviation."""
         profile_zero_std = StatisticalProfile(
             mean=0.0,
@@ -97,34 +94,21 @@ class TestStatisticalProfile:
             zero_ratio=1.0,
             sparsity=1.0,
         )
-        other = StatisticalProfile(
+        other = replace(
+            base_profile,
             mean=1.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
             percentiles={1: 0.0, 5: 0.0, 25: 0.0, 50: 0.0, 75: 0.0, 95: 0.0, 99: 0.0},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
         )
         # Should not crash with zero std
         is_anomalous, score = profile_zero_std.is_anomalous(other)
         assert isinstance(is_anomalous, bool)
         assert isinstance(score, float)
 
-    def test_is_anomalous_high_sparsity_difference(self, base_profile):
+    def test_is_anomalous_high_sparsity_difference(self, base_profile: StatisticalProfile) -> None:
         """Test profile with very different sparsity."""
-        sparse = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={1: -0.25, 5: -0.2, 25: -0.1, 50: 0.0, 75: 0.1, 95: 0.2, 99: 0.25},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
+        sparse = replace(
+            base_profile,
+            percentiles=base_profile.percentiles.copy(),
             zero_ratio=0.9,
             sparsity=0.95,  # Very high sparsity difference
         )
@@ -134,11 +118,6 @@ class TestStatisticalProfile:
 
 class TestAnomalyDetector:
     """Tests for AnomalyDetector class."""
-
-    @pytest.fixture
-    def detector(self):
-        """Create an anomaly detector instance."""
-        return AnomalyDetector()
 
     def test_initialization(self, detector):
         """Test detector initialization."""
@@ -228,20 +207,16 @@ class TestAnomalyDetector:
             pytest.param("sparsity", 0.95, "sparsity", id="extreme_sparsity"),
         ],
     )
-    def test_analyze_anomaly(self, detector: AnomalyDetector, field: str, value: float, expected_detail: str) -> None:
+    def test_analyze_anomaly(
+        self,
+        detector: AnomalyDetector,
+        base_profile: StatisticalProfile,
+        field: str,
+        value: float,
+        expected_detail: str,
+    ) -> None:
         """Detect each statistical anomaly against an otherwise identical profile."""
-        expected = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
+        expected = replace(base_profile, percentiles={})
         actual = replace(expected, percentiles={}, **{field: value})
         details = detector._analyze_anomaly(expected, actual)
         assert expected_detail in details
@@ -249,11 +224,6 @@ class TestAnomalyDetector:
 
 class TestSuspiciousPatternDetection:
     """Tests for suspicious pattern detection without numpy."""
-
-    @pytest.fixture
-    def detector(self):
-        """Create an anomaly detector instance."""
-        return AnomalyDetector()
 
     def test_check_suspicious_patterns_no_numpy(
         self, detector: AnomalyDetector, monkeypatch: pytest.MonkeyPatch
@@ -306,11 +276,6 @@ class TestSuspiciousPatternDetection:
 
 class TestWithNumpy:
     """Tests that require numpy."""
-
-    @pytest.fixture
-    def detector(self):
-        """Create an anomaly detector instance."""
-        return AnomalyDetector()
 
     @pytest.fixture
     def np(self):

@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve early TAR findings after sparse-file probing and enforce SafeTensors JSON nesting limits consistently across Python versions.
 - Keep complete streamed pickle analysis available for oversized remote source URLs across Python versions, preserving SBOM findings and source associations.
+### Fixed
+
+- Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
+- Make the nested archive test fixture portable to Windows.
 
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
 

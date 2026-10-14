@@ -80,10 +80,7 @@ pub(crate) fn decode_possible_encoded_pickle(
                 max_base64_nested_pickle_chars,
                 candidate.len(),
             ) {
-                if let Some(decoded) = canonical_base64_candidate(&bounded_base64)
-                    .as_deref()
-                    .and_then(decode_base64)
-                {
+                if let Some(decoded) = decode_base64_candidate(&bounded_base64) {
                     let mut decoded_payloads =
                         decoded_pickle_payloads(&decoded, max_nested_pickle_bytes);
                     if decoded_payloads.is_empty()
@@ -221,7 +218,6 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
         return payloads;
     }
 
-    let mut seen_spans = Vec::new();
     for offset in nested_pickle_probe_offsets_unbounded(&decoded[search_start..]) {
         let offset = search_start.saturating_add(offset);
         let end = decoded
@@ -245,10 +241,6 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
                 Ok(None) | Err(_) => continue,
             };
         let span = (offset, offset.saturating_add(payload_len));
-        if seen_spans.contains(&span) {
-            continue;
-        }
-        seen_spans.push(span);
         payloads.push((decoded[span.0..span.1].to_vec(), analysis_incomplete));
         if analysis_incomplete {
             break;
@@ -287,15 +279,12 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
             base64_literal_candidates(stripped, max_base64_probe_chars, stripped.len())
                 .into_iter()
                 .any(|bounded| {
-                    canonical_base64_candidate(&bounded)
-                        .as_deref()
-                        .and_then(decode_base64)
-                        .is_some_and(|decoded| {
-                            oversized_decoded_pickle_prefix_requires_fail_closed(
-                                &decoded,
-                                max_nested_pickle_bytes,
-                            )
-                        })
+                    decode_base64_candidate(&bounded).is_some_and(|decoded| {
+                        oversized_decoded_pickle_prefix_requires_fail_closed(
+                            &decoded,
+                            max_nested_pickle_bytes,
+                        )
+                    })
                 });
         if oversized_prefix_found {
             let strict_token = take_base64_literal_prefix(stripped, stripped.len());
@@ -408,7 +397,7 @@ pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
             Err(_) => return false,
         };
         match parsed.name {
-            "INST" if protocol0_opcode_operands_are_plausible(&parsed, value) => return true,
+            "INST" if protocol0_opcode_operands_are_plausible(&parsed) => return true,
             "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "BUILD" | "PERSID" | "BINPERSID" => {
                 return true;
             }
@@ -473,7 +462,7 @@ fn has_structurally_valid_execution_prefix(value: &[u8]) -> bool {
             Err(_) => return false,
         };
         if matches!(parsed.name, "GLOBAL" | "INST")
-            && !protocol0_opcode_operands_are_import_references(&parsed, value)
+            && !protocol0_opcode_operands_are_import_references(&parsed)
         {
             return false;
         }
@@ -515,94 +504,37 @@ fn validate_pickle_stack_effect(
             *stack_depth -= 1;
             true
         }
-        "POP_MARK" => match mark_depths.pop() {
+        "POP_MARK" | "APPENDS" | "SETITEMS" | "ADDITEMS" => match mark_depths.pop() {
             Some(mark_depth) => {
                 *stack_depth = mark_depth;
                 true
             }
             None => false,
         },
-        "TUPLE" | "LIST" | "DICT" | "FROZENSET" => match mark_depths.pop() {
+        "TUPLE" | "LIST" | "DICT" | "FROZENSET" | "OBJ" | "INST" => match mark_depths.pop() {
             Some(mark_depth) => {
                 *stack_depth = mark_depth + 1;
                 true
             }
             None => false,
         },
-        "APPENDS" | "SETITEMS" | "ADDITEMS" => match mark_depths.pop() {
-            Some(mark_depth) => {
-                *stack_depth = mark_depth;
-                true
-            }
-            None => false,
-        },
-        "TUPLE1" => *stack_depth >= 1,
-        "TUPLE2" => {
+        "TUPLE1" | "BINPERSID" => *stack_depth >= 1,
+        "TUPLE2" | "APPEND" | "REDUCE" | "NEWOBJ" | "BUILD" | "STACK_GLOBAL" => {
             if *stack_depth < 2 {
                 return false;
             }
             *stack_depth -= 1;
             true
         }
-        "TUPLE3" => {
+        "TUPLE3" | "SETITEM" | "NEWOBJ_EX" => {
             if *stack_depth < 3 {
                 return false;
             }
             *stack_depth -= 2;
             true
         }
-        "APPEND" => {
-            if *stack_depth < 2 {
-                return false;
-            }
-            *stack_depth -= 1;
-            true
-        }
-        "PERSID" => {
+        "PERSID" | "GET" | "BINGET" | "LONG_BINGET" | "NEXT_BUFFER" => {
             *stack_depth += 1;
-            true
-        }
-        "BINPERSID" => *stack_depth >= 1,
-        "SETITEM" => {
-            if *stack_depth < 3 {
-                return false;
-            }
-            *stack_depth -= 2;
-            true
-        }
-        "REDUCE" | "NEWOBJ" | "BUILD" => {
-            if *stack_depth < 2 {
-                return false;
-            }
-            *stack_depth -= 1;
-            true
-        }
-        "NEWOBJ_EX" => {
-            if *stack_depth < 3 {
-                return false;
-            }
-            *stack_depth -= 2;
-            true
-        }
-        "OBJ" => match mark_depths.pop() {
-            Some(mark_depth) => {
-                *stack_depth = mark_depth + 1;
-                true
-            }
-            None => false,
-        },
-        "INST" => match mark_depths.pop() {
-            Some(mark_depth) => {
-                *stack_depth = mark_depth + 1;
-                true
-            }
-            None => false,
-        },
-        "STACK_GLOBAL" => {
-            if *stack_depth < 2 {
-                return false;
-            }
-            *stack_depth -= 1;
             true
         }
         "DUP" => {
@@ -612,15 +544,7 @@ fn validate_pickle_stack_effect(
             *stack_depth += 1;
             true
         }
-        "GET" | "BINGET" | "LONG_BINGET" => {
-            *stack_depth += 1;
-            true
-        }
         "PUT" | "BINPUT" | "LONG_BINPUT" | "MEMOIZE" | "PROTO" | "FRAME" | "STOP" => true,
-        "NEXT_BUFFER" => {
-            *stack_depth += 1;
-            true
-        }
         "READONLY_BUFFER" => true,
         _ => {
             *stack_depth += 1;
@@ -672,10 +596,10 @@ fn protocol0_global_prefix_is_nested_probe(value: &[u8]) -> bool {
     let Ok(global) = parse_opcode(probe, 0, probe.len()) else {
         return false;
     };
-    if global.name != "GLOBAL" || !protocol0_opcode_operands_are_plausible(&global, probe) {
+    if global.name != "GLOBAL" || !protocol0_opcode_operands_are_plausible(&global) {
         return false;
     }
-    let (module, name) = global.arg.global_parts(probe);
+    let (module, name) = global.arg.global_parts();
     if !is_protocol0_import_reference(module.as_bytes())
         || !is_protocol0_import_reference(name.as_bytes())
     {
@@ -698,10 +622,10 @@ fn protocol0_dangerous_global_prefix(value: &[u8]) -> bool {
     let Ok(global) = parse_opcode(probe, 0, probe.len()) else {
         return false;
     };
-    if global.name != "GLOBAL" || !protocol0_opcode_operands_are_plausible(&global, probe) {
+    if global.name != "GLOBAL" || !protocol0_opcode_operands_are_plausible(&global) {
         return false;
     }
-    let (module, name) = global.arg.global_parts(probe);
+    let (module, name) = global.arg.global_parts();
     is_protocol0_import_reference(module.as_bytes())
         && is_protocol0_import_reference(name.as_bytes())
         && global_severity(&module, &name).is_some()
@@ -791,7 +715,7 @@ fn pickle_prefix_has_structured_opcodes_with_minimum_anchors(
             }
         };
         if matches!(parsed.name, "GLOBAL" | "INST")
-            && !protocol0_opcode_operands_are_import_references(&parsed, value)
+            && !protocol0_opcode_operands_are_import_references(&parsed)
         {
             return false;
         }
@@ -936,13 +860,13 @@ fn protocol0_global_or_inst_prefix_has_complete_lines(value: &[u8]) -> bool {
     is_protocol0_global_operand(module) && is_protocol0_global_operand(name)
 }
 
-fn protocol0_opcode_operands_are_plausible(opcode: &ParsedOpcode, value: &[u8]) -> bool {
-    let (module, name) = opcode.arg.global_parts(value);
+fn protocol0_opcode_operands_are_plausible(opcode: &ParsedOpcode) -> bool {
+    let (module, name) = opcode.arg.global_parts();
     is_protocol0_global_operand(module.as_bytes()) && is_protocol0_global_operand(name.as_bytes())
 }
 
-fn protocol0_opcode_operands_are_import_references(opcode: &ParsedOpcode, value: &[u8]) -> bool {
-    let (module, name) = opcode.arg.global_parts(value);
+fn protocol0_opcode_operands_are_import_references(opcode: &ParsedOpcode) -> bool {
+    let (module, name) = opcode.arg.global_parts();
     is_protocol0_import_reference(module.as_bytes())
         && is_protocol0_import_reference(name.as_bytes())
 }
@@ -1253,10 +1177,7 @@ fn embedded_long_protocol0_base64_probe_windows(
         if (probe_end - alignment) % 4 == 1 {
             probe_end -= 1;
         }
-        let Some(decoded) = canonical_base64_candidate(&compact[alignment..probe_end])
-            .as_deref()
-            .and_then(decode_base64)
-        else {
+        let Some(decoded) = decode_base64_candidate(&compact[alignment..probe_end]) else {
             continue;
         };
 
@@ -1662,15 +1583,12 @@ fn lenient_base64_decodes_to_single_pickle(
     if normalized.len() > max_encoded_chars {
         return false;
     }
-    canonical_base64_candidate(&normalized)
-        .as_deref()
-        .and_then(decode_base64)
-        .is_some_and(|decoded| {
-            pickle_payload_extent_result(&decoded, decoded.len())
-                .ok()
-                .flatten()
-                == Some(decoded.len())
-        })
+    decode_base64_candidate(&normalized).is_some_and(|decoded| {
+        pickle_payload_extent_result(&decoded, decoded.len())
+            .ok()
+            .flatten()
+            == Some(decoded.len())
+    })
 }
 
 fn encoded_literal_candidates(stripped: &str) -> Vec<String> {
@@ -1802,10 +1720,6 @@ fn is_lenient_base64_candidate(value: &str) -> bool {
         }
     }
     unpadded_chars > 0 && unpadded_chars % 4 != 1
-}
-
-fn canonical_base64_candidate(value: &str) -> Option<String> {
-    base64_candidate_unpadded(value).map(pad_base64)
 }
 
 fn base64_candidate_unpadded(value: &str) -> Option<&str> {
@@ -2003,12 +1917,7 @@ fn base64_prefix_len_for_payload(value: &str, payload: &[u8]) -> Option<usize> {
         if !is_strict_base64_literal(candidate.as_bytes()) {
             continue;
         }
-        if canonical_base64_candidate(candidate)
-            .as_deref()
-            .and_then(decode_base64)
-            .as_deref()
-            == Some(payload)
-        {
+        if decode_base64_candidate(candidate).as_deref() == Some(payload) {
             return Some(candidate_len);
         }
     }
@@ -2095,15 +2004,6 @@ fn is_repeated_single_char(value: &str) -> bool {
     chars.all(|char_value| char_value == first)
 }
 
-fn pad_base64(value: &str) -> String {
-    let mut padded = value.to_string();
-    let padding = (4 - padded.len() % 4) % 4;
-    for _ in 0..padding {
-        padded.push('=');
-    }
-    padded
-}
-
 fn base64_prefix_has_pickle_prefix(value: &str) -> bool {
     base64_prefix_has_pickle_prefix_with_limit(value, MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES)
 }
@@ -2131,9 +2031,7 @@ fn base64_prefix_has_pickle_prefix_with_probe_chars(
     max_encoded_chars: usize,
 ) -> bool {
     let strict = take_base64_literal_prefix(value, max_encoded_chars.min(max_input_bytes));
-    if canonical_base64_candidate(strict)
-        .as_deref()
-        .and_then(decode_base64)
+    if decode_base64_candidate(strict)
         .is_some_and(|decoded| decoded_contains_pickle_prefix(&decoded))
     {
         return true;
@@ -2141,9 +2039,7 @@ fn base64_prefix_has_pickle_prefix_with_probe_chars(
 
     let lenient = normalize_base64_literal(value, max_encoded_chars, max_input_bytes);
     lenient != strict
-        && canonical_base64_candidate(&lenient)
-            .as_deref()
-            .and_then(decode_base64)
+        && decode_base64_candidate(&lenient)
             .is_some_and(|decoded| has_nested_probe_prefix(&decoded))
 }
 
@@ -2151,9 +2047,7 @@ fn base64_prefix_has_nested_probe_prefix(value: &str, max_input_bytes: usize) ->
     base64_literal_candidates(value, ENCODED_LITERAL_PROBE_CHARS, max_input_bytes)
         .into_iter()
         .any(|prefix| {
-            canonical_base64_candidate(&prefix)
-                .as_deref()
-                .and_then(decode_base64)
+            decode_base64_candidate(&prefix)
                 .is_some_and(|decoded| has_nested_probe_prefix(&decoded))
         })
 }
@@ -2168,18 +2062,15 @@ fn base64_prefix_has_complete_protocol0_line(value: &str, max_input_bytes: usize
         return false;
     }
 
-    canonical_base64_candidate(strict)
-        .as_deref()
-        .and_then(decode_base64)
-        .is_some_and(|decoded| {
-            decoded
-                .first()
-                .is_some_and(|byte| is_protocol0_long_line_probe_opcode(*byte))
-                && pickle_payload_extent_result(&decoded, decoded.len())
-                    .ok()
-                    .flatten()
-                    .is_some()
-        })
+    decode_base64_candidate(strict).is_some_and(|decoded| {
+        decoded
+            .first()
+            .is_some_and(|byte| is_protocol0_long_line_probe_opcode(*byte))
+            && pickle_payload_extent_result(&decoded, decoded.len())
+                .ok()
+                .flatten()
+                .is_some()
+    })
 }
 
 fn short_base64_token_has_security_evidence(value: &str) -> bool {
@@ -2187,10 +2078,7 @@ fn short_base64_token_has_security_evidence(value: &str) -> bool {
     if token.trim_end_matches('=').len() >= MIN_GENERAL_ENCODED_LITERAL_CHARS {
         return false;
     }
-    let Some(decoded) = canonical_base64_candidate(token)
-        .as_deref()
-        .and_then(decode_base64)
-    else {
+    let Some(decoded) = decode_base64_candidate(token) else {
         return false;
     };
     let explicitly_padded = token.ends_with('=');
@@ -2237,10 +2125,7 @@ fn short_base64_literal_has_complete_payload(value: &str) -> bool {
         strict.to_string(),
         normalize_base64_literal(value, MIN_GENERAL_ENCODED_LITERAL_CHARS, value.len()),
     ] {
-        let Some(decoded) = canonical_base64_candidate(&candidate)
-            .as_deref()
-            .and_then(decode_base64)
-        else {
+        let Some(decoded) = decode_base64_candidate(&candidate) else {
             continue;
         };
         if decoded_pickle_payloads(&decoded, decoded.len())
@@ -2541,32 +2426,8 @@ fn encoded_hex_first_byte(value: &[u8]) -> Option<u8> {
     Some((high << 4) | low)
 }
 
-fn decode_base64(value: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::new();
-    let bytes = value.as_bytes();
-    if bytes.len() % 4 != 0 {
-        return None;
-    }
-    for chunk in bytes.chunks(4) {
-        let mut values = [0u8; 4];
-        let mut padding = 0usize;
-        for (index, byte) in chunk.iter().enumerate() {
-            if *byte == b'=' {
-                values[index] = 0;
-                padding += 1;
-            } else {
-                values[index] = base64_value(*byte)?;
-            }
-        }
-        output.push((values[0] << 2) | (values[1] >> 4));
-        if padding < 2 {
-            output.push((values[1] << 4) | (values[2] >> 2));
-        }
-        if padding < 1 {
-            output.push((values[2] << 6) | values[3]);
-        }
-    }
-    Some(output)
+fn decode_base64_candidate(value: &str) -> Option<Vec<u8>> {
+    crate::strings::decode_base64(base64_candidate_unpadded(value)?.as_bytes())
 }
 
 fn encode_base64(value: &[u8]) -> String {
@@ -2695,14 +2556,7 @@ fn take_last_chars(value: &str, count: usize) -> String {
 }
 
 fn take_bytes_str(value: &str, count: usize) -> String {
-    if count >= value.len() {
-        return value.to_string();
-    }
-    let mut end = count;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_string()
+    take_bytes_str_slice(value, count).to_string()
 }
 
 fn take_bytes_str_slice(value: &str, count: usize) -> &str {
@@ -2782,6 +2636,15 @@ mod tests {
 
     #[test]
     fn encoded_prefix_gates_recognize_pickle_prefixes() {
+        for (encoded, expected) in [("YQ==", b"a".as_slice()), ("YWI=", b"ab"), ("YWJj", b"abc")] {
+            assert_eq!(decode_base64_candidate(encoded), Some(expected.to_vec()));
+        }
+        for (encoded, expected) in [("YQ", b"a".as_slice()), ("YWI", b"ab"), ("YR====", b"a")] {
+            assert_eq!(decode_base64_candidate(encoded), Some(expected.to_vec()));
+        }
+        for encoded in ["", "A", "-AAA", "_AAA", "Y=AA"] {
+            assert!(decode_base64_candidate(encoded).is_none());
+        }
         assert!(base64_prefix_has_pickle_prefix("gAR9Lg=="));
         assert!(hex_prefix_has_pickle_prefix("80047d2e"));
         assert!(hex_prefix_has_pickle_prefix(r"\x80\x04\x7d\x2e"));
@@ -3787,6 +3650,77 @@ mod tests {
             b"config\nvalue\nplain prose",
             2
         ));
+    }
+
+    #[test]
+    fn grouped_stack_effects_preserve_validity_depth_and_marks() {
+        let check = |name,
+                     before,
+                     initial_marks: &[usize],
+                     after: Option<usize>,
+                     expected_marks: &[usize]| {
+            let opcode = ParsedOpcode {
+                name,
+                ..parse_opcode(b"N", 0, 1).unwrap()
+            };
+            let mut depth = before;
+            let mut marks = initial_marks.to_vec();
+            let valid = validate_pickle_stack_effect(&opcode, &mut depth, &mut marks);
+            let context = format!("{name}: depth={before}, marks={initial_marks:?}");
+            assert_eq!(valid, after.is_some(), "{context}");
+            assert_eq!(depth, after.unwrap_or(before), "{context}");
+            assert_eq!(marks, expected_marks, "{context}");
+        };
+        let mark_states: &[&[usize]] = &[&[], &[0], &[0, 2], &[0, 6]];
+        for (names, expected_depths) in [
+            (
+                "TUPLE1 BINPERSID",
+                [None, Some(1), Some(2), Some(3), Some(4)],
+            ),
+            (
+                "TUPLE2 APPEND REDUCE NEWOBJ BUILD STACK_GLOBAL",
+                [None, None, Some(1), Some(2), Some(3)],
+            ),
+            (
+                "TUPLE3 SETITEM NEWOBJ_EX",
+                [None, None, None, Some(1), Some(2)],
+            ),
+            (
+                "PERSID GET BINGET LONG_BINGET NEXT_BUFFER",
+                [Some(1), Some(2), Some(3), Some(4), Some(5)],
+            ),
+        ] {
+            for name in names.split_whitespace() {
+                for (before, after) in expected_depths.into_iter().enumerate() {
+                    for &marks in mark_states {
+                        check(name, before, marks, after, marks);
+                    }
+                }
+            }
+        }
+        // Fixed outcomes include empty, nested, and inconsistent marks; do not repair them.
+        for (names, expected_depths) in [
+            (
+                "POP_MARK APPENDS SETITEMS ADDITEMS",
+                [None, Some(0), Some(2), Some(6)],
+            ),
+            (
+                "TUPLE LIST DICT FROZENSET OBJ INST",
+                [None, Some(1), Some(3), Some(7)],
+            ),
+        ] {
+            for name in names.split_whitespace() {
+                for before in 0..=4 {
+                    for ((&marks, after), expected_marks) in mark_states
+                        .iter()
+                        .zip(expected_depths)
+                        .zip([&[][..], &[], &[0], &[0]])
+                    {
+                        check(name, before, marks, after, expected_marks);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ from modelaudit_picklescan.call_graph import (
     find_startup_hook_write_call_graphs,
 )
 
-_OSCILLATING_MODULE_SOURCE = """\
+_CLASS_A_B_SOURCE = """\
 class A:
     pass
 
@@ -41,89 +41,18 @@ class B:
     pass
 
 
-if cond:
-    m = A()
-else:
-    m = B()
 """
 
-_DEPENDENT_CYCLE_SOURCE = """\
-class A:
+_CLASS_FINAL_SOURCE = """\
+class Final:
     pass
 
 
-class B:
-    pass
-
-
-a = A()
-a = b
-b = B()
-b = a
-c = a
 """
 
-_SEQUENTIAL_REBIND_SOURCE = """\
-class A:
-    pass
+_CLASS_A_B_FINAL_SOURCE = _CLASS_A_B_SOURCE + _CLASS_FINAL_SOURCE
 
-
-class B:
-    pass
-
-
-m = A()
-m = B()
-"""
-
-_TRY_REBIND_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-try:
-    m = A()
-    operation()
-except Exception:
-    m = B()
-"""
-
-_LOOP_ELSE_REBIND_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-for value in values:
-    m = A()
-    break
-else:
-    m = B()
-"""
-
-_LOOP_ELSE_COMPLETION_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-for value in values:
-    m = A()
-else:
-    m = B()
-"""
-
-_LOOP_MATCHING_TERMINAL_REBIND_SOURCE = """\
+_CLASS_A_FINAL_SOURCE = """\
 class A:
     pass
 
@@ -132,6 +61,72 @@ class Final:
     pass
 
 
+"""
+
+_OSCILLATING_MODULE_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
+if cond:
+    m = A()
+else:
+    m = B()
+"""
+)
+
+_DEPENDENT_CYCLE_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
+a = A()
+a = b
+b = B()
+b = a
+c = a
+"""
+)
+
+_SEQUENTIAL_REBIND_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
+m = A()
+m = B()
+"""
+)
+
+_TRY_REBIND_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
+try:
+    m = A()
+    operation()
+except Exception:
+    m = B()
+"""
+)
+
+_LOOP_ELSE_REBIND_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
+for value in values:
+    m = A()
+    break
+else:
+    m = B()
+"""
+)
+
+_LOOP_ELSE_COMPLETION_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
+for value in values:
+    m = A()
+else:
+    m = B()
+"""
+)
+
+_LOOP_MATCHING_TERMINAL_REBIND_SOURCE = (
+    _CLASS_A_FINAL_SOURCE
+    + """\
 m = A()
 for value in values:
     m = Final()
@@ -140,16 +135,11 @@ else:
     m = Final()
 exposed = m
 """
+)
 
-_LOOP_EARLY_BREAK_BEFORE_TERMINAL_REBIND_SOURCE = """\
-class A:
-    pass
-
-
-class Final:
-    pass
-
-
+_LOOP_EARLY_BREAK_BEFORE_TERMINAL_REBIND_SOURCE = (
+    _CLASS_A_FINAL_SOURCE
+    + """\
 m = A()
 for value in values:
     if cond:
@@ -160,40 +150,22 @@ else:
     m = Final()
 exposed = m
 """
+)
 
-_UNCONDITIONAL_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_UNCONDITIONAL_OVERWRITE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     m = A()
 else:
     m = B()
 m = Final()
 """
+)
 
-_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     m = A()
 else:
@@ -201,20 +173,11 @@ else:
 exposed = m
 m = Final()
 """
+)
 
-_CALL_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_CALL_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     m = A()
 else:
@@ -222,16 +185,11 @@ else:
 exposed = m()
 m = Final()
 """
+)
 
-_TERMINATING_ALIAS_BRANCH_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
+_TERMINATING_ALIAS_BRANCH_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
 if cond:
     m = A()
     consumed = m
@@ -240,20 +198,11 @@ else:
     m = B()
 exposed = m
 """
+)
 
-_OVERWRITE_BEFORE_READ_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_OVERWRITE_BEFORE_READ_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     m = A()
 else:
@@ -261,31 +210,21 @@ else:
 m = Final()
 exposed = m
 """
+)
 
-_ONE_SIDED_REBIND_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
+_ONE_SIDED_REBIND_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
 m = A()
 if cond:
     m = B()
 exposed = m
 """
+)
 
-_NONEXHAUSTIVE_MATCH_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
+_NONEXHAUSTIVE_MATCH_OVERWRITE_SOURCE = (
+    _CLASS_A_B_SOURCE
+    + """\
 m = A()
 match value:
     case 1:
@@ -294,20 +233,11 @@ match value:
         m = B()
 exposed = m
 """
+)
 
-_CONDITIONALLY_REBOUND_TERMINAL_DEPENDENCY_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_CONDITIONALLY_REBOUND_TERMINAL_DEPENDENCY_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     F = A
 else:
@@ -319,20 +249,11 @@ else:
 F = Final
 exposed = m
 """
+)
 
-_BRANCH_READ_BEFORE_MATCHING_TERMINAL_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_BRANCH_READ_BEFORE_MATCHING_TERMINAL_OVERWRITE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     m = A()
     exposed = m
@@ -342,20 +263,11 @@ else:
     exposed = m
     m = Final()
 """
+)
 
-_MATCHING_BRANCH_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_MATCHING_BRANCH_OVERWRITE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     m = A()
     m = Final()
@@ -364,20 +276,11 @@ else:
     m = Final()
 exposed = m
 """
+)
 
-_MATCHING_BRANCH_EPILOGUE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_MATCHING_BRANCH_EPILOGUE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     m = A()
     m = Final()
@@ -388,12 +291,11 @@ else:
     log()
 exposed = m
 """
+)
 
-_RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE = """\
-class Final:
-    pass
-
-
+_RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 F = Final
 if cond:
     m = F()
@@ -401,32 +303,22 @@ else:
     m = Final()
 exposed = m
 """
+)
 
-_SAME_LINE_RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE = """\
-class Final:
-    pass
-
-
+_SAME_LINE_RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 if cond:
     F = Final; m = F()
 else:
     F = Final; m = F()
 exposed = m
 """
+)
 
-_OVERWRITTEN_TERMINAL_DEPENDENCY_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_OVERWRITTEN_TERMINAL_DEPENDENCY_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 if cond:
     F = A
 else:
@@ -438,12 +330,11 @@ else:
     m = F()
 exposed = m
 """
+)
 
-_MUTUALLY_DEPENDENT_TERMINAL_ALIAS_SOURCE = """\
-class Final:
-    pass
-
-
+_MUTUALLY_DEPENDENT_TERMINAL_ALIAS_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 if cond:
     m = Final()
     exposed = m
@@ -451,24 +342,22 @@ else:
     exposed = Final()
     m = exposed
 """
+)
 
-_TERMINATING_ALTERNATIVE_SOURCE = """\
-class Final:
-    pass
-
-
+_TERMINATING_ALTERNATIVE_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 if cond:
     m = Final()
 else:
     raise ImportError
 exposed = m
 """
+)
 
-_SCOPED_TERMINAL_DEPENDENCY_SOURCE = """\
-class Final:
-    pass
-
-
+_SCOPED_TERMINAL_DEPENDENCY_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 if cond:
     F = first_value
 else:
@@ -479,37 +368,30 @@ else:
     m = Final(lambda F: F)
 exposed = m
 """
+)
 
-_MATCHING_ONE_SIDED_REBIND_SOURCE = """\
-class Final:
-    pass
-
-
+_MATCHING_ONE_SIDED_REBIND_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 m = Final()
 if cond:
     m = Final()
 exposed = m
 """
+)
 
-_UNBOUND_ONE_SIDED_REBIND_SOURCE = """\
-class Final:
-    pass
-
-
+_UNBOUND_ONE_SIDED_REBIND_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 if cond:
     m = Final()
 exposed = m
 """
+)
 
-_TERMINATING_UNRELATED_ALIAS_SOURCE = """\
-class A:
-    pass
-
-
-class Final:
-    pass
-
-
+_TERMINATING_UNRELATED_ALIAS_SOURCE = (
+    _CLASS_A_FINAL_SOURCE
+    + """\
 if cond:
     unused = A()
     raise ImportError
@@ -517,20 +399,11 @@ else:
     m = Final()
 exposed = m
 """
+)
 
-_MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 try:
     m = A()
     m = Final()
@@ -539,20 +412,11 @@ except Exception:
     m = Final()
 exposed = m
 """
+)
 
-_EXHAUSTIVE_MATCH_OVERWRITE_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_EXHAUSTIVE_MATCH_OVERWRITE_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 match value:
     case 1:
         m = A()
@@ -563,32 +427,22 @@ match value:
         m = Final()
         exposed = m
 """
+)
 
-_TRY_FINALLY_NO_HANDLER_SOURCE = """\
-class Final:
-    pass
-
-
+_TRY_FINALLY_NO_HANDLER_SOURCE = (
+    _CLASS_FINAL_SOURCE
+    + """\
 try:
     m = Final()
 finally:
     cleanup()
 exposed = m
 """
+)
 
-_TRY_FINALLY_REBIND_SOURCE = """\
-class A:
-    pass
-
-
-class B:
-    pass
-
-
-class Final:
-    pass
-
-
+_TRY_FINALLY_REBIND_SOURCE = (
+    _CLASS_A_B_FINAL_SOURCE
+    + """\
 try:
     m = A()
 except Exception:
@@ -596,6 +450,7 @@ except Exception:
 finally:
     m = Final()
 """
+)
 
 
 def _reference_callback(

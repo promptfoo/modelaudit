@@ -45,7 +45,21 @@ from modelaudit.scanners.llamafile_scanner import (
     LlamafileScanner,
     find_structural_torch7_offset,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_malicious_pickle
+
+
+def _assert_llamafile_scan_not_cached(binary: Path, cache_dir: Path) -> None:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
 def _record_torch7_candidate_offsets(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -820,19 +834,7 @@ def test_llamafile_multiple_benign_gguf_candidates_are_inconclusive_and_not_cach
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "ambiguous-gguf-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_scanner_trusts_structural_zip_gguf_boundary_for_ape(tmp_path: Path) -> None:
@@ -901,19 +903,7 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "compressed-gguf-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_scanner_scans_trailing_gguf_inside_stored_zip_member(tmp_path: Path) -> None:
@@ -1257,8 +1247,7 @@ def test_llamafile_scanner_fails_closed_for_incomplete_ape_mapping_search(tmp_pa
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "bounded-ape-cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             cache_enabled=True,
@@ -1270,8 +1259,6 @@ def test_llamafile_scanner_fails_closed_for_incomplete_ape_mapping_search(tmp_pa
         assert cached_aggregate.success is False
         assert determine_exit_code(cached_aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("executable_format", ["elf", "ape"])
@@ -1337,8 +1324,7 @@ def test_llamafile_scanner_propagates_trusted_embedded_gguf_inconclusive_state(t
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "embedded-gguf-cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             gguf_max_metadata_keys=1,
@@ -1349,8 +1335,6 @@ def test_llamafile_scanner_propagates_trusted_embedded_gguf_inconclusive_state(t
         assert cached_aggregate.success is False
         assert determine_exit_code(cached_aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_llamafile_runtime_evidence_retention_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1446,8 +1430,7 @@ def test_llamafile_scanner_marks_omitted_runtime_bytes_inconclusive(tmp_path: Pa
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "runtime-coverage-cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             llamafile_payload_scan_bytes=3 * 1024 * 1024,
@@ -1460,8 +1443,6 @@ def test_llamafile_scanner_marks_omitted_runtime_bytes_inconclusive(tmp_path: Pa
         assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in cached_metadata.get("scan_outcome_reasons", [])
         assert determine_exit_code(cached_aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_llamafile_scanner_does_not_rescan_out_of_context_tail_heredoc_preview(tmp_path: Path) -> None:
@@ -1620,19 +1601,7 @@ def test_llamafile_fails_closed_when_torch7_marker_probe_limit_is_exceeded(tmp_p
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "torch7-marker-probe-limit-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_finds_torch7_in_initial_payload_pass_while_skipping_marker_decoys(
@@ -2124,8 +2093,7 @@ def test_llamafile_runtime_preview_read_failure_is_inconclusive_not_security_fin
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             cache_enabled=True,
@@ -2138,8 +2106,6 @@ def test_llamafile_runtime_preview_read_failure_is_inconclusive_not_security_fin
         assert LLAMAFILE_RUNTIME_PREVIEW_READ_REASON in cached_metadata.get("scan_outcome_reasons", [])
         assert determine_exit_code(cached_aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize(
@@ -2190,19 +2156,7 @@ def test_llamafile_runtime_stream_failures_are_inconclusive_and_not_cached(
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / f"runtime-stream-cache-{'error' if read_error else 'short'}"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_runtime_stream_failure_retains_only_pre_boundary_preview_findings(
@@ -2264,19 +2218,7 @@ def test_llamafile_long_runtime_string_is_inconclusive_and_not_cached(tmp_path: 
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "runtime-string-limit-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_transfer_token_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2300,19 +2242,7 @@ def test_llamafile_transfer_token_limit_is_inconclusive_and_not_cached(tmp_path:
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "transfer-token-limit-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_transfer_command_preprocessing_is_bounded() -> None:
@@ -2459,19 +2389,7 @@ def test_llamafile_interpreter_token_limit_is_inconclusive_and_not_cached(tmp_pa
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "interpreter-token-limit-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 @pytest.mark.parametrize(
@@ -2527,19 +2445,7 @@ def test_llamafile_transfer_option_ambiguity_is_inconclusive_and_not_cached(
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "transfer-option-ambiguity-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_utf16_ambiguity_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2562,19 +2468,7 @@ def test_llamafile_utf16_ambiguity_is_inconclusive_and_not_cached(tmp_path: Path
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "utf16-ambiguity-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_gguf_candidate_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2599,19 +2493,7 @@ def test_llamafile_gguf_candidate_limit_is_inconclusive_and_not_cached(tmp_path:
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "gguf-candidate-limit-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_gguf_header_resource_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2633,19 +2515,7 @@ def test_llamafile_gguf_header_resource_limit_is_inconclusive_and_not_cached(tmp
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "gguf-header-resource-limit-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 def test_llamafile_truncated_gguf_header_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2665,19 +2535,7 @@ def test_llamafile_truncated_gguf_header_is_inconclusive_and_not_cached(tmp_path
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "truncated-gguf-cache"
-    reset_cache_manager()
-    try:
-        cached_aggregate = scan_model_directory_or_file(
-            str(binary),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    _assert_llamafile_scan_not_cached(binary, cache_dir)
 
 
 @pytest.mark.parametrize("version", [4, 10_001])
@@ -3559,8 +3417,7 @@ def test_llamafile_scanner_fails_closed_when_payload_scan_window_ends_before_ggu
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             llamafile_payload_scan_bytes=256,
@@ -3575,8 +3432,6 @@ def test_llamafile_scanner_fails_closed_when_payload_scan_window_ends_before_ggu
         assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in cached_metadata.get("scan_outcome_reasons", [])
         assert determine_exit_code(cached_aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_llamafile_embedded_gguf_findings_include_location_mapping(tmp_path: Path) -> None:

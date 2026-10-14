@@ -566,11 +566,7 @@ class TestSecretsDetector:
         assert text.index("Basic ") - text.index(opener) > 256
         findings = detector.scan_text(text, context="headers.txt")
 
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert isinstance(basic_findings[0]["redacted_value"], str)
-        assert token in basic_findings[0]["redacted_value"]
-        assert token in json.dumps(basic_findings, sort_keys=True)
+        _assert_basic_auth_findings(findings, token)
 
     def test_basic_auth_source_tuple_headers_container_is_detected(self) -> None:
         detector = SecretsDetector()
@@ -579,11 +575,7 @@ class TestSecretsDetector:
 
         findings = detector.scan_text(text, context="client.py")
 
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert isinstance(basic_findings[0]["redacted_value"], str)
-        assert token in basic_findings[0]["redacted_value"]
-        assert token in json.dumps(basic_findings, sort_keys=True)
+        _assert_basic_auth_findings(findings, token)
 
     @pytest.mark.parametrize("container_name", ["params", "metadata"])
     def test_basic_auth_source_tuple_non_headers_container_is_ignored(self, container_name: str) -> None:
@@ -602,7 +594,7 @@ class TestSecretsDetector:
         text = f"Authorization:\n{filler}  - Basic {token}\n"
 
         assert text.index("Basic ") - text.index("Authorization:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
-        _assert_yaml_basic_auth(detector, text, token)
+        _assert_basic_auth_findings(detector.scan_text(text, context="headers.yaml"), token)
 
     def test_basic_auth_many_yaml_quoted_header_value_list_entries_are_detected(self) -> None:
         detector = SecretsDetector()
@@ -611,7 +603,7 @@ class TestSecretsDetector:
         text = f'"Authorization":\n{filler}  - Basic {token}\n'
 
         assert text.index("Basic ") - text.index('"Authorization":') > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
-        _assert_yaml_basic_auth(detector, text, token)
+        _assert_basic_auth_findings(detector.scan_text(text, context="headers.yaml"), token)
 
     def test_basic_auth_many_yaml_header_object_value_list_entries_are_detected(self) -> None:
         detector = SecretsDetector()
@@ -620,7 +612,7 @@ class TestSecretsDetector:
         text = f"headers:\n  - name: Proxy-Authorization\n    value:\n{filler}      - Basic {token}\n"
 
         assert text.index("Basic ") - text.index("value:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
-        _assert_yaml_basic_auth(detector, text, token)
+        _assert_basic_auth_findings(detector.scan_text(text, context="headers.yaml"), token)
 
     @pytest.mark.parametrize("value_key", ["value", "headerValue"])
     @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
@@ -637,11 +629,7 @@ class TestSecretsDetector:
         assert text.index("Basic ") - text.index(f"- {value_key}:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
         findings = detector.scan_text(text, context="headers.yaml")
 
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert isinstance(basic_findings[0]["redacted_value"], str)
-        assert token in basic_findings[0]["redacted_value"]
-        assert token in json.dumps(basic_findings, sort_keys=True)
+        _assert_basic_auth_findings(findings, token)
 
     def test_basic_auth_yaml_header_value_list_context_stops_at_next_key(self) -> None:
         detector = SecretsDetector()
@@ -658,7 +646,7 @@ class TestSecretsDetector:
         token = _basic_auth_token(b"yaml-comment-gap:pass")
         text = f"{header_name}:\n  # generated header list\n  # primary credential\n  - Basic {token}\n"
 
-        _assert_yaml_basic_auth(detector, text, token)
+        _assert_basic_auth_findings(detector.scan_text(text, context="headers.yaml"), token)
 
     @pytest.mark.parametrize(
         "body",
@@ -683,7 +671,7 @@ class TestSecretsDetector:
         token = _basic_auth_token(b"direct-mapping-sibling:pass")
         text = f"{header_name}:\n  - metadata: placeholder\n  - Basic {token}\n"
 
-        _assert_yaml_basic_auth(detector, text, token)
+        _assert_basic_auth_findings(detector.scan_text(text, context="headers.yaml"), token)
 
     @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
     def test_basic_auth_yaml_header_value_list_detects_after_block_mapping_sibling(self, header_name: str) -> None:
@@ -691,7 +679,7 @@ class TestSecretsDetector:
         token = _basic_auth_token(b"direct-block-mapping-sibling:pass")
         text = f"{header_name}:\n  - metadata:\n      note: placeholder\n  - Basic {token}\n"
 
-        _assert_yaml_basic_auth(detector, text, token)
+        _assert_basic_auth_findings(detector.scan_text(text, context="headers.yaml"), token)
 
     @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
     def test_basic_auth_yaml_header_value_list_ignores_nested_metadata(self, header_name: str) -> None:
@@ -994,11 +982,7 @@ class TestSecretsDetector:
 
         findings = detector.scan_dict({"headers": [{name_key: header_name, value_key: f"Basic {token}"}]})
 
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert isinstance(basic_findings[0]["redacted_value"], str)
-        assert token in basic_findings[0]["redacted_value"]
-        assert token in json.dumps(basic_findings, sort_keys=True)
+        _assert_basic_auth_findings(findings, token)
 
     @pytest.mark.parametrize(
         "data",
@@ -1602,8 +1586,7 @@ def _assert_secret_type_detection(case_text: str, case_secret_type: str) -> None
     assert any(case_secret_type in f["secret_type"] for f in findings)
 
 
-def _assert_yaml_basic_auth(detector: SecretsDetector, text: str, token: str) -> None:
-    findings = detector.scan_text(text, context="headers.yaml")
+def _assert_basic_auth_findings(findings: list[dict[str, object]], token: str) -> None:
     basic_findings = _basic_auth_findings(findings)
     assert len(basic_findings) == 1
     assert isinstance(basic_findings[0]["redacted_value"], str)

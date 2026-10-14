@@ -24,6 +24,7 @@ from modelaudit.utils.file import handlers as advanced_handlers
 from modelaudit.utils.file import large_file_handler
 from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_zip_entry_preflight
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_mock_onnx
 
 
@@ -106,8 +107,7 @@ def test_large_handler_cache_bypasses_oversized_safetensors_hashing(
         lambda _self, _path: pytest.fail("bounded SafeTensors failure must not hash inside the scanner"),
     )
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_func(str(payload), scanner)
 
         assert result.success is False
@@ -115,8 +115,6 @@ def test_large_handler_cache_bypasses_oversized_safetensors_hashing(
         assert any(check.name == "Header Size Limit" for check in result.checks)
         assert hash_attempts == 0
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize("scan_func", [large_file_handler.scan_large_file, advanced_handlers.scan_advanced_large_file])
@@ -214,12 +212,9 @@ def test_large_handler_cache_preserves_private_metadata_for_internal_results(
         return result
 
     monkeypatch.setattr(module, internal_name, scan_internal)
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_func(str(payload), CachedScanner())
         second = scan_func(str(payload), CachedScanner())
-    finally:
-        reset_cache_manager()
 
     assert scan_calls == 1
     assert first._private_metadata["call_graph_source_fingerprints"] == fingerprint_metadata
@@ -284,15 +279,12 @@ def test_large_handler_cache_bypasses_zip_entry_preflight(
     monkeypatch.setattr(handler_module, "should_bypass_cache_for_zip_entry_preflight", lambda _path, _config: True)
     monkeypatch.setattr(handler_module, internal_name, record_internal)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_func(str(payload), scanner)
 
         assert result.success is True
         assert internal_calls == 1
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_zip_entry_preflight_cache_bypass_honors_scanner_selection(tmp_path: Path) -> None:
@@ -335,8 +327,7 @@ def test_large_handler_missing_h5py_does_not_return_stale_clean_cache(
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
     scanner = KerasH5Scanner(config=config)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         clean_result = large_file_handler.scan_large_file(str(model_path), scanner)
         assert clean_result.success is True
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)
@@ -350,8 +341,6 @@ def test_large_handler_missing_h5py_does_not_return_stale_clean_cache(
             assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
 
         assert cache_manager.get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_advanced_handler_missing_h5py_preserves_shard_coverage_without_stale_cache(
@@ -368,8 +357,7 @@ def test_advanced_handler_missing_h5py_preserves_shard_coverage_without_stale_ca
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
     scanner = KerasH5Scanner(config=config)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         clean_result = advanced_handlers.scan_advanced_large_file(str(shard_paths[0]), scanner)
         assert clean_result.success is True
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)
@@ -385,8 +373,6 @@ def test_advanced_handler_missing_h5py_preserves_shard_coverage_without_stale_ca
             assert shard_check.details["total_shards"] == 2
 
         assert cache_manager.get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_chunked_scan_populates_end_time_and_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

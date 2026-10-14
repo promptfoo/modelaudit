@@ -5,6 +5,8 @@ Comprehensive tests for ModelAudit telemetry system.
 import json
 import os
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -40,6 +42,25 @@ _NO_CI_ENV = (
     "PROMPTFOO_DISABLE_TELEMETRY",
     "NO_ANALYTICS",
 )
+
+
+@contextmanager
+def enabled_telemetry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[TelemetryClient, MagicMock]]:
+    """Keep the enabled mock client and its private home within the test's scope."""
+    with tempfile.TemporaryDirectory(dir=tmp_path) as temp_dir, monkeypatch.context() as scoped:
+        for name in (*_NO_CI_ENV, "MODELAUDIT_TELEMETRY_DEV", "MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY"):
+            scoped.setenv(name, "")
+        mock_posthog = MagicMock()
+        scoped.setattr("modelaudit.telemetry.Path.home", lambda: Path(temp_dir))
+        scoped.setattr("modelaudit.telemetry._IS_DEVELOPMENT", False)
+        scoped.setattr("modelaudit.telemetry.POSTHOG_AVAILABLE", True)
+        scoped.setattr("modelaudit.telemetry.POSTHOG_PROJECT_KEY", "test-project-key")
+        scoped.setattr("modelaudit.telemetry.Posthog", MagicMock(return_value=mock_posthog))
+        scoped.setattr("modelaudit.telemetry.atexit.register", MagicMock())
+        client = TelemetryClient()
+        client._posthog_client = mock_posthog
+        client._user_config.telemetry_enabled = True
+        yield client, mock_posthog
 
 
 class TestUserConfig:
@@ -258,27 +279,9 @@ class TestTelemetryClient:
 
             assert client._is_disabled() is True
 
-    def test_event_recording_when_enabled(self):
+    def test_event_recording_when_enabled(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that events are recorded when telemetry is enabled."""
-        mock_posthog = MagicMock()
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
-            patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
-            patch.dict(
-                os.environ,
-                dict.fromkeys(_NO_CI_ENV, ""),
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             client.record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
 
             # Should call PostHog capture
@@ -315,23 +318,7 @@ class TestTelemetryClient:
 
     def test_event_properties_mark_ci_environment(self) -> None:
         """Telemetry payloads should expose Promptfoo-compatible CI state."""
-        mock_posthog = MagicMock()
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
-            patch.dict(os.environ, {**dict.fromkeys(_NO_CI_ENV, ""), "GITHUB_ACTIONS": "true"}, clear=False),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-
-            client._send_event_internal(TelemetryEvent.COMMAND_USED, {"command": "test"})
-
-            properties = mock_posthog.capture.call_args.kwargs["properties"]
-            assert properties["isRunningInCi"] is True
+        _assert_ci_event_properties("GITHUB_ACTIONS", "true")
 
     @pytest.mark.parametrize(
         ("env_var", "value"),
@@ -344,23 +331,7 @@ class TestTelemetryClient:
     )
     def test_marker_style_ci_vars_are_detected_by_presence(self, env_var: str, value: str) -> None:
         """Marker-style CI vars carry build IDs, version strings, or paths — not booleans."""
-        mock_posthog = MagicMock()
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
-            patch.dict(os.environ, {**dict.fromkeys(_NO_CI_ENV, ""), env_var: value}, clear=False),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-
-            client._send_event_internal(TelemetryEvent.COMMAND_USED, {"command": "test"})
-
-            properties = mock_posthog.capture.call_args.kwargs["properties"]
-            assert properties["isRunningInCi"] is True
+        _assert_ci_event_properties(env_var, value)
 
     def test_event_recording_can_flush_immediately_when_configured(self):
         """Immediate flush can be enabled for low-latency delivery."""
@@ -414,29 +385,15 @@ class TestTelemetryClient:
             # Should not call PostHog
             mock_posthog.capture.assert_not_called()
 
-    def test_scan_completed_uses_top_level_results_schema(self, tmp_path: Path) -> None:
+    def test_scan_completed_uses_top_level_results_schema(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test that scan completion telemetry aggregates without file identifiers."""
-        mock_posthog = MagicMock()
         first_model = tmp_path / "a.pkl"
         second_model = tmp_path / "b.zip"
         first_model.write_bytes(b"pickle")
         second_model.write_bytes(b"zip")
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             results = {
                 "files_scanned": 2,
                 "scanner_names": ["pickle", "zip"],
@@ -512,27 +469,11 @@ class TestTelemetryClient:
             assert "b.zip" not in serialized
             assert '"None"' not in json.dumps(properties)
 
-    def test_scan_started_includes_per_path_fields(self, tmp_path: Path) -> None:
+    def test_scan_started_includes_per_path_fields(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan started events include coarse path metadata but no identifiers."""
-        mock_posthog = MagicMock()
         model_path = tmp_path / "model.pkl"
         model_path.write_bytes(b"pickle")
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             paths = [str(model_path), "hf://meta-llama/Llama-2-7b"]
             client.record_scan_started(paths, {"format": "json"})
 
@@ -553,28 +494,12 @@ class TestTelemetryClient:
             assert "meta-llama" not in serialized
             assert "Llama-2-7b" not in serialized
 
-    def test_path_and_url_fields_omit_identifiers(self, tmp_path: Path) -> None:
+    def test_path_and_url_fields_omit_identifiers(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Path and URL fields should not include raw sensitive values or identifiers."""
-        mock_posthog = MagicMock()
         sensitive_path = tmp_path / "private" / "model.pkl"
         sensitive_path.parent.mkdir()
         sensitive_path.write_bytes(b"pickle")
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             sensitive_url = "https://user:pass@example.com/model.bin?token=secret"
 
             client.record_file_type_detected(str(sensitive_path), "pickle")
@@ -585,8 +510,7 @@ class TestTelemetryClient:
             assert file_props["model_reference_type"] == "file:.pkl"
             assert file_props["source_type"] == "local"
             assert "path_identifier" not in file_props
-            assert str(sensitive_path) not in json.dumps(file_props)
-            assert "model.pkl" not in json.dumps(file_props)
+            _assert_omitted(file_props, str(sensitive_path), "model.pkl")
 
             client.record_issue_found("dangerous pattern", "critical", "pickle", str(sensitive_path))
             issue_props = mock_posthog.capture.call_args.kwargs["properties"]
@@ -596,8 +520,7 @@ class TestTelemetryClient:
             assert issue_props["model_reference_type"] == "file:.pkl"
             assert issue_props["source_type"] == "local"
             assert "path_identifier" not in issue_props
-            assert str(sensitive_path) not in json.dumps(issue_props)
-            assert "model.pkl" not in json.dumps(issue_props)
+            _assert_omitted(issue_props, str(sensitive_path), "model.pkl")
 
             client.record_download_started("http", sensitive_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
@@ -608,10 +531,7 @@ class TestTelemetryClient:
             assert download_props["model_reference_type"] == "http:.bin"
             assert download_props["file_extension"] == ".bin"
             assert "url_identifier" not in download_props
-            assert sensitive_url not in json.dumps(download_props)
-            assert "user:pass@" not in json.dumps(download_props)
-            assert "example.com" not in json.dumps(download_props)
-            assert "model.bin" not in json.dumps(download_props)
+            _assert_omitted(download_props, sensitive_url, "user:pass@", "example.com", "model.bin")
 
             client.record_download_completed("http", 2.0, 2048, sensitive_url)
             completed_props = mock_posthog.capture.call_args.kwargs["properties"]
@@ -622,30 +542,13 @@ class TestTelemetryClient:
             assert completed_props["model_reference_type"] == "http:.bin"
             assert completed_props["file_extension"] == ".bin"
             assert "url_identifier" not in completed_props
-            assert sensitive_url not in json.dumps(completed_props)
-            assert "user:pass@" not in json.dumps(completed_props)
-            assert "example.com" not in json.dumps(completed_props)
-            assert "model.bin" not in json.dumps(completed_props)
+            _assert_omitted(completed_props, sensitive_url, "user:pass@", "example.com", "model.bin")
 
-    def test_download_events_preserve_explicit_source_type(self) -> None:
+    def test_download_events_preserve_explicit_source_type(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """URL classification must not overwrite the download integration name."""
-        mock_posthog = MagicMock()
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             client.record_download_started("jfrog", "https://tenant.jfrog.io/artifactory/model.pt")
             started_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert started_props["source_type"] == "jfrog"
@@ -698,33 +601,18 @@ class TestTelemetryClient:
             )
             assert client._extract_model_reference("https://user:pass@example.com") == "http:no_extension"
 
-    def test_unknown_extensions_are_bucketed_without_preserving_identifiers(self) -> None:
+    def test_unknown_extensions_are_bucketed_without_preserving_identifiers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """User-defined suffixes should collapse to one non-identifying bucket."""
-        mock_posthog = MagicMock()
         sensitive_path = "weights.customer-secret-project"
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             client.record_scan_started([sensitive_path], {"format": "json"})
             properties = mock_posthog.capture.call_args.kwargs["properties"]
             assert properties["file_extensions"] == ["other_extension"]
             assert properties["file_extension_counts"] == {"other_extension": 1}
             assert properties["model_reference_types"] == ["unknown:other_extension"]
-            assert sensitive_path not in json.dumps(properties)
-            assert "customer-secret-project" not in json.dumps(properties)
+            _assert_omitted(properties, sensitive_path, "customer-secret-project")
 
             assert (
                 client._extract_file_extension("https://example.com/model.internal?token=secret") == "other_extension"
@@ -732,26 +620,12 @@ class TestTelemetryClient:
             assert client._extract_model_reference("https://example.com/model.internal") == "http:other_extension"
             assert client._extract_file_extension("model.safetensors") == ".safetensors"
 
-    def test_scan_completed_omits_metadata_derived_from_free_form_locations(self) -> None:
+    def test_scan_completed_omits_metadata_derived_from_free_form_locations(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Issue location prose must not become identifying telemetry dimensions."""
-        mock_posthog = MagicMock()
         sensitive_location = "/tmp/model.pb (node: company.secret)"
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             client.record_scan_completed(
                 0.1,
                 {
@@ -772,39 +646,21 @@ class TestTelemetryClient:
                 "severity": "critical",
                 "location_type": "unknown",
             }
-            assert sensitive_location not in json.dumps(properties)
-            assert "company.secret" not in json.dumps(properties)
+            _assert_omitted(properties, sensitive_location, "company.secret")
 
-    def test_cloud_url_telemetry_fields_strip_query_and_fragment(self) -> None:
+    def test_cloud_url_telemetry_fields_strip_query_and_fragment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Cloud URL telemetry should not retain presigned query material."""
-        mock_posthog = MagicMock()
         cloud_url = "s3://access:secret@bucket/path/model.pt?X-Amz-Signature=SECRET#frag"
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             client.record_scan_started([cloud_url], {"format": "json"})
             started_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "model_names" not in started_props
             assert "model_references" not in started_props
             assert started_props["model_reference_types"] == ["s3:.pt"]
             assert started_props["file_extensions"] == [".pt"]
-            assert "SECRET" not in json.dumps(started_props)
-            assert "access:secret@" not in json.dumps(started_props)
-            assert "bucket" not in json.dumps(started_props)
-            assert "path/model.pt" not in json.dumps(started_props)
+            _assert_omitted(started_props, "SECRET", "access:secret@", "bucket", "path/model.pt")
 
             client.record_file_type_detected(cloud_url, "pytorch")
             file_props = mock_posthog.capture.call_args.kwargs["properties"]
@@ -812,10 +668,7 @@ class TestTelemetryClient:
             assert "model_name" not in file_props
             assert "model_reference" not in file_props
             assert file_props["model_reference_type"] == "s3:.pt"
-            assert "SECRET" not in json.dumps(file_props)
-            assert "access:secret@" not in json.dumps(file_props)
-            assert "bucket" not in json.dumps(file_props)
-            assert "path/model.pt" not in json.dumps(file_props)
+            _assert_omitted(file_props, "SECRET", "access:secret@", "bucket", "path/model.pt")
 
             client.record_download_started("s3", cloud_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
@@ -823,10 +676,7 @@ class TestTelemetryClient:
             assert "model_name" not in download_props
             assert "model_reference" not in download_props
             assert download_props["model_reference_type"] == "s3:.pt"
-            assert "SECRET" not in json.dumps(download_props)
-            assert "access:secret@" not in json.dumps(download_props)
-            assert "bucket" not in json.dumps(download_props)
-            assert "path/model.pt" not in json.dumps(download_props)
+            _assert_omitted(download_props, "SECRET", "access:secret@", "bucket", "path/model.pt")
 
     @pytest.mark.parametrize(
         ("model_uri", "identifiers", "secrets"),
@@ -853,25 +703,11 @@ class TestTelemetryClient:
         model_uri: str,
         identifiers: tuple[str, ...],
         secrets: tuple[str, ...],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """MLflow telemetry must expose neither credentials nor model identifiers."""
-        mock_posthog = MagicMock()
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             client.record_scan_started([model_uri], {"format": "json"})
             started_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "model_names" not in started_props
@@ -951,27 +787,11 @@ class TestTelemetryClient:
 class TestDataHandling:
     """Test data handling and sanitization."""
 
-    def test_error_events_omit_free_form_text(self) -> None:
+    def test_error_events_omit_free_form_text(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Error telemetry should retain categories, never exception or context prose."""
-        mock_posthog = MagicMock()
         sensitive_error = "Invalid max-size: secret-model.pkl password=hunter2 alice@example.com"
         sensitive_context = "s3://access:secret@bucket/customer/model.pt?token=shortsecret"
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            patch.dict(
-                os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._posthog_client = mock_posthog
-            client._user_config.telemetry_enabled = True
-
+        with enabled_telemetry(tmp_path, monkeypatch) as (client, mock_posthog):
             client.record_scan_failed(0.5, sensitive_error)
             scan_failed_properties = mock_posthog.capture.call_args.kwargs["properties"]
             assert scan_failed_properties["error_type"] == "str"
@@ -1130,6 +950,32 @@ class TestTelemetryIntegration:
 
         assert len(result.issues) > 0
         assert mock_core_record_issue_found.call_count + mock_results_record_issue_found.call_count > 0
+
+
+def _assert_ci_event_properties(env_var: str, value: str) -> None:
+    mock_posthog = MagicMock()
+
+    with (
+        tempfile.TemporaryDirectory() as temp_dir,
+        patch("modelaudit.telemetry.Path.home") as mock_home,
+        patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+        patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
+        patch.dict(os.environ, {**dict.fromkeys(_NO_CI_ENV, ""), env_var: value}, clear=False),
+    ):
+        mock_home.return_value = Path(temp_dir)
+        client = TelemetryClient()
+        client._posthog_client = mock_posthog
+
+        client._send_event_internal(TelemetryEvent.COMMAND_USED, {"command": "test"})
+
+        properties = mock_posthog.capture.call_args.kwargs["properties"]
+        assert properties["isRunningInCi"] is True
+
+
+def _assert_omitted(properties: dict[str, object], *values: str) -> None:
+    for value in values:
+        serialized = json.dumps(properties)
+        assert value not in serialized, (value, serialized)
 
 
 def _assert_development_telemetry_policy(case_dev_override: str, case_disabled: bool) -> None:

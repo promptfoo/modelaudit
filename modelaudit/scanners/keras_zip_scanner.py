@@ -53,6 +53,7 @@ from .archive_dispatch import (
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .keras_utils import (
+    _DANGEROUS_CONFIG_MODULE_ROOTS,
     _keras_exact_module_policy,
     check_custom_loss_config,
     check_custom_metric_config,
@@ -75,40 +76,6 @@ from .zip_scanner import (
 _SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
 _SAFE_ALLOWLISTED_REGISTERED_OBJECTS: frozenset[str] = frozenset({"notequal"})
 
-# Importable module roots that are explicitly dangerous when referenced in config.json.
-_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
-    {
-        "os",
-        "sys",
-        "subprocess",
-        "builtins",
-        "__builtin__",
-        "importlib",
-        "shutil",
-        "socket",
-        "http",
-        "pickle",
-        "marshal",
-        "ctypes",
-        "code",
-        "codeop",
-        "compileall",
-        "runpy",
-        "webbrowser",
-        "tempfile",
-        "signal",
-        "multiprocessing",
-        "threading",
-        "pty",
-        "commands",
-        "pdb",
-        "profile",
-        "trace",
-        "pip",
-        "setuptools",
-        "distutils",
-    }
-)
 _DANGEROUS_LAMBDA_MODULE_TOKENS = frozenset(
     {
         "__builtin__",
