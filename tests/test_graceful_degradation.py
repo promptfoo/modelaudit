@@ -14,25 +14,6 @@ import pytest
 from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry, get_scanner_for_file
 
 
-@pytest.fixture
-def registry_state():
-    """Fixture to save and restore registry state for test isolation."""
-    # Save original state
-    orig_scanners = _registry._scanners.copy()
-    orig_loaded = _registry._loaded_scanners.copy()
-    orig_failed = _registry._failed_scanners.copy()
-    try:
-        yield
-    finally:
-        # Restore original state
-        _registry._scanners.clear()
-        _registry._scanners.update(orig_scanners)
-        _registry._loaded_scanners.clear()
-        _registry._loaded_scanners.update(orig_loaded)
-        _registry._failed_scanners.clear()
-        _registry._failed_scanners.update(orig_failed)
-
-
 class TestGracefulDegradation:
     """Test graceful degradation when scanners fail to load"""
 

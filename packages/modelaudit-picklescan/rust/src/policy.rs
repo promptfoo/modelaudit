@@ -97,15 +97,17 @@ fn direct_global_severity_without_wrapper_alias(module: &str, name: &str) -> Opt
         return None;
     }
 
-    if attribute_access_source_method_is_dangerous(name) {
+    if name_contains_component(name, &["__getattribute__", "__subclasses__"]) {
         return Some("critical");
     }
 
-    if object_graph_source_method_is_dangerous(name) {
-        return Some("critical");
-    }
-
-    if warning_globals(module).is_some_and(|warning_match| warning_match.matches(name)) {
+    if matches!(
+        (module, name),
+        ("functools", "partial" | "partialmethod")
+            | ("glob", _)
+            | ("linecache", "getline")
+            | ("tempfile", "mktemp")
+    ) {
         return Some("warning");
     }
 
@@ -114,7 +116,7 @@ fn direct_global_severity_without_wrapper_alias(module: &str, name: &str) -> Opt
     }
 
     if BUILTIN_MODULES.contains(&module) {
-        return if builtin_global_is_dangerous(name) {
+        return if BUILTIN_DANGEROUS_NAMES.binary_search(&name).is_ok() {
             Some("critical")
         } else {
             None
@@ -186,44 +188,8 @@ fn bounded_leading_dotted_parts(name: &str) -> Vec<&str> {
     parts
 }
 
-#[derive(Clone, Copy)]
-enum WarningGlobalMatch {
-    AnyName,
-    OneOf(&'static [&'static str]),
-}
-
-impl WarningGlobalMatch {
-    fn matches(self, name: &str) -> bool {
-        match self {
-            Self::AnyName => true,
-            Self::OneOf(names) => names.contains(&name),
-        }
-    }
-}
-
 fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
-    DANGEROUS_GLOBALS
-        .binary_search_by(|&(candidate_module, candidate_name)| {
-            match candidate_module.cmp(module) {
-                std::cmp::Ordering::Equal => candidate_name.cmp(name),
-                ordering => ordering,
-            }
-        })
-        .is_ok()
-}
-
-fn warning_globals(module: &str) -> Option<WarningGlobalMatch> {
-    match module {
-        "functools" => Some(WarningGlobalMatch::OneOf(&["partial", "partialmethod"])),
-        "glob" => Some(WarningGlobalMatch::AnyName),
-        "linecache" => Some(WarningGlobalMatch::OneOf(&["getline"])),
-        "tempfile" => Some(WarningGlobalMatch::OneOf(&["mktemp"])),
-        _ => None,
-    }
-}
-
-fn builtin_global_is_dangerous(name: &str) -> bool {
-    BUILTIN_DANGEROUS_NAMES.binary_search(&name).is_ok() || namespace_global_is_dangerous(name)
+    DANGEROUS_GLOBALS.binary_search(&(module, name)).is_ok()
 }
 
 fn operator_container_mutator_is_target_aware(module: &str, name: &str) -> bool {
@@ -244,14 +210,6 @@ fn pathlib_concrete_path_alias_is_dangerous(module: &str, name: &str) -> bool {
 
 fn namespace_global_is_dangerous(name: &str) -> bool {
     name_contains_component(name, &["__builtins__", "__dict__", "__globals__"])
-}
-
-fn attribute_access_source_method_is_dangerous(name: &str) -> bool {
-    name_contains_component(name, &["__getattribute__"])
-}
-
-fn object_graph_source_method_is_dangerous(name: &str) -> bool {
-    name_contains_component(name, &["__subclasses__"])
 }
 
 fn name_contains_component(name: &str, blocked_components: &[&str]) -> bool {
@@ -735,6 +693,17 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
 mod tests {
     use super::*;
 
+    #[track_caller]
+    fn assert_critical_globals(cases: &[(&str, &str)]) {
+        for (module, name) in cases {
+            assert_eq!(
+                global_severity(module, name),
+                Some("critical"),
+                "{module}.{name}"
+            );
+        }
+    }
+
     #[test]
     fn dangerous_global_table_is_sorted_for_binary_search() {
         for pair in DANGEROUS_GLOBALS.windows(2) {
@@ -754,38 +723,24 @@ mod tests {
 
     #[test]
     fn dangerous_global_lookup_uses_sorted_table() {
-        assert_eq!(global_severity("joblib", "load"), Some("critical"));
-        assert_eq!(global_severity("mailcap", "findmatch"), Some("critical"));
-        assert_eq!(global_severity("atexit", "register"), Some("critical"));
-        assert_eq!(
-            global_severity("setuptools._distutils.spawn", "spawn"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
-        assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
-        assert_eq!(global_severity("operator", "call"), Some("critical"));
+        assert_critical_globals(&[
+            ("joblib", "load"),
+            ("mailcap", "findmatch"),
+            ("atexit", "register"),
+            ("setuptools._distutils.spawn", "spawn"),
+            ("pipes", "Template.copy"),
+            ("pipes", "Template.open"),
+            ("operator", "call"),
+        ]);
         assert_eq!(global_severity("operator", "setitem"), None);
-        assert_eq!(global_severity("site", "os.system"), Some("critical"));
-        assert_eq!(
-            global_severity("sysconfig", "prefix.os.system"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("site", "logging.config.dictConfig"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("site", "logging.config.dictConfig.__call__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("site", "logging.config.dictConfig.__get__.__self__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("site", "logging.config.dictConfig.__repr__.__self__"),
-            Some("critical")
-        );
+        assert_critical_globals(&[
+            ("site", "os.system"),
+            ("sysconfig", "prefix.os.system"),
+            ("site", "logging.config.dictConfig"),
+            ("site", "logging.config.dictConfig.__call__"),
+            ("site", "logging.config.dictConfig.__get__.__self__"),
+            ("site", "logging.config.dictConfig.__repr__.__self__"),
+        ]);
         for module in BUILTIN_MODULES {
             for name in [
                 "__dict__",
@@ -801,27 +756,29 @@ mod tests {
                 assert_eq!(global_severity(module, name), Some("critical"));
             }
         }
-        for (module, name) in [
+        assert_critical_globals(&[
             ("statistics", "__getattribute__"),
             ("statistics", "mean.__getattribute__"),
             ("statistics", "mean.__globals__"),
             ("collections", "Counter.__subclasses__"),
-        ] {
-            assert_eq!(global_severity(module, name), Some("critical"));
+        ]);
+        for name in ["__getattribute__", "__subclasses__"] {
+            assert_eq!(global_severity("glob", name), Some("critical"));
+            assert_eq!(global_severity("os.path", name), None);
+            assert_eq!(global_severity("safe", &format!("x{name}")), None);
+            assert_eq!(global_severity("safe", &format!("{name}x")), None);
         }
-        assert_eq!(global_severity("statistics", "mean.__name__"), None);
-        assert_eq!(
-            global_severity("statistics", "mean.__name__.__call__"),
-            None
-        );
-        assert_eq!(global_severity("statistics", "mean.__get__"), None);
-        assert_eq!(global_severity("statistics", "mean.__get__.__self__"), None);
-        assert_eq!(
-            global_severity("statistics", "mean.__repr__.__self__"),
-            None
-        );
-        assert_eq!(global_severity("statistics", "mean.__self__"), None);
-        assert_eq!(global_severity("statistics", "mean.subclasses"), None);
+        for (module, name) in [
+            ("statistics", "mean.__name__"),
+            ("statistics", "mean.__name__.__call__"),
+            ("statistics", "mean.__get__"),
+            ("statistics", "mean.__get__.__self__"),
+            ("statistics", "mean.__repr__.__self__"),
+            ("statistics", "mean.__self__"),
+            ("statistics", "mean.subclasses"),
+        ] {
+            assert_eq!(global_severity(module, name), None, "{module}.{name}");
+        }
         for name in [
             "eval.__doc__",
             "eval.__name__",
@@ -838,109 +795,58 @@ mod tests {
         assert_eq!(global_severity("os.path", "__get__"), None);
         assert_eq!(global_severity("os.path", "__get__.__self__"), None);
         assert_eq!(global_severity("os.path", "__repr__.__self__"), None);
-        assert_eq!(global_severity("builtins", "filter"), Some("critical"));
-        assert_eq!(global_severity("builtins", "hasattr"), Some("critical"));
-        assert_eq!(global_severity("builtins", "map"), Some("critical"));
-        assert_eq!(
-            global_severity("builtins", "staticmethod"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "property.__get__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "classmethod.__get__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("codecs", "StreamReaderWriter.write"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("codecs", "open"), Some("critical"));
-        assert_eq!(global_severity("_functools", "partial"), Some("critical"));
-        assert_eq!(global_severity("_functools", "reduce"), Some("critical"));
+        assert_critical_globals(&[
+            ("builtins", "filter"),
+            ("builtins", "hasattr"),
+            ("builtins", "map"),
+            ("builtins", "staticmethod"),
+            ("builtins", "property.__get__"),
+            ("builtins", "classmethod.__get__"),
+            ("codecs", "StreamReaderWriter.write"),
+            ("codecs", "open"),
+            ("_functools", "partial"),
+            ("_functools", "reduce"),
+        ]);
         for name in ["FileIO", "FileIO.write", "TextIOWrapper.write", "open"] {
             assert_eq!(global_severity("_io", name), Some("critical"));
         }
         for name in ["TkappType.call", "TkappType.eval"] {
             assert_eq!(global_severity("_tkinter", name), Some("critical"));
         }
-        assert_eq!(
-            global_severity("_xxsubinterpreters", "run_string"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("argparse", "FileType"), Some("critical"));
-        assert_eq!(global_severity("functools", "cache"), Some("critical"));
-        assert_eq!(
-            global_severity("functools", "cached_property.__get__"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("functools", "cmp_to_key"), Some("critical"));
-        assert_eq!(global_severity("functools", "lru_cache"), Some("critical"));
-        assert_eq!(
-            global_severity("functools", "singledispatch"),
-            Some("critical")
-        );
+        assert_critical_globals(&[
+            ("_xxsubinterpreters", "run_string"),
+            ("argparse", "FileType"),
+            ("functools", "cache"),
+            ("functools", "cached_property.__get__"),
+            ("functools", "cmp_to_key"),
+            ("functools", "lru_cache"),
+            ("functools", "singledispatch"),
+        ]);
         for name in ["get_objects", "get_referents", "get_referrers"] {
             assert_eq!(global_severity("gc", name), Some("critical"));
         }
-        assert_eq!(global_severity("inspect", "currentframe"), Some("critical"));
-        assert_eq!(
-            global_severity("inspect", "currentframe.__call__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__call__.__call__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__get__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__get__.__self__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__get__.__self__.__call__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__repr__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__repr__.__self__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__str__.__self__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("inspect", "currentframe.__reduce__.__self__"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("inspect", "getmembers"), Some("critical"));
-        assert_eq!(global_severity("itertools", "accumulate"), Some("critical"));
-        assert_eq!(global_severity("itertools", "dropwhile"), Some("critical"));
-        assert_eq!(
-            global_severity("itertools", "filterfalse"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("itertools", "groupby"), Some("critical"));
-        assert_eq!(global_severity("itertools", "starmap"), Some("critical"));
-        assert_eq!(global_severity("itertools", "takewhile"), Some("critical"));
-        assert_eq!(global_severity("typing", "_eval_type"), Some("critical"));
-        assert_eq!(
-            global_severity("typing", "get_type_hints"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("logging", "Filterer.filter"),
-            Some("critical")
-        );
+        assert_critical_globals(&[
+            ("inspect", "currentframe"),
+            ("inspect", "currentframe.__call__"),
+            ("inspect", "currentframe.__call__.__call__"),
+            ("inspect", "currentframe.__get__"),
+            ("inspect", "currentframe.__get__.__self__"),
+            ("inspect", "currentframe.__get__.__self__.__call__"),
+            ("inspect", "currentframe.__repr__"),
+            ("inspect", "currentframe.__repr__.__self__"),
+            ("inspect", "currentframe.__str__.__self__"),
+            ("inspect", "currentframe.__reduce__.__self__"),
+            ("inspect", "getmembers"),
+            ("itertools", "accumulate"),
+            ("itertools", "dropwhile"),
+            ("itertools", "filterfalse"),
+            ("itertools", "groupby"),
+            ("itertools", "starmap"),
+            ("itertools", "takewhile"),
+            ("typing", "_eval_type"),
+            ("typing", "get_type_hints"),
+            ("logging", "Filterer.filter"),
+        ]);
         for name in [
             "FileHandler",
             "FileHandler.emit",
@@ -988,11 +894,7 @@ mod tests {
         for name in ["FileIO", "FileIO.write", "TextIOWrapper.write", "open"] {
             assert_eq!(global_severity("io", name), Some("critical"));
         }
-        assert_eq!(global_severity("numpy", "savetxt"), Some("critical"));
-        assert_eq!(
-            global_severity("numpy.lib._npyio_impl", "savetxt"),
-            Some("critical")
-        );
+        assert_critical_globals(&[("numpy", "savetxt"), ("numpy.lib._npyio_impl", "savetxt")]);
         for name in ["Path.open", "Path.write_bytes", "Path.write_text"] {
             assert_eq!(global_severity("pathlib", name), None);
             assert_eq!(callable_severity("pathlib", name), Some("critical"));
@@ -1021,25 +923,19 @@ mod tests {
             assert_eq!(global_severity("sysconfig", name), Some("critical"));
         }
         assert_eq!(global_severity("os.path", "__dict__"), None);
-        for (module, name) in [
+        assert_critical_globals(&[
             ("unittest", "TestLoader.discover"),
             ("unittest", "defaultTestLoader.discover"),
             ("unittest.loader", "TestLoader.discover"),
             ("unittest.loader", "defaultTestLoader.discover"),
             ("unittest.loader", "TestLoader.loadTestsFromName"),
             ("unittest.loader", "TestLoader.loadTestsFromNames"),
-        ] {
-            assert_eq!(global_severity(module, name), Some("critical"));
-        }
-        assert_eq!(global_severity("unittest.mock", "Mock"), Some("critical"));
-        assert_eq!(
-            global_severity("unittest.mock", "MagicMock"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("unittest.mock", "_get_target"),
-            Some("critical")
-        );
+        ]);
+        assert_critical_globals(&[
+            ("unittest.mock", "Mock"),
+            ("unittest.mock", "MagicMock"),
+            ("unittest.mock", "_get_target"),
+        ]);
         for name in [
             "_patch.__enter__",
             "_patch.start",
@@ -1049,11 +945,7 @@ mod tests {
         ] {
             assert_eq!(global_severity("unittest.mock", name), Some("critical"));
         }
-        assert_eq!(
-            global_severity("copyreg", "add_extension"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("copyreg", "pickle"), Some("critical"));
+        assert_critical_globals(&[("copyreg", "add_extension"), ("copyreg", "pickle")]);
         assert_eq!(global_severity("builtins", "dict.__setitem__"), None);
         assert_eq!(global_severity("builtins", "dict.update"), None);
         assert_eq!(global_severity("builtins", "list.append"), None);
@@ -1062,107 +954,49 @@ mod tests {
         assert_eq!(global_severity("operator", "imul"), None);
         assert_eq!(global_severity("_operator", "setitem"), None);
         assert_eq!(global_severity("_operator", "imul"), None);
-        assert_eq!(global_severity("operator", "call"), Some("critical"));
-        assert_eq!(global_severity("io", "open"), Some("critical"));
-        assert_eq!(global_severity("logging", "FileHandler"), Some("critical"));
-        assert_eq!(
-            global_severity("logging.handlers", "RotatingFileHandler"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("dbm", "open"), Some("critical"));
-        assert_eq!(global_severity("mailbox", "Maildir"), Some("critical"));
-        assert_eq!(global_severity("argparse", "FileType"), Some("critical"));
-        assert_eq!(global_severity("codecs", "open"), Some("critical"));
-        assert_eq!(global_severity("gzip", "open"), Some("critical"));
-        assert_eq!(global_severity("bz2", "open"), Some("critical"));
-        assert_eq!(global_severity("lzma", "open"), Some("critical"));
-        assert_eq!(global_severity("wave", "open"), Some("critical"));
-        assert_eq!(global_severity("aifc", "open"), Some("critical"));
-        assert_eq!(global_severity("sunau", "open"), Some("critical"));
-        assert_eq!(global_severity("decimal", "setcontext"), Some("critical"));
-        assert_eq!(global_severity("gc", "disable"), Some("critical"));
-        assert_eq!(global_severity("logging", "disable"), Some("critical"));
-        assert_eq!(
-            global_severity("logging", "captureWarnings"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("warnings", "simplefilter"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("warnings", "filterwarnings"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("warnings", "resetwarnings"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("faulthandler", "disable"), Some("critical"));
-        assert_eq!(
-            global_severity("configparser", "ConfigParser.read"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("configparser", "RawConfigParser.read"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("site", "addpackage"), Some("critical"));
-        assert_eq!(global_severity("site", "addsitedir"), Some("critical"));
-        assert_eq!(global_severity("site", "main"), Some("critical"));
-        assert_eq!(
-            global_severity("csv", "DictWriter.writerow"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("csv", "DictWriter.writerows"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("concurrent.futures", "ProcessPoolExecutor.submit"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("concurrent.futures", "ProcessPoolExecutor.map"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("concurrent.futures", "ProcessPoolExecutor.shutdown"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("concurrent.futures", "ThreadPoolExecutor.submit"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("concurrent.futures", "ThreadPoolExecutor.map"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("concurrent.futures", "ThreadPoolExecutor.shutdown"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("contextlib", "ExitStack.callback"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("contextlib", "ExitStack.close"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("contextlib", "ExitStack.__exit__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("contextlib", "ExitStack.enter_context"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("contextvars", "Context.run"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("weakref", "finalize"), Some("critical"));
+        assert_critical_globals(&[
+            ("operator", "call"),
+            ("io", "open"),
+            ("logging", "FileHandler"),
+            ("logging.handlers", "RotatingFileHandler"),
+            ("dbm", "open"),
+            ("mailbox", "Maildir"),
+            ("argparse", "FileType"),
+            ("codecs", "open"),
+            ("gzip", "open"),
+            ("bz2", "open"),
+            ("lzma", "open"),
+            ("wave", "open"),
+            ("aifc", "open"),
+            ("sunau", "open"),
+            ("decimal", "setcontext"),
+            ("gc", "disable"),
+            ("logging", "disable"),
+            ("logging", "captureWarnings"),
+            ("warnings", "simplefilter"),
+            ("warnings", "filterwarnings"),
+            ("warnings", "resetwarnings"),
+            ("faulthandler", "disable"),
+            ("configparser", "ConfigParser.read"),
+            ("configparser", "RawConfigParser.read"),
+            ("site", "addpackage"),
+            ("site", "addsitedir"),
+            ("site", "main"),
+            ("csv", "DictWriter.writerow"),
+            ("csv", "DictWriter.writerows"),
+            ("concurrent.futures", "ProcessPoolExecutor.submit"),
+            ("concurrent.futures", "ProcessPoolExecutor.map"),
+            ("concurrent.futures", "ProcessPoolExecutor.shutdown"),
+            ("concurrent.futures", "ThreadPoolExecutor.submit"),
+            ("concurrent.futures", "ThreadPoolExecutor.map"),
+            ("concurrent.futures", "ThreadPoolExecutor.shutdown"),
+            ("contextlib", "ExitStack.callback"),
+            ("contextlib", "ExitStack.close"),
+            ("contextlib", "ExitStack.__exit__"),
+            ("contextlib", "ExitStack.enter_context"),
+            ("contextvars", "Context.run"),
+            ("weakref", "finalize"),
+        ]);
         for name in [
             "CLoader",
             "CUnsafeLoader",
@@ -1175,108 +1009,63 @@ mod tests {
         ] {
             assert_eq!(global_severity("yaml", name), Some("critical"));
         }
-        for (module, name) in [
+        assert_critical_globals(&[
             ("yaml.cyaml", "CLoader"),
             ("yaml.cyaml", "CUnsafeLoader"),
             ("yaml.loader", "Loader"),
             ("yaml.loader", "UnsafeLoader"),
-        ] {
-            assert_eq!(global_severity(module, name), Some("critical"));
-        }
+        ]);
         for name in ["CFullLoader", "CSafeLoader", "FullLoader", "SafeLoader"] {
             assert_eq!(global_severity("yaml", name), None);
         }
-        assert_eq!(
-            global_severity("sched", "scheduler.enter"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("sched", "scheduler.enterabs"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("sched", "scheduler.run"), Some("critical"));
-        assert_eq!(
-            global_severity("dataclasses", "_create_fn"),
-            Some("critical")
-        );
+        assert_critical_globals(&[
+            ("sched", "scheduler.enter"),
+            ("sched", "scheduler.enterabs"),
+            ("sched", "scheduler.run"),
+            ("dataclasses", "_create_fn"),
+        ]);
         for module in ["dotenv", "dotenv.cli", "dotenv.main"] {
             assert_eq!(global_severity(module, "set_key"), Some("critical"));
             assert_eq!(global_severity(module, "unset_key"), None);
         }
-        assert_eq!(
-            global_severity("tempfile", "NamedTemporaryFile"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("types", "MethodType"), Some("critical"));
-        assert_eq!(
-            global_severity("types", "ClassMethodDescriptorType.__get__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("types", "DynamicClassAttribute.__get__"),
-            Some("critical")
-        );
+        assert_critical_globals(&[
+            ("tempfile", "NamedTemporaryFile"),
+            ("types", "MethodType"),
+            ("types", "ClassMethodDescriptorType.__get__"),
+            ("types", "DynamicClassAttribute.__get__"),
+        ]);
         for name in [
             "FrameType.f_builtins.__get__",
             "FrameType.f_globals.__get__",
             "FrameType.f_locals.__get__",
         ] {
-            assert_eq!(global_severity("types", name), Some("critical"));
-            assert_eq!(
-                global_severity("types", &format!("{name}.__call__")),
-                Some("critical")
-            );
-            assert_eq!(
-                global_severity("types", &format!("{name}.__call__.__call__")),
-                Some("critical")
-            );
-            assert_eq!(
-                global_severity("types", &format!("{name}.__self__")),
-                Some("critical")
-            );
-            assert_eq!(
-                global_severity("types", &format!("{name}.__self__.__get__")),
-                Some("critical")
-            );
-            assert_eq!(
-                global_severity("types", &format!("{name}.__self__.__get__.__call__")),
-                Some("critical")
-            );
-            assert_eq!(
-                global_severity("types", &format!("{name}.__repr__")),
-                Some("critical")
-            );
-            assert_eq!(
-                global_severity("types", &format!("{name}.__repr__.__self__")),
-                Some("critical")
-            );
-            assert_eq!(
-                global_severity("types", &format!("{name}.__str__.__self__")),
-                Some("critical")
-            );
+            for suffix in [
+                "",
+                ".__call__",
+                ".__call__.__call__",
+                ".__self__",
+                ".__self__.__get__",
+                ".__self__.__get__.__call__",
+                ".__repr__",
+                ".__repr__.__self__",
+                ".__str__.__self__",
+            ] {
+                assert_eq!(
+                    global_severity("types", &format!("{name}{suffix}")),
+                    Some("critical"),
+                    "{name}{suffix}"
+                );
+            }
         }
-        assert_eq!(
-            global_severity("types", "GetSetDescriptorType.__get__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("types", "MemberDescriptorType.__get__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("types", "MethodDescriptorType.__get__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("types", "WrapperDescriptorType.__get__"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("site", "addsitedir"), Some("critical"));
-        assert_eq!(global_severity("site", "addpackage"), Some("critical"));
-        assert_eq!(
-            global_severity("string", "Formatter.get_field"),
-            Some("critical")
-        );
+        assert_critical_globals(&[
+            ("types", "GetSetDescriptorType.__get__"),
+            ("types", "MemberDescriptorType.__get__"),
+            ("types", "MethodDescriptorType.__get__"),
+            ("types", "WrapperDescriptorType.__get__"),
+            ("site", "addsitedir"),
+            ("site", "addpackage"),
+            ("string", "Formatter.get_field"),
+        ]);
         assert_eq!(global_severity("custom", "load"), None);
         assert_eq!(global_severity("configparser", "ConfigParser"), None);
         assert_eq!(global_severity("configparser", "ConfigParser.get"), None);
@@ -1339,6 +1128,18 @@ mod tests {
         assert_eq!(global_severity("functools", "partial"), Some("warning"));
         assert_eq!(global_severity("functools", "reduce"), Some("critical"));
         assert_eq!(global_severity("linecache", "clearcache"), None);
+        assert_eq!(
+            global_severity("functools", "partialmethod"),
+            Some("warning")
+        );
+        assert_eq!(global_severity("linecache", "getline"), Some("warning"));
+        assert_eq!(global_severity("tempfile", "mktemp"), Some("warning"));
+        assert_eq!(global_severity("FUNCTOOLS", "partial"), None);
+        assert_eq!(global_severity("functools", "Partial"), None);
+        assert_eq!(global_severity("linecache", "getline_extra"), None);
+        assert_eq!(global_severity("glob", ""), Some("warning"));
+        assert_eq!(global_severity("glob", "__dict__"), Some("warning"));
+        assert_eq!(global_severity("glob", "__globals__"), Some("warning"));
     }
 
     #[test]
@@ -1373,54 +1174,29 @@ mod tests {
 
     #[test]
     fn pathlib_filesystem_access_methods_are_dangerous_without_wildcarding_pathlib() {
-        assert_eq!(
-            callable_severity("pathlib", "PosixPath.touch"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib", "PosixPath.read_text"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib", "WindowsPath.read_bytes"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib", "PosixPath.iterdir"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib._local", "PosixPath.iterdir"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib._local", "PosixPath.read_text"),
-            Some("critical")
-        );
-        assert_eq!(callable_severity("pathlib", "Path.glob"), Some("critical"));
-        assert_eq!(callable_severity("pathlib", "Path.rglob"), Some("critical"));
-        assert_eq!(callable_severity("pathlib", "Path.stat"), Some("critical"));
-        assert_eq!(
-            callable_severity("pathlib", "Path.readlink"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib", "Path.exists"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib", "Path.is_file"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib", "Path.is_dir"),
-            Some("critical")
-        );
-        assert_eq!(
-            callable_severity("pathlib", "WindowsPath.write_text"),
-            Some("critical")
-        );
-        assert_eq!(callable_severity("pathlib", "Path.open"), Some("critical"));
+        for (module, name) in [
+            ("pathlib", "PosixPath.touch"),
+            ("pathlib", "PosixPath.read_text"),
+            ("pathlib", "WindowsPath.read_bytes"),
+            ("pathlib", "PosixPath.iterdir"),
+            ("pathlib._local", "PosixPath.iterdir"),
+            ("pathlib._local", "PosixPath.read_text"),
+            ("pathlib", "Path.glob"),
+            ("pathlib", "Path.rglob"),
+            ("pathlib", "Path.stat"),
+            ("pathlib", "Path.readlink"),
+            ("pathlib", "Path.exists"),
+            ("pathlib", "Path.is_file"),
+            ("pathlib", "Path.is_dir"),
+            ("pathlib", "WindowsPath.write_text"),
+            ("pathlib", "Path.open"),
+        ] {
+            assert_eq!(
+                callable_severity(module, name),
+                Some("critical"),
+                "{module}.{name}"
+            );
+        }
         assert_eq!(global_severity("pathlib", "Path.touch"), None);
         assert_eq!(
             global_severity("pathlib._local", "PosixPath.read_text"),

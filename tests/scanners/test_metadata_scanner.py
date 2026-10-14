@@ -16,6 +16,7 @@ from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
 from modelaudit.utils.helpers import cache_decorator
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.text import LowerCountingText
 
 
@@ -138,8 +139,7 @@ class TestMetadataScanner:
         metadata_path.write_text("model-index:\n- name: clean-model\n" + "x" * 11_000, encoding="utf-8")
         cache_dir = tmp_path / "cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             with monkeypatch.context() as warm_cache:
                 warm_cache.setattr(
                     cache_decorator,
@@ -179,8 +179,6 @@ class TestMetadataScanner:
             )
             assert determine_exit_code(aggregate) == 2
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-        finally:
-            reset_cache_manager()
 
     def test_scan_suspicious_urls_in_readme(self) -> None:
         """Test detection of suspicious URLs in README."""

@@ -8,7 +8,7 @@ import zipfile
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
-from itertools import pairwise
+from itertools import chain, pairwise
 from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import mark_operational_scan_error
@@ -24,7 +24,7 @@ from .archive_dispatch import (
     scan_nested_file,
 )
 from .archive_member_security import is_executable_archive_member_name, scan_archive_member_for_known_risks
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, Issue, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -1510,33 +1510,19 @@ class ZipScanner(BaseScanner):
         """Rewrite nested result locations so archive members, not temp files, are reported."""
         archive_location = f"{archive_path}:{entry_name}"
 
-        for issue in scan_result.issues:
-            issue.location = rewrite_extracted_member_location(
-                issue.location,
+        findings: Iterator[Issue | Check] = chain(scan_result.issues, scan_result.checks)
+        for finding in findings:
+            finding.location = rewrite_extracted_member_location(
+                finding.location,
                 tmp_path,
                 archive_location,
                 preserve_non_delimited_suffix=False,
             )
 
-            existing_issue_entry = issue.details.get("zip_entry")
-            issue.details["zip_entry"] = (
-                f"{entry_name}:{existing_issue_entry}"
-                if isinstance(existing_issue_entry, str) and existing_issue_entry
-                else entry_name
-            )
-
-        for check in scan_result.checks:
-            check.location = rewrite_extracted_member_location(
-                check.location,
-                tmp_path,
-                archive_location,
-                preserve_non_delimited_suffix=False,
-            )
-
-            existing_check_entry = check.details.get("zip_entry")
-            check.details["zip_entry"] = (
-                f"{entry_name}:{existing_check_entry}"
-                if isinstance(existing_check_entry, str) and existing_check_entry
+            existing_member_entry = finding.details.get("zip_entry")
+            finding.details["zip_entry"] = (
+                f"{entry_name}:{existing_member_entry}"
+                if isinstance(existing_member_entry, str) and existing_member_entry
                 else entry_name
             )
 

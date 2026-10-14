@@ -14,9 +14,8 @@ from typing import ClassVar, NamedTuple
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from ..utils.file.detection import _read_proto_varint as _read_varint
 from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, CheckStatus, IssueSeverity, ScanResult
-
-_MAX_VARINT_BYTES = 10
 
 _NETWORK_PATTERN = re.compile(
     r"(?i)\b(?:https?://|wss?://|ftp://|file://|s3://|gs://|[a-z0-9.-]+\.(?:com|net|org|io|ai)(?:/|\b))"
@@ -45,28 +44,6 @@ class _ProtoField(NamedTuple):
     value: int | bytes
     declared_length: int | None = None
     truncated: bool = False
-
-
-def _read_varint(data: bytes, offset: int) -> tuple[int, int] | None:
-    """Read a protobuf varint from data[offset:]."""
-    value = 0
-    shift = 0
-    pos = offset
-
-    for _ in range(_MAX_VARINT_BYTES):
-        if pos >= len(data):
-            return None
-
-        byte_val = data[pos]
-        pos += 1
-        value |= (byte_val & 0x7F) << shift
-
-        if (byte_val & 0x80) == 0:
-            return value, pos
-
-        shift += 7
-
-    return None
 
 
 def _skip_group(

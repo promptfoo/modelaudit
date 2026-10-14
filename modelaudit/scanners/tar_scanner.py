@@ -16,6 +16,7 @@ import zlib
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from itertools import chain
 from typing import Any, BinaryIO, ClassVar, Literal, cast
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
@@ -34,7 +35,7 @@ from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import scan_archive_member_for_known_risks
-from .base import DEFAULT_MAX_FILE_READ_SIZE, BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
+from .base import DEFAULT_MAX_FILE_READ_SIZE, BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -729,23 +730,14 @@ class TarScanner(BaseScanner):
         """Rewrite nested result locations so archive members, not temp files, are reported."""
         archive_location = f"{archive_path}:{entry_name}"
 
-        for issue in scan_result.issues:
-            issue.location = self._rewrite_archive_location(issue.location, tmp_path, archive_location)
+        findings: Iterator[Issue | Check] = chain(scan_result.issues, scan_result.checks)
+        for finding in findings:
+            finding.location = self._rewrite_archive_location(finding.location, tmp_path, archive_location)
 
-            existing_issue_entry = issue.details.get("tar_entry")
-            issue.details["tar_entry"] = (
-                f"{entry_name}:{existing_issue_entry}"
-                if isinstance(existing_issue_entry, str) and existing_issue_entry
-                else entry_name
-            )
-
-        for check in scan_result.checks:
-            check.location = self._rewrite_archive_location(check.location, tmp_path, archive_location)
-
-            existing_check_entry = check.details.get("tar_entry")
-            check.details["tar_entry"] = (
-                f"{entry_name}:{existing_check_entry}"
-                if isinstance(existing_check_entry, str) and existing_check_entry
+            existing_member_entry = finding.details.get("tar_entry")
+            finding.details["tar_entry"] = (
+                f"{entry_name}:{existing_member_entry}"
+                if isinstance(existing_member_entry, str) and existing_member_entry
                 else entry_name
             )
 

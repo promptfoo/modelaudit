@@ -242,93 +242,7 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
     }
 
     match value {
-        StackValue::Mark => "MARK".to_string(),
-        StackValue::Text { value, .. } => format!("str:{:?}", value),
-        StackValue::TextSpan { start, end, .. } => {
-            format!("str_span(len={})", end.saturating_sub(*start))
-        }
-        StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
-        StackValue::ExternalBuffer => "external_buffer".to_string(),
         StackValue::Global(reference) => format!("global:{}", reference.symbol()),
-        StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
-        StackValue::CallIterator { callable } => {
-            format!("call_iterator:{}", callable.symbol())
-        }
-        StackValue::CallIteratorTuple {
-            callable,
-            item_count,
-        } => format!(
-            "call_iterator_tuple(callable={}, len={})",
-            callable.symbol(),
-            item_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
-        ),
-        StackValue::DefaultDict { default_factory } => {
-            format!("defaultdict(factory={})", default_factory.symbol())
-        }
-        StackValue::DynamicType {
-            type_name,
-            memo_index,
-        } => format!(
-            "dynamic_type(name={}, memo={})",
-            type_name.as_deref().unwrap_or("unknown"),
-            memo_index.map_or_else(|| "none".to_string(), |index| index.to_string())
-        ),
-        StackValue::TrackedDict {
-            entries,
-            unknown_key_values,
-            ..
-        } if entries.is_empty() && unknown_key_values.is_empty() => "dict:{}".to_string(),
-        StackValue::TrackedDict {
-            entries,
-            unknown_key_values,
-            unknown_key_values_overflowed,
-            ..
-        } => {
-            let overflow = if *unknown_key_values_overflowed {
-                "+overflow"
-            } else {
-                ""
-            };
-            format!(
-                "dict(keys={}, dynamic_keys={}{})",
-                entries.len(),
-                unknown_key_values.len(),
-                overflow
-            )
-        }
-        StackValue::MappingWrapper {
-            reference,
-            mappings,
-        } => format!(
-            "mapping_wrapper:{}(mappings={})",
-            reference.symbol(),
-            mappings.len()
-        ),
-        StackValue::StringTemplate { template } => format!("string_template:{template:?}"),
-        StackValue::RegexPattern { pattern, flags } => {
-            format!(
-                "regex_pattern:{pattern:?},flags={}",
-                regex_flags_preview(*flags)
-            )
-        }
-        StackValue::RegexScannerLexicon { rules } => {
-            format!("regex_scanner_lexicon(rules={})", rules.len())
-        }
-        StackValue::RegexScanner { rules, flags } => {
-            format!(
-                "regex_scanner(rules={}, flags={})",
-                rules.len(),
-                regex_flags_preview(*flags)
-            )
-        }
-        StackValue::FutureCallbacks(callbacks) => format!(
-            "future_callbacks(callbacks={}, done={}, memo={})",
-            callbacks.callbacks.len(),
-            callbacks.done,
-            callbacks
-                .memo_index
-                .map_or_else(|| "none".to_string(), |index| index.to_string())
-        ),
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()
@@ -340,8 +254,7 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
             }
             format!("tuple({})", parts.join(", "))
         }
-        StackValue::Primitive { type_name, repr } => format!("{type_name}:{repr}"),
-        StackValue::Other => "object".to_string(),
+        _ => operand_preview(Some(value)),
     }
 }
 
@@ -538,4 +451,44 @@ fn little_endian_signed_integer_repr(value: &[u8]) -> Option<String> {
     let mut buffer = if sign_extend { [0xffu8; 16] } else { [0u8; 16] };
     buffer[..value.len()].copy_from_slice(value);
     Some(i128::from_le_bytes(buffer).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stack_previews_preserve_recursive_format_and_limits() {
+        let global = StackValue::Global(GlobalRef {
+            module: "os".to_string(),
+            name: "system".to_string(),
+            position: 0,
+            malformed: false,
+            memo_index: None,
+            memo_read: false,
+        });
+        let nested = StackValue::Tuple(vec![StackValue::Tuple(vec![global.clone()])]);
+        for (value, depth, expected) in [
+            (global.clone(), 0, "global:os.system"),
+            (global.clone(), 2, "global:os.system"),
+            (global, 3, "..."),
+            (nested.clone(), 0, "tuple(tuple(global:os.system))"),
+            (nested, 1, "tuple(tuple(...))"),
+            (StackValue::Other, 2, "object"),
+            (StackValue::Other, 3, "..."),
+            (StackValue::Tuple(vec![]), 3, "..."),
+            (
+                StackValue::Tuple(vec![StackValue::Other; 6]),
+                0,
+                "tuple(object, object, object, object, object, object)",
+            ),
+            (
+                StackValue::Tuple(vec![StackValue::Other; 7]),
+                0,
+                "tuple(object, object, object, object, object, object, ...)",
+            ),
+        ] {
+            assert_eq!(stack_value_preview(&value, depth), expected);
+        }
+    }
 }

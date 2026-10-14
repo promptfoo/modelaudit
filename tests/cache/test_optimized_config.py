@@ -1,6 +1,9 @@
 """Tests for optimized cache configuration."""
 
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from modelaudit.cache.optimized_config import (
     CACHE_SCHEMA_VERSION,
@@ -20,17 +23,15 @@ def test_cache_schema_invalidates_pre_whitelist_policy_entries() -> None:
 class TestCacheConfiguration:
     """Tests for CacheConfiguration class."""
 
-    def test_default_values(self):
-        """Test default configuration values."""
+    def test_default_values(self) -> None:
         config = CacheConfiguration()
         assert config.enabled is True
         assert config.cache_dir is None
         assert config.max_file_size == 100 * 1024 * 1024
         assert config.min_file_size == 1024
 
-    def test_custom_values(self):
-        """Test custom configuration values."""
-        cache_dir = str(Path("/tmp/cache"))
+    def test_custom_values(self, tmp_path: Path) -> None:
+        cache_dir = str(tmp_path / "cache")
         config = CacheConfiguration(
             {
                 "cache_enabled": False,
@@ -44,142 +45,82 @@ class TestCacheConfiguration:
         assert config.max_file_size == 50 * 1024 * 1024
         assert config.min_file_size == 2048
 
-    def test_should_cache_disabled(self):
-        """Test caching disabled globally."""
-        config = CacheConfiguration({"cache_enabled": False})
-        assert config.should_cache_file(10000) is False
+    @pytest.mark.parametrize(
+        ("enabled", "size", "extension", "expected"),
+        [
+            pytest.param(False, 10000, "", False, id="disabled"),
+            pytest.param(None, 100, "", False, id="too-small"),
+            pytest.param(None, 200 * 1024 * 1024, "", False, id="too-large"),
+            pytest.param(None, 50 * 1024, "", True, id="normal"),
+            pytest.param(None, 5 * 1024, ".txt", False, id="small-text"),
+            pytest.param(None, 5 * 1024, ".json", False, id="small-json"),
+            pytest.param(None, 50 * 1024, ".txt", True, id="large-text"),
+        ],
+    )
+    def test_should_cache_file(self, enabled: bool | None, size: int, extension: str, expected: bool) -> None:
+        config = CacheConfiguration({"cache_enabled": enabled} if enabled is not None else None)
+        assert config.should_cache_file(size, extension) is expected
 
-    def test_should_cache_too_small(self):
-        """Test file too small to cache."""
-        config = CacheConfiguration()
-        assert config.should_cache_file(100) is False
+    @pytest.mark.parametrize(
+        ("enabled", "size", "expected"),
+        [
+            pytest.param(False, 10000, "none", id="disabled"),
+            pytest.param(None, 5 * 1024 * 1024, "quick", id="medium"),
+            pytest.param(None, 50 * 1024 * 1024, "content", id="large"),
+        ],
+    )
+    def test_get_cache_strategy(self, enabled: bool | None, size: int, expected: str) -> None:
+        config = CacheConfiguration({"cache_enabled": enabled} if enabled is not None else None)
+        assert config.get_cache_strategy(size) == expected
 
-    def test_should_cache_too_large(self):
-        """Test file too large to cache."""
-        config = CacheConfiguration()
-        assert config.should_cache_file(200 * 1024 * 1024) is False
-
-    def test_should_cache_normal_file(self):
-        """Test normal file should be cached."""
-        config = CacheConfiguration()
-        assert config.should_cache_file(50 * 1024) is True
-
-    def test_should_cache_small_text_file(self):
-        """Test small text files are not cached."""
-        config = CacheConfiguration()
-        assert config.should_cache_file(5 * 1024, ".txt") is False
-        assert config.should_cache_file(5 * 1024, ".json") is False
-
-    def test_should_cache_large_text_file(self):
-        """Test larger text files are cached."""
-        config = CacheConfiguration()
-        assert config.should_cache_file(50 * 1024, ".txt") is True
-
-    def test_get_cache_strategy_none(self):
-        """Test no caching strategy."""
-        config = CacheConfiguration({"cache_enabled": False})
-        assert config.get_cache_strategy(10000) == "none"
-
-    def test_get_cache_strategy_quick(self):
-        """Test quick caching strategy for medium files."""
-        config = CacheConfiguration()
-        assert config.get_cache_strategy(5 * 1024 * 1024) == "quick"
-
-    def test_get_cache_strategy_content(self):
-        """Test content caching strategy for large files."""
-        config = CacheConfiguration()
-        assert config.get_cache_strategy(50 * 1024 * 1024) == "content"
-
-    def test_get_performance_hint_small_file(self):
-        """Test performance hints for small files."""
-        config = CacheConfiguration()
-        hints = config.get_performance_hint(100 * 1024)
-        assert hints["use_batch_operations"] is False
-        assert hints["parallel_io_recommended"] is False
-        assert hints["memory_streaming_recommended"] is False
-
-    def test_get_performance_hint_large_file(self):
-        """Test performance hints for large files."""
-        config = CacheConfiguration()
-        hints = config.get_performance_hint(100 * 1024 * 1024)
-        assert hints["use_batch_operations"] is True
-        assert hints["parallel_io_recommended"] is True
-        assert hints["memory_streaming_recommended"] is True
+    @pytest.mark.parametrize(
+        ("size", "expected"),
+        [pytest.param(100 * 1024, False, id="small"), pytest.param(100 * 1024 * 1024, True, id="large")],
+    )
+    def test_get_performance_hint(self, size: int, expected: bool) -> None:
+        hints = CacheConfiguration().get_performance_hint(size)
+        assert hints["use_batch_operations"] is expected
+        assert hints["parallel_io_recommended"] is expected
+        assert hints["memory_streaming_recommended"] is expected
 
 
 class TestConfigurationExtractor:
     """Tests for ConfigurationExtractor class."""
 
-    def test_extract_from_args(self):
-        """Test extracting config from positional args."""
-        extractor = ConfigurationExtractor()
-        config, path = extractor.extract_fast(("/test/file.pkl",), {})
-        assert path == "/test/file.pkl"
+    @pytest.mark.parametrize("call_shape", ["positional", "keyword", "disabled", "no-path"])
+    def test_extract(self, call_shape: str, tmp_path: Path) -> None:
+        file_path = str(tmp_path / "file.pkl")
+        cases: dict[str, tuple[tuple[Any, ...], dict[str, Any], str | None, bool]] = {
+            "positional": ((file_path,), {}, file_path, True),
+            "keyword": ((), {"path": file_path}, file_path, True),
+            "disabled": ((file_path, {"cache_enabled": False}), {}, file_path, False),
+            "no-path": ((), {}, None, True),
+        }
+        args, kwargs, expected_path, expected_enabled = cases[call_shape]
+        config, path = ConfigurationExtractor().extract_fast(args, kwargs)
+        assert path == expected_path
         assert config is not None
+        assert config.enabled is expected_enabled
 
-    def test_extract_from_kwargs(self):
-        """Test extracting config from keyword args."""
-        extractor = ConfigurationExtractor()
-        _config, path = extractor.extract_fast((), {"path": "/test/file.pkl"})
-        assert path == "/test/file.pkl"
-
-    def test_extract_with_config_dict(self):
-        """Test extracting with config dict."""
-        extractor = ConfigurationExtractor()
-        config_dict = {"cache_enabled": False}
-        config, _path = extractor.extract_fast(("/test/file.pkl", config_dict), {})
-        assert config is not None
-        assert config.enabled is False
-
-    def test_extract_no_path(self):
-        """Test extraction with no path."""
-        extractor = ConfigurationExtractor()
-        config, path = extractor.extract_fast((), {})
-        assert path is None
-        assert config is not None
-
-    def test_config_caching(self):
-        """Test configuration caching."""
+    def test_config_caching(self, tmp_path: Path) -> None:
         extractor = ConfigurationExtractor()
         config_dict = {"cache_enabled": True}
-
-        # First call
-        config1, _ = extractor.extract_fast(("/file1.pkl", config_dict), {})
-
-        # Second call with same config
-        config2, _ = extractor.extract_fast(("/file2.pkl", config_dict), {})
-
-        # Should return cached config
+        config1, _ = extractor.extract_fast((str(tmp_path / "file1.pkl"), config_dict), {})
+        config2, _ = extractor.extract_fast((str(tmp_path / "file2.pkl"), config_dict), {})
         assert config1 is config2
 
-    def test_cleanup_config_cache(self):
-        """Test cache cleanup."""
+    def test_cleanup_config_cache(self, tmp_path: Path) -> None:
         extractor = ConfigurationExtractor()
         extractor._cache_expiry = 0  # Immediate expiry
-
-        # Add some entries
         for i in range(25):
-            config_dict = {"id": i}
-            extractor.extract_fast((f"/file{i}.pkl", config_dict), {})
+            extractor.extract_fast((str(tmp_path / f"file{i}.pkl"), {"id": i}), {})
 
-        # Trigger cleanup
         newest_timestamp = max(timestamp for _, timestamp in extractor._config_cache.values())
         extractor._cleanup_config_cache(current_time=newest_timestamp + 1.0)
-
-        # Cache should be cleaned
         assert len(extractor._config_cache) <= 20
 
 
-class TestGetConfigExtractor:
-    """Tests for get_config_extractor function."""
-
-    def test_returns_global_instance(self):
-        """Test that same instance is returned."""
-        ext1 = get_config_extractor()
-        ext2 = get_config_extractor()
-        assert ext1 is ext2
-
-    def test_instance_is_extractor(self):
-        """Test that returned instance is ConfigurationExtractor."""
-        ext = get_config_extractor()
-        assert isinstance(ext, ConfigurationExtractor)
+def test_get_config_extractor_returns_global_instance() -> None:
+    extractor = get_config_extractor()
+    assert extractor is get_config_extractor()
+    assert isinstance(extractor, ConfigurationExtractor)

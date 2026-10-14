@@ -1,7 +1,9 @@
 """Tests for progress tracking base module."""
 
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from modelaudit.progress.base import (
     ProgressPhase,
@@ -45,67 +47,34 @@ class TestProgressStats:
         time.sleep(0.05)
         assert stats.elapsed_time >= 0.05
 
-    def test_bytes_percentage_zero_total(self):
-        """Test bytes percentage with zero total."""
-        stats = ProgressStats(total_bytes=0)
-        assert stats.bytes_percentage == 0.0
-
-    def test_bytes_percentage_normal(self):
-        """Test bytes percentage calculation."""
-        stats = ProgressStats(bytes_processed=50, total_bytes=100)
-        assert stats.bytes_percentage == 50.0
-
-    def test_bytes_percentage_capped(self):
-        """Test bytes percentage is capped at 100."""
-        stats = ProgressStats(bytes_processed=150, total_bytes=100)
-        assert stats.bytes_percentage == 100.0
-
-    def test_items_percentage_zero_total(self):
-        """Test items percentage with zero total."""
-        stats = ProgressStats(total_items=0)
-        assert stats.items_percentage == 0.0
-
-    def test_items_percentage_normal(self):
-        """Test items percentage calculation."""
-        stats = ProgressStats(items_processed=25, total_items=100)
-        assert stats.items_percentage == 25.0
-
-    def test_format_bytes_bytes(self):
-        """Test byte formatting for small values."""
+    @pytest.mark.parametrize("counter", ["bytes", "items"])
+    @pytest.mark.parametrize(
+        ("processed", "total", "expected"),
+        [(0, 0, 0.0), (25, 100, 25.0), (50, 100, 50.0), (150, 100, 100.0)],
+        ids=["zero-total", "quarter", "half", "capped"],
+    )
+    def test_percentage(self, counter: str, processed: int, total: int, expected: float) -> None:
+        """Test percentages for empty, partially processed and exceeded totals."""
         stats = ProgressStats()
-        assert stats.format_bytes(500) == "500.0 B"
+        setattr(stats, f"{counter}_processed", processed)
+        setattr(stats, f"total_{counter}", total)
+        assert getattr(stats, f"{counter}_percentage") == expected
 
-    def test_format_bytes_kilobytes(self) -> None:
-        """Test byte formatting for KB values."""
-        stats = ProgressStats()
-        assert stats.format_bytes(1536) == "1.5 KB"
+    @pytest.mark.parametrize(
+        ("size", "expected"),
+        [(500, "500.0 B"), (1536, "1.5 KB"), (2048 * 1024, "2.0 MB"), (3 * 1024**3, "3.0 GB")],
+        ids=["bytes", "kilobytes", "megabytes", "gigabytes"],
+    )
+    def test_format_bytes(self, size: int, expected: str) -> None:
+        assert ProgressStats().format_bytes(size) == expected
 
-    def test_format_bytes_megabytes(self) -> None:
-        """Test byte formatting for MB values."""
-        stats = ProgressStats()
-        assert stats.format_bytes(2048 * 1024) == "2.0 MB"
-
-    def test_format_bytes_gigabytes(self) -> None:
-        """Test byte formatting for GB values."""
-        stats = ProgressStats()
-        assert stats.format_bytes(3 * 1024 * 1024 * 1024) == "3.0 GB"
-
-    def test_format_time_seconds(self) -> None:
-        """Test time formatting for seconds."""
-        stats = ProgressStats()
-        assert stats.format_time(30) == "30.0s"
-
-    def test_format_time_minutes(self) -> None:
-        """Test time formatting for minutes."""
-        stats = ProgressStats()
-        result = stats.format_time(90)
-        assert result == "1m 30s"
-
-    def test_format_time_hours(self) -> None:
-        """Test time formatting for hours."""
-        stats = ProgressStats()
-        result = stats.format_time(3661)
-        assert result == "1h 1m"
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [(30, "30.0s"), (90, "1m 30s"), (3661, "1h 1m")],
+        ids=["seconds", "minutes", "hours"],
+    )
+    def test_format_time(self, seconds: int, expected: str) -> None:
+        assert ProgressStats().format_time(seconds) == expected
 
     def test_update_performance_metrics(self) -> None:
         """Test performance metrics update."""
@@ -243,13 +212,12 @@ class TestProgressTracker:
         assert tracker.stats.total_bytes == 5000
         assert tracker.stats.total_items == 50
 
-    def test_force_update(self):
+    def test_force_update(self) -> None:
         """Test forcing update."""
         reporter = MockReporter(update_interval=0)
         tracker = ProgressTracker(reporters=[reporter], update_interval=0)
         tracker.force_update()
-        # Reporter should have been called
-        assert len(reporter.progress_calls) >= 0
+        assert reporter.progress_calls == [tracker.stats]
 
     def test_complete(self):
         """Test completion."""
@@ -288,61 +256,39 @@ class TestProgressTracker:
         tracker.update_bytes(500)
         assert observed == [200, 500]
 
-    def test_reporter_exception_handling(self):
-        """Test that reporter exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_progress(self, stats):
-                raise RuntimeError("Reporter failed")
-
-        reporter = FailingReporter(update_interval=0)
+    @pytest.mark.parametrize(
+        ("reporter_method", "tracker_method", "args", "message"),
+        [
+            ("report_progress", "force_update", (), "Reporter failed"),
+            ("report_phase_change", "set_phase", (ProgressPhase.ANALYZING,), "Phase change failed"),
+            ("report_completion", "complete", (), "Completion failed"),
+            ("report_error", "report_error", (ValueError("Original error"),), "Error reporting failed"),
+        ],
+        ids=["progress", "phase-change", "completion", "error-reporting"],
+    )
+    def test_reporter_exception_handling(
+        self,
+        reporter_method: str,
+        tracker_method: str,
+        args: tuple[object, ...],
+        message: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test each reporter failure is reached and logged without crashing the tracker."""
+        caplog.set_level("WARNING", logger="modelaudit.progress")
+        reporter = MockReporter(update_interval=0)
         tracker = ProgressTracker(reporters=[reporter], update_interval=0)
-        # Should not raise
-        tracker.force_update()
+        with patch.object(reporter, reporter_method, side_effect=RuntimeError(message)) as failing_method:
+            getattr(tracker, tracker_method)(*args)
+        failing_method.assert_called_once()
+        assert message in caplog.text
 
-    def test_phase_change_exception_handling(self):
-        """Test that phase change exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_phase_change(self, old, new):
-                raise RuntimeError("Phase change failed")
-
-        reporter = FailingReporter()
-        tracker = ProgressTracker(reporters=[reporter])
-        # Should not raise
-        tracker.set_phase(ProgressPhase.ANALYZING)
-
-    def test_completion_exception_handling(self):
-        """Test that completion exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_completion(self, stats):
-                raise RuntimeError("Completion failed")
-
-        reporter = FailingReporter()
-        tracker = ProgressTracker(reporters=[reporter])
-        # Should not raise
-        tracker.complete()
-
-    def test_error_reporting_exception_handling(self):
-        """Test that error reporting exceptions don't crash tracker."""
-
-        class FailingReporter(MockReporter):
-            def report_error(self, error, stats):
-                raise RuntimeError("Error reporting failed")
-
-        reporter = FailingReporter()
-        tracker = ProgressTracker(reporters=[reporter])
-        # Should not raise
-        tracker.report_error(ValueError("Original error"))
-
-    def test_callback_exception_handling(self):
+    def test_callback_exception_handling(self, caplog: pytest.LogCaptureFixture) -> None:
         """Test that callback exceptions don't crash tracker."""
-
-        def failing_callback(stats):
-            raise RuntimeError("Callback failed")
-
+        caplog.set_level("WARNING", logger="modelaudit.progress")
+        callback = MagicMock(side_effect=RuntimeError("Callback failed"))
         tracker = ProgressTracker(update_interval=0)
-        tracker.add_callback(failing_callback)
-        # Should not raise
+        tracker.add_callback(callback)
         tracker.force_update()
+        callback.assert_called_once_with(tracker.stats)
+        assert "Callback failed" in caplog.text

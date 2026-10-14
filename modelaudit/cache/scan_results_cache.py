@@ -1271,6 +1271,27 @@ class ScanResultsCache:
 
         raise ValueError(f"File kept changing while capturing cache identity: {file_path}") from last_change_error
 
+    @staticmethod
+    def _close_change_clock_probe(probe: BinaryIO) -> None:
+        """Close a probe, including a previously closed tempfile wrapper."""
+        close_failed = False
+        try:
+            probe.close()
+        except OSError:
+            close_failed = True
+
+        if not probe.closed and not close_failed:
+            underlying_probe = getattr(probe, "file", None)
+            wrapper_closer = getattr(probe, "_closer", None)
+            if (
+                underlying_probe is not None
+                and underlying_probe is not probe
+                and getattr(wrapper_closer, "file", None) is underlying_probe
+                and getattr(wrapper_closer, "close_called", False)
+            ):
+                with suppress(OSError):
+                    cast(BinaryIO, underlying_probe).close()
+
     def _get_change_clock_probe(
         self,
         file_path: str,
@@ -1300,24 +1321,7 @@ class ScanResultsCache:
                         raise ValueError(f"No writable cache identity probe directory for: {file_path}")
 
                     existing_probe = existing[0]
-                    close_failed = False
-                    try:
-                        existing_probe.close()
-                    except OSError:
-                        close_failed = True
-
-                    if not existing_probe.closed and not close_failed:
-                        underlying_probe = getattr(existing_probe, "file", None)
-                        wrapper_closer = getattr(existing_probe, "_closer", None)
-                        if (
-                            underlying_probe is not None
-                            and underlying_probe is not existing_probe
-                            and getattr(wrapper_closer, "file", None) is underlying_probe
-                            and getattr(wrapper_closer, "close_called", False)
-                        ):
-                            with suppress(OSError):
-                                cast(BinaryIO, underlying_probe).close()
-
+                    self._close_change_clock_probe(existing_probe)
                     if not existing_probe.closed:
                         raise ValueError(f"No writable cache identity probe directory for: {file_path}")
                     self._change_clock_probes.pop(file_device, None)
@@ -1335,12 +1339,7 @@ class ScanResultsCache:
                 candidates.extend(reversed(protected_root.parents))
             else:
                 candidates = [self.cache_dir, Path(tempfile.gettempdir())]
-                ancestor = scanned_parent
-                while True:
-                    candidates.append(ancestor)
-                    if ancestor.parent == ancestor:
-                        break
-                    ancestor = ancestor.parent
+                candidates.extend((scanned_parent, *scanned_parent.parents))
 
             checked: set[Path] = set()
             for candidate in candidates:
@@ -1917,6 +1916,17 @@ class ScanResultsCache:
         return (*identity, file_stat.st_ctime_ns)
 
     @staticmethod
+    def _read_fingerprint_bytes(file_descriptor: int, remaining: int) -> bytes:
+        chunks: list[bytes] = []
+        while remaining > 0:
+            chunk = os.read(file_descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
     def _bounded_source_fingerprint(path: Path) -> str | None:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
@@ -1937,15 +1947,7 @@ class ScanResultsCache:
                 )
             if not is_extension and before.st_size > max_bytes:
                 raise ValueError("source fingerprint budget exceeded")
-            chunks: list[bytes] = []
-            remaining = 0 if is_extension else max_bytes + 1
-            while remaining > 0:
-                chunk = os.read(file_descriptor, min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            source = b"".join(chunks)
+            source = ScanResultsCache._read_fingerprint_bytes(file_descriptor, 0 if is_extension else max_bytes + 1)
             after = os.fstat(file_descriptor)
             before_identity = _file_stat_identity(before)
             after_identity = _file_stat_identity(after)
@@ -2002,15 +2004,7 @@ class ScanResultsCache:
             before = os.fstat(file_descriptor)
             if not stat.S_ISREG(before.st_mode):
                 return None
-            chunks: list[bytes] = []
-            remaining = read_limit + int(require_complete)
-            while remaining > 0:
-                chunk = os.read(file_descriptor, min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            source = b"".join(chunks)
+            source = ScanResultsCache._read_fingerprint_bytes(file_descriptor, read_limit + int(require_complete))
             after = os.fstat(file_descriptor)
             before_identity = _file_stat_identity(before)
             after_identity = _file_stat_identity(after)
@@ -2404,24 +2398,7 @@ class ScanResultsCache:
                     self._change_clock_probe_condition.wait()
 
                 for file_device, (probe, probe_directory) in tuple(self._change_clock_probes.items()):
-                    close_failed = False
-                    try:
-                        probe.close()
-                    except OSError:
-                        close_failed = True
-
-                    if not probe.closed and not close_failed:
-                        underlying_probe = getattr(probe, "file", None)
-                        wrapper_closer = getattr(probe, "_closer", None)
-                        if (
-                            underlying_probe is not None
-                            and underlying_probe is not probe
-                            and getattr(wrapper_closer, "file", None) is underlying_probe
-                            and getattr(wrapper_closer, "close_called", False)
-                        ):
-                            with suppress(OSError):
-                                cast(BinaryIO, underlying_probe).close()
-
+                    self._close_change_clock_probe(probe)
                     if not probe.closed:
                         probe_name = getattr(probe, "name", None)
                         if isinstance(probe_name, str):

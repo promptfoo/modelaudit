@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -31,27 +32,28 @@ class TestDebugCommand:
         """Create a CLI runner."""
         return CliRunner()
 
-    def test_debug_command_success(self, runner):
+    @pytest.fixture
+    def parsed(self, runner: CliRunner) -> dict[str, Any]:
+        """Invoke JSON diagnostics anew for each requesting test."""
+        result = runner.invoke(cli, ["debug", "--json"])
+        assert result.exit_code == 0
+        parsed: dict[str, Any] = json.loads(result.output)
+        return parsed
+
+    def test_debug_command_success(self, runner: CliRunner) -> None:
         """Debug command should always succeed."""
         result = runner.invoke(cli, ["debug"])
         assert result.exit_code == 0
         assert "version" in result.output
 
-    def test_debug_json_output_is_valid_json(self, runner):
+    def test_debug_json_output_is_valid_json(self, parsed: dict[str, Any]) -> None:
         """JSON output should be valid and parseable."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        assert result.exit_code == 0
 
         # Should be valid JSON
-        parsed = json.loads(result.output)
         assert isinstance(parsed, dict)
 
-    def test_debug_json_output_has_required_fields(self, runner):
+    def test_debug_json_output_has_required_fields(self, parsed: dict[str, Any]) -> None:
         """JSON output should have all required fields."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        assert result.exit_code == 0
-
-        parsed = json.loads(result.output)
 
         # Check all required top-level fields
         assert "version" in parsed
@@ -64,10 +66,8 @@ class TestDebugCommand:
         assert "cache" in parsed
         assert "config" in parsed
 
-    def test_debug_platform_info_structure(self, runner: CliRunner) -> None:
+    def test_debug_platform_info_structure(self, parsed: dict[str, Any]) -> None:
         """Platform info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         platform_info = parsed["platform"]
         assert "os" in platform_info
@@ -79,19 +79,15 @@ class TestDebugCommand:
         assert isinstance(platform_info["pythonRecursionLimit"], int)
         assert platform_info["pythonRecursionLimit"] > 0
 
-    def test_debug_install_info_structure(self, runner):
+    def test_debug_install_info_structure(self, parsed: dict[str, Any]) -> None:
         """Install info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         install_info = parsed["install"]
         # editable should always be present
         assert "editable" in install_info
 
-    def test_debug_env_info_structure(self, runner):
+    def test_debug_env_info_structure(self, parsed: dict[str, Any]) -> None:
         """Environment info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         env_info = parsed["env"]
         assert "telemetryDisabled" in env_info
@@ -100,10 +96,8 @@ class TestDebugCommand:
         assert "jfrogConfigured" in env_info
         assert "mlflowConfigured" in env_info
 
-    def test_debug_scanner_info_structure(self, runner):
+    def test_debug_scanner_info_structure(self, parsed: dict[str, Any]) -> None:
         """Scanner info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         scanner_info = parsed["scanners"]
         assert "total" in scanner_info
@@ -116,10 +110,8 @@ class TestDebugCommand:
         # Available should be <= total
         assert scanner_info["available"] <= scanner_info["total"]
 
-    def test_debug_scanner_has_available_list(self, runner):
+    def test_debug_scanner_has_available_list(self, parsed: dict[str, Any]) -> None:
         """Scanner info should include list of available scanners."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         scanner_info = parsed["scanners"]
         assert "availableList" in scanner_info
@@ -127,10 +119,8 @@ class TestDebugCommand:
         # Should have at least some scanners
         assert len(scanner_info["availableList"]) > 0
 
-    def test_debug_cache_info_structure(self, runner):
+    def test_debug_cache_info_structure(self, parsed: dict[str, Any]) -> None:
         """Cache info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         cache_info = parsed["cache"]
         # Should have either enabled=True with stats, or enabled=False with error
@@ -141,10 +131,8 @@ class TestDebugCommand:
         else:
             assert "error" in cache_info
 
-    def test_debug_config_info_structure(self, runner):
+    def test_debug_config_info_structure(self, parsed: dict[str, Any]) -> None:
         """Config info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         config_info = parsed["config"]
         # Should have both shared and modelaudit config paths
@@ -154,7 +142,7 @@ class TestDebugCommand:
             assert "modelauditConfigPath" in config_info
             assert "modelauditConfigExists" in config_info
 
-    def test_debug_never_exposes_api_keys(self, runner):
+    def test_debug_never_exposes_api_keys(self, runner: CliRunner) -> None:
         """Ensure no API keys or tokens appear in output."""
         # Set a fake API key in environment
         with patch.dict(os.environ, {"MODELAUDIT_API_KEY": "secret-test-key-12345"}):
@@ -170,7 +158,7 @@ class TestDebugCommand:
         assert '"token"' not in output_lower
         assert '"secret"' not in output_lower
 
-    def test_debug_verbose_includes_more_details(self, runner):
+    def test_debug_verbose_includes_more_details(self, runner: CliRunner) -> None:
         """Verbose mode should include additional details when there are scanner failures."""
         result = runner.invoke(cli, ["debug", "--verbose", "--json"])
         assert result.exit_code == 0
@@ -183,7 +171,7 @@ class TestDebugCommand:
             assert "failedList" in scanner_info
             assert "failedDetails" in scanner_info
 
-    def test_debug_pretty_output_has_quick_diagnosis(self, runner):
+    def test_debug_pretty_output_has_quick_diagnosis(self, runner: CliRunner) -> None:
         """Pretty output should include quick diagnosis section."""
         result = runner.invoke(cli, ["debug"])
         assert result.exit_code == 0
@@ -207,74 +195,57 @@ class TestDebugCommand:
         assert "Inspect this output and remove sensitive values before sharing" in result.output
         assert "https://github.com/promptfoo/modelaudit/issues" in result.output
 
-    def test_debug_handles_missing_cache_gracefully(self, runner):
+    def test_debug_handles_missing_cache_gracefully(self, parsed: dict[str, Any]) -> None:
         """Debug should handle cache errors gracefully."""
         # Even if cache has issues, debug should not fail
-        result = runner.invoke(cli, ["debug", "--json"])
-        assert result.exit_code == 0
 
-        parsed = json.loads(result.output)
         # Cache section should exist and have either enabled or error
         assert "cache" in parsed
         cache_info = parsed["cache"]
         assert "enabled" in cache_info or "error" in cache_info
 
-    def test_debug_env_detection_ci(self, runner):
-        """Debug should detect CI environment."""
-        with patch.dict(os.environ, {"CI": "true"}):
+    @pytest.mark.parametrize(
+        ("name", "value", "field"),
+        [
+            # Debug should detect CI environment.
+            pytest.param("CI", "true", "ciEnvironment", id="ci"),
+            # Debug should detect NO_COLOR environment variable.
+            pytest.param("NO_COLOR", "1", "noColor", id="no_color"),
+            # Debug should detect JFrog configuration (presence only).
+            pytest.param("JFROG_API_TOKEN", "fake-token", "jfrogConfigured", id="jfrog"),
+            # Debug should detect MLflow configuration.
+            pytest.param("MLFLOW_TRACKING_URI", "http://localhost:5000", "mlflowConfigured", id="mlflow"),
+        ],
+    )
+    def test_debug_env_detection(self, runner: CliRunner, name: str, value: str, field: str) -> None:
+        """Configured environment flags should be JSON booleans."""
+        with patch.dict(os.environ, {name: value}):
             result = runner.invoke(cli, ["debug", "--json"])
 
         assert result.exit_code == 0
         parsed = json.loads(result.output)
-        assert parsed["env"]["ciEnvironment"] is True
+        assert parsed["env"][field] is True
+        if name == "JFROG_API_TOKEN":
+            # But should not expose the actual token
+            assert value not in result.output
 
-    def test_debug_env_detection_no_color(self, runner):
-        """Debug should detect NO_COLOR environment variable."""
-        with patch.dict(os.environ, {"NO_COLOR": "1"}):
-            result = runner.invoke(cli, ["debug", "--json"])
-
-        assert result.exit_code == 0
-        parsed = json.loads(result.output)
-        assert parsed["env"]["noColor"] is True
-
-    def test_debug_env_detection_jfrog(self, runner):
-        """Debug should detect JFrog configuration (presence only)."""
-        with patch.dict(os.environ, {"JFROG_API_TOKEN": "fake-token"}):
-            result = runner.invoke(cli, ["debug", "--json"])
-
-        assert result.exit_code == 0
-        parsed = json.loads(result.output)
-        assert parsed["env"]["jfrogConfigured"] is True
-        # But should not expose the actual token
-        assert "fake-token" not in result.output
-
-    def test_debug_env_detection_mlflow(self, runner):
-        """Debug should detect MLflow configuration."""
-        with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": "http://localhost:5000"}):
-            result = runner.invoke(cli, ["debug", "--json"])
-
-        assert result.exit_code == 0
-        parsed = json.loads(result.output)
-        assert parsed["env"]["mlflowConfigured"] is True
-
-    def test_debug_proxy_detection(self, runner):
+    @pytest.mark.parametrize(
+        "proxy",
+        [
+            # Proxy without credentials should be shown as-is.
+            pytest.param("http://proxy:8080", id="without_credentials"),
+            # Debug reports configured proxy URLs as provided.
+            pytest.param("http://user:secret@proxy:8080", id="preserves_credentials"),
+        ],
+    )
+    def test_debug_proxy_detection(self, runner: CliRunner, proxy: str) -> None:
         """Debug should detect proxy settings."""
-        with patch.dict(os.environ, {"HTTP_PROXY": "http://proxy:8080"}):
+        with patch.dict(os.environ, {"HTTP_PROXY": proxy}):
             result = runner.invoke(cli, ["debug", "--json"])
 
         assert result.exit_code == 0
         parsed = json.loads(result.output)
-        # Proxy without credentials should be shown as-is
-        assert parsed["env"]["httpProxy"] == "http://proxy:8080"
-
-    def test_debug_proxy_preserves_credentials(self, runner: CliRunner) -> None:
-        """Debug reports configured proxy URLs as provided."""
-        with patch.dict(os.environ, {"HTTP_PROXY": "http://user:secret@proxy:8080"}):
-            result = runner.invoke(cli, ["debug", "--json"])
-
-        assert result.exit_code == 0
-        parsed = json.loads(result.output)
-        assert parsed["env"]["httpProxy"] == "http://user:secret@proxy:8080"
+        assert parsed["env"]["httpProxy"] == proxy
 
     @pytest.mark.parametrize("outside_home", [False, True])
     def test_debug_paths_preserve_configured_paths(self, runner: CliRunner, tmp_path: Path, outside_home: bool) -> None:
@@ -300,7 +271,7 @@ class TestDebugCommand:
         assert config_info["modelauditConfigExists"] == (tmp_path / ".modelaudit" / "user_config.json").exists()
         assert parsed["cache"]["directory"] == str(cache_dir)
 
-    def test_debug_command_is_fast(self, runner):
+    def test_debug_command_is_fast(self, runner: CliRunner) -> None:
         """Debug command should complete quickly (under 10 seconds)."""
         import time
 
@@ -313,10 +284,8 @@ class TestDebugCommand:
         # (relaxed from 5s to account for CI variance)
         assert duration < 10.0, f"Debug command took {duration:.2f}s, expected < 10s"
 
-    def test_debug_auth_info_structure(self, runner):
+    def test_debug_auth_info_structure(self, parsed: dict[str, Any]) -> None:
         """Auth info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        parsed = json.loads(result.output)
 
         auth_info = parsed["auth"]
         assert "authenticated" in auth_info
@@ -334,12 +303,8 @@ class TestDebugCommand:
         assert "raw configuration values" in result.output
         assert "remove sensitive values" in " ".join(result.output.split())
 
-    def test_debug_dependencies_structure(self, runner):
+    def test_debug_dependencies_structure(self, parsed: dict[str, Any]) -> None:
         """Dependencies info should have expected structure."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        assert result.exit_code == 0
-
-        parsed = json.loads(result.output)
 
         # Dependencies section should exist
         assert "dependencies" in parsed
@@ -354,19 +319,16 @@ class TestDebugCommand:
         # Core dependencies should have at least click (always installed)
         assert "click" in deps["core"]
 
-    def test_debug_dependencies_has_numpy(self, runner):
+    def test_debug_dependencies_has_numpy(self, parsed: dict[str, Any]) -> None:
         """Dependencies should include numpy version (since it's a core dependency)."""
-        result = runner.invoke(cli, ["debug", "--json"])
-        assert result.exit_code == 0
 
-        parsed = json.loads(result.output)
         deps = parsed.get("dependencies", {})
         ml_frameworks = deps.get("mlFrameworks", {})
 
         # NumPy should be listed in ML frameworks
         assert "numpy" in ml_frameworks
 
-    def test_debug_pretty_output_shows_ml_frameworks(self, runner):
+    def test_debug_pretty_output_shows_ml_frameworks(self, runner: CliRunner) -> None:
         """Pretty output should show ML framework summary."""
         result = runner.invoke(cli, ["debug"])
         assert result.exit_code == 0

@@ -39,23 +39,26 @@ def _create_result_model(**kwargs: Any) -> ModelAuditResultModel:
     return ModelAuditResultModel(**defaults)
 
 
+def _create_issue(message: str, severity: IssueSeverity, location: str = "test.pkl", **kwargs: Any) -> Issue:
+    """Create deterministic issues with the defaults used by exit-code cases."""
+    defaults: dict[str, Any] = {"timestamp": 0.0, "why": None, "type": None}
+    defaults.update(kwargs)
+    return Issue(message=message, severity=severity, location=location, **defaults)
+
+
 def test_exit_code_clean_scan():
     """Test exit code 0 for clean scan with no issues."""
     results = _create_result_model()
     assert determine_exit_code(results) == 0
 
 
-def test_exit_code_clean_scan_with_debug_issues():
+def test_exit_code_clean_scan_with_debug_issues() -> None:
     """Test exit code 0 for scan with only debug issues."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="Debug info",
                 severity=IssueSeverity.DEBUG,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ]
     )
@@ -87,80 +90,61 @@ def test_exit_code_clean_scan_with_runtime_version_skip_check() -> None:
     assert determine_exit_code(results) == 0
 
 
-def test_exit_code_security_issues():
+def test_exit_code_security_issues() -> None:
     """Test exit code 1 for security issues found."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="Suspicious operation",
                 severity=IssueSeverity.WARNING,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ]
     )
     assert determine_exit_code(results) == 1
 
 
-def test_exit_code_security_errors():
+def test_exit_code_security_errors() -> None:
     """Test exit code 1 for security errors found."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="Malicious code detected",
                 severity=IssueSeverity.CRITICAL,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ]
     )
     assert determine_exit_code(results) == 1
 
 
-def test_exit_code_operational_errors():
+def test_exit_code_operational_errors() -> None:
     """Test exit code 2 for operational errors."""
     results = _create_result_model(
         success=False,
         has_errors=True,
         issues=[
-            Issue(
+            _create_issue(
                 message="Error during scan: File not found",
                 severity=IssueSeverity.CRITICAL,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
     assert determine_exit_code(results) == 2
 
 
-def test_exit_code_mixed_issues():
+def test_exit_code_mixed_issues() -> None:
     """Test that operational errors take precedence over security issues."""
     results = _create_result_model(
         success=False,
         has_errors=True,
         issues=[
-            Issue(
+            _create_issue(
                 message="Error during scan: Scanner crashed",
                 severity=IssueSeverity.CRITICAL,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
-            Issue(
+            _create_issue(
                 message="Also found suspicious code",
                 severity=IssueSeverity.WARNING,
                 location="test2.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
@@ -169,33 +153,21 @@ def test_exit_code_mixed_issues():
     assert determine_exit_code(results) == 2
 
 
-def test_exit_code_mixed_severity():
+def test_exit_code_mixed_severity() -> None:
     """Test with mixed severity levels (no operational errors)."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="Debug info",
                 severity=IssueSeverity.DEBUG,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
-            Issue(
+            _create_issue(
                 message="Info message",
                 severity=IssueSeverity.INFO,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
-            Issue(
+            _create_issue(
                 message="Warning about something",
                 severity=IssueSeverity.WARNING,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ]
     )
@@ -203,17 +175,13 @@ def test_exit_code_mixed_severity():
     assert determine_exit_code(results) == 1
 
 
-def test_exit_code_info_level_issues():
+def test_exit_code_info_level_issues() -> None:
     """Test exit code 0 for info level issues (INFO is not a security problem)."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="Information about model",
                 severity=IssueSeverity.INFO,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ]
     )
@@ -255,7 +223,7 @@ def test_exit_code_inconclusive_pickle_with_info_parse_failure_without_security_
         success=False,
         file_metadata={"model.pkl": {"scan_outcome": "inconclusive", "analysis_incomplete": True}},
         issues=[
-            Issue(
+            _create_issue(
                 message="Pickle parsing failed before full scan completion",
                 severity=IssueSeverity.INFO,
                 location="model.pkl",
@@ -264,9 +232,6 @@ def test_exit_code_inconclusive_pickle_with_info_parse_failure_without_security_
                     "failure_reason": "unknown_opcode_or_format_error",
                     "analysis_incomplete": True,
                 },
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
@@ -279,13 +244,10 @@ def test_exit_code_inconclusive_pickle_with_security_findings() -> None:
         success=False,
         file_metadata={"model.pkl": {"scan_outcome": "inconclusive"}},
         issues=[
-            Issue(
+            _create_issue(
                 message="Suspicious import found beyond opcode budget",
                 severity=IssueSeverity.WARNING,
                 location="model.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
@@ -314,7 +276,7 @@ def test_exit_code_issue_details_incomplete_without_security_findings() -> None:
     """Issue-only incomplete coverage evidence should fail closed."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="DVC output limit exceeded - not all declared outputs were scanned",
                 severity=IssueSeverity.INFO,
                 location="model.dvc",
@@ -323,8 +285,6 @@ def test_exit_code_issue_details_incomplete_without_security_findings() -> None:
                     "scan_outcome": "inconclusive",
                     "reason": "dvc_output_limit_exceeded",
                 },
-                timestamp=0.0,
-                why=None,
                 type="dvc_output_limit_exceeded",
             ),
         ],
@@ -378,13 +338,11 @@ def test_exit_code_issue_with_skipped_status_still_treats_bare_analysis_incomple
     """Only skipped checks get the bare analysis_incomplete exemption; issues stay fail-closed."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="DVC output coverage incomplete",
                 severity=IssueSeverity.INFO,
                 location="model.dvc",
                 details={"analysis_incomplete": True},
-                timestamp=0.0,
-                why=None,
                 type="dvc_analysis_incomplete",
                 status="skipped",
             ),
@@ -442,22 +400,16 @@ def test_exit_code_bare_analysis_incomplete_preserves_security_exit() -> None:
     """Security findings still exit 1 when bare incomplete coverage evidence coexists."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="Embedded secret scan truncated",
                 severity=IssueSeverity.INFO,
                 location="model.bin",
                 details={"analysis_incomplete": True},
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
-            Issue(
+            _create_issue(
                 message="Dangerous pickle global",
                 severity=IssueSeverity.CRITICAL,
                 location="payload.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
@@ -524,22 +476,16 @@ def test_exit_code_issue_details_incomplete_with_security_findings() -> None:
     """Security findings still exit 1 while issue-only coverage remains visible."""
     results = _create_result_model(
         issues=[
-            Issue(
+            _create_issue(
                 message="DVC output resolution incomplete",
                 severity=IssueSeverity.INFO,
                 location="model.dvc",
                 details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
-            Issue(
+            _create_issue(
                 message="Dangerous pickle global",
                 severity=IssueSeverity.WARNING,
                 location="payload.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
@@ -583,36 +529,30 @@ def test_exit_code_dry_run_operational_error_still_errors() -> None:
     assert determine_exit_code(results) == 2
 
 
-def test_exit_code_no_files_scanned_with_issues():
+def test_exit_code_no_files_scanned_with_issues() -> None:
     """Security findings should still return exit code 1 even with zero scanned files."""
     results = _create_result_model(
         files_scanned=0,
         issues=[
-            Issue(
+            _create_issue(
                 message="Path traversal outside scanned directory",
                 severity=IssueSeverity.CRITICAL,
                 location="link.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
     assert determine_exit_code(results) == 1
 
 
-def test_exit_code_no_files_scanned_with_info_only_issues():
+def test_exit_code_no_files_scanned_with_info_only_issues() -> None:
     """Benign zero-file scans should keep exit code 2 when only informational issues exist."""
     results = _create_result_model(
         files_scanned=0,
         issues=[
-            Issue(
+            _create_issue(
                 message="No supported model files found",
                 severity=IssueSeverity.INFO,
                 location="",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )
@@ -625,18 +565,14 @@ def test_exit_code_files_scanned_clean():
     assert determine_exit_code(results) == 0
 
 
-def test_exit_code_files_scanned_with_issues():
+def test_exit_code_files_scanned_with_issues() -> None:
     """Test exit code 1 when files are scanned with issues."""
     results = _create_result_model(
         files_scanned=5,
         issues=[
-            Issue(
+            _create_issue(
                 message="Security issue",
                 severity=IssueSeverity.WARNING,
-                location="test.pkl",
-                timestamp=0.0,
-                why=None,
-                type=None,
             ),
         ],
     )

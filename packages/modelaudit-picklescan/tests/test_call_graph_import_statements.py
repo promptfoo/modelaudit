@@ -9830,3 +9830,135 @@ def _assert_rewritten_call_graph(
     assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", sink)
     assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", sink)
+
+
+_CLICK_LAZY_FILE_COMPATIBILITY_HOOK = """def __getattr__(name: str) -> object:
+    import warnings
+    if name in {
+        "LazyFile", "KeepOpenFile", "make_default_short_help", "PacifyFlushWrapper",
+        "safecall", "get_text_stream", "get_binary_stream",
+    }:
+        warnings.warn(
+            f"'click.utils.{name}' is deprecated and will be removed in Click 9.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return globals()[f"_{name}"]
+    raise AttributeError(name)
+"""
+
+
+def _click_compatibility_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str) -> Path:
+    source_path = tmp_path / "click_utils_source.py"
+    source_path.write_text(source, encoding="utf-8")
+    original_resolver = call_graph._resolve_module_source
+    monkeypatch.setattr(
+        call_graph,
+        "_resolve_module_source",
+        lambda module_name: source_path if module_name == "click.utils" else original_resolver(module_name),
+    )
+    _clear_call_graph_caches()
+    return source_path
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_click_lazy_file_compatibility_export_follows_source_constructor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool
+) -> None:
+    source_path = _click_compatibility_source(
+        tmp_path,
+        monkeypatch,
+        "from __future__ import annotations\nimport os\n"
+        "class _LazyFile:\n    def __init__(self):\n"
+        + ("        os.system('not-executed')\n" if dangerous else "        pass\n")
+        + _CLICK_LAZY_FILE_COMPATIBILITY_HOOK,
+    )
+    report = scan_bytes(_global_call_payload("click.utils", "LazyFile"), source="click-compatibility.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == (SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS)
+    assert report.errors == ()
+    if not dangerous:
+        assert [finding.rule_code for finding in report.findings] == ["NON_ALLOWLISTED_GLOBAL"]
+    paths = [finding.details.get("call_path") for finding in report.findings if finding.severity == Severity.CRITICAL]
+    assert (("click.utils._LazyFile.__init__", "os.system") in paths) is dangerous
+    assert not any(str(source_path) == getattr(module, "__file__", None) for module in tuple(sys.modules.values()))
+
+
+@pytest.mark.parametrize("opcode, constructor", [("REDUCE", True), ("NEWOBJ", False)])
+def test_click_lazy_file_compatibility_keeps_getter_and_opcode_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opcode: str, constructor: bool
+) -> None:
+    _click_compatibility_source(
+        tmp_path,
+        monkeypatch,
+        "from __future__ import annotations\nclass _LazyFile:\n    def __init__(self):\n        pass\n"
+        + _CLICK_LAZY_FILE_COMPATIBILITY_HOOK,
+    )
+    entrypoints = call_graph._call_graph_entrypoints_for_reference(
+        "click.utils", "LazyFile", {"opcode": opcode, "positional_arg_count": 0}
+    )
+
+    assert "click.utils.__getattr__" in entrypoints
+    assert ("click.utils._LazyFile.__init__" in entrypoints) is constructor
+    assert "warnings.warn" in (call_graph._calls_for_function("click.utils.__getattr__") or ())
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "altered-return",
+        "rebound-globals",
+        "rebound-target",
+        "initialization-call",
+        "member-store",
+        "class-base",
+        "custom-allocator",
+        "async-initializer",
+        "generator-initializer",
+        "late-typing-import",
+        "unscoped-paramspec",
+        "wildcard-import",
+        "implicit-binder",
+        "eager-default",
+    ],
+)
+def test_click_lazy_file_compatibility_declines_changed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    source = (
+        "from __future__ import annotations\nclass _LazyFile:\n    def __init__(self):\n        pass\n"
+        + _CLICK_LAZY_FILE_COMPATIBILITY_HOOK
+    )
+    additions = {
+        "rebound-globals": "globals = lambda: {}\n",
+        "rebound-target": "_LazyFile = replacement\n",
+        "initialization-call": "mutate()\n",
+        "member-store": "_LazyFile.__init__ = replacement\n",
+        "wildcard-import": "from dependency import *\n",
+        "implicit-binder": "for globals in ():\n    pass\n",
+        "eager-default": "def helper(value=mutate()):\n    pass\n",
+        "late-typing-import": 'R = t.TypeVar("R")\nimport typing as t\n',
+        "unscoped-paramspec": (
+            "import typing as t\nif t.TYPE_CHECKING:\n    import typing_extensions as te\n"
+            '    P = te.ParamSpec("P")\nP = te.ParamSpec("P")\n'
+        ),
+    }
+    if change == "altered-return":
+        source = source.replace('globals()[f"_{name}"]', "globals()[name]")
+    elif change == "class-base":
+        source = source.replace("class _LazyFile:", "class _LazyFile(object):")
+    elif change == "async-initializer":
+        source = source.replace("def __init__(self):", "async def __init__(self):")
+    elif change == "generator-initializer":
+        source = source.replace("def __init__(self):\n        pass", "def __init__(self):\n        yield None")
+    elif change == "custom-allocator":
+        source = source.replace("class _LazyFile:", "class _LazyFile:\n    def __new__(cls):\n        return None")
+    else:
+        source += additions[change]
+    _click_compatibility_source(tmp_path, monkeypatch, source)
+
+    assert call_graph._click_lazy_file_compatibility_target() is None
+    assert call_graph._call_graph_entrypoints_for_reference(
+        "click.utils", "LazyFile", {"opcode": "REDUCE", "positional_arg_count": 0}
+    ) == ("click.utils.__getattr__",)

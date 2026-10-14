@@ -58,9 +58,7 @@ _HASH_FIELD_NAMES: Final[frozenset[str]] = frozenset({"md5", "sha1", "sha256", "
 def _deep_mutable_copy(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {key: _deep_mutable_copy(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_deep_mutable_copy(item) for item in value]
-    if isinstance(value, set | frozenset):
+    if isinstance(value, list | tuple | set | frozenset):
         return [_deep_mutable_copy(item) for item in value]
     return deepcopy(value)
 
@@ -226,8 +224,6 @@ def _merge_call_graph_source_fingerprints_metadata(
         )
         merged["search_context"] = existing_search_context
         merged["resolution_context"] = _deep_mutable_copy(existing_resolution_context)
-    if mapping_conflict:
-        merged["reusable"] = False
 
     return merged
 

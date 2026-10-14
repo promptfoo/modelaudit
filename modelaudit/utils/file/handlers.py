@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -445,19 +446,8 @@ def _summarize_missing_shard_indices(
     if missing_count == 0:
         return [], 0, False
 
-    missing_indices: list[int] = []
-    next_candidate = 1
-    for present_index in sorted(bounded_present_indices):
-        while next_candidate < present_index and len(missing_indices) < MAX_RECORDED_MISSING_SHARD_INDICES:
-            missing_indices.append(next_candidate)
-            next_candidate += 1
-        if len(missing_indices) >= MAX_RECORDED_MISSING_SHARD_INDICES:
-            break
-        next_candidate = present_index + 1
-
-    while next_candidate <= expected_total and len(missing_indices) < MAX_RECORDED_MISSING_SHARD_INDICES:
-        missing_indices.append(next_candidate)
-        next_candidate += 1
+    missing_candidates = (index for index in range(1, expected_total + 1) if index not in bounded_present_indices)
+    missing_indices = list(islice(missing_candidates, MAX_RECORDED_MISSING_SHARD_INDICES))
 
     return missing_indices, missing_count, missing_count > len(missing_indices)
 
@@ -1859,6 +1849,17 @@ def scan_advanced_large_file(
     Returns:
         ScanResult with findings
     """
+
+    def direct_scan(fpath: str) -> "ScanResult":
+        return _scan_advanced_large_file_internal(
+            fpath,
+            scanner,
+            progress_callback,
+            timeout,
+            allowed_shard_paths=allowed_shard_paths,
+            allowed_shard_targets=allowed_shard_targets,
+        )
+
     # Check if caching is enabled in scanner config
     config = getattr(scanner, "config", {})
     cache_enabled = config.get("cache_enabled", True)
@@ -1886,45 +1887,17 @@ def scan_advanced_large_file(
         return scanner.scan(file_path)  # type: ignore[no-any-return]
     if shard_info is not None and not _supports_reliable_shard_cache_identity():
         logger.debug(f"Bypassing advanced-file cache for unreliable shard identities: {file_path}")
-        return _scan_advanced_large_file_internal(
-            file_path,
-            scanner,
-            progress_callback,
-            timeout,
-            allowed_shard_paths=allowed_shard_paths,
-            allowed_shard_targets=allowed_shard_targets,
-        )
+        return direct_scan(file_path)
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
-        return _scan_advanced_large_file_internal(
-            file_path,
-            scanner,
-            progress_callback,
-            timeout,
-            allowed_shard_paths=allowed_shard_paths,
-            allowed_shard_targets=allowed_shard_targets,
-        )
+        return direct_scan(file_path)
     if should_bypass_cache_for_zip_entry_preflight(file_path, config):
         logger.debug(f"Bypassing advanced-file cache for bounded ZIP entry preflight: {file_path}")
-        return _scan_advanced_large_file_internal(
-            file_path,
-            scanner,
-            progress_callback,
-            timeout,
-            allowed_shard_paths=allowed_shard_paths,
-            allowed_shard_targets=allowed_shard_targets,
-        )
+        return direct_scan(file_path)
     if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
         logger.debug(f"Bypassing advanced-file cache because HDF5 analysis is unavailable: {file_path}")
-        return _scan_advanced_large_file_internal(
-            file_path,
-            scanner,
-            progress_callback,
-            timeout,
-            allowed_shard_paths=allowed_shard_paths,
-            allowed_shard_targets=allowed_shard_targets,
-        )
+        return direct_scan(file_path)
 
     # Use cache manager for advanced large file scans
     try:
@@ -1945,14 +1918,7 @@ def scan_advanced_large_file(
             )
             if not shard_family_cacheable:
                 logger.debug("Bypassing advanced-file cache for uncacheable shard family identity: %s", file_path)
-                return _scan_advanced_large_file_internal(
-                    file_path,
-                    scanner,
-                    progress_callback,
-                    timeout,
-                    allowed_shard_paths=allowed_shard_paths,
-                    allowed_shard_targets=allowed_shard_targets,
-                )
+                return direct_scan(file_path)
             if shard_family_fingerprint is not None:
                 version_config["advanced_shard_family_cache_fingerprint"] = shard_family_fingerprint
             model_config_fingerprint, model_config_cacheable = _build_advanced_shard_model_config_cache_fingerprint(
@@ -1960,14 +1926,7 @@ def scan_advanced_large_file(
             )
             if not model_config_cacheable:
                 logger.debug("Bypassing advanced-file cache for uncacheable shard model config: %s", file_path)
-                return _scan_advanced_large_file_internal(
-                    file_path,
-                    scanner,
-                    progress_callback,
-                    timeout,
-                    allowed_shard_paths=allowed_shard_paths,
-                    allowed_shard_targets=allowed_shard_targets,
-                )
+                return direct_scan(file_path)
             version_config["advanced_shard_model_config_cache_fingerprint"] = model_config_fingerprint
         if allowed_shard_paths is not None:
             # The allowlist changes shard expansion, so direct advanced scans need distinct cache keys.
@@ -1980,14 +1939,7 @@ def scan_advanced_large_file(
 
         # Create wrapper function for cache manager
         def cached_advanced_scan_wrapper(fpath: str) -> dict:
-            result = _scan_advanced_large_file_internal(
-                fpath,
-                scanner,
-                progress_callback,
-                timeout,
-                allowed_shard_paths=allowed_shard_paths,
-                allowed_shard_targets=allowed_shard_targets,
-            )
+            result = direct_scan(fpath)
             current_shard_info = ShardedModelDetector.detect_shards(
                 file_path,
                 allowed_paths=allowed_shard_paths,
@@ -2055,14 +2007,7 @@ def scan_advanced_large_file(
     except Exception as e:
         # If cache system fails, fall back to direct scanning
         logger.warning(f"Advanced file cache error for {file_path}: {e}. Falling back to direct scan.")
-        return _scan_advanced_large_file_internal(
-            file_path,
-            scanner,
-            progress_callback,
-            timeout,
-            allowed_shard_paths=allowed_shard_paths,
-            allowed_shard_targets=allowed_shard_targets,
-        )
+        return direct_scan(file_path)
 
 
 def _scan_advanced_large_file_internal(

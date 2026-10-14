@@ -40,7 +40,6 @@ struct PostBudgetRecordSink<'a> {
 
 pub(crate) fn post_budget_global_matches(
     tail: &[u8],
-    tail_prefix_len: usize,
     initial_stack: &[StackValue],
     initial_memo_len: usize,
     resolve_memo_value: impl Fn(i64) -> Option<StackValue>,
@@ -50,17 +49,12 @@ pub(crate) fn post_budget_global_matches(
 
     record_post_budget_opcode_stream(
         tail,
-        tail_prefix_len,
         initial_stack,
         initial_memo_len,
         &resolve_memo_value,
         &mut seen,
         &mut matches,
     );
-
-    if tail_prefix_len > 0 {
-        record_post_budget_module_name_pair(tail, 0, 0, &mut seen, &mut matches);
-    }
 
     let mut index = 0;
     while index < tail.len() {
@@ -78,19 +72,6 @@ pub(crate) fn post_budget_global_matches(
     }
 
     matches
-}
-
-pub(crate) fn post_budget_absolute_position(
-    stream_offset: usize,
-    read_offset: usize,
-    tail_prefix_len: usize,
-    tail_offset: usize,
-) -> usize {
-    if tail_offset < tail_prefix_len {
-        stream_offset.saturating_add(tail_offset)
-    } else {
-        read_offset.saturating_add(tail_offset - tail_prefix_len)
-    }
 }
 
 fn record_post_budget_module_name_pair(
@@ -134,7 +115,6 @@ fn record_post_budget_module_name_pair(
 
 fn record_post_budget_opcode_stream(
     tail: &[u8],
-    start_index: usize,
     initial_stack: &[StackValue],
     initial_memo_len: usize,
     resolve_memo_value: &impl Fn(i64) -> Option<StackValue>,
@@ -145,7 +125,7 @@ fn record_post_budget_opcode_stream(
     let mut memo_overlay: HashMap<i64, StackValue> = HashMap::new();
     let initial_memo_len = i64::try_from(initial_memo_len).unwrap_or(i64::MAX);
     let mut memo_len = initial_memo_len;
-    let mut index = start_index.min(tail.len());
+    let mut index = 0;
     let mut sink = PostBudgetRecordSink { seen, matches };
 
     while index < tail.len() {
@@ -276,8 +256,12 @@ fn handle_post_budget_opcode(
                 stack.push(value);
             }
         }
-        "GLOBAL" => {
-            let (module, name) = opcode.arg.global_parts(tail);
+        "GLOBAL" | "INST" => {
+            let is_inst = opcode.name == "INST";
+            if is_inst {
+                pop_to_mark(stack);
+            }
+            let (module, name) = opcode.arg.global_parts();
             let reference = GlobalRef {
                 module,
                 name,
@@ -286,8 +270,12 @@ fn handle_post_budget_opcode(
                 memo_index: None,
                 memo_read: false,
             };
-            stack.push(StackValue::Global(reference.clone()));
-            record_post_budget_global_ref(&reference, false, opcode.next, tail, sink);
+            stack.push(if is_inst {
+                StackValue::Constructed(reference.clone())
+            } else {
+                StackValue::Global(reference.clone())
+            });
+            record_post_budget_global_ref(&reference, is_inst, opcode.next, tail, sink);
         }
         "STACK_GLOBAL" => {
             let name_value = stack.pop();
@@ -310,7 +298,7 @@ fn handle_post_budget_opcode(
             stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, false, opcode.next, tail, sink);
         }
-        "REDUCE" | "NEWOBJ" => {
+        "REDUCE" | "NEWOBJ" | "BUILD" => {
             let callable_value = consume_top_operands(stack, 2);
             record_post_budget_callable_value(callable_value, opcode.next, tail, sink);
         }
@@ -322,24 +310,6 @@ fn handle_post_budget_opcode(
             let values = pop_to_mark(stack);
             let callable_value = values.into_iter().next();
             push_constructed_result(stack, callable_value.as_ref());
-            record_post_budget_callable_value(callable_value, opcode.next, tail, sink);
-        }
-        "INST" => {
-            pop_to_mark(stack);
-            let (module, name) = opcode.arg.global_parts(tail);
-            let reference = GlobalRef {
-                module,
-                name,
-                position: opcode.pos,
-                malformed: false,
-                memo_index: None,
-                memo_read: false,
-            };
-            stack.push(StackValue::Constructed(reference.clone()));
-            record_post_budget_global_ref(&reference, true, opcode.next, tail, sink);
-        }
-        "BUILD" => {
-            let callable_value = consume_top_operands(stack, 2);
             record_post_budget_callable_value(callable_value, opcode.next, tail, sink);
         }
         _ => {}
@@ -367,23 +337,14 @@ fn resolve_post_budget_stack_global(
 ) -> GlobalRef {
     let module = resolve_global_operand(module_value.as_ref(), tail);
     let name = resolve_global_operand(name_value.as_ref(), tail);
-    match (module, name) {
-        (Some(module), Some(name)) => GlobalRef {
-            module,
-            name,
-            position,
-            malformed: false,
-            memo_index: None,
-            memo_read: false,
-        },
-        (module, name) => GlobalRef {
-            module: module.unwrap_or_else(|| "__unknown__".to_string()),
-            name: name.unwrap_or_else(|| "__unknown__".to_string()),
-            position,
-            malformed: true,
-            memo_index: None,
-            memo_read: false,
-        },
+    let malformed = module.is_none() || name.is_none();
+    GlobalRef {
+        module: module.unwrap_or_else(|| "__unknown__".to_string()),
+        name: name.unwrap_or_else(|| "__unknown__".to_string()),
+        position,
+        malformed,
+        memo_index: None,
+        memo_read: false,
     }
 }
 
@@ -397,9 +358,6 @@ fn record_post_budget_callable_value(
     else {
         return;
     };
-    if reference.malformed && reference.module != "copyreg.extension" {
-        return;
-    }
     record_post_budget_global_ref(&reference, true, proximity_start, tail, sink);
 }
 
@@ -466,13 +424,7 @@ fn collapse_top_n(stack: &mut Vec<StackValue>, count: usize) {
         stack.push(StackValue::Other);
         return;
     }
-    let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        if let Some(value) = stack.pop() {
-            values.push(value);
-        }
-    }
-    values.reverse();
+    let values = stack.split_off(start);
     stack.push(collapse_tuple_values(values));
 }
 
@@ -481,14 +433,7 @@ fn consume_top_operands(stack: &mut Vec<StackValue>, operand_count: usize) -> Op
         stack.push(StackValue::Other);
         return None;
     }
-    let mut values = Vec::with_capacity(operand_count);
-    for _ in 0..operand_count {
-        if let Some(value) = stack.pop() {
-            values.push(value);
-        }
-    }
-    values.reverse();
-    let callable_value = values.into_iter().next();
+    let callable_value = stack.drain(stack.len() - operand_count..).next();
     push_constructed_result(stack, callable_value.as_ref());
     callable_value
 }
@@ -578,7 +523,6 @@ fn record_post_budget_global_with_severity(
                     && existing.name == candidate.name
             }) {
                 existing.reduce_proximate = true;
-                existing.severity = stronger_severity(existing.severity, candidate.severity);
             }
         }
         return;
@@ -590,23 +534,6 @@ fn record_post_budget_global_with_severity(
         reduce_proximate,
         severity: candidate.severity,
     });
-}
-
-fn stronger_severity(left: &'static str, right: &'static str) -> &'static str {
-    if severity_rank(right) > severity_rank(left) {
-        right
-    } else {
-        left
-    }
-}
-
-fn severity_rank(severity: &str) -> u8 {
-    match severity {
-        "critical" => 4,
-        "warning" => 3,
-        "info" => 2,
-        _ => 1,
-    }
 }
 
 fn post_budget_global_severity(module: &str, name: &str) -> Option<&'static str> {

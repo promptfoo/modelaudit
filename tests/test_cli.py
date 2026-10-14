@@ -13,7 +13,7 @@ import subprocess
 import sys
 import types
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import partial
@@ -22,7 +22,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from modelaudit import __version__
 from modelaudit import cli as cli_module
@@ -101,6 +101,25 @@ def _hf_streaming_plan(
     )
 
 
+@contextmanager
+def _mock_huggingface_acquisition() -> Iterator[Callable[[], None]]:
+    """Keep acquisition guards available after their patches have been restored."""
+    with (
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+    ):
+
+        def assert_no_acquisition() -> None:
+            mock_download_streaming.assert_not_called()
+            mock_scan_streaming.assert_not_called()
+            mock_download_model.assert_not_called()
+            mock_scan_local.assert_not_called()
+
+        yield assert_no_acquisition
+
+
 def _minimal_safetensors_bytes() -> bytes:
     header = {"weights": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
@@ -174,6 +193,13 @@ def test_track_huggingface_stream_acquisition_propagates_source_cleanup_failure(
 
     with pytest.raises(_HfStreamingStagingCleanupError, match="deterministic family cleanup failure"):
         tracked.close()
+
+
+def _invoke_scanner_catalog(output_path: Path) -> Result:
+    return CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
 
 
 def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
@@ -519,6 +545,12 @@ def test_scan_cli_tokenizer_json_late_chat_template_after_structure_budget_repor
     )
 
 
+def _run_cli_subprocess(args: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "modelaudit", *args], check=False, capture_output=True, text=True, env=env
+    )
+
+
 def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
     """Real process execution keeps JSON parseable without leaking finding payloads to logs."""
     import tarfile
@@ -529,12 +561,7 @@ def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: 
         payload_file.write_text("content")
         tar.add(payload_file, arcname="../evil.txt")
 
-    completed = subprocess.run(
-        [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "json"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_cli_subprocess(["scan", str(model_file), "--format", "json"])
 
     assert completed.returncode == 1
     assert completed.stdout.lstrip().startswith("{")
@@ -549,12 +576,7 @@ def test_scan_json_subprocess_single_skipped_file_keeps_stdout_parseable(tmp_pat
     skipped_file = tmp_path / "skip.py"
     skipped_file.write_text("print('hello')\n")
 
-    completed = subprocess.run(
-        [sys.executable, "-m", "modelaudit", "scan", str(skipped_file), "--format", "json"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_cli_subprocess(["scan", str(skipped_file), "--format", "json"])
 
     assert completed.returncode == 2
     assert "Skipping non-model file:" not in completed.stdout
@@ -581,13 +603,7 @@ def test_scan_json_subprocess_scans_tensorflow_metagraph_named_python(tmp_path: 
     payload.write_bytes(metagraph.SerializeToString())
 
     env = {**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"}
-    completed = subprocess.run(
-        [sys.executable, "-m", "modelaudit", "scan", str(payload), "--format", "json", "--no-cache"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    completed = _run_cli_subprocess(["scan", str(payload), "--format", "json", "--no-cache"], env=env)
 
     assert completed.returncode == 1
     output_payload = json.loads(completed.stdout)
@@ -605,12 +621,7 @@ def test_scan_json_subprocess_mixed_directory_keeps_stdout_parseable(tmp_path: P
     model_file = tmp_path / "safe.pkl"
     model_file.write_bytes(pickle.dumps({"ok": 1}))
 
-    completed = subprocess.run(
-        [sys.executable, "-m", "modelaudit", "scan", str(tmp_path), "--format", "json"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_cli_subprocess(["scan", str(tmp_path), "--format", "json"])
 
     assert completed.returncode == 0
     assert "Skipping non-model file:" not in completed.stdout
@@ -627,13 +638,7 @@ def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_pat
     skipped_file.write_text("print('hello')\n")
     env = {**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"}
 
-    completed = subprocess.run(
-        [sys.executable, "-m", "modelaudit", "scan", str(skipped_file), "--format", "sarif", "--no-cache"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    completed = _run_cli_subprocess(["scan", str(skipped_file), "--format", "sarif", "--no-cache"], env=env)
 
     assert completed.returncode == 2
     sarif_payload = json.loads(completed.stdout)
@@ -649,20 +654,8 @@ def test_scan_sarif_subprocess_preserves_modelaudit_rule_codes() -> None:
     model_file = Path("tests/assets/samples/pickles/malicious_system_call.pkl").resolve()
     env = {**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"}
 
-    json_completed = subprocess.run(
-        [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "json", "--no-cache"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    sarif_completed = subprocess.run(
-        [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "sarif", "--no-cache"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    json_completed = _run_cli_subprocess(["scan", str(model_file), "--format", "json", "--no-cache"], env=env)
+    sarif_completed = _run_cli_subprocess(["scan", str(model_file), "--format", "sarif", "--no-cache"], env=env)
 
     assert json_completed.returncode == 1
     assert sarif_completed.returncode == 1
@@ -1407,10 +1400,7 @@ def test_cli_report_writers_reject_symlinked_parent_directory(tmp_path: Path, re
     redirected_dir.symlink_to(outside_dir, target_is_directory=True)
     output_path = redirected_dir / "scanners.json"
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Refusing to write output through symlink" in result.output
@@ -1465,10 +1455,7 @@ def test_cli_report_writers_reject_symlink_before_dotdot(tmp_path: Path, require
     (safe_dir / "redirected").symlink_to(outside_child, target_is_directory=True)
     output_path = safe_dir / "redirected" / ".." / "victim.json"
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Refusing to write output through symlink" in result.output
@@ -1483,10 +1470,7 @@ def test_cli_report_writers_allow_dotdot_without_links(tmp_path: Path) -> None:
     child_dir.mkdir(parents=True)
     output_path = child_dir / ".." / "scanners.json"
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads((output_dir / "scanners.json").read_text())["scanners"]
@@ -1498,10 +1482,7 @@ def test_cli_report_writers_reject_dotdot_after_regular_file(tmp_path: Path) -> 
     regular_file.write_text("sentinel")
     output_path = regular_file / ".." / "scanners.json"
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     if os.name == "nt":
@@ -1514,10 +1495,7 @@ def test_cli_report_writers_reject_dotdot_after_missing_component(tmp_path: Path
     """Missing intermediate components must not disappear during Windows normalization."""
     output_path = tmp_path / "missing-directory" / ".." / "scanners.json"
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert not (tmp_path / "scanners.json").exists()
@@ -1652,10 +1630,7 @@ def test_cli_report_writers_fsync_published_parent(
 
     monkeypatch.setattr(cli_module.os, "fsync", record_fsync)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert stat.S_IFREG in synced_file_types
@@ -1705,10 +1680,7 @@ def test_cli_report_writers_allow_posix_colon_filename(tmp_path: Path) -> None:
     """The Windows stream guard must not reject a valid POSIX filename."""
     output_path = tmp_path / "scan:report.json"
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
@@ -1968,10 +1940,7 @@ def test_cli_report_writers_stage_new_output_in_private_directory(
         {inspect_staging_then_link if function is original_link else function for function in original_supports_dir_fd},
     )
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert observed_stage_modes
@@ -2017,10 +1986,7 @@ def test_cli_report_writers_do_not_replace_destination_created_during_install(
         },
     )
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Unable to write output" in result.output
@@ -2041,10 +2007,7 @@ def test_cli_report_writers_preserve_existing_xattrs(tmp_path: Path) -> None:
     except OSError as exc:
         pytest.skip(f"Extended attributes are unsupported: {exc}")
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert get_xattr(output_path, attribute_name) == b"keep"
@@ -2092,10 +2055,7 @@ def test_cli_report_writers_replace_hard_link_without_modifying_alias(tmp_path: 
     victim_path.write_text("sentinel")
     output_path.hardlink_to(victim_path)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
@@ -2113,10 +2073,7 @@ def test_cli_report_writers_reject_unpreservable_extended_acl(
     output_path.write_text("sentinel")
     monkeypatch.setattr(cli_module, "_posix_fd_has_extended_acl", lambda _path, _fd: True)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Unable to preserve extended output ACL" in result.output
@@ -2223,10 +2180,7 @@ def test_cli_report_writers_do_not_disclose_output_through_late_hard_link(
         },
     )
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
@@ -2321,10 +2275,7 @@ def test_cli_report_writers_recheck_parent_links_on_fallback(
     monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: lock_handle)
     monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Refusing to write output through symlink" in result.output
@@ -2364,10 +2315,7 @@ def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
     monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
     monkeypatch.setattr(cli_module, "_validated_absolute_output_path", install_hard_link_after_validation)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert victim_path.read_text() == "sentinel"
@@ -2421,10 +2369,7 @@ def test_cli_report_writers_keep_windows_parent_guard_through_replace(
 
         monkeypatch.setattr(cli_module.os, "replace", guarded_replace)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert closed_handles == ([lock_handle, guard_handle] if os.name == "nt" else [guard_handle])
@@ -2703,10 +2648,7 @@ def test_cli_report_writers_fail_closed_without_secure_parent_primitive(
     monkeypatch.setattr(cli_module.os, "name", "unsupported")
     monkeypatch.setattr(cli_module, "_validated_absolute_output_path", lambda _path: output_path)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Secure output writes are unsupported" in result.output
@@ -2745,10 +2687,7 @@ def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
 
     monkeypatch.setattr(cli_module, "_replace_windows_output_file", attempt_parent_swap)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
@@ -2760,10 +2699,7 @@ def test_cli_report_writers_windows_atomically_overwrite_existing_output(tmp_pat
     output_path = tmp_path / "scanners.json"
     output_path.write_text("stale")
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
@@ -2782,10 +2718,7 @@ def test_cli_report_writers_fail_closed_for_write_only_parent_without_search_ope
     monkeypatch.setattr(cli_module.os, "O_SEARCH", 0, raising=False)
     output_dir.chmod(0o333)
     try:
-        result = CliRunner().invoke(
-            cli,
-            ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-        )
+        result = _invoke_scanner_catalog(output_path)
     finally:
         output_dir.chmod(0o700)
 
@@ -2804,10 +2737,7 @@ def test_cli_report_writers_support_long_valid_output_name(
     monkeypatch.setattr(cli_module.os, "O_PATH", 0, raising=False)
     monkeypatch.setattr(cli_module.os, "O_SEARCH", 0, raising=False)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
@@ -2823,10 +2753,7 @@ def test_cli_report_writers_preserve_read_only_output(tmp_path: Path) -> None:
     output_path.write_text("sentinel")
     output_path.chmod(0o444)
     try:
-        result = CliRunner().invoke(
-            cli,
-            ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-        )
+        result = _invoke_scanner_catalog(output_path)
     finally:
         output_path.chmod(0o600)
 
@@ -2848,10 +2775,7 @@ def test_cli_report_writers_fail_closed_in_read_only_directory(tmp_path: Path) -
     output_path.chmod(0o600)
     output_dir.chmod(0o500)
     try:
-        result = CliRunner().invoke(
-            cli,
-            ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-        )
+        result = _invoke_scanner_catalog(output_path)
     finally:
         output_dir.chmod(0o700)
 
@@ -2865,10 +2789,7 @@ def test_cli_report_writers_reject_fifo_output_without_blocking(tmp_path: Path) 
     output_path = tmp_path / "report.fifo"
     os.mkfifo(output_path)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Unable to write output" in result.output or "non-regular file" in result.output
@@ -2950,10 +2871,7 @@ def test_cli_report_writers_atomically_overwrite_regular_file_and_preserve_mode(
     output_path.chmod(0o640)
     original_inode = output_path.stat().st_ino
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
-    )
+    result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
@@ -5115,7 +5033,12 @@ def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_streaming_success(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test streaming scan with --stream flag."""
     # Setup mocks
     mock_is_hf_url.return_value = True
@@ -5128,7 +5051,7 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         test_files.append(test_file)
 
     # Mock file generator
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         for i, f in enumerate(test_files):
             yield (f, i == len(test_files) - 1)
 
@@ -5179,10 +5102,7 @@ def test_scan_huggingface_streaming_dry_run_does_not_download_or_scan() -> None:
             "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
             return_value=_hf_streaming_plan(selected_sizes={"model.bin": 512}),
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
         patch("modelaudit.cli.record_download_started") as mock_download_started,
         patch("modelaudit.cli.record_download_completed") as mock_download_completed,
     ):
@@ -5217,10 +5137,7 @@ def test_scan_huggingface_streaming_dry_run_does_not_download_or_scan() -> None:
     assert "checks" not in preview
     assert "scanner_names" not in preview
     assert "file_metadata" not in preview
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
     mock_download_started.assert_not_called()
     mock_download_completed.assert_not_called()
 
@@ -5252,10 +5169,7 @@ def test_scan_huggingface_streaming_dry_run_multiple_paths_emits_single_json_pay
                 _hf_streaming_plan("test/model-b", selected_files=["model-b.bin"]),
             ],
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5278,10 +5192,7 @@ def test_scan_huggingface_streaming_dry_run_multiple_paths_emits_single_json_pay
     assert all("bytes_scanned" not in preview for preview in payload["previews"])
     assert all("files_scanned" not in preview for preview in payload["previews"])
     assert all("issues" not in preview for preview in payload["previews"])
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_honors_output_file(tmp_path: Path) -> None:
@@ -5301,10 +5212,7 @@ def test_scan_huggingface_streaming_dry_run_honors_output_file(tmp_path: Path) -
             "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
             return_value=_hf_streaming_plan(),
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5331,10 +5239,7 @@ def test_scan_huggingface_streaming_dry_run_honors_output_file(tmp_path: Path) -
     assert "bytes_scanned" not in preview
     assert "files_scanned" not in preview
     assert "issues" not in preview
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_rejects_mixed_scan_inputs(tmp_path: Path) -> None:
@@ -5344,10 +5249,7 @@ def test_scan_huggingface_streaming_dry_run_rejects_mixed_scan_inputs(tmp_path: 
     with (
         patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
         patch("modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download") as mock_plan_streaming,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5368,10 +5270,7 @@ def test_scan_huggingface_streaming_dry_run_rejects_mixed_scan_inputs(tmp_path: 
     assert str(local_file) in result.output
     mock_get_model_info.assert_not_called()
     mock_plan_streaming.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_rejects_sarif_before_metadata() -> None:
@@ -5431,10 +5330,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successfu
                 _hf_streaming_plan("test/model-b", selected_files=["model-b.bin"]),
             ],
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5460,10 +5356,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successfu
     assert output_payload["dry_run"] is True
     assert [preview["model_id"] for preview in output_payload["previews"]] == ["test/model-a"]
     assert_huggingface_acquisition_error_payload(output_payload, "hf://test/model-b", blocked=False)
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successful_text_preview() -> None:
@@ -5488,10 +5381,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successfu
                 _hf_streaming_plan("test/model-b", selected_files=["model-b.bin"]),
             ],
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5511,10 +5401,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successfu
     assert "Preview for hf://test/model-a" in result.output
     assert "Error previewing model" in result.output
     assert "Hugging Face acquisition failed" in result.output
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_text_escapes_metadata() -> None:
@@ -5533,10 +5420,7 @@ def test_scan_huggingface_streaming_dry_run_text_escapes_metadata() -> None:
             "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
             return_value=_hf_streaming_plan("org/model"),
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5549,10 +5433,7 @@ def test_scan_huggingface_streaming_dry_run_text_escapes_metadata() -> None:
     assert "2\\x1b[2J" in result.output
     assert "Unknown size" in result.output
     assert "org/model\nFORGED\u202e" not in result.output
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_metadata_failure_fails_closed() -> None:
@@ -5567,10 +5448,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_fails_closed() -> N
             "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
             return_value=_hf_streaming_plan(),
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5584,10 +5462,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_fails_closed() -> N
     assert "\\nFORGED" in result.output
     assert "\nFORGED" not in result.output
     assert "Hugging Face acquisition failed" in result.output
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 @patch(
@@ -5602,10 +5477,7 @@ def test_scan_huggingface_streaming_dry_run_refuses_without_selected_scannable_f
     """Repository dry-run previews must fail when streaming planning selects no scannable files."""
     with (
         patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5630,10 +5502,7 @@ def test_scan_huggingface_streaming_dry_run_refuses_without_selected_scannable_f
     assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_detect_content.assert_not_called()
     mock_get_model_info.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_before_max_size() -> None:
@@ -5647,10 +5516,7 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_b
         patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect_content,
         patch("modelaudit.utils.sources.huggingface._get_huggingface_path_sizes") as mock_path_sizes,
         patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5679,10 +5545,7 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_b
     mock_detect_content.assert_not_called()
     mock_path_sizes.assert_not_called()
     mock_get_model_info.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_before_preview() -> None:
@@ -5708,10 +5571,7 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_
             side_effect=path_sizes_side_effect,
         ) as mock_path_sizes,
         patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5740,10 +5600,7 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_
     mock_detect_content.assert_not_called()
     mock_path_sizes.assert_not_called()
     mock_get_model_info.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 @patch(
@@ -5766,10 +5623,7 @@ def test_scan_huggingface_streaming_dry_run_allows_selected_scannable_files(
                 "file_count": 1,
             },
         ),
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5793,10 +5647,7 @@ def test_scan_huggingface_streaming_dry_run_allows_selected_scannable_files(
     assert preview["artifact_downloads"] == 0
     assert preview["scanner_execution"] is False
     mock_detect_content.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_streaming_dry_run_metadata_selection_ignores_unselected_sidecars() -> None:
@@ -5838,10 +5689,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_selection_ignores_unselecte
             "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
             side_effect=path_sizes_side_effect,
         ) as mock_path_sizes,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5873,10 +5721,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_selection_ignores_unselecte
     mock_list_repo_files.assert_called_once()
     mock_detect_content.assert_not_called()
     mock_path_sizes.assert_called_once()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 @patch(
@@ -5891,10 +5736,7 @@ def test_scan_huggingface_standard_dry_run_refuses_without_selected_scannable_fi
     """Standard repository dry-run previews must also fail when no selected file would download."""
     with (
         patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5916,10 +5758,7 @@ def test_scan_huggingface_standard_dry_run_refuses_without_selected_scannable_fi
     assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_detect_content.assert_not_called()
     mock_get_model_info.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 @patch(
@@ -5947,10 +5786,7 @@ def test_scan_huggingface_standard_dry_run_uses_standard_selection_not_streaming
             },
         ),
         patch("modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download") as mock_streaming_plan,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5973,10 +5809,7 @@ def test_scan_huggingface_standard_dry_run_uses_standard_selection_not_streaming
     assert preview["scanner_execution"] is False
     mock_detect_content.assert_not_called()
     mock_streaming_plan.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_standard_dry_run_refuses_unprobed_renamed_candidate_before_max_size() -> None:
@@ -5991,10 +5824,7 @@ def test_scan_huggingface_standard_dry_run_refuses_unprobed_renamed_candidate_be
         patch("modelaudit.utils.sources.huggingface._get_huggingface_path_sizes") as mock_path_sizes,
         patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
         patch("modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download") as mock_streaming_plan,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6021,10 +5851,7 @@ def test_scan_huggingface_standard_dry_run_refuses_unprobed_renamed_candidate_be
     mock_path_sizes.assert_not_called()
     mock_get_model_info.assert_not_called()
     mock_streaming_plan.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() -> None:
@@ -6045,10 +5872,7 @@ def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() ->
             },
         ) as mock_get_model_info,
         patch("modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download") as mock_streaming_plan,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6075,10 +5899,7 @@ def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() ->
     assert 0 < metadata_timeout <= 7
     assert mock_get_model_info.call_args.kwargs["allow_content_probes"] is False
     mock_streaming_plan.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expires() -> None:
@@ -6091,10 +5912,7 @@ def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expir
         ) as mock_plan_download,
         patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
         patch("modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download") as mock_streaming_plan,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6120,10 +5938,7 @@ def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expir
     assert mock_plan_download.call_args.kwargs["allow_content_probes"] is False
     mock_get_model_info.assert_not_called()
     mock_streaming_plan.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_file_streaming_dry_run_does_not_download_or_scan() -> None:
@@ -6384,10 +6199,7 @@ def test_scan_huggingface_file_streaming_dry_run_metadata_failure_fails_closed()
             side_effect=RuntimeError(f"metadata unavailable for {url}\nFORGED"),
         ),
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6402,10 +6214,7 @@ def test_scan_huggingface_file_streaming_dry_run_metadata_failure_fails_closed()
     assert "\nFORGED" not in result.output
     assert "Hugging Face acquisition failed" in result.output
     mock_download_file.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 def test_scan_huggingface_file_streaming_dry_run_parse_failure_fails_closed() -> None:
@@ -6418,10 +6227,7 @@ def test_scan_huggingface_file_streaming_dry_run_parse_failure_fails_closed() ->
             side_effect=ValueError(f"ambiguous URL {url}\nFORGED"),
         ),
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
-        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
-        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
-        patch("modelaudit.cli.download_model") as mock_download_model,
-        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        _mock_huggingface_acquisition() as assert_no_acquisition,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6436,10 +6242,7 @@ def test_scan_huggingface_file_streaming_dry_run_parse_failure_fails_closed() ->
     assert "\nFORGED" not in result.output
     assert "Hugging Face acquisition failed" in result.output
     mock_download_file.assert_not_called()
-    mock_download_streaming.assert_not_called()
-    mock_scan_streaming.assert_not_called()
-    mock_download_model.assert_not_called()
-    mock_scan_local.assert_not_called()
+    assert_no_acquisition()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -6858,7 +6661,7 @@ def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     streamed_file = tmp_path / "weights.bin"
     streamed_file.write_bytes(b"weights")
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         yield (streamed_file, True)
 
     mock_download_streaming.return_value = file_generator()
@@ -6926,8 +6729,11 @@ def test_scan_huggingface_no_cache_streaming_preserves_repository_scan_root(
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
-    mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path
-):
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Streaming scans should build SBOM components from discovered artifacts."""
     mock_is_hf_url.return_value = True
 
@@ -6944,7 +6750,7 @@ def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
         file_hashes[str(file_path)] = hashlib.sha256(content).hexdigest()
         file_sizes[str(file_path)] = len(content)
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         for index, file_path in enumerate(streamed_files):
             yield (file_path, index == len(streamed_files) - 1)
 
@@ -7424,7 +7230,12 @@ def test_scan_huggingface_streaming_selected_pickle_scans_shard_shaped_renamed_p
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-def test_scan_huggingface_streaming_scan_errors(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_streaming_scan_errors(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test handling of scan errors during streaming."""
     mock_is_hf_url.return_value = True
 
@@ -7432,7 +7243,7 @@ def test_scan_huggingface_streaming_scan_errors(mock_scan_streaming, mock_downlo
     test_file = tmp_path / "test.bin"
     test_file.write_text("test content")
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         yield (test_file, True)
 
     mock_download_streaming.return_value = file_generator()
@@ -7737,23 +7548,13 @@ def test_progress_initial_status_preserves_signed_stream_url() -> None:
     """Initial progress status includes the requested stream URL."""
     url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
 
-    class _Stats:
-        total_bytes = 0
-        total_items = 0
-
-    class _Tracker:
-        stats = _Stats()
-
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        def set_phase(self, _phase: object, message: str) -> None:
-            self.messages.append(message)
-
-        def update_bytes(self, _bytes_processed: int, _message: str) -> None:
-            pass
-
-    tracker = _Tracker()
+    messages: list[str] = []
+    tracker = types.SimpleNamespace(
+        stats=types.SimpleNamespace(total_bytes=0, total_items=0),
+        messages=messages,
+        set_phase=lambda _phase, message: messages.append(message),
+        update_bytes=lambda _bytes_processed, _message: None,
+    )
     callback = _create_path_progress_callback(spinner=None, progress_tracker=tracker, actual_path=url)
 
     assert callback is not None
@@ -7795,23 +7596,13 @@ def test_scan_path_state_preserves_local_asset_path_for_sbom() -> None:
 def test_progress_callback_escapes_model_controlled_messages(tmp_path: Path) -> None:
     model_path = tmp_path / "model\nname.pkl"
 
-    class _Stats:
-        total_bytes = 0
-        total_items = 0
-
-    class _Tracker:
-        stats = _Stats()
-
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        def set_phase(self, _phase: object, message: str) -> None:
-            self.messages.append(message)
-
-        def update_bytes(self, _bytes_processed: int, message: str) -> None:
-            self.messages.append(message)
-
-    tracker = _Tracker()
+    messages: list[str] = []
+    tracker = types.SimpleNamespace(
+        stats=types.SimpleNamespace(total_bytes=0, total_items=0),
+        messages=messages,
+        set_phase=lambda _phase, message: messages.append(message),
+        update_bytes=lambda _bytes_processed, message: messages.append(message),
+    )
     callback = _create_path_progress_callback(
         spinner=None,
         progress_tracker=tracker,
