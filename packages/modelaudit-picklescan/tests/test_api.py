@@ -126,6 +126,7 @@ from modelaudit_picklescan.call_graph import (
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
+from modelaudit_picklescan.report import _deep_mutable_copy
 
 
 class _ClearedSourceSensitiveCaches:
@@ -13235,9 +13236,9 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
-def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
+def _source_fingerprint_diagnostics(source_fingerprints: collections.abc.Mapping[str, Any]) -> str:
     diagnostics: dict[str, Any] = {
-        "source_fingerprints": source_fingerprints,
+        "source_fingerprints": _deep_mutable_copy(source_fingerprints),
         "import_runtime_trusted": call_graph._interpreter_import_runtime_is_trusted(),
         "importers": [],
     }
@@ -13300,6 +13301,44 @@ def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
         except (OSError, ValueError, struct.error) as error:
             record["diagnostic_error"] = f"{type(error).__name__}: {error}"
     return json.dumps(diagnostics, indent=2)
+
+
+@pytest.mark.parametrize("cache_available", [False, True])
+def test_source_fingerprint_diagnostics_serializes_frozen_metadata(
+    monkeypatch: pytest.MonkeyPatch, cache_available: bool
+) -> None:
+    report = PickleReport(
+        source="fingerprint-diagnostic.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        private_metadata={
+            "call_graph_source_fingerprints": {
+                "reusable": False,
+                "fingerprints": {"safe.py": [1, 2]},
+                "resolution_context": {"meta_path": [["finder", 3]]},
+            }
+        },
+    )
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_is_trusted", lambda: True)
+    monkeypatch.setattr(
+        call_graph, "_runtime_path_importer_cache_without_hooks", lambda: {} if cache_available else None
+    )
+    monkeypatch.setattr(call_graph, "_runtime_search_path_without_hooks", lambda: ())
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+
+    diagnostics = json.loads(_source_fingerprint_diagnostics(source_fingerprints))
+
+    assert diagnostics == {
+        "source_fingerprints": {
+            "reusable": False,
+            "fingerprints": {"safe.py": [1, 2]},
+            "resolution_context": {"meta_path": [["finder", 3]]},
+        },
+        "import_runtime_trusted": True,
+        "importers": [],
+    }
+    assert source_fingerprints["fingerprints"]["safe.py"] == (1, 2)
+    assert source_fingerprints["resolution_context"]["meta_path"] == (("finder", 3),)
 
 
 def test_with_call_graph_findings_records_source_fingerprint_metadata(
