@@ -2343,11 +2343,42 @@ def test_text_scanner_fence_opener_outside_context_keeps_call_actionable(tmp_pat
     )
 
 
+def test_text_scanner_fence_context_limits_call_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.scanners.text_scanner import MAX_TEXT_FENCE_CONTEXT_BYTES, MAX_TEXT_FENCE_MARKERS
+
+    probes = 0
+
+    def open_call(_prefix: bytes) -> bool:
+        nonlocal probes
+        probes += 1
+        return True
+
+    monkeypatch.setattr(TextScanner, "_documentation_prefix_has_enclosing_call", staticmethod(open_call))
+    payload = b"```\n" * (MAX_TEXT_FENCE_MARKERS + 10)
+    assert TextScanner._documentation_last_closed_fence_end(payload, 0, len(payload)) == 0
+    assert probes <= MAX_TEXT_FENCE_MARKERS
+    probes = 0
+    oversized = b"x" * (MAX_TEXT_FENCE_CONTEXT_BYTES + 1)
+    assert TextScanner._documentation_last_closed_fence_end(oversized, 1, len(oversized)) == 1
+    assert probes == 0
+
+
 @pytest.mark.parametrize("fence", ["```", "~~~", "````"])
 @pytest.mark.parametrize("example", ['download(\n    "local"\n)\n', "download(\n"])
-def test_text_scanner_closed_fence_does_not_extend_call_into_prose(tmp_path: Path, fence: str, example: str) -> None:
+@pytest.mark.parametrize("padding", [0, MAX_TEXT_FINDING_CONTEXT_BYTES + 16])
+def test_text_scanner_closed_fence_does_not_extend_call_into_prose(
+    tmp_path: Path, fence: str, example: str, padding: int
+) -> None:
     _assert_model_card_endpoint_informational(
-        tmp_path, f"{fence}python\n{example}{fence}\n[guide](https://docs.example.com/reference)\n"
+        tmp_path, "x" * padding + f"\n{fence}python\n{example}{fence}\n[guide](https://docs.example.com/reference)\n"
+    )
+
+
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES, MAX_TEXT_FINDING_CONTEXT_BYTES * 2])
+@pytest.mark.parametrize("prefix", ["", 'endpoint = "closed"\n'])
+def test_text_scanner_deeply_indented_passive_link_is_informational(tmp_path: Path, padding: int, prefix: str) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, prefix + " " * padding + "[guide](https://docs.example.com/reference)\n"
     )
 
 
@@ -3634,6 +3665,34 @@ def test_text_scanner_possible_misuse_does_not_hide_same_line_admissions(tmp_pat
     _assert_documentation_network_actionable(
         tmp_path, "Malware production may be possible" + suffix + "\n", "cc_pattern"
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "The model installs it on the scanner host by default.",
+        "This capability is enabled by default.",
+        "Review generated outputs.\nThe model installs it on the scanner host by default.",
+    ],
+)
+def test_text_scanner_possible_misuse_keeps_paragraph_continuations_actionable(
+    tmp_path: Path, newline: str, continuation: str
+) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, "Malware production may be possible." + newline + continuation + newline, "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_text_scanner_wrapped_misuse_guidance_is_informational(tmp_path: Path, newline: str) -> None:
+    result = _scan_text_content(
+        tmp_path / "README.md",
+        f"Malware production may be possible,{newline}and developers should ensure that their applications "
+        f"do not violate applicable laws and regulations.{newline}{newline}## Usage{newline}",
+    )
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
 
 
 def test_text_scanner_possible_misuse_with_compliance_guidance_is_informational(tmp_path: Path) -> None:
