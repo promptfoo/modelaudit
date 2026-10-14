@@ -1613,8 +1613,11 @@ def test_zipimporter_identity_survives_normal_cache_invalidation(
     assert before is not None
 
     finder.invalidate_caches()
+    cache_was_missing = root not in directory_cache
 
     assert call_graph._zipimporter_resolution_identity(finder, entry) == before
+    if cache_was_missing:
+        assert root not in directory_cache, "identity validation published speculative metadata"
     assert type(zipimporter.find_spec(finder, "trusted_module")) is ModuleSpec
 
 
@@ -1634,6 +1637,29 @@ def test_zipimporter_cache_restoration_does_not_heal_poison(
 
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
     assert directory_cache[entry] is poison
+
+
+def test_zipimporter_rejects_poisoned_finder_before_reading_other_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder_archive = tmp_path / "finder.zip"
+    requested_archive = tmp_path / "requested.zip"
+    _write_zipimporter_archive(finder_archive, "trusted_module", include_module=True)
+    _write_zipimporter_archive(requested_archive, "trusted_module", include_module=True)
+    finder_entry = str(finder_archive)
+    requested_entry = str(requested_archive)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, requested_entry, raising=False)
+    finder = zipimporter(finder_entry)
+    assert call_graph._zipimporter_resolution_identity(finder, finder_entry) is not None
+    monkeypatch.setitem(directory_cache, finder_entry, None)
+
+    assert requested_entry not in directory_cache
+    assert call_graph._zipimporter_resolution_identity(finder, requested_entry) is None
+    assert requested_entry not in directory_cache
+    assert directory_cache[finder_entry] is None
 
 
 def test_zipimporter_missing_cache_does_not_heal_legacy_files(
@@ -1693,20 +1719,29 @@ def test_zipimporter_cache_restoration_preserves_raced_poison(
     entry = str(archive_path)
     finder = zipimporter(entry)
     state = object.__getattribute__(finder, "__dict__")
+    legacy_files = "_files" in state
     state.pop("_files", None)
     directory_cache = call_graph._ZIP_DIRECTORY_CACHE
     assert type(directory_cache) is dict
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._zipimport_read_bounded_archive_files
+    reader_called = False
 
     def populate_poison_while_reading(archive: str) -> dict[str, object] | None:
+        nonlocal reader_called
+        reader_called = True
         files = original_reader(archive)
+        assert files is not None
         directory_cache[archive] = None
         return files
 
     monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", populate_poison_while_reading)
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
-    assert directory_cache[entry] is None
+    assert reader_called is not legacy_files
+    if legacy_files:
+        assert entry not in directory_cache
+    else:
+        assert directory_cache[entry] is None
 
 
 @pytest.mark.parametrize("mutation", ["archive", "prefix", "dictionary"])
@@ -1720,14 +1755,19 @@ def test_zipimporter_cache_restoration_rechecks_importer_after_read(
     entry = str(archive_path)
     finder = zipimporter(entry)
     state = object.__getattribute__(finder, "__dict__")
+    legacy_files = "_files" in state
     state.pop("_files", None)
     directory_cache = call_graph._ZIP_DIRECTORY_CACHE
     assert type(directory_cache) is dict
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._zipimport_read_bounded_archive_files
+    reader_called = False
 
     def change_importer_while_reading(archive: str) -> dict[str, object] | None:
+        nonlocal reader_called
+        reader_called = True
         files = original_reader(archive)
+        assert files is not None
         if mutation == "dictionary":
             object.__setattr__(finder, "__dict__", dict(state))
         else:
@@ -1736,6 +1776,8 @@ def test_zipimporter_cache_restoration_rechecks_importer_after_read(
 
     monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", change_importer_while_reading)
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert reader_called is not legacy_files
+    assert entry not in directory_cache
 
 
 def test_zipimporter_cache_restoration_rejects_archive_change_during_read(
@@ -1746,14 +1788,19 @@ def test_zipimporter_cache_restoration_rejects_archive_change_during_read(
     _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
     entry = str(archive_path)
     finder = zipimporter(entry)
-    object.__getattribute__(finder, "__dict__").pop("_files", None)
+    state = object.__getattribute__(finder, "__dict__")
+    legacy_files = "_files" in state
+    state.pop("_files", None)
     directory_cache = call_graph._ZIP_DIRECTORY_CACHE
     assert type(directory_cache) is dict
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._ZIP_READ_DIRECTORY
     assert isinstance(original_reader, FunctionType)
+    reader_called = False
 
     def replace_archive_while_reading(archive: str) -> object:
+        nonlocal reader_called
+        reader_called = True
         files = original_reader(archive)
         _write_zipimporter_archive(archive_path, "replacement_module", include_module=True)
         return files
@@ -1769,6 +1816,7 @@ def test_zipimporter_cache_restoration_rejects_archive_change_during_read(
 
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
     assert entry not in directory_cache
+    assert reader_called is not legacy_files
 
 
 @pytest.mark.parametrize("limit", ["archive-bytes", "implicit-count", "implicit-bytes"])
@@ -4019,3 +4067,200 @@ def _poison_zipimport_unpack(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
 
     monkeypatch.setitem(zipimport_namespace, "_unpack_uint32", poisoned_unpack)
     return calls
+
+
+@pytest.mark.parametrize("source_available", [False, True])
+@pytest.mark.parametrize("reference_kind", ["unavailable", "python", "native"])
+def test_frozen_invoked_reference_requires_callable_body_coverage(
+    monkeypatch: pytest.MonkeyPatch, source_available: bool, reference_kind: str
+) -> None:
+    def python_callable() -> None:
+        pass
+
+    states: dict[str, tuple[bool, object | None]] = {
+        "unavailable": (False, None),
+        "python": (True, python_callable),
+        "native": (True, len),
+    }
+    monkeypatch.setattr(
+        call_graph,
+        "_call_graph_entrypoints_for_reference",
+        lambda *_args: ("ntpath.abspath",) if source_available else (),
+    )
+    monkeypatch.setattr(call_graph, "_call_graph_source_unavailable_reason", lambda _module: None)
+    monkeypatch.setattr(call_graph, "_interpreter_module_origin_without_import_hooks", lambda _module: "frozen")
+    monkeypatch.setattr(
+        call_graph, "_current_loaded_interpreter_reference_state", lambda *_args: states[reference_kind]
+    )
+    invocation = {"module": "ntpath", "name": "abspath", "opcode": "REDUCE", "positional_arg_count": 1}
+    references = call_graph.find_unanalyzed_callable_call_graph_references([invocation])
+    if source_available or reference_kind == "native":
+        assert references == ()
+    else:
+        assert references == (
+            call_graph.UnanalyzedCallGraphReference(
+                module="ntpath", name="abspath", import_reference="ntpath.abspath", reason="source_unavailable"
+            ),
+        )
+        for payload, verdict in (
+            (b"\x80\x04N.", SafetyVerdict.UNKNOWN),
+            (b"\x80\x04cbuiltins\neval\n\x8c\x011\x85R.", SafetyVerdict.MALICIOUS),
+        ):
+            report = package_api._with_unanalyzed_call_graph_notices(
+                package_api.scan_bytes(payload, enrich_call_graph=False), references
+            )
+            assert report.status == ScanStatus.INCONCLUSIVE
+            assert report.verdict == verdict
+            assert report.metadata["analysis_incomplete"] is True
+            assert report.notices[-1].code == "call_graph_source_unavailable"
+            assert report.notices[-1].details["reason"] == "source_unavailable"
+
+
+@pytest.mark.parametrize("mutation", ["replace-archive", "remove-archive", "finder-state"])
+@pytest.mark.parametrize("competing_cache", ["absent", "poison", "replacement"])
+def test_zipimporter_rejected_private_read_does_not_publish_or_remove_shared_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, competing_cache: str
+) -> None:
+    archive_path = tmp_path / "private-read.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    legacy_files = "_files" in state
+    state.pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    original_reader = call_graph._zipimport_read_bounded_archive_files
+    replacement: object = None if competing_cache == "poison" else {}
+    first_read = True
+
+    def mutate_after_bounded_read(archive: str) -> dict[str, object] | None:
+        nonlocal first_read
+        files = original_reader(archive)
+        if first_read:
+            first_read = False
+            if mutation == "replace-archive":
+                _write_zipimporter_archive(archive_path, "replacement_module", include_module=True)
+            elif mutation == "remove-archive":
+                archive_path.unlink()
+            else:
+                state["prefix"] = "changed/"
+            if competing_cache != "absent":
+                directory_cache[entry] = replacement
+        return files
+
+    monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", mutate_after_bounded_read)
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert first_read is legacy_files
+    if competing_cache == "absent" or legacy_files:
+        assert entry not in directory_cache
+    else:
+        assert directory_cache[entry] is replacement
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX backslashes are literal ZIP prefix characters")
+@pytest.mark.parametrize("forged", [False, True])
+def test_missing_zip_cache_preserves_literal_backslash_constructor_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forged: bool
+) -> None:
+    archive_path = tmp_path / "prefix.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("pkg\\hidden/canonical_module.py", "")
+        archive.writestr("pkg/hidden/other_module.py", "")
+    entry = f"{archive_path}/pkg\\hidden"
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    assert state["prefix"] == "pkg\\hidden/"
+    assert type(zipimporter.find_spec(finder, "canonical_module")) is ModuleSpec
+    assert zipimporter.find_spec(finder, "other_module") is None
+    before = call_graph._zipimporter_resolution_identity(finder, entry)
+    assert before is not None
+    legacy_files = "_files" in state
+    state.pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, str(archive_path))
+    if forged:
+        state["prefix"] = "pkg/hidden/"
+
+    identity = call_graph._zipimporter_resolution_identity(finder, entry)
+
+    assert identity == (None if forged or legacy_files else before)
+    assert str(archive_path) not in directory_cache
+
+
+@pytest.mark.parametrize("suffix", ["package", "package//nested", "package/nested/"])
+def test_private_zip_constructor_state_matches_platform_spelling(tmp_path: Path, suffix: str) -> None:
+    archive_path = tmp_path / "spelling.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = f"{archive_path}/{suffix}"
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+
+    assert call_graph._zipimport_constructor_state_without_cache(entry) == (state["archive"], state["prefix"])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native ZIP joining interprets colon-bearing roots")
+@pytest.mark.parametrize("suffix", ["C:foo/c:bar", "C:foo/D:bar", "folder:name"])
+def test_missing_zip_cache_rejects_unqualified_windows_prefix_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    archive_path = tmp_path / "windows-prefix.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = f"{archive_path}/{suffix}"
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    state.pop("_files", None)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, state["archive"])
+
+    assert call_graph._zipimport_constructor_state_without_cache(entry) is None
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert state["archive"] not in directory_cache
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 13), reason="Legacy ZIP importers retain per-instance _files")
+def test_deleted_legacy_zip_files_cannot_claim_modern_constructor_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive_path = tmp_path / "legacy-deleted-files.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    state = object.__getattribute__(finder, "__dict__")
+    assert "_files" in state
+    state.pop("_files")
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert entry not in directory_cache
+
+
+@pytest.mark.skipif(sys.version_info < (3, 13), reason="Modern ZIP importers use lazy shared directory state")
+def test_private_zip_validation_rechecks_constructor_without_executing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive_path = tmp_path / "changed-constructor.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    finder = zipimporter(entry)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, entry)
+    original_reader = call_graph._zipimport_read_bounded_archive_files
+
+    def unexpected_constructor(*_args: object) -> None:
+        pytest.fail("identity validation executed a changed constructor")
+
+    def change_constructor_after_read(archive: str) -> dict[str, object] | None:
+        files = original_reader(archive)
+        monkeypatch.setattr(zipimporter, "__init__", unexpected_constructor)
+        return files
+
+    monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", change_constructor_after_read)
+    assert call_graph._zipimporter_resolution_identity(finder, entry) is None
+    assert entry not in directory_cache

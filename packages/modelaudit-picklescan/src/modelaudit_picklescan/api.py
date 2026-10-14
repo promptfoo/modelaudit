@@ -3502,11 +3502,24 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
 
         opcode_count = 0
         has_non_trivial_opcode = False
+        has_security_opcode = False
         try:
             for opcode, _arg, pos in pickletools.genops(candidate):
                 opcode_count += 1
                 if opcode.name == "STOP":
                     stop_pos = 0 if pos is None else pos
+                    if not has_security_opcode:
+                        try:
+                            pickletools.dis(candidate[: stop_pos + 1], out=io.StringIO())
+                        except ValueError as exc:
+                            message = str(exc)
+                            if not (
+                                message.startswith("stack not empty after STOP")
+                                or (message.startswith("memo key ") and message.endswith(" already defined"))
+                            ):
+                                return False
+                        except Exception:
+                            return False
                     trailing = candidate[stop_pos + 1 :]
                     if not trailing or not trailing.strip(_PROTO0_1_IGNORABLE_TRAILING_BYTES):
                         return opcode_count >= 2
@@ -3519,6 +3532,8 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
                     )
                 if opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
                     has_non_trivial_opcode = True
+                if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
+                    has_security_opcode = True
                 if opcode_count >= _PROTO0_1_MAX_PROBE_OPCODES:
                     return False
         except ValueError as exc:

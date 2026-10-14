@@ -1763,6 +1763,7 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
         partial_path: tuple[str, ...] | None = None,
         partial_entrypoints: tuple[str, ...] = (),
+        partial_calls: tuple[str, ...] = (),
         stability_reason: str | None = None,
     ) -> None:
         super().__init__(message)
@@ -1770,6 +1771,7 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
         self.partial_path = partial_path
         self.partial_entrypoints = partial_entrypoints
+        self.partial_calls = partial_calls
         # Which snapshot gate invalidated the run, reported without changing the message text.
         self.stability_reason = stability_reason
 
@@ -2105,6 +2107,19 @@ def find_dangerous_call_graphs(
         if str(reference.get("module", "")) and str(reference.get("name", ""))
     }
 
+    template_execution_complete = bool(callable_references) and all(
+        reference.get("template_execution_complete") is True for reference in callable_references
+    )
+    if not template_execution_complete:
+        # A direct call's argument shape does not cover later memo/opaque uses.
+        for reference in callable_references:
+            module = str(reference.get("module", ""))
+            name = str(reference.get("name", ""))
+            if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+                continue
+            if _reference_may_enter_template_method(module, name, reference):
+                invoked_references.discard((module, name))
+
     analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
         module = str(reference.get("module", ""))
@@ -2115,27 +2130,49 @@ def find_dangerous_call_graphs(
             continue
 
         try:
-            if (
-                module == "string"
-                and name
-                in {"Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"}
-                and reference.get("invocation_import_reference")
-                and _template_uses_reviewed_lazy_pattern()
-                and reference.get("template_receiver_state_unmodified") is not True
-            ):
-                raise _CallGraphAnalysisLimitError("string.Template receiver state cannot be proven unchanged")
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
             entrypoints = error.partial_entrypoints
+        template_entrypoints = {f"{module}.{name}", *entrypoints} & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+            "string.Template.is_valid",
+            "string.Template.get_identifiers",
+        }
+        template_mapping_entrypoints = template_entrypoints & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+        }
+        if (
+            template_entrypoints
+            and reference.get("invocation_import_reference")
+            and _template_uses_reviewed_lazy_pattern()
+        ):
+            if reference.get("template_receiver_state_unmodified") is not True and analysis_limit_error is None:
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template receiver state cannot be proven unchanged"
+                )
+            if (
+                template_mapping_entrypoints
+                and reference.get("template_mapping_callbacks_complete") is not True
+                and analysis_limit_error is None
+            ):
+                # Resolved aliases need the same proof; retain their original report identity.
+                # Missing coverage must not hide independent Template sinks.
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template mapping callbacks cannot be proven covered"
+                )
         if not entrypoints:
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
         try:
             path_for = (
                 partial(_find_sink_path, keyword_arg_names=_complete_keyword_arg_names(reference))
-                if module == "string" and name in {"Template.substitute", "Template.safe_substitute"}
+                if template_mapping_entrypoints
+                and template_execution_complete
+                and reference.get("invocation_import_reference")
                 else _find_sink_path
             )
             sink_path = _first_matching_path(entrypoints, path_for)
@@ -2152,6 +2189,7 @@ def find_dangerous_call_graphs(
                     sink_path = _find_invoked_import_execution_path(
                         entrypoint,
                         entrypoint_arg_count,
+                        None if template_mapping_entrypoints and not template_execution_complete else (),
                         allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                     )
                 except _CallGraphAnalysisLimitError as error:
@@ -2167,7 +2205,9 @@ def find_dangerous_call_graphs(
                         entrypoints,
                         _invoked_import_execution_path_callback(
                             positional_arg_count,
-                            keyword_arg_names,
+                            None
+                            if template_mapping_entrypoints and not template_execution_complete
+                            else keyword_arg_names,
                             allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                         ),
                     )
@@ -2423,7 +2463,7 @@ def find_unanalyzed_callable_call_graph_references(
         if reason is None and _interpreter_module_origin_without_import_hooks(module) == "frozen":
             state = _current_loaded_interpreter_reference_state(module, name)
             _track_loaded_interpreter_reference_state(module, name, state)
-            if state[0] and type(state[1]) is FunctionType:
+            if not state[0] or type(state[1]) is FunctionType:
                 # Frozen origin authenticates the module, not coverage of its Python body.
                 reason = "source_unavailable"
         if reason is None:
@@ -3124,7 +3164,13 @@ def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
     return tuple(dict.fromkeys(functions))
 
 
-def _function_owner_matches_trusted_source(function: FunctionType, *, expected_module: str) -> bool:
+def _function_owner_matches_trusted_source(
+    function: FunctionType,
+    *,
+    expected_module: str,
+    code: CodeType | None = None,
+    expected_qualname: str | None = None,
+) -> bool:
     globals_namespace = function.__globals__
     if type(globals_namespace) is not dict:
         return False
@@ -3135,10 +3181,16 @@ def _function_owner_matches_trusted_source(function: FunctionType, *, expected_m
     if source_path is None:
         return False
     try:
-        code_path = Path(function.__code__.co_filename).resolve()
+        code_path = Path((function.__code__ if code is None else code).co_filename).resolve()
     except (OSError, RuntimeError, ValueError):
         return False
-    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+    if expected_qualname is not None:
+        return code_path == source_path and _function_code_matches_trusted_source(
+            function, source_path, code=code, expected_qualname=expected_qualname
+        )
+    if code is None:
+        return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+    return code_path == source_path and _function_code_matches_trusted_source(function, source_path, code=code)
 
 
 def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> bool:
@@ -3158,9 +3210,19 @@ def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> boo
     return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
 
 
-def _function_code_matches_trusted_source(function: FunctionType, source_path: Path) -> bool:
-    code = function.__code__
-    return any(candidate == code for candidate in _trusted_source_code_objects(str(source_path)))
+def _function_code_matches_trusted_source(
+    function: FunctionType,
+    source_path: Path,
+    *,
+    code: CodeType | None = None,
+    expected_qualname: str | None = None,
+) -> bool:
+    code = function.__code__ if code is None else code
+    return any(
+        candidate == code
+        for candidate in _trusted_source_code_objects(str(source_path))
+        if expected_qualname is None or getattr(candidate, "co_qualname", None) == expected_qualname
+    )
 
 
 @_register_source_sensitive_cache
@@ -3384,7 +3446,7 @@ def _first_matching_path(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            path = error.partial_path
         except Exception:
             continue
         if path is not None:
@@ -3415,6 +3477,26 @@ def _invoked_import_execution_path_callback(
     return path_for
 
 
+def _reference_may_enter_template_method(module: str, name: str, reference: Mapping[str, object]) -> bool:
+    targets = {f"{module}.{name}"}
+    try:
+        targets.update(_call_graph_entrypoints_for_reference(module, name, reference))
+    except _CallGraphAnalysisLimitError as error:
+        targets.update(error.partial_entrypoints)
+    except Exception:
+        # Normal analysis below retains its existing error handling.
+        pass
+    return bool(
+        targets
+        & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+            "string.Template.is_valid",
+            "string.Template.get_identifiers",
+        }
+    )
+
+
 def _iter_call_graph_references(
     import_references: object,
     callable_references: tuple[dict[str, object], ...],
@@ -3422,7 +3504,9 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    seen_invocations: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
+    seen_invocations: set[
+        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None, bool | None]
+    ] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -3438,6 +3522,8 @@ def _iter_call_graph_references(
             _optional_bool_reference_detail(item.get("build_uses_slot_state")),
             _complete_keyword_arg_names(item),
             _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
+            _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
+            _optional_bool_reference_detail(item.get("template_execution_complete")),
         )
         if invocation_key in seen_invocations:
             continue
@@ -3501,7 +3587,9 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
+    seen: set[
+        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None, bool | None]
+    ] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -3524,6 +3612,8 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 _optional_bool_reference_detail(item.get("build_uses_slot_state")),
                 _complete_keyword_arg_names(item),
                 _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
+                _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
+                _optional_bool_reference_detail(item.get("template_execution_complete")),
             )
             if reference_key in seen:
                 continue
@@ -4516,7 +4606,37 @@ def _zipimport_archive_files_match(archive: str, files: object) -> bool:
     return archive_files is not None and files == archive_files
 
 
-def _zipimport_restore_missing_directory_cache(
+def _zipimport_constructor_state_without_cache(entry: str) -> tuple[str, str] | None:
+    if type(entry) is not str or not entry:
+        return None
+    path = entry.replace(os.path.altsep, os.path.sep) if os.path.altsep else entry
+    prefix_parts: list[str] = []
+    for _ in range(_MAX_ZIPIMPORT_PATH_COMPONENTS + 1):
+        try:
+            archive_stat = os.stat(path)
+        except (OSError, ValueError):
+            separator = path.rfind(os.path.sep)
+            directory = path[:separator] if separator >= 0 else ""
+            basename = path[separator + 1 :] if separator >= 0 else path
+            if directory == path:
+                return None
+            path = directory
+            prefix_parts.append(basename)
+            continue
+        if not stat.S_ISREG(archive_stat.st_mode):
+            return None
+        # CPython's Windows join delegates colon-bearing components to a native
+        # root parser. Do not approximate that parser with ntpath.join.
+        if os.path.sep == "\\" and any(":" in part for part in prefix_parts):
+            return None
+        # Components came from the constructor's last-separator split, so the
+        # remaining join is exact and preserves POSIX literal backslashes.
+        prefix = os.path.sep.join(part for part in reversed(prefix_parts) if part)
+        return path, prefix + os.path.sep if prefix else ""
+    return None
+
+
+def _zipimport_read_missing_directory_files(
     instance_state: dict[str, object],
     archive: str,
     prefix: str,
@@ -4526,11 +4646,20 @@ def _zipimport_restore_missing_directory_cache(
     # retain _files; a missing shared entry cannot authenticate that older state.
     if set(instance_state) != {"archive", "prefix"} or not _zipimport_runtime_is_trusted():
         return None
-    archive_state = _zipimport_archive_state_from_entry(cache_key)
-    if not isinstance(archive_state, tuple):
+    initializer = _type_member_without_hooks(zipimporter, "__init__")[1]
+    if type(initializer) is not FunctionType:
         return None
-    _absolute_archive, expected_prefix, expected_archive = archive_state
-    if archive != expected_archive or prefix != expected_prefix.replace("/", os.path.sep):
+    constructor_names = initializer.__code__.co_names
+    if (
+        type(constructor_names) is not tuple
+        or len(constructor_names) > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        or any(type(name) is not str for name in constructor_names)
+        or "_files" in constructor_names
+    ):
+        # Removing _files from a legacy instance does not make its constructor modern.
+        return None
+    expected_state = _zipimport_constructor_state_without_cache(cache_key)
+    if expected_state is None or (archive, prefix) != expected_state:
         return None
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
     if dict.__contains__(directory_cache, archive):
@@ -4538,8 +4667,9 @@ def _zipimport_restore_missing_directory_cache(
     files = _zipimport_read_bounded_archive_files(archive)
     if files is None:
         return None
-    # Never replace a concurrently populated or poisoned entry.
-    return files if dict.setdefault(directory_cache, archive, files) is files else None
+    # Keep speculative metadata private. Publishing it would leave stale shared
+    # importer state when a subsequent disk or finder check rejects this identity.
+    return files if not dict.__contains__(directory_cache, archive) else None
 
 
 def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | None:
@@ -4561,15 +4691,21 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
     if type(archive) is not str or type(prefix) is not str or not _zipimport_runtime_is_trusted():
         return None
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
-    if dict.__contains__(directory_cache, archive):
-        files = dict.__getitem__(directory_cache, archive)
+    missing_cache = not dict.__contains__(directory_cache, archive)
+    if missing_cache:
+        files = _zipimport_read_missing_directory_files(instance_state, archive, prefix, cache_key)
+        # The private read authenticates the exact modern archive/prefix shape.
+        # Constructing another importer here would populate the shared cache.
+        expected_state = {"archive": archive, "prefix": prefix}
     else:
-        files = _zipimport_restore_missing_directory_cache(instance_state, archive, prefix, cache_key)
+        files = dict.__getitem__(directory_cache, archive)
+        if not _zipimport_files_are_safe(files):
+            return None
+        try:
+            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+        except (AttributeError, ImportError, OSError, TypeError):
+            return None
     if not _zipimport_files_are_safe(files):
-        return None
-    try:
-        expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-    except (AttributeError, ImportError, OSError, TypeError):
         return None
     if not (
         type(expected_state) is dict
@@ -4581,7 +4717,16 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
         and dict.get(instance_state, "_files", files) is files
         and dict.get(expected_state, "_files", files) is files
         and _zipimport_archive_files_match(archive, files)
-        and _zipimport_directory_cache_files(archive) is files
+        and (
+            not dict.__contains__(directory_cache, archive)
+            if missing_cache
+            else _zipimport_directory_cache_files(archive) is files
+        )
+        and _zipimport_runtime_is_trusted()
+        and all(
+            _runtime_value_matches_snapshot(_type_member_without_hooks(zipimporter, name)[1], snapshot)
+            for name, snapshot in _TRUSTED_ZIPIMPORTER_METHODS
+        )
         and object.__getattribute__(finder, "__dict__") is instance_state
         and type(dict.get(instance_state, "archive")) is str
         and dict.get(instance_state, "archive") == archive
@@ -6101,19 +6246,33 @@ def _find_matching_call_path(
     queue: deque[tuple[str, tuple[str, ...]]] = deque([(start, (start,))])
     visited = {start}
     import_execution_fallback_path: tuple[str, ...] | None = None
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path = queue.popleft()
         sink = sink_for(function_name)
         if sink is not None:
+            if analysis_limit_error is not None:
+                raise _CallGraphAnalysisLimitError(
+                    str(analysis_limit_error), partial_path=path
+                ) from analysis_limit_error
             return path
         resolved_function = _resolve_function_target(function_name)
         if resolved_function is not None and resolved_function != function_name:
             sink = sink_for(resolved_function)
             if sink is not None:
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
 
-        calls = _calls_for_function(function_name)
+        try:
+            calls = _calls_for_function(function_name)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            calls = error.partial_calls
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6131,17 +6290,30 @@ def _find_matching_call_path(
                     if import_execution_fallback_allowed and import_execution_fallback_path is None:
                         import_execution_fallback_path = (*path, sink)
                     continue
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
 
         if sink_for is _rce_sink:
             for call in sorted(bounded_calls, key=_short_sink_call_priority):
-                short_sink_path = _find_short_matching_call_path(
-                    call, sink_for, ignored_direct_import_from=ignored_direct_import_from
-                )
+                try:
+                    short_sink_path = _find_short_matching_call_path(
+                        call, sink_for, ignored_direct_import_from=ignored_direct_import_from
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    short_sink_path = error.partial_path
                 if short_sink_path is not None:
                     sink = short_sink_path[-1]
                     if _is_tcl_interpreter_dispatch_call(sink) or _is_import_execution_sink(sink):
                         continue
+                    if analysis_limit_error is not None:
+                        raise _CallGraphAnalysisLimitError(
+                            str(analysis_limit_error), partial_path=(*path, *short_sink_path)
+                        ) from analysis_limit_error
                     return (*path, *short_sink_path)
 
         for call in bounded_calls:
@@ -6152,6 +6324,10 @@ def _find_matching_call_path(
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved)))
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_path=import_execution_fallback_path
+        ) from analysis_limit_error
     return import_execution_fallback_path
 
 
@@ -6172,10 +6348,16 @@ def _find_short_matching_call_path(
 ) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...], int]] = deque([(start, (start,), 0)])
     visited = {start}
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path, depth = queue.popleft()
-        calls = _calls_for_function(function_name)
+        try:
+            calls = _calls_for_function(function_name)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            calls = error.partial_calls
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6185,6 +6367,10 @@ def _find_short_matching_call_path(
             if sink is not None:
                 if _is_import_execution_sink(sink):
                     continue
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
             if depth >= _MAX_SHORT_SINK_DEPTH:
                 continue
@@ -6193,6 +6379,8 @@ def _find_short_matching_call_path(
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved), depth + 1))
+    if analysis_limit_error is not None:
+        raise analysis_limit_error
     return None
 
 
@@ -6209,13 +6397,18 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
     calls = analysis.calls_by_function.get(f"{module_name}.{qualified_name}")
     if calls is None:
         return None
-    if (
-        any(call.startswith("string.Template.pattern.") for call in calls)
-        and module_name == "string"
-        and _template_uses_reviewed_lazy_pattern()
-        and not _template_has_trusted_compiled_pattern()
-    ):
-        calls = (*calls, "string.Template._compile_pattern")
+    try:
+        if (
+            any(call.startswith("string.Template.pattern.") for call in calls)
+            and module_name == "string"
+            and _template_uses_reviewed_lazy_pattern()
+            and not _template_has_trusted_compiled_pattern()
+        ):
+            calls = (*calls, "string.Template._compile_pattern")
+    except _CallGraphAnalysisLimitError as error:
+        raise _CallGraphAnalysisLimitError(
+            str(error), partial_calls=calls, stability_reason=error.stability_reason
+        ) from error
     return calls
 
 
@@ -6463,14 +6656,83 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
     for name in ("__init__", "_invalid", "substitute", "safe_substitute", "is_valid", "get_identifiers"):
         member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
         _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
+        if not member[0] or type(member[1]) is not FunctionType:
+            return False
+        function = member[1]
+        code = function.__code__
         if (
-            not member[0]
-            or type(member[1]) is not FunctionType
-            or getattr(member[1].__code__, "co_qualname", None) != f"Template.{name}"
-            or not _function_owner_matches_trusted_source(member[1], expected_module="string")
-            or not _template_function_runtime_is_canonical(member[1], module, name, sentinel)
+            not _template_code_metadata_is_hook_free(code)
+            or code.co_name != name
+            or getattr(code, "co_qualname", None) != f"Template.{name}"
+            or not _function_owner_matches_trusted_source(
+                function, expected_module="string", code=code, expected_qualname=f"Template.{name}"
+            )
+            or not _template_function_runtime_is_canonical(function, module, name, sentinel, code=code)
+            or function.__code__ is not code
         ):
             return False
+    return True
+
+
+def _template_code_metadata_is_hook_free(code: CodeType) -> bool:
+    missing = object()
+    pending: list[tuple[object, int]] = [(code, 0)]
+    checked = 0
+    code_count = 0
+    while pending:
+        value, depth = pending.pop()
+        checked += 1
+        if checked > _MAX_SOURCE_FINGERPRINT_CANDIDATES or depth > _MAX_TRUSTED_REFERENCE_FUNCTIONS:
+            return False
+        value_type = type(value)
+        if (
+            value is None
+            or value is Ellipsis
+            or any(value_type is primitive for primitive in (bool, int, float, complex, str, bytes))
+        ):
+            continue
+        if (
+            value_type is not CodeType
+            and value_type is not tuple
+            and value_type is not frozenset
+            and value_type is not slice
+        ):
+            return False
+        remaining = _MAX_SOURCE_FINGERPRINT_CANDIDATES - checked - len(pending)
+        if value_type is CodeType:
+            current = cast(CodeType, value)
+            code_count += 1
+            if code_count > _MAX_TRUSTED_REFERENCE_FUNCTIONS:
+                return False
+            if type(current.co_name) is not str or type(current.co_filename) is not str:
+                return False
+            # Python 3.10 lacks these fields; present metadata must have exact types.
+            qualified_name = getattr(current, "co_qualname", missing)
+            exception_table = getattr(current, "co_exceptiontable", missing)
+            if qualified_name is not missing and type(qualified_name) is not str:
+                return False
+            if type(current.co_linetable) is not bytes:
+                return False
+            if exception_table is not missing and type(exception_table) is not bytes:
+                return False
+            names = current.co_names
+            constants = current.co_consts
+            if type(names) is not tuple or type(constants) is not tuple or len(names) >= remaining:
+                return False
+            checked += len(names)
+            if any(type(name) is not str for name in names):
+                return False
+            pending.append((constants, depth + 1))
+        elif value_type is slice:
+            if remaining < 3:
+                return False
+            current_slice = cast(slice, value)
+            pending.extend((item, depth + 1) for item in (current_slice.start, current_slice.stop, current_slice.step))
+        else:
+            items = cast(tuple[object, ...] | frozenset[object], value)
+            if len(items) > remaining:
+                return False
+            pending.extend((item, depth + 1) for item in items)
     return True
 
 
@@ -6504,7 +6766,7 @@ def _template_defaultdict_constructor_is_canonical(value: object) -> bool:
 
 
 def _template_function_runtime_is_canonical(
-    function: FunctionType, module: ModuleType, name: str, sentinel: object
+    function: FunctionType, module: ModuleType, name: str, sentinel: object, *, code: CodeType
 ) -> bool:
     namespace = ModuleType.__getattribute__(module, "__dict__")
     if (
@@ -6521,7 +6783,7 @@ def _template_function_runtime_is_canonical(
             return False
     elif defaults is not None:
         return False
-    for dependency in _code_loaded_global_names(function.__code__):
+    for dependency in _code_loaded_global_names(code):
         state = _loaded_reference_state_without_hooks(module, dependency)
         _track_loaded_interpreter_reference_state("string", dependency, state)
         if dependency == "_sentinel_dict":

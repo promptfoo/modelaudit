@@ -899,20 +899,22 @@ jobs:
           # Exercise the release platform where scalar-probe timing regressed.
           - os: macos-15-intel
             python-version: "3.11"
+            timeout-minutes: 45
           - os: macos-15-intel
             python-version: "3.12"
             timeout-minutes: 45
           - os: macos-14
             python-version: "3.14"
-            timeout-minutes: 30
+            timeout-minutes: 60
           - os: macos-15-intel
             python-version: "3.14"
             timeout-minutes: 75
           - os: ubuntu-24.04-arm
             python-version: "3.14"
+            timeout-minutes: 30
           - os: windows-latest
             python-version: "3.14"
-            timeout-minutes: 75
+            timeout-minutes: 90
     defaults:
       run:
         shell: bash

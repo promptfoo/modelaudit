@@ -519,6 +519,7 @@ type CallableInvocationDedupeKey = (
     Option<bool>,
     Option<Vec<String>>,
     Option<bool>,
+    Option<bool>,
 );
 type PendingGlobalImportFinding = (String, usize, Vec<(String, DetailValue)>);
 
@@ -581,7 +582,7 @@ fn stack_value_memo_read(value: Option<&StackValue>) -> bool {
         Some(StackValue::Text { memo_read, .. } | StackValue::TextSpan { memo_read, .. }) => {
             *memo_read
         }
-        Some(StackValue::Global(reference) | StackValue::Constructed(reference)) => {
+        Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. }) => {
             reference.memo_read
         }
         _ => false,
@@ -715,6 +716,7 @@ pub(crate) struct ScanState<'a> {
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
     callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     template_receiver_may_have_mutated: bool,
+    template_execution_may_be_unmodeled: bool,
     non_allowlisted_global_imports: Vec<PendingGlobalImportFinding>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
@@ -786,6 +788,7 @@ impl<'a> ScanState<'a> {
             callable_invocations: Vec::new(),
             callable_invocation_keys: HashSet::new(),
             template_receiver_may_have_mutated: false,
+            template_execution_may_be_unmodeled: false,
             non_allowlisted_global_imports: Vec::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
@@ -1177,7 +1180,7 @@ impl<'a> ScanState<'a> {
                 value.len()
             }
             StackValue::Global(reference)
-            | StackValue::Constructed(reference)
+            | StackValue::Constructed { reference, .. }
             | StackValue::DefaultDict {
                 default_factory: reference,
             }
@@ -1251,7 +1254,7 @@ impl<'a> ScanState<'a> {
     fn tracked_dict_value_is_security_relevant(value: &StackValue) -> bool {
         match value {
             StackValue::Global(_)
-            | StackValue::Constructed(_)
+            | StackValue::Constructed { .. }
             | StackValue::CallIterator { .. }
             | StackValue::CallIteratorTuple { .. }
             | StackValue::DefaultDict { .. }
@@ -1410,6 +1413,7 @@ impl<'a> ScanState<'a> {
     fn handle_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
         if !TEMPLATE_PASSIVE_PREFIX_OPCODES.contains(&opcode.name) {
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled = true;
         }
         match opcode.name {
             "PROTO" => {
@@ -1796,6 +1800,7 @@ impl<'a> ScanState<'a> {
                 let invocations = self.consume_callable_opcode(opcode, position);
                 if invocations.is_empty() {
                     self.template_receiver_may_have_mutated = true;
+                    self.template_execution_may_be_unmodeled = true;
                 }
                 for invocation in &invocations {
                     self.mark_non_allowlisted_global_invoked(invocation);
@@ -2421,7 +2426,7 @@ impl<'a> ScanState<'a> {
             keyword_arg_names,
         ) = match opcode.name {
             "REDUCE" | "NEWOBJ" => {
-                let Some(values) = self.consume_top_operand_values(2) else {
+                let Some(values) = self.consume_top_operand_values(2, opcode.name) else {
                     return Vec::new();
                 };
                 (
@@ -2433,7 +2438,7 @@ impl<'a> ScanState<'a> {
                 )
             }
             "NEWOBJ_EX" => {
-                let Some(values) = self.consume_top_operand_values(3) else {
+                let Some(values) = self.consume_top_operand_values(3, opcode.name) else {
                     return Vec::new();
                 };
                 (
@@ -2470,7 +2475,10 @@ impl<'a> ScanState<'a> {
                     memo_read: false,
                 };
                 self.record_global_ref(&reference, opcode.name);
-                self.push_stack_value(StackValue::Constructed(reference.clone()));
+                self.push_stack_value(StackValue::Constructed {
+                    reference: reference.clone(),
+                    defaultdict_without_factory: false,
+                });
                 (
                     Some(StackValue::Global(reference)),
                     Some(values.len()),
@@ -2480,7 +2488,7 @@ impl<'a> ScanState<'a> {
                 )
             }
             "BUILD" => {
-                let values = self.consume_top_operand_values(2);
+                let values = self.consume_top_operand_values(2, opcode.name);
                 let callable_value = values.as_ref().and_then(|items| items.first()).cloned();
                 let build_uses_slot_state = values
                     .as_ref()
@@ -2574,7 +2582,7 @@ impl<'a> ScanState<'a> {
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
-            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+            Some(StackValue::Constructed { reference, .. }) if !reference.malformed => {
                 let reference = match op_name {
                     "REDUCE" | "OBJ" => Self::constructed_callable_reference(reference),
                     _ => reference.clone(),
@@ -2589,7 +2597,7 @@ impl<'a> ScanState<'a> {
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+            Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
                 if reference.module == "copyreg.extension" =>
             {
                 Some(CallableInvocation {
@@ -3761,7 +3769,11 @@ impl<'a> ScanState<'a> {
         if !(1..=2).contains(&arguments.len()) {
             return Vec::new();
         }
-        let Some(StackValue::Constructed(receiver_reference)) = arguments.first() else {
+        let Some(StackValue::Constructed {
+            reference: receiver_reference,
+            ..
+        }) = arguments.first()
+        else {
             return Vec::new();
         };
         Self::format_invocation(receiver_reference, op_name, position)
@@ -3782,7 +3794,7 @@ impl<'a> ScanState<'a> {
             .iter()
             .skip(1)
             .filter_map(|argument| match argument {
-                StackValue::Constructed(reference) => {
+                StackValue::Constructed { reference, .. } => {
                     Self::format_invocation(reference, op_name, position)
                 }
                 _ => None,
@@ -4527,6 +4539,116 @@ impl<'a> ScanState<'a> {
         self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
     }
 
+    fn template_mapping_callbacks_complete(&self, invocation: &CallableInvocation) -> bool {
+        if invocation.positional_arg_count != Some(invocation.args.len())
+            || !matches!(invocation.args.len(), 1 | 2)
+            || invocation.op_name != "REDUCE"
+            || invocation
+                .keyword_arg_names
+                .as_ref()
+                .is_some_and(|names| !names.is_empty())
+            || self.template_receiver_may_have_mutated
+        {
+            return false;
+        }
+        let Some(StackValue::StringTemplate { template }) = invocation.args.first() else {
+            return false;
+        };
+        if !Self::template_has_reachable_lookup(
+            template,
+            invocation.reference.name == "Template.safe_substitute",
+        ) {
+            return true;
+        }
+        // The omitted mapping is the authenticated, empty canonical default.
+        let Some(mapping) = invocation.args.get(1) else {
+            return true;
+        };
+        match mapping {
+            StackValue::Constructed { reference, defaultdict_without_factory: true } => {
+                !reference.malformed && reference.module == "collections" && reference.name == "defaultdict"
+            }
+            StackValue::DefaultDict { default_factory } => {
+                // Its factory call is emitted separately. Only this reviewed factory
+                // also proves that converting the returned value cannot call user code.
+                !default_factory.malformed
+                    && default_factory.module == "collections"
+                    && default_factory.name == "defaultdict"
+            }
+            StackValue::TrackedDict {
+                entries,
+                unknown_key_values,
+                unknown_key_values_overflowed,
+                memo_index,
+            } => {
+                !self.current_tracked_dict_unknown_key_values_overflowed(
+                    *unknown_key_values_overflowed,
+                    *memo_index,
+                ) && self
+                    .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
+                    .is_empty()
+                    && self
+                        .current_tracked_dict_entries(entries, *memo_index)
+                        .iter()
+                        .all(|(_, value)| {
+                            matches!(
+                                value,
+                                StackValue::Text { .. }
+                                    | StackValue::TextSpan { .. }
+                                    | StackValue::Bytes { .. }
+                                    | StackValue::Primitive { .. }
+                            ) || matches!(
+                                value,
+                                StackValue::Constructed { reference, defaultdict_without_factory: true }
+                                    if !reference.malformed && reference.module == "collections" && reference.name == "defaultdict"
+                            )
+                        })
+            }
+            _ => false,
+        }
+    }
+
+    fn template_has_reachable_lookup(template: &str, safe_substitute: bool) -> bool {
+        // Canonical Template identifiers use ASCII (?a:[_a-z][_a-z0-9]*).
+        // This linear scan allocates nothing and never evaluates mapping protocols.
+        let bytes = template.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'$' {
+                index += 1;
+                continue;
+            }
+            index += 1;
+            if bytes.get(index) == Some(&b'$') {
+                index += 1;
+                continue;
+            }
+            let braced = bytes.get(index) == Some(&b'{');
+            let start = index + usize::from(braced);
+            let mut end = start;
+            if bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+            {
+                end += 1;
+                while bytes
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    end += 1;
+                }
+                if !braced || bytes.get(end) == Some(&b'}') {
+                    return true;
+                }
+            }
+            if !safe_substitute {
+                // substitute raises on the first invalid match before any later lookup.
+                return false;
+            }
+        }
+        false
+    }
+
     fn string_template_may_lookup(value: Option<&StackValue>) -> bool {
         let Some(StackValue::StringTemplate { template }) = value else {
             return false;
@@ -4968,7 +5090,7 @@ impl<'a> ScanState<'a> {
 
     fn is_constructed_builtin_instance(value: Option<&StackValue>, name: &str) -> bool {
         match value {
-            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+            Some(StackValue::Constructed { reference, .. }) if !reference.malformed => {
                 matches!(
                     reference.module.as_str(),
                     "builtins" | "__builtin__" | "__builtins__"
@@ -4993,7 +5115,8 @@ impl<'a> ScanState<'a> {
     ) -> bool {
         match value {
             Some(
-                StackValue::Constructed(reference) | StackValue::MappingWrapper { reference, .. },
+                StackValue::Constructed { reference, .. }
+                | StackValue::MappingWrapper { reference, .. },
             ) if !reference.malformed => reference.module == module && reference.name == name,
             _ => false,
         }
@@ -5159,9 +5282,15 @@ impl<'a> ScanState<'a> {
                 reference.memo_index = Some(index);
                 StackValue::Global(reference)
             }
-            StackValue::Constructed(mut reference) => {
+            StackValue::Constructed {
+                mut reference,
+                defaultdict_without_factory,
+            } => {
                 reference.memo_index = Some(index);
-                StackValue::Constructed(reference)
+                StackValue::Constructed {
+                    reference,
+                    defaultdict_without_factory,
+                }
             }
             StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
                 type_name,
@@ -5221,11 +5350,17 @@ impl<'a> ScanState<'a> {
                 reference.memo_read |= memo_read;
                 StackValue::Global(reference)
             }
-            StackValue::Constructed(reference) => {
+            StackValue::Constructed {
+                reference,
+                defaultdict_without_factory,
+            } => {
                 let mut reference = reference.clone();
                 reference.memo_index = Some(index);
                 reference.memo_read |= memo_read;
-                StackValue::Constructed(reference)
+                StackValue::Constructed {
+                    reference,
+                    defaultdict_without_factory: *defaultdict_without_factory,
+                }
             }
             value => Self::memo_read_stack_value(value, memo_read),
         }
@@ -5241,10 +5376,16 @@ impl<'a> ScanState<'a> {
                 reference.memo_read = true;
                 StackValue::Global(reference)
             }
-            StackValue::Constructed(reference) => {
+            StackValue::Constructed {
+                reference,
+                defaultdict_without_factory,
+            } => {
                 let mut reference = reference.clone();
                 reference.memo_read = true;
-                StackValue::Constructed(reference)
+                StackValue::Constructed {
+                    reference,
+                    defaultdict_without_factory: *defaultdict_without_factory,
+                }
             }
             StackValue::Text {
                 value,
@@ -5300,7 +5441,11 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn consume_top_operand_values(&mut self, operand_count: usize) -> Option<Vec<StackValue>> {
+    fn consume_top_operand_values(
+        &mut self,
+        operand_count: usize,
+        op_name: &'static str,
+    ) -> Option<Vec<StackValue>> {
         if self.stack.len() < operand_count {
             self.push_stack_value(StackValue::Other);
             return None;
@@ -5312,11 +5457,11 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        self.push_reducer_result(&values);
+        self.push_reducer_result(&values, op_name);
         Some(values)
     }
 
-    fn push_reducer_result(&mut self, values: &[StackValue]) {
+    fn push_reducer_result(&mut self, values: &[StackValue], op_name: &'static str) {
         if let Some(call_iterator) = Self::call_iterator_result(values) {
             self.push_stack_value(call_iterator);
             return;
@@ -5333,7 +5478,7 @@ impl<'a> ScanState<'a> {
             self.push_stack_value(call_iterator_tuple);
             return;
         }
-        if let Some(defaultdict) = Self::defaultdict_result(values) {
+        if let Some(defaultdict) = Self::defaultdict_result(values, op_name) {
             self.push_stack_value(defaultdict);
             return;
         }
@@ -5834,7 +5979,7 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn defaultdict_result(values: &[StackValue]) -> Option<StackValue> {
+    fn defaultdict_result(values: &[StackValue], op_name: &'static str) -> Option<StackValue> {
         let Some(StackValue::Global(callable_reference)) = values.first() else {
             return None;
         };
@@ -5847,6 +5992,20 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Tuple(arguments)) = values.get(1) else {
             return None;
         };
+        if op_name == "REDUCE"
+            && matches!(
+                arguments.as_slice(),
+                [] | [StackValue::Primitive {
+                    type_name: "NoneType",
+                    ..
+                }]
+            )
+        {
+            return Some(StackValue::Constructed {
+                reference: callable_reference.clone(),
+                defaultdict_without_factory: true,
+            });
+        }
         if arguments.len() != 1 {
             return None;
         }
@@ -6039,10 +6198,10 @@ impl<'a> ScanState<'a> {
     fn callable_reference_from_value(value: Option<&StackValue>) -> Option<GlobalRef> {
         match value {
             Some(StackValue::Global(reference)) if !reference.malformed => Some(reference.clone()),
-            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+            Some(StackValue::Constructed { reference, .. }) if !reference.malformed => {
                 Some(Self::constructed_callable_reference(reference))
             }
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+            Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
                 if reference.module == "copyreg.extension" =>
             {
                 Some(reference.clone())
@@ -6053,22 +6212,28 @@ impl<'a> ScanState<'a> {
 
     fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {
         match callable_value {
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+            Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
                 if !reference.malformed =>
             {
-                self.push_stack_value(StackValue::Constructed(reference.clone()));
+                self.push_stack_value(StackValue::Constructed {
+                    reference: reference.clone(),
+                    defaultdict_without_factory: false,
+                });
             }
             Some(StackValue::DynamicType { type_name, .. }) => {
-                self.push_stack_value(StackValue::Constructed(GlobalRef {
-                    module: "__dynamic_type__".to_string(),
-                    name: type_name
-                        .clone()
-                        .unwrap_or_else(|| "__dynamic__".to_string()),
-                    position: 0,
-                    malformed: false,
-                    memo_index: None,
-                    memo_read: false,
-                }));
+                self.push_stack_value(StackValue::Constructed {
+                    reference: GlobalRef {
+                        module: "__dynamic_type__".to_string(),
+                        name: type_name
+                            .clone()
+                            .unwrap_or_else(|| "__dynamic__".to_string()),
+                        position: 0,
+                        malformed: false,
+                        memo_index: None,
+                        memo_read: false,
+                    },
+                    defaultdict_without_factory: false,
+                });
             }
             _ => self.push_stack_value(StackValue::Other),
         }
@@ -6881,6 +7046,7 @@ impl<'a> ScanState<'a> {
             )
         {
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled = true;
         }
         let symbol = reference.symbol();
         let severity = global_severity(&reference.module, &reference.name);
@@ -7190,6 +7356,7 @@ impl<'a> ScanState<'a> {
     fn push_callable_invocation(&mut self, invocation: &CallableInvocation) {
         if invocation.reference.malformed {
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled = true;
             return;
         }
 
@@ -7207,9 +7374,33 @@ impl<'a> ScanState<'a> {
                 Some(StackValue::StringTemplate { .. })
             ) && !self.template_receiver_may_have_mutated
         });
-        // Capture this call's proof first; arbitrary primary calls must invalidate
-        // aliases before synthetic callbacks, duplicate elision or metadata limits.
+        let template_mapping_callbacks_complete = (invocation.reference.module == "string"
+            && matches!(
+                invocation.reference.name.as_str(),
+                "Template.substitute" | "Template.safe_substitute"
+            ))
+        .then(|| self.template_mapping_callbacks_complete(invocation));
+        let modeled_template_call = template_receiver_state_unmodified == Some(true)
+            && invocation.op_name == "REDUCE"
+            && invocation.positional_arg_count == Some(invocation.args.len())
+            && !invocation
+                .keyword_arg_names
+                .as_ref()
+                .is_some_and(|names| !names.is_empty())
+            && match invocation.reference.name.as_str() {
+                "Template.substitute" | "Template.safe_substitute" => {
+                    template_mapping_callbacks_complete == Some(true)
+                }
+                "Template.is_valid" | "Template.get_identifiers" => invocation.args.len() == 1,
+                _ => false,
+            };
+        // Final use coverage is separate from receiver history. Later opaque work
+        // can reuse a callable through a memo or wrapper without another import.
+        // Update both proofs before callbacks, duplicate elision and metadata caps.
         if !Self::template_prefix_constructor_is_inert(invocation) {
+            if !modeled_template_call {
+                self.template_execution_may_be_unmodeled = true;
+            }
             self.template_receiver_may_have_mutated = true;
         }
         let dedupe_key = (
@@ -7224,6 +7415,7 @@ impl<'a> ScanState<'a> {
             invocation.build_uses_slot_state,
             invocation.keyword_arg_names.clone(),
             template_receiver_state_unmodified,
+            template_mapping_callbacks_complete,
         );
         if self.callable_invocation_keys.contains(&dedupe_key) {
             return;
@@ -7261,6 +7453,12 @@ impl<'a> ScanState<'a> {
         if let Some(proven) = template_receiver_state_unmodified {
             details.push((
                 "template_receiver_state_unmodified".to_string(),
+                DetailValue::Bool(proven),
+            ));
+        }
+        if let Some(proven) = template_mapping_callbacks_complete {
+            details.push((
+                "template_mapping_callbacks_complete".to_string(),
                 DetailValue::Bool(proven),
             ));
         }
@@ -7878,6 +8076,9 @@ impl<'a> ScanState<'a> {
             Some(self.deadline),
         );
         nested_scan.run();
+        // Nested imports join the parent even when nested invocation rows do not.
+        // Preserve their complete execution proof before moving any child fields.
+        self.template_execution_may_be_unmodeled |= !nested_scan.template_execution_is_complete();
 
         let nested_had_findings = !nested_scan.findings.is_empty();
         let mut outcome = NestedSurfaceOutcome {
@@ -8154,8 +8355,11 @@ impl<'a> ScanState<'a> {
             );
             // Skipped padding and earlier streams may have changed process state.
             follow_on_scan.template_receiver_may_have_mutated = true;
+            follow_on_scan.template_execution_may_be_unmodeled = true;
             follow_on_scan.run();
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled |=
+                follow_on_scan.template_execution_may_be_unmodeled;
             skip_offsets_before =
                 skip_offsets_before.max(absolute_offset.saturating_add(candidate_len));
             let had_findings = !follow_on_scan.findings.is_empty();
@@ -8311,6 +8515,15 @@ impl<'a> ScanState<'a> {
                     }
                     _ => None,
                 });
+        let template_mapping_callbacks_complete =
+            details
+                .iter()
+                .find_map(|(key, value)| match (key.as_str(), value) {
+                    ("template_mapping_callbacks_complete", DetailValue::Bool(value)) => {
+                        Some(*value)
+                    }
+                    _ => None,
+                });
         Some((
             module,
             name,
@@ -8321,6 +8534,7 @@ impl<'a> ScanState<'a> {
             build_uses_slot_state,
             keyword_arg_names,
             template_receiver_state_unmodified,
+            template_mapping_callbacks_complete,
         ))
     }
 
@@ -8342,6 +8556,18 @@ impl<'a> ScanState<'a> {
         } else {
             self.verdict = ScanVerdict::Unknown;
         }
+    }
+
+    fn template_execution_is_complete(&self) -> bool {
+        !self.template_execution_may_be_unmodeled
+            && self.status.is_complete()
+            && self
+                .bytes_total
+                .map(|total| self.bytes_scanned >= total)
+                .unwrap_or(true)
+            && !self.import_references_truncated
+            && !self.callable_invocations_truncated
+            && !self.non_allowlisted_global_imports_truncated
     }
 
     pub(crate) fn to_py_report(&self, py: Python<'_>, duration_s: f64) -> PyResult<Py<PyDict>> {
@@ -8401,7 +8627,14 @@ impl<'a> ScanState<'a> {
         )?;
         let callable_invocations = PyList::empty(py);
         for invocation in &self.callable_invocations {
-            callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
+            // Serialize only the final report-wide proof, never an earlier true
+            // snapshot that a later opaque or recovered segment invalidated.
+            let mut details = invocation.clone();
+            details.push((
+                "template_execution_complete".to_string(),
+                DetailValue::Bool(self.template_execution_is_complete()),
+            ));
+            callable_invocations.append(DetailValue::Dict(details).to_py_object(py)?)?;
         }
         metadata.set_item("callable_invocations", callable_invocations)?;
         metadata.set_item(
@@ -8448,7 +8681,7 @@ fn operator_mutator_protocol_target(
     if !matches!(callable_ref.module.as_str(), "operator" | "_operator") {
         return None;
     }
-    if !matches!(args.first(), Some(StackValue::Constructed(_))) {
+    if !matches!(args.first(), Some(StackValue::Constructed { .. })) {
         return None;
     }
     match callable_ref.name.as_str() {
@@ -8491,7 +8724,7 @@ fn is_container_mutator_callable(callable_ref: &GlobalRef) -> bool {
 }
 
 fn sensitive_mutation_target(value: &StackValue) -> Option<&'static str> {
-    let (StackValue::Global(reference) | StackValue::Constructed(reference)) = value else {
+    let (StackValue::Global(reference) | StackValue::Constructed { reference, .. }) = value else {
         return None;
     };
     match (reference.module.as_str(), reference.name.as_str()) {
@@ -8584,6 +8817,449 @@ mod tests {
     };
     use crate::report::{detail_string, detail_usize};
     use std::time::Duration;
+
+    fn factoryless_defaultdict() -> StackValue {
+        StackValue::Constructed {
+            reference: GlobalRef {
+                module: "collections".to_string(),
+                name: "defaultdict".to_string(),
+                position: 0,
+                malformed: false,
+                memo_index: None,
+                memo_read: false,
+            },
+            defaultdict_without_factory: true,
+        }
+    }
+
+    #[test]
+    fn factoryless_defaultdict_retains_operator_iterator_dispatch() {
+        let options = default_test_options();
+        for arguments in [b")".as_slice(), b"N\x85".as_slice()] {
+            let mut payload = b"\x80\x04coperator\nior\nccollections\ndefaultdict\n".to_vec();
+            payload.extend_from_slice(arguments);
+            payload.extend_from_slice(
+                b"R\x940h\x00cbuiltins\niter\ncbuiltins\nhelp\n\x8c\x04stop\x86R\x86R.",
+            );
+            let scan = run_test_scan("factoryless-defaultdict-ior.pkl", &payload, &options);
+            assert!(scan.callable_invocations.iter().any(|details| {
+                detail_string(details, "module").as_deref() == Some("builtins")
+                    && detail_string(details, "name").as_deref() == Some("help")
+                    && detail_usize(details, "positional_arg_count") == Some(0)
+            }));
+        }
+    }
+
+    #[test]
+    fn constructor_provenance_survives_memo_without_blessing_unknown_aliases() {
+        let options = default_test_options();
+        let scan = ScanState::new(
+            "constructor-proof".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let known = factoryless_defaultdict();
+        let StackValue::Constructed { reference, .. } = &known else {
+            panic!("constructed fixture")
+        };
+        let unknown = StackValue::Constructed {
+            reference: reference.clone(),
+            defaultdict_without_factory: false,
+        };
+        for (value, expected) in [(&known, true), (&unknown, false), (&known, true)] {
+            let value = scan.with_memo_index(value.clone(), 7);
+            let value = ScanState::memo_value_for_stack(7, &value, true);
+            let value = ScanState::memo_read_stack_value(&value, true);
+            let StackValue::Constructed {
+                reference,
+                defaultdict_without_factory,
+            } = value
+            else {
+                panic!("memo must preserve constructed identity");
+            };
+            assert_eq!(defaultdict_without_factory, expected);
+            assert!(reference.memo_read);
+            assert_eq!(reference.memo_index, Some(7));
+        }
+        let values = [
+            StackValue::Global(reference.clone()),
+            StackValue::Tuple(Vec::new()),
+        ];
+        assert!(matches!(
+            ScanState::defaultdict_result(&values, "REDUCE"),
+            Some(StackValue::Constructed {
+                defaultdict_without_factory: true,
+                ..
+            })
+        ));
+        assert!(ScanState::defaultdict_result(&values, "NEWOBJ").is_none());
+        assert!(
+            ScanState::defaultdict_result(&[values[0].clone(), StackValue::Other], "REDUCE")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn template_lookup_proof_respects_canonical_identifier_and_error_order() {
+        for (template, substitute, safe_substitute) in [
+            ("plain", false, false),
+            ("", false, false),
+            ("$$name", false, false),
+            ("$", false, false),
+            ("$9", false, false),
+            ("${}", false, false),
+            ("${not-closed", false, false),
+            ("$x", true, true),
+            ("${_X2}", true, true),
+            ("$$$x", true, true),
+            ("$!$x", false, true),
+            ("${!$x}", false, true),
+            ("$x$!", true, true),
+            ("$é", false, false),
+        ] {
+            assert_eq!(
+                ScanState::template_has_reachable_lookup(template, false),
+                substitute,
+                "{template:?}",
+            );
+            assert_eq!(
+                ScanState::template_has_reachable_lookup(template, true),
+                safe_substitute,
+                "{template:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn template_unicode_byte_stream_preserves_lookup_proof_and_callbacks() {
+        let options = default_test_options();
+        let cases: &[(&[u8], bool)] = &[
+            (br"\u0024$x", false),
+            (br"\\u0024$x", true),
+            (br"\\\u0024$x", false),
+            (br"\\\\u0024$x", true),
+            (br"\U00000024$x", false),
+            (br"\\U00000024$x", true),
+            (br"\\\U00000024$x", false),
+            (br"\\\\U00000024$x", true),
+            (br"\ud800$x", true),
+            (br"\U0000dfff$x", true),
+            (br"\q$x", true),
+            (br"\", false),
+            (br"\u0024x", true),
+            (b"\xff$x", true),
+            (br"\u00e9$x", true),
+            (br"\U0001f40d$x", true),
+        ];
+        for method in ["Template.substitute", "Template.safe_substitute"] {
+            for (raw, lookup) in cases {
+                let mut payload = b"\x80\x04ccollections\ndefaultdict\ncbuiltins\nhelp\n\x85Rq\x000cstring\nTemplate\nV".to_vec();
+                payload.extend_from_slice(raw);
+                payload.extend_from_slice(b"\n\x85Rq\x010cstring\n");
+                payload.extend_from_slice(method.as_bytes());
+                payload.extend_from_slice(b"\nh\x01h\x00\x86R.");
+                let scan = run_test_scan("template-unicode.pkl", &payload, &options);
+                let invocation = scan
+                    .callable_invocations
+                    .iter()
+                    .find(|details| detail_string(details, "name").as_deref() == Some(method))
+                    .expect("Template invocation");
+                assert!(invocation.iter().any(|(key, value)| {
+                    key == "template_mapping_callbacks_complete"
+                        && matches!(value, DetailValue::Bool(proven) if *proven != *lookup)
+                }));
+                assert_ne!(scan.template_execution_is_complete(), *lookup);
+                let help = scan.callable_invocations.iter().any(|details| {
+                    detail_string(details, "module").as_deref() == Some("builtins")
+                        && detail_string(details, "name").as_deref() == Some("help")
+                });
+                assert_eq!(help, *lookup);
+            }
+        }
+    }
+
+    #[test]
+    fn template_reduce_byte_stream_retains_complete_mapping_metadata() {
+        let options = default_test_options();
+        for (mapping, expected) in [
+            (b"}".as_slice(), true),
+            (b"cbuiltins\nhelp\n".as_slice(), false),
+        ] {
+            let mut payload =
+                b"\x80\x04cstring\nTemplate.safe_substitute\ncstring\nTemplate\n\x8c\x02$x\x85R"
+                    .to_vec();
+            payload.extend_from_slice(mapping);
+            payload.extend_from_slice(b"\x86R.");
+            let scan = run_test_scan("template-real-reduce.pkl", &payload, &options);
+            let invocation = scan
+                .callable_invocations
+                .iter()
+                .find(|details| {
+                    detail_string(details, "name").as_deref() == Some("Template.safe_substitute")
+                })
+                .expect("real REDUCE must be recorded");
+            assert!(invocation.iter().any(|(key, value)| {
+                key == "template_mapping_callbacks_complete"
+                    && matches!(value, DetailValue::Bool(proven) if *proven == expected)
+            }));
+        }
+    }
+
+    #[test]
+    fn template_final_execution_proof_covers_direct_and_memoized_calls() {
+        let options = default_test_options();
+        for memo in [b"".as_slice(), b"q\x050h\x05".as_slice()] {
+            let mut payload = b"\x80\x04cstring\nTemplate.substitute\n".to_vec();
+            payload.extend_from_slice(memo);
+            payload.extend_from_slice(b"cstring\nTemplate\n\x8c\x05plain\x85R}\x86R.");
+            let scan = run_test_scan("template-direct-use.pkl", &payload, &options);
+            assert!(scan.template_execution_is_complete());
+            assert!(!scan.callable_invocations.is_empty());
+        }
+    }
+
+    #[test]
+    fn template_final_execution_proof_rejects_opaque_work_in_either_order() {
+        let options = default_test_options();
+        let direct = b"cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R";
+        for opaque in [
+            b"cbuiltins\nstr\n)R".as_slice(),
+            b"cre\nScanner\n]\x85R".as_slice(),
+            b"]Na".as_slice(),
+            b"N)R".as_slice(),
+        ] {
+            for opaque_first in [false, true] {
+                let mut payload = b"\x80\x04".to_vec();
+                let (first, second) = if opaque_first {
+                    (opaque, direct.as_slice())
+                } else {
+                    (direct.as_slice(), opaque)
+                };
+                payload.extend_from_slice(first);
+                payload.push(b'0');
+                payload.extend_from_slice(second);
+                payload.push(b'.');
+                let scan = run_test_scan("template-opaque-use.pkl", &payload, &options);
+                assert!(scan.template_execution_may_be_unmodeled);
+                assert!(!scan.template_execution_is_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn template_final_execution_proof_rejects_limits_and_later_streams() {
+        let options = default_test_options();
+        let direct =
+            b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R.";
+        let valid = run_test_scan("template-valid.pkl", direct, &options);
+        assert!(valid.template_execution_is_complete());
+        let opaque = b"\x80\x04cbuiltins\nstr\n)R.";
+        for separator in [b"".as_slice(), b"\xff".as_slice()] {
+            for opaque_first in [false, true] {
+                let (first, second) = if opaque_first {
+                    (opaque.as_slice(), direct.as_slice())
+                } else {
+                    (direct.as_slice(), opaque.as_slice())
+                };
+                let mut payload = first.to_vec();
+                payload.extend_from_slice(separator);
+                payload.extend_from_slice(second);
+                let scan = run_test_scan("template-later-stream.pkl", &payload, &options);
+                assert!(!scan.template_execution_is_complete());
+                for name in ["str", "Template.substitute"] {
+                    assert!(
+                        scan.callable_invocations.iter().any(|details| {
+                            detail_string(details, "name").as_deref() == Some(name)
+                        }),
+                        "both report segments must be analyzed: {name}"
+                    );
+                }
+            }
+        }
+        let mut payload = direct[..direct.len() - 1].to_vec();
+        payload.extend_from_slice(b"0N0N0N.");
+        let mut limited_options = default_test_options();
+        limited_options.max_opcodes = valid.opcode_count;
+        let limited = run_test_scan("template-limited.pkl", &payload, &limited_options);
+        assert!(!limited.status.is_complete());
+        assert!(!limited.template_execution_is_complete());
+    }
+
+    #[test]
+    fn template_nested_reports_conjoin_final_execution_proof() {
+        let options = default_test_options();
+        let direct =
+            b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R.";
+        let mut scan = run_test_scan("template-outer.pkl", direct, &options);
+        assert!(scan.template_execution_is_complete());
+        scan.surface_nested_pickle_findings(b"\x80\x04N.", "raw", 0);
+        assert!(scan.template_execution_is_complete());
+        let nested = b"\x80\x04cfunctools\npartial\ncstring\nTemplate.substitute\n\x85R.";
+        scan.surface_nested_pickle_findings(nested, "raw", 0);
+        assert!(scan.template_execution_may_be_unmodeled);
+        assert!(!scan.template_execution_is_complete());
+
+        let mut limited_options = default_test_options();
+        limited_options.max_nested_depth = 0;
+        let mut limited = run_test_scan("template-depth.pkl", direct, &limited_options);
+        assert!(limited.template_execution_is_complete());
+        let outcome = limited.surface_nested_pickle_findings(b"\x80\x04N.", "raw", 0);
+        assert!(outcome.incomplete);
+        assert!(has_notice_code(&limited, "nested_pickle_incomplete"));
+        assert!(!limited.template_execution_is_complete());
+    }
+
+    #[test]
+    fn template_execution_invalidates_before_invocation_dedupe_and_caps() {
+        let options = default_test_options();
+        let mut scan = ScanState::new(
+            "template-dedupe".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let invocation = CallableInvocation {
+            reference: GlobalRef {
+                module: "builtins".to_string(),
+                name: "str".to_string(),
+                position: 0,
+                malformed: false,
+                memo_index: None,
+                memo_read: false,
+            },
+            op_name: "REDUCE",
+            opcode_position: 0,
+            positional_arg_count: Some(0),
+            build_uses_slot_state: None,
+            keyword_arg_names: None,
+            args: Vec::new(),
+        };
+        scan.push_callable_invocation(&invocation);
+        assert!(scan.template_execution_may_be_unmodeled);
+        scan.template_execution_may_be_unmodeled = false;
+        scan.push_callable_invocation(&invocation);
+        assert!(scan.template_execution_may_be_unmodeled);
+        assert_eq!(scan.callable_invocations.len(), 1);
+        scan.template_execution_may_be_unmodeled = false;
+        scan.callable_invocations
+            .resize(MAX_IMPORT_REFERENCES, Vec::new());
+        let mut distinct = invocation;
+        distinct.reference.name = "repr".to_string();
+        scan.push_callable_invocation(&distinct);
+        assert!(scan.template_execution_may_be_unmodeled);
+        assert!(!scan.template_execution_is_complete());
+
+        scan.record_global_ref(&distinct.reference, "GLOBAL");
+        scan.import_references
+            .resize(MAX_IMPORT_REFERENCES, Vec::new());
+        scan.template_execution_may_be_unmodeled = false;
+        scan.record_global_ref(&distinct.reference, "GLOBAL");
+        assert!(scan.template_execution_may_be_unmodeled);
+    }
+
+    #[test]
+    fn template_mapping_proof_preserves_unproven_metadata_and_factory_callbacks() {
+        let options = default_test_options();
+        let mut scan = ScanState::new(
+            "template-proof".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let reference = GlobalRef {
+            module: "string".to_string(),
+            name: "Template.safe_substitute".to_string(),
+            position: 0,
+            malformed: false,
+            memo_index: None,
+            memo_read: false,
+        };
+        let mut invocation = CallableInvocation {
+            reference,
+            op_name: "REDUCE",
+            opcode_position: 0,
+            positional_arg_count: Some(2),
+            build_uses_slot_state: None,
+            keyword_arg_names: Some(Vec::new()),
+            args: vec![
+                StackValue::StringTemplate {
+                    template: "$x".to_string(),
+                },
+                factoryless_defaultdict(),
+            ],
+        };
+        assert!(scan.template_mapping_callbacks_complete(&invocation));
+        invocation.positional_arg_count = None;
+        assert!(!scan.template_mapping_callbacks_complete(&invocation));
+        invocation.positional_arg_count = Some(2);
+        // REDUCE has no keyword channel; its native metadata intentionally uses None.
+        invocation.keyword_arg_names = None;
+        assert!(scan.template_mapping_callbacks_complete(&invocation));
+        invocation.op_name = "NEWOBJ_EX";
+        assert!(!scan.template_mapping_callbacks_complete(&invocation));
+        invocation.op_name = "REDUCE";
+        invocation.keyword_arg_names = Some(vec!["unexpected".to_string()]);
+        assert!(!scan.template_mapping_callbacks_complete(&invocation));
+        invocation.keyword_arg_names = None;
+        for mapping in [
+            StackValue::Other,
+            StackValue::StringTemplate {
+                template: "$x".to_string(),
+            },
+            StackValue::Global(invocation.reference.clone()),
+            StackValue::Constructed {
+                reference: invocation.reference.clone(),
+                defaultdict_without_factory: false,
+            },
+            StackValue::TrackedDict {
+                entries: Vec::new(),
+                unknown_key_values: vec![StackValue::Other],
+                unknown_key_values_overflowed: false,
+                memo_index: None,
+            },
+        ] {
+            invocation.args[1] = mapping;
+            assert!(!scan.template_mapping_callbacks_complete(&invocation));
+        }
+        invocation.args[1] = StackValue::DefaultDict {
+            default_factory: GlobalRef {
+                module: "builtins".to_string(),
+                name: "help".to_string(),
+                position: 0,
+                malformed: false,
+                memo_index: None,
+                memo_read: false,
+            },
+        };
+        assert!(!scan.template_mapping_callbacks_complete(&invocation));
+        let callbacks = scan.template_substitute_invocations(&invocation.args, "REDUCE", 0);
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].reference.symbol(), "builtins.help");
+
+        invocation.args[1] = factoryless_defaultdict();
+        scan.push_callable_invocation(&invocation);
+        let complete = scan.callable_invocations[0].clone();
+        let mut incomplete = complete.clone();
+        for (name, value) in &mut incomplete {
+            if name == "template_mapping_callbacks_complete" {
+                *value = DetailValue::Bool(false);
+            }
+        }
+        assert_ne!(
+            ScanState::callable_invocation_detail_key(&complete),
+            ScanState::callable_invocation_detail_key(&incomplete),
+        );
+    }
 
     fn encoded_probe_limit_decoy_literal() -> String {
         let mut value = String::new();
@@ -10343,7 +11019,7 @@ mod tests {
             memo_read: false,
         });
 
-        assert!(scan.consume_top_operand_values(2).is_none());
+        assert!(scan.consume_top_operand_values(2, "REDUCE").is_none());
 
         assert_eq!(scan.stack.len(), 2);
         assert_eq!(stack_value_preview(&scan.stack[0], 0), "str:\"survivor\"");

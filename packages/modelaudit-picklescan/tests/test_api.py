@@ -126,6 +126,7 @@ from modelaudit_picklescan.call_graph import (
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
+from modelaudit_picklescan.report import _deep_mutable_copy
 
 
 class _ClearedSourceSensitiveCaches:
@@ -7557,6 +7558,74 @@ def test_scan_file_storage_reference_opcode_budget_is_aggregate(
     _assert_storage_dangerous_call(report, archive_path, "archive1/data/0")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\n",
+        b"(R not a pickle",
+        b"c\nplain text\n\xff",
+        b"configuration\nReference\nR not a pickle",
+        b"configuration\nReference\nNNR not a pickle",
+    ],
+)
+def test_scan_file_skips_license_opcode_near_matches(tmp_path: Path, payload: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/LICENSE", payload)
+
+    report = scan_file(archive_path)
+
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+@pytest.mark.parametrize("tail", [b".\xff", b"0.Microsoft.\r\n"])
+@pytest.mark.parametrize("prefix", [b"", b"I0\n"])
+def test_scan_file_routes_execution_before_malformed_license_tail(tmp_path: Path, tail: bytes, prefix: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/LICENSE", prefix + b'cbuiltins\neval\n(S"1+1"\ntR' + tail)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/LICENSE" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("import_reference") == "builtins.eval"
+        and finding.location is not None
+        and "archive/LICENSE" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("prefix", [b"I0\n", b"I0\np0\nI1\np0\n"])
+def test_scan_file_discovers_nested_payload_with_residual_stack(tmp_path: Path, prefix: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/constants", prefix + b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.")
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/constants" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and "archive/constants" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -13235,9 +13304,9 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
-def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
+def _source_fingerprint_diagnostics(source_fingerprints: collections.abc.Mapping[str, Any]) -> str:
     diagnostics: dict[str, Any] = {
-        "source_fingerprints": source_fingerprints,
+        "source_fingerprints": _deep_mutable_copy(source_fingerprints),
         "import_runtime_trusted": call_graph._interpreter_import_runtime_is_trusted(),
         "importers": [],
     }
@@ -13300,6 +13369,44 @@ def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
         except (OSError, ValueError, struct.error) as error:
             record["diagnostic_error"] = f"{type(error).__name__}: {error}"
     return json.dumps(diagnostics, indent=2)
+
+
+@pytest.mark.parametrize("cache_available", [False, True])
+def test_source_fingerprint_diagnostics_serializes_frozen_metadata(
+    monkeypatch: pytest.MonkeyPatch, cache_available: bool
+) -> None:
+    report = PickleReport(
+        source="fingerprint-diagnostic.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        private_metadata={
+            "call_graph_source_fingerprints": {
+                "reusable": False,
+                "fingerprints": {"safe.py": [1, 2]},
+                "resolution_context": {"meta_path": [["finder", 3]]},
+            }
+        },
+    )
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_is_trusted", lambda: True)
+    monkeypatch.setattr(
+        call_graph, "_runtime_path_importer_cache_without_hooks", lambda: {} if cache_available else None
+    )
+    monkeypatch.setattr(call_graph, "_runtime_search_path_without_hooks", lambda: ())
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+
+    diagnostics = json.loads(_source_fingerprint_diagnostics(source_fingerprints))
+
+    assert diagnostics == {
+        "source_fingerprints": {
+            "reusable": False,
+            "fingerprints": {"safe.py": [1, 2]},
+            "resolution_context": {"meta_path": [["finder", 3]]},
+        },
+        "import_runtime_trusted": True,
+        "importers": [],
+    }
+    assert source_fingerprints["fingerprints"]["safe.py"] == (1, 2)
+    assert source_fingerprints["resolution_context"]["meta_path"] == (("finder", 3),)
 
 
 def test_with_call_graph_findings_records_source_fingerprint_metadata(
