@@ -1763,6 +1763,7 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
         partial_path: tuple[str, ...] | None = None,
         partial_entrypoints: tuple[str, ...] = (),
+        partial_calls: tuple[str, ...] = (),
         stability_reason: str | None = None,
     ) -> None:
         super().__init__(message)
@@ -1770,6 +1771,7 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
         self.partial_path = partial_path
         self.partial_entrypoints = partial_entrypoints
+        self.partial_calls = partial_calls
         # Which snapshot gate invalidated the run, reported without changing the message text.
         self.stability_reason = stability_reason
 
@@ -6268,7 +6270,7 @@ def _find_matching_call_path(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            calls = error.partial_calls
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6353,7 +6355,7 @@ def _find_short_matching_call_path(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            calls = error.partial_calls
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6393,13 +6395,18 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
     calls = analysis.calls_by_function.get(f"{module_name}.{qualified_name}")
     if calls is None:
         return None
-    if (
-        any(call.startswith("string.Template.pattern.") for call in calls)
-        and module_name == "string"
-        and _template_uses_reviewed_lazy_pattern()
-        and not _template_has_trusted_compiled_pattern()
-    ):
-        calls = (*calls, "string.Template._compile_pattern")
+    try:
+        if (
+            any(call.startswith("string.Template.pattern.") for call in calls)
+            and module_name == "string"
+            and _template_uses_reviewed_lazy_pattern()
+            and not _template_has_trusted_compiled_pattern()
+        ):
+            calls = (*calls, "string.Template._compile_pattern")
+    except _CallGraphAnalysisLimitError as error:
+        raise _CallGraphAnalysisLimitError(
+            str(error), partial_calls=calls, stability_reason=error.stability_reason
+        ) from error
     return calls
 
 

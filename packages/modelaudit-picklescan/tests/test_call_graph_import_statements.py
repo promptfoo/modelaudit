@@ -10042,6 +10042,114 @@ finally:
     assert marker.read_text() == "keyword-import-called"
 
 
+@pytest.mark.parametrize("walker", ["main", "short"])
+@pytest.mark.parametrize("edge", ["rce", "import", "ignored-import"])
+def test_call_graph_walkers_preserve_partial_calls_with_coverage_error(
+    monkeypatch: pytest.MonkeyPatch, walker: str, edge: str
+) -> None:
+    sink = "builtins.eval" if edge == "rce" else "builtins.__import__"
+
+    def calls_for(function_name: str) -> tuple[str, ...]:
+        if function_name == "entry":
+            raise call_graph._CallGraphAnalysisLimitError("incomplete node", partial_calls=(sink,))
+        return ()
+
+    monkeypatch.setattr(call_graph, "_calls_for_function", calls_for)
+    monkeypatch.setattr(call_graph, "_resolve_function_target", lambda name: name)
+    ignored = "entry" if edge == "ignored-import" else None
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="incomplete node") as caught:
+        if walker == "main":
+            call_graph._find_matching_call_path(
+                "entry",
+                call_graph._rce_sink,
+                import_execution_fallback_allowed=True,
+                ignored_direct_import_from=ignored,
+            )
+        else:
+            call_graph._find_short_matching_call_path(
+                "entry",
+                call_graph._rce_sink,
+                ignored_direct_import_from=ignored,
+            )
+    expected = ("entry", sink) if edge == "rce" or (walker == "main" and edge == "import") else None
+    assert caught.value.partial_path == expected
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template keyword imports are deferred in Python 3.14")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_template_pattern_authentication_error_retains_partial_keyword_import(tmp_path: Path, method_name: str) -> None:
+    method = _global_operand("string", method_name)
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$value")) + b"R"
+    keywords = b"}" + _unicode_operand("value") + _unicode_operand("mapped") + b"s"
+    partial = _global_operand("functools", "partial") + _args_tuple(method) + b"R"
+    state = _args_tuple(method, _args_tuple(receiver, b"}"), keywords, b"N")
+    payload = b"\x80\x04" + partial + state + b"b)R."
+    control_receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain text")) + b"R"
+    control_payload = b"\x80\x04" + method + _args_tuple(control_receiver, b"}") + b"R."
+    marker = tmp_path / "custom_pattern_keyword_marker"
+    child_code = """
+import collections
+import functools
+import pickle
+import re
+import string
+import sys
+from pathlib import Path
+
+string.Template.pattern = re.compile("nomatch")
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, Severity, scan_bytes
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+control_payload = bytes.fromhex(sys.argv[3])
+method_name = sys.argv[4]
+original_chainmap = collections.ChainMap
+
+def observed_chainmap(*maps):
+    marker.write_text("keyword-import-called")
+    return original_chainmap(*maps)
+
+collections.ChainMap = observed_chainmap
+try:
+    control = scan_bytes(control_payload)
+    assert control.status == ScanStatus.INCONCLUSIVE, control
+    assert control.verdict in {SafetyVerdict.UNKNOWN, SafetyVerdict.SUSPICIOUS}, control
+    assert any("cached string.Template runtime" in error.message for error in control.errors), control
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in control.findings), control
+    assert control.metadata["callable_invocations"], control
+    assert all(item.get("template_execution_complete") is True
+               for item in control.metadata["callable_invocations"]), control
+    assert not marker.exists()
+    assert pickle.loads(control_payload) == "plain text"
+    assert not marker.exists()
+
+    report = scan_bytes(payload)
+    assert not marker.exists(), "scanning executed the keyword import target"
+    assert any(item.get("module") == "functools" and item.get("name") == "partial.__call__"
+               for item in report.metadata["callable_invocations"]), report
+    assert not any(item.get("module") == "string" and item.get("name") == method_name
+                   for item in report.metadata["callable_invocations"]), report
+    assert pickle.loads(payload) == "$value"
+    assert marker.read_text() == "keyword-import-called"
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert report.verdict == SafetyVerdict.MALICIOUS, report
+    assert any("cached string.Template runtime" in error.message for error in report.errors), report
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("call_path") == ("string." + method_name, "builtins.__import__")
+        for finding in report.findings
+    ), report
+finally:
+    collections.ChainMap = original_chainmap
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [sys.executable, "-c", child_code, str(marker), payload.hex(), control_payload.hex(), method_name],
+    )
+    assert marker.read_text() == "keyword-import-called"
+
+
 def test_first_matching_path_preserves_later_partial_sink_after_earlier_limit() -> None:
     expected = ("second", "builtins.eval")
 
@@ -10112,9 +10220,27 @@ sys.path.insert(0, str(module_dir))
 
 control = scan_bytes(control_payload)
 assert control.status == ScanStatus.INCONCLUSIVE, control
-assert control.verdict in {SafetyVerdict.UNKNOWN, SafetyVerdict.SUSPICIOUS}, control
 assert any("cached string.Template runtime" in error.message for error in control.errors), control
-assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in control.findings), control
+control_paths = [
+    finding.details.get("call_path")
+    for finding in control.findings
+    if finding.rule_code == "DANGEROUS_CALL_GRAPH"
+]
+if method_name in {"Template.substitute", "Template.safe_substitute"}:
+    expected_control_path = [f"{module_name}.safe_entry"]
+    if shape == "wrapped":
+        expected_control_path.append(f"{module_name}.safe_wrapped")
+    expected_control_path.extend(("string." + method_name, "builtins.__import__"))
+    assert control.verdict == SafetyVerdict.MALICIOUS, control
+    assert control_paths == [tuple(expected_control_path)], control
+    assert all(
+        finding.severity == Severity.CRITICAL
+        for finding in control.findings
+        if finding.rule_code == "DANGEROUS_CALL_GRAPH"
+    ), control
+else:
+    assert control.verdict in {SafetyVerdict.UNKNOWN, SafetyVerdict.SUSPICIOUS}, control
+    assert control_paths == [], control
 assert not marker.exists()
 assert pickle.loads(control_payload) == "safe"
 assert not marker.exists()
