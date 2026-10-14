@@ -7556,6 +7556,48 @@ def test_scan_file_storage_reference_opcode_budget_is_aggregate(
     _assert_storage_dangerous_call(report, archive_path, "archive1/data/0")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [b"Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\n", b"(R not a pickle", b"c\nplain text\n\xff"],
+)
+def test_scan_file_skips_license_opcode_near_matches(tmp_path: Path, payload: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/LICENSE", payload)
+
+    report = scan_file(archive_path)
+
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+@pytest.mark.parametrize("tail", [b"\xff", b"0.Microsoft.\r\n"])
+def test_scan_file_routes_execution_before_malformed_license_tail(tmp_path: Path, tail: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/LICENSE", b'cbuiltins\neval\n(S"1+1"\ntR' + tail)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/LICENSE" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("import_reference") == "builtins.eval"
+        and finding.location is not None
+        and "archive/LICENSE" in finding.location
+        for finding in report.findings
+    )
+    if tail == b"\xff":
+        assert report.status != ScanStatus.COMPLETE
+
+
 def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:

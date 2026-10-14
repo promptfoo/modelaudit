@@ -3652,13 +3652,27 @@ def test_detect_file_format_license_opcode_collision_is_not_pickle(
 
 
 @pytest.mark.parametrize("filename", ["LICENSE", "README.md", "notes.txt"])
-def test_detect_file_format_text_named_pickle_with_malformed_tail_still_routes(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'cos\nsystem\n(S"echo regression"\ntR0.Microsoft.\r\n',
+        b'cbuiltins\neval\n(S"1+1"\ntR\xff',
+    ],
+)
+def test_detect_file_format_text_named_pickle_with_malformed_tail_still_routes(
+    tmp_path: Path, filename: str, payload: bytes
+) -> None:
     document = tmp_path / filename
-    document.write_bytes(b'cos\nsystem\n(S"echo regression"\ntR0.Microsoft.\r\n')
+    document.write_bytes(payload)
 
     assert detect_file_format(str(document)) == "pickle"
     assert detect_file_format_from_magic(str(document)) == "pickle"
     assert detect_file_format_for_skip_filter(str(document)) == "pickle"
+
+
+@pytest.mark.parametrize("payload", [b"(R not a pickle", b"c\nplain text\n\xff", b"cbuiltins\neval\nN."])
+def test_proto0_probe_keeps_opcode_budget(payload: bytes) -> None:
+    assert not file_detection._looks_like_proto0_or_1_pickle(payload, max_probe_opcodes=1)
 
 
 def test_detect_file_format_proto1_scalar_with_trailing_text_not_pickle(tmp_path: Path) -> None:

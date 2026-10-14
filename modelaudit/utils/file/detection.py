@@ -4281,9 +4281,16 @@ def _looks_like_proto0_or_1_pickle(
         opcode_count = 0
         has_non_trivial_opcode = False
         has_security_opcode = False
+        has_initial_global = False
+        has_initial_global_call = False
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
+                if opcode_count == 1 and opcode.name == "GLOBAL" and isinstance(_arg, str):
+                    module, _, name = _arg.partition(" ")
+                    has_initial_global = bool(module and name)
+                if has_initial_global and opcode.name in {"REDUCE", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST"}:
+                    has_initial_global_call = True
                 if opcode.name == "STOP":
                     stop_pos = 0 if _pos is None else _pos
                     if not has_security_opcode:
@@ -4317,7 +4324,9 @@ def _looks_like_proto0_or_1_pickle(
                     return False
         except ValueError as exc:
             exc_message = str(exc)
-            return (
+            # Preserve an initial global's invocation before a later parse error.
+            # A global-like string alone is not enough for nested byte discovery.
+            return has_initial_global_call or (
                 sample_is_prefix
                 and opcode_count >= 2
                 and has_non_trivial_opcode
@@ -4326,7 +4335,7 @@ def _looks_like_proto0_or_1_pickle(
                 )
             )
         except Exception:
-            return False
+            return has_initial_global_call
         # A cleanly parsed prefix without STOP at the probe boundary is only a
         # pickle indicator when a non-trivial opcode has already appeared. This
         # avoids routing large plain-text files made of scalar opcode lookalikes
