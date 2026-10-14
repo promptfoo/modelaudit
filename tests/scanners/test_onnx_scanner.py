@@ -39448,3 +39448,195 @@ class TestOnnxEinsumEquationBudgets:
             prior_weights,
             coverage_reason=reason,
         )
+
+
+class TestOnnxReplayRuntimeInputTypes:
+    @staticmethod
+    def _model(scope: str, order: str) -> tuple[Any, Any, Any]:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        sources = [f"replacement_{index}" for index in range(33)]
+        arrays: dict[str, Any] = {
+            "two": np.int64(2),
+            "condition": np.bool_(True),
+            **{name: np.ones((2, 2), np.int64) for name in sources},
+        }
+        function_scope = scope in {"function", "function_unknown"}
+        operands = ["D", "state"] if order == "left" else ["state", "D"]
+        consumer_nodes = [
+            helper.make_node("Add", operands, ["weight"]),
+            helper.make_node("MatMul", ["X", "weight"], ["body_y"]),
+        ]
+        functions = []
+        if function_scope:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Consume",
+                    ["state", "D", "X"],
+                    ["body_y"],
+                    consumer_nodes,
+                    [helper.make_opsetid("", 18)],
+                )
+            )
+            consumer_nodes = [helper.make_node("Consume", ["state", "D", "X"], ["body_y"], domain="local")]
+        if scope == "producer_shadow":
+            # Establish a schema-valid oracle before introducing the malformed
+            # shadow and unknown Cast target in the scanned fixture.
+            for node in consumer_nodes:
+                for index, name in enumerate(node.input):
+                    if name == "D":
+                        node.input[index] = "local_bias"
+            consumer_nodes.insert(0, helper.make_node("Cast", ["other_bias"], ["local_bias"], to=TensorProto.INT64))
+        elif scope == "function_unknown":
+            consumer_nodes = [
+                helper.make_node("Consume", ["state", "D", "X"], ["known_integer_y"], domain="local"),
+                helper.make_node("Cast", ["other_bias"], ["unknown_bias"], to=TensorProto.INT64),
+                helper.make_node("Consume", ["state", "unknown_bias", "X"], ["body_y"], domain="local"),
+            ]
+        previous = sources[0]
+        replacements = []
+        for index, name in enumerate(sources[1:], 1):
+            output = "next_state" if index == len(sources) - 1 else f"sum_{index}"
+            replacements.append(helper.make_node("Add", [previous, name], [output]))
+            previous = output
+        body = helper.make_graph(
+            [
+                *consumer_nodes,
+                *replacements,
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "runtime_input_type_body",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", [2, 2], TensorProto.INT64),
+            ],
+            [
+                value("condition_out", [], TensorProto.BOOL),
+                value("next_state", [2, 2], TensorProto.INT64),
+            ],
+        )
+        loop = helper.make_node("Loop", ["two", "condition", "initial"], ["final"], body=body)
+        main_nodes = [loop]
+        if scope == "outer_function":
+            outer_inputs = ["initial", "D", "X", "two", "condition", *sources]
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Outer",
+                    outer_inputs,
+                    ["final"],
+                    [loop],
+                    [helper.make_opsetid("", 18)],
+                )
+            )
+            main_nodes = [helper.make_node("Outer", outer_inputs, ["final"], domain="local")]
+        elif scope == "lexical":
+            branch = helper.make_graph([loop], "type_capture_branch", [], [value("final", [2, 2], TensorProto.INT64)])
+            main_nodes = [helper.make_node("If", ["condition"], ["final"], then_branch=branch, else_branch=branch)]
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node("MatMul", ["A", "prior"], ["known"]), *main_nodes],
+                "runtime_input_type_scope",
+                [
+                    value("A", [1, 64]),
+                    value("initial", [2, 2], TensorProto.INT64),
+                    value("X", [1, 2], TensorProto.INT64),
+                    value("D", [2, 2], TensorProto.INT64),
+                    value("other_bias", [2, 2], TensorProto.INT64),
+                ],
+                [value("known", [1, 64]), value("final", [2, 2], TensorProto.INT64)],
+                initializer=[tensor("prior", prior_weights), *[tensor(name, data) for name, data in arrays.items()]],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+
+        def loop_body(graph: Any) -> Any:
+            for node in graph.node:
+                if node.op_type == "Loop":
+                    return next(attribute.g for attribute in node.attribute if attribute.name == "body")
+                for attribute in node.attribute:
+                    if attribute.type == onnx.AttributeProto.GRAPH:
+                        found = loop_body(attribute.g)
+                        if found is not None:
+                            return found
+            return None
+
+        runtime_body = deepcopy(loop_body(inlined.graph))
+        assert runtime_body is not None
+        runtime_consumer = [node for node in runtime_body.node if node.op_type == "MatMul"][-1]
+        runtime_body.output.append(value(runtime_consumer.output[0], [1, 2], TensorProto.INT64))
+        state = np.zeros((2, 2), np.int64)
+        x = np.ones((1, 2), np.int64)
+        evaluator = ReferenceEvaluator(runtime_body, opsets={"": 18})
+        for iteration in range(2):
+            actual: Any = evaluator.run(
+                None,
+                {
+                    **arrays,
+                    runtime_body.input[0].name: np.int64(iteration),
+                    runtime_body.input[1].name: np.bool_(True),
+                    runtime_body.input[2].name: state,
+                    "X": x,
+                    "D": np.ones((2, 2), np.int64),
+                    "other_bias": np.ones((2, 2), np.int64),
+                },
+            )
+            np.testing.assert_array_equal(actual[2], x @ (state + 1))
+            np.testing.assert_array_equal(actual[1], sum(arrays[name] for name in sources))
+            state = actual[1]
+        return model, loop_body(model.graph), prior_weights
+
+    @pytest.mark.parametrize("scope", ["direct", "function", "outer_function", "lexical"])
+    @pytest.mark.parametrize("order", ["left", "right"])
+    def test_finite_replay_uses_scoped_runtime_input_types(self, tmp_path: Path, scope: str, order: str) -> None:
+        model, _body, prior_weights = self._model(scope, order)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, False, prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+
+    @pytest.mark.parametrize("scope", ["producer_shadow", "function_unknown", "missing_root_type"])
+    @pytest.mark.parametrize("order", ["left", "right"])
+    def test_finite_replay_does_not_reuse_shadowed_or_unknown_input_types(
+        self, tmp_path: Path, scope: str, order: str
+    ) -> None:
+        model, body, prior_weights = self._model(scope, order)
+        assert body is not None
+        if scope == "missing_root_type":
+            next(value for value in model.graph.input if value.name == "D").type.tensor_type.elem_type = 0
+            body.value_info.append(helper.make_tensor_value_info("D", TensorProto.INT64, [2, 2]))
+        else:
+            cast = next(node for node in body.node if node.op_type == "Cast")
+            next(attribute for attribute in cast.attribute if attribute.name == "to").i = 999
+            if scope == "producer_shadow":
+                cast.output[0] = "D"
+                for node in body.node:
+                    for index, name in enumerate(node.input):
+                        if name == "local_bias":
+                            node.input[index] = "D"
+            body.value_info.append(helper.make_tensor_value_info(cast.output[0], TensorProto.INT64, [2, 2]))
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, True, prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+
+    @pytest.mark.parametrize("scope", ["direct", "outer_function"])
+    def test_runtime_input_type_budget_failure_preserves_coverage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str
+    ) -> None:
+        model, _body, prior_weights = self._model(scope, "left")
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_RUNTIME_INPUT_TYPE_WORK_LIMIT", 0)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, True, prior_weights, coverage_reason="lineages_per_value_limit"
+        )

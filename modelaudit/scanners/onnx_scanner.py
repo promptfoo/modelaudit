@@ -175,6 +175,7 @@ _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
 _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_RUNTIME_INPUT_TYPE_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
 _ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_EINSUM_EQUATION_BYTE_LIMIT = 4 * _ONNX_STRUCTURE_STRING_MAX_BYTES
@@ -7257,6 +7258,27 @@ def _build_onnx_weight_analysis_plan(
                 schema_cache[key] = False
         return schema_cache[key]
 
+    runtime_input_type_work_remaining = _ONNX_RUNTIME_INPUT_TYPE_WORK_LIMIT
+
+    def reserve_runtime_input_type_work(work: int) -> bool:
+        nonlocal runtime_input_type_work_remaining
+        if work > runtime_input_type_work_remaining:
+            return False
+        runtime_input_type_work_remaining -= work
+        return True
+
+    def runtime_type_producer_names(current_graph: Any) -> set[str] | None:
+        nodes = getattr(current_graph, "node", ())
+        if not reserve_runtime_input_type_work(1 + len(nodes)):
+            return None
+        produced: set[str] = set()
+        for current_node in nodes:
+            outputs = getattr(current_node, "output", ())
+            if not reserve_runtime_input_type_work(len(outputs)):
+                return None
+            produced.update(name for name in outputs if name)
+        return produced
+
     def walk_graph(
         current_graph: Any,
         inherited_lineages: dict[str, dict[int, _OnnxWeightLineage]],
@@ -7288,6 +7310,8 @@ def _build_onnx_weight_analysis_plan(
         bound_value_ranks: dict[str, int] | None = None,
         bound_unknown_value_ranks: set[str] | None = None,
         bound_proven_value_ranks: set[str] | None = None,
+        inherited_runtime_input_type: Callable[[str], int | None] | None = None,
+        bound_runtime_input_types: Mapping[str, int | None] | None = None,
         bound_attributes: dict[str, Any] | None = None,
         bound_attribute_keys: dict[str, tuple[Any, ...]] | None = None,
         function_depth: int = 0,
@@ -7333,6 +7357,9 @@ def _build_onnx_weight_analysis_plan(
         inherited_rank_promotable_lineage_limit_gap_summaries = (
             inherited_rank_promotable_lineage_limit_gap_summaries or {}
         )
+        # Optional type proofs have their own aggregate admission. An incomplete
+        # shadow inventory disables the whole scope rather than trusting a prefix.
+        runtime_type_shadow_names = runtime_type_producer_names(current_graph)
         if root_graph:
             value_lineages = dict(inherited_lineages)
             constants = dict(inherited_constants)
@@ -7408,6 +7435,21 @@ def _build_onnx_weight_analysis_plan(
         known_value_shapes: dict[str, tuple[int, ...]] = {}
         known_value_ranks: dict[str, int] = {}
         proven_value_ranks: set[str] = set()
+        runtime_input_types: dict[str, int | None] = {}
+        formal_runtime_input_types = bound_runtime_input_types or {}
+
+        def trusted_runtime_input_type(name: str) -> int | None:
+            # A producer shadows declarations and formal bindings even if a
+            # selective replay does not visit that producer.
+            if runtime_type_shadow_names is None or name in runtime_type_shadow_names:
+                return None
+            if name in runtime_input_types:
+                return runtime_input_types[name]
+            if name in formal_runtime_input_types:
+                return formal_runtime_input_types[name]
+            if root_graph or name in declared_names or inherited_runtime_input_type is None:
+                return None
+            return inherited_runtime_input_type(name)
 
         def set_known_value_shape(name: str, shape: tuple[int, ...], *, proven: bool) -> None:
             bounded_shape = inferred_shape(len(shape), shape)
@@ -7481,8 +7523,24 @@ def _build_onnx_weight_analysis_plan(
                 )
             )
 
+        admit_runtime_inputs = (
+            current_graph is graph
+            and source_scope == ("root_graph",)
+            and runtime_type_shadow_names is not None
+            and reserve_runtime_input_type_work(1 + len(getattr(current_graph, "input", ())))
+        )
         for value_info in getattr(current_graph, "input", ()):
             name = _onnx_value_name(value_info)
+            if admit_runtime_inputs and name:
+                # Only the model's actual runtime inputs are authoritative;
+                # training/body/intermediate annotations are not type proofs.
+                data_type = None
+                value_type = getattr(value_info, "type", None)
+                if value_type is not None and _onnx_has_singular_field(value_type, "tensor_type"):
+                    candidate_type = int(value_type.tensor_type.elem_type)
+                    if valid_cast_data_type(candidate_type):
+                        data_type = candidate_type
+                runtime_input_types[name] = None if name in runtime_input_types else data_type
             shape = value_info_shape(value_info, preserve_unknown=root_graph)
             if name and shape is not None:
                 set_known_value_shape(name, shape, proven=root_graph)
@@ -8859,6 +8917,7 @@ def _build_onnx_weight_analysis_plan(
                             replay_constants: Mapping[str, Any],
                             attribute_resolver: Callable[[Any], Any | None],
                             standard_operator: bool,
+                            context_data_type: Callable[[str], int | None],
                         ) -> int | None:
                             if not standard_operator:
                                 return None
@@ -8906,7 +8965,11 @@ def _build_onnx_weight_analysis_plan(
                                     data_type = data_types[input_name]
                                 else:
                                     constant = replay_constants.get(input_name)
-                                    data_type = int(constant.data_type) if constant is not None else None
+                                    data_type = (
+                                        int(constant.data_type)
+                                        if constant is not None
+                                        else context_data_type(input_name)
+                                    )
                                 if data_type is None:
                                     return None
                                 known_types.add(data_type)
@@ -8915,6 +8978,21 @@ def _build_onnx_weight_analysis_plan(
                         context_shapes = related_input_shapes or {}
                         external_shape_names = graph_external_reference_names(subgraph, attribute_bindings)
                         if dependency_names_exceeded_limit(external_shape_names):
+                            return None
+
+                        def known_input_data_type(input_name: str) -> int | None:
+                            if input_name in tainted_data_types:
+                                return tainted_data_types[input_name]
+                            constant = subgraph_constants.get(input_name)
+                            if constant is not None:
+                                return int(constant.data_type)
+                            if input_name in external_shape_names:
+                                return trusted_runtime_input_type(input_name)
+                            return None
+
+                        def external_input_data_type(input_name: str) -> int | None:
+                            if input_name in external_shape_names:
+                                return trusted_runtime_input_type(input_name)
                             return None
 
                         def known_input_shape(input_name: str) -> tuple[int, ...] | None:
@@ -9043,13 +9121,16 @@ def _build_onnx_weight_analysis_plan(
                             function_attributes: dict[str, Any],
                             function_constants: dict[str, Any],
                             function_context_shapes: dict[str, tuple[int, ...]],
+                            function_context_data_types: Mapping[str, int | None],
                             output_shapes_out: dict[str, tuple[int, ...]] | None = None,
                             input_data_type: int | None = None,
                             output_data_types_out: dict[str, int | None] | None = None,
                         ) -> bool | None:
                             nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
                             if not reserve_exact_loop_replay_traversal(
-                                function_graph, len(function_constants), len(function_context_shapes)
+                                function_graph,
+                                len(function_constants),
+                                len(function_context_shapes) + len(function_context_data_types),
                             ):
                                 return None
                             weight_dependency_names = subgraph_potential_weight_consumer_dependency_names(
@@ -9094,10 +9175,18 @@ def _build_onnx_weight_analysis_plan(
                             if dependency_names_exceeded_limit(weight_dependency_names):
                                 return None
                             live_node_ids = graph_nodes_producing_names(function_graph, weight_dependency_names)
+                            function_producers = graph_output_producer_nodes_by_name(function_graph)
+                            if function_input_name in function_producers:
+                                return None
                             local_tainted_shapes: dict[str, tuple[int, ...] | None] = {
                                 function_input_name: function_input_shape
                             }
                             local_data_types: dict[str, int | None] = {function_input_name: input_data_type}
+
+                            def function_context_data_type(input_name: str) -> int | None:
+                                if input_name in function_producers:
+                                    return None
+                                return function_context_data_types.get(input_name)
 
                             def function_attribute(attribute: Any) -> Any | None:
                                 reference = str(getattr(attribute, "ref_attr_name", ""))
@@ -9313,6 +9402,7 @@ def _build_onnx_weight_analysis_plan(
                                         function_constants,
                                         function_attribute,
                                         function_standard_domain and is_registered_standard_operator,
+                                        function_context_data_type,
                                     )
                                     local_tainted_shapes[output_name] = output_shape
                             if output_shapes_out is not None:
@@ -9475,7 +9565,7 @@ def _build_onnx_weight_analysis_plan(
                                     if reference_names is None or len(getattr(nested_graph, "input", ())) != 2:
                                         return None
                                     if not reserve_exact_loop_replay_traversal(
-                                        nested_graph, len(subgraph_constants), len(reference_names)
+                                        nested_graph, len(subgraph_constants), 2 * len(reference_names)
                                     ):
                                         return None
                                     if referenced_function_attributes(nested_graph) != frozenset():
@@ -9484,6 +9574,9 @@ def _build_onnx_weight_analysis_plan(
                                         name: shape
                                         for name in reference_names
                                         if (shape := known_input_shape(name)) is not None
+                                    }
+                                    captured_data_types = {
+                                        name: known_input_data_type(name) for name in reference_names
                                     }
                                     nested_constants = graph_initializer_constants(
                                         nested_graph, subgraph_constants, attribute_bindings=attribute_bindings
@@ -9501,6 +9594,7 @@ def _build_onnx_weight_analysis_plan(
                                                 {},
                                                 nested_constants,
                                                 captured_shapes,
+                                                captured_data_types,
                                                 input_data_type=tainted_data_types.get(captured_name),
                                             )
                                         )
@@ -9522,6 +9616,9 @@ def _build_onnx_weight_analysis_plan(
                                 )
                                 function_constants.update(function_bound_input_constants)
                                 function_context_shapes: dict[str, tuple[int, ...]] = {}
+                                function_context_data_types: dict[str, int | None] = {}
+                                # The actual-input walk was charged above; retain only
+                                # this call's explicit bindings, never a global map copy.
                                 for input_index, input_name in enumerate(function_actuals):
                                     if input_index >= len(getattr(function, "input", ())):
                                         continue
@@ -9529,6 +9626,12 @@ def _build_onnx_weight_analysis_plan(
                                     input_shape = known_input_shape(input_name)
                                     if function_input_name and input_shape is not None:
                                         function_context_shapes[function_input_name] = input_shape
+                                    if function_input_name:
+                                        function_context_data_types[function_input_name] = (
+                                            None
+                                            if function_input_name in function_context_data_types
+                                            else known_input_data_type(input_name)
+                                        )
                                 function_output_shapes: dict[str, tuple[int, ...]] = {}
                                 function_output_data_types: dict[str, int | None] = {}
                                 for input_index, input_name in enumerate(function_actuals):
@@ -9559,6 +9662,7 @@ def _build_onnx_weight_analysis_plan(
                                         function_attributes,
                                         function_constants,
                                         function_context_shapes,
+                                        function_context_data_types,
                                         function_output_shapes if node_is_live_for_output else None,
                                         tainted_data_types.get(input_name),
                                         function_output_data_types if node_is_live_for_output else None,
@@ -9726,6 +9830,7 @@ def _build_onnx_weight_analysis_plan(
                                     subgraph_constants,
                                     resolve_attribute,
                                     standard_operator,
+                                    external_input_data_type,
                                 )
                                 tainted_shapes[output_name] = output_shape
                         return False, tainted_shapes.get(graph_output_name) if graph_output_name else None
@@ -10904,6 +11009,7 @@ def _build_onnx_weight_analysis_plan(
                             bound_value_ranks=subgraph_bound_value_ranks,
                             bound_unknown_value_ranks=subgraph_bound_unknown_value_ranks,
                             bound_proven_value_ranks=subgraph_bound_proven_value_ranks,
+                            inherited_runtime_input_type=trusted_runtime_input_type,
                             bound_attributes=attribute_bindings,
                             bound_attribute_keys=attribute_binding_keys,
                             function_depth=function_depth,
@@ -11109,6 +11215,7 @@ def _build_onnx_weight_analysis_plan(
                 function_bound_value_ranks: dict[str, int] = {}
                 function_bound_unknown_value_ranks: set[str] = set()
                 function_bound_proven_value_ranks: set[str] = set()
+                function_bound_runtime_input_types: dict[str, int | None] = {}
                 function_source_scope = ("function", *function_key)
                 function_bound_attributes, function_bound_attribute_keys = default_function_attribute_maps(function)
                 referenced_attributes = referenced_function_attributes(function)
@@ -11138,9 +11245,16 @@ def _build_onnx_weight_analysis_plan(
                     else:
                         function_bound_attributes.pop(attribute_name, None)
                         function_bound_attribute_keys.pop(attribute_name, None)
+                admit_runtime_bindings = reserve_runtime_input_type_work(1 + min(len(node.input), len(function.input)))
                 for parent_input, function_input in zip(node.input, function.input, strict=False):
                     parent_name = str(parent_input)
                     function_input_name = _onnx_value_name(function_input)
+                    if admit_runtime_bindings:
+                        function_bound_runtime_input_types[function_input_name] = (
+                            None
+                            if function_input_name in function_bound_runtime_input_types
+                            else trusted_runtime_input_type(parent_name)
+                        )
                     if parent_name in value_lineages:
                         function_bound_lineages[function_input_name] = value_lineages[parent_name]
                     if parent_name in constants:
@@ -11217,6 +11331,8 @@ def _build_onnx_weight_analysis_plan(
                         bound_value_ranks=function_bound_value_ranks,
                         bound_unknown_value_ranks=function_bound_unknown_value_ranks,
                         bound_proven_value_ranks=function_bound_proven_value_ranks,
+                        inherited_runtime_input_type=(trusted_runtime_input_type if admit_runtime_bindings else None),
+                        bound_runtime_input_types=function_bound_runtime_input_types,
                         bound_attributes=function_bound_attributes,
                         bound_attribute_keys=function_bound_attribute_keys,
                         function_depth=function_depth + 1,
