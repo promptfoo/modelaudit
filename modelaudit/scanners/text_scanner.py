@@ -167,6 +167,8 @@ DOCUMENTATION_BARE_DOMAIN_TLDS = frozenset(
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
+MAX_TEXT_FENCE_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
+MAX_TEXT_FENCE_MARKERS = 128
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
@@ -746,13 +748,16 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"|\b(?:detect(?:ing|ion|s)?|mitigat(?:e|ing|ion)|resistan(?:ce|t)|robust(?:ness)?)\s+"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\b"
-    rb"|\b"
+    rb")",
+    re.IGNORECASE,
+)
+BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
+    rb"\b"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\s+(?:production|generation|creation)\s+(?:may|might|could)\s+be\s+possible\b"
     rb"(?=[.;]?\s*$|[.;]\s*review\s+generated\s+outputs\.?\s*$"
     rb"|,\s*and\s+developers\s+should\s+ensure\s+that\s+their\s+applications\s+do\s+not\s+violate\s+"
-    rb"applicable\s+laws\s+and\s+regulations\.?\s*$)"
-    rb")",
+    rb"applicable\s+laws\s+and\s+regulations\.?\s*$)",
     re.IGNORECASE,
 )
 GENERIC_CC_PROSE_PATTERNS = frozenset({"backdoor", "botnet", "malware", "trojan", "zombie"})
@@ -1280,7 +1285,11 @@ class TextScanner(BaseScanner):
             return False
         context_prefix, link_start = context
         line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
-        if len(line_prefix) >= MAX_TEXT_FINDING_CONTEXT_BYTES and not line_prefix.strip():
+        if (
+            len(line_prefix) >= MAX_TEXT_FINDING_CONTEXT_BYTES
+            and not line_prefix.strip()
+            and cls._documentation_assignment_is_actionable(context_prefix.rstrip())
+        ):
             return False
         passive_line_markdown_link = cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix)
         literal_value_prefix = cls._documentation_markdown_link_leading_prefix_is_literal_value(line_prefix)
@@ -2047,26 +2056,29 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_last_closed_fence_end(cls, payload: bytes, start: int, end: int) -> int:
-        if start:
-            # A truncated window cannot distinguish an opener from an earlier fence's closer.
+        if end > MAX_TEXT_FENCE_CONTEXT_BYTES:
             return start
         cursor = 0
         boundary = 0
         opening: bytes | None = None
-        for line in payload[cursor:end].splitlines(keepends=True):
+        markers = 0
+        for line in payload[:end].splitlines(keepends=True):
             fence = re.fullmatch(rb" {0,3}(`{3,}|~{3,})([^\r\n]*)\r?\n?", line)
             if fence is not None:
+                markers += 1
+                if markers > MAX_TEXT_FENCE_MARKERS:
+                    return start
                 delimiter, info = fence.groups()
                 if opening is None:
                     if (delimiter[:1] != b"`" or b"`" not in info) and not cls._documentation_prefix_has_enclosing_call(
-                        payload[boundary:cursor]
+                        payload[max(boundary, cursor - MAX_TEXT_FINDING_CONTEXT_BYTES) : cursor]
                     ):
                         opening = delimiter
                 elif delimiter[:1] == opening[:1] and len(delimiter) >= len(opening) and not info.strip():
                     boundary = cursor + len(line)
                     opening = None
             cursor += len(line)
-        return boundary
+        return max(start, boundary)
 
     @classmethod
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
@@ -2407,8 +2419,19 @@ class TextScanner(BaseScanner):
         line, position = line_parts
         if cls._documentation_shell_comment_before_position(line, position):
             return True
-        return not cls._documentation_line_is_code_shaped(line, position) and any(
-            match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_CC_PATTERN.finditer(line)
+        if cls._documentation_line_is_code_shaped(line, position):
+            return False
+        if any(match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_CC_PATTERN.finditer(line)):
+            return True
+        absolute_position = finding["position"]
+        context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[absolute_position - position : context_end]
+        paragraph_end = re.search(rb"\r?\n[ \t]*\r?\n", context)
+        if paragraph_end is None and context_end < len(payload):
+            return False
+        paragraph = context[: paragraph_end.start()] if paragraph_end is not None else context
+        return any(
+            match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_MISUSE_PATTERN.finditer(paragraph)
         )
 
     @classmethod
