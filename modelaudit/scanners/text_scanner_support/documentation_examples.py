@@ -18,6 +18,7 @@ PARSED_FENCE_LANGUAGES = frozenset({b"", b"sh", b"bash", b"shell", b"console", b
 FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r\n]*?)[ \t]*\r?$")
 INDENTED_CODE_BLOCK_PATTERN = re.compile(rb"(?m)^(?: {4}|\t)[^\n]*\n?(?:(?: {4}|\t)[^\n]*\n?|[ \t]*\n)*")
 BACKTICK_PATTERN = re.compile(rb"`+")
+EXECUTION_DIRECTIVE_PATTERN = re.compile(r"\b(?:run|execute|invoke|launch|source)[ \t]+", re.IGNORECASE)
 URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
 PYTHON_EXECUTION_NAMES = frozenset(
@@ -469,11 +470,36 @@ def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int
     return _html_examples_execute_script(payload, html_regions)
 
 
+def _prose_executes_script(text: str) -> bool:
+    for count, match in enumerate(EXECUTION_DIRECTIVE_PATTERN.finditer(text)):
+        if count >= MAX_FENCES:
+            return True
+        end = text.find("\n", match.end())
+        command = text[match.end() : end if end >= 0 else len(text)].strip()
+        if len(command) > MAX_EXAMPLE_BYTES:
+            return True
+        call = re.match(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(", command)
+        if call and any(name in PYTHON_EXECUTION_NAMES for name in call.group(1).split(".")):
+            return True
+        try:
+            shlex.split(command)
+        except ValueError:
+            # An apostrophe in ordinary prose is not an execution instruction.
+            first = command.split(maxsplit=1)[0].strip("\"'") if command else ""
+            if _command_executes_script([first]):
+                return True
+        else:
+            if _example_executes_script(command.encode(), b""):
+                return True
+    return False
+
+
 class _HTMLCodeExamples(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.tags: list[str] = []
         self.parts: list[str] = []
+        self.prose_parts: list[str] = []
         self.size = 0
         self.count = 0
         self.executes_script = False
@@ -526,18 +552,20 @@ class _HTMLCodeExamples(HTMLParser):
             else:
                 self.parts.append(data)
         elif not self.tags:
+            self.prose_parts.append(data)
             self.before = (self.before + data)[-64:]
 
 
 def _html_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
     parser = _HTMLCodeExamples()
     for start, end in regions:
+        parser.prose_parts.clear()
         try:
             parser.feed(payload[start:end].decode("utf-8"))
             parser.close()
         except (UnicodeDecodeError, ValueError, RecursionError):
             return True
-        if parser.executes_script or parser.tags:
+        if parser.executes_script or parser.tags or _prose_executes_script("".join(parser.prose_parts)):
             return True
     return False
 
