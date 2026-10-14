@@ -8571,14 +8571,14 @@ def _build_onnx_weight_analysis_plan(
                                 if function_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
                                     return concat_shape(
                                         function_node,
-                                        (local_tainted_shapes.get(input_name) for input_name in function_inputs),
+                                        (local_known_input_shape(input_name) for input_name in function_inputs),
                                         axis=_onnx_int_attribute(function_node, "axis"),
                                     )
                                 if function_node.op_type == "MatMul":
                                     return matmul_output_shape(
-                                        local_tainted_shapes.get(function_inputs[0]) if function_inputs else None,
+                                        local_known_input_shape(function_inputs[0]) if function_inputs else None,
                                         (
-                                            local_tainted_shapes.get(function_inputs[1])
+                                            local_known_input_shape(function_inputs[1])
                                             if len(function_inputs) > 1
                                             else None
                                         ),
@@ -8586,14 +8586,14 @@ def _build_onnx_weight_analysis_plan(
                                 if function_node.op_type == "OneHot":
                                     return onehot_output_shape(
                                         function_node,
-                                        local_tainted_shapes.get(function_inputs[0]) if function_inputs else None,
+                                        local_known_input_shape(function_inputs[0]) if function_inputs else None,
                                         function_constants,
                                     )
                                 if function_node.op_type == "Einsum":
                                     return einsum_output_shape(function_node, input_shapes_by_name)
                                 if function_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
                                     return broadcast_shapes(
-                                        local_tainted_shapes.get(input_name) for input_name in function_inputs
+                                        local_known_input_shape(input_name) for input_name in function_inputs
                                     )
                                 if function_node.op_type == "Expand" and data_input_shape is not None:
                                     shape_name = function_inputs[1] if len(function_inputs) > 1 else ""

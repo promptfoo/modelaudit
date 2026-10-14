@@ -22418,6 +22418,76 @@ class TestOnnxReviewShapeRegressions:
         )
         TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
 
+    @pytest.mark.parametrize("consume_matrix", [False, True])
+    def test_exact_loop_local_function_broadcast_keeps_clean_operand_shape(
+        self, tmp_path: Path, consume_matrix: bool
+    ) -> None:
+        constant_shape = (1, 1) if consume_matrix else (1,)
+        function = helper.make_function(
+            "local",
+            "Update",
+            ["state"],
+            ["out"],
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["bias"],
+                    value=onnx.numpy_helper.from_array(np.ones(constant_shape, dtype=np.float32)),
+                ),
+                helper.make_node("Add", ["state", "bias"], ["out"]),
+            ],
+            [helper.make_opsetid("", 18)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["X", "state"], ["unused"]),
+                helper.make_node("Update", ["state"], ["out"], domain="local"),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "constant_broadcast_loop_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("out", TensorProto.FLOAT, None),
+            ],
+        )
+        source_names = [f"W{index}" for index in range(33)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.array(float(index), dtype=np.float32), name=name)
+            for index, name in enumerate(source_names)
+        ]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
+                onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="count"),
+            ]
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial"]),
+                helper.make_node("Loop", ["count", "condition", "initial"], ["final"], body=body),
+            ],
+            "constant_broadcast_loop",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("final", TensorProto.FLOAT, list(constant_shape))],
+            initializer=initializers,
+        )
+        path = self._save(graph, tmp_path, functions=[function])
+        if consume_matrix:
+            result = OnnxScanner().scan(str(path))
+            assert result.success is False
+            assert (
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"] > 0
+            )
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            self._assert_clean(path)
+
     @pytest.mark.parametrize("with_attribute", [False, True])
     @pytest.mark.parametrize("consume_matrix", [False, True])
     def test_exact_loop_local_function_accepts_literal_attributes(
