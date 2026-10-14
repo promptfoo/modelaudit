@@ -25,6 +25,7 @@ from modelaudit.utils.file.handlers import (
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 
 
 def _assert_suspect_shard_family_not_cacheable(tmp_path: Path, field: str, value: object) -> None:
@@ -1575,8 +1576,7 @@ class TestAdvancedFileHandler:
         restricted_paths = [str(shard_one.resolve())]
         expanded_paths = [str(shard_one.resolve()), str(shard_two.resolve())]
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             restricted = scan_advanced_large_file(
                 str(shard_one),
                 scanner,
@@ -1587,8 +1587,6 @@ class TestAdvancedFileHandler:
                 scanner,
                 allowed_shard_paths=expanded_paths,
             )
-        finally:
-            reset_cache_manager()
 
         assert restricted.bytes_scanned == shard_one.stat().st_size
         assert expanded.bytes_scanned == shard_one.stat().st_size + shard_two.stat().st_size
@@ -1651,8 +1649,7 @@ class TestAdvancedFileHandler:
         )
         scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first = scan_advanced_large_file(str(shard_one), scanner)
             assert Counter(scanned_payloads) == Counter([b"one", b"two"])
             first_scan_count = len(scanned_payloads)
@@ -1664,8 +1661,6 @@ class TestAdvancedFileHandler:
             second_scan_start = len(scanned_payloads)
             second = scan_advanced_large_file(str(shard_one), scanner)
             assert Counter(scanned_payloads[second_scan_start:]) == Counter([b"one", b"bad"])
-        finally:
-            reset_cache_manager()
 
         assert first.success is True
         assert cached.success is True
@@ -1702,8 +1697,7 @@ class TestAdvancedFileHandler:
 
         scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(tmp_path / "cache")})
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             absent = scan_advanced_large_file(str(shard_one), scanner)
             assert len(scanned_paths) == 2
             assert not any(check.name == "PyTorch Configuration Detection" for check in absent.checks)
@@ -1726,8 +1720,6 @@ class TestAdvancedFileHandler:
             removed = scan_advanced_large_file(str(shard_one), scanner)
             assert len(scanned_paths) == 6
             assert not any(check.name == "PyTorch Configuration Detection" for check in removed.checks)
-        finally:
-            reset_cache_manager()
 
     def test_absent_shard_family_fingerprint_is_cacheable(self) -> None:
         """A non-sharded scan does not need a sibling-family fingerprint."""
@@ -2015,8 +2007,7 @@ class TestAdvancedFileHandler:
             lambda: True,
         )
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             cache_manager = get_cache_manager(str(cache_dir), enabled=True)
             assert cache_manager.cache is not None
             original_hash_file = cache_manager.cache.hasher.hash_file
@@ -2031,8 +2022,6 @@ class TestAdvancedFileHandler:
             first = scan_advanced_large_file(str(shard_one), scanner)
             second = scan_advanced_large_file(str(shard_one), scanner)
             cache_entries = cache_manager.get_stats()["total_entries"]
-        finally:
-            reset_cache_manager()
 
         assert first.success is True
         assert second.success is True
@@ -2084,14 +2073,11 @@ class TestAdvancedFileHandler:
             lambda: False,
         )
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first = scan_advanced_large_file(str(shard_one), scanner)
             shard_two.write_bytes(b"bad")
             second = scan_advanced_large_file(str(shard_one), scanner)
             cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
-        finally:
-            reset_cache_manager()
 
         assert first.success is True
         assert second.success is False
@@ -2141,8 +2127,7 @@ class TestAdvancedFileHandler:
             lambda: True,
         )
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first = scan_advanced_large_file(str(shard_one), scanner)
             first_scan_paths = list(scanned_paths)
             cached = scan_advanced_large_file(str(shard_one), scanner)
@@ -2150,8 +2135,6 @@ class TestAdvancedFileHandler:
             shard_two.unlink()
             shard_two.symlink_to(outside_target)
             second = scan_advanced_large_file(str(shard_one), scanner)
-        finally:
-            reset_cache_manager()
 
         assert first.success is True
         assert cached.success is True
@@ -2204,13 +2187,10 @@ class TestAdvancedFileHandler:
             lambda: True,
         )
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             result = scan_advanced_large_file(str(shard_one), scanner)
             cache_manager = get_cache_manager(str(cache_dir), enabled=True)
             assert cache_manager.get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
         assert result.success is False
         assert result.metadata["operational_error_reason"] == "shard_boundary_changed"

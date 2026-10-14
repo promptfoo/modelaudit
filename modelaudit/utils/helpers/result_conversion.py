@@ -92,10 +92,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
             s = "failed"
         if s not in ("passed", "failed", "skipped"):
             s = "passed"
-        try:
-            return CheckStatus(s)
-        except Exception:
-            return CheckStatus.PASSED
+        return CheckStatus(s)
 
     # Restore issues from cached data
     for issue_dict in result_dict.get("issues", []):

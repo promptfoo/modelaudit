@@ -26,6 +26,7 @@ from modelaudit.scanners.compressed_scanner import (
     _CompressedPaddingLimitExceeded,
     _MissingOptionalDependencyError,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import EvalPayload
 
 TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
@@ -531,8 +532,7 @@ def test_compressed_scanner_unparseable_python_payload_is_inconclusive(tmp_path:
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["scan_outcome_reasons"] == ["compressed_python_payload_analysis_incomplete"]
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -554,8 +554,6 @@ def test_compressed_scanner_unparseable_python_payload_is_inconclusive(tmp_path:
             assert metadata["scan_outcome_reasons"] == ["compressed_python_payload_analysis_incomplete"]
             assert any("could not be parsed" in issue.message.lower() for issue in aggregate.issues)
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_compressed_scanner_corrupt_stream_is_warning_not_critical(tmp_path: Path) -> None:
@@ -1062,8 +1060,7 @@ def test_compressed_scanner_excess_members_are_exit2_and_not_cached(tmp_path: Pa
     path = tmp_path / "too_many_members.pkl.zlib"
     path.write_bytes(zlib.compress(b"a") + zlib.compress(b"b") + zlib.compress(b"c"))
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1084,16 +1081,13 @@ def test_compressed_scanner_excess_members_are_exit2_and_not_cached(tmp_path: Pa
             assert determine_exit_code(aggregate) == 2
             assert any("member count exceeded limit (3 > 2)" in issue.message.lower() for issue in aggregate.issues)
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_compressed_scanner_complete_wrapper_caches_without_ephemeral_inner_entries(tmp_path: Path) -> None:
     path = tmp_path / "safe_payload.pkl.gz"
     path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]}, protocol=4)))
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1124,16 +1118,13 @@ def test_compressed_scanner_complete_wrapper_caches_without_ephemeral_inner_entr
         assert second_stats["total_entries"] == first_stats["total_entries"]
         assert second_stats["cache_hits"] > first_stats["cache_hits"]
         assert cached_names == {path.name}
-    finally:
-        reset_cache_manager()
 
 
 def test_compressed_scanner_depth_limit_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
     path = tmp_path / "depth_limited_payload.pkl.gz"
     path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1157,16 +1148,13 @@ def test_compressed_scanner_depth_limit_preserves_exit1_and_is_not_cached(tmp_pa
             assert metadata["scan_outcome_reasons"] == ["compressed_depth_limit_exceeded"]
             assert any("nesting depth (0) exceeded" in issue.message.lower() for issue in aggregate.issues)
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
     path = tmp_path / "size_limited_payload.pkl.gz"
     path.write_bytes(gzip.compress(b"A" * 4096))
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1190,16 +1178,13 @@ def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cache
             assert metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
             assert any("decompressed size exceeded limit" in issue.message.lower() for issue in aggregate.issues)
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_compressed_scanner_corrupt_stream_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
     path = tmp_path / "corrupt_payload.pkl.gz"
     path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1221,8 +1206,6 @@ def test_compressed_scanner_corrupt_stream_preserves_exit1_and_is_not_cached(tmp
             assert metadata["scan_outcome_reasons"] == ["compressed_stream_decode_failed"]
             assert any("invalid gzip stream" in issue.message.lower() for issue in aggregate.issues)
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_compressed_scanner_keeps_split_pickle_members_clean(tmp_path: Path) -> None:
@@ -1440,8 +1423,7 @@ def test_compressed_scanner_missing_lz4_is_exit2_and_not_cached(
 
     monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(_raise_missing_dependency))
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(lz4_path),
             cache_enabled=True,
@@ -1463,5 +1445,3 @@ def test_compressed_scanner_missing_lz4_is_exit2_and_not_cached(
             assert metadata["scan_outcome_reasons"] == ["compressed_optional_dependency_unavailable"]
             assert any("optional dependency" in issue.message.lower() for issue in aggregate.issues)
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()

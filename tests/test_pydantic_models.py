@@ -1,10 +1,10 @@
 """Tests for Pydantic models that match current JSON format."""
 
 import json
-import time
-from typing import cast
+from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 # Ensure models are rebuilt for forward references
 from modelaudit.models import (
@@ -18,12 +18,32 @@ from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity
 rebuild_models()
 
 
+@pytest.fixture
+def result_payload() -> dict[str, Any]:
+    """Literal required fields, with fresh mutable values for each test."""
+    return {
+        "bytes_scanned": 100,
+        "issues": [],
+        "checks": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanner_names": ["pickle"],
+        "file_metadata": {},
+        "start_time": 1234567890.0,
+        "duration": 1.0,
+        "total_checks": 1,
+        "passed_checks": 1,
+        "failed_checks": 0,
+    }
+
+
 class TestPydanticModels:
     """Test Pydantic model functionality for current JSON format."""
 
-    def test_issue_model_creation(self):
+    def test_issue_model_creation(self) -> None:
         """Test Issue creation and serialization."""
-        timestamp = time.time()
+        timestamp = 1234567890.0
         issue = Issue(
             message="Test issue",
             severity=IssueSeverity.WARNING,
@@ -45,46 +65,50 @@ class TestPydanticModels:
         issue_dict = issue.model_dump()
         assert issue_dict["severity"] == "warning"  # Enum serializes to its value
 
-    def test_check_model_creation(self):
+    @pytest.mark.parametrize("status", [CheckStatus.FAILED, CheckStatus.PASSED], ids=["failed-rich", "passed-nullable"])
+    def test_check_model_creation(self, status: CheckStatus) -> None:
         """Test Check creation and serialization."""
-        timestamp = time.time()
+        timestamp = 1234567890.0
+        failed = status == CheckStatus.FAILED
         check = Check(
             name="Test Check",
-            status=CheckStatus.FAILED,
-            message="Check failed",
-            severity=IssueSeverity.CRITICAL,
-            location="/path/to/file.pkl",
-            details={"error": "details"},
+            status=status,
+            message="Check failed" if failed else "Test message",
+            severity=IssueSeverity.CRITICAL if failed else None,
+            location="/path/to/file.pkl" if failed else None,
+            details={"error": "details"} if failed else {},
             timestamp=timestamp,
-            why="Explanation of failure",
+            why="Explanation of failure" if failed else None,
         )
 
         assert check.name == "Test Check"
-        assert check.status == CheckStatus.FAILED
-        assert check.message == "Check failed"
-        assert check.severity == IssueSeverity.CRITICAL
-        assert check.location == "/path/to/file.pkl"
-        assert check.details == {"error": "details"}
+        assert check.status == status
+        assert check.message == ("Check failed" if failed else "Test message")
+        assert check.severity == (IssueSeverity.CRITICAL if failed else None)
+        assert check.location == ("/path/to/file.pkl" if failed else None)
+        assert check.details == ({"error": "details"} if failed else {})
         assert check.timestamp == timestamp
-        assert check.why == "Explanation of failure"
+        assert check.why == ("Explanation of failure" if failed else None)
 
-    def test_model_audit_result_creation(self):
+        data = check.model_dump()
+        assert isinstance(data, dict)
+        assert data["name"] == "Test Check"
+        assert data["status"] == ("failed" if failed else "passed")
+        json_str = check.model_dump_json()
+        assert isinstance(json_str, str)
+        assert json.loads(json_str)["name"] == "Test Check"
+        assert hasattr(check, "model_config")
+
+    def test_model_audit_result_creation(self, result_payload: dict[str, Any]) -> None:
         """Test ModelAuditResultModel creation."""
-        result = ModelAuditResultModel(
+        result_payload.update(
             bytes_scanned=1000,
-            issues=[],
-            checks=[],
-            files_scanned=1,
-            assets=[],
-            has_errors=False,
             scanner_names=["test_scanner"],
-            file_metadata={},
-            start_time=time.time(),
             duration=1.5,
             total_checks=5,
             passed_checks=5,
-            failed_checks=0,
         )
+        result = ModelAuditResultModel(**result_payload)
 
         assert result.bytes_scanned == 1000
         assert result.files_scanned == 1
@@ -93,43 +117,40 @@ class TestPydanticModels:
         assert result.duration == 1.5
         assert result.total_checks == 5
 
-    def test_create_audit_result_model(self):
+    def test_create_audit_result_model(self, result_payload: dict[str, Any]) -> None:
         """Test creating ModelAuditResultModel from aggregated results."""
-        aggregated_results = {
-            "bytes_scanned": 2000,
-            "issues": [
-                {
-                    "message": "Critical issue",
-                    "severity": "critical",
-                    "location": "/path/to/file1.pkl",
-                    "details": {},
-                    "timestamp": time.time(),
-                }
-            ],
-            "checks": [
-                {
-                    "name": "Test Check 1",
-                    "status": "failed",
-                    "message": "Check failed",
-                    "severity": "critical",
-                    "location": "/path/to/file1.pkl",
-                    "details": {},
-                    "timestamp": time.time(),
-                }
-            ],
-            "files_scanned": 2,
-            "assets": [{"path": "test.pkl", "type": "pickle", "size": 100}],
-            "has_errors": True,
-            "scanner_names": ["pickle"],
-            "file_metadata": {},
-            "start_time": time.time(),
-            "duration": 1.0,
-            "total_checks": 1,
-            "passed_checks": 0,
-            "failed_checks": 1,
-        }
+        result_payload.update(
+            {
+                "bytes_scanned": 2000,
+                "issues": [
+                    {
+                        "message": "Critical issue",
+                        "severity": "critical",
+                        "location": "/path/to/file1.pkl",
+                        "details": {},
+                        "timestamp": 1234567890.0,
+                    }
+                ],
+                "checks": [
+                    {
+                        "name": "Test Check 1",
+                        "status": "failed",
+                        "message": "Check failed",
+                        "severity": "critical",
+                        "location": "/path/to/file1.pkl",
+                        "details": {},
+                        "timestamp": 1234567890.0,
+                    }
+                ],
+                "files_scanned": 2,
+                "assets": [{"path": "test.pkl", "type": "pickle", "size": 100}],
+                "has_errors": True,
+                "passed_checks": 0,
+                "failed_checks": 1,
+            }
+        )
 
-        model = create_audit_result_model(aggregated_results)
+        model = create_audit_result_model(result_payload)
 
         assert isinstance(model, ModelAuditResultModel)
         assert model.bytes_scanned == 2000
@@ -140,16 +161,14 @@ class TestPydanticModels:
         assert model.has_errors is True
         assert model.scanner_names == ["pickle"]
 
-    def test_json_serialization_matches_format(self):
+    def test_json_serialization_matches_format(self, result_payload: dict[str, Any]) -> None:
         """Test that model JSON serialization matches expected format."""
-        # Create a realistic model
-        model = ModelAuditResultModel(
-            bytes_scanned=100,
+        result_payload.update(
             issues=[
                 Issue(
                     message="Test issue",
                     severity=IssueSeverity.WARNING,
-                    timestamp=time.time(),
+                    timestamp=1234567890.0,
                     location=None,
                     why=None,
                     type=None,
@@ -160,23 +179,16 @@ class TestPydanticModels:
                     name="Test Check",
                     status=CheckStatus.PASSED,
                     message="Check passed",
-                    timestamp=time.time(),
+                    timestamp=1234567890.0,
                     severity=None,
                     location=None,
                     why=None,
                 )
             ],
-            files_scanned=1,
             assets=[AssetModel(path="test.pkl", type="pickle", size=None, tensors=None, keys=None, contents=None)],
-            has_errors=False,
-            scanner_names=["pickle"],
-            file_metadata={},
-            start_time=time.time(),
-            duration=1.0,
-            total_checks=1,
-            passed_checks=1,
-            failed_checks=0,
         )
+
+        model = ModelAuditResultModel(**result_payload)
 
         # Serialize to JSON and verify structure
         json_str = model.model_dump_json(indent=2, exclude_none=True)
@@ -207,49 +219,26 @@ class TestPydanticModels:
         assert isinstance(parsed["files_scanned"], int)
         assert isinstance(parsed["has_errors"], bool)
 
-    def test_pydantic_v2_features(self):
-        """Test Pydantic v2 specific features."""
-        check = Check(
-            name="Test Check",
-            status=CheckStatus.PASSED,
-            message="Test message",
-            timestamp=time.time(),
-            severity=None,
-            location=None,
-            why=None,
-        )
-
-        # Test model_dump() method (v2 syntax)
-        data = check.model_dump()
-        assert isinstance(data, dict)
-        assert data["name"] == "Test Check"
-        assert data["status"] == "passed"
-
-        # Test model_dump_json() returns JSON string
-        json_str = check.model_dump_json()
-        assert isinstance(json_str, str)
-        parsed = json.loads(json_str)
-        assert parsed["name"] == "Test Check"
-
-        # Test ConfigDict usage
-        assert hasattr(check, "model_config")
-
-    def test_model_validation(self):
+    def test_model_validation(self) -> None:
         """Test that models validate input data."""
-        from pydantic import ValidationError
-
         # Test that required fields are enforced
         with pytest.raises(ValidationError):
             ModelAuditResultModel()  # type: ignore[call-arg]  # Missing required fields - intentionally testing validation
 
-        # Test that invalid data is caught
-        with pytest.raises(ValidationError):
+    @pytest.mark.parametrize(
+        ("status", "timestamp", "invalid_field"),
+        [("invalid_status", 1234567890.0, "status"), (CheckStatus.PASSED, "not_a_number", "timestamp")],
+        ids=["invalid-status", "invalid-timestamp"],
+    )
+    def test_check_validation(self, status: str, timestamp: float | str, invalid_field: str) -> None:
+        with pytest.raises(ValidationError) as error:
             Check(
                 name="Test",
-                status=cast(CheckStatus, "invalid_status"),  # Invalid status - should fail validation
+                status=cast(CheckStatus, status),
                 message="Test",
-                timestamp=cast(float, "not_a_number"),  # Invalid timestamp - should fail validation
+                timestamp=cast(float, timestamp),
                 severity=None,
                 location=None,
                 why=None,
             )
+        assert error.value.errors()[0]["loc"] == (invalid_field,)

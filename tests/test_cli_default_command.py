@@ -1,6 +1,5 @@
 """Test the default command behavior of the CLI."""
 
-import tempfile
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -32,64 +31,54 @@ class TestDefaultCommandGroup:
         assert group.get_command(ctx, "model.pkl") is None
         assert group.get_command(ctx, "/path/to/file") is None
 
-    def test_default_scan_command_with_file_path(self):
+    def test_default_scan_command_with_file_path(self, tmp_path: Path) -> None:
         """Test that providing a file path without command defaults to scan."""
         runner = CliRunner()
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            tmp.write(b"test content")
+        model_path = tmp_path / "model.pkl"
+        model_path.touch(mode=0o600)
+        model_path.write_bytes(b"test content")
 
-        try:
-            # Test without explicit scan command
-            result = runner.invoke(cli, [str(tmp_path)])
+        # Test without explicit scan command
+        result = runner.invoke(cli, [str(model_path)])
 
-            # Should not fail due to unknown command
-            assert "No such command" not in result.output
-            assert "Usage:" not in result.output or "error" not in result.output.lower()
+        # Should not fail due to unknown command
+        assert "No such command" not in result.output
+        assert "Usage:" not in result.output or "error" not in result.output.lower()
+        # Delete before fixture teardown to catch leaked file handles.
+        model_path.unlink(missing_ok=True)
 
-        finally:
-            tmp_path.unlink(missing_ok=True)
-
-    def test_default_scan_command_with_multiple_paths(self):
+    def test_default_scan_command_with_multiple_paths(self, tmp_path: Path) -> None:
         """Test that providing multiple paths without command defaults to scan."""
         runner = CliRunner()
-        with (
-            tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp1,
-            tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp2,
-        ):
-            tmp_path1 = Path(tmp1.name)
-            tmp_path2 = Path(tmp2.name)
-            tmp1.write(b"test content 1")
-            tmp2.write(b"test content 2")
+        model_path1 = tmp_path / "model.pkl"
+        model_path2 = tmp_path / "model.h5"
+        model_path1.touch(mode=0o600)
+        model_path2.touch(mode=0o600)
+        model_path1.write_bytes(b"test content 1")
+        model_path2.write_bytes(b"test content 2")
 
-        try:
-            # Test without explicit scan command
-            result = runner.invoke(cli, [str(tmp_path1), str(tmp_path2)])
+        # Test without explicit scan command
+        result = runner.invoke(cli, [str(model_path1), str(model_path2)])
 
-            # Should not fail due to unknown command
-            assert "No such command" not in result.output
-            assert result.exit_code != 2  # Exit code 2 typically indicates command not found
+        # Should not fail due to unknown command
+        assert "No such command" not in result.output
+        assert result.exit_code != 2  # Exit code 2 typically indicates command not found
+        model_path1.unlink(missing_ok=True)
+        model_path2.unlink(missing_ok=True)
 
-        finally:
-            tmp_path1.unlink(missing_ok=True)
-            tmp_path2.unlink(missing_ok=True)
-
-    def test_explicit_scan_command_still_works(self):
+    def test_explicit_scan_command_still_works(self, tmp_path: Path) -> None:
         """Test that explicit scan command still works as expected."""
         runner = CliRunner()
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            tmp.write(b"test content")
+        model_path = tmp_path / "model.pkl"
+        model_path.touch(mode=0o600)
+        model_path.write_bytes(b"test content")
 
-        try:
-            # Test with explicit scan command
-            result = runner.invoke(cli, ["scan", str(tmp_path)])
+        # Test with explicit scan command
+        result = runner.invoke(cli, ["scan", str(model_path)])
 
-            # Should work normally
-            assert "No such command" not in result.output
-
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        # Should work normally
+        assert "No such command" not in result.output
+        model_path.unlink(missing_ok=True)
 
     def test_other_commands_work_normally(self):
         """Test that other commands like 'doctor' work without issues."""
@@ -122,22 +111,19 @@ class TestDefaultCommandGroup:
         assert "modelaudit [OPTIONS] PATHS..." in result.output
         assert "modelaudit scan [OPTIONS] PATHS..." in result.output
 
-    def test_options_before_paths(self):
+    def test_options_before_paths(self, tmp_path: Path) -> None:
         """Test that options work correctly with default command."""
         runner = CliRunner()
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            tmp.write(b"test content")
+        model_path = tmp_path / "model.pkl"
+        model_path.touch(mode=0o600)
+        model_path.write_bytes(b"test content")
 
-        try:
-            # Test with options before path
-            result = runner.invoke(cli, ["--format", "json", str(tmp_path)])
+        # Test with options before path
+        result = runner.invoke(cli, ["--format", "json", str(model_path)])
 
-            # Should work with default scan command
-            assert "No such command" not in result.output
-
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        # Should work with default scan command
+        assert "No such command" not in result.output
+        model_path.unlink(missing_ok=True)
 
     def test_urls_as_default_arguments(self):
         """Test that URLs work with default command."""

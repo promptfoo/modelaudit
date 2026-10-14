@@ -21,6 +21,7 @@ from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners import flax_msgpack_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_aggregate_not_cached
 from tests.helpers.file_creators import SystemCommandPayload
 from tests.helpers.file_creators import write_delayed_flax_cntk_overlap as _write_delayed_flax_cntk_overlap
@@ -292,8 +293,7 @@ class TestOciLayerScanner:
         manifest_path.write_text(json.dumps({"layers": ["missing.tar.gz", "layer.tar.gz"]}))
         cache_dir = tmp_path / "stacked-cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first = scan_model_directory_or_file(
                 str(manifest_path),
                 cache_enabled=True,
@@ -318,8 +318,6 @@ class TestOciLayerScanner:
                 assert aggregate.assets[0].size == manifest_path.stat().st_size
                 assert determine_exit_code(aggregate) == 2
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_scan_manifest_with_multiple_layers(self, tmp_path):
         """Test scanning manifest with multiple layers."""
@@ -2131,8 +2129,7 @@ class TestOciLayerScanner:
         )
 
         cache_dir = tmp_path / "traversal-cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             aggregate = scan_model_directory_or_file(
                 str(manifest_path),
                 cache_enabled=True,
@@ -2152,8 +2149,6 @@ class TestOciLayerScanner:
                 for issue in aggregate.issues
             )
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     @pytest.mark.parametrize(
         "target",

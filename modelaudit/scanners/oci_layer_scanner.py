@@ -380,20 +380,12 @@ class OciLayerScanner(BaseScanner):
 
     def _resolve_max_layer_extracted_bytes(self) -> int:
         """Return the aggregate copied-member budget for one OCI layer."""
-        positive_limits: list[int] = []
         configured_limit = self.config.get("max_oci_layer_extracted_bytes")
-        if configured_limit is not None:
-            if configured_limit != 0:
-                positive_limits.append(
-                    self._normalize_positive_int_config(
-                        configured_limit,
-                        self._DEFAULT_MAX_EXTRACTED_BYTES,
-                    )
-                )
-        else:
-            positive_limits.append(self._DEFAULT_MAX_EXTRACTED_BYTES)
-
-        return min(positive_limits) if positive_limits else 0
+        if configured_limit is None:
+            return self._DEFAULT_MAX_EXTRACTED_BYTES
+        if configured_limit != 0:
+            return self._normalize_positive_int_config(configured_limit, self._DEFAULT_MAX_EXTRACTED_BYTES)
+        return 0
 
     def _resolve_max_total_extracted_bytes(self) -> int:
         """Return the copied-member budget shared by every layer in one manifest."""

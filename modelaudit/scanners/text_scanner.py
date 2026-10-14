@@ -3274,7 +3274,6 @@ class TextScanner(BaseScanner):
             grouped.setdefault(key, []).append((index, finding, evidence))
 
         deduplicated: list[dict[str, Any]] = []
-        emitted_keys: set[tuple[int, int, str, str]] = set()
         for item_type, item_value in ordered_items:
             if item_type == "standalone":
                 assert isinstance(item_value, int)
@@ -3282,9 +3281,6 @@ class TextScanner(BaseScanner):
                 continue
             assert not isinstance(item_value, int)
             key = item_value
-            if key in emitted_keys:
-                continue
-            emitted_keys.add(key)
             entries = grouped[key]
             representative_index, representative, representative_evidence = max(
                 entries,
@@ -3698,60 +3694,32 @@ class TextScanner(BaseScanner):
 
             # Identify file type - these are informational checks, not security issues
             if filename in DOCUMENTATION_TEXT_FILENAMES:
-                result.add_check(
-                    name="File Type Identification",
-                    passed=True,
-                    message="Model documentation file",
-                    location=path,
-                    details={"file_type": "documentation"},
-                    rule_code=None,  # Passing check
-                )
+                file_type = "documentation"
+                message = "Model documentation file"
             elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt", "merges.txt"]:
-                result.add_check(
-                    name="File Type Identification",
-                    passed=True,
-                    message="Tokenizer vocabulary file",
-                    location=path,
-                    details={"file_type": "vocabulary"},
-                    rule_code=None,  # Passing check
-                )
+                file_type = "vocabulary"
+                message = "Tokenizer vocabulary file"
             elif filename in ["labels.txt", "classes.txt"]:
-                result.add_check(
-                    name="File Type Identification",
-                    passed=True,
-                    message="Classification labels file",
-                    location=path,
-                    details={"file_type": "labels"},
-                    rule_code=None,  # Passing check
-                )
+                file_type = "labels"
+                message = "Classification labels file"
             elif filename in ["license.txt", "license.md"]:
-                result.add_check(
-                    name="File Type Identification",
-                    passed=True,
-                    message="License file",
-                    location=path,
-                    details={"file_type": "license"},
-                    rule_code=None,  # Passing check
-                )
+                file_type = "license"
+                message = "License file"
             elif filename == "requirements.txt":
                 # Could scan for suspicious dependencies in the future
-                result.add_check(
-                    name="File Type Identification",
-                    passed=True,
-                    message="Python requirements file",
-                    location=path,
-                    details={"file_type": "requirements"},
-                    rule_code=None,  # Passing check
-                )
+                file_type = "requirements"
+                message = "Python requirements file"
             else:
-                result.add_check(
-                    name="File Type Identification",
-                    passed=True,
-                    message="ML-related text file",
-                    location=path,
-                    details={"file_type": "text"},
-                    rule_code=None,  # Passing check
-                )
+                file_type = "text"
+                message = "ML-related text file"
+            result.add_check(
+                name="File Type Identification",
+                passed=True,
+                message=message,
+                location=path,
+                details={"file_type": file_type},
+                rule_code=None,  # Passing check
+            )
 
             result.bytes_scanned = self._run_content_security_checks(path, result, file_size)
             result.finish(

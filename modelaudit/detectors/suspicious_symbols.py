@@ -561,53 +561,6 @@ EXECUTABLE_SIGNATURES: dict[bytes, str] = {
 # TENSORFLOW/KERAS SECURITY PATTERNS
 # =============================================================================
 
-# Suspicious TensorFlow operations
-# These operations can perform file I/O, code execution, or system interaction
-SUSPICIOUS_OPS = {
-    # File system operations - HIGH RISK
-    "ReadFile",  # Read arbitrary files
-    "WriteFile",  # Write arbitrary files
-    "MergeV2Checkpoints",  # Checkpoint manipulation
-    "Save",  # Save operations (potential overwrite)
-    "SaveV2",  # SaveV2 operations
-    "LoadAndRemapMatrix",  # Load matrix from files with arbitrary paths
-    "RestoreV2",  # Restore checkpoint data (file access)
-    "ParseTensor",  # Deserialize serialized tensor payloads
-    # External data loading - HIGH RISK
-    "LookupTableImport",  # Import data from external files
-    "InitializeTable",  # Initialize lookup tables from files
-    "LookupTableImportV2",  # Import data from external files (V2)
-    "InitializeTableV2",  # Initialize lookup tables from files (V2)
-    # Code execution - CRITICAL RISK
-    "PyFunc",  # Execute Python functions
-    "PyFuncStateless",  # Execute Python functions (stateless variant)
-    "EagerPyFunc",  # Execute Python functions (eager execution)
-    "PyCall",  # Call Python code
-    # System operations - CRITICAL RISK
-    "ShellExecute",  # Execute shell commands
-    "ExecuteOp",  # Execute arbitrary operations
-    "LoadLibrary",  # Load native TensorFlow op libraries
-    "LoadLibraryV2",  # Load native TensorFlow op libraries (V2 variant)
-    "SystemConfig",  # System configuration access
-    # Queue operations - data exfiltration risk
-    "QueueEnqueue",  # Enqueue data (potential exfiltration)
-    "QueueEnqueueV2",  # Enqueue data V2
-    "QueueDequeue",  # Dequeue data (potential exfiltration)
-    "QueueDequeueV2",  # Dequeue data V2
-    "QueueEnqueueMany",  # Batch enqueue (potential exfiltration)
-    "QueueDequeueMany",  # Batch dequeue (potential exfiltration)
-    # Side-channel information leakage
-    "Print",  # Print to stdout (information leakage)
-    "PrintV2",  # Print to stdout V2 (information leakage)
-    # Pipeline disruption
-    "Assert",  # Can crash inference pipelines
-    "Abort",  # Can abort execution
-    # Data decoding - CRITICAL (scanner emits CRITICAL for these ops in suspicious-ops path)
-    "DecodeRaw",  # Raw data decoding
-    "DecodeJpeg",  # JPEG decoding (image processing)
-    "DecodePng",  # PNG decoding (image processing)
-}
-
 TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     # File system operations - HIGH RISK
     "ReadFile": "Can read arbitrary files from the system",
@@ -652,6 +605,10 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "DecodeJpeg": "Can decode JPEG data, potential injection of malicious content",
     "DecodePng": "Can decode PNG data, potential injection of malicious content",
 }
+
+# Suspicious TensorFlow operations
+# These operations can perform file I/O, code execution, or system interaction
+SUSPICIOUS_OPS = set(TENSORFLOW_DANGEROUS_OPS)
 
 # Known safe Keras model classes that use declarative layer configurations
 # without custom code execution (Sequential, Functional, Model)

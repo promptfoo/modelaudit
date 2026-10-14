@@ -31,6 +31,7 @@ from modelaudit.scanners.gguf_scanner import (
     GgufScanner,
     _with_container_owned_gguf_trailing,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_malicious_pickle, create_mock_gguf
 from tests.helpers.cache import single_file_metadata as _single_file_metadata
@@ -56,68 +57,35 @@ def _write_minimal_gguf(path, n_kv=1, n_tensors=0, kv_key=b"test", kv_value=b"va
             f.write(kv_value)  # value
 
 
-def _write_comprehensive_gguf(path):
-    """Create a comprehensive GGUF file with tensors for testing."""
-    with open(path, "wb") as f:
-        # Header
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))  # version
-        f.write(struct.pack("<Q", 1))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
-
-        # Metadata
-        key = b"general.alignment"
-        f.write(struct.pack("<Q", len(key)))
-        f.write(key)
-        f.write(struct.pack("<I", 4))  # UINT32
-        f.write(struct.pack("<I", 32))  # alignment value
-
-        # Align to 32 bytes
-        pad = (32 - (f.tell() % 32)) % 32
-        f.write(b"\0" * pad)
-
-        # Tensor info
-        name = b"weight"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 1))  # dimensions
-        f.write(struct.pack("<Q", 8))  # dimension size
-        f.write(struct.pack("<I", 0))  # f32 tensor type
-        f.write(struct.pack("<Q", 0))  # tensor offset (relative to tensor data section start)
-
-        # Align tensor data section to 32 bytes
-        tensor_info_end = f.tell()
-        pad_to_tensor_data = (32 - (tensor_info_end % 32)) % 32
-        if pad_to_tensor_data:
-            f.write(b"\0" * pad_to_tensor_data)
-
-        # Tensor data (8 * 4 bytes for f32)
-        f.write(b"\0" * 32)
-
-
 def _write_aligned_gguf(path: Path, alignment: int) -> None:
     """Create a single-tensor GGUF with an explicit supported alignment."""
     with path.open("wb") as handle:
+        # Header
         handle.write(b"GGUF")
-        handle.write(struct.pack("<I", 3))
-        handle.write(struct.pack("<Q", 1))
-        handle.write(struct.pack("<Q", 1))
+        handle.write(struct.pack("<I", 3))  # version
+        handle.write(struct.pack("<Q", 1))  # tensor count
+        handle.write(struct.pack("<Q", 1))  # kv count
 
+        # Metadata
         key = b"general.alignment"
         handle.write(struct.pack("<Q", len(key)))
         handle.write(key)
-        handle.write(struct.pack("<I", 4))
-        handle.write(struct.pack("<I", alignment))
+        handle.write(struct.pack("<I", 4))  # UINT32
+        handle.write(struct.pack("<I", alignment))  # alignment value
+        # Align to the requested boundary
         handle.write(b"\0" * ((alignment - (handle.tell() % alignment)) % alignment))
 
+        # Tensor info
         tensor_name = b"weight"
         handle.write(struct.pack("<Q", len(tensor_name)))
         handle.write(tensor_name)
-        handle.write(struct.pack("<I", 1))
-        handle.write(struct.pack("<Q", 8))
-        handle.write(struct.pack("<I", 0))
-        handle.write(struct.pack("<Q", 0))
+        handle.write(struct.pack("<I", 1))  # dimensions
+        handle.write(struct.pack("<Q", 8))  # dimension size
+        handle.write(struct.pack("<I", 0))  # f32 tensor type
+        handle.write(struct.pack("<Q", 0))  # tensor offset (relative to tensor data section start)
+        # Align tensor data section to the requested boundary
         handle.write(b"\0" * ((alignment - (handle.tell() % alignment)) % alignment))
+        # Tensor data (8 * 4 bytes for f32)
         handle.write(b"\0" * 32)
 
 
@@ -176,20 +144,12 @@ def _write_tensor_covered_gguf_zip(
         handle.write(tensor_data.ljust(tensor_elements * 4, b"\0"))
 
 
-def _write_ggml_file(path):
-    """Create a basic GGML file for testing."""
-    with open(path, "wb") as f:
-        f.write(b"GGML")
-        f.write(struct.pack("<I", 1))  # version
-        f.write(b"\0" * 24)  # padding to minimum size
-
-
-def _write_ggml_variant_file(path, magic):
-    """Create a GGML variant file with custom magic."""
+def _write_ggml_file(path: Path, magic: bytes = b"GGML") -> None:
+    """Create a GGML file or variant with custom magic."""
     with open(path, "wb") as f:
         f.write(magic)
-        f.write(struct.pack("<I", 1))
-        f.write(b"\0" * 24)
+        f.write(struct.pack("<I", 1))  # version
+        f.write(b"\0" * 24)  # padding to minimum size
 
 
 def _write_gguf_with_tensor_type(
@@ -200,24 +160,7 @@ def _write_gguf_with_tensor_type(
     dims: tuple[int, ...] = (8,),
     tensor_data_size: int = 32,
 ) -> None:
-    with path.open("wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))
-        f.write(struct.pack("<Q", 0))
-
-        f.write(struct.pack("<Q", len(tensor_name)))
-        f.write(tensor_name)
-        f.write(struct.pack("<I", len(dims)))
-        for dimension in dims:
-            f.write(struct.pack("<Q", dimension))
-        f.write(struct.pack("<I", tensor_type))
-        f.write(struct.pack("<Q", 0))
-
-        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
-        if pad_to_tensor_data:
-            f.write(b"\0" * pad_to_tensor_data)
-        f.write(b"\0" * tensor_data_size)
+    _write_gguf_with_tensor_records(path, [(tensor_name, tensor_type, dims, tensor_data_size)])
 
 
 def _write_gguf_with_tensor_records(
@@ -373,8 +316,7 @@ def _assert_uncached_rerun_preserves_inconclusive_exit2(
     reason: str,
     **scan_kwargs: Any,
 ) -> None:
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -393,8 +335,6 @@ def _assert_uncached_rerun_preserves_inconclusive_exit2(
         _assert_inconclusive_exit2(first, reason)
         _assert_inconclusive_exit2(second, reason)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_gguf_scanner_can_handle_gguf(tmp_path):
@@ -437,11 +377,11 @@ def test_large_gguf_scans_metadata_without_default_full_file_cap(
     assert result.metadata["file_size"] > DEFAULT_MAX_FILE_READ_SIZE
 
 
-def test_gguf_scanner_can_handle_ggml_variants(tmp_path):
+def test_gguf_scanner_can_handle_ggml_variants(tmp_path: Path) -> None:
     """Scanner handles GGML variant magic codes."""
     for magic in [b"GGMF", b"GGJT"]:
         path = tmp_path / f"model_{magic.decode().lower()}.ggml"
-        _write_ggml_variant_file(path, magic)
+        _write_ggml_file(path, magic)
         assert GgufScanner.can_handle(str(path))
 
 
@@ -468,7 +408,7 @@ def test_gguf_scanner_basic_scan(tmp_path):
 def test_gguf_scanner_inspects_embedded_zip_polyglot_members(tmp_path: Path, has_tensor: bool) -> None:
     path = tmp_path / "polyglot.gguf"
     if has_tensor:
-        _write_comprehensive_gguf(path)
+        _write_aligned_gguf(path, 32)
     else:
         _write_minimal_gguf(path, n_kv=0, n_tensors=0)
 
@@ -643,7 +583,7 @@ def test_gguf_scanner_consumes_raw_carve_provenance_before_nested_zip_members(tm
 def test_gguf_scanner_allows_bounded_zero_padding(tmp_path: Path, has_tensor: bool) -> None:
     path = tmp_path / "zero-padded.gguf"
     if has_tensor:
-        _write_comprehensive_gguf(path)
+        _write_aligned_gguf(path, 32)
     else:
         _write_minimal_gguf(path, n_kv=0, n_tensors=0)
     with path.open("ab") as handle:
@@ -1395,10 +1335,10 @@ def test_gguf_oversized_chat_template_uncached_rerun_preserves_exit2(tmp_path: P
     )
 
 
-def test_gguf_scanner_comprehensive_scan(tmp_path):
+def test_gguf_scanner_comprehensive_scan(tmp_path: Path) -> None:
     """Test comprehensive GGUF scanning with tensors."""
     path = tmp_path / "model.gguf"
-    _write_comprehensive_gguf(path)
+    _write_aligned_gguf(path, 32)
     scanner = GgufScanner()
     result = scanner.scan(str(path))
     assert result.success
@@ -2671,10 +2611,10 @@ def test_ggml_scanner_basic(tmp_path):
     assert result.metadata["version"] == 1
 
 
-def test_ggml_variant_scanner_basic(tmp_path):
+def test_ggml_variant_scanner_basic(tmp_path: Path) -> None:
     """Ensure GGML variants are scanned correctly."""
     path = tmp_path / "model.ggmf"
-    _write_ggml_variant_file(path, b"GGMF")
+    _write_ggml_file(path, b"GGMF")
     result = GgufScanner().scan(str(path))
     assert result.success
     assert result.metadata["format"] == "ggml"
@@ -2698,7 +2638,7 @@ def test_ggml_scanner_inspects_embedded_zip_polyglot_members(
     suffix: str,
 ) -> None:
     path = tmp_path / f"polyglot{suffix}"
-    _write_ggml_variant_file(path, magic)
+    _write_ggml_file(path, magic)
     pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
     _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes(), "../escaped.txt": b"escape"})
 
@@ -3230,11 +3170,11 @@ def test_ggml_polyglot_preserves_outer_format_and_magic(
 ) -> None:
     outer_path = tmp_path / "outer.ggmf"
     nested_path = tmp_path / f"nested{nested_suffix}"
-    _write_ggml_variant_file(outer_path, b"GGMF")
+    _write_ggml_file(outer_path, b"GGMF")
     if nested_magic == b"GGUF":
         _write_minimal_gguf(nested_path)
     else:
-        _write_ggml_variant_file(nested_path, nested_magic)
+        _write_ggml_file(nested_path, nested_magic)
     _append_gguf_zip(outer_path, {nested_path.name: nested_path.read_bytes()})
 
     result = GgufScanner().scan(str(outer_path))
@@ -3655,7 +3595,7 @@ def test_gguf_ggml_ignores_stray_end_of_central_directory_bytes(tmp_path: Path, 
     if magic == b"GGUF":
         _write_minimal_gguf(path)
     else:
-        _write_ggml_variant_file(path, magic)
+        _write_ggml_file(path, magic)
     with path.open("ab") as handle:
         handle.write(b"\x00" * 64 + b"PK\x05\x06" + b"\x00" * 18 + b"\x00" * 32)
 

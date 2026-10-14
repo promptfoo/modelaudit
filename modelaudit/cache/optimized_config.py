@@ -51,9 +51,6 @@ def _extract_config_and_path(args: tuple, kwargs: dict) -> tuple[dict[str, Any] 
     Returns:
         Tuple of (config_dict, file_path)
     """
-    config = None
-    file_path = None
-
     # Try to extract file path
     if args:
         # Check if first arg looks like self (has attributes)
@@ -116,17 +113,12 @@ def _normalize_fingerprint_value(value: Any) -> Any:
             normalized[field.name] = _normalize_fingerprint_value(getattr(value, field.name))
         return normalized
 
-    if hasattr(value, "model_dump"):
-        try:
-            return _normalize_fingerprint_value(value.model_dump())
-        except Exception:
-            pass
-
-    if hasattr(value, "to_dict"):
-        try:
-            return _normalize_fingerprint_value(value.to_dict())
-        except Exception:
-            pass
+    for method in ("model_dump", "to_dict"):
+        if hasattr(value, method):
+            try:
+                return _normalize_fingerprint_value(getattr(value, method)())
+            except Exception:
+                pass
 
     return repr(value)
 
@@ -210,9 +202,6 @@ class CacheConfiguration:
     """Pre-computed cache configuration to avoid repeated extraction overhead."""
 
     def __init__(self, config: dict[str, Any] | None = None):
-        if config is None:
-            config = {}
-
         cache_settings = _normalize_cache_settings(config)
         self.enabled = cache_settings["cache_enabled"]
         self.cache_dir = cache_settings["cache_dir"]

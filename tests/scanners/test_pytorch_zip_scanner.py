@@ -64,6 +64,7 @@ from modelaudit.utils.repository_context import (
     REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
     RepositoryFileInventory,
 )
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_mock_pytorch_zip
 from tests.helpers.cache import private_actionable_failed_checks as _private_actionable_failed_checks
 from tests.helpers.file_creators import EvalPayload
@@ -166,14 +167,18 @@ def _float_storage_persistent_id_payload_for_bytes(key: str | bytes, data: bytes
     )
 
 
-def _scan_referenced_float_storage_blob(tmp_path: Path, filename: str, storage_blob: bytes) -> ScanResult:
-    model_path = tmp_path / filename
-    storage_blob += b" " * (-len(storage_blob) % 4)
+def _write_referenced_float_storage(model_path: Path, storage_blob: bytes) -> None:
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3\n")
         zip_file.writestr("archive/byteorder", "little")
         zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
         zip_file.writestr("archive/data/0", storage_blob)
+
+
+def _scan_referenced_float_storage_blob(tmp_path: Path, filename: str, storage_blob: bytes) -> ScanResult:
+    model_path = tmp_path / filename
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    _write_referenced_float_storage(model_path, storage_blob)
     return PyTorchZipScanner().scan(str(model_path))
 
 
@@ -2184,11 +2189,7 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp
     """A data.pkl-referenced tensor blob is raw storage, not a follow-on pickle stream."""
     model_path = tmp_path / "referenced_storage_pickleish_bytes.pt"
     storage_blob = _pickleish_tensor_storage_bytes()
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2216,11 +2217,7 @@ def test_pytorch_zip_discovery_skips_referenced_storage_impossible_declared_pref
     model_path = tmp_path / "referenced_storage_impossible_declared_prefix.pt"
     storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1024
     storage_blob = prefix + (b"A" * (storage_size - len(prefix)))
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2279,11 +2276,7 @@ def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_impossible_d
     storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1024
     storage_blob = prefix + b"A" * 16 + malicious_suffix
     storage_blob += b"A" * (storage_size - len(storage_blob))
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2304,11 +2297,7 @@ def test_pytorch_zip_discovery_skips_same_sized_benign_unread_tail_after_impossi
     prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
     storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 512
     storage_blob = prefix + (b"A" * (storage_size - len(prefix)))
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2332,11 +2321,7 @@ def test_pytorch_zip_discovery_expands_whitespace_before_impossible_declared_pre
     storage_blob += prefix + b"A" * 16 + malicious_suffix
     storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2359,11 +2344,7 @@ def test_pytorch_zip_discovery_skips_whitespace_impossible_prefix_near_match(
     storage_blob += prefix
     storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2386,11 +2367,7 @@ def test_pytorch_zip_discovery_fails_closed_after_padding_beyond_trusted_probe(
     storage_blob += prefix + b"A" * 16 + malicious_suffix
     storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2414,11 +2391,7 @@ def test_pytorch_zip_discovery_fails_closed_after_nul_padding_beyond_trusted_pro
     storage_blob += prefix + b"A" * 16 + malicious_suffix
     storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2438,11 +2411,7 @@ def test_pytorch_zip_discovery_fails_closed_after_verified_nul_padding_separator
     model_path = tmp_path / "referenced_storage_nul_padding_separator_hidden_pickle.pt"
     storage_blob = b"\x00" * 70_000 + b"!cposix\nsystem\n)R."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2462,11 +2431,7 @@ def test_pytorch_zip_discovery_skips_verified_nul_padding_with_benign_tensor_tai
     model_path = tmp_path / "referenced_storage_nul_padding_benign_tensor_tail.pt"
     storage_blob = b"\x00" * 70_000 + b"\x01\x02\x03\x04" * 16
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2487,11 +2452,7 @@ def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_beyond_unread_impo
     storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 512
     storage_blob = prefix + (b"A" * (malicious_offset - len(prefix))) + malicious_suffix
     storage_blob += b"A" * (storage_size - len(storage_blob))
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2513,11 +2474,7 @@ def test_pytorch_zip_discovery_fails_closed_for_impossible_long_prefix(
     model_path = tmp_path / "referenced_storage_impossible_long_prefix_hidden_pickle.pt"
     storage_blob = prefix + _malicious_proto0_system_payload()
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2600,11 +2557,7 @@ def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_raw_candidat
     malicious_suffix = b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94\x93\x8c\x1decho inert-modelaudit-fixture\x94\x85R."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2632,11 +2585,7 @@ def test_pytorch_zip_discovery_skips_same_sized_candidate_budget_gap_near_match(
     )
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2659,11 +2608,7 @@ def test_pytorch_zip_discovery_fails_closed_for_proto0_inst_after_raw_candidate_
     malicious_suffix = b"(S'https://example.invalid/'\niwebbrowser\nopen\n."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2691,11 +2636,7 @@ def test_pytorch_zip_discovery_fails_closed_for_proto0_inst_mark_before_budget_g
     )
     storage_blob = prefix + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2722,11 +2663,7 @@ def test_pytorch_zip_discovery_skips_proto0_inst_mark_before_budget_gap_near_mat
         + (b"!" * payload_size)
     )
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2749,11 +2686,7 @@ def test_pytorch_zip_discovery_skips_proto0_inst_sized_candidate_budget_gap_near
     payload_size = len(b"(S'https://example.invalid/'\niwebbrowser\nopen\n.")
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2776,11 +2709,7 @@ def test_pytorch_zip_discovery_fails_closed_for_proto0_inst_operand_crossing_can
     malicious_suffix = b"(S'" + (b"a" * 8_180) + b"'\niwebbrowser\nopen\n."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2806,11 +2735,7 @@ def test_pytorch_zip_discovery_fails_closed_for_late_headerless_binunicode_stack
     )
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2836,11 +2761,7 @@ def test_pytorch_zip_discovery_skips_late_headerless_binunicode_stack_global_nea
     )
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2866,11 +2787,7 @@ def test_pytorch_zip_discovery_fails_closed_for_persid_after_candidate_budget_ga
     )
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2897,11 +2814,7 @@ def test_pytorch_zip_discovery_skips_persid_sized_budget_gap_near_match(
     )
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2924,11 +2837,7 @@ def test_pytorch_zip_discovery_fails_closed_for_long_persid_operand_after_budget
     malicious_suffix = b"P" + (b"A" * (9 * 1024)) + b"\n."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2951,11 +2860,7 @@ def test_pytorch_zip_discovery_skips_marker_rich_binbytes_persid_near_match(
     literal_payload = b"Q!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     storage_blob = prefix + decoys + b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -2979,11 +2884,7 @@ def test_pytorch_zip_discovery_skips_p_marker_inside_binbytes_literal(
     storage_blob = prefix + decoys + inert_padding
     storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3007,11 +2908,7 @@ def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binbytes_literal(
     storage_blob = prefix + decoys + inert_padding
     storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3036,11 +2933,7 @@ def test_pytorch_zip_discovery_skips_p_marker_beyond_literal_lookback(
     storage_blob = prefix + decoys + inert_padding
     storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3065,11 +2958,7 @@ def test_pytorch_zip_discovery_skips_literal_p_marker_after_decoy_headers(
     storage_blob = prefix + decoys + inert_padding
     storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3093,11 +2982,7 @@ def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binunicode_literal(
     storage_blob = prefix + decoys + inert_padding
     storage_blob += b"X" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3121,11 +3006,7 @@ def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binunicode8_literal(
     storage_blob = prefix + decoys + inert_padding
     storage_blob += _pickle_binunicode8(literal_payload) + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3149,11 +3030,7 @@ def test_pytorch_zip_discovery_skips_inst_like_bytes_inside_binbytes_literal(
     storage_blob = prefix + decoys + inert_padding
     storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3175,11 +3052,7 @@ def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_literal_decoy
     inert_padding = b"!" * (70 * 1024)
     storage_blob = prefix + decoys + inert_padding + b"B\x06\x00\x00\x00!!!!Px\n."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3203,11 +3076,7 @@ def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_text_literal_
     literal_payload = (b"!" * (9 * 1024)) + b"Pexternal-storage-key\n." + (b"!" * (9 * 1024))
     storage_blob = prefix + decoys + inert_padding + _pickle_binunicode(literal_payload) + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3232,11 +3101,7 @@ def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_after_many_li
     literal_payload += b"Pexternal-storage-key\n." + b"!"
     storage_blob = prefix + decoys + inert_padding + _pickle_binunicode(literal_payload) + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3261,11 +3126,7 @@ def test_pytorch_zip_discovery_skips_many_literal_markers_without_overlapping_pe
     literal_payload += b"Pexternal-storage-key!." + b"!"
     storage_blob = prefix + decoys + inert_padding + _pickle_binunicode(literal_payload) + b"."
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3288,11 +3149,7 @@ def test_pytorch_zip_discovery_fails_closed_for_unicode_stack_global_after_budge
     malicious_suffix = b"Vposix\nVsystem\n\x93(Vtrue\ntR."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3316,11 +3173,7 @@ def test_pytorch_zip_discovery_skips_unicode_stack_global_after_budget_gap_near_
     payload_size = len(b"Vposix\nVsystem\n\x93(Vtrue\ntR.")
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3343,11 +3196,7 @@ def test_pytorch_zip_discovery_fails_closed_for_long_proto0_inst_operand_after_b
     malicious_suffix = b"(S'" + (b"a" * (9 * 1024)) + b"'\niwebbrowser\nopen\n."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3371,11 +3220,7 @@ def test_pytorch_zip_discovery_skips_long_proto0_inst_sized_budget_gap_near_matc
     payload_size = len(b"(S'" + (b"a" * (9 * 1024)) + b"'\niwebbrowser\nopen\n.")
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3398,11 +3243,7 @@ def test_pytorch_zip_discovery_fails_closed_for_cross_window_proto0_inst_operand
     malicious_suffix = b"(S'" + (b"a" * (70 * 1024)) + b"'\niwebbrowser\nopen\n."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3426,11 +3267,7 @@ def test_pytorch_zip_discovery_skips_cross_window_proto0_inst_sized_budget_gap_n
     payload_size = len(b"(S'" + (b"a" * (70 * 1024)) + b"'\niwebbrowser\nopen\n.")
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3453,11 +3290,7 @@ def test_pytorch_zip_discovery_fails_closed_for_truncated_inst_module_name_after
     malicious_suffix = b"(S'https://example.invalid/'\ni" + (b"a" * (64 * 1024)) + b"\nopen\n."
     storage_blob = prefix + decoys + inert_padding + malicious_suffix
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3481,11 +3314,7 @@ def test_pytorch_zip_discovery_skips_same_sized_truncated_inst_module_near_match
     payload_size = len(b"(S'https://example.invalid/'\ni" + (b"a" * (64 * 1024)) + b"\nopen\n.")
     storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3509,11 +3338,7 @@ def test_pytorch_zip_discovery_skips_invalid_proto0_string_marker_budget_noise(
     inert_padding = b"!" * (70 * 1024)
     storage_blob = prefix + decoys + inert_padding + (marker_noise * 128)
     storage_blob += b"!" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3529,11 +3354,7 @@ def test_pytorch_zip_discovery_skips_invalid_proto0_string_marker_budget_noise(
 def test_pytorch_zip_discovery_skips_referenced_float_storage_extension_like_bytes(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_float_storage_extension_like_bytes.pt"
     storage_blob = b"\x8c\x01\xff\x3f\x82\x01\xff\x3f"
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3547,11 +3368,7 @@ def test_pytorch_zip_discovery_skips_referenced_float_storage_extension_like_byt
 def test_pytorch_zip_discovery_skips_referenced_yolov5n6_storage_prefix(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_yolov5n6_storage_prefix.pt"
     storage_blob = _yolov5n6_tensor_storage_prefix_bytes()
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3589,11 +3406,7 @@ def test_pytorch_zip_discovery_scans_binary_pickle_after_mixed_padding_trivial_p
     model_path = tmp_path / "referenced_scalar_prefix_mixed_padding_binary_pickle.pt"
     storage_blob = b"N." + (b"\xff\xfe" * 3000) + _malicious_eval_pickle_payload()
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3685,11 +3498,7 @@ def test_pytorch_zip_discovery_scans_extension_opcode_crossing_trusted_probe_bou
     model_path = tmp_path / "referenced_scalar_prefix_ext_opcode_boundary.pt"
     storage_blob = b"N." + (b" " * 4093) + b"\x82\x01."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3722,11 +3531,7 @@ def test_pytorch_zip_discovery_routes_encoded_extension_operand_cut_after_recove
     )
     storage_blob = _proto0_string_literal(base64.b64encode(nested_payload))
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3739,11 +3544,7 @@ def test_pytorch_zip_discovery_routes_nested_mark_extension_context(tmp_path: Pa
     payload = b"(N(N10\x82\x01)o\xff"
     storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3757,11 +3558,7 @@ def test_pytorch_zip_discovery_routes_exact_fit_binbytes_storage_without_stop(tm
     storage_blob = b"B" + len(byte_literal).to_bytes(4, "little") + byte_literal
     assert len(storage_blob) == 5024
 
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3787,11 +3584,7 @@ def test_pytorch_zip_discovery_routes_encoded_extension_fail_closed_suffixes(
     model_path = tmp_path / "referenced_extension_fail_closed_suffix.pt"
     storage_blob = b"S'" + base64.b64encode(payload) + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -3814,11 +3607,7 @@ def test_pytorch_zip_preserves_later_payload_after_exhausted_extension_context(
     model_path = tmp_path / "referenced_extension_exhausted_context_later_payload.pt"
     storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4366,11 +4155,7 @@ def test_pytorch_zip_discovery_skips_padding_only_at_padding_probe_limit(
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_padding_only_at_probe_limit.pt"
     storage_blob = b"N." + (b"\x00" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BYTES - len(b"N.")))
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4388,11 +4173,7 @@ def test_pytorch_zip_discovery_scans_raw_nested_binary_prefix_at_padding_probe_b
     padding_len = pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BYTES - len(b"N.") - len(boundary_prefix)
     storage_blob = b"N." + (b"\x00" * padding_len) + boundary_prefix + _malicious_proto0_system_payload()
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4418,11 +4199,7 @@ def test_pytorch_zip_discovery_marks_oversized_length_operand_incomplete(
     model_path = tmp_path / "referenced_scalar_prefix_oversized_length_operand.pt"
     storage_blob = b"N." + b"X" + (70_000).to_bytes(4, "little") + (b"A" * 70_000)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4485,11 +4262,7 @@ def test_pytorch_zip_discovery_marks_oversized_frame_payload_incomplete(
     frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
     storage_blob = b"N." + frame
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4569,11 +4342,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_nul_padding_with_bad_storage_c
     model_path = tmp_path / "referenced_nul_padding_bad_crc_pickle.pt"
     storage_blob = b"N." + (b"\x00" * 65536) + _malicious_proto0_system_payload()
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
     _corrupt_zip_member_crc(model_path, "archive/data/0")
 
     result = PyTorchZipScanner().scan(str(model_path))
@@ -4653,11 +4422,7 @@ def test_pytorch_zip_discovery_skips_benign_proto0_string_operand_split_at_trust
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + b"'tensor-name'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4703,11 +4468,7 @@ def test_pytorch_zip_discovery_scans_truncated_inst_operand_after_trivial_stream
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + b"posix\nsystem\n(S'echo hidden'\ntR."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4725,11 +4486,7 @@ def test_pytorch_zip_discovery_routes_nested_extension_reference_literal_storage
     model_path = tmp_path / "referenced_extension_literal_pickle.pt"
     storage_blob = b"U\x03\x82\x01.."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4746,11 +4503,7 @@ def test_pytorch_zip_discovery_routes_base64_extension_reduce_literal_storage(tm
     model_path = tmp_path / "referenced_base64_extension_reduce_literal_pickle.pt"
     storage_blob = b"S'ggFOMClSLg=='\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4788,11 +4541,7 @@ def test_pytorch_zip_discovery_skips_benign_truncated_memo_operand_at_trusted_pr
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + memo_suffix + b"."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4819,11 +4568,7 @@ def test_pytorch_zip_discovery_does_not_route_benign_getattr_literal_storage(tmp
     model_path = tmp_path / "referenced_scalar_literal_benign_getattr.pt"
     storage_blob = _proto0_string_literal(b"getattr(obj, 'bar')")
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4851,11 +4596,7 @@ def test_pytorch_zip_discovery_routes_binunicode8_literal_after_trivial_prefix(t
     encoded_payload = base64.b64encode(_malicious_proto0_system_payload())
     storage_blob = b"N." + _pickle_binunicode8(encoded_payload) + b"."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4882,11 +4623,7 @@ def test_pytorch_zip_discovery_scans_short_encoded_nested_pickle_storage_literal
     model_path = tmp_path / "referenced_scalar_literal_short_encoded_nested_pickle.pt"
     storage_blob = pickle.dumps(encoded_literal, protocol=0)
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4909,11 +4646,7 @@ def test_pytorch_zip_discovery_fails_closed_for_encoded_nested_pickle_after_cand
     )
     storage_blob = b"S'" + encoded_payload + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4958,11 +4691,7 @@ def test_pytorch_zip_discovery_skips_padded_base64_scalar_near_match(tmp_path: P
     model_path = tmp_path / "referenced_scalar_literal_padded_base64_near_match.pt"
     storage_blob = b"S'" + base64.b64encode(b"safe") + base64.b64encode(b"benign") + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4976,11 +4705,7 @@ def test_pytorch_zip_discovery_skips_padded_base64_scalar_short_suffix_near_matc
     model_path = tmp_path / "referenced_scalar_literal_padded_base64_short_suffix_near_match.pt"
     storage_blob = b"S'" + base64.b64encode(b"safe") + b"AAAA" + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -4996,11 +4721,7 @@ def test_pytorch_zip_discovery_skips_multiple_padded_base64_scalar_near_match(tm
         b"S'" + base64.b64encode(b"safe") + base64.b64encode(b"public") + base64.b64encode(b"benign") + b"'\n."
     )
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5037,11 +4758,7 @@ def test_pytorch_zip_discovery_preserves_suspicious_literal_after_trivial_stream
     model_path = tmp_path / "referenced_suspicious_literal_after_trivial_stream.pt"
     storage_blob = b"N.]S'__reduce__'\na."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5069,11 +4786,7 @@ def test_pytorch_zip_discovery_scans_scalar_literal_with_suspicious_string(tmp_p
     model_path = tmp_path / "referenced_scalar_literal_suspicious_string.pt"
     storage_blob = b"S'eval('\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5093,11 +4806,7 @@ def test_pytorch_zip_discovery_preserves_spooled_line_continuation_suspicious_st
     model_path = tmp_path / "referenced_spooled_line_continuation_suspicious_string.pt"
     storage_blob = b"S'os.\\\\\\nsystem'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner(config={"pickle_max_memory_read": 1}).scan(str(model_path))
 
@@ -5172,11 +4881,7 @@ def test_pytorch_zip_discovery_continues_literal_inspection_after_surrogate_unic
     model_path = tmp_path / "referenced_surrogate_unicode_suspicious_string.pt"
     storage_blob = b"V\\ud800\nS'os.system'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5198,11 +4903,7 @@ def test_pytorch_zip_discovery_scans_scalar_literal_with_magic_method_suspicious
     model_path = tmp_path / "referenced_scalar_literal_magic_method_suspicious_string.pt"
     storage_blob = b"S'__reduce__'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5234,11 +4935,7 @@ def test_pytorch_zip_discovery_routes_storage_literals_matching_native_suspiciou
     model_path = tmp_path / "referenced_storage_native_suspicious_literal.pt"
     storage_blob = _proto0_string_literal(literal_value)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5290,11 +4987,7 @@ def test_pytorch_zip_discovery_skips_binary_candidate_budget_noise_near_match(tm
     model_path = tmp_path / "referenced_binary_candidate_budget_noise_near_match.pt"
     storage_blob = b"S'" + (b"\x8c" * 65) + (b"\xff" * 16) + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5309,11 +5002,7 @@ def test_pytorch_zip_discovery_skips_repeated_text_candidate_budget_near_match(t
     literal = b"abc" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     storage_blob = _proto0_string_literal(literal)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5843,11 +5532,7 @@ def test_pytorch_zip_discovery_routes_budget_exhausted_storage(
     model_path = tmp_path / f"referenced_{case_name}.pt"
     storage_blob = _proto0_string_literal(literal)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5867,11 +5552,7 @@ def test_pytorch_zip_discovery_routes_extension_opcode_after_raw_candidate_budge
     literal = (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"A" * 10) + b"\x82\x01."
     storage_blob = _proto0_string_literal(literal)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5903,11 +5584,7 @@ def test_pytorch_zip_discovery_scans_malformed_separator_after_security_opcode_p
     model_path = tmp_path / "referenced_malformed_separator_after_security_opcode_prefix.pt"
     storage_blob = b"N.cfoo\nbar\n\xffcposix\nsystem\n(S'echo hidden'\ntR."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5938,11 +5615,7 @@ def test_pytorch_zip_discovery_scans_encoded_pickle_after_mixed_malformed_separa
     nested_payload = base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.")
     storage_blob = b"N.#@S'" + nested_payload + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5964,11 +5637,7 @@ def test_pytorch_zip_discovery_scans_encoded_pickle_after_long_malformed_separat
     nested_payload = base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.")
     storage_blob = b"N." + (b"Z" * separator_count) + b"S'" + nested_payload + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -5986,11 +5655,7 @@ def test_pytorch_zip_discovery_skips_repeated_malformed_separator_literal_near_m
     model_path = tmp_path / "referenced_repeated_malformed_separator_literal_near_match.pt"
     storage_blob = b"N." + (b"Z" * 16) + b"S'benign-token'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6038,11 +5703,7 @@ def test_pytorch_zip_discovery_reports_large_malformed_separator_tensor_noise_in
     model_path = tmp_path / "referenced_large_malformed_separator_tensor_noise.pt"
     storage_blob = b"N." + (b"\xff" * 100_000)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6056,11 +5717,7 @@ def test_pytorch_zip_discovery_routes_binunicode_literal_with_repeated_line_cont
     model_path = tmp_path / "referenced_binunicode_repeated_line_continuations.pt"
     storage_blob = b"\x80\x02" + _pickle_binunicode(b"os\\\n\\\n.system('id') ") + b"."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6086,11 +5743,7 @@ def test_pytorch_zip_discovery_skips_encoded_marker_density_scalar_tensor_noise(
     model_path = tmp_path / "referenced_encoded_marker_density_scalar_tensor_noise.pt"
     storage_blob = _proto0_string_literal(b"a" * 512)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6524,11 +6177,7 @@ def test_pytorch_zip_discovery_routes_direct_headerless_byte_literal_storage(tmp
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
     storage_blob = b"C" + bytes([len(encoded)]) + encoded + b"."
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6544,11 +6193,7 @@ def test_pytorch_zip_discovery_routes_long_headerless_binbytes_storage(tmp_path:
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
     byte_literal = (b"A" * 5000) + b" " + encoded + b" "
     storage_blob = b"B" + len(byte_literal).to_bytes(4, "little") + byte_literal + b"."
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6582,11 +6227,7 @@ def test_pytorch_zip_discovery_skips_impossible_headerless_binbytes_length(tmp_p
     model_path = tmp_path / "referenced_impossible_headerless_binbytes_length.pt"
     storage_blob = b"B" + (10_000_000).to_bytes(4, "little") + (b"\x00\x00\x80\x3f" * 2048)
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6632,11 +6273,7 @@ def test_pytorch_zip_discovery_keeps_long_headerless_binbytes_near_match_clean(t
     model_path = tmp_path / "referenced_headerless_binbytes_long_near_match.pt"
     byte_literal = (b"A" * 5000) + b" " + base64.b64encode(b"benign") + b" "
     storage_blob = b"B" + len(byte_literal).to_bytes(4, "little") + byte_literal + b"."
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6675,11 +6312,7 @@ def test_pytorch_zip_discovery_scans_malicious_pickle_after_oversized_nul_paddin
     malicious_tail = b"cposix\nsystem\n(S'echo hidden'\ntR."
     storage_blob = b"N." + (b"\x00" * 300_000) + malicious_tail
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6695,11 +6328,7 @@ def test_pytorch_zip_discovery_scans_malicious_pickle_after_oversized_nul_paddin
 def test_pytorch_zip_discovery_scans_direct_protocol0_persid_storage_blob(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_direct_protocol0_persid_storage.pt"
     storage_blob = b"Pkey01\n."
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6715,11 +6344,7 @@ def test_pytorch_zip_discovery_scans_direct_protocol0_persid_storage_blob(tmp_pa
 def test_pytorch_zip_discovery_skips_protocol0_persid_near_match_storage_blob(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_protocol0_persid_near_match_storage.pt"
     storage_blob = b"PNG\x00" * 8
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6732,11 +6357,7 @@ def test_pytorch_zip_discovery_skips_protocol0_persid_near_match_storage_blob(tm
 def test_pytorch_zip_discovery_keeps_large_all_nul_storage_padding_clean(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_large_nul_padding_storage.pt"
     storage_blob = b"N." + (b"\x00" * ((5 * 1024 * 1024) + 2))
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -7438,11 +7059,7 @@ def test_pytorch_zip_discovery_routes_scalar_literals_with_full_suspicious_strin
     model_path = tmp_path / "referenced_scalar_literal_suspicious_string_policy.pt"
     storage_blob = _proto0_string_literal(literal)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -8623,11 +8240,7 @@ def test_pytorch_zip_discovery_scans_malformed_separator_unicode_literal_nested_
     encoded = base64.b64encode(b"cbuiltins\neval\n(S'1'\ntR.")
     storage_blob = b"N.!V" + encoded + b"\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -8658,11 +8271,7 @@ def test_pytorch_zip_discovery_marks_repeated_trivial_streams_filling_expanded_p
     model_path = tmp_path / "referenced_scalar_prefix_repeated_streams_fill_expanded_probe.pt"
     storage_blob = (b"N." * 32768) + _malicious_eval_pickle_payload()
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -8732,11 +8341,7 @@ def test_pytorch_zip_discovery_scans_persid_after_trivial_prefix_crossing_probe_
     model_path = tmp_path / "referenced_scalar_prefix_long_persid_pickle.pt"
     storage_blob = b"N.P" + (b"A" * 4093) + b"\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -8752,11 +8357,7 @@ def test_pytorch_zip_discovery_scans_security_relevant_pickle_after_trivial_scal
     model_path = tmp_path / "referenced_scalar_prefix_security_relevant_pickle.pt"
     storage_blob = b"N." + trailing_payload
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -8798,11 +8399,7 @@ def test_pytorch_zip_discovery_skips_trivial_prefix_tensor_noise(
 def test_pytorch_zip_discovery_skips_large_nul_padding_storage_blob(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_large_nul_padding_storage.pt"
     storage_blob = b"N." + (b"\x00" * ((600 * 1024) - len(b"N.")))
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -8843,11 +8440,7 @@ def test_pytorch_zip_discovery_does_not_route_size_mismatched_benign_storage_blo
 def test_pytorch_zip_discovery_skips_referenced_storage_blob_binary_magic_without_opcode(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_storage_binary_magic_bytes.pt"
     storage_blob = _binary_magic_tensor_storage_bytes()
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -8864,11 +8457,7 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_frame_first_without
 ) -> None:
     model_path = tmp_path / "referenced_storage_frame_first_raw_bytes.pt"
     storage_blob = _frame_first_raw_storage_bytes()
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -9878,8 +9467,7 @@ def _assert_blacklist_inconclusive_not_cached(
     reason: str,
     **scan_kwargs: Any,
 ) -> None:
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -9904,8 +9492,6 @@ def _assert_blacklist_inconclusive_not_cached(
             ]
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_pytorch_zip_oversized_blacklist_member_is_inconclusive(tmp_path: Path) -> None:
@@ -10277,8 +9863,7 @@ def test_pytorch_zip_scan_failure_is_inconclusive_and_not_cached(
 
     monkeypatch.setattr(PyTorchZipScanner, "_discover_pickle_files", fail_discovery)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for _ in range(2):
             aggregate = scan_model_directory_or_file(
                 str(zip_path),
@@ -10294,8 +9879,6 @@ def test_pytorch_zip_scan_failure_is_inconclusive_and_not_cached(
                 issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
             ]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_pytorch_zip_scan_failure_preserves_prior_malicious_finding(
@@ -18731,39 +18314,18 @@ def test_pytorch_zip_directory_scan_reuses_indexed_repository_inventory(
     assert len({id(value) for value in seen_inventory_objects}) == 1
 
 
-def test_pytorch_zip_streaming_scan_uses_repository_inventory(tmp_path: Path) -> None:
+def _assert_pytorch_zip_streaming_repository_inventory(tmp_path: Path, member_prefix: str, populate_late: bool) -> None:
     repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    model_path = create_mock_pytorch_zip(repo_root / "pytorch_model.bin", prefix="archive")
-
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        yield model_path, True
-
-    repository_config: dict[str, Any] = {
-        REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ["pytorch_model.bin", "model.safetensors"]
-    }
-    result = scan_model_streaming(
-        file_generator=file_generator(),
-        scan_root=str(repo_root),
-        delete_after_scan=False,
-        timeout=30,
-        cache_enabled=False,
-        **repository_config,
-    )
-
-    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
-    assert check.details["safetensors_available"] is True
-
-
-def test_pytorch_zip_streaming_scan_indexes_inventory_after_generator_populates(tmp_path: Path) -> None:
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    model_path = create_mock_pytorch_zip(repo_root / "pytorch_model.bin", prefix="archive")
-    repository_inventory: list[str] = []
+    model_dir = repo_root / member_prefix
+    model_dir.mkdir(parents=bool(member_prefix))
+    model_path = create_mock_pytorch_zip(model_dir / "pytorch_model.bin", prefix="archive")
+    repository_members = [f"{member_prefix}pytorch_model.bin", f"{member_prefix}model.safetensors"]
+    repository_inventory = [] if populate_late else repository_members
     repository_config: dict[str, Any] = {REPOSITORY_FILE_INVENTORY_CONFIG_KEY: repository_inventory}
 
     def file_generator() -> Iterator[tuple[Path, bool]]:
-        repository_inventory.extend(["pytorch_model.bin", "model.safetensors"])
+        if populate_late:
+            repository_inventory.extend(repository_members)
         yield model_path, True
 
     result = scan_model_streaming(
@@ -18777,31 +18339,18 @@ def test_pytorch_zip_streaming_scan_indexes_inventory_after_generator_populates(
 
     check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
     assert check.details["safetensors_available"] is True
+
+
+def test_pytorch_zip_streaming_scan_uses_repository_inventory(tmp_path: Path) -> None:
+    _assert_pytorch_zip_streaming_repository_inventory(tmp_path, "", False)
+
+
+def test_pytorch_zip_streaming_scan_indexes_inventory_after_generator_populates(tmp_path: Path) -> None:
+    _assert_pytorch_zip_streaming_repository_inventory(tmp_path, "", True)
 
 
 def test_pytorch_zip_streaming_scan_uses_repository_inventory_for_nested_sibling(tmp_path: Path) -> None:
-    repo_root = tmp_path / "repo"
-    nested_dir = repo_root / "sub"
-    nested_dir.mkdir(parents=True)
-    model_path = create_mock_pytorch_zip(nested_dir / "pytorch_model.bin", prefix="archive")
-
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        yield model_path, True
-
-    repository_config: dict[str, Any] = {
-        REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ["sub/pytorch_model.bin", "sub/model.safetensors"]
-    }
-    result = scan_model_streaming(
-        file_generator=file_generator(),
-        scan_root=str(repo_root),
-        delete_after_scan=False,
-        timeout=30,
-        cache_enabled=False,
-        **repository_config,
-    )
-
-    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
-    assert check.details["safetensors_available"] is True
+    _assert_pytorch_zip_streaming_repository_inventory(tmp_path, "sub/", False)
 
 
 def test_pytorch_zip_safetensors_inventory_does_not_suppress_malicious_pickle(tmp_path: Path) -> None:
@@ -19671,8 +19220,7 @@ def _assert_pytorch_zip_inconclusive_not_cached(
     expected_exit_code: int,
     **scan_kwargs: Any,
 ) -> None:
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -19695,8 +19243,6 @@ def _assert_pytorch_zip_inconclusive_not_cached(
             assert reason in metadata["scan_outcome_reasons"]
             assert determine_exit_code(aggregate) == expected_exit_code
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_pytorch_zip_entry_limit_is_exit1_and_not_cached(tmp_path: Path) -> None:
@@ -20466,11 +20012,7 @@ def _record_nested_zip_scan(calls: list[str], /, path: str, config: dict[str, ob
 
 def _assert_referenced_storage_critical(model_path: Path, storage_blob: bytes) -> None:
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -20540,11 +20082,7 @@ def _assert_truncated_encoded_extension(tmp_path: Path, filename: str, payload: 
     model_path = tmp_path / filename
     storage_blob = payload
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -20556,11 +20094,7 @@ def _assert_malformed_separator_noise(tmp_path: Path, filename: str, repetitions
     model_path = tmp_path / filename
     storage_blob = b"N." + (b"c" * repetitions)
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -20574,11 +20108,7 @@ def _assert_binary_literal_near_match(tmp_path: Path, filename: str, payload: by
     model_path = tmp_path / filename
     storage_blob = payload
     storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -20611,11 +20141,7 @@ def _assert_headerless_byte_near_match(tmp_path: Path, filename: str, payload: b
     model_path = tmp_path / filename
     storage_blob = payload
     storage_blob += padding * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -20648,11 +20174,7 @@ def _assert_conservative_process_source(tmp_path: Path, payload: bytes, pattern:
 def _assert_headerless_opcode_near_match(tmp_path: Path, storage_blob: bytes, filename: str) -> None:
     model_path = tmp_path / filename
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -20686,11 +20208,7 @@ def _assert_forwarded_native_load(tmp_path: Path, prefix: bytes, suffix: bytes) 
 def _assert_storage_padding_clean(tmp_path: Path, filename: str, padding: bytes, padding_size: int) -> None:
     model_path = tmp_path / filename
     storage_blob = b"N." + (padding * padding_size)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
+    _write_referenced_float_storage(model_path, storage_blob)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
