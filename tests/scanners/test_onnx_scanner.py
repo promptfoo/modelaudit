@@ -38728,3 +38728,121 @@ class TestOnnxFiniteReplayUnusedFunctionGraphs:
             assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
         if incomplete:
             TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxSiblingReplayShapeAdmission:
+    @pytest.mark.parametrize(
+        "mode", ["misleading_pool", "unknown_pool", "proven_vector", "proven_tensor", "constant_vector"]
+    )
+    def test_replay_uses_only_proven_sibling_shapes(self, tmp_path: Path, mode: str) -> None:
+        from copy import deepcopy
+
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        tensor_peer = mode in {"misleading_pool", "unknown_pool", "proven_tensor"}
+        peer = np.ones((1, 1, 4, 4) if tensor_peer else (4,), np.float32)
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
+                helper.make_node("Add", ["state", "peer_state"], ["next_state"]),
+                helper.make_node("Identity", ["peer_state"], ["next_peer"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "sibling_shape_admission",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+                value("peer_state", None),
+            ],
+            [
+                value("condition_out", [], TensorProto.BOOL),
+                value("next_state", None),
+                value("next_peer", None),
+            ],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        sources = [f"source_{index}" for index in range(33)]
+        inputs = [value("A", [1, 64]), value("activation", [1, 1, 4, 4])]
+        initializers = [
+            tensor("prior", prior_weights),
+            tensor("two", np.int64(2)),
+            tensor("condition", np.bool_(True)),
+            tensor("dummy", np.float32(0)),
+            *[tensor(name, np.ones(4, np.float32)) for name in sources],
+        ]
+        nodes = [
+            helper.make_node("MatMul", ["A", "prior"], ["known"]),
+            helper.make_node("Sum", sources, ["initial"]),
+        ]
+        if mode in {"misleading_pool", "unknown_pool"}:
+            inputs.append(value("runtime_peer", list(peer.shape)))
+            nodes.append(helper.make_node("MaxPool", ["runtime_peer"], ["peer"], kernel_shape=[1, 1]))
+        elif mode == "constant_vector":
+            initializers.append(tensor("peer", peer))
+        else:
+            inputs.append(value("peer", list(peer.shape)))
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Loop", ["two", "condition", "initial", "peer"], ["final_state", "final_peer"], body=body
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ]
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "unproven_sibling_context",
+                inputs,
+                [value("known", [1, 64]), value("Y", [])],
+                initializer=initializers,
+                value_info=[value("peer", [4])] if mode == "misleading_pool" else [],
+            ),
+            opset_imports=[helper.make_opsetid("", 18)],
+        )
+        model.ir_version = 9
+        # Intermediate annotations are deliberately untrusted; validate structure
+        # and establish the executed slope shapes independently below.
+        onnx.checker.check_model(model)
+        if mode in {"misleading_pool", "unknown_pool"}:
+            pool_graph = helper.make_graph(
+                [helper.make_node("MaxPool", ["runtime_peer"], ["peer"], kernel_shape=[1, 1])],
+                "actual_pool_shape",
+                [value("runtime_peer", list(peer.shape))],
+                [value("peer", list(peer.shape))],
+            )
+            pooled: Any = ReferenceEvaluator(pool_graph, opsets={"": 18}).run(None, {"runtime_peer": peer})
+            np.testing.assert_array_equal(pooled[0], peer)
+        runtime_body = deepcopy(body)
+        runtime_body.output.append(value("body_y", [1, 1, 4, 4]))
+        evaluator = ReferenceEvaluator(runtime_body, opsets={"": 18})
+        state = np.full((4,), 33, np.float32)
+        activation = -np.ones((1, 1, 4, 4), np.float32)
+        ranks = []
+        for iteration in range(2):
+            ranks.append(state.ndim)
+            actual: Any = evaluator.run(
+                None,
+                {
+                    "iteration": np.int64(iteration),
+                    "condition_in": np.bool_(True),
+                    "state": state,
+                    "peer_state": peer,
+                    "activation": activation,
+                },
+            )
+            np.testing.assert_array_equal(actual[1], state + peer)
+            np.testing.assert_array_equal(actual[2], peer)
+            np.testing.assert_array_equal(actual[3], activation * state)
+            state = actual[1]
+        assert ranks == ([1, 4] if tensor_peer else [1, 1])
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            tensor_peer,
+            prior_weights,
+            coverage_reason="lineages_per_value_limit",
+        )

@@ -10210,15 +10210,13 @@ def _build_onnx_weight_analysis_plan(
                         if not graph_input_name or not is_repeated_control_flow_state_input(pair_index):
                             continue
                         parent_name = str(parent_input)
-                        related_parent_shape = known_value_shapes.get(parent_name)
-                        if related_parent_shape is None:
+                        related_parent_shape = proven_value_shape(parent_name)
+                        if related_parent_shape is None and parent_name not in graph_input_names:
                             related_parent_shape = constant_initializer_shape(constants, parent_name)
-                        if related_parent_shape is None and parent_name in value_lineages:
-                            related_parent_shape = resolved_lineage_shape(value_lineages[parent_name].values())
                         if node.op_type == "Scan":
                             related_parent_shape, _related_parent_rank = _onnx_scan_bound_subgraph_input_shape(
                                 related_parent_shape,
-                                known_value_ranks.get(parent_name),
+                                proven_value_rank(parent_name),
                                 pair_index=pair_index,
                                 scan_input_start=scan_input_start,
                                 scan_input_offset=scan_input_offset,
@@ -10459,13 +10457,14 @@ def _build_onnx_weight_analysis_plan(
                                     and sibling_graph_input_name not in current_weight_consumer_dependency_names
                                 ):
                                     continue
-                                sibling_parent_shape = known_value_shapes.get(sibling_parent_name)
-                                if sibling_parent_shape is None:
+                                sibling_parent_shape = proven_value_shape(sibling_parent_name)
+                                if sibling_parent_shape is None and sibling_parent_name not in graph_input_names:
                                     sibling_parent_shape = constant_initializer_shape(constants, sibling_parent_name)
                                 if sibling_parent_shape is None:
-                                    sibling_parent_rank = known_value_ranks.get(sibling_parent_name)
+                                    sibling_parent_rank = proven_value_rank(sibling_parent_name)
                                     if sibling_parent_rank is None:
-                                        continue
+                                        sibling_state_rank_promotion_may_affect_weight = True
+                                        break
                                     sibling_parent_shape = tuple(-1 for _ in range(sibling_parent_rank))
                                 if subgraph_reenters_state_with_rank_promotion(
                                     subgraph,
