@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
 try:
@@ -232,3 +233,52 @@ def test_h5py_requirements_preserve_older_python_floors(extra: str, python_versi
     assert requirement.specifier.contains("3.15.0")
     assert not requirement.specifier.contains("4.0.0")
     assert requirement.specifier.contains("3.14.0") is (python_version != "3.14")
+
+
+def test_renovate_python_updates_follow_runtime_support() -> None:
+    project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    supported_versions = sorted(
+        Version(match.group(1))
+        for classifier in project["classifiers"]
+        if (match := re.fullmatch(r"Programming Language :: Python :: (3\.\d+)", classifier))
+    )
+    assert supported_versions
+    last_supported = supported_versions[-1]
+    next_minor = Version(f"{last_supported.major}.{last_supported.minor + 1}")
+    versions = [*supported_versions, next_minor]
+    runtime_support = SpecifierSet(project["requires-python"])
+    rules = json.loads(RENOVATE_CONFIG.read_text(encoding="utf-8"))["packageRules"]
+    python_rules = [(index, rule) for index, rule in enumerate(rules) if rule.get("matchPackageNames") == ["python"]]
+    global_rules = [(index, rule) for index, rule in python_rules if "matchFileNames" not in rule]
+    assert len(global_rules) == 1
+    global_index, global_rule = global_rules[0]
+    update_policy = SpecifierSet(global_rule["allowedVersions"])
+
+    for version in versions:
+        assert update_policy.contains(version) == runtime_support.contains(version)
+
+    tensorflow_rules = [
+        (index, rule) for index, rule in python_rules if rule.get("matchFileNames") == ["Dockerfile.tensorflow"]
+    ]
+    assert len(tensorflow_rules) == 1
+    tensorflow_index, tensorflow_rule = tensorflow_rules[0]
+    assert tensorflow_index > global_index
+    tensorflow_policy = SpecifierSet(tensorflow_rule["allowedVersions"])
+    tensorflow_requirements = [
+        requirement
+        for entry in project["optional-dependencies"]["tensorflow"]
+        if (requirement := Requirement(entry)).name == "tensorflow"
+    ]
+    assert len(tensorflow_requirements) == 1
+    image = (ROOT_DIR / "Dockerfile.tensorflow").read_text(encoding="utf-8")
+    image_match = re.search(r"(?m)^ARG PYTHON_IMAGE=python:(\d+\.\d+)", image)
+    assert image_match is not None
+    image_version = Version(image_match.group(1))
+    for version in versions:
+        if version < image_version:
+            continue
+        expected = any(
+            requirement.marker is None or requirement.marker.evaluate({"python_version": str(version)})
+            for requirement in tensorflow_requirements
+        )
+        assert tensorflow_policy.contains(version) == expected
