@@ -749,6 +749,9 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"|\b"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\s+(?:production|generation|creation)\s+(?:may|might|could)\s+be\s+possible\b"
+    rb"(?=[.;]?\s*$|[.;]\s*review\s+generated\s+outputs\.?\s*$"
+    rb"|,\s*and\s+developers\s+should\s+ensure\s+that\s+their\s+applications\s+do\s+not\s+violate\s+"
+    rb"applicable\s+laws\s+and\s+regulations\.?\s*$)"
     rb")",
     re.IGNORECASE,
 )
@@ -1142,6 +1145,21 @@ class TextScanner(BaseScanner):
                 previous = current
                 previous_closed_subscript = current_closed_subscript
         except (IndentationError, tokenize.TokenError):
+            # Prose contractions can stop tokenization before a closing paren.
+            # Preserve actual Python string prefixes and keywords.
+            normalized = re.sub(
+                rb"\b([A-Za-z]+)'(s|t|re|ve|ll|d|m)\b",
+                lambda match: (
+                    match.group()
+                    if keyword.iskeyword(match[1].decode())
+                    or match[1].lower() in {b"r", b"u", b"b", b"f", b"br", b"rb", b"fr", b"rf"}
+                    else match[1] + b"_" + match[2]
+                ),
+                source,
+                flags=re.IGNORECASE,
+            )
+            if normalized != source:
+                return TextScanner._documentation_prefix_has_enclosing_call(normalized)
             # Incomplete prefixes are expected; the partial stack still identifies an open call.
             return any(opening == "(" and is_call for opening, is_call in stack)
         return any(opening == "(" and is_call for opening, is_call in stack)
@@ -1269,9 +1287,7 @@ class TextScanner(BaseScanner):
             return False
         passive_line_markdown_link = cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix)
         literal_value_prefix = cls._documentation_markdown_link_leading_prefix_is_literal_value(line_prefix)
-        if (passive_line_markdown_link or literal_value_prefix) and cls._documentation_open_call_contains_position(
-            payload, link_start
-        ):
+        if cls._documentation_open_call_contains_position(payload, link_start):
             return False
         return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is False and (
             (passive_line_markdown_link and not cls._documentation_markdown_link_config_is_actionable(context_prefix))
@@ -2111,9 +2127,11 @@ class TextScanner(BaseScanner):
             tag_line_start = html_prefix.rfind(b"\n", 0, html_link.start()) + 1
             if not html_prefix[tag_line_start : html_link.start()].strip():
                 surrounding_prefix = html_prefix[: html_link.start()]
-                return cls._documentation_assignment_is_actionable(
-                    surrounding_prefix
-                ) or cls._documentation_markdown_link_config_is_actionable(surrounding_prefix)
+                return (
+                    cls._documentation_assignment_is_actionable(surrounding_prefix)
+                    or cls._documentation_markdown_link_config_is_actionable(surrounding_prefix)
+                    or cls._documentation_prefix_has_enclosing_call(surrounding_prefix)
+                )
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return not cls._documentation_truncated_prefix_after_closed_xml_config_is_passive(payload, position)
         line_parts = cls._finding_line_parts(payload, finding)
@@ -2206,16 +2224,13 @@ class TextScanner(BaseScanner):
         original_position = finding.get("position")
         search_start = (
             0
-            if finding_type == "network_library"
+            if finding_type in {"network_library", "suspicious_port"}
             else original_position
             if isinstance(original_position, int) and original_position >= 0
             else 0
         )
         find_token = cls._find_documentation_token
         if finding_type == "suspicious_port":
-            # Detector positions point at the digits, while retarget tokens
-            # include their delimiter. Include the original occurrence.
-            search_start = max(0, search_start - max(map(len, token_bytes_options)) + len(str(finding["port"])))
             find_token = cls._find_documentation_port_token
         next_positions = {
             token_bytes: find_token(lowered_payload, token_bytes, search_start) for token_bytes in token_bytes_options

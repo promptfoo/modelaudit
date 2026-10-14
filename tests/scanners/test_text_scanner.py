@@ -2307,7 +2307,10 @@ def test_text_scanner_model_card_wrapped_long_literal_markdown_link_remains_acti
     )
 
 
-@pytest.mark.parametrize("literal_prefix,literal_suffix", [("", ""), ('r#"', '"#')])
+@pytest.mark.parametrize(
+    "literal_prefix,literal_suffix",
+    [("", ""), ('r#"', '"#'), ("source ", ""), ("--url ", ""), ("r's ", "'"), ("'x' and's ", "'")],
+)
 def test_text_scanner_markdown_link_in_open_call_remains_actionable(
     tmp_path: Path, literal_prefix: str, literal_suffix: str
 ) -> None:
@@ -3569,6 +3572,26 @@ def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: P
 
 
 @pytest.mark.parametrize(
+    "suffix",
+    [" and is enabled by default.", "; it is enabled by default.", ". This capability is enabled by default."],
+)
+def test_text_scanner_possible_misuse_does_not_hide_same_line_admissions(tmp_path: Path, suffix: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, "Malware production may be possible" + suffix + "\n", "cc_pattern"
+    )
+
+
+def test_text_scanner_possible_misuse_with_compliance_guidance_is_informational(tmp_path: Path) -> None:
+    result = _scan_text_content(
+        tmp_path / "README.md",
+        "* **Misuse:** Other forms of misuse such as fraud, spam, or malware production may be possible, "
+        "and developers should ensure that their applications do not violate applicable laws and regulations.\n",
+    )
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+@pytest.mark.parametrize(
     "content",
     [
         'label = "malware production may be possible"\n',
@@ -3616,6 +3639,17 @@ def test_text_scanner_port_retarget_exact_budget_ignores_longer_numbers() -> Non
     assert remaining == 0
 
 
+def test_text_scanner_port_retarget_includes_earlier_pattern_variants(tmp_path: Path) -> None:
+    content = 'endpoint = "port=23"\nReference host:23 is documented.\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "suspicious_port"
+        and check.details.get("position") == content.index("23")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     "prefix",
     [
@@ -3640,7 +3674,7 @@ def test_text_scanner_multiline_documentation_html_links_are_informational(
 
 
 @pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
-@pytest.mark.parametrize("prefix", ["<endpoint>\n", 'endpoint = "\n', "endpoint:\n"])
+@pytest.mark.parametrize("prefix", ["<endpoint>\n", 'endpoint = "\n', "endpoint:\n", "download(\n"])
 def test_text_scanner_passive_html_in_config_remains_actionable(
     tmp_path: Path, tag: str, attribute: str, prefix: str
 ) -> None:
