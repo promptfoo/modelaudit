@@ -28,6 +28,8 @@ URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
 PYTHON_EXECUTION_NAMES = frozenset(
     {"exec", "eval", "compile", "__import__", "subprocess", "system", "popen", "runpy", "run_path", "run_module"}
+    | {prefix + suffix for prefix in ("exec", "spawn") for suffix in ("l", "le", "lp", "lpe", "v", "ve", "vp", "vpe")}
+    | {"posix_spawn", "posix_spawnp", "startfile"}
 )
 URL_RISK_TERMS = (
     NetworkCommDetector.INFORMATIONAL_URL_RISK_TERMS
@@ -99,6 +101,32 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
         words = ["python", *words[1:]]
     if words[:1] == ["cmake"] and _cmake_script_options(words[1:]):
         return None
+    if words[:2] == ["vllm", "serve"]:
+        if len(words) < 3 or words[2].startswith("-") or re.fullmatch(r"[\w./-]+", words[2]) is None:
+            return None
+        options = iter(words[3:])
+        for arg in options:
+            option, separator, value = arg.partition("=")
+            if option in {"--enable-prefix-caching", "--enable-auto-tool-choice", "--enable-reasoning"}:
+                if separator:
+                    return None
+                continue
+            if option not in {
+                "--host",
+                "--port",
+                "--served-model-name",
+                "--max-model-len",
+                "--gpu-memory-utilization",
+                "--tensor-parallel-size",
+                "--dtype",
+                "--tool-call-parser",
+                "--reasoning-parser",
+            }:
+                return None
+            value = value if separator else next(options, "")
+            if not value or value.startswith("-") or re.fullmatch(r"[\w.:-]+", value) is None:
+                return None
+        return set()
     if words[:2] == ["git", "clone"]:
         args = words[2:]
         while args:
@@ -164,7 +192,6 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
             ["conda", "activate"],
             ["cmake", "-B"],
             ["cmake", "--build"],
-            ["vllm", "serve"],
         )
     ) and all(re.fullmatch(r"[\w./=+:-]+", arg) is not None for arg in words):
         return set()
@@ -425,7 +452,7 @@ def _command_executes_script(words: list[str]) -> bool:
         return False
     command = words[0].rsplit("/", 1)[-1].lower().removesuffix(".exe")
     if (
-        words[0].startswith("$")
+        "$" in words[0]
         or (wrapped and command.startswith("-"))
         or command.endswith(
             (".py", ".pyw", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd")
@@ -456,6 +483,7 @@ def _command_executes_script(words: list[str]) -> bool:
             "powershell",
             "sudo",
             "npx",
+            "vllm",
         }
         or (command in {"uv", "pipx", "npm"} and words[1:2] in (["run"], ["exec"]))
         or (command == "cmake" and _cmake_script_options(words[1:]))
