@@ -59,6 +59,25 @@ class _FakeCloudConfig:
         self.app_url = app_url
 
 
+@pytest.fixture(params=[False, True], ids=["allowlist", "environment"])
+def auth_host_case(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_FakeCloudConfig, str, str | None]:
+    use_environment = request.param
+    fake_config = _FakeCloudConfig(
+        api_host="https://old.promptfoo.app" if use_environment else "https://api.promptfoo.app"
+    )
+    monkeypatch.setenv(
+        "MODELAUDIT_API_HOST" if use_environment else "MODELAUDIT_API_ALLOWED_HOSTS",
+        "https://enterprise.example:8443" if use_environment else "enterprise.example",
+    )
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    token = "enterprise-token" if use_environment else "secret-token"
+    api_host = None if use_environment else "https://ENTERPRISE.EXAMPLE:8443/"
+    return fake_config, token, api_host
+
+
 def _patch_config_paths(
     module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -119,84 +138,56 @@ def test_write_global_config_replaces_symlink_instead_of_following_target(
     assert written["cloud"]["apiKey"] == "secret"
 
 
-def test_read_global_config_ignores_symlinked_config_directory(
+@pytest.mark.parametrize(
+    ("symlink_ancestor", "safe_fallback"),
+    [
+        pytest.param(False, True, id="symlinked-directory-existing-fallback"),
+        pytest.param(False, False, id="symlinked-directory-missing-fallback"),
+        pytest.param(True, True, id="symlinked-ancestor-existing-fallback"),
+    ],
+)
+def test_read_global_config_ignores_symlinked_config_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     requires_symlinks: None,
+    symlink_ancestor: bool,
+    safe_fallback: bool,
 ) -> None:
-    primary_parent = tmp_path / "xdg"
-    primary_parent.mkdir()
-    attacker_dir = tmp_path / "attacker"
-    attacker_dir.mkdir()
-    primary_dir = primary_parent / "promptfoo"
-    primary_dir.symlink_to(attacker_dir, target_is_directory=True)
-    (attacker_dir / "promptfoo.yaml").write_text(
+    if symlink_ancestor:
+        attacker_dir = tmp_path / "attacker-root"
+        attacker_dir.mkdir()
+        redirected_root = tmp_path / "redirected-root"
+        redirected_root.symlink_to(attacker_dir, target_is_directory=True)
+        primary_dir = redirected_root / "promptfoo"
+        primary_dir.mkdir()
+    else:
+        primary_parent = tmp_path / "xdg"
+        primary_parent.mkdir()
+        attacker_dir = tmp_path / "attacker"
+        attacker_dir.mkdir()
+        primary_dir = primary_parent / "promptfoo"
+        primary_dir.symlink_to(attacker_dir, target_is_directory=True)
+
+    attacker_config_dir = primary_dir if symlink_ancestor else attacker_dir
+    (attacker_config_dir / "promptfoo.yaml").write_text(
         yaml.safe_dump({"id": "attacker-id", "cloud": {"apiKey": "stolen-secret"}})
     )
-
     fallback_dir = tmp_path / "home" / ".promptfoo"
-    fallback_dir.mkdir(parents=True)
-    (fallback_dir / "promptfoo.yaml").write_text(yaml.safe_dump({"id": "safe-id", "cloud": {"apiKey": "safe-key"}}))
+    if safe_fallback:
+        fallback_dir.mkdir(parents=True)
+        (fallback_dir / "promptfoo.yaml").write_text(yaml.safe_dump({"id": "safe-id", "cloud": {"apiKey": "safe-key"}}))
 
     _patch_config_paths(auth_config, monkeypatch, primary_dir, fallback_dir)
 
     config = auth_config.read_global_config()
 
-    assert config.id == "safe-id"
-    assert config.cloud["apiKey"] == "safe-key"
-
-
-def test_read_global_config_does_not_read_attacker_file_when_safe_fallback_is_missing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    requires_symlinks: None,
-) -> None:
-    primary_parent = tmp_path / "xdg"
-    primary_parent.mkdir()
-    attacker_dir = tmp_path / "attacker"
-    attacker_dir.mkdir()
-    primary_dir = primary_parent / "promptfoo"
-    primary_dir.symlink_to(attacker_dir, target_is_directory=True)
-    (attacker_dir / "promptfoo.yaml").write_text(
-        yaml.safe_dump({"id": "attacker-id", "cloud": {"apiKey": "stolen-secret"}})
-    )
-
-    fallback_dir = tmp_path / "home" / ".promptfoo"
-
-    _patch_config_paths(auth_config, monkeypatch, primary_dir, fallback_dir)
-
-    config = auth_config.read_global_config()
-
-    assert config.id != "attacker-id"
-    assert config.cloud.get("apiKey") != "stolen-secret"
-    assert (fallback_dir / "promptfoo.yaml").exists()
-
-
-def test_read_global_config_ignores_config_directory_under_symlinked_ancestor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    requires_symlinks: None,
-) -> None:
-    attacker_root = tmp_path / "attacker-root"
-    attacker_root.mkdir()
-    redirected_root = tmp_path / "redirected-root"
-    redirected_root.symlink_to(attacker_root, target_is_directory=True)
-    primary_dir = redirected_root / "promptfoo"
-    primary_dir.mkdir()
-    (primary_dir / "promptfoo.yaml").write_text(
-        yaml.safe_dump({"id": "attacker-id", "cloud": {"apiKey": "stolen-secret"}})
-    )
-
-    fallback_dir = tmp_path / "home" / ".promptfoo"
-    fallback_dir.mkdir(parents=True)
-    (fallback_dir / "promptfoo.yaml").write_text(yaml.safe_dump({"id": "safe-id", "cloud": {"apiKey": "safe-key"}}))
-
-    _patch_config_paths(auth_config, monkeypatch, primary_dir, fallback_dir)
-
-    config = auth_config.read_global_config()
-
-    assert config.id == "safe-id"
-    assert config.cloud["apiKey"] == "safe-key"
+    if safe_fallback:
+        assert config.id == "safe-id"
+        assert config.cloud["apiKey"] == "safe-key"
+    else:
+        assert config.id != "attacker-id"
+        assert config.cloud.get("apiKey") != "stolen-secret"
+        assert (fallback_dir / "promptfoo.yaml").exists()
 
 
 def test_write_global_config_avoids_directory_under_symlinked_ancestor(
@@ -575,8 +566,12 @@ def test_cloud_config_set_api_host_accepts_allowlisted_enterprise_https_hosts(
     assert cloud_config.get_api_host() == "https://enterprise.example:8443"
 
 
-def test_cloud_config_set_api_host_rolls_back_in_memory_on_write_failure(
+@pytest.mark.parametrize("credentials", [False, True], ids=["api-host", "credentials"])
+@pytest.mark.parametrize("failure", ["raised", "silent"])
+def test_cloud_config_rolls_back_failed_update(
     monkeypatch: pytest.MonkeyPatch,
+    credentials: bool,
+    failure: str,
 ) -> None:
     cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
     old_config = {
@@ -589,32 +584,31 @@ def test_cloud_config_set_api_host_rolls_back_in_memory_on_write_failure(
     def fail_save() -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr(cloud_config, "_save_config", fail_save)
-
-    with pytest.raises(OSError, match="disk full"):
-        cloud_config.set_api_host("https://new-api.promptfoo.app")
-
-    assert cloud_config.config == old_config
-
-
-def test_cloud_config_set_api_host_detects_silent_persistence_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
-    old_config = {
-        "appUrl": "https://old-app.example",
-        "apiHost": "https://old-api.example",
-        "apiKey": "old-token",
-    }
-    cloud_config.config = dict(old_config)
+    def fail_write(_partial: dict[str, Any]) -> None:
+        fail_save()
 
     def silently_restore_old_config() -> None:
         cloud_config.config = dict(old_config)
 
-    monkeypatch.setattr(cloud_config, "_save_config", silently_restore_old_config)
+    if credentials and failure == "raised":
+        monkeypatch.setattr(auth_config, "write_global_config_partial", fail_write)
+    else:
+        monkeypatch.setattr(
+            cloud_config, "_save_config", fail_save if failure == "raised" else silently_restore_old_config
+        )
 
-    with pytest.raises(OSError, match="Unable to persist cloud API host"):
-        cloud_config.set_api_host("https://new-api.promptfoo.app")
+    if failure == "raised":
+        expected_message = "disk full"
+    elif credentials:
+        expected_message = "Unable to persist cloud authentication credentials"
+    else:
+        expected_message = "Unable to persist cloud API host"
+
+    with pytest.raises(OSError, match=expected_message):
+        if credentials:
+            cloud_config.set_credentials("https://new-api.promptfoo.app", "new-token", "https://new-app.example")
+        else:
+            cloud_config.set_api_host("https://new-api.promptfoo.app")
 
     assert cloud_config.config == old_config
 
@@ -676,48 +670,27 @@ def test_auth_login_rejects_untrusted_host_before_request(
     assert f"Authentication failed: {expected_message}" in result.output
 
 
-def test_auth_login_accepts_explicit_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_auth_login_uses_selected_enterprise_https_host(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_host_case: tuple[_FakeCloudConfig, str, str | None],
+) -> None:
     from click.testing import CliRunner
 
     from modelaudit.cli import cli
 
-    fake_config = _FakeCloudConfig()
+    fake_config, token, api_host = auth_host_case
     requested_urls: list[str] = []
-
-    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", "enterprise.example")
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
     monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
     monkeypatch.setattr("modelaudit.cli.get_user_email", lambda: None)
     monkeypatch.setattr("modelaudit.cli.set_user_email", lambda _email: None)
 
-    result = CliRunner().invoke(
-        cli,
-        ["auth", "login", "--api-key", "secret-token", "--host", "https://ENTERPRISE.EXAMPLE:8443/"],
-    )
+    args = ["auth", "login", "--api-key", token]
+    if api_host is not None:
+        args.extend(["--host", api_host])
+    result = CliRunner().invoke(cli, args)
 
     assert result.exit_code == 0, result.output
     assert "Successfully logged in" in result.output
-    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
-    assert fake_config.api_host == "https://enterprise.example:8443"
-
-
-def test_auth_login_uses_environment_host_instead_of_persisted_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    from click.testing import CliRunner
-
-    from modelaudit.cli import cli
-
-    fake_config = _FakeCloudConfig(api_host="https://old.promptfoo.app")
-    requested_urls: list[str] = []
-
-    monkeypatch.setenv("MODELAUDIT_API_HOST", "https://enterprise.example:8443")
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
-    monkeypatch.setattr("modelaudit.cli.get_user_email", lambda: None)
-    monkeypatch.setattr("modelaudit.cli.set_user_email", lambda _email: None)
-
-    result = CliRunner().invoke(cli, ["auth", "login", "--api-key", "enterprise-token"])
-
-    assert result.exit_code == 0, result.output
     assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
     assert fake_config.api_host == "https://enterprise.example:8443"
 
@@ -735,44 +708,25 @@ def test_auth_login_help_documents_custom_host_trust_configuration() -> None:
     assert "API_HOST" in result.output
 
 
-def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalized_host(
+def test_validate_and_set_api_token_uses_selected_host_and_stores_normalized_credentials(
     monkeypatch: pytest.MonkeyPatch,
+    auth_host_case: tuple[_FakeCloudConfig, str, str | None],
 ) -> None:
-    fake_config = _FakeCloudConfig()
+    fake_config, token, api_host = auth_host_case
     requested_urls: list[str] = []
     requested_kwargs: list[dict[str, Any]] = []
-
-    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", "enterprise.example")
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
     monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls, requested_kwargs))
 
-    result = auth_client_module.AuthClient().validate_and_set_api_token(
-        "secret-token",
-        "https://ENTERPRISE.EXAMPLE:8443/",
-    )
+    if api_host is None:
+        result = auth_client_module.AuthClient().validate_and_set_api_token(token)
+    else:
+        result = auth_client_module.AuthClient().validate_and_set_api_token(token, api_host)
 
     assert result["user"].email == "user@example.com"
     assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
     assert requested_kwargs[0]["allow_redirects"] is False
     assert fake_config.api_host == "https://enterprise.example:8443"
-    assert fake_config.api_key == "secret-token"
-
-
-def test_validate_and_set_api_token_uses_environment_host_instead_of_persisted_host(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_config = _FakeCloudConfig(api_host="https://old.promptfoo.app")
-    requested_urls: list[str] = []
-
-    monkeypatch.setenv("MODELAUDIT_API_HOST", "https://enterprise.example:8443")
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
-
-    auth_client_module.AuthClient().validate_and_set_api_token("enterprise-token")
-
-    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
-    assert fake_config.api_host == "https://enterprise.example:8443"
-    assert fake_config.api_key == "enterprise-token"
+    assert fake_config.api_key == token
 
 
 def test_validate_and_set_api_token_does_not_change_credentials_when_atomic_persistence_fails(
@@ -819,50 +773,6 @@ def test_cloud_config_set_credentials_uses_one_cloud_write(monkeypatch: pytest.M
     assert writes == [{"cloud": expected_cloud_config}]
 
 
-def test_cloud_config_set_credentials_rolls_back_in_memory_on_write_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
-    old_config = {
-        "appUrl": "https://old-app.example",
-        "apiHost": "https://old-api.example",
-        "apiKey": "old-token",
-    }
-    cloud_config.config = dict(old_config)
-
-    def fail_write(_partial: dict[str, Any]) -> None:
-        raise OSError("disk full")
-
-    monkeypatch.setattr(auth_config, "write_global_config_partial", fail_write)
-
-    with pytest.raises(OSError, match="disk full"):
-        cloud_config.set_credentials("https://new-api.promptfoo.app", "new-token", "https://new-app.example")
-
-    assert cloud_config.config == old_config
-
-
-def test_cloud_config_set_credentials_detects_silent_persistence_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
-    old_config = {
-        "appUrl": "https://old-app.example",
-        "apiHost": "https://old-api.example",
-        "apiKey": "old-token",
-    }
-    cloud_config.config = dict(old_config)
-
-    def silently_restore_old_config() -> None:
-        cloud_config.config = dict(old_config)
-
-    monkeypatch.setattr(cloud_config, "_save_config", silently_restore_old_config)
-
-    with pytest.raises(OSError, match="Unable to persist cloud authentication credentials"):
-        cloud_config.set_credentials("https://new-api.promptfoo.app", "new-token", "https://new-app.example")
-
-    assert cloud_config.config == old_config
-
-
 def test_validate_and_set_api_token_rejects_redirect_response_without_persisting_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -892,14 +802,17 @@ def test_get_user_info_rejects_attacker_https_config_host_before_request(monkeyp
     _assert_untrusted_config_host_rejection(monkeypatch, "https://attacker.example", "trusted Promptfoo API host")
 
 
-def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_config = _FakeCloudConfig(api_host="https://enterprise.example:8443", api_key="secret-token")
+def test_get_user_info_uses_selected_enterprise_https_host(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_host_case: tuple[_FakeCloudConfig, str, str | None],
+) -> None:
+    fake_config, token, api_host = auth_host_case
+    fake_config.api_key = token
+    if api_host is not None:
+        fake_config.api_host = "https://enterprise.example:8443"
+        monkeypatch.setattr(auth_client_module.config, "cloud_config", fake_config)
     requested_urls: list[str] = []
     requested_kwargs: list[dict[str, Any]] = []
-
-    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", "enterprise.example")
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module.config, "cloud_config", fake_config)
     monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
     monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls, requested_kwargs))
 
@@ -907,20 +820,6 @@ def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pyte
 
     assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
     assert requested_kwargs[0]["allow_redirects"] is False
-
-
-def test_get_user_info_uses_environment_host_instead_of_persisted_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_config = _FakeCloudConfig(api_host="https://old.promptfoo.app", api_key="enterprise-token")
-    requested_urls: list[str] = []
-
-    monkeypatch.setenv("MODELAUDIT_API_HOST", "https://enterprise.example:8443")
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
-
-    auth_client_module.AuthClient().get_user_info()
-
-    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
 
 
 def _assert_untrusted_config_host_rejection(

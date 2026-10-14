@@ -469,51 +469,33 @@ class TestMLDirectoryDetection:
         assert _is_ml_config_file("config.txt") is False
 
 
+def _license_results(file_path: str, **license_info: object) -> dict[str, object]:
+    return {"file_metadata": {file_path: {"license_info": [license_info]}}}
+
+
 class TestCommercialUseWarnings:
     """Test commercial use warnings."""
 
-    def test_agpl_detection(self):
+    def test_agpl_detection(self) -> None:
         """Test AGPL component detection."""
-        scan_results = {
-            "file_metadata": {
-                "/path/agpl_file.py": {
-                    "license_info": [
-                        {"spdx_id": "AGPL-3.0", "commercial_allowed": True},
-                    ],
-                },
-            },
-        }
+        scan_results = _license_results("/path/agpl_file.py", spdx_id="AGPL-3.0", commercial_allowed=True)
 
         agpl_files = detect_agpl_components(scan_results)
 
         assert len(agpl_files) == 1
         assert "/path/agpl_file.py" in agpl_files
 
-    def test_no_agpl_detection(self):
+    def test_no_agpl_detection(self) -> None:
         """Test when no AGPL components are present."""
-        scan_results = {
-            "file_metadata": {
-                "/path/mit_file.py": {
-                    "license_info": [{"spdx_id": "MIT", "commercial_allowed": True}],
-                },
-            },
-        }
+        scan_results = _license_results("/path/mit_file.py", spdx_id="MIT", commercial_allowed=True)
 
         agpl_files = detect_agpl_components(scan_results)
 
         assert len(agpl_files) == 0
 
-    def test_check_commercial_use_warnings_agpl(self):
+    def test_check_commercial_use_warnings_agpl(self) -> None:
         """Test commercial use warnings for AGPL components."""
-        scan_results = {
-            "file_metadata": {
-                "/path/agpl_component.py": {
-                    "license_info": [
-                        {"spdx_id": "AGPL-3.0", "commercial_allowed": True},
-                    ],
-                },
-            },
-        }
+        scan_results = _license_results("/path/agpl_component.py", spdx_id="AGPL-3.0", commercial_allowed=True)
 
         warnings = check_commercial_use_warnings(scan_results)
 
@@ -527,17 +509,9 @@ class TestCommercialUseWarnings:
         assert agpl_warnings[0]["severity"] == "warning"
         assert "network use restrictions" in agpl_warnings[0]["message"]
 
-    def test_check_commercial_use_warnings_noncommercial(self):
+    def test_check_commercial_use_warnings_noncommercial(self) -> None:
         """Test warnings for non-commercial licensed components."""
-        scan_results = {
-            "file_metadata": {
-                "/path/cc_nc_dataset.csv": {
-                    "license_info": [
-                        {"spdx_id": "CC-BY-NC-4.0", "commercial_allowed": False},
-                    ],
-                },
-            },
-        }
+        scan_results = _license_results("/path/cc_nc_dataset.csv", spdx_id="CC-BY-NC-4.0", commercial_allowed=False)
 
         warnings = check_commercial_use_warnings(scan_results)
 
@@ -546,15 +520,9 @@ class TestCommercialUseWarnings:
         assert any("Non-commercial" in w["message"] for w in warnings)
         assert any("cannot be used commercially" in w["message"] for w in warnings)
 
-    def test_check_commercial_use_warnings_clean(self):
+    def test_check_commercial_use_warnings_clean(self) -> None:
         """Test no warnings for clean licenses."""
-        scan_results = {
-            "file_metadata": {
-                "/path/mit_file.py": {
-                    "license_info": [{"spdx_id": "MIT", "commercial_allowed": True}],
-                },
-            },
-        }
+        scan_results = _license_results("/path/mit_file.py", spdx_id="MIT", commercial_allowed=True)
 
         warnings = check_commercial_use_warnings(scan_results)
 

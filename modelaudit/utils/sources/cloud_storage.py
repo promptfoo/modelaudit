@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import shutil
-import struct
 import tempfile
 import unicodedata
 import zipfile
@@ -1243,27 +1242,6 @@ class _CloudContentSniffBudget:
 
         return cached + chunk
 
-    def read_stream(self, remote_file: Any, requested_bytes: int | None = -1) -> bytes:
-        """Read from a random-access stream without exceeding the shared budget."""
-        if requested_bytes == 0:
-            return b""
-        if self.remaining_bytes <= 0:
-            raise _CloudContentSniffBudgetExceeded
-
-        if requested_bytes is None or requested_bytes < 0:
-            read_size = self.remaining_bytes
-            was_capped = True
-        else:
-            read_size = min(requested_bytes, self.remaining_bytes)
-            was_capped = requested_bytes > self.remaining_bytes
-        chunk = remote_file.read(read_size)
-        if not isinstance(chunk, bytes):
-            raise TypeError("cloud filesystem returned non-bytes content")
-        self.remaining_bytes -= len(chunk)
-        if was_capped and len(chunk) == read_size:
-            self.incomplete_stream_reads += 1
-        return chunk
-
     def classification_error(self, file_url: str) -> ValueError:
         """Build an error for an inconclusive budget-limited probe."""
         return ValueError(
@@ -1358,7 +1336,16 @@ class _BudgetedCloudContentReader:
             next_cached_offset = next((start for start, _cached in self._cached_ranges if start > offset), None)
             if next_cached_offset is not None:
                 read_size = min(read_size, next_cached_offset - offset)
-            chunk = self._budget.read_stream(self._remote_file, read_size)
+            if self._budget.remaining_bytes <= 0:
+                raise _CloudContentSniffBudgetExceeded
+            was_capped = read_size > self._budget.remaining_bytes
+            read_size = min(read_size, self._budget.remaining_bytes)
+            chunk = self._remote_file.read(read_size)
+            if not isinstance(chunk, bytes):
+                raise TypeError("cloud filesystem returned non-bytes content")
+            self._budget.remaining_bytes -= len(chunk)
+            if was_capped and len(chunk) == read_size:
+                self._budget.incomplete_stream_reads += 1
             if not chunk:
                 break
             self._cache_range(offset, chunk)
@@ -1367,21 +1354,14 @@ class _BudgetedCloudContentReader:
 
         return bytes(result)
 
-    def readinto(self, buffer: Any) -> int:
-        chunk = self.read(len(buffer))
-        buffer[: len(chunk)] = chunk
-        return len(chunk)
-
     def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
         return int(self._remote_file.seek(offset, whence))
 
     def tell(self) -> int:
         return int(self._remote_file.tell())
 
-    def readable(self) -> bool:
+    def seekable(self) -> bool:
         return True
-
-    seekable = readable
 
 
 def _read_cloud_content_prefix(
@@ -1522,40 +1502,6 @@ def _detect_cloud_shared_skip_filter_route(
         return None if detected_format == "unknown" else detected_format
 
 
-def _is_cloud_safetensors_routing_candidate(
-    fs: Any,
-    file_url: str,
-    prefix: bytes,
-    size: int,
-    *,
-    size_is_known: bool,
-    sniff_budget: _CloudContentSniffBudget | None = None,
-) -> bool:
-    """Recognize bounded remote SafeTensors framing without downloading tensor data."""
-    if len(prefix) < 9:
-        return False
-    try:
-        header_len = struct.unpack("<Q", prefix[:8])[0]
-    except struct.error:
-        return False
-    if header_len <= 0 or (size_is_known and header_len > size - 8):
-        return False
-
-    from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
-
-    if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
-        return prefix[8:9] == b"{"
-
-    header_probe = _read_cloud_content_prefix(fs, file_url, 8 + header_len, sniff_budget)
-    if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
-        return False
-    try:
-        parsed_header = json.loads(header_probe[8:].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return isinstance(parsed_header, dict)
-
-
 def _detect_cloud_mxnet_symbol_route(
     fs: Any,
     file_url: str,
@@ -1645,13 +1591,12 @@ def _detect_cloud_content_route_format(
     if mxnet_route is not None:
         return mxnet_route
 
-    if _is_cloud_safetensors_routing_candidate(
-        fs,
-        file_url,
+    from ._routing import _is_remote_safetensors_candidate
+
+    if _is_remote_safetensors_candidate(
         prefix,
-        size,
-        size_is_known=size_is_known,
-        sniff_budget=sniff_budget,
+        size if size_is_known else None,
+        lambda max_bytes: _read_cloud_content_prefix(fs, file_url, max_bytes, sniff_budget),
     ):
         return "safetensors"
 

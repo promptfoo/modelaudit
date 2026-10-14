@@ -75,10 +75,8 @@ class _MlflowLocalSource:
 class _MlflowDownloadPlan:
     artifacts: tuple[_MlflowArtifact, ...]
     root_uri: str
-    local_artifact_root: Path
-    artifact_path: str | None
     max_artifact_entries: int
-    local_sources: tuple[_MlflowLocalSource, ...] = ()
+    local_sources: tuple[_MlflowLocalSource, ...]
 
 
 @dataclass(frozen=True)
@@ -811,19 +809,11 @@ def _local_runs_mlflow_sources(
     return tuple(sources)
 
 
-def _is_local_mlflow_artifact_repository(artifact_repository: Any) -> bool:
-    try:
-        from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
-    except Exception:
-        return False
-    return isinstance(artifact_repository, LocalArtifactRepository)
-
-
 def _copy_local_mlflow_artifact(
     source_root: Path,
     artifact: _MlflowArtifact,
     destination: Path,
-) -> int:
+) -> None:
     """Copy one local artifact without writing more than its preflight size."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     copied_size = 0
@@ -857,8 +847,6 @@ def _copy_local_mlflow_artifact(
     finally:
         if source_fd is not None:
             os.close(source_fd)
-
-    return copied_size
 
 
 def _opened_local_mlflow_path(source_fd: int) -> Path | None:
@@ -1068,15 +1056,8 @@ def _snapshot_local_mlflow_sources(
 
 
 def _verify_local_mlflow_artifact_set(plan: _MlflowDownloadPlan) -> None:
-    if plan.local_sources:
-        current_plan, _ = _snapshot_local_mlflow_sources(plan.local_sources, plan.max_artifact_entries)
-        current_artifacts = {artifact.path: artifact.size for artifact in current_plan.values()}
-    else:
-        current_artifacts, _ = _snapshot_local_mlflow_artifacts(
-            plan.local_artifact_root,
-            plan.artifact_path,
-            plan.max_artifact_entries,
-        )
+    current_plan, _ = _snapshot_local_mlflow_sources(plan.local_sources, plan.max_artifact_entries)
+    current_artifacts = {artifact.path: artifact.size for artifact in current_plan.values()}
     expected_artifacts = {artifact.path: artifact.size for artifact in plan.artifacts}
     added_paths = current_artifacts.keys() - expected_artifacts.keys()
     removed_paths = expected_artifacts.keys() - current_artifacts.keys()
@@ -1226,12 +1207,9 @@ def _preflight_local_mlflow_sources(
                 details,
             )
 
-    primary_source = sources[0]
     return _MlflowDownloadPlan(
         artifacts=tuple(planned_artifacts.values()),
         root_uri=root_uri,
-        local_artifact_root=primary_source.root,
-        artifact_path=primary_source.artifact_path,
         max_artifact_entries=max_artifact_entries,
         local_sources=sources,
     )
@@ -1315,206 +1293,19 @@ def _preflight_mlflow_download_budget(
             details,
         )
 
-    if _is_local_mlflow_artifact_repository(artifact_repository):
-        return _preflight_local_mlflow_sources(
-            model_uri,
-            root_uri,
-            (
-                _MlflowLocalSource(
-                    local_artifact_root,
-                    initial_artifact_path,
-                    initial_artifact_path,
-                ),
-            ),
-            details,
-            max_file_size=max_file_size,
-            max_total_size=max_total_size,
-            max_artifact_entries=max_artifact_entries,
-        )
-
-    list_artifacts = artifact_repository.list_artifacts
-    total_size = 0
-    file_count = 0
-    entry_count = 0
-    normalized_initial_path: str | None = None
-    pending_dirs: list[str | None] = []
-    visited_dirs: set[str | None] = set()
-    planned_artifacts: dict[str, _MlflowArtifact] = {}
-    try:
-        normalized_initial_path = (
-            _normalize_mlflow_artifact_path(initial_artifact_path) if initial_artifact_path is not None else None
-        )
-        pending_dirs.append(normalized_initial_path)
-        while pending_dirs:
-            current_path = pending_dirs.pop()
-            if current_path in visited_dirs:
-                continue
-            visited_dirs.add(current_path)
-            artifact_infos, listing_exceeded = _bounded_artifact_listing(
-                list_artifacts,
-                current_path,
-                max_artifact_entries - entry_count,
-            )
-            if listing_exceeded:
-                details.update(
-                    {
-                        "reason": "artifact_listing_budget_exceeded",
-                        "artifact_entry_count": max_artifact_entries + 1,
-                    }
-                )
-                return _mlflow_budget_failure_result(
-                    model_uri,
-                    f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
-                    details,
-                )
-
-            artifact_infos_already_counted = False
-            if not artifact_infos and current_path == normalized_initial_path and current_path:
-                artifact_info, parent_entry_count, parent_listing_exceeded = _find_single_file_artifact_info(
-                    list_artifacts,
-                    current_path,
-                    max_artifact_entries - entry_count,
-                )
-                if parent_listing_exceeded:
-                    details.update(
-                        {
-                            "reason": "artifact_listing_budget_exceeded",
-                            "artifact_entry_count": max_artifact_entries + 1,
-                        }
-                    )
-                    return _mlflow_budget_failure_result(
-                        model_uri,
-                        f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
-                        details,
-                    )
-                entry_count += parent_entry_count
-                artifact_infos = [artifact_info] if artifact_info is not None else []
-                artifact_infos_already_counted = artifact_info is not None
-
-            for artifact_info in artifact_infos:
-                if not artifact_infos_already_counted:
-                    entry_count += 1
-                    if entry_count > max_artifact_entries:
-                        details.update(
-                            {
-                                "reason": "artifact_listing_budget_exceeded",
-                                "artifact_entry_count": entry_count,
-                            }
-                        )
-                        return _mlflow_budget_failure_result(
-                            model_uri,
-                            f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
-                            details,
-                        )
-
-                raw_artifact_path = getattr(artifact_info, "path", None)
-                artifact_path = (
-                    current_path
-                    if artifact_infos_already_counted and current_path is not None
-                    else _normalize_mlflow_artifact_path(raw_artifact_path)
-                )
-                if not _artifact_path_is_within(artifact_path, current_path):
-                    raise ValueError(f"Artifact entry path escaped listed directory: {artifact_path}")
-                if getattr(artifact_info, "is_dir", False):
-                    pending_dirs.append(artifact_path)
-                    continue
-
-                file_size = getattr(artifact_info, "file_size", None)
-                if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
-                    raise ValueError(f"Artifact file size unavailable for {artifact_path or '<unknown>'}")
-                if artifact_path in planned_artifacts:
-                    raise ValueError(f"Artifact listing returned a duplicate file path: {artifact_path}")
-
-                file_count += 1
-                total_size += file_size
-                planned_artifacts[artifact_path] = _MlflowArtifact(path=artifact_path, size=file_size)
-                if max_file_size > 0 and file_size > max_file_size:
-                    details.update(
-                        {
-                            "reason": "artifact_file_size_exceeded",
-                            "artifact_path": artifact_path,
-                            "artifact_file_size": file_size,
-                        }
-                    )
-                    return _mlflow_budget_failure_result(
-                        model_uri,
-                        f"MLflow artifact file too large to download: {file_size} bytes (max: {max_file_size})",
-                        details,
-                    )
-                if max_total_size > 0 and total_size > max_total_size:
-                    details.update(
-                        {
-                            "reason": "artifact_total_size_exceeded",
-                            "artifact_total_size": total_size,
-                            "artifact_file_count": file_count,
-                            "artifact_entry_count": entry_count,
-                        }
-                    )
-                    return _mlflow_budget_failure_result(
-                        model_uri,
-                        f"MLflow artifact total size too large to download: {total_size} bytes (max: {max_total_size})",
-                        details,
-                    )
-    except Exception as e:
-        details["reason"] = "artifact_size_unavailable"
-        details["error"] = _format_mlflow_error(e)
-        return _mlflow_budget_failure_result(
-            model_uri,
-            "Unable to determine MLflow artifact size before download",
-            details,
-        )
-
-    if file_count == 0:
-        try:
-            current_artifacts, _ = _snapshot_local_mlflow_artifacts(
+    return _preflight_local_mlflow_sources(
+        model_uri,
+        root_uri,
+        (
+            _MlflowLocalSource(
                 local_artifact_root,
-                normalized_initial_path,
-                max_artifact_entries,
-            )
-        except _MlflowArtifactListingExceededError:
-            details.update(
-                {
-                    "reason": "artifact_listing_budget_exceeded",
-                    "artifact_entry_count": max_artifact_entries + 1,
-                }
-            )
-            return _mlflow_budget_failure_result(
-                model_uri,
-                f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
-                details,
-            )
-        except (OSError, ValueError) as exc:
-            details.update(
-                {
-                    "reason": "artifact_size_unavailable",
-                    "artifact_file_count": 0,
-                    "error": _format_mlflow_error(exc),
-                }
-            )
-            return _mlflow_budget_failure_result(
-                model_uri,
-                "Unable to determine MLflow artifact size before download",
-                details,
-            )
-        if current_artifacts:
-            details.update(
-                {
-                    "reason": "artifact_size_unavailable",
-                    "artifact_file_count": 0,
-                    "error": "Artifact listing omitted files present in the local repository",
-                }
-            )
-            return _mlflow_budget_failure_result(
-                model_uri,
-                "Unable to determine MLflow artifact size before download",
-                details,
-            )
-
-    return _MlflowDownloadPlan(
-        artifacts=tuple(planned_artifacts.values()),
-        root_uri=root_uri,
-        local_artifact_root=local_artifact_root,
-        artifact_path=normalized_initial_path,
+                initial_artifact_path,
+                initial_artifact_path,
+            ),
+        ),
+        details,
+        max_file_size=max_file_size,
+        max_total_size=max_total_size,
         max_artifact_entries=max_artifact_entries,
     )
 
@@ -1536,7 +1327,6 @@ def _download_preflighted_mlflow_artifacts(
     }
 
     download_root = Path(download_dir).resolve()
-    actual_total_size = 0
     try:
         _verify_local_mlflow_artifact_set(plan)
     except _MlflowArtifactListingExceededError:
@@ -1604,8 +1394,8 @@ def _download_preflighted_mlflow_artifacts(
             )
 
         try:
-            actual_size = _copy_local_mlflow_artifact(
-                artifact.source_root or plan.local_artifact_root,
+            _copy_local_mlflow_artifact(
+                artifact.source_root or plan.local_sources[0].root,
                 artifact,
                 local_path,
             )
@@ -1627,7 +1417,7 @@ def _download_preflighted_mlflow_artifacts(
                 "MLflow artifact size changed after preflight",
                 details,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             details.update(
                 {
                     "reason": "artifact_download_verification_failed",
@@ -1638,47 +1428,6 @@ def _download_preflighted_mlflow_artifacts(
             return _mlflow_budget_failure_result(
                 model_uri,
                 "Unable to verify downloaded MLflow artifact",
-                details,
-            )
-        except ValueError as exc:
-            details.update(
-                {
-                    "reason": "artifact_download_verification_failed",
-                    "artifact_path": artifact.path,
-                    "error": str(exc),
-                }
-            )
-            return _mlflow_budget_failure_result(
-                model_uri,
-                "Unable to verify downloaded MLflow artifact",
-                details,
-            )
-
-        actual_total_size += actual_size
-        if max_file_size > 0 and actual_size > max_file_size:
-            details.update(
-                {
-                    "reason": "artifact_file_size_exceeded",
-                    "artifact_path": artifact.path,
-                    "artifact_file_size": actual_size,
-                }
-            )
-            return _mlflow_budget_failure_result(
-                model_uri,
-                f"Downloaded MLflow artifact exceeds the file size budget: {actual_size} bytes (max: {max_file_size})",
-                details,
-            )
-        if max_total_size > 0 and actual_total_size > max_total_size:
-            details.update(
-                {
-                    "reason": "artifact_total_size_exceeded",
-                    "artifact_total_size": actual_total_size,
-                }
-            )
-            return _mlflow_budget_failure_result(
-                model_uri,
-                f"Downloaded MLflow artifacts exceed the total size budget: {actual_total_size} bytes "
-                f"(max: {max_total_size})",
                 details,
             )
 
@@ -2397,44 +2146,32 @@ def scan_mlflow_model(
         logger.debug(
             f"Downloading MLflow model {format_terminal_text(_format_mlflow_error(model_uri))} to {download_dir}"
         )
-        local_path: str | None
-        if isinstance(download_plan, _MlflowDownloadPlan):
-            download_result = _download_preflighted_mlflow_artifacts(
-                download_plan,
+        local_plan = download_plan if isinstance(download_plan, _MlflowDownloadPlan) else download_plan.local_plan
+        local_path: str | None = None
+        if local_plan is not None:
+            local_download_result = _download_preflighted_mlflow_artifacts(
+                local_plan,
                 model_uri,
                 download_dir,
                 max_file_size=max_file_size,
                 max_total_size=max_total_size,
             )
-            if isinstance(download_result, ModelAuditResultModel):
-                return download_result
-            local_path = download_result
-        else:
-            local_path = None
-            if download_plan.local_plan is not None:
-                local_download_result = _download_preflighted_mlflow_artifacts(
-                    download_plan.local_plan,
-                    model_uri,
-                    download_dir,
-                    max_file_size=max_file_size,
-                    max_total_size=max_total_size,
-                )
-                if isinstance(local_download_result, ModelAuditResultModel):
-                    return local_download_result
-                local_path = local_download_result
-            if download_plan.targets:
-                delegated_path = _download_trusted_mlflow_artifacts(
-                    download_plan,
-                    model_uri,
-                    download_dir,
-                    max_artifact_entries,
-                    download_root_identity,
-                )
-                if isinstance(delegated_path, ModelAuditResultModel):
-                    return delegated_path
-                local_path = download_dir if local_path is not None else delegated_path
-            if local_path is None:
-                raise RuntimeError("MLflow artifact download plan did not contain any targets")
+            if isinstance(local_download_result, ModelAuditResultModel):
+                return local_download_result
+            local_path = local_download_result
+        if isinstance(download_plan, _MlflowDelegatedDownloadPlan) and download_plan.targets:
+            delegated_path = _download_trusted_mlflow_artifacts(
+                download_plan,
+                model_uri,
+                download_dir,
+                max_artifact_entries,
+                download_root_identity,
+            )
+            if isinstance(delegated_path, ModelAuditResultModel):
+                return delegated_path
+            local_path = download_dir if local_path is not None else delegated_path
+        if local_path is None:
+            raise RuntimeError("MLflow artifact download plan did not contain any targets")
         download_path = _resolve_mlflow_download_path(
             model_uri,
             local_path,

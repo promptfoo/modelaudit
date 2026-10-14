@@ -16,7 +16,9 @@ from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
-# Values derived from ggml source
+# Values derived from ggml source: every type in `enum ggml_type` is listed. Of the
+# IDs ggml has retired, 31-33 are kept because published files still use them; they
+# store the Q4_0 blocks of several rows together. 4, 5 and 36-38 stay unknown.
 _GGML_TYPE_INFO = {
     0: (1, 4),  # F32
     1: (1, 2),  # F16
@@ -32,9 +34,37 @@ _GGML_TYPE_INFO = {
     13: (256, 176),  # Q5_K
     14: (256, 210),  # Q6_K
     15: (256, 292),  # Q8_K
+    16: (256, 66),  # IQ2_XXS
+    17: (256, 74),  # IQ2_XS
+    18: (256, 98),  # IQ3_XXS
+    19: (256, 50),  # IQ1_S
+    20: (32, 18),  # IQ4_NL
     21: (256, 110),  # IQ3_S
+    22: (256, 82),  # IQ2_S
     23: (256, 136),  # IQ4_XS
+    24: (1, 1),  # I8
+    25: (1, 2),  # I16
+    26: (1, 4),  # I32
+    27: (1, 8),  # I64
+    28: (1, 8),  # F64
+    29: (256, 56),  # IQ1_M
     30: (1, 2),  # BF16
+    31: (32, 18),  # Q4_0_4_4 (retired)
+    32: (32, 18),  # Q4_0_4_8 (retired)
+    33: (32, 18),  # Q4_0_8_8 (retired)
+    34: (256, 54),  # TQ1_0
+    35: (256, 66),  # TQ2_0
+    39: (32, 17),  # MXFP4
+    40: (64, 36),  # NVFP4
+    41: (128, 18),  # Q1_0
+    42: (64, 18),  # Q2_0
+}
+# Rows that the retired Q4_0 layouts pack into one on-disk block (block_q4_0x4 and
+# block_q4_0x8 in ggml): a tensor of these types holds whole groups of rows.
+_GGML_INTERLEAVED_ROW_GROUPS = {
+    31: 4,  # Q4_0_4_4
+    32: 4,  # Q4_0_4_8
+    33: 8,  # Q4_0_8_8
 }
 _UINT64_MAX: int = 2**64 - 1
 
@@ -1035,14 +1065,41 @@ class GgufScanner(BaseScanner):
                     },
                 )
 
-            if nelements % blck != 0:
+            # ggml stores whole blocks per row, so it rejects a tensor whose first
+            # dimension is not a multiple of the block size even when its total is.
+            row_width = tensor.dims[0] if tensor.dims else 1
+            if row_width % blck != 0:
                 result.add_check(
                     name="Tensor Block Alignment Check",
                     passed=False,
                     message=f"Tensor {tensor.name} not aligned to block size {blck}",
                     severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
-                    details={"tensor_name": tensor.name, "block_size": blck, "elements": nelements},
+                    details={
+                        "tensor_name": tensor.name,
+                        "block_size": blck,
+                        "elements": nelements,
+                        "row_width": row_width,
+                    },
+                    rule_code="S804",
+                )
+
+            row_group = _GGML_INTERLEAVED_ROW_GROUPS.get(tensor.tensor_type)
+            rows = nelements // row_width
+            if row_group is not None and rows % row_group != 0:
+                result.add_check(
+                    name="Tensor Block Alignment Check",
+                    passed=False,
+                    message=f"Tensor {tensor.name} not aligned to its {row_group}-row block groups",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "tensor_name": tensor.name,
+                        "block_size": blck,
+                        "elements": nelements,
+                        "rows": rows,
+                        "row_group": row_group,
+                    },
                     rule_code="S804",
                 )
 
