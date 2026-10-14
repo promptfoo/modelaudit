@@ -184,7 +184,7 @@ def _without_shell_comment(command: bytes) -> bytes:
                 quote = None
         elif value in {ord("'"), ord('"')}:
             quote = value
-        elif value == ord("#") and (index == 0 or command[index - 1] in b" \t"):
+        elif value == ord("#") and (index == 0 or command[index - 1] in b" \t;&|()"):
             return command[:index]
     return command
 
@@ -245,7 +245,41 @@ def _literal_api_url(node: ast.expr) -> ast.Constant | None:
     return None
 
 
+def _has_unsafe_deserialization_call(nodes: list[ast.AST]) -> bool:
+    imports: dict[str, str] = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                imports[alias.asname or root] = alias.name if alias.asname else root
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                imports[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        parts: list[str] = []
+        while isinstance(target, ast.Attribute):
+            parts.append(target.attr)
+            target = target.value
+        if not isinstance(target, ast.Name):
+            continue
+        name = ".".join([imports.get(target.id, target.id), *reversed(parts)])
+        if name in {"pickle.load", "pickle.loads", "dill.load", "dill.loads", "joblib.load", "cloudpickle.loads"}:
+            return True
+        if name in {"torch.load", "torch.serialization.load"} and any(
+            keyword.arg == "weights_only"
+            and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is True)
+            for keyword in node.keywords
+        ):
+            return True
+    return False
+
+
 def _has_execution_reference(nodes: list[ast.AST]) -> bool:
+    if _has_unsafe_deserialization_call(nodes):
+        return True
     literal_targets: set[ast.Name] = set()
     writes: dict[str, list[ast.Name]] = {}
     rebound: set[str] = set()
@@ -493,10 +527,11 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
         return True
     joined = re.sub(rb"\\\r?\n", b"", shell_source)
     try:
-        for line in joined.decode("utf-8").splitlines():
+        for line in joined.splitlines():
             # Preserve quotes so a quoted operator remains an argument.
-            lexer = shlex.shlex(line, posix=False, punctuation_chars=";&|()")
+            lexer = shlex.shlex(_without_shell_comment(line).decode("utf-8"), posix=False, punctuation_chars=";&|()")
             lexer.whitespace_split = True
+            lexer.commenters = ""
             words: list[str] = []
             for raw in lexer:
                 if not (raw.startswith("'") and raw.endswith("'")) and any(
