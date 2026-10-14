@@ -4281,29 +4281,9 @@ def _looks_like_proto0_or_1_pickle(
         opcode_count = 0
         has_non_trivial_opcode = False
         has_security_opcode = False
-        has_global = False
-        has_global_call = False
-        global_call_checked = False
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
-                if opcode.name == "GLOBAL" and isinstance(_arg, str):
-                    module, _, name = _arg.partition(" ")
-                    has_global = has_global or bool(module and name)
-                if (
-                    has_global
-                    and not global_call_checked
-                    and opcode.name in {"REDUCE", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ"}
-                    and _pos is not None
-                ):
-                    global_call_checked = True
-                    try:
-                        pickletools.dis(candidate[: _pos + 1] + b".", out=StringIO())
-                        has_global_call = True
-                    except ValueError as exc:
-                        has_global_call = str(exc).startswith("stack not empty after STOP")
-                    except Exception:
-                        has_global_call = False
                 if opcode.name == "STOP":
                     stop_pos = 0 if _pos is None else _pos
                     if not has_security_opcode:
@@ -4346,9 +4326,7 @@ def _looks_like_proto0_or_1_pickle(
                     return False
         except ValueError as exc:
             exc_message = str(exc)
-            # Preserve a global's invocation before a later parse error.
-            # A global-like string alone is not enough for nested byte discovery.
-            return has_global_call or (
+            return (
                 sample_is_prefix
                 and opcode_count >= 2
                 and has_non_trivial_opcode
@@ -4357,7 +4335,7 @@ def _looks_like_proto0_or_1_pickle(
                 )
             )
         except Exception:
-            return has_global_call
+            return False
         # A cleanly parsed prefix without STOP at the probe boundary is only a
         # pickle indicator when a non-trivial opcode has already appeared. This
         # avoids routing large plain-text files made of scalar opcode lookalikes

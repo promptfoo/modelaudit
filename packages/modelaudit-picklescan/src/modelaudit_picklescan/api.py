@@ -3503,29 +3503,9 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
         opcode_count = 0
         has_non_trivial_opcode = False
         has_security_opcode = False
-        has_global = False
-        has_global_call = False
-        global_call_checked = False
         try:
             for opcode, _arg, pos in pickletools.genops(candidate):
                 opcode_count += 1
-                if opcode.name == "GLOBAL" and isinstance(_arg, str):
-                    module, _, name = _arg.partition(" ")
-                    has_global = has_global or bool(module and name)
-                if (
-                    has_global
-                    and not global_call_checked
-                    and opcode.name in {"REDUCE", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ"}
-                    and pos is not None
-                ):
-                    global_call_checked = True
-                    try:
-                        pickletools.dis(candidate[: pos + 1] + b".", out=io.StringIO())
-                        has_global_call = True
-                    except ValueError as exc:
-                        has_global_call = str(exc).startswith("stack not empty after STOP")
-                    except Exception:
-                        has_global_call = False
                 if opcode.name == "STOP":
                     stop_pos = 0 if pos is None else pos
                     if not has_security_opcode:
@@ -3558,7 +3538,7 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
                     return False
         except ValueError as exc:
             exc_message = str(exc)
-            return has_global_call or (
+            return (
                 sample_is_prefix
                 and opcode_count >= 2
                 and has_non_trivial_opcode
@@ -3567,7 +3547,7 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
                 )
             )
         except Exception:
-            return has_global_call
+            return False
 
         return sample_is_prefix and opcode_count >= 2 and has_non_trivial_opcode
 

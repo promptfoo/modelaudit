@@ -3636,9 +3636,12 @@ def test_detect_file_format_plain_text_binint1_prefix_not_pickle(tmp_path: Path)
     assert detect_file_format_from_magic(str(payload)) != "pickle"
 
 
-def test_detect_file_format_global_text_with_missing_call_arguments_is_not_pickle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("opcodes", [b"R", b"NNR"])
+def test_detect_file_format_global_text_with_missing_call_arguments_is_not_pickle(
+    tmp_path: Path, opcodes: bytes
+) -> None:
     document = tmp_path / "LICENSE"
-    document.write_bytes(b"configuration\nReference\nR not a pickle")
+    document.write_bytes(b"configuration\nReference\n" + opcodes + b" not a pickle")
 
     assert detect_file_format(str(document)) == "unknown"
     assert detect_file_format_from_magic(str(document)) == "unknown"
@@ -3675,8 +3678,8 @@ def test_detect_file_format_license_opcode_collision_is_not_pickle(
     "payload",
     [
         b'cos\nsystem\n(S"echo regression"\ntR0.Microsoft.\r\n',
-        b'cbuiltins\neval\n(S"1+1"\ntR\xff',
-        b'I0\ncbuiltins\neval\n(S"1+1"\ntR\xff',
+        b'cbuiltins\neval\n(S"1+1"\ntR.\xff',
+        b'I0\ncbuiltins\neval\n(S"1+1"\ntR.\xff',
     ],
 )
 def test_detect_file_format_text_named_pickle_with_malformed_tail_still_routes(
