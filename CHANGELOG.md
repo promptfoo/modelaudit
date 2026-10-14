@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject unresolved ONNX function overrides and invalid Squeeze rank proofs without consuming capture budgets for unused graph arguments.
 - Keep local-function graph captures reachable during ONNX weight analysis, and prevent invalid transform bindings from establishing weight-coverage exclusions.
 - Bound and reuse ONNX repeated Constant attribute copies and opset environments, and resolve caller-bound weight-transform attributes while preserving findings and incomplete-coverage outcomes.
 - Reuse ONNX local-function default maps and bound copying them into call environments.

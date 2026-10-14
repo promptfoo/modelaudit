@@ -35498,7 +35498,10 @@ class TestOnnxFunctionCaptureReachability:
     _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
     _assert_contract = staticmethod(TestOnnxDeferredNumericCoverage._assert_contract)
 
-    @pytest.mark.parametrize("node_count,mode", [(8, "unused"), (1400, "unused"), (1400, "absent"), (1400, "used")])
+    @pytest.mark.parametrize(
+        "node_count,mode",
+        [(8, "unused"), (1400, "unused"), (1400, "absent"), (1400, "used"), (8, "mixed"), (1400, "mixed")],
+    )
     def test_unused_graph_does_not_spend_function_capture_budget(
         self, tmp_path: Path, node_count: int, mode: str
     ) -> None:
@@ -35523,7 +35526,7 @@ class TestOnnxFunctionCaptureReachability:
             [],
             [value("ignored", [64])],
         )
-        if mode == "used":
+        if mode in {"used", "mixed"}:
             choose = helper.make_node("If", ["flag"], ["Y"])
             for name in ("then_branch", "else_branch"):
                 choose.attribute.append(
@@ -35539,10 +35542,20 @@ class TestOnnxFunctionCaptureReachability:
             ["Y"],
             function_nodes,
             [helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
-            attributes=[] if mode == "absent" else ["branch"],
+            attributes=[] if mode == "absent" else ["branch", "unused"] if mode == "mixed" else ["branch"],
         )
         call = helper.make_node("Apply", ["state"], ["next"], domain="local")
-        if mode != "absent":
+        if mode == "mixed":
+            cheap_argument = helper.make_graph(
+                [helper.make_node("Identity", ["state"], ["selected"])],
+                "selected_argument",
+                [],
+                [value("selected", [64])],
+            )
+            call.attribute.extend(
+                [helper.make_attribute("branch", cheap_argument), helper.make_attribute("unused", argument)]
+            )
+        elif mode != "absent":
             call.attribute.append(helper.make_attribute("branch", argument))
         body = helper.make_graph(
             [call, helper.make_node("MatMul", ["X", "state"], ["used"])],
@@ -38131,3 +38144,135 @@ class TestOnnxFullPrCoverageReview:
         assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
         assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+
+class TestOnnxFinalReviewBindingAndSqueeze:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+
+    @staticmethod
+    def _assert_standalone_contract(model: Any, tmp_path: Path, incomplete: bool, prior_weights: Any) -> Any:
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        assert bool(plan.coverage_gaps.get("unresolved_initializer_lineage", 0)) is incomplete
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "review-binding-shape.onnx")
+        result = WeightDistributionScanner().scan(str(path))
+        assert result.success is not incomplete
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        coverage_checks = TestWeightDistributionCoverage._coverage_checks(result)
+        assert bool(coverage_checks) is incomplete
+        assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
+        if incomplete:
+            # The normal route also refuses to cache malformed models. Its schema
+            # reason can differ from the standalone planner's coverage reason.
+            reset_cache_manager()
+            try:
+                for _ in range(2):
+                    aggregate = scan_model_directory_or_file(
+                        str(path), cache_enabled=True, cache_dir=str(tmp_path / "cache"), min_cache_file_size=0
+                    )
+                    assert aggregate.success is False
+                    assert determine_exit_code(aggregate) == 2
+                    assert aggregate.file_metadata[str(path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+                stats = get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()
+                assert stats["total_entries"] == stats["cache_hits"] == 0
+            finally:
+                reset_cache_manager()
+        else:
+            assert OnnxScanner().scan(str(path)).success is True
+        return plan
+
+    @pytest.mark.parametrize("mode", ["omitted", "valid", "unresolved", "unresolved_then_omitted"])
+    def test_unresolved_explicit_override_invalidates_only_its_call(self, tmp_path: Path, mode: str) -> None:
+        value, tensor = self._value, self._tensor
+        transform = helper.make_node("Squeeze", ["W"], ["view"])
+        transform.attribute.append(
+            onnx.AttributeProto(name="axes", ref_attr_name="parameter", type=onnx.AttributeProto.INTS)
+        )
+        function = helper.make_function(
+            "local",
+            "DefaultSqueeze",
+            ["W"],
+            ["view"],
+            [transform],
+            [helper.make_opsetid("", 11)],
+            attribute_protos=[helper.make_attribute("parameter", [0])],
+        )
+        call = helper.make_node("DefaultSqueeze", ["W"], ["view"], domain="local")
+        if mode == "valid":
+            call.attribute.append(helper.make_attribute("parameter", [0]))
+        elif mode.startswith("unresolved"):
+            call.attribute.append(
+                onnx.AttributeProto(name="parameter", ref_attr_name="missing", type=onnx.AttributeProto.INTS)
+            )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        nodes = [
+            helper.make_node("MatMul", ["A", "prior"], ["known"]),
+            call,
+            helper.make_node("MatMul", ["X", "view"], ["Y"]),
+        ]
+        inputs = [value("A", [1, 64]), value("X", [1, 64])]
+        outputs = [value("known", [1, 64]), value("Y", [1])]
+        initializers = [
+            tensor("W", np.arange(64, dtype=np.float32).reshape(1, 64)),
+            tensor("prior", prior_weights),
+        ]
+        later_weights = np.arange(6, dtype=np.float32).reshape(1, 2, 3)
+        if mode == "unresolved_then_omitted":
+            nodes.extend(
+                [
+                    helper.make_node("DefaultSqueeze", ["later"], ["later_view"], domain="local"),
+                    helper.make_node("MatMul", ["B", "later_view"], ["later_Y"]),
+                ]
+            )
+            inputs.append(value("B", [1, 2]))
+            outputs.append(value("later_Y", [1, 3]))
+            initializers.append(tensor("later", later_weights))
+        model = helper.make_model(
+            helper.make_graph(nodes, "explicit_override", inputs, outputs, initializer=initializers),
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 11), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        incomplete = mode.startswith("unresolved")
+        if not incomplete:
+            onnx.checker.check_model(model, full_check=True)
+        plan = self._assert_standalone_contract(model, tmp_path, incomplete, prior_weights)
+        if mode == "unresolved_then_omitted":
+            assert any(np.array_equal(spec.weights, later_weights.reshape(2, 3)) for spec in plan.specs)
+
+    @pytest.mark.parametrize("axis", [0, -2])
+    @pytest.mark.parametrize("extent", [1, 2, None])
+    def test_squeeze_rank_proof_rejects_known_non_singleton_axes(
+        self, tmp_path: Path, axis: int, extent: int | None
+    ) -> None:
+        value, tensor = self._value, self._tensor
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        inputs = [value("A", [1, 64]), value("X", [1, 64])]
+        initializers = [tensor("prior", prior_weights)]
+        if extent is None:
+            inputs.append(value("W", [None, 64]))
+        else:
+            initializers.append(tensor("W", np.arange(extent * 64, dtype=np.float32).reshape(extent, 64)))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Squeeze", ["W"], ["view"], axes=[axis]),
+                    helper.make_node("MatMul", ["X", "view"], ["Y"]),
+                ],
+                "squeeze_axis_proof",
+                inputs,
+                [value("known", [1, 64]), value("Y", [1])],
+                initializer=initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", 11)],
+        )
+        model.ir_version = 9
+        if extent != 2:
+            onnx.checker.check_model(model, full_check=True)
+        self._assert_standalone_contract(model, tmp_path, extent == 2, prior_weights)

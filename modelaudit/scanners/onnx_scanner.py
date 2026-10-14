@@ -2310,6 +2310,9 @@ def _build_onnx_weight_analysis_plan(
             resolved_attribute = resolve_attribute(attribute)
             if resolved_attribute is not None:
                 attributes[str(attribute.name)] = resolved_attribute
+            else:
+                # An explicit failed override must not fall back to a valid default.
+                attributes.pop(str(attribute.name), None)
         return attributes
 
     def bound_function_constants(
@@ -2633,6 +2636,17 @@ def _build_onnx_weight_analysis_plan(
             noop_value = int(getattr(resolved_attribute, "i", 0)) if resolved_attribute is not None else 0
             break
         return node.op_type == "Squeeze" and not axes and bool(noop_value)
+
+    def squeeze_axes_are_valid(
+        axes: tuple[int, ...],
+        rank: int,
+        shape: tuple[int, ...] | None,
+        *,
+        allow_unknown_dimensions: bool = False,
+    ) -> bool:
+        if len(set(axes)) != len(axes) or any(axis < 0 or axis >= rank for axis in axes):
+            return False
+        return shape is None or all(shape[axis] == 1 or (allow_unknown_dimensions and shape[axis] < 0) for axis in axes)
 
     def implicit_squeeze_shape(
         node: Any,
@@ -3298,11 +3312,10 @@ def _build_onnx_weight_analysis_plan(
                 ),
             )
             merge_dependency_names(dependencies, graph_external_reference_names(function, function_attributes))
-        if not dependency_names_exceeded_limit(frozenset(dependencies)):
-            function_references = referenced_function_attributes(function) if function is not None else None
+        # Local-function graph arguments are followed at the callee's reference
+        # sites above; accepting an argument does not make its graph executable.
+        if function is None and not dependency_names_exceeded_limit(frozenset(dependencies)):
             for attribute in getattr(node, "attribute", ()):
-                if function_references is not None and str(attribute.name) not in function_references:
-                    continue
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = local_attribute_bindings.get(reference_name) if reference_name else attribute
                 if resolved_attribute is None:
@@ -5485,10 +5498,8 @@ def _build_onnx_weight_analysis_plan(
                     ),
                 )
                 referenced_names.update(graph_external_reference_names(function, function_attributes, depth=depth + 1))
-            function_references = referenced_function_attributes(function) if function is not None else None
+                continue
             for attribute in getattr(graph_node, "attribute", ()):
-                if function_references is not None and str(attribute.name) not in function_references:
-                    continue
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = (attribute_bindings or {}).get(reference_name) if reference_name else attribute
                 if resolved_attribute is not None:
@@ -6013,7 +6024,7 @@ def _build_onnx_weight_analysis_plan(
             return None
         return resolved
 
-    def weight_transform_attribute_error(
+    def weight_transform_proof_error(
         node: Any,
         *,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
@@ -6078,7 +6089,7 @@ def _build_onnx_weight_analysis_plan(
                     return int(resolved.i) if resolved is not None else None
             return default
 
-        attribute_error = weight_transform_attribute_error(
+        attribute_error = weight_transform_proof_error(
             node, resolve_attribute=resolve_attribute, cast_target_data_type=cast_target_data_type
         )
         if attribute_error is not None:
@@ -6161,11 +6172,8 @@ def _build_onnx_weight_analysis_plan(
                         return transformed if transformed != lineage else lineage
                     normalized_axes = tuple(index for index, dimension in enumerate(lineage.shape) if dimension == 1)
                 if (
-                    (not axes and implicit_squeeze_shape(node, lineage.shape, resolved_transform_attribute) is None)
-                    or len(set(normalized_axes)) != len(normalized_axes)
-                    or any(axis < 0 or axis >= len(lineage.shape) for axis in normalized_axes)
-                    or any(lineage.shape[axis] != 1 for axis in normalized_axes)
-                ):
+                    not axes and implicit_squeeze_shape(node, lineage.shape, resolved_transform_attribute) is None
+                ) or not squeeze_axes_are_valid(normalized_axes, len(lineage.shape), lineage.shape):
                     return _OnnxWeightLineage(
                         initializer_index=lineage.initializer_index,
                         shape=None,
@@ -10841,6 +10849,9 @@ def _build_onnx_weight_analysis_plan(
                             local_node_index,
                             attribute_position,
                         )
+                    else:
+                        function_bound_attributes.pop(attribute_name, None)
+                        function_bound_attribute_keys.pop(attribute_name, None)
                 for parent_input, function_input in zip(node.input, function.input, strict=False):
                     parent_name = str(parent_input)
                     function_input_name = _onnx_value_name(function_input)
@@ -12700,8 +12711,8 @@ def _build_onnx_weight_analysis_plan(
             transform_output_shape: tuple[int, ...] | None = None
             transform_output_rank: int | None = None
             transform_output_rank_proven = True
-            transform_attribute_error = (
-                weight_transform_attribute_error(
+            transform_proof_error = (
+                weight_transform_proof_error(
                     node,
                     resolve_attribute=resolve_attribute,
                     cast_target_data_type=resolved_cast_target_data_type,
@@ -12709,8 +12720,8 @@ def _build_onnx_weight_analysis_plan(
                 if supported_transform
                 else None
             )
-            clear_transform_output_rank = transform_attribute_error is not None
-            if supported_transform and input_names and transform_attribute_error is None:
+            clear_transform_output_rank = transform_proof_error is not None
+            if supported_transform and input_names and transform_proof_error is None:
                 transform_input_shape = known_value_shapes.get(input_names[0])
                 transform_input_rank = known_value_ranks.get(input_names[0])
                 transform_input_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
@@ -12802,8 +12813,11 @@ def _build_onnx_weight_analysis_plan(
                                 clear_transform_output_rank = True
                         else:
                             normalized_axes = tuple(axis if axis >= 0 else transform_input_rank + axis for axis in axes)
-                            if len(set(normalized_axes)) == len(normalized_axes) and all(
-                                0 <= axis < transform_input_rank for axis in normalized_axes
+                            if squeeze_axes_are_valid(
+                                normalized_axes,
+                                transform_input_rank,
+                                transform_input_shape,
+                                allow_unknown_dimensions=True,
                             ):
                                 transform_output_rank = transform_input_rank - len(normalized_axes)
                                 if transform_input_shape is not None:
@@ -12813,6 +12827,9 @@ def _build_onnx_weight_analysis_plan(
                                         for index, dimension in enumerate(transform_input_shape)
                                         if index not in squeeze_axes
                                     )
+                            else:
+                                transform_proof_error = "invalid_squeeze_lineage"
+                                clear_transform_output_rank = True
                 elif node.op_type == "Unsqueeze" and transform_input_rank is not None:
                     transform_output_rank_proven = transform_input_rank_proven
                     axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
@@ -12858,8 +12875,8 @@ def _build_onnx_weight_analysis_plan(
                     elif subgraph_output_rank_unknown[output_index]:
                         inferred_output_shape = None
                         inferred_output_rank = None
-                if transform_attribute_error is not None and output_index == 0:
-                    # Rejected bindings cannot establish a rank exclusion through
+                if transform_proof_error is not None and output_index == 0:
+                    # Rejected transforms cannot establish a rank exclusion through
                     # a separate generic or subgraph shape proof.
                     inferred_output_shape = None
                     inferred_output_rank = None
