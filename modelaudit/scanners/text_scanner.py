@@ -2045,8 +2045,8 @@ class TextScanner(BaseScanner):
             previous_line_end = previous_line_start - 1
         return False
 
-    @staticmethod
-    def _documentation_last_closed_fence_end(payload: bytes, start: int, end: int) -> int:
+    @classmethod
+    def _documentation_last_closed_fence_end(cls, payload: bytes, start: int, end: int) -> int:
         cursor = start
         if start and payload[start - 1 : start] != b"\n":
             newline = payload.find(b"\n", start, end)
@@ -2060,7 +2060,9 @@ class TextScanner(BaseScanner):
             if fence is not None:
                 delimiter, info = fence.groups()
                 if opening is None:
-                    if delimiter[:1] != b"`" or b"`" not in info:
+                    if (delimiter[:1] != b"`" or b"`" not in info) and not cls._documentation_prefix_has_enclosing_call(
+                        payload[boundary:cursor]
+                    ):
                         opening = delimiter
                 elif delimiter[:1] == opening[:1] and len(delimiter) >= len(opening) and not info.strip():
                     boundary = cursor + len(line)
