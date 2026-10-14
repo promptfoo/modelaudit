@@ -2406,6 +2406,26 @@ def test_text_scanner_long_quoted_assignment_markdown_remains_actionable(tmp_pat
     )
 
 
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES + 1, MAX_TEXT_FINDING_CONTEXT_BYTES * 2])
+def test_text_scanner_long_gap_before_quoted_assignment_remains_actionable(
+    tmp_path: Path, quote: str, padding: int
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, "endpoint =" + " " * padding + f"{quote}[payload](https://evil.example/payload.sh){quote}\n"
+    )
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_text_scanner_closed_long_gap_assignment_before_prose_link_is_informational(tmp_path: Path, quote: str) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path,
+        "endpoint ="
+        + " " * (MAX_TEXT_FINDING_CONTEXT_BYTES * 2)
+        + f"{quote}closed{quote} See [guide](https://docs.example.com/reference)\n",
+    )
+
+
 def test_text_scanner_many_escaped_assignment_fragments_before_prose_link(tmp_path: Path) -> None:
     _assert_model_card_endpoint_informational(
         tmp_path, '; x=\\"' * 4000 + '" See [guide](https://docs.example.com/reference)\n'

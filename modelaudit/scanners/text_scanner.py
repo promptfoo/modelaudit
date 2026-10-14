@@ -176,7 +176,7 @@ DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
 )
 DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
-    rb"[\s(\[{\\]{0,4096}[rubfRUBF]*(?P<quote>[\"'`])"
+    rb"[\s(\[{\\]*[rubfRUBF]*(?P<quote>[\"'`])"
 )
 DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
