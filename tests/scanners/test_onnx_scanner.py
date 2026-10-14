@@ -37213,3 +37213,622 @@ class TestOnnxUnreachableScanWeightConsumers:
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == int(reachable_call)
+
+
+class TestOnnxPrimaryConstantBudgets:
+    @staticmethod
+    def _outputs(counts: list[int], *, ints: bool = False) -> Any:
+        data_type = TensorProto.INT64 if ints else TensorProto.FLOAT
+        nodes = []
+        for index, count in enumerate(counts):
+            attributes: dict[str, Any] = {
+                "value_ints" if ints else "value_floats": [value if ints else float(value) for value in range(count)]
+            }
+            nodes.append(helper.make_node("Constant", [], [f"value_{index}"], **attributes))
+        graph = helper.make_graph(
+            nodes,
+            "repeated_constant_fields",
+            [],
+            [helper.make_tensor_value_info(f"value_{index}", data_type, [count]) for index, count in enumerate(counts)],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        return model
+
+    @staticmethod
+    def _aliases() -> Any:
+        nodes = []
+        for name in ("first", "second"):
+            node = helper.make_node("Constant", [], [name])
+            node.attribute.append(
+                onnx.AttributeProto(name="value_floats", ref_attr_name="payload", type=onnx.AttributeProto.FLOATS)
+            )
+            nodes.append(node)
+        function = helper.make_function(
+            "local",
+            "Emit",
+            [],
+            ["first", "second"],
+            nodes,
+            [helper.make_opsetid("", 18)],
+            attribute_protos=[helper.make_attribute("payload", [0.0, 1.0, 2.0, 3.0])],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Emit", [], ["a", "b"], domain="local"),
+                helper.make_node("Emit", [], ["c", "d"], domain="local"),
+            ],
+            "shared_constant_payload",
+            [],
+            [helper.make_tensor_value_info(name, TensorProto.FLOAT, [4]) for name in ("a", "b", "c", "d")],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        return model
+
+    @staticmethod
+    def _record_copies(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        tensors: list[Any] = []
+        copy_values = onnx_scanner_module._copy_onnx_repeated_constant_values
+
+        def record(tensor: Any, values: Any, **kwargs: Any) -> bool:
+            tensors.append(tensor)
+            return copy_values(tensor, values, **kwargs)
+
+        monkeypatch.setattr(onnx_scanner_module, "_copy_onnx_repeated_constant_values", record)
+        return tensors
+
+    def test_copy_rejects_declared_size_before_iteration(self) -> None:
+        class UnreadableValues:
+            def __len__(self) -> int:
+                return 1_000_000
+
+            def __iter__(self) -> Any:
+                raise AssertionError("Over-budget values must not be iterated")
+
+        tensor = onnx.TensorProto(data_type=TensorProto.FLOAT, dims=[1_000_000])
+        assert not onnx_scanner_module._copy_onnx_repeated_constant_values(
+            tensor, UnreadableValues(), max_elements=8, onnx=onnx
+        )
+        assert len(tensor.float_data) == 0
+
+    @pytest.mark.parametrize("ints", [False, True])
+    def test_primary_limit_precedes_repeated_field_copy(self, monkeypatch: pytest.MonkeyPatch, ints: bool) -> None:
+        model = self._outputs([16], ints=ints)
+        copied = self._record_copies(monkeypatch)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=32)
+        assert copied == []
+        assert plan.coverage_gaps["constant_attribute_decode_limit"] == 1
+        assert plan.oversized_initializers_skipped == 1
+
+    @pytest.mark.parametrize("callback_budget", [False, True])
+    def test_individually_small_copies_share_an_aggregate_budget(
+        self, monkeypatch: pytest.MonkeyPatch, callback_budget: bool
+    ) -> None:
+        model = self._outputs([4, 4])
+        copied = self._record_copies(monkeypatch)
+        retained = 0
+        preflight_names: list[str] = []
+
+        def preflight(tensor: Any, name: str, size: int) -> bool:
+            assert tensor.data_type == TensorProto.FLOAT
+            assert list(tensor.dims) == [4]
+            assert len(tensor.float_data) == 0
+            assert size == 16
+            preflight_names.append(name)
+            return True
+
+        def reserve(_name: str, size: int) -> bool:
+            nonlocal retained
+            if retained + size > 24:
+                return False
+            retained += size
+            return True
+
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_CONSTANT_ATTRIBUTE_FALLBACK_BYTE_LIMIT", 24)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=None,
+            pre_materialization_check=preflight,
+            retain_array_check=reserve if callback_budget else None,
+        )
+        assert [tensor.name for tensor in copied] == ["value_0"]
+        assert preflight_names == ["value_0", "value_1"]
+        assert plan.coverage_gaps["constant_attribute_decode_limit"] == 1
+        assert plan.oversized_initializers_skipped == 1
+        assert retained == (16 if callback_budget else 0)
+
+    @pytest.mark.parametrize("budget", [8, 16])
+    def test_source_aliases_share_success_and_failure_without_relabeling(
+        self, monkeypatch: pytest.MonkeyPatch, budget: int
+    ) -> None:
+        copied = self._record_copies(monkeypatch)
+        reservations: list[tuple[str, int]] = []
+
+        def reserve(name: str, size: int) -> bool:
+            reservations.append((name, size))
+            return size <= budget
+
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            self._aliases(), onnx=onnx, np=np, max_array_size=None, retain_array_check=reserve
+        )
+        assert reservations == [("first", 16)]
+        assert len(copied) == int(budget == 16)
+        if budget == 16:
+            assert copied[0].name == "first"
+            np.testing.assert_array_equal(onnx.numpy_helper.to_array(copied[0]), np.arange(4, dtype=np.float32))
+            assert plan.coverage_gaps == {}
+        else:
+            assert plan.coverage_gaps["constant_attribute_decode_limit"] == 1
+
+    @pytest.mark.parametrize("array_limit", [None, 0, 64 * 1024])
+    def test_primary_constant_larger_than_reentry_cap_remains_supported(
+        self, monkeypatch: pytest.MonkeyPatch, array_limit: int | None
+    ) -> None:
+        copied = self._record_copies(monkeypatch)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            self._outputs([5000]), onnx=onnx, np=np, max_array_size=array_limit
+        )
+        assert plan.coverage_gaps == {}
+        assert len(copied) == 1
+        np.testing.assert_array_equal(onnx.numpy_helper.to_array(copied[0]), np.arange(5000, dtype=np.float32))
+
+    def test_copied_payload_and_analysis_array_are_reserved_separately(self) -> None:
+        graph = helper.make_graph(
+            [
+                helper.make_node("Constant", [], ["flat"], value_floats=[1.0, 2.0, 3.0, 4.0]),
+                helper.make_node("Reshape", ["flat", "shape"], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ],
+            "constant_payload_and_array",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            initializer=[onnx.numpy_helper.from_array(np.array([2, 2], np.int64), name="shape")],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        analyzer = WeightDistributionScanner(config={"max_array_size": 0, "max_weight_distribution_total_bytes": 32})
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=None,
+            pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size
+            ),
+            retain_array_check=lambda name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size, retain=True
+            ),
+        )
+        assert plan.coverage_gaps == {}
+        assert analyzer.retained_tensor_bytes == 32
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, np.array([[1, 2], [3, 4]], np.float32))
+
+    def test_distinct_function_overrides_keep_distinct_payloads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = create_many_local_function_weight_overrides_model(tmp_path, call_count=3)
+        model = onnx.load(str(path))
+        copied = self._record_copies(monkeypatch)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=1024 * 1024)
+        assert plan.coverage_gaps == {}
+        assert sum(tensor.data_type == TensorProto.FLOAT for tensor in copied) == 3
+        assert sum(tensor.data_type == TensorProto.INT64 for tensor in copied) == 1
+        assert len(plan.specs) == 3
+        assert [spec.analysis_id for spec in plan.specs] == [0, 1, 2]
+        assert np.count_nonzero(plan.specs[0].weights) == 0
+        assert np.count_nonzero(plan.specs[-1].weights) == 5
+
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_over_budget_constant_retains_findings_and_uncached_exit2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner_type: Any
+    ) -> None:
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "Bad"], ["known"]),
+                helper.make_node("Constant", [], ["flat"], value_floats=[0.0] * 10_000),
+                helper.make_node("Reshape", ["flat", "shape"], ["large"]),
+                helper.make_node("MatMul", ["Z", "large"], ["unknown"]),
+            ],
+            "bounded_constant_retains_findings",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64]),
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1, 100]),
+            ],
+            [
+                helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64]),
+                helper.make_tensor_value_info("unknown", TensorProto.FLOAT, [1, 100]),
+            ],
+            initializer=[
+                onnx.numpy_helper.from_array(weights, name="Bad"),
+                onnx.numpy_helper.from_array(np.array([100, 100], np.int64), name="shape"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        path = _save_onnx_model(model, tmp_path / "constant-budget.onnx")
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE", 32 * 1024)
+        result = scanner_type(config={"max_array_size": 32 * 1024}).scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert (
+            result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["constant_attribute_decode_limit"]
+            == 1
+        )
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxBoundWeightTransformAttributes:
+    @staticmethod
+    def _model(
+        operation: str,
+        attribute_name: str,
+        value: int | list[int],
+        input_shape: tuple[int, ...],
+        output_shape: tuple[int, int],
+        mode: str,
+        *,
+        reshape_shape: list[int] | None = None,
+    ) -> Any:
+        attribute_type = onnx.AttributeProto.INTS if isinstance(value, list) else onnx.AttributeProto.INT
+
+        def attribute(name: str) -> Any:
+            result = onnx.AttributeProto(name=name, type=attribute_type)
+            if isinstance(value, list):
+                result.ints.extend(value)
+            else:
+                result.i = value
+            return result
+
+        inputs = ["W", "shape"] if operation == "Reshape" else ["W"]
+        transform = helper.make_node(operation, inputs, ["view"])
+        functions: list[Any] = []
+        opset = 11 if operation in {"Squeeze", "Unsqueeze"} else 18
+        if mode == "literal":
+            transform.attribute.append(attribute(attribute_name))
+            nodes = [transform]
+        else:
+            transform.attribute.append(
+                onnx.AttributeProto(name=attribute_name, ref_attr_name="parameter", type=attribute_type)
+            )
+            function = helper.make_function(
+                "local",
+                "Transform",
+                inputs,
+                ["view"],
+                [transform],
+                [helper.make_opsetid("", opset)],
+                attributes=[] if mode == "default" else ["parameter"],
+                attribute_protos=[attribute("parameter")] if mode == "default" else [],
+            )
+            functions.append(function)
+            call = helper.make_node("Transform", inputs, ["view"], domain="local")
+            if mode == "override":
+                call.attribute.append(attribute("parameter"))
+            elif mode == "forwarded":
+                call.attribute.append(
+                    onnx.AttributeProto(name="parameter", ref_attr_name="outer_parameter", type=attribute_type)
+                )
+                functions.append(
+                    helper.make_function(
+                        "local",
+                        "Forward",
+                        inputs,
+                        ["view"],
+                        [call],
+                        [helper.make_opsetid("", opset), helper.make_opsetid("local", 1)],
+                        attributes=["outer_parameter"],
+                    )
+                )
+                call = helper.make_node("Forward", inputs, ["view"], domain="local")
+                call.attribute.append(attribute("outer_parameter"))
+            nodes = [call]
+        weights = np.arange(math.prod(input_shape), dtype=np.float32).reshape(input_shape)
+        initializers = [onnx.numpy_helper.from_array(weights, name="W")]
+        if reshape_shape is not None:
+            initializers.append(onnx.numpy_helper.from_array(np.array(reshape_shape, np.int64), name="shape"))
+        graph = helper.make_graph(
+            [*nodes, helper.make_node("MatMul", ["X", "view"], ["Y"])],
+            "bound_weight_transform",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, output_shape[0]])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, output_shape[1]])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", opset), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        return model
+
+    @pytest.mark.parametrize("mode", ["default", "override", "forwarded"])
+    @pytest.mark.parametrize(
+        ("operation", "attribute_name", "value", "input_shape", "output_shape", "reshape_shape"),
+        [
+            ("Flatten", "axis", 0, (2, 3), (1, 6), None),
+            ("Flatten", "axis", -1, (2, 3, 4), (6, 4), None),
+            ("Transpose", "perm", [1, 0], (2, 3), (3, 2), None),
+            ("Transpose", "perm", [0, 1], (2, 3), (2, 3), None),
+            ("Squeeze", "axes", [-2], (2, 1, 3), (2, 3), None),
+            ("Squeeze", "axes", [], (1, 2, 3), (2, 3), None),
+            ("Unsqueeze", "axes", [0], (3,), (1, 3), None),
+            ("Unsqueeze", "axes", [-1], (3,), (3, 1), None),
+            ("Reshape", "allowzero", 0, (2, 3), (2, 3), [0, 3]),
+            ("Reshape", "allowzero", 1, (2, 3), (2, 3), [2, 3]),
+        ],
+    )
+    def test_bound_transform_matches_literal_values_and_both_scanner_routes(
+        self,
+        tmp_path: Path,
+        mode: str,
+        operation: str,
+        attribute_name: str,
+        value: int | list[int],
+        input_shape: tuple[int, ...],
+        output_shape: tuple[int, int],
+        reshape_shape: list[int] | None,
+    ) -> None:
+        models = [
+            self._model(
+                operation, attribute_name, value, input_shape, output_shape, binding, reshape_shape=reshape_shape
+            )
+            for binding in ("literal", mode)
+        ]
+        plans = [
+            onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=4096)
+            for model in models
+        ]
+        assert [plan.coverage_gaps for plan in plans] == [{}, {}]
+        assert [len(plan.specs) for plan in plans] == [1, 1]
+        expected = np.arange(math.prod(input_shape), dtype=np.float32).reshape(input_shape)
+        expected = expected.transpose(value) if operation == "Transpose" else expected.reshape(output_shape)
+        for plan in plans:
+            np.testing.assert_array_equal(plan.specs[0].weights, expected)
+        assert plans[0].specs[0].output_axes == plans[1].specs[0].output_axes
+        path = _save_onnx_model(models[1], tmp_path / "bound-transform.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result = scanner_type().scan(str(path))
+            assert result.success is True
+            assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+    def test_two_overrides_of_one_function_keep_distinct_views(self) -> None:
+        model = self._model("Transpose", "perm", [0, 1], (2, 2), (2, 2), "override")
+        second_call = helper.make_node("Transform", ["W"], ["other_view"], domain="local", parameter=[1, 0])
+        model.graph.node.insert(2, second_call)
+        model.graph.node.append(helper.make_node("MatMul", ["X", "other_view"], ["other_Y"]))
+        model.graph.output.append(helper.make_tensor_value_info("other_Y", TensorProto.FLOAT, [1, 2]))
+        onnx.checker.check_model(model, full_check=True)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=4096)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 2
+        weights = np.arange(4, dtype=np.float32).reshape(2, 2)
+        assert any(np.array_equal(spec.weights, weights) for spec in plan.specs)
+        assert any(np.array_equal(spec.weights, weights.T) for spec in plan.specs)
+
+    @pytest.mark.parametrize("malformation", ["missing", "wrong_type", "missing_value", "unresolved_reference"])
+    def test_invalid_bound_scalar_keeps_incomplete_coverage_and_prior_weights(self, malformation: str) -> None:
+        model = self._model("Flatten", "axis", 0, (2, 3), (1, 6), "override")
+        attribute = model.graph.node[0].attribute[0]
+        if malformation == "missing":
+            del model.graph.node[0].attribute[:]
+        elif malformation == "wrong_type":
+            attribute.ClearField("i")
+            attribute.type = onnx.AttributeProto.FLOAT
+            attribute.f = 0.0
+        elif malformation == "missing_value":
+            attribute.ClearField("i")
+        else:
+            attribute.ClearField("i")
+            attribute.ref_attr_name = "missing"
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model.graph.initializer.append(onnx.numpy_helper.from_array(prior_weights, name="prior"))
+        model.graph.input.append(helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 64]))
+        model.graph.node.insert(0, helper.make_node("MatMul", ["A", "prior"], ["prior_Y"]))
+        model.graph.output.append(helper.make_tensor_value_info("prior_Y", TensorProto.FLOAT, [1, 64]))
+        # Deliberately malformed bindings bypass schema validation to exercise the planner's fail-closed guard.
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=32768)
+        assert plan.coverage_gaps.get("unresolved_initializer_lineage", 0) > 0
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+
+
+class TestOnnxOpsetEnvironmentWork:
+    @staticmethod
+    def _model() -> Any:
+        functions = [
+            helper.make_function(
+                "local",
+                f"Consume{version}",
+                ["activation", "weight"],
+                ["result"],
+                [helper.make_node("MatMul", ["activation", "weight"], ["result"])],
+                [helper.make_opsetid("", version)],
+            )
+            for version in (13, 18)
+        ]
+        state_count = 4
+        body = helper.make_graph(
+            [
+                *[
+                    helper.make_node(
+                        f"Consume{13 if index % 2 else 18}",
+                        ["X", f"state{index}"],
+                        [f"unused{index}"],
+                        domain="local",
+                    )
+                    for index in range(state_count)
+                ],
+                *[helper.make_node("Identity", [f"state{index}"], [f"next{index}"]) for index in range(state_count)],
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "opset_environment_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2, 2])
+                    for index in range(state_count)
+                ],
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"next{index}", TensorProto.FLOAT, [2, 2])
+                    for index in range(state_count)
+                ],
+            ],
+        )
+        sources = [f"W{index}" for index in range(33)]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", sources, ["initial"]),
+                helper.make_node(
+                    "Loop",
+                    ["count", "condition", *(["initial"] * state_count)],
+                    [f"out{index}" for index in range(state_count)],
+                    body=body,
+                ),
+            ],
+            "opset_environment_work",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info(f"out{index}", TensorProto.FLOAT, [2, 2]) for index in range(state_count)],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((2, 2), np.float32), name=name) for name in sources],
+                onnx.numpy_helper.from_array(np.array(2, np.int64), name="count"),
+                onnx.numpy_helper.from_array(np.array(True, np.bool_), name="condition"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial", TensorProto.FLOAT, [2, 2])],
+        )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[
+                helper.make_opsetid("", 18),
+                helper.make_opsetid("local", 1),
+                *[helper.make_opsetid(f"unused{index}", 1) for index in range(8)],
+            ],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        return model
+
+    @staticmethod
+    def _observe(model: Any) -> tuple[Any, dict[str, Any]]:
+        observations: dict[str, Any] = {
+            "keys": [],
+            "sorts": [],
+            "function_environments": [],
+            "function_builds": [],
+        }
+
+        def observe(frame: Any, event: str, arg: Any) -> None:
+            if frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            name = frame.f_code.co_name
+            if name == "opset_cache_key":
+                if event == "return":
+                    observations["keys"].append((frame.f_locals["opset_versions"], arg))
+                elif event == "c_call" and arg is sorted:
+                    observations["sorts"].append(frame.f_locals["opset_versions"])
+            elif name == "function_opset_versions" and event == "return":
+                observations["function_environments"].append(
+                    (frame.f_locals["function"], frame.f_locals["caller_opset_versions"], arg)
+                )
+            elif name == "_opset_versions_by_domain" and event == "call":
+                caller = frame.f_back
+                if caller is not None and caller.f_code.co_name == "function_opset_versions":
+                    observations["function_builds"].append(caller.f_locals["function"])
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(observe)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=4096)
+        finally:
+            sys.setprofile(previous_profile)
+        return plan, observations
+
+    def test_shared_environments_use_bounded_keys_and_one_function_map_build(self) -> None:
+        plan, observations = self._observe(self._model())
+        keys = observations["keys"]
+        assert len(keys) > 4
+        assert all(isinstance(key, int) for _environment, key in keys)
+        tokens_by_contents: dict[tuple[tuple[str, int], ...], int] = {}
+        for environment, token in keys:
+            contents = tuple(sorted(environment.items()))
+            assert tokens_by_contents.setdefault(contents, token) == token
+        assert len(set(tokens_by_contents.values())) == len(tokens_by_contents)
+        sorted_owners = [id(environment) for environment in observations["sorts"]]
+        assert len(sorted_owners) == len(set(sorted_owners))
+        builds = observations["function_builds"]
+        assert len(builds) == 2
+        assert len({id(function) for function in builds}) == 2
+        calls = observations["function_environments"]
+        assert len(calls) > len(builds)
+        explicit_by_version: dict[int, Any] = {}
+        for _function, _caller, environment in calls:
+            version = environment[""]
+            assert explicit_by_version.setdefault(version, environment) is environment
+        assert set(explicit_by_version) == {13, 18}
+        assert plan.coverage_gaps.get("opset_environment_work_limit", 0) == 0
+        assert plan.coverage_gaps["lineages_per_value_limit"] > 0
+
+    def test_empty_function_imports_inherit_each_caller_without_rebuilding(self) -> None:
+        model = self._model()
+        for function in model.functions:
+            del function.opset_import[:]
+        _plan, observations = self._observe(model)
+        assert len(observations["function_builds"]) == 2
+        calls = observations["function_environments"]
+        assert len(calls) > 2
+        assert all(environment is caller for _function, caller, environment in calls)
+
+    def test_conflicting_function_imports_keep_ambiguity(self) -> None:
+        model = self._model()
+        for function in model.functions:
+            function.opset_import.append(helper.make_opsetid("", 17))
+        _plan, observations = self._observe(model)
+        calls = observations["function_environments"]
+        assert calls
+        assert all(
+            environment[""] == onnx_scanner_module._AMBIGUOUS_ONNX_OPSET_VERSION
+            for _function, _caller, environment in calls
+        )
+        assert len(observations["function_builds"]) == 2
+
+    def test_key_work_exhaustion_is_conservative_before_sorting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_OPSET_ENVIRONMENT_WORK_LIMIT", 1)
+        model = self._model()
+        plan, observations = self._observe(model)
+        assert observations["keys"]
+        assert all(token is None for environment, token in observations["keys"] if environment)
+        assert observations["sorts"] == []
+        assert plan.coverage_gaps["opset_environment_work_limit"] == 1
+        assert plan.coverage_gaps["lineages_per_value_limit"] > 0
+        path = _save_onnx_model(model, tmp_path / "opset-work-limit.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result = scanner_type().scan(str(path))
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert (
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["opset_environment_work_limit"]
+                == 1
+            )
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")

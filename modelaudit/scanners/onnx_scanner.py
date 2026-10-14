@@ -11,7 +11,7 @@ import stat
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
-from itertools import chain, repeat
+from itertools import chain, islice, repeat
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, NoReturn
 
@@ -128,6 +128,8 @@ _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT = 5
 _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT = 20
 _ONNX_CUSTOM_OPERATOR_TEXT_LIMIT = 256
 _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
+_ONNX_CONSTANT_ATTRIBUTE_FALLBACK_BYTE_LIMIT = _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE
+_ONNX_CONSTANT_ATTRIBUTE_COPY_CHUNK_ELEMENTS = 1024
 _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
@@ -171,6 +173,7 @@ _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
 _ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
+_ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
@@ -1617,6 +1620,33 @@ def _bounded_onnx_integer_sequence(field_name: str, values: Any) -> dict[str, An
     }
 
 
+def _copy_onnx_repeated_constant_values(
+    tensor: Any,
+    values: Any,
+    *,
+    max_elements: int,
+    onnx: Any,
+) -> bool:
+    count = len(values)
+    if count > max_elements or len(tensor.dims) != 1 or int(tensor.dims[0]) != count:
+        return False
+    if int(tensor.data_type) == int(onnx.TensorProto.FLOAT):
+        destination = tensor.float_data
+    elif int(tensor.data_type) == int(onnx.TensorProto.INT64):
+        destination = tensor.int64_data
+    else:
+        return False
+    values_iter = iter(values)
+    for offset in range(0, count, _ONNX_CONSTANT_ATTRIBUTE_COPY_CHUNK_ELEMENTS):
+        chunk_count = min(_ONNX_CONSTANT_ATTRIBUTE_COPY_CHUNK_ELEMENTS, count - offset)
+        chunk = tuple(islice(values_iter, chunk_count))
+        if len(chunk) != chunk_count:
+            return False
+        destination.extend(chunk)
+    sentinel = object()
+    return next(values_iter, sentinel) is sentinel
+
+
 def _onnx_inline_storage_nbytes(initializer: Any) -> int:
     raw_bytes = len(getattr(initializer, "raw_data", b""))
     typed_bytes = 0
@@ -2173,8 +2203,16 @@ def _build_onnx_weight_analysis_plan(
         graph_constants.update(local_constants)
         return graph_constants
 
+    function_opset_cache: dict[int, tuple[Any, dict[str, int]]] = {}
+
     def function_opset_versions(function: Any, caller_opset_versions: dict[str, int]) -> dict[str, int]:
-        return _opset_versions_by_domain(getattr(function, "opset_import", ())) or caller_opset_versions
+        cached = function_opset_cache.get(id(function))
+        if cached is None or cached[0] is not function:
+            explicit_versions = _opset_versions_by_domain(getattr(function, "opset_import", ()))
+            function_opset_cache[id(function)] = (function, explicit_versions)
+        else:
+            explicit_versions = cached[1]
+        return explicit_versions or caller_opset_versions
 
     function_attribute_references: dict[int, frozenset[str] | None] = {}
 
@@ -2292,10 +2330,18 @@ def _build_onnx_weight_analysis_plan(
         if not builtin_operator(node, "Constant"):
             return None
 
-        def repeated_attribute_tensor_values(values: Any) -> list[Any] | None:
-            if len(values) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+        def repeated_attribute_tensor(values: Any, data_type: int) -> Any | None:
+            count = len(values)
+            if count > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
                 return None
-            return list(values)
+            tensor = onnx.TensorProto()
+            tensor.data_type = data_type
+            tensor.dims.append(count)
+            if not _copy_onnx_repeated_constant_values(
+                tensor, values, max_elements=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK, onnx=onnx
+            ):
+                return None
+            return tensor
 
         for attribute in getattr(node, "attribute", ()):
             resolved_attribute = resolve_attribute(attribute)
@@ -2304,32 +2350,74 @@ def _build_onnx_weight_analysis_plan(
             if attribute.name == "value" and _onnx_has_singular_field(resolved_attribute, "t"):
                 return resolved_attribute.t
             if attribute.name == "value_ints":
-                values = repeated_attribute_tensor_values(resolved_attribute.ints)
-                if values is None:
-                    return None
-                return onnx.helper.make_tensor(
-                    "",
-                    onnx.TensorProto.INT64,
-                    [len(values)],
-                    values,
-                )
+                return repeated_attribute_tensor(resolved_attribute.ints, int(onnx.TensorProto.INT64))
             if attribute.name == "value_int":
                 return onnx.helper.make_tensor("", onnx.TensorProto.INT64, [], [resolved_attribute.i])
             if attribute.name == "value_floats":
-                values = repeated_attribute_tensor_values(resolved_attribute.floats)
-                if values is None:
-                    return None
-                return onnx.helper.make_tensor(
-                    "",
-                    onnx.TensorProto.FLOAT,
-                    [len(values)],
-                    values,
-                )
+                return repeated_attribute_tensor(resolved_attribute.floats, int(onnx.TensorProto.FLOAT))
             if attribute.name == "value_float":
                 return onnx.helper.make_tensor("", onnx.TensorProto.FLOAT, [], [resolved_attribute.f])
             if attribute.name == "sparse_value" and _onnx_has_singular_field(resolved_attribute, "sparse_tensor"):
                 return resolved_attribute.sparse_tensor
         return None
+
+    constant_attribute_tensors: dict[tuple[Any, ...], tuple[Any, Any, str | None]] = {}
+    constant_attribute_bytes_remaining = _ONNX_CONSTANT_ATTRIBUTE_FALLBACK_BYTE_LIMIT
+
+    def primary_repeated_constant_tensor(
+        attribute: Any,
+        values: Any,
+        data_type: int,
+        source_key: tuple[Any, ...],
+        name: str,
+    ) -> tuple[Any, str | None]:
+        nonlocal constant_attribute_bytes_remaining
+        cached = constant_attribute_tensors.get(source_key)
+        if cached is not None:
+            return cached[1], cached[2]
+
+        count = len(values)
+        tensor = onnx.TensorProto()
+        tensor.name = name
+        tensor.data_type = data_type
+        tensor.dims.append(count)
+        tensor_bytes = count * (4 if data_type == int(onnx.TensorProto.FLOAT) else 8)
+        bounded_name, _length, _truncated = _bounded_onnx_metadata_text(plan, name)
+        reason: str | None = None
+        # This metadata-only tensor lets callbacks check the declared size
+        # without iterating the source field or allocating its copied payload.
+        if (max_array_size is not None and max_array_size > 0 and tensor_bytes > max_array_size) or (
+            pre_materialization_check is not None and not pre_materialization_check(tensor, bounded_name, tensor_bytes)
+        ):
+            reason = "constant_attribute_decode_limit"
+        elif retain_array_check is not None:
+            if not retain_array_check(bounded_name, tensor_bytes):
+                reason = "constant_attribute_decode_limit"
+        elif tensor_bytes > constant_attribute_bytes_remaining:
+            reason = "constant_attribute_decode_limit"
+        else:
+            # Direct planner callers without a retention callback still get a
+            # finite aggregate copy budget, separate from the small reentry cap.
+            constant_attribute_bytes_remaining -= tensor_bytes
+
+        if reason is None:
+            try:
+                if not _copy_onnx_repeated_constant_values(tensor, values, max_elements=count, onnx=onnx):
+                    reason = "constant_attribute_decode_failure"
+            except Exception:
+                reason = "constant_attribute_decode_failure"
+            if reason is not None:
+                tensor.ClearField("float_data")
+                tensor.ClearField("int64_data")
+                plan.extraction_failures += 1
+        else:
+            plan.oversized_initializers_skipped += 1
+        if reason is not None:
+            plan.record_coverage_gap(reason)
+        # Preserve both successful payloads and failed source identities. Their
+        # reservation remains charged while the tensor and later arrays coexist.
+        constant_attribute_tensors[source_key] = (attribute, tensor, reason)
+        return tensor, reason
 
     def graph_value_is_constant_bool(
         current_graph: Any,
@@ -2979,8 +3067,31 @@ def _build_onnx_weight_analysis_plan(
             )
         )
 
-    def opset_cache_key(opset_versions: dict[str, int]) -> tuple[tuple[str, int], ...]:
-        return tuple(sorted((str(domain), int(version)) for domain, version in opset_versions.items()))
+    opset_key_work_remaining = _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT
+    opset_keys_by_owner: dict[int, tuple[dict[str, int], int]] = {}
+    opset_environment_tokens: dict[tuple[tuple[str, int], ...], int] = {}
+
+    def opset_cache_key(opset_versions: dict[str, int]) -> int | None:
+        nonlocal opset_key_work_remaining
+        if not opset_versions:
+            return 0
+        cached = opset_keys_by_owner.get(id(opset_versions))
+        if cached is not None and cached[0] is opset_versions:
+            return cached[1]
+        work = len(opset_versions) + 1
+        if work > opset_key_work_remaining:
+            plan.coverage_gaps.setdefault("opset_environment_work_limit", 1)
+            return None
+        opset_key_work_remaining -= work
+        semantic_key = tuple(sorted((str(domain), int(version)) for domain, version in opset_versions.items()))
+        token = opset_environment_tokens.get(semantic_key)
+        if token is None:
+            token = len(opset_environment_tokens) + 1
+            opset_environment_tokens[semantic_key] = token
+        # These environments are immutable after construction. Retain their
+        # owners to prevent id reuse, and hash only the token in per-state keys.
+        opset_keys_by_owner[id(opset_versions)] = (opset_versions, token)
+        return token
 
     def bound_control_flow_graph_inputs(
         node: Any,
@@ -3361,9 +3472,12 @@ def _build_onnx_weight_analysis_plan(
         else:
             live_nodes = list(graph_nodes_in_dependency_order(subgraph, dependency_names))
             if include_potential_weight_consumers:
+                opset_key = opset_cache_key(opset_versions or {})
+                if opset_key is None:
+                    return True
                 cache_key = (
                     id(subgraph),
-                    opset_cache_key(opset_versions or {}),
+                    opset_key,
                     attribute_key,
                 )
                 cached_work = graph_potential_weight_work_cache.get(cache_key)
@@ -3496,6 +3610,9 @@ def _build_onnx_weight_analysis_plan(
         bound_constants_key = constant_binding_cache_key(bound_input_constants or {}, bound_constant_names)
         if constants_key is None or bound_constants_key is None:
             return True
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return True
         cache_key = (
             id(subgraph),
             graph_input_name,
@@ -3504,7 +3621,7 @@ def _build_onnx_weight_analysis_plan(
             tuple(sorted(restorable_output_indexes)),
             trusted_context_shape_cache_key(trusted_context_shapes, output_dependency_names),
             related_graph_input_shapes_cache_key,
-            opset_cache_key(opset_versions),
+            opset_key,
             attribute_binding_cache_key(attribute_bindings),
             constants_key,
             bound_constants_key,
@@ -4320,10 +4437,13 @@ def _build_onnx_weight_analysis_plan(
         constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
         if constants_key is None:
             return set(range(len(graph_outputs)))
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return set(range(len(graph_outputs)))
         cache_key = (
             id(subgraph),
             tuple(sorted(graph_input_names)),
-            opset_cache_key(opset_versions),
+            opset_key,
             attribute_binding_cache_key(attribute_bindings),
             depth,
             constants_key,
@@ -4492,11 +4612,14 @@ def _build_onnx_weight_analysis_plan(
         constants_key = constant_binding_cache_key(constants, constant_names | frozenset(node_input_slots(node)[:2]))
         if constants_key is None:
             return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
         key = (
             id(node),
             id(subgraph),
             tuple(sorted(input_names)),
-            opset_cache_key(opset_versions),
+            opset_key,
             attribute_binding_cache_key(attribute_bindings),
             depth,
             constants_key,
@@ -4602,9 +4725,12 @@ def _build_onnx_weight_analysis_plan(
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return True
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return True
         cache_key = (
             id(subgraph),
-            opset_cache_key(opset_versions),
+            opset_key,
             attribute_key,
             depth,
         )
@@ -4678,9 +4804,12 @@ def _build_onnx_weight_analysis_plan(
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return dependency_collection_limit
         cache_key = (
             id(subgraph),
-            opset_cache_key(opset_versions),
+            opset_key,
             attribute_key,
             depth,
         )
@@ -4786,10 +4915,13 @@ def _build_onnx_weight_analysis_plan(
         constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
         if constants_key is None:
             return True
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return True
         cache_key = (
             id(subgraph),
             graph_input_name,
-            opset_cache_key(opset_versions),
+            opset_key,
             attribute_binding_cache_key(attribute_bindings),
             depth,
             constants_key,
@@ -5823,6 +5955,18 @@ def _build_onnx_weight_analysis_plan(
             consumer_sample_count += 1
         eligible_initializer_indexes.add(lineage.initializer_index)
 
+    weight_transform_attribute_types = {
+        "Flatten": {"axis": int(onnx.AttributeProto.INT)},
+        "Transpose": {"perm": int(onnx.AttributeProto.INTS)},
+        "Squeeze": {
+            "axes": int(onnx.AttributeProto.INTS),
+            "noop_with_empty_axes": int(onnx.AttributeProto.INT),
+        },
+        "Unsqueeze": {"axes": int(onnx.AttributeProto.INTS)},
+        "Reshape": {"allowzero": int(onnx.AttributeProto.INT)},
+        "GatherND": {"batch_dims": int(onnx.AttributeProto.INT)},
+    }
+
     def transformed_lineage(
         lineage: _OnnxWeightLineage,
         node: Any,
@@ -5832,20 +5976,49 @@ def _build_onnx_weight_analysis_plan(
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineage:
-        has_referenced_attributes = any(
-            getattr(attribute, "ref_attr_name", "") for attribute in getattr(node, "attribute", ())
-        )
-        if has_referenced_attributes and not (
-            (node.op_type == "Cast" and cast_target_data_type is not None)
-            or (node.op_type == "GatherND" and resolve_attribute is not None)
-        ):
+        def unresolved_transform(reason: str) -> _OnnxWeightLineage:
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=None,
                 data_type=lineage.data_type,
                 transforms=lineage.transforms,
-                unresolved_reason=lineage.unresolved_reason or "referenced_function_attribute",
+                unresolved_reason=lineage.unresolved_reason or reason,
             )
+
+        attribute_types = weight_transform_attribute_types.get(node.op_type, {})
+
+        def resolved_transform_attribute(attribute: Any) -> Any | None:
+            resolved = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            expected_type = attribute_types.get(str(attribute.name))
+            if (
+                resolved is None
+                or expected_type is None
+                or bool(getattr(resolved, "ref_attr_name", ""))
+                or int(getattr(resolved, "type", 0)) != expected_type
+                or (expected_type == int(onnx.AttributeProto.INT) and not _onnx_has_singular_field(resolved, "i"))
+            ):
+                return None
+            return resolved
+
+        def transform_int_attribute(name: str, default: int = 0) -> int | None:
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name == name:
+                    resolved = resolved_transform_attribute(attribute)
+                    return int(resolved.i) if resolved is not None else None
+            return default
+
+        for attribute in getattr(node, "attribute", ()):
+            reference_name = getattr(attribute, "ref_attr_name", "")
+            if reference_name and node.op_type == "Cast" and cast_target_data_type is not None:
+                continue
+            if reference_name and (
+                resolve_attribute is None
+                or attribute.name not in attribute_types
+                or resolved_transform_attribute(attribute) is None
+            ):
+                return unresolved_transform("referenced_function_attribute")
+            if attribute.name in attribute_types and resolved_transform_attribute(attribute) is None:
+                return unresolved_transform("invalid_transform_attribute")
         if node.op_type == "Identity":
             return lineage
         if node.op_type == "Cast":
@@ -5881,9 +6054,10 @@ def _build_onnx_weight_analysis_plan(
         output_shape: tuple[int, ...]
         transform: _OnnxWeightTransform
         if node.op_type == "Flatten":
-            axis = _onnx_int_attribute(node, "axis", 1)
-            axis = axis if axis >= 0 else len(lineage.shape) + axis
-            if axis < 0 or axis > len(lineage.shape):
+            axis = transform_int_attribute("axis", 1)
+            if axis is not None and axis < 0:
+                axis += len(lineage.shape)
+            if axis is None or axis < 0 or axis > len(lineage.shape):
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
                     shape=None,
@@ -5894,7 +6068,7 @@ def _build_onnx_weight_analysis_plan(
             output_shape = (flattened_shape_extent(lineage.shape[:axis]), flattened_shape_extent(lineage.shape[axis:]))
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type in {"Squeeze", "Unsqueeze"}:
-            axes = resolve_axes(node, constants, onnx=onnx)
+            axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolved_transform_attribute)
             if axes is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -5906,7 +6080,7 @@ def _build_onnx_weight_analysis_plan(
             if node.op_type == "Squeeze":
                 normalized_axes = tuple(axis if axis >= 0 else len(lineage.shape) + axis for axis in axes)
                 if not normalized_axes:
-                    if squeeze_with_empty_axes_is_noop(node, axes):
+                    if squeeze_with_empty_axes_is_noop(node, axes, resolved_transform_attribute):
                         output_shape = lineage.shape
                         transform = _OnnxWeightTransform("Reshape", output_shape)
                         transformed = _OnnxWeightLineage(
@@ -5919,7 +6093,7 @@ def _build_onnx_weight_analysis_plan(
                         return transformed if transformed != lineage else lineage
                     normalized_axes = tuple(index for index, dimension in enumerate(lineage.shape) if dimension == 1)
                 if (
-                    (not axes and implicit_squeeze_shape(node, lineage.shape) is None)
+                    (not axes and implicit_squeeze_shape(node, lineage.shape, resolved_transform_attribute) is None)
                     or len(set(normalized_axes)) != len(normalized_axes)
                     or any(axis < 0 or axis >= len(lineage.shape) for axis in normalized_axes)
                     or any(lineage.shape[axis] != 1 for axis in normalized_axes)
@@ -5947,7 +6121,7 @@ def _build_onnx_weight_analysis_plan(
                 output_shape = unsqueezed
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "Transpose":
-            permutation = transpose_permutation(node, len(lineage.shape))
+            permutation = transpose_permutation(node, len(lineage.shape), resolved_transform_attribute)
             if permutation is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -6018,7 +6192,7 @@ def _build_onnx_weight_analysis_plan(
                 node,
                 input_shape=lineage.shape,
                 index_shape=index_shape,
-                resolve_attribute=resolve_attribute,
+                resolve_attribute=resolved_transform_attribute,
             )
             if gathered_shape is None:
                 return _OnnxWeightLineage(
@@ -6038,14 +6212,15 @@ def _build_onnx_weight_analysis_plan(
         else:  # Reshape
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             shape_initializer = constants.get(shape_name)
+            allowzero = transform_int_attribute("allowzero")
             resolved_shape = (
                 _resolve_onnx_reshape_shape(
                     lineage.shape,
                     shape_initializer,
-                    allowzero=bool(_onnx_int_attribute(node, "allowzero")),
+                    allowzero=bool(allowzero),
                     onnx=onnx,
                 )
-                if shape_initializer is not None
+                if shape_initializer is not None and allowzero is not None
                 else None
             )
             if resolved_shape is None:
@@ -10643,11 +10818,7 @@ def _build_onnx_weight_analysis_plan(
                         inherited_weight_lineage_limit_gap_summaries=value_weight_lineage_limit_gap_summaries,
                         inherited_rank_promotable_lineage_limit_gap_counts=value_rank_promotable_lineage_limit_gap_counts,
                         inherited_rank_promotable_lineage_limit_gap_summaries=value_rank_promotable_lineage_limit_gap_summaries,
-                        opset_versions={
-                            str(getattr(opset, "domain", "") or ""): int(opset.version)
-                            for opset in getattr(function, "opset_import", ())
-                        }
-                        or opset_versions,
+                        opset_versions=function_opset_versions(function, opset_versions),
                         bound_lineages=function_bound_lineages,
                         bound_constants=function_bound_constants,
                         bound_dynamic_values=function_bound_dynamic,
@@ -11237,6 +11408,7 @@ def _build_onnx_weight_analysis_plan(
                 constant_tensor = None
                 sparse_constant = None
                 unresolved_constant_attribute = False
+                constant_unresolved_reason: str | None = None
                 constant_source_key: tuple[Any, ...] | None = None
                 for attribute_position, attribute in enumerate(node.attribute):
                     resolved_attribute = resolve_attribute(attribute)
@@ -11246,12 +11418,25 @@ def _build_onnx_weight_analysis_plan(
                     if attribute.name == "value":
                         if _onnx_has_singular_field(resolved_attribute, "t"):
                             constant_tensor = resolved_attribute.t
-                    elif attribute.name == "value_ints":
-                        constant_tensor = onnx.helper.make_tensor(
-                            "",
-                            onnx.TensorProto.INT64,
-                            [len(resolved_attribute.ints)],
-                            list(resolved_attribute.ints),
+                    elif attribute.name in {"value_ints", "value_floats"}:
+                        is_float = attribute.name == "value_floats"
+                        expected_type = onnx.AttributeProto.FLOATS if is_float else onnx.AttributeProto.INTS
+                        if int(getattr(resolved_attribute, "type", 0)) != int(expected_type) or bool(
+                            getattr(resolved_attribute, "ref_attr_name", "")
+                        ):
+                            unresolved_constant_attribute = True
+                            plan.record_coverage_gap("invalid_constant_attribute")
+                            continue
+                        constant_source_key = (
+                            "constant_value",
+                            *attribute_source_key(attribute, local_node_index, attribute_position),
+                        )
+                        constant_tensor, constant_unresolved_reason = primary_repeated_constant_tensor(
+                            resolved_attribute,
+                            resolved_attribute.floats if is_float else resolved_attribute.ints,
+                            int(onnx.TensorProto.FLOAT if is_float else onnx.TensorProto.INT64),
+                            constant_source_key,
+                            next((str(output_name) for output_name in node.output if output_name), ""),
                         )
                     elif attribute.name == "value_int":
                         constant_tensor = onnx.helper.make_tensor(
@@ -11259,13 +11444,6 @@ def _build_onnx_weight_analysis_plan(
                             onnx.TensorProto.INT64,
                             [],
                             [resolved_attribute.i],
-                        )
-                    elif attribute.name == "value_floats":
-                        constant_tensor = onnx.helper.make_tensor(
-                            "",
-                            onnx.TensorProto.FLOAT,
-                            [len(resolved_attribute.floats)],
-                            list(resolved_attribute.floats),
                         )
                     elif attribute.name == "value_float":
                         constant_tensor = onnx.helper.make_tensor(
@@ -11280,20 +11458,23 @@ def _build_onnx_weight_analysis_plan(
                     ):
                         sparse_constant = resolved_attribute.sparse_tensor
                     if constant_tensor is not None or sparse_constant is not None:
-                        constant_source_key = (
-                            "constant_value",
-                            *attribute_source_key(attribute, local_node_index, attribute_position),
-                        )
+                        if constant_source_key is None:
+                            constant_source_key = (
+                                "constant_value",
+                                *attribute_source_key(attribute, local_node_index, attribute_position),
+                            )
                         break
                 output_names = [str(output_name) for output_name in node.output if output_name]
                 if len(output_names) != 1:
                     plan.record_coverage_gap("invalid_constant_outputs")
                 elif constant_tensor is not None:
                     name = output_names[0]
-                    constant_tensor.name = name
+                    if constant_source_key not in initializer_source_indexes:
+                        constant_tensor.name = name
                     lineage = register_initializer(
                         constant_tensor,
                         current_graph_index,
+                        unresolved_reason=constant_unresolved_reason,
                         source_key=constant_source_key,
                     )
                     constants[name] = constant_tensor
