@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Reuse successful and rejected ONNX vector-control proofs so repeated Expand analysis reads each immutable tensor payload once.
+- Reuse successful and rejected ONNX vector-control proofs across Expand, axes and Reshape analysis, including recurrent state proofs, so each immutable tensor payload is read once.
 - Bound primary Einsum weight orientation with the shared literal-equation cache before decoding, including resolved Expand and repeated function consumers.
 - Require immutable or proven Scan-8 batch extents and admit typed, budgeted body-local constants before finite weight replay.
 - Preserve trusted runtime-input types through ONNX loop replay and function scopes without trusting shadowed names or unknown operands.

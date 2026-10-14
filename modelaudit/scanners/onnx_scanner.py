@@ -1686,28 +1686,36 @@ def _resolve_onnx_reshape_shape(
     *,
     allowzero: bool,
     onnx: Any,
+    resolve_int64_vector: Callable[[Any], tuple[int, ...] | None] | None = None,
 ) -> tuple[int, ...] | None:
     if any(dimension < 0 for dimension in input_shape):
         return None
-    dims: Any = getattr(shape_initializer, "dims", ())
-    if len(dims) != 1:
-        return None
-    element_count = int(dims[0])
-    if (
-        len(dims) != 1
-        or element_count < 0
-        or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
-        or int(getattr(shape_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
-        or _onnx_inline_storage_nbytes(shape_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
-        or _onnx_tensor_uses_external_storage(shape_initializer, onnx=onnx)
-    ):
-        return None
+    if resolve_int64_vector is not None:
+        values = resolve_int64_vector(shape_initializer)
+        if values is None:
+            return None
+        target = list(values)
+        element_count = len(target)
+    else:
+        dims: Any = getattr(shape_initializer, "dims", ())
+        if len(dims) != 1:
+            return None
+        element_count = int(dims[0])
+        if (
+            len(dims) != 1
+            or element_count < 0
+            or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+            or int(getattr(shape_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
+            or _onnx_inline_storage_nbytes(shape_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
+            or _onnx_tensor_uses_external_storage(shape_initializer, onnx=onnx)
+        ):
+            return None
 
-    try:
-        target_values = onnx.numpy_helper.to_array(shape_initializer).reshape(-1).tolist()
-        target = [int(value) for value in target_values]
-    except Exception:
-        return None
+        try:
+            target_values = onnx.numpy_helper.to_array(shape_initializer).reshape(-1).tolist()
+            target = [int(value) for value in target_values]
+        except Exception:
+            return None
     if len(target) != element_count or any(value < -1 for value in target) or target.count(-1) > 1:
         return None
     if allowzero and -1 in target and 0 in target:
@@ -1742,6 +1750,7 @@ def _resolve_onnx_axes(
     onnx: Any,
     resolve_attribute: Callable[[Any], Any | None] | None = None,
     on_limit: Callable[[], None] | None = None,
+    resolve_int64_vector: Callable[[Any], tuple[int, ...] | None] | None = None,
 ) -> tuple[int, ...] | None:
     for attribute in getattr(node, "attribute", ()):
         if attribute.name == "axes":
@@ -1766,6 +1775,8 @@ def _resolve_onnx_axes(
     element_count = int(dims[0])
     if element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT and on_limit is not None:
         on_limit()
+    if resolve_int64_vector is not None:
+        return resolve_int64_vector(axes_initializer)
     if (
         len(dims) != 1
         or element_count < 0
@@ -1941,7 +1952,14 @@ def _build_onnx_weight_analysis_plan(
         def exhausted() -> None:
             plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
 
-        return _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute, on_limit=exhausted)
+        return _resolve_onnx_axes(
+            node,
+            constants,
+            onnx=onnx,
+            resolve_attribute=resolve_attribute,
+            on_limit=exhausted,
+            resolve_int64_vector=constant_int64_vector_values,
+        )
 
     def unsqueezed_shape(shape: tuple[int, ...], axes: tuple[int, ...]) -> tuple[int, ...] | None:
         rank = len(shape) + len(axes)
@@ -4394,6 +4412,7 @@ def _build_onnx_weight_analysis_plan(
                             shape_initializer,
                             allowzero=bool(allowzero),
                             onnx=onnx,
+                            resolve_int64_vector=constant_int64_vector_values,
                         )
                 elif standard_reentry_operator and body_node.op_type == "Unsqueeze" and data_input_shape is not None:
                     axes = resolve_axes(
@@ -5907,6 +5926,7 @@ def _build_onnx_weight_analysis_plan(
                 shape_initializer,
                 allowzero=bool(allowzero),
                 onnx=onnx,
+                resolve_int64_vector=constant_int64_vector_values,
             )
             return resolved_shape is None or len(resolved_shape) >= 2
         return False
@@ -6517,6 +6537,7 @@ def _build_onnx_weight_analysis_plan(
                     shape_initializer,
                     allowzero=bool(allowzero),
                     onnx=onnx,
+                    resolve_int64_vector=constant_int64_vector_values,
                 )
                 if shape_initializer is not None and allowzero is not None
                 else None
@@ -9191,6 +9212,7 @@ def _build_onnx_weight_analysis_plan(
                                     shape_initializer,
                                     allowzero=bool(_onnx_int_attribute(body_node, "allowzero")),
                                     onnx=onnx,
+                                    resolve_int64_vector=constant_int64_vector_values,
                                 )
                             if body_node.op_type == "Unsqueeze" and data_input_shape is not None:
                                 axes = resolve_axes(body_node, subgraph_constants, onnx=onnx)
@@ -9373,6 +9395,7 @@ def _build_onnx_weight_analysis_plan(
                                         shape_initializer,
                                         allowzero=bool(_onnx_int_attribute(function_node, "allowzero")),
                                         onnx=onnx,
+                                        resolve_int64_vector=constant_int64_vector_values,
                                     )
                                 if function_node.op_type == "Unsqueeze" and data_input_shape is not None:
                                     axes = resolve_axes(function_node, function_constants, onnx=onnx)
@@ -13322,6 +13345,7 @@ def _build_onnx_weight_analysis_plan(
                                 shape_initializer,
                                 allowzero=bool(resolved_int_attribute(node, "allowzero")),
                                 onnx=onnx,
+                                resolve_int64_vector=constant_int64_vector_values,
                             )
                             if transform_output_shape is None:
                                 transform_output_rank = None

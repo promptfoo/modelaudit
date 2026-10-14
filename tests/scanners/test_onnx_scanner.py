@@ -40264,3 +40264,213 @@ class TestOnnxVectorControlBudgets:
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model, tmp_path, incomplete, prior_weights, coverage_reason=coverage_reason
         )
+
+
+class TestOnnxReentryVectorControlCaching:
+    @pytest.mark.parametrize("operator", ["Squeeze", "Unsqueeze", "Reshape"])
+    @pytest.mark.parametrize("storage", ["raw", "typed", "oversized"])
+    @pytest.mark.parametrize("local_function", [False, True])
+    def test_repeated_state_proofs_share_control_payloads(
+        self, tmp_path: Path, operator: str, storage: str, local_function: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        state_shape = (64,) if operator == "Unsqueeze" else (1, 64)
+        control_values = [64] if operator == "Reshape" else [0]
+        names = [f"state{index}" for index in range(3)]
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "InspectState",
+                    ["state", "control", "restore", "activation"],
+                    ["next", "used"],
+                    [
+                        helper.make_node(operator, ["state", "control"], ["view"]),
+                        helper.make_node("PRelu", ["activation", "view"], ["used"]),
+                        helper.make_node("Reshape", ["view", "restore"], ["next"]),
+                    ],
+                    [helper.make_opsetid("", 13)],
+                )
+            )
+        body_nodes = []
+        for index, name in enumerate(names):
+            if local_function:
+                body_nodes.append(
+                    helper.make_node(
+                        "InspectState",
+                        [name, "control", "restore", "activation"],
+                        [f"next{index}", f"used{index}"],
+                        domain="local",
+                    )
+                )
+            else:
+                body_nodes.extend(
+                    [
+                        helper.make_node(operator, [name, "control"], [f"view{index}"]),
+                        helper.make_node("PRelu", ["activation", f"view{index}"], [f"used{index}"]),
+                        helper.make_node("Reshape", [f"view{index}", "restore"], [f"next{index}"]),
+                    ]
+                )
+        body = helper.make_graph(
+            body_nodes,
+            "shared_reentry_control",
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, list(state_shape)) for name in names],
+            [value("condition", [], TensorProto.BOOL)]
+            + [value(f"next{index}", list(state_shape)) for index in range(3)],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        initial = np.ones(state_shape, np.float32)
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["X", "prior"], ["known"]),
+                    helper.make_node(
+                        "Loop",
+                        ["two", "start", "initial", "initial", "initial"],
+                        [f"final{index}" for index in range(3)],
+                        body=body,
+                    ),
+                ],
+                "cached_reentry_vectors",
+                [value("X", [1, 64]), value("activation", [1, 64])],
+                [value("known", [1, 64])] + [value(f"final{index}", list(state_shape)) for index in range(3)],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("initial", initial),
+                    tensor("control", np.array(control_values, np.int64)),
+                    tensor("restore", np.array(state_shape, np.int64)),
+                    tensor("two", np.int64(2)),
+                    tensor("start", np.bool_(True)),
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"X": np.ones((1, 64), np.float32), "activation": -np.ones((1, 64), np.float32)}
+        )
+        for result_value in actual[1:]:
+            np.testing.assert_array_equal(result_value, initial)
+        control = next(item for item in model.graph.initializer if item.name == "control")
+        if storage == "typed":
+            control.ClearField("raw_data")
+            control.int64_data.extend(control_values)
+        elif storage == "oversized":
+            control.raw_data += b"x" * 640
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        observed: dict[str, Any] = {"queries": 0, "reentry_queries": 0, "payload_reads": [], "legacy_reads": 0}
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if event != "return":
+                return
+            name = frame.f_code.co_name
+            if name in {"_onnx_inline_storage_nbytes", "to_array"}:
+                caller = frame.f_back
+                if caller is not None and caller.f_code.co_name in {
+                    "_resolve_onnx_axes",
+                    "_resolve_onnx_reshape_shape",
+                }:
+                    observed["legacy_reads"] += 1
+                return
+            if name != "constant_int64_vector_values" or Path(frame.f_code.co_filename).resolve() != scanner_path:
+                return
+            owner = frame.f_locals.get("initializer")
+            if owner is None or str(owner.name) != "control":
+                return
+            observed["queries"] += 1
+            if "raw_data" in frame.f_locals:
+                observed["payload_reads"].append(len(frame.f_locals["raw_data"]))
+            ancestor = frame.f_back
+            while ancestor is not None:
+                if ancestor.f_code.co_name == "subgraph_reenters_state_with_rank_promotion":
+                    observed["reentry_queries"] += 1
+                    break
+                ancestor = ancestor.f_back
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous_profile)
+        assert observed["queries"] >= 2, observed
+        assert observed["reentry_queries"] >= 2, observed
+        assert observed["legacy_reads"] == 0, observed
+        assert observed["payload_reads"] == ([] if storage == "typed" else [648 if storage == "oversized" else 8])
+        if storage == "oversized":
+            assert plan.coverage_gaps["vector_control_decode_failure"] >= 1
+        else:
+            assert plan.coverage_gaps == {}
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, storage == "oversized", prior_weights, coverage_reason="vector_control_decode_failure"
+        )
+
+    @pytest.mark.parametrize("local_function", [False, True])
+    def test_shared_reshape_values_keep_input_specific_shapes(self, tmp_path: Path, local_function: bool) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "ReshapeWeight",
+                    ["data", "target"],
+                    ["view"],
+                    [helper.make_node("Reshape", ["data", "target"], ["view"])],
+                    [helper.make_opsetid("", 14)],
+                )
+            )
+        shapes = [(2, 32), (4, 16), (4, 16)]
+        targets = ["same", "same", "other"]
+        arrays = [np.arange(64, dtype=np.float32).reshape(shape) for shape in [(2, 32), (4, 16), (2, 32)]]
+        nodes = []
+        for index, target in enumerate(targets):
+            nodes.append(
+                helper.make_node(
+                    "ReshapeWeight" if local_function else "Reshape",
+                    [f"W{index}", target],
+                    [f"view{index}"],
+                    domain="local" if local_function else "",
+                )
+            )
+            nodes.append(helper.make_node("MatMul", [f"X{index}", f"view{index}"], [f"Y{index}"]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "input_specific_reshape",
+                [value(f"X{index}", [1, shape[0]]) for index, shape in enumerate(shapes)],
+                [value(f"Y{index}", [1, shape[1]]) for index, shape in enumerate(shapes)],
+                initializer=[
+                    *[tensor(f"W{index}", array) for index, array in enumerate(arrays)],
+                    tensor("same", np.array([0, -1], np.int64)),
+                    tensor("other", np.array([4, 16], np.int64)),
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 14), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        feeds = {f"X{index}": np.ones((1, shape[0]), np.float32) for index, shape in enumerate(shapes)}
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        for index, shape in enumerate(shapes):
+            np.testing.assert_array_equal(actual[index], feeds[f"X{index}"] @ arrays[index].reshape(shape))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 3
+        assert sorted(spec.weights.shape for spec in plan.specs) == sorted(shapes)
+        for index, shape in enumerate(shapes):
+            assert any(np.array_equal(spec.weights, arrays[index].reshape(shape)) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "reshape-input-shapes.onnx")
+        for scanner in [OnnxScanner(), WeightDistributionScanner()]:
+            result = scanner.scan(str(path))
+            assert result.success is True, result.metadata
