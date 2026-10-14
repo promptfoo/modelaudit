@@ -2315,6 +2315,11 @@ def _build_onnx_weight_analysis_plan(
                 attributes.pop(str(attribute.name), None)
         return attributes
 
+    def direct_graph_attributes(node: Any, function: Any | None) -> Iterable[Any]:
+        # Local-function arguments are bindings, not executable subgraphs. Their
+        # graphs are followed only at reference sites in the resolved callee.
+        return getattr(node, "attribute", ()) if function is None else ()
+
     def bound_function_constants(
         function: Any, node_input_names: list[str], constants: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -3312,10 +3317,8 @@ def _build_onnx_weight_analysis_plan(
                 ),
             )
             merge_dependency_names(dependencies, graph_external_reference_names(function, function_attributes))
-        # Local-function graph arguments are followed at the callee's reference
-        # sites above; accepting an argument does not make its graph executable.
-        if function is None and not dependency_names_exceeded_limit(frozenset(dependencies)):
-            for attribute in getattr(node, "attribute", ()):
+        if not dependency_names_exceeded_limit(frozenset(dependencies)):
+            for attribute in direct_graph_attributes(node, function):
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = local_attribute_bindings.get(reference_name) if reference_name else attribute
                 if resolved_attribute is None:
@@ -3953,10 +3956,7 @@ def _build_onnx_weight_analysis_plan(
                 )[0]
 
             nested_branch_shapes: list[dict[str, tuple[int, ...]]] = []
-            function_references = referenced_function_attributes(function) if function is not None else None
-            for attribute in getattr(body_node, "attribute", ()):
-                if function_references is not None and str(attribute.name) not in function_references:
-                    continue
+            for attribute in direct_graph_attributes(body_node, function):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
@@ -5076,13 +5076,8 @@ def _build_onnx_weight_analysis_plan(
             output_is_live = id(body_node) in live_node_ids
             node_output_is_live_after_node[id(body_node)] = output_is_live
             body_function = functions.get(_operator_identifier(body_node))
-            body_function_references = (
-                referenced_function_attributes(body_function) if body_function is not None else None
-            )
             if not output_is_live:
-                for attribute in getattr(body_node, "attribute", ()):
-                    if body_function_references is not None and str(attribute.name) not in body_function_references:
-                        continue
+                for attribute in direct_graph_attributes(body_node, body_function):
                     resolved_attribute = resolve_reentry_attribute(attribute)
                     if resolved_attribute is None:
                         continue
@@ -5114,9 +5109,7 @@ def _build_onnx_weight_analysis_plan(
             live_body_inputs = node_input_names(body_node)
             live_names.update(live_body_inputs)
             live_node_ids.update(graph_nodes_producing_names(subgraph, live_body_inputs))
-            for attribute in getattr(body_node, "attribute", ()):
-                if body_function_references is not None and str(attribute.name) not in body_function_references:
-                    continue
+            for attribute in direct_graph_attributes(body_node, body_function):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
@@ -5206,11 +5199,8 @@ def _build_onnx_weight_analysis_plan(
                     return finish(True)
             tainted_function_captures = function_captures & tainted
             has_tainted_nested_capture = False
-            function_references = referenced_function_attributes(function) if function is not None else None
             if not any_tainted:
-                for attribute in getattr(body_node, "attribute", ()):
-                    if function_references is not None and str(attribute.name) not in function_references:
-                        continue
+                for attribute in direct_graph_attributes(body_node, function):
                     resolved_attribute = resolve_reentry_attribute(attribute)
                     if resolved_attribute is None:
                         continue
@@ -5300,9 +5290,7 @@ def _build_onnx_weight_analysis_plan(
                         )
                     )
                 tainted.update(function_tainted_outputs)
-            for attribute in getattr(body_node, "attribute", ()):
-                if function_references is not None and str(attribute.name) not in function_references:
-                    continue
+            for attribute in direct_graph_attributes(body_node, function):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
@@ -5498,8 +5486,7 @@ def _build_onnx_weight_analysis_plan(
                     ),
                 )
                 referenced_names.update(graph_external_reference_names(function, function_attributes, depth=depth + 1))
-                continue
-            for attribute in getattr(graph_node, "attribute", ()):
+            for attribute in direct_graph_attributes(graph_node, function):
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = (attribute_bindings or {}).get(reference_name) if reference_name else attribute
                 if resolved_attribute is not None:
