@@ -139,7 +139,7 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
         "${{ matrix.timeout-minutes || ((matrix.os == 'macos-15-intel' || "
         "matrix.os == 'windows-latest') && 30 || 15) }}"
     )
-    for version in ("3.13", "3.14"):
+    for version in ("3.12", "3.13", "3.14"):
         linux = next(
             lane for lane in matrix["include"] if lane["os"] == "ubuntu-latest" and lane["python-version"] == version
         )
