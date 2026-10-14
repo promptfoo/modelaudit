@@ -7580,13 +7580,14 @@ def test_scan_file_skips_license_opcode_near_matches(tmp_path: Path, payload: by
 
 
 @pytest.mark.parametrize("tail", [b"\xff", b"0.Microsoft.\r\n"])
-def test_scan_file_routes_execution_before_malformed_license_tail(tmp_path: Path, tail: bytes) -> None:
+@pytest.mark.parametrize("prefix", [b"", b"I0\n"])
+def test_scan_file_routes_execution_before_malformed_license_tail(tmp_path: Path, tail: bytes, prefix: bytes) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/LICENSE", b'cbuiltins\neval\n(S"1+1"\ntR' + tail)
+        archive.writestr("archive/LICENSE", prefix + b'cbuiltins\neval\n(S"1+1"\ntR' + tail)
 
     report = scan_file(archive_path)
 

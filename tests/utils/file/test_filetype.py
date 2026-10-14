@@ -3676,6 +3676,7 @@ def test_detect_file_format_license_opcode_collision_is_not_pickle(
     [
         b'cos\nsystem\n(S"echo regression"\ntR0.Microsoft.\r\n',
         b'cbuiltins\neval\n(S"1+1"\ntR\xff',
+        b'I0\ncbuiltins\neval\n(S"1+1"\ntR\xff',
     ],
 )
 def test_detect_file_format_text_named_pickle_with_malformed_tail_still_routes(

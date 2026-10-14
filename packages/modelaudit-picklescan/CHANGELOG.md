@@ -9,7 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Avoid discovering ordinary license text as pickle data in archives. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and calls through initial pickle globals before malformed trailing data.
+- Avoid discovering ordinary license text as pickle data in archives. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and stack-compatible calls before malformed trailing data.
 - Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
 - Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit.
 - Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
