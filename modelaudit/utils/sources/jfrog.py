@@ -326,6 +326,21 @@ def _get_jfrog_probe_origin(url: str) -> tuple[str, str, int | None] | None:
     return parsed_origin if parsed_origin == prepared_origin and parsed_origin[1] else None
 
 
+def _decode_jfrog_path(path: str, error_message: str) -> str:
+    """Decode bounded URL escaping without permitting encoded separators."""
+    for _ in range(3):
+        if re.search(r"%(?:2f|5c)", path, re.IGNORECASE):
+            raise ValueError(error_message)
+        try:
+            next_path = unquote(path, errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError(error_message) from exc
+        if next_path == path:
+            return path
+        path = next_path
+    raise ValueError(error_message)
+
+
 def _canonical_jfrog_path(url: str) -> tuple[tuple[str, str, int | None], PurePosixPath]:
     """Return an unambiguous origin and decoded path for a JFrog URL."""
     origin = _get_jfrog_probe_origin(url)
@@ -336,19 +351,7 @@ def _canonical_jfrog_path(url: str) -> tuple[tuple[str, str, int | None], PurePo
     if origin is None or not prepared_url:
         raise ValueError(f"Unsafe JFrog artifact path: {url}")
 
-    decoded_path = urlparse(prepared_url).path
-    for _ in range(3):
-        if re.search(r"%(?:2f|5c)", decoded_path, re.IGNORECASE):
-            raise ValueError(f"Unsafe JFrog artifact path: {url}")
-        try:
-            next_path = unquote(decoded_path, errors="strict")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"Unsafe JFrog artifact path: {url}") from exc
-        if next_path == decoded_path:
-            break
-        decoded_path = next_path
-    else:
-        raise ValueError(f"Unsafe JFrog artifact path: {url}")
+    decoded_path = _decode_jfrog_path(urlparse(prepared_url).path, f"Unsafe JFrog artifact path: {url}")
 
     path = PurePosixPath(decoded_path)
     if "\x00" in decoded_path or "\\" in decoded_path or any(part in {".", ".."} for part in path.parts):
@@ -365,19 +368,7 @@ def _safe_jfrog_child_name(uri: object, folder_url: str) -> str:
         raise ValueError(f"Unsafe JFrog child path in {folder_url}")
 
     child_name = uri.lstrip("/")
-    decoded_name = child_name
-    for _ in range(3):
-        if re.search(r"%(?:2f|5c)", decoded_name, re.IGNORECASE):
-            raise ValueError(f"Unsafe JFrog child path in {folder_url}")
-        try:
-            next_name = unquote(decoded_name, errors="strict")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"Unsafe JFrog child path in {folder_url}") from exc
-        if next_name == decoded_name:
-            break
-        decoded_name = next_name
-    else:
-        raise ValueError(f"Unsafe JFrog child path in {folder_url}")
+    decoded_name = _decode_jfrog_path(child_name, f"Unsafe JFrog child path in {folder_url}")
 
     parts = decoded_name.split("/")
     if not decoded_name or "\\" in decoded_name or any(part in {"", ".", ".."} for part in parts):
@@ -527,10 +518,7 @@ def _require_size_within_limit(
 
 def _read_bounded_jfrog_json_response(response: requests.Response, *, display_url: str) -> dict[str, Any]:
     """Read and decode one bounded JFrog JSON response."""
-    response_headers = getattr(response, "headers", {})
-    content_length = None
-    if hasattr(response_headers, "get"):
-        content_length = _coerce_nonnegative_size(response_headers.get("Content-Length"))
+    content_length = _coerce_nonnegative_size(response.headers.get("Content-Length"))
     _require_size_within_limit(
         size=content_length,
         limit=_MAX_JFROG_STORAGE_RESPONSE_BYTES,
@@ -710,10 +698,7 @@ def download_artifact(
         # Raise an exception for HTTP error responses
         response.raise_for_status()
 
-        content_length = None
-        response_headers = getattr(response, "headers", {})
-        if hasattr(response_headers, "get"):
-            content_length = _coerce_nonnegative_size(response_headers.get("Content-Length"))
+        content_length = _coerce_nonnegative_size(response.headers.get("Content-Length"))
         _require_size_within_limit(
             size=content_length,
             limit=max_download_size,
@@ -1750,7 +1735,6 @@ def download_jfrog_folder(
 
     # Download each file
     completed_downloads = 0
-    downloaded_files: list[Path] = []
     actual_downloaded_size = probe_bytes_counter[0]
     backup_dir: Path | None = None
     backup_paths: dict[Path, Path] = {}
@@ -1807,9 +1791,7 @@ def download_jfrog_folder(
         raise
 
     try:
-        for file_info, prepared_local_file in zip(files, local_files, strict=True):
-            local_file = prepared_local_file
-            downloaded_file: Path | None = None
+        for file_info, local_file in zip(files, local_files, strict=True):
             try:
                 if show_progress:
                     size_display = file_info["human_size"] if file_info["human_size"] != "Unknown" else "size unknown"
@@ -1834,7 +1816,7 @@ def download_jfrog_folder(
                 if file_download_limit is not None:
                     artifact_download_kwargs["max_size"] = file_download_limit
                     artifact_download_kwargs["_enforce_zero_max_size"] = file_download_limit == 0
-                downloaded_file = download_artifact(
+                download_artifact(
                     download_url,
                     cache_dir=local_file.parent,
                     api_token=api_token,
@@ -1844,14 +1826,8 @@ def download_jfrog_folder(
                     **artifact_download_kwargs,
                 )
 
-                # Move to correct location if needed
-                if downloaded_file != local_file and downloaded_file.exists():
-                    if local_file.exists():
-                        local_file.unlink()
-                    downloaded_file.rename(local_file)
-                    downloaded_file = local_file
-                if downloaded_file.exists():
-                    actual_downloaded_size += downloaded_file.stat().st_size
+                if local_file.exists():
+                    actual_downloaded_size += local_file.stat().st_size
                 _require_size_within_limit(
                     size=actual_downloaded_size,
                     limit=total_limit,
@@ -1859,7 +1835,6 @@ def download_jfrog_folder(
                     description="folder selected-file total",
                 )
                 completed_downloads += 1
-                downloaded_files.append(downloaded_file)
 
             except BaseException as e:
                 display_error = str(e)
@@ -1868,16 +1843,14 @@ def download_jfrog_folder(
                 if show_progress:
                     click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
                 current_file_candidates = [
-                    path
-                    for path in (local_file, downloaded_file)
-                    if path is not None and path not in backup_paths and path not in protected_existing_paths
+                    path for path in (local_file,) if path not in backup_paths and path not in protected_existing_paths
                 ]
                 _cleanup_failed_folder_download(
                     download_dir,
                     owns_download_dir=owns_download_dir,
                     downloaded_files=[
                         path
-                        for path in downloaded_files
+                        for path in local_files[:completed_downloads]
                         if path not in backup_paths and path not in protected_existing_paths
                     ],
                     current_file_candidates=current_file_candidates,

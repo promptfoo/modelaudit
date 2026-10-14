@@ -2225,43 +2225,6 @@ def _detect_huggingface_media_route(
     return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
 
 
-def _looks_like_safetensors_prefix(
-    repo_id: str,
-    filename: str,
-    revision: str,
-    budget: _HuggingFaceProbeBudget,
-    prefix: bytes,
-) -> bool:
-    """Recognize bounded SafeTensors framing without requiring a local path."""
-    if len(prefix) <= 8:
-        return False
-
-    header_len = struct.unpack("<Q", prefix[:8])[0]
-    header_prefix = prefix[8:]
-    if header_len <= 0 or not header_prefix.startswith(b"{"):
-        return False
-
-    file_size = budget.file_sizes.get(filename)
-    if file_size is not None and header_len > file_size - 8:
-        return False
-
-    from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
-
-    if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
-        return (file_size is None and len(prefix) >= _HF_CONTENT_SNIFF_BYTES) or header_len <= (
-            file_size if file_size is not None else len(prefix)
-        ) - 8
-
-    header_probe = _read_huggingface_prefix(repo_id, filename, revision, budget, 8 + header_len)
-    if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
-        return False
-    try:
-        parsed_header = json.loads(header_probe[8:].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return isinstance(parsed_header, dict)
-
-
 def _detect_huggingface_mxnet_symbol_route(
     repo_id: str,
     filename: str,
@@ -2911,7 +2874,14 @@ def _detect_huggingface_content_route_format(
     if is_zlib_header(prefix[:2]) and prefix[1] & 0x20:
         return "zlib"
 
-    if _looks_like_safetensors_prefix(repo_id, filename, revision, budget, prefix):
+    from ._routing import _is_remote_safetensors_candidate
+
+    if prefix[8:9] == b"{" and _is_remote_safetensors_candidate(
+        prefix,
+        budget.file_sizes.get(filename),
+        lambda max_bytes: _read_huggingface_prefix(repo_id, filename, revision, budget, max_bytes),
+        unknown_oversized_minimum=_HF_CONTENT_SNIFF_BYTES,
+    ):
         if remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
             flax_route = _detect_huggingface_flax_msgpack_route(
                 repo_id,
