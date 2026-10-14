@@ -494,6 +494,8 @@ def _command_executes_script(words: list[str]) -> bool:
         return False
     if (
         "$" in words[0]
+        or "/" in words[0]
+        or "\\" in words[0]
         or (wrapped and command.startswith("-"))
         or command.endswith(
             (

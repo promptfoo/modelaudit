@@ -2265,6 +2265,49 @@ def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionabl
     _assert_model_card_endpoint_evidence(tmp_path, ('endpoint = "[download](https://evil.example/payload.sh)"\n'))
 
 
+@pytest.mark.parametrize("assigned", [False, True])
+def test_text_scanner_reuses_quote_analysis_across_many_links(tmp_path: Path, assigned: bool) -> None:
+    links = " ".join("x" * 128 + f"[guide](https://docs.example.com/reference/{index})" for index in range(64))
+    content = f'endpoint = "{links}"\n' if assigned else links + "\n"
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert len(checks) == 64
+    assert all((check.severity != IssueSeverity.INFO) == assigned for check in checks)
+    assert TextScanner._documentation_quoted_assignment_index.cache_info().misses <= 2
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "source,marker,expected",
+    [
+        (b'a="escaped\\"[link]', b"[link]", True),
+        (b'a="closed" [link]', b"[link]", False),
+        (b"a='doubled''[link]", b"[link]", True),
+        (b"a='closed' [link]", b"[link]", False),
+        (b"a=';b=''[link]", b"[link]", True),
+        (b'a="line\\\n[link]', b"[link]", True),
+        (b'a="line\n[link]', b"[link]", False),
+        (b"a=`escaped\\`[link]", b"[link]", True),
+        (b"a=`closed` [link]", b"[link]", False),
+    ],
+)
+def test_documentation_quote_index_preserves_escape_and_doubled_quote_states(
+    source: bytes, marker: bytes, expected: bool
+) -> None:
+    end = source.index(marker)
+    assert TextScanner._documentation_has_open_quoted_assignment(source, 0, end) is expected
+
+
+@pytest.mark.parametrize("padding", [0, 256 * 1024 - 8, 256 * 1024 + 8])
+def test_documentation_quote_index_respects_context_and_window_boundaries(padding: int) -> None:
+    source = b"x" * padding + b'\nclosed="value"\nendpoint="[link]\nplain [next]'
+    start = source.index(b"endpoint=")
+    assert TextScanner._documentation_has_open_quoted_assignment(source, start, source.index(b"[link]"))
+    next_start = source.index(b"plain")
+    assert not TextScanner._documentation_has_open_quoted_assignment(source, next_start, source.index(b"[next]"))
+
+
 def test_text_scanner_model_card_markdown_link_return_remains_actionable(tmp_path: Path) -> None:
     _assert_model_card_endpoint_evidence(
         tmp_path, ('def endpoint():\n    return "[download](https://evil.example/payload.sh)"\n')
@@ -3723,11 +3766,14 @@ def test_text_scanner_generic_misuse_capability_across_paragraphs_is_information
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_text_scanner_wrapped_misuse_guidance_is_informational(tmp_path: Path, newline: str) -> None:
-    result = _scan_text_content(
-        tmp_path / "README.md",
-        f"Malware production may be possible,{newline}and developers should ensure that their applications "
-        f"do not violate applicable laws and regulations.{newline}{newline}## Usage{newline}",
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(
+        (
+            f"Malware production may be possible,{newline}and developers should ensure that their applications "
+            f"do not violate applicable laws and regulations.{newline}{newline}## Usage{newline}"
+        ).encode()
     )
+    result = TextScanner().scan(str(text_path))
     checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
     assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
 
@@ -5510,6 +5556,16 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
     "execution",
     [
         "```bash\npython repo/install.py\n```\n",
+        "```bash\n./repo/install\n```\n",
+        "```bash\nrepo/bin/tool\n```\n",
+        "```bash\n./repo/install --version\n```\n",
+        "```bash\nenv ./repo/install\n```\n",
+        "```bash\ntime repo/bin/tool\n```\n",
+        "```bash\n'./repo/install'\n```\n",
+        "```bash\n'.\\repo\\install'\n```\n",
+        "Run `./repo/install` next.\n",
+        "Run repo/bin/tool next.\n",
+        "<pre><code>./repo/install</code></pre>\n",
         '```bash\necho "$(python repo/install.py)"\n```\n',
         '```bash\necho "\\\\$(python repo/install.py)"\n```\n',
         "```bash\npy\\\nthon repo/install.py\n```\n",
@@ -5708,6 +5764,11 @@ def test_documented_clone_fence_on_list_marker(tmp_path: Path, complete: bool) -
         "```bash\necho 'python${IFS}-m${IFS}repo.install'\n```\n",
         '```bash\necho "${HOME}"\n```\n',
         '```bash\necho "./repo/install.exe"\n```\n',
+        '```bash\necho "./repo/install"\n```\n',
+        "```bash\nls repo/bin\n```\n",
+        "```bash\ncat repo/install\n```\n",
+        "```bash\ncommand -v ./repo/bin/tool\n```\n",
+        "The file `repo/bin/tool` contains the installer.\n",
         '```python\nprint("ctypes.CDLL(./repo/plugin.so)")\n```\n',
         "```python\nimport ctypes\nvalue = ctypes.c_int(1)\n```\n",
         "```console\nPython.exe --version\n```\n",

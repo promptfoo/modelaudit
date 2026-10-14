@@ -1188,12 +1188,18 @@ class TextScanner(BaseScanner):
         return cls._documentation_passive_markdown_link_match(prefix) is not None
 
     @classmethod
-    def _documentation_markdown_link_is_in_code_context(cls, prefix: bytes, link_start: int) -> bool:
+    def _documentation_markdown_link_is_in_code_context(
+        cls, prefix: bytes, link_start: int, *, quoted_assignment: bool | None = None
+    ) -> bool:
         code_prefix = prefix[:link_start]
         line_prefix = code_prefix.rsplit(b"\n", 1)[-1]
         return (
             cls._documentation_assignment_is_actionable(code_prefix)
-            or cls._documentation_has_open_quoted_assignment(code_prefix)
+            or (
+                cls._documentation_has_open_quoted_assignment(code_prefix)
+                if quoted_assignment is None
+                else quoted_assignment
+            )
             or (not line_prefix.lstrip().startswith(b"|") and cls._documentation_prefix_has_enclosing_call(line_prefix))
             or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
@@ -1283,6 +1289,9 @@ class TextScanner(BaseScanner):
         return cls._documentation_markdown_link_is_in_code_context(
             context_prefix,
             len(context_prefix),
+            quoted_assignment=cls._documentation_has_open_quoted_assignment(
+                payload, link_start - len(context_prefix), link_start
+            ),
         ) or cls._documentation_markdown_link_has_open_xml_config_context(
             payload,
             link_start,
@@ -1312,6 +1321,9 @@ class TextScanner(BaseScanner):
                 and not cls._documentation_markdown_link_is_in_code_context(
                     context_prefix,
                     len(context_prefix),
+                    quoted_assignment=cls._documentation_has_open_quoted_assignment(
+                        payload, link_start - len(context_prefix), link_start
+                    ),
                 )
             )
         )
@@ -1383,31 +1395,60 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _documentation_has_open_quoted_assignment(source: bytes) -> bool:
-        starts_by_quote: dict[int, set[int]] = {}
-        for match in DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(source):
-            starts_by_quote.setdefault(match.group("quote")[0], set()).add(match.end())
-
-        # Reuse each suffix result instead of rescanning it for every assignment.
-        for quote, starts in starts_by_quote.items():
-            next_open = after_next_open = True
-            if len(source) in starts:
-                return True
-            for cursor in range(len(source) - 1, min(starts) - 1, -1):
-                value = source[cursor]
-                if value == ord("\\") and quote != ord("'"):
-                    is_open = after_next_open
-                elif value in {ord("\r"), ord("\n")}:
-                    is_open = False
-                elif value == quote:
-                    doubled = quote == ord("'") and source[cursor + 1 : cursor + 2] == b"'"
-                    is_open = doubled and after_next_open
+    @lru_cache(maxsize=4)
+    def _documentation_quoted_assignment_index(context: bytes) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        matches = iter(DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(context))
+        following = next(matches, None)
+        if following is None:
+            return (0,), (-1,)
+        # Keep the most recent still-open assignment for each quote/escape state.
+        # A pending single quote can reopen only when the next quote doubles it.
+        states = dict.fromkeys(b"\"'`", (-1, -1))
+        positions = [0]
+        starts = [-1]
+        for position, value in enumerate(context, 1):
+            for quote, (opened, pending) in states.items():
+                if quote == ord("'"):
+                    states[quote] = (
+                        pending if value == quote else (-1 if value in b"\r\n" else opened),
+                        opened if value == quote else -1,
+                    )
                 else:
-                    is_open = next_open
-                if cursor in starts and is_open:
-                    return True
-                after_next_open, next_open = next_open, is_open
-        return False
+                    states[quote] = (
+                        max(pending, opened if value not in (quote, ord("\\"), ord("\r"), ord("\n")) else -1),
+                        opened if value == ord("\\") else -1,
+                    )
+            if following is not None and following.end() == position:
+                quote = following.group("quote")[0]
+                opened, pending = states[quote]
+                assignment_start = following.start()
+                if context[assignment_start] in b"\r\n{[(,;":
+                    assignment_start += 1
+                states[quote] = max(opened, assignment_start), pending
+                following = next(matches, None)
+            latest = max(
+                max(opened, pending) if quote != ord("'") else opened for quote, (opened, pending) in states.items()
+            )
+            if latest != starts[-1]:
+                positions.append(position)
+                starts.append(latest)
+        return tuple(positions), tuple(starts)
+
+    @classmethod
+    def _documentation_has_open_quoted_assignment(cls, source: bytes, start: int = 0, end: int | None = None) -> bool:
+        if end is None:
+            end = len(source)
+        # Stable overlapping windows let findings share the index while retaining
+        # the existing 256 KiB lookback, including across a window boundary.
+        window = MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES
+        origin = start // window * window
+        context = source[origin : origin + 2 * window]
+        positions, starts = cls._documentation_quoted_assignment_index(context)
+        index = bisect_right(positions, end - origin) - 1
+        if starts[index] >= start - origin:
+            return True
+        # A partial line beyond the lookback cannot establish a passive context.
+        return start > origin and source[start - 1 : start] not in {b"\r", b"\n"}
 
     @staticmethod
     def _documentation_quoted_value_is_open(source: bytes, quote: int, value_start: int) -> bool:
