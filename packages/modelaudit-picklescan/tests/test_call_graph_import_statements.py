@@ -2811,13 +2811,19 @@ def test_module_getattr_parameter_annotation_preserves_export_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, annotation: str
 ) -> None:
     result = "_Danger" if dangerous else "_Safe"
-    report = _scan_module_getattr_class_source(
-        tmp_path,
-        monkeypatch,
+    source = (
         f"def __getattr__(name):\n    name: {annotation}\n"
-        f"    if name == 'Gadget':\n        return {result}\n    return _Danger",
+        f"    if name == 'Gadget':\n        return {result}\n    return _Danger"
     )
+    if sys.version_info >= (3, 14) and annotation == "(name := str)":
+        # CPython 3.14 rejects named expressions in annotations.
+        message = "named expression cannot be used within an annotation"
+        with pytest.raises(SyntaxError, match=message):
+            compile(source, str(tmp_path / "fixture.py"), "exec")
+        _scan_module_getattr_class_source(tmp_path, monkeypatch, source, expected_gap=message)
+        return
 
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, source)
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
 
 
