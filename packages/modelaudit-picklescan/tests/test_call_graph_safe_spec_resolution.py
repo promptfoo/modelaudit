@@ -1639,6 +1639,29 @@ def test_zipimporter_cache_restoration_does_not_heal_poison(
     assert directory_cache[entry] is poison
 
 
+def test_zipimporter_rejects_poisoned_finder_before_reading_other_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder_archive = tmp_path / "finder.zip"
+    requested_archive = tmp_path / "requested.zip"
+    _write_zipimporter_archive(finder_archive, "trusted_module", include_module=True)
+    _write_zipimporter_archive(requested_archive, "trusted_module", include_module=True)
+    finder_entry = str(finder_archive)
+    requested_entry = str(requested_archive)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, requested_entry, raising=False)
+    finder = zipimporter(finder_entry)
+    assert call_graph._zipimporter_resolution_identity(finder, finder_entry) is not None
+    monkeypatch.setitem(directory_cache, finder_entry, None)
+
+    assert requested_entry not in directory_cache
+    assert call_graph._zipimporter_resolution_identity(finder, requested_entry) is None
+    assert requested_entry not in directory_cache
+    assert directory_cache[finder_entry] is None
+
+
 def test_zipimporter_missing_cache_does_not_heal_legacy_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

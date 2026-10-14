@@ -4699,6 +4699,8 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
         expected_state = {"archive": archive, "prefix": prefix}
     else:
         files = dict.__getitem__(directory_cache, archive)
+        if not _zipimport_files_are_safe(files):
+            return None
         try:
             expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
         except (AttributeError, ImportError, OSError, TypeError):
