@@ -9926,7 +9926,7 @@ def test_template_partial_keyword_state_preserves_import_finding(
     tmp_path: Path, method_name: str, import_opcode: str
 ) -> None:
     method = (
-        _global_operand("string", method_name)
+        b"cstring\n" + method_name.encode("ascii") + b"\n"
         if import_opcode == "GLOBAL"
         else _unicode_operand("string") + _unicode_operand(method_name) + b"\x93"
     )
@@ -9979,9 +9979,9 @@ try:
     assert marker.read_text() == "keyword-import-called"
     assert report.verdict == SafetyVerdict.MALICIOUS, report
     assert any(
-        finding.code == "DANGEROUS_CALL_GRAPH"
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
         and finding.severity == Severity.CRITICAL
-        and finding.details.get("call_path") == [f"string.{method_name}", "builtins.__import__"]
+        and finding.details.get("call_path") == (f"string.{method_name}", "builtins.__import__")
         for finding in report.findings
     ), report
 finally:
