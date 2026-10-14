@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep local-function graph captures reachable during ONNX weight analysis, and prevent invalid transform bindings from establishing weight-coverage exclusions.
 - Bound and reuse ONNX repeated Constant attribute copies and opset environments, and resolve caller-bound weight-transform attributes while preserving findings and incomplete-coverage outcomes.
 - Reuse ONNX local-function default maps and bound copying them into call environments.
 - Avoid false ONNX weight-coverage gaps for empty Scan-8 batches while retaining downstream coverage for returned states and output dimensions.

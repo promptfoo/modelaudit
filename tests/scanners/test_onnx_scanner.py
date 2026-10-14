@@ -37832,3 +37832,302 @@ class TestOnnxOpsetEnvironmentWork:
                 == 1
             )
         TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxFullPrCoverageReview:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _assert_contract = staticmethod(TestOnnxDeferredNumericCoverage._assert_contract)
+
+    @pytest.mark.parametrize(
+        ("mode", "iterations", "count"),
+        [
+            ("direct", 2, 33),
+            ("alias", 2, 33),
+            ("alias", 1, 33),
+            ("alias", 2, 32),
+            ("override", 2, 33),
+            ("unused", 2, 33),
+        ],
+    )
+    def test_returned_default_graph_capture_keeps_its_producer_live(
+        self, tmp_path: Path, mode: str, iterations: int, count: int
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        arrays: dict[str, Any] = {f"W{index}": np.full((2, 2), index + 1, np.float32) for index in range(count)}
+        arrays.update({"M": np.int64(iterations), "C": np.bool_(True)})
+        captured_name = "state" if mode == "direct" else "captured"
+        active = helper.make_graph(
+            [helper.make_node("Identity", [captured_name], ["selected"])],
+            "return_capture",
+            [],
+            [value("selected", [2, 2])],
+            value_info=[value(captured_name, [2, 2])],
+        )
+        inactive = helper.make_graph(
+            [helper.make_node("Constant", [], ["selected"], value=tensor("", np.zeros((2, 2), np.float32)))],
+            "return_constant",
+            [],
+            [value("selected", [2, 2])],
+        )
+        choose = helper.make_node("If", ["flag"], ["selected"])
+        for name in ("then_branch", "else_branch"):
+            choose.attribute.append(
+                onnx.AttributeProto(name=name, ref_attr_name="branch", type=onnx.AttributeProto.GRAPH)
+            )
+        function = helper.make_function(
+            "local",
+            "ReturnCaptured",
+            [],
+            ["selected"],
+            [helper.make_node("Constant", [], ["flag"], value=tensor("", np.bool_(True))), choose],
+            [helper.make_opsetid("", 18)],
+            attribute_protos=[helper.make_attribute("branch", active)],
+        )
+        call = helper.make_node("ReturnCaptured", [], ["body_weight"], domain="local")
+        if mode == "override":
+            call.attribute.append(helper.make_attribute("branch", inactive))
+        nodes = [] if mode == "direct" else [helper.make_node("Identity", ["state"], ["captured"])]
+        nodes.append(call)
+        if mode != "unused":
+            nodes.append(helper.make_node("MatMul", ["X", "body_weight"], ["body_y"]))
+        nodes.append(helper.make_node("Sum", [f"W{index}" for index in range(count)], ["next"]))
+        body = helper.make_graph(
+            nodes,
+            "returned_capture_body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [2, 2])],
+            [value("c", [], TensorProto.BOOL), value("next", [2, 2])],
+        )
+        model = self._model(
+            [helper.make_node("Loop", ["M", "C", "initial"], ["final"], body=body)],
+            [value("initial", [2, 2]), value("X", [1, 2])],
+            [value("final", [2, 2])],
+            [tensor(name, array) for name, array in arrays.items()],
+            [function],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        oracle = deepcopy(model)
+        oracle_body = next(attribute.g for attribute in oracle.graph.node[0].attribute if attribute.name == "body")
+        oracle_call = next(node for node in oracle_body.node if node.op_type == "ReturnCaptured")
+        if not oracle_call.attribute:
+            oracle_call.attribute.extend(oracle.functions[0].attribute_proto)
+        inlined = inline_local_functions(oracle)
+        onnx.checker.check_model(inlined, full_check=True)
+        runtime_body = next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        runtime_body.output.append(value("body_weight", [2, 2]))
+        if mode != "unused":
+            runtime_body.output.append(value("body_y", [1, 2]))
+        state = np.zeros((2, 2), np.float32)
+        replacement = sum(arrays[f"W{index}"] for index in range(count))
+        activation = np.ones((1, 2), np.float32)
+        for iteration in range(iterations):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None,
+                {**arrays, "state": state, "i": np.int64(iteration), "c": np.bool_(True), "X": activation},
+            )
+            expected_weight = np.zeros((2, 2), np.float32) if mode == "override" else state
+            np.testing.assert_array_equal(actual[2], expected_weight)
+            if mode != "unused":
+                np.testing.assert_array_equal(actual[3], activation @ expected_weight)
+            np.testing.assert_array_equal(actual[1], replacement)
+            state = actual[1]
+        self._assert_contract(model, tmp_path, mode not in {"override", "unused"} and count > 32 and iterations > 1)
+
+    @pytest.mark.parametrize("binding_source", ["default", "override"])
+    @pytest.mark.parametrize(
+        ("operation", "binding_kind"),
+        [
+            ("Squeeze", "valid"),
+            ("Squeeze", "float"),
+            ("Squeeze", "floats"),
+            ("Reshape", "valid"),
+            ("Reshape", "float"),
+            ("Reshape", "floats"),
+            ("Cast", "valid"),
+            ("Cast", "float"),
+            ("Cast", "floats"),
+            ("Cast", "missing_i"),
+            ("Cast", "undefined"),
+            ("Cast", "unknown"),
+            ("Cast", "int64"),
+        ],
+    )
+    def test_rejected_binding_cannot_publish_weight_exclusions(
+        self, tmp_path: Path, operation: str, binding_source: str, binding_kind: str
+    ) -> None:
+        is_squeeze = operation == "Squeeze"
+        is_cast = operation == "Cast"
+        opset = 11 if is_squeeze else 18
+        attribute_name = "axes" if is_squeeze else "to" if is_cast else "allowzero"
+        attribute_type = onnx.AttributeProto.INTS if is_squeeze else onnx.AttributeProto.INT
+        output_type = TensorProto.INT64 if binding_kind == "int64" else TensorProto.FLOAT
+        parameter_value = [0] if is_squeeze else int(output_type) if is_cast else 0
+        parameter = helper.make_attribute("parameter", parameter_value)
+        transform_inputs = ["W", "shape"] if operation == "Reshape" else ["W"]
+        transform = helper.make_node(operation, transform_inputs, ["view"])
+        transform.attribute.append(
+            onnx.AttributeProto(name=attribute_name, ref_attr_name="parameter", type=attribute_type)
+        )
+        function = helper.make_function(
+            "local",
+            "TransformToVector",
+            transform_inputs,
+            ["view"],
+            [transform],
+            [helper.make_opsetid("", opset)],
+            attributes=["parameter"] if binding_source == "override" else [],
+            attribute_protos=[parameter] if binding_source == "default" else [],
+        )
+        call = helper.make_node("TransformToVector", transform_inputs, ["view"], domain="local")
+        if binding_source == "override":
+            call.attribute.append(parameter)
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        initializers = [
+            onnx.numpy_helper.from_array(np.arange(64, dtype=np.float32).reshape(1, 64), name="W"),
+            onnx.numpy_helper.from_array(prior_weights, name="prior"),
+        ]
+        if operation == "Reshape":
+            initializers.append(onnx.numpy_helper.from_array(np.array([64], np.int64), name="shape"))
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                call,
+                helper.make_node("MatMul", ["X", "view"], ["Y"]),
+            ],
+            "invalid_binding_rank_exclusion",
+            [
+                helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 64]),
+                helper.make_tensor_value_info("X", output_type, [1, 1] if is_cast else [1, 64]),
+            ],
+            [
+                helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64]),
+                helper.make_tensor_value_info("Y", output_type, [1, 64] if is_cast else [1]),
+            ],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", opset), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        if binding_kind not in {"valid", "int64"}:
+            malformed = onnx.AttributeProto(name="parameter")
+            if binding_kind == "float":
+                malformed.type = onnx.AttributeProto.FLOAT
+                malformed.f = 0.0
+            elif binding_kind == "floats":
+                malformed.type = onnx.AttributeProto.FLOATS
+                malformed.floats.append(0.0)
+            else:
+                malformed.type = onnx.AttributeProto.INT
+                if binding_kind != "missing_i":
+                    malformed.i = 0 if binding_kind == "undefined" else 999
+            bound_attribute = (
+                model.functions[0].attribute_proto[0]
+                if binding_source == "default"
+                else model.graph.node[1].attribute[0]
+            )
+            bound_attribute.CopyFrom(malformed)
+        # The standalone route intentionally reaches the planner without schema checking.
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        incomplete = binding_kind not in {"valid", "int64"}
+        assert bool(plan.coverage_gaps.get("unresolved_initializer_lineage", 0)) is incomplete
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "bound-vector-rank.onnx")
+        result = WeightDistributionScanner().scan(str(path))
+        assert result.success is not incomplete
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert (
+            bool(
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"].get(
+                    "unresolved_initializer_lineage", 0
+                )
+            )
+            is incomplete
+        )
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "bad_count_type",
+            "bad_count_missing",
+            "bad_pads_type",
+            "bad_auto_pad_type",
+            "bad_auto_pad_missing",
+            "padded_include",
+            "absent_count",
+            "no_pad",
+            "absent_padding",
+            "valid_auto_pad",
+        ],
+    )
+    def test_pooling_exemption_requires_typed_present_attributes(self, tmp_path: Path, mode: str) -> None:
+        value, tensor = self._value, self._tensor
+        no_padding = mode in {"no_pad", "absent_padding", "valid_auto_pad"}
+        extent = 1 if no_padding else 3
+        attrs: dict[str, Any] = {"kernel_shape": [3, 3], "strides": [1, 1]}
+        if mode != "absent_count":
+            attrs["count_include_pad"] = 1
+        if "auto_pad" in mode:
+            attrs["auto_pad"] = "VALID" if no_padding else "SAME_UPPER"
+        elif mode != "absent_padding":
+            attrs["pads"] = [0 if no_padding else 1] * 4
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        nodes = [
+            helper.make_node("MatMul", ["A", "prior"], ["known"]),
+            helper.make_node("Shape", ["source"], ["dimensions"]),
+            helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
+            helper.make_node("AveragePool", ["expanded"], ["pooled"], **attrs),
+            helper.make_node("MatMul", ["left", "pooled"], ["Y"]),
+        ]
+        model = self._model(
+            nodes,
+            [value("A", [1, 64]), value("runtime", []), value("left", [1, extent])],
+            [value("known", [1, 64]), value("Y", [1, 1, 1, extent])],
+            [
+                tensor("prior", prior_weights),
+                tensor("source", np.zeros((1, 1, 3, 3), np.float32)),
+            ],
+            [],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        if mode.startswith("bad_"):
+            if mode.startswith("bad_count"):
+                malformed = onnx.AttributeProto(
+                    name="count_include_pad",
+                    type=onnx.AttributeProto.FLOAT if mode.endswith("type") else onnx.AttributeProto.INT,
+                )
+                if mode.endswith("type"):
+                    malformed.f = 1.0
+            elif mode == "bad_pads_type":
+                malformed = onnx.AttributeProto(name="pads", type=onnx.AttributeProto.FLOATS, floats=[1.0] * 4)
+            else:
+                malformed = onnx.AttributeProto(
+                    name="auto_pad",
+                    type=onnx.AttributeProto.INT if mode.endswith("type") else onnx.AttributeProto.STRING,
+                )
+                if mode.endswith("type"):
+                    malformed.i = 1
+            pool = next(node for node in model.graph.node if node.op_type == "AveragePool")
+            next(attribute for attribute in pool.attribute if attribute.name == malformed.name).CopyFrom(malformed)
+        incomplete = mode.startswith("bad_") or mode == "padded_include"
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        assert bool(plan.coverage_gaps) is incomplete
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "pooling-proof-attributes.onnx")
+        result = WeightDistributionScanner().scan(str(path))
+        assert result.success is not incomplete
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1

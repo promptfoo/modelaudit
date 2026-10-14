@@ -2096,18 +2096,33 @@ def _build_onnx_weight_analysis_plan(
             and len(lineage.shape) < 2
         )
 
+    def valid_cast_data_type(data_type: int) -> bool:
+        if data_type <= 0:
+            return False
+        try:
+            onnx.TensorProto.DataType.Name(data_type)
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def cast_output_data_type(
         node: Any,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> int | None:
-        target_data_type = -1
-        for attribute in getattr(node, "attribute", []):
-            if attribute.name == "to":
-                resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
-                if resolved_attribute is not None:
-                    target_data_type = int(getattr(resolved_attribute, "i", -1))
-                break
-        return target_data_type if target_data_type >= 0 else None
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name != "to":
+                continue
+            resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            if (
+                resolved_attribute is None
+                or bool(getattr(resolved_attribute, "ref_attr_name", ""))
+                or int(getattr(resolved_attribute, "type", 0)) != int(onnx.AttributeProto.INT)
+                or not _onnx_has_singular_field(resolved_attribute, "i")
+            ):
+                return None
+            target_data_type = int(resolved_attribute.i)
+            return target_data_type if valid_cast_data_type(target_data_type) else None
+        return None
 
     def cast_output_may_be_floating(
         node: Any,
@@ -5070,6 +5085,19 @@ def _build_onnx_weight_analysis_plan(
                         live_names.update(external_names)
                         live_node_ids.update(graph_nodes_producing_names(subgraph, external_names))
                 continue
+            if body_function is not None:
+                live_function_attributes = bound_function_attributes(
+                    body_function, body_node, resolve_reentry_attribute
+                )
+                live_function_captures = graph_external_reference_names(body_function, live_function_attributes)
+                if dependency_names_exceeded_limit(live_function_captures):
+                    return finish(True)
+                if len(live_function_captures) > graph_taint_work_remaining:
+                    graph_taint_work_remaining = 0
+                    return finish(True)
+                graph_taint_work_remaining -= len(live_function_captures)
+                live_names.update(live_function_captures)
+                live_node_ids.update(graph_nodes_producing_names(subgraph, live_function_captures))
             live_body_inputs = node_input_names(body_node)
             live_names.update(live_body_inputs)
             live_node_ids.update(graph_nodes_producing_names(subgraph, live_body_inputs))
@@ -5956,6 +5984,7 @@ def _build_onnx_weight_analysis_plan(
         eligible_initializer_indexes.add(lineage.initializer_index)
 
     weight_transform_attribute_types = {
+        "Cast": {"to": int(onnx.AttributeProto.INT)},
         "Flatten": {"axis": int(onnx.AttributeProto.INT)},
         "Transpose": {"perm": int(onnx.AttributeProto.INTS)},
         "Squeeze": {
@@ -5966,6 +5995,60 @@ def _build_onnx_weight_analysis_plan(
         "Reshape": {"allowzero": int(onnx.AttributeProto.INT)},
         "GatherND": {"batch_dims": int(onnx.AttributeProto.INT)},
     }
+
+    def resolved_weight_transform_attribute(
+        node: Any,
+        attribute: Any,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> Any | None:
+        resolved = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+        expected_type = weight_transform_attribute_types.get(node.op_type, {}).get(str(attribute.name))
+        if (
+            resolved is None
+            or expected_type is None
+            or bool(getattr(resolved, "ref_attr_name", ""))
+            or int(getattr(resolved, "type", 0)) != expected_type
+            or (expected_type == int(onnx.AttributeProto.INT) and not _onnx_has_singular_field(resolved, "i"))
+        ):
+            return None
+        return resolved
+
+    def weight_transform_attribute_error(
+        node: Any,
+        *,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+        cast_target_data_type: int | None = None,
+    ) -> str | None:
+        attribute_types = weight_transform_attribute_types.get(node.op_type, {})
+        for attribute in getattr(node, "attribute", ()):
+            reference_name = getattr(attribute, "ref_attr_name", "")
+            if (
+                reference_name
+                and node.op_type == "Cast"
+                and resolve_attribute is None
+                and cast_target_data_type is not None
+            ):
+                continue
+            if reference_name and (
+                resolve_attribute is None
+                or attribute.name not in attribute_types
+                or resolved_weight_transform_attribute(node, attribute, resolve_attribute) is None
+            ):
+                return "referenced_function_attribute"
+            if (
+                attribute.name in attribute_types
+                and resolved_weight_transform_attribute(node, attribute, resolve_attribute) is None
+            ):
+                return "invalid_transform_attribute"
+        if node.op_type == "Cast":
+            target_data_type = (
+                cast_output_data_type(node, resolve_attribute)
+                if resolve_attribute is not None or cast_target_data_type is None
+                else cast_target_data_type
+            )
+            if target_data_type is None or not valid_cast_data_type(target_data_type):
+                return "invalid_cast_target"
+        return None
 
     def transformed_lineage(
         lineage: _OnnxWeightLineage,
@@ -5985,20 +6068,8 @@ def _build_onnx_weight_analysis_plan(
                 unresolved_reason=lineage.unresolved_reason or reason,
             )
 
-        attribute_types = weight_transform_attribute_types.get(node.op_type, {})
-
         def resolved_transform_attribute(attribute: Any) -> Any | None:
-            resolved = resolve_attribute(attribute) if resolve_attribute is not None else attribute
-            expected_type = attribute_types.get(str(attribute.name))
-            if (
-                resolved is None
-                or expected_type is None
-                or bool(getattr(resolved, "ref_attr_name", ""))
-                or int(getattr(resolved, "type", 0)) != expected_type
-                or (expected_type == int(onnx.AttributeProto.INT) and not _onnx_has_singular_field(resolved, "i"))
-            ):
-                return None
-            return resolved
+            return resolved_weight_transform_attribute(node, attribute, resolve_attribute)
 
         def transform_int_attribute(name: str, default: int = 0) -> int | None:
             for attribute in getattr(node, "attribute", ()):
@@ -6007,30 +6078,27 @@ def _build_onnx_weight_analysis_plan(
                     return int(resolved.i) if resolved is not None else None
             return default
 
-        for attribute in getattr(node, "attribute", ()):
-            reference_name = getattr(attribute, "ref_attr_name", "")
-            if reference_name and node.op_type == "Cast" and cast_target_data_type is not None:
-                continue
-            if reference_name and (
-                resolve_attribute is None
-                or attribute.name not in attribute_types
-                or resolved_transform_attribute(attribute) is None
-            ):
-                return unresolved_transform("referenced_function_attribute")
-            if attribute.name in attribute_types and resolved_transform_attribute(attribute) is None:
-                return unresolved_transform("invalid_transform_attribute")
+        attribute_error = weight_transform_attribute_error(
+            node, resolve_attribute=resolve_attribute, cast_target_data_type=cast_target_data_type
+        )
+        if attribute_error is not None:
+            return unresolved_transform(attribute_error)
         if node.op_type == "Identity":
             return lineage
         if node.op_type == "Cast":
             target_data_type = (
-                cast_target_data_type if cast_target_data_type is not None else _onnx_int_attribute(node, "to", -1)
+                cast_output_data_type(node, resolve_attribute)
+                if resolve_attribute is not None or cast_target_data_type is None
+                else cast_target_data_type
             )
+            if target_data_type is None:
+                return unresolved_transform("invalid_cast_target")
             if target_data_type == lineage.data_type:
                 return lineage
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=lineage.shape,
-                data_type=target_data_type if target_data_type >= 0 else None,
+                data_type=target_data_type,
                 transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason or "dtype_changing_cast_lineage",
             )
@@ -7371,12 +7439,29 @@ def _build_onnx_weight_analysis_plan(
                 name = str(producer.input[0])
             return False
 
+        def resolved_proof_attribute(attribute: Any, expected_type: int, field: str | None = None) -> Any | None:
+            resolved = resolve_attribute(attribute)
+            if (
+                resolved is None
+                or bool(getattr(resolved, "ref_attr_name", ""))
+                or int(getattr(resolved, "type", 0)) != expected_type
+                or (field is not None and not _onnx_has_singular_field(resolved, field))
+            ):
+                return None
+            return resolved
+
         def has_no_padding(node: Any) -> bool:
             for attribute in getattr(node, "attribute", ()):
                 if attribute.name not in {"pads", "auto_pad", "output_padding", "output_shape"}:
                     continue
-                resolved = resolve_attribute(attribute)
-                if resolved is None or attribute.name == "output_shape":
+                if attribute.name == "output_shape":
+                    return False
+                resolved = resolved_proof_attribute(
+                    attribute,
+                    int(onnx.AttributeProto.STRING if attribute.name == "auto_pad" else onnx.AttributeProto.INTS),
+                    "s" if attribute.name == "auto_pad" else None,
+                )
+                if resolved is None:
                     return False
                 if attribute.name == "auto_pad":
                     if resolved.s not in {b"", b"NOTSET", b"VALID"}:
@@ -7398,7 +7483,7 @@ def _build_onnx_weight_analysis_plan(
             for attribute in getattr(node, "attribute", ()):
                 if attribute.name not in {"is_test", "training_mode"}:
                     continue
-                resolved = resolve_attribute(attribute)
+                resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INT), "i")
                 if resolved is None:
                     return False
                 if attribute.name == "is_test":
@@ -7416,7 +7501,7 @@ def _build_onnx_weight_analysis_plan(
                 includes_padding = False
                 for attribute in getattr(node, "attribute", ()):
                     if attribute.name == "count_include_pad":
-                        resolved = resolve_attribute(attribute)
+                        resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INT), "i")
                         if resolved is None:
                             return False
                         includes_padding = bool(resolved.i)
@@ -7434,7 +7519,7 @@ def _build_onnx_weight_analysis_plan(
             for attribute in getattr(node, "attribute", ()):
                 if attribute.name not in {"kernel_shape", "strides", "dilations"}:
                     continue
-                resolved = resolve_attribute(attribute)
+                resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INTS))
                 if resolved is None or len(resolved.ints) != len(spatial_shape):
                     return False
                 values = tuple(int(value) for value in resolved.ints)
@@ -12615,8 +12700,17 @@ def _build_onnx_weight_analysis_plan(
             transform_output_shape: tuple[int, ...] | None = None
             transform_output_rank: int | None = None
             transform_output_rank_proven = True
-            clear_transform_output_rank = False
-            if supported_transform and input_names:
+            transform_attribute_error = (
+                weight_transform_attribute_error(
+                    node,
+                    resolve_attribute=resolve_attribute,
+                    cast_target_data_type=resolved_cast_target_data_type,
+                )
+                if supported_transform
+                else None
+            )
+            clear_transform_output_rank = transform_attribute_error is not None
+            if supported_transform and input_names and transform_attribute_error is None:
                 transform_input_shape = known_value_shapes.get(input_names[0])
                 transform_input_rank = known_value_ranks.get(input_names[0])
                 transform_input_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
@@ -12764,6 +12858,12 @@ def _build_onnx_weight_analysis_plan(
                     elif subgraph_output_rank_unknown[output_index]:
                         inferred_output_shape = None
                         inferred_output_rank = None
+                if transform_attribute_error is not None and output_index == 0:
+                    # Rejected bindings cannot establish a rank exclusion through
+                    # a separate generic or subgraph shape proof.
+                    inferred_output_shape = None
+                    inferred_output_rank = None
+                    inferred_output_rank_proven = False
                 subgraph_clears_output_rank = (
                     output_index < len(subgraph_output_rank_unknown) and subgraph_output_rank_unknown[output_index]
                 )
