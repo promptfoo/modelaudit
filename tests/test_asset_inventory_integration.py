@@ -244,9 +244,9 @@ class TestAssetInventoryIntegration:
         with zipfile.ZipFile(inner_zip, "w") as inner_zf:
             # Add SafeTensors file to inner ZIP
             safetensors_data = {"weight": np.array([1, 2, 3, 4]).astype(np.float32)}
-            model_path = tmp_path / "model.safetensors"
-            save_file(safetensors_data, model_path)
-            inner_zf.writestr("model.safetensors", model_path.read_bytes())
+            safetensors_file = tmp_path / "model.safetensors"
+            save_file(safetensors_data, str(safetensors_file))
+            inner_zf.writestr("model.safetensors", safetensors_file.read_bytes())
 
         outer_zip = tmp_path / "outer.zip"
         with zipfile.ZipFile(outer_zip, "w") as outer_zf, open(inner_zip, "rb") as f:
