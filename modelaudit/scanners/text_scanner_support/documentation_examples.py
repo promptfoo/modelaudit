@@ -7,6 +7,7 @@ or of code downloaded by a reader. Other findings in each example stay intact.
 import ast
 import re
 import shlex
+from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 from modelaudit.detectors.network_comm import NetworkCommDetector
@@ -423,7 +424,9 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
 
 def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
     delimiter_count = 0
+    html_regions: list[tuple[int, int]] = []
     for start, end in regions:
+        previous_end = start
         delimiters: list[re.Match[bytes]] = []
         for match in BACKTICK_PATTERN.finditer(payload, start, end):
             delimiter_count += 1
@@ -459,7 +462,83 @@ def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int
             )
             if command_context and _example_executes_script(source, b""):
                 return True
+            html_regions.append((previous_end, left.start()))
+            previous_end = right.end()
             index = close + 1
+        html_regions.append((previous_end, end))
+    return _html_examples_execute_script(payload, html_regions)
+
+
+class _HTMLCodeExamples(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: list[str] = []
+        self.parts: list[str] = []
+        self.size = 0
+        self.count = 0
+        self.executes_script = False
+        self.before = ""
+        self.command_context = False
+        self.language = b""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.executes_script:
+            return
+        if tag in {"pre", "code"}:
+            if not self.tags:
+                self.command_context = (
+                    re.search(r"\b(?:run|execute|invoke|launch|source)[ \t]*$", self.before, re.IGNORECASE) is not None
+                )
+                self.language = b""
+            self.command_context |= tag == "pre"
+            for attribute, value in attrs:
+                if attribute == "class" and value:
+                    for name in value.split():
+                        if name.startswith("language-"):
+                            self.language = name.removeprefix("language-").lower().encode()
+            self.count += 1
+            if self.count > MAX_FENCES:
+                self.executes_script = True
+                return
+            self.tags.append(tag)
+        elif self.tags and tag == "br":
+            self.handle_data("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.executes_script or tag not in {"pre", "code"}:
+            return
+        if not self.tags or self.tags.pop() != tag:
+            self.executes_script = True
+            return
+        if not self.tags:
+            source = "".join(self.parts).encode().strip()
+            if self.command_context or re.search(rb"\s|[();|&]", source):
+                self.executes_script = _example_executes_script(source, self.language)
+            self.parts.clear()
+            self.size = 0
+            self.before = ""
+
+    def handle_data(self, data: str) -> None:
+        if self.tags and not self.executes_script:
+            self.size += len(data.encode())
+            if self.size > MAX_EXAMPLE_BYTES:
+                self.executes_script = True
+            else:
+                self.parts.append(data)
+        elif not self.tags:
+            self.before = (self.before + data)[-64:]
+
+
+def _html_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
+    parser = _HTMLCodeExamples()
+    for start, end in regions:
+        try:
+            parser.feed(payload[start:end].decode("utf-8"))
+            parser.close()
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return True
+        if parser.executes_script or parser.tags:
+            return True
     return False
 
 
