@@ -38180,9 +38180,16 @@ class TestOnnxFinalReviewBindingAndSqueeze:
         assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
         assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
-        coverage_checks = TestWeightDistributionCoverage._coverage_checks(result)
+        coverage_checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Analysis" and check.details.get("analysis_incomplete") is True
+        ]
         assert bool(coverage_checks) is incomplete
         assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
+        for check in coverage_checks:
+            assert check.details["scan_outcome_reason"] == "weight_distribution_analysis_incomplete"
+            assert f"onnx_{coverage_reason}" in check.details["extraction_incomplete_reasons"]
         if incomplete:
             # The normal route also refuses to cache malformed models. Its schema
             # reason can differ from the standalone planner's coverage reason.
