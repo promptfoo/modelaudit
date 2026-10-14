@@ -2150,7 +2150,9 @@ def find_dangerous_call_graphs(
         try:
             path_for = (
                 partial(_find_sink_path, keyword_arg_names=_complete_keyword_arg_names(reference))
-                if module == "string" and name in {"Template.substitute", "Template.safe_substitute"}
+                if module == "string"
+                and name in {"Template.substitute", "Template.safe_substitute"}
+                and reference.get("invocation_import_reference")
                 else _find_sink_path
             )
             sink_path = _first_matching_path(entrypoints, path_for)

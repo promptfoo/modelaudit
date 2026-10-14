@@ -9919,6 +9919,80 @@ def test_template_unknown_or_nonempty_keywords_keep_import_edge(
     assert path == ("string.Template.substitute", "builtins.__import__")
 
 
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template keyword imports are deferred in Python 3.14")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("import_opcode", ["GLOBAL", "STACK_GLOBAL"])
+def test_template_partial_keyword_state_preserves_import_finding(
+    tmp_path: Path, method_name: str, import_opcode: str
+) -> None:
+    method = (
+        _global_operand("string", method_name)
+        if import_opcode == "GLOBAL"
+        else _unicode_operand("string") + _unicode_operand(method_name) + b"\x93"
+    )
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$value")) + b"R"
+    keywords = b"}" + _unicode_operand("value") + _unicode_operand("mapped") + b"s"
+    partial = _global_operand("functools", "partial") + _args_tuple(method) + b"R"
+    state = _args_tuple(method, _args_tuple(receiver, b"}"), keywords, b"N")
+    payload = b"\x80\x04" + partial + state + b"b)R."
+    control_receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain text")) + b"R"
+    control_payload = b"\x80\x04" + method + _args_tuple(control_receiver, b"}") + b"R."
+    marker = tmp_path / "partial_keyword_marker"
+    child_code = """
+import collections
+import functools
+import pickle
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, Severity, call_graph, scan_bytes
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+control_payload = bytes.fromhex(sys.argv[3])
+method_name = sys.argv[4]
+original_chainmap = collections.ChainMap
+
+def observed_chainmap(*maps):
+    marker.write_text("keyword-import-called")
+    return original_chainmap(*maps)
+
+collections.ChainMap = observed_chainmap
+try:
+    assert call_graph._template_has_trusted_compiled_pattern()
+    control = scan_bytes(control_payload)
+    assert control.status == ScanStatus.COMPLETE, control
+    assert control.verdict == SafetyVerdict.CLEAN, control
+    assert not marker.exists()
+    assert pickle.loads(control_payload) == "plain text"
+    assert not marker.exists()
+
+    report = scan_bytes(payload)
+    assert not marker.exists(), "scanning executed the keyword import target"
+    assert any(
+        item.get("module") == "functools" and item.get("name") == "partial.__call__"
+        for item in report.metadata["callable_invocations"]
+    ), report
+    assert pickle.loads(payload) == "mapped"
+    assert marker.read_text() == "keyword-import-called"
+    assert report.verdict == SafetyVerdict.MALICIOUS, report
+    assert any(
+        finding.code == "DANGEROUS_CALL_GRAPH"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("call_path") == [f"string.{method_name}", "builtins.__import__"]
+        for finding in report.findings
+    ), report
+finally:
+    collections.ChainMap = original_chainmap
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), control_payload.hex(), method_name]
+    )
+    assert marker.read_text() == "keyword-import-called"
+
+
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-pattern qualification starts in Python 3.14")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 @pytest.mark.parametrize("warm_after_import", [False, True])
