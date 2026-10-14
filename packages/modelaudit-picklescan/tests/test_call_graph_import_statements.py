@@ -9929,8 +9929,9 @@ def test_template_unknown_or_nonempty_keywords_keep_import_edge(
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 @pytest.mark.parametrize("import_opcode", ["GLOBAL", "STACK_GLOBAL"])
 @pytest.mark.parametrize("alias_module", ["string", "logging"])
+@pytest.mark.parametrize("direct_use", ["none", "before", "after", "memo-before", "memo-after"])
 def test_template_partial_keyword_state_preserves_import_finding(
-    tmp_path: Path, method_name: str, import_opcode: str, alias_module: str
+    tmp_path: Path, method_name: str, import_opcode: str, alias_module: str, direct_use: str
 ) -> None:
     method = (
         b"c" + alias_module.encode("ascii") + b"\n" + method_name.encode("ascii") + b"\n"
@@ -9939,10 +9940,25 @@ def test_template_partial_keyword_state_preserves_import_finding(
     )
     receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$value")) + b"R"
     keywords = b"}" + _unicode_operand("value") + _unicode_operand("mapped") + b"s"
-    partial = _global_operand("functools", "partial") + _args_tuple(method) + b"R"
-    state = _args_tuple(method, _args_tuple(receiver, b"}"), keywords, b"N")
-    payload = b"\x80\x04" + partial + state + b"b)R."
+    shared_method = direct_use.startswith("memo-")
+    direct_first = direct_use.endswith("before")
+    partial_method = b"h\x05" if shared_method and direct_first else method + (b"q\x05" if shared_method else b"")
+    state_method = b"h\x05" if shared_method else method
+    partial = _global_operand("functools", "partial") + _args_tuple(partial_method) + b"R"
+    state = _args_tuple(state_method, _args_tuple(receiver, b"}"), keywords, b"N")
+    indirect = partial + state + b"b)R"
     control_receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain text")) + b"R"
+    direct_method = (
+        method + (b"q\x05" if shared_method else b"") if direct_first else b"h\x05" if shared_method else method
+    )
+    direct = direct_method + _args_tuple(control_receiver, b"}") + b"R"
+    if direct_use == "none":
+        body = indirect
+    elif direct_first:
+        body = direct + b"0" + indirect
+    else:
+        body = indirect + b"0" + direct
+    payload = b"\x80\x04" + body + b"."
     control_method = method if alias_module == "string" else _global_operand("string", method_name)
     control_payload = b"\x80\x04" + control_method + _args_tuple(control_receiver, b"}") + b"R."
     marker = tmp_path / "partial_keyword_marker"
@@ -9962,6 +9978,7 @@ marker = Path(sys.argv[1])
 payload = bytes.fromhex(sys.argv[2])
 control_payload = bytes.fromhex(sys.argv[3])
 method_name = sys.argv[4]
+direct_use = sys.argv[5]
 original_chainmap = collections.ChainMap
 
 def observed_chainmap(*maps):
@@ -9974,6 +9991,8 @@ try:
     control = scan_bytes(control_payload)
     assert control.status == ScanStatus.COMPLETE, control
     assert control.verdict == SafetyVerdict.CLEAN, control
+    assert all(item.get("template_execution_complete") is True
+               for item in control.metadata["callable_invocations"]), control
     assert not marker.exists()
     assert pickle.loads(control_payload) == "plain text"
     assert not marker.exists()
@@ -9984,8 +10003,10 @@ try:
         item.get("module") == "functools" and item.get("name") == "partial.__call__"
         for item in report.metadata["callable_invocations"]
     ), report
-    assert pickle.loads(payload) == "mapped"
+    assert pickle.loads(payload) == ("plain text" if direct_use.endswith("after") else "mapped")
     assert marker.read_text() == "keyword-import-called"
+    assert all(item.get("template_execution_complete") is False
+               for item in report.metadata["callable_invocations"]), report
     assert report.verdict == SafetyVerdict.MALICIOUS, report
     assert any(
         finding.rule_code == "DANGEROUS_CALL_GRAPH"
@@ -9997,7 +10018,8 @@ finally:
     collections.ChainMap = original_chainmap
 """
     _assert_isolated_python(
-        tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), control_payload.hex(), method_name]
+        tmp_path,
+        [sys.executable, "-c", child_code, str(marker), payload.hex(), control_payload.hex(), method_name, direct_use],
     )
     assert marker.read_text() == "keyword-import-called"
 
@@ -13768,6 +13790,7 @@ record = {
     "positional_arg_count": 2, "keyword_args_complete": True, "keyword_arg_names": [],
     "template_receiver_state_unmodified": True,
     "template_mapping_callbacks_complete": True,
+    "template_execution_complete": True,
 }
 unproven = dict(record)
 if proof is None:
@@ -13991,3 +14014,133 @@ else:
 assert not marker.exists()
 """
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), str(retag_name)])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template use qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_template_memoized_direct_call_keeps_complete_execution_proof(tmp_path: Path, method_name: str) -> None:
+    method = _global_operand("string", method_name) + b"q\x050h\x05"
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain")) + b"R"
+    payload = b"\x80\x04" + method + _args_tuple(receiver, b"}") + b"R."
+    child_code = """
+import pickle
+import string
+import sys
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+payload = bytes.fromhex(sys.argv[1])
+report = scan_bytes(payload)
+assert report.status == ScanStatus.COMPLETE, report
+assert report.verdict == SafetyVerdict.CLEAN, report
+assert report.metadata["callable_invocations"], report
+assert all(item.get("template_execution_complete") is True
+           for item in report.metadata["callable_invocations"]), report
+assert pickle.loads(payload) == "plain"
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, payload.hex()])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template use qualification is Python 3.14-specific")
+@pytest.mark.parametrize("proof", [None, False, "true", 1])
+@pytest.mark.parametrize("unproven_first", [False, True])
+def test_template_final_execution_proof_survives_normalization(
+    tmp_path: Path, proof: object, unproven_first: bool
+) -> None:
+    child_code = """
+import ast
+import string
+import sys
+string.Template("warm").substitute({})
+from modelaudit_picklescan import call_graph
+record = {
+    "opcode": "REDUCE", "module": "string", "name": "Template.substitute",
+    "positional_arg_count": 2,
+    "template_receiver_state_unmodified": True,
+    "template_mapping_callbacks_complete": True,
+    "template_execution_complete": True,
+}
+imports = [{"opcode": "GLOBAL", "module": "string", "name": "Template.substitute"}]
+assert call_graph.find_dangerous_call_graphs(imports, [record]) == ()
+unproven = dict(record)
+proof = ast.literal_eval(sys.argv[1])
+if proof is None:
+    unproven.pop("template_execution_complete")
+else:
+    unproven["template_execution_complete"] = proof
+records = [unproven, record] if sys.argv[2] == "True" else [record, unproven]
+findings = call_graph.find_dangerous_call_graphs(imports, records)
+assert any(finding.call_path == ("string.Template.substitute", "builtins.__import__")
+           for finding in findings), findings
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, repr(proof), str(unproven_first)])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template use qualification is Python 3.14-specific")
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("nested_first", [False, True])
+def test_template_direct_call_preserves_embedded_partial_import_finding(
+    tmp_path: Path, method_name: str, nested_first: bool
+) -> None:
+    method = _global_operand("string", method_name)
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("$value")) + b"R"
+    keywords = b"}" + _unicode_operand("value") + _unicode_operand("mapped") + b"s"
+    partial = _global_operand("functools", "partial") + _args_tuple(method) + b"R"
+    state = _args_tuple(method, _args_tuple(receiver, b"}"), keywords, b"N")
+    nested = b"\x80\x04" + partial + state + b"b)R."
+    direct_receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain")) + b"R"
+    direct = method + _args_tuple(direct_receiver, b"}") + b"R"
+
+    def outer_payload(inner: bytes) -> bytes:
+        embedded = b"B" + len(inner).to_bytes(4, "little") + inner
+        # Keep the embedded bytes as the result while exercising both scan orders.
+        body = embedded + direct + b"0" if nested_first else direct + b"0" + embedded
+        return b"\x80\x04" + body + b"."
+
+    payload = outer_payload(nested)
+    control = outer_payload(b"\x80\x04N.")
+    marker = tmp_path / "nested_partial_keyword_marker"
+    child_code = """
+import collections
+import pickle
+import string
+import sys
+from pathlib import Path
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, Severity, scan_bytes
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+control = bytes.fromhex(sys.argv[3])
+method_name = sys.argv[4]
+original_chainmap = collections.ChainMap
+def observed_chainmap(*maps):
+    marker.write_text("nested-keyword-called")
+    return original_chainmap(*maps)
+collections.ChainMap = observed_chainmap
+try:
+    benign = scan_bytes(control)
+    assert benign.status == ScanStatus.COMPLETE, benign
+    assert benign.verdict == SafetyVerdict.CLEAN, benign
+    assert all(item.get("template_execution_complete") is True
+               for item in benign.metadata["callable_invocations"]), benign
+    assert pickle.loads(pickle.loads(control)) is None
+    assert not marker.exists()
+    report = scan_bytes(payload)
+    assert not marker.exists(), "scanning executed a nested callback"
+    nested = pickle.loads(payload)
+    assert isinstance(nested, bytes)
+    assert not marker.exists(), "outer unpickle should only return the nested bytes"
+    assert pickle.loads(nested) == "mapped"
+    assert marker.read_text() == "nested-keyword-called"
+    assert report.verdict == SafetyVerdict.MALICIOUS, report
+    assert all(item.get("template_execution_complete") is False
+               for item in report.metadata["callable_invocations"]), report
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH"
+               and finding.severity == Severity.CRITICAL
+               and finding.details.get("call_path") == (f"string.{method_name}", "builtins.__import__")
+               for finding in report.findings), report
+finally:
+    collections.ChainMap = original_chainmap
+"""
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), control.hex(), method_name]
+    )

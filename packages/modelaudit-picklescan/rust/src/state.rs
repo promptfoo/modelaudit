@@ -716,6 +716,7 @@ pub(crate) struct ScanState<'a> {
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
     callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     template_receiver_may_have_mutated: bool,
+    template_execution_may_be_unmodeled: bool,
     non_allowlisted_global_imports: Vec<PendingGlobalImportFinding>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
@@ -787,6 +788,7 @@ impl<'a> ScanState<'a> {
             callable_invocations: Vec::new(),
             callable_invocation_keys: HashSet::new(),
             template_receiver_may_have_mutated: false,
+            template_execution_may_be_unmodeled: false,
             non_allowlisted_global_imports: Vec::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
@@ -1411,6 +1413,7 @@ impl<'a> ScanState<'a> {
     fn handle_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
         if !TEMPLATE_PASSIVE_PREFIX_OPCODES.contains(&opcode.name) {
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled = true;
         }
         match opcode.name {
             "PROTO" => {
@@ -1797,6 +1800,7 @@ impl<'a> ScanState<'a> {
                 let invocations = self.consume_callable_opcode(opcode, position);
                 if invocations.is_empty() {
                     self.template_receiver_may_have_mutated = true;
+                    self.template_execution_may_be_unmodeled = true;
                 }
                 for invocation in &invocations {
                     self.mark_non_allowlisted_global_invoked(invocation);
@@ -7042,6 +7046,7 @@ impl<'a> ScanState<'a> {
             )
         {
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled = true;
         }
         let symbol = reference.symbol();
         let severity = global_severity(&reference.module, &reference.name);
@@ -7351,6 +7356,7 @@ impl<'a> ScanState<'a> {
     fn push_callable_invocation(&mut self, invocation: &CallableInvocation) {
         if invocation.reference.malformed {
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled = true;
             return;
         }
 
@@ -7374,9 +7380,27 @@ impl<'a> ScanState<'a> {
                 "Template.substitute" | "Template.safe_substitute"
             ))
         .then(|| self.template_mapping_callbacks_complete(invocation));
-        // Capture this call's proof first; arbitrary primary calls must invalidate
-        // aliases before synthetic callbacks, duplicate elision or metadata limits.
+        let modeled_template_call = template_receiver_state_unmodified == Some(true)
+            && invocation.op_name == "REDUCE"
+            && invocation.positional_arg_count == Some(invocation.args.len())
+            && !invocation
+                .keyword_arg_names
+                .as_ref()
+                .is_some_and(|names| !names.is_empty())
+            && match invocation.reference.name.as_str() {
+                "Template.substitute" | "Template.safe_substitute" => {
+                    template_mapping_callbacks_complete == Some(true)
+                }
+                "Template.is_valid" | "Template.get_identifiers" => invocation.args.len() == 1,
+                _ => false,
+            };
+        // Final use coverage is separate from receiver history. Later opaque work
+        // can reuse a callable through a memo or wrapper without another import.
+        // Update both proofs before callbacks, duplicate elision and metadata caps.
         if !Self::template_prefix_constructor_is_inert(invocation) {
+            if !modeled_template_call {
+                self.template_execution_may_be_unmodeled = true;
+            }
             self.template_receiver_may_have_mutated = true;
         }
         let dedupe_key = (
@@ -8052,6 +8076,9 @@ impl<'a> ScanState<'a> {
             Some(self.deadline),
         );
         nested_scan.run();
+        // Nested imports join the parent even when nested invocation rows do not.
+        // Preserve their complete execution proof before moving any child fields.
+        self.template_execution_may_be_unmodeled |= !nested_scan.template_execution_is_complete();
 
         let nested_had_findings = !nested_scan.findings.is_empty();
         let mut outcome = NestedSurfaceOutcome {
@@ -8328,8 +8355,11 @@ impl<'a> ScanState<'a> {
             );
             // Skipped padding and earlier streams may have changed process state.
             follow_on_scan.template_receiver_may_have_mutated = true;
+            follow_on_scan.template_execution_may_be_unmodeled = true;
             follow_on_scan.run();
             self.template_receiver_may_have_mutated = true;
+            self.template_execution_may_be_unmodeled |=
+                follow_on_scan.template_execution_may_be_unmodeled;
             skip_offsets_before =
                 skip_offsets_before.max(absolute_offset.saturating_add(candidate_len));
             let had_findings = !follow_on_scan.findings.is_empty();
@@ -8528,6 +8558,18 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn template_execution_is_complete(&self) -> bool {
+        !self.template_execution_may_be_unmodeled
+            && self.status.is_complete()
+            && self
+                .bytes_total
+                .map(|total| self.bytes_scanned >= total)
+                .unwrap_or(true)
+            && !self.import_references_truncated
+            && !self.callable_invocations_truncated
+            && !self.non_allowlisted_global_imports_truncated
+    }
+
     pub(crate) fn to_py_report(&self, py: Python<'_>, duration_s: f64) -> PyResult<Py<PyDict>> {
         let report = PyDict::new(py);
         report.set_item("source", &self.source)?;
@@ -8585,7 +8627,14 @@ impl<'a> ScanState<'a> {
         )?;
         let callable_invocations = PyList::empty(py);
         for invocation in &self.callable_invocations {
-            callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
+            // Serialize only the final report-wide proof, never an earlier true
+            // snapshot that a later opaque or recovered segment invalidated.
+            let mut details = invocation.clone();
+            details.push((
+                "template_execution_complete".to_string(),
+                DetailValue::Bool(self.template_execution_is_complete()),
+            ));
+            callable_invocations.append(DetailValue::Dict(details).to_py_object(py)?)?;
         }
         metadata.set_item("callable_invocations", callable_invocations)?;
         metadata.set_item(
@@ -8910,6 +8959,161 @@ mod tests {
                     && matches!(value, DetailValue::Bool(proven) if *proven == expected)
             }));
         }
+    }
+
+    #[test]
+    fn template_final_execution_proof_covers_direct_and_memoized_calls() {
+        let options = default_test_options();
+        for memo in [b"".as_slice(), b"q\x050h\x05".as_slice()] {
+            let mut payload = b"\x80\x04cstring\nTemplate.substitute\n".to_vec();
+            payload.extend_from_slice(memo);
+            payload.extend_from_slice(b"cstring\nTemplate\n\x8c\x05plain\x85R}\x86R.");
+            let scan = run_test_scan("template-direct-use.pkl", &payload, &options);
+            assert!(scan.template_execution_is_complete());
+            assert!(!scan.callable_invocations.is_empty());
+        }
+    }
+
+    #[test]
+    fn template_final_execution_proof_rejects_opaque_work_in_either_order() {
+        let options = default_test_options();
+        let direct = b"cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R";
+        for opaque in [
+            b"cbuiltins\nstr\n)R".as_slice(),
+            b"cre\nScanner\n]\x85R".as_slice(),
+            b"]Na".as_slice(),
+            b"N)R".as_slice(),
+        ] {
+            for opaque_first in [false, true] {
+                let mut payload = b"\x80\x04".to_vec();
+                let (first, second) = if opaque_first {
+                    (opaque, direct.as_slice())
+                } else {
+                    (direct.as_slice(), opaque)
+                };
+                payload.extend_from_slice(first);
+                payload.push(b'0');
+                payload.extend_from_slice(second);
+                payload.push(b'.');
+                let scan = run_test_scan("template-opaque-use.pkl", &payload, &options);
+                assert!(scan.template_execution_may_be_unmodeled);
+                assert!(!scan.template_execution_is_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn template_final_execution_proof_rejects_limits_and_later_streams() {
+        let options = default_test_options();
+        let direct =
+            b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R.";
+        let valid = run_test_scan("template-valid.pkl", direct, &options);
+        assert!(valid.template_execution_is_complete());
+        let opaque = b"\x80\x04cbuiltins\nstr\n)R.";
+        for separator in [b"".as_slice(), b"\xff".as_slice()] {
+            for opaque_first in [false, true] {
+                let (first, second) = if opaque_first {
+                    (opaque.as_slice(), direct.as_slice())
+                } else {
+                    (direct.as_slice(), opaque.as_slice())
+                };
+                let mut payload = first.to_vec();
+                payload.extend_from_slice(separator);
+                payload.extend_from_slice(second);
+                let scan = run_test_scan("template-later-stream.pkl", &payload, &options);
+                assert!(!scan.template_execution_is_complete());
+                for name in ["str", "Template.substitute"] {
+                    assert!(
+                        scan.callable_invocations.iter().any(|details| {
+                            detail_string(details, "name").as_deref() == Some(name)
+                        }),
+                        "both report segments must be analyzed: {name}"
+                    );
+                }
+            }
+        }
+        let mut payload = direct[..direct.len() - 1].to_vec();
+        payload.extend_from_slice(b"0N0N0N.");
+        let mut limited_options = default_test_options();
+        limited_options.max_opcodes = valid.opcode_count;
+        let limited = run_test_scan("template-limited.pkl", &payload, &limited_options);
+        assert!(!limited.status.is_complete());
+        assert!(!limited.template_execution_is_complete());
+    }
+
+    #[test]
+    fn template_nested_reports_conjoin_final_execution_proof() {
+        let options = default_test_options();
+        let direct =
+            b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R.";
+        let mut scan = run_test_scan("template-outer.pkl", direct, &options);
+        assert!(scan.template_execution_is_complete());
+        scan.surface_nested_pickle_findings(b"\x80\x04N.", "raw", 0);
+        assert!(scan.template_execution_is_complete());
+        let nested = b"\x80\x04cfunctools\npartial\ncstring\nTemplate.substitute\n\x85R.";
+        scan.surface_nested_pickle_findings(nested, "raw", 0);
+        assert!(scan.template_execution_may_be_unmodeled);
+        assert!(!scan.template_execution_is_complete());
+
+        let mut limited_options = default_test_options();
+        limited_options.max_nested_depth = 0;
+        let mut limited = run_test_scan("template-depth.pkl", direct, &limited_options);
+        assert!(limited.template_execution_is_complete());
+        let outcome = limited.surface_nested_pickle_findings(b"\x80\x04N.", "raw", 0);
+        assert!(outcome.incomplete);
+        assert!(has_notice_code(&limited, "nested_pickle_incomplete"));
+        assert!(!limited.template_execution_is_complete());
+    }
+
+    #[test]
+    fn template_execution_invalidates_before_invocation_dedupe_and_caps() {
+        let options = default_test_options();
+        let mut scan = ScanState::new(
+            "template-dedupe".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let invocation = CallableInvocation {
+            reference: GlobalRef {
+                module: "builtins".to_string(),
+                name: "str".to_string(),
+                position: 0,
+                malformed: false,
+                memo_index: None,
+                memo_read: false,
+            },
+            op_name: "REDUCE",
+            opcode_position: 0,
+            positional_arg_count: Some(0),
+            build_uses_slot_state: None,
+            keyword_arg_names: None,
+            args: Vec::new(),
+        };
+        scan.push_callable_invocation(&invocation);
+        assert!(scan.template_execution_may_be_unmodeled);
+        scan.template_execution_may_be_unmodeled = false;
+        scan.push_callable_invocation(&invocation);
+        assert!(scan.template_execution_may_be_unmodeled);
+        assert_eq!(scan.callable_invocations.len(), 1);
+        scan.template_execution_may_be_unmodeled = false;
+        scan.callable_invocations
+            .resize(MAX_IMPORT_REFERENCES, Vec::new());
+        let mut distinct = invocation;
+        distinct.reference.name = "repr".to_string();
+        scan.push_callable_invocation(&distinct);
+        assert!(scan.template_execution_may_be_unmodeled);
+        assert!(!scan.template_execution_is_complete());
+
+        scan.record_global_ref(&distinct.reference, "GLOBAL");
+        scan.import_references
+            .resize(MAX_IMPORT_REFERENCES, Vec::new());
+        scan.template_execution_may_be_unmodeled = false;
+        scan.record_global_ref(&distinct.reference, "GLOBAL");
+        assert!(scan.template_execution_may_be_unmodeled);
     }
 
     #[test]

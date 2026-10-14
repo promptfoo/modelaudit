@@ -2105,6 +2105,19 @@ def find_dangerous_call_graphs(
         if str(reference.get("module", "")) and str(reference.get("name", ""))
     }
 
+    template_execution_complete = bool(callable_references) and all(
+        reference.get("template_execution_complete") is True for reference in callable_references
+    )
+    if not template_execution_complete:
+        # A direct call's argument shape does not cover later memo/opaque uses.
+        for reference in callable_references:
+            module = str(reference.get("module", ""))
+            name = str(reference.get("name", ""))
+            if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+                continue
+            if _reference_may_enter_template_method(module, name, reference):
+                invoked_references.discard((module, name))
+
     analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
         module = str(reference.get("module", ""))
@@ -2155,7 +2168,9 @@ def find_dangerous_call_graphs(
         try:
             path_for = (
                 partial(_find_sink_path, keyword_arg_names=_complete_keyword_arg_names(reference))
-                if template_mapping_entrypoints and reference.get("invocation_import_reference")
+                if template_mapping_entrypoints
+                and template_execution_complete
+                and reference.get("invocation_import_reference")
                 else _find_sink_path
             )
             sink_path = _first_matching_path(entrypoints, path_for)
@@ -2172,6 +2187,7 @@ def find_dangerous_call_graphs(
                     sink_path = _find_invoked_import_execution_path(
                         entrypoint,
                         entrypoint_arg_count,
+                        None if template_mapping_entrypoints and not template_execution_complete else (),
                         allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                     )
                 except _CallGraphAnalysisLimitError as error:
@@ -2187,7 +2203,9 @@ def find_dangerous_call_graphs(
                         entrypoints,
                         _invoked_import_execution_path_callback(
                             positional_arg_count,
-                            keyword_arg_names,
+                            None
+                            if template_mapping_entrypoints and not template_execution_complete
+                            else keyword_arg_names,
                             allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                         ),
                     )
@@ -3457,6 +3475,26 @@ def _invoked_import_execution_path_callback(
     return path_for
 
 
+def _reference_may_enter_template_method(module: str, name: str, reference: Mapping[str, object]) -> bool:
+    targets = {f"{module}.{name}"}
+    try:
+        targets.update(_call_graph_entrypoints_for_reference(module, name, reference))
+    except _CallGraphAnalysisLimitError as error:
+        targets.update(error.partial_entrypoints)
+    except Exception:
+        # Normal analysis below retains its existing error handling.
+        pass
+    return bool(
+        targets
+        & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+            "string.Template.is_valid",
+            "string.Template.get_identifiers",
+        }
+    )
+
+
 def _iter_call_graph_references(
     import_references: object,
     callable_references: tuple[dict[str, object], ...],
@@ -3465,7 +3503,7 @@ def _iter_call_graph_references(
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
     seen_invocations: set[
-        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None]
+        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None, bool | None]
     ] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
@@ -3483,6 +3521,7 @@ def _iter_call_graph_references(
             _complete_keyword_arg_names(item),
             _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
             _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
+            _optional_bool_reference_detail(item.get("template_execution_complete")),
         )
         if invocation_key in seen_invocations:
             continue
@@ -3546,7 +3585,9 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None]] = set()
+    seen: set[
+        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None, bool | None]
+    ] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -3570,6 +3611,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 _complete_keyword_arg_names(item),
                 _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
                 _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
+                _optional_bool_reference_detail(item.get("template_execution_complete")),
             )
             if reference_key in seen:
                 continue
