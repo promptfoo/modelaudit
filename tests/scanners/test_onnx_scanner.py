@@ -40761,3 +40761,104 @@ class TestOnnxExpandedViewAdmission:
                 assert stats["total_entries"] == stats["cache_hits"] == 0
             finally:
                 reset_cache_manager()
+
+
+class TestOnnxConcatReplayCleanOperands:
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize("unknown_operand", [False, True])
+    def test_concat_preserves_vector_proof_with_clean_operands(
+        self, tmp_path: Path, local_function: bool, unknown_operand: bool
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        sources = [f"W{index}" for index in range(33)]
+        update = [
+            helper.make_node("Concat", ["state", "append"], ["joined"], axis=0),
+            helper.make_node("Neg", ["joined"], ["activation"]),
+            helper.make_node("PRelu", ["activation", "joined"], ["used"]),
+            helper.make_node("Identity", ["joined"], ["next"]),
+        ]
+        functions = []
+        body_nodes = update
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local", "Update", ["state", "append"], ["next", "used"], update, [helper.make_opsetid("", 18)]
+                )
+            )
+            body_nodes = [helper.make_node("Update", ["state", "append"], ["next", "used"], domain="local")]
+        body = helper.make_graph(
+            body_nodes,
+            "growing_vector_body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [None])],
+            [value("c", [], TensorProto.BOOL), value("next", [None])],
+        )
+        inputs = [value("X", [1, 64])]
+        tensors = [tensor(name, np.ones(1, np.float32)) for name in sources] + [
+            tensor("prior", prior_weights),
+            tensor("two", np.int64(2)),
+            tensor("start", np.bool_(True)),
+        ]
+        if unknown_operand:
+            inputs.append(value("append", [1]))
+        else:
+            tensors.append(tensor("append", np.ones(1, np.float32)))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["X", "prior"], ["known"]),
+                    helper.make_node("Sum", sources, ["initial"]),
+                    helper.make_node("Loop", ["two", "start", "initial"], ["final"], body=body),
+                ],
+                "concat_clean_operand_replay",
+                inputs,
+                [value("known", [1, 64]), value("final", [None])],
+                tensors,
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=10,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        runtime_body = deepcopy(
+            next(attribute.g for attribute in inlined.graph.node[2].attribute if attribute.name == "body")
+        )
+        # Observe the same-iteration weight consumer before any next-state fallback.
+        runtime_body.output.append(value("used", [None]))
+        if local_function:
+            prelu = next(node for node in runtime_body.node if node.op_type == "PRelu")
+            runtime_body.output[-1].name = prelu.output[0]
+        state = np.full(1, 33, np.float32)
+        runner = ReferenceEvaluator(runtime_body, opsets={"": 18})
+        observed_shapes = []
+        for iteration in range(2):
+            actual: Any = runner.run(
+                None,
+                {"i": np.int64(iteration), "c": np.bool_(True), "state": state, "append": np.ones(1, np.float32)},
+            )
+            expected = np.concatenate((state, np.ones(1, np.float32)))
+            np.testing.assert_array_equal(actual[1], expected)
+            np.testing.assert_array_equal(actual[2], -(expected * expected))
+            observed_shapes.append(actual[2].shape)
+            state = actual[1]
+        assert observed_shapes == [(2,), (3,)]
+        np.testing.assert_array_equal(state, np.array([33, 1, 1], np.float32))
+        if unknown_operand:
+            # Concrete runtime values remain valid; an unranked runtime operand
+            # cannot supply the static proof needed to discharge the lineage cap.
+            next(item for item in model.graph.input if item.name == "append").type.tensor_type.ClearField("shape")
+        plan = TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, unknown_operand, prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+        if not unknown_operand:
+            assert plan.coverage_gaps == {}
+            normal = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "concat-normal.onnx")))
+            assert normal.success is True, normal.metadata
+            assert len(TestWeightDistributionSemantics._extreme_checks(normal)) == 1

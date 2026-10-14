@@ -9172,7 +9172,7 @@ def _build_onnx_weight_analysis_plan(
                             if body_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
                                 return concat_shape(
                                     body_node,
-                                    (tainted_shapes.get(input_name) for input_name in body_inputs),
+                                    (known_input_shape(input_name) for input_name in body_inputs),
                                     axis=_onnx_int_attribute(body_node, "axis"),
                                 )
                             if body_node.op_type == "MatMul":
