@@ -2251,12 +2251,7 @@ def _build_onnx_weight_analysis_plan(
     graph_constant_context_cache: dict[int, tuple[Any, frozenset[str], dict[str, Any]]] = {}
     graph_constant_context_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
-    def graph_initializer_constants(
-        current_graph: Any,
-        inherited_constants: dict[str, Any],
-        attribute_bindings: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        nonlocal graph_constant_context_work_remaining
+    def graph_initializer_context(current_graph: Any) -> tuple[Any, frozenset[str], dict[str, Any]]:
         cached_context = graph_constant_context_cache.get(id(current_graph))
         if cached_context is None or cached_context[0] is not current_graph:
             local_declared_names = frozenset(_graph_declared_value_names(current_graph))
@@ -2266,9 +2261,17 @@ def _build_onnx_weight_analysis_plan(
                 for initializer in getattr(current_graph, "initializer", ())
                 if getattr(initializer, "name", "") and str(initializer.name) not in graph_input_names
             }
-            graph_constant_context_cache[id(current_graph)] = (current_graph, local_declared_names, local_constants)
-        else:
-            _owner, local_declared_names, local_constants = cached_context
+            cached_context = (current_graph, local_declared_names, local_constants)
+            graph_constant_context_cache[id(current_graph)] = cached_context
+        return cached_context
+
+    def graph_initializer_constants(
+        current_graph: Any,
+        inherited_constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal graph_constant_context_work_remaining
+        _owner, local_declared_names, local_constants = graph_initializer_context(current_graph)
         external_names = graph_external_reference_names(current_graph, attribute_bindings=attribute_bindings)
         work = len(external_names) + len(local_constants)
         if work > graph_constant_context_work_remaining:
@@ -2381,7 +2384,7 @@ def _build_onnx_weight_analysis_plan(
         call_attributes = getattr(node, "attribute", ())
         if not call_attributes:
             return defaults
-        if not reserve_function_default_work(len(defaults)):
+        if not reserve_function_default_work(len(defaults) + len(call_attributes)):
             return {}
         attributes = defaults.copy()
         for attribute in call_attributes:
@@ -2532,7 +2535,7 @@ def _build_onnx_weight_analysis_plan(
         expected_value: bool,
         attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
-        graph_constants = graph_initializer_constants(current_graph, inherited_constants, attribute_bindings)
+        _owner, local_declared_names, local_constants = graph_initializer_context(current_graph)
         producers = graph_output_producer_nodes_by_name(current_graph)
         seen: set[str] = set()
         current_name = value_name
@@ -2540,7 +2543,12 @@ def _build_onnx_weight_analysis_plan(
             if not current_name or current_name in seen:
                 return False
             seen.add(current_name)
-            constant_value = constant_scalar_value(graph_constants.get(current_name), int(onnx.TensorProto.BOOL))
+            # A bounded condition proof needs one immutable source, not a copy
+            # of the entire graph context. Local declarations still shadow captures.
+            initializer = local_constants.get(current_name)
+            if initializer is None and current_name not in local_declared_names:
+                initializer = inherited_constants.get(current_name)
+            constant_value = constant_scalar_value(initializer, int(onnx.TensorProto.BOOL))
             if constant_value is not None:
                 return constant_value is expected_value
             candidates = producers.get(current_name, ())

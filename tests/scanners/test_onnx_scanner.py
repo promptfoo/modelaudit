@@ -40873,3 +40873,182 @@ class TestOnnxConcatReplayCleanOperands:
             normal = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "concat-normal.onnx")))
             assert normal.success is True, normal.metadata
             assert len(TestWeightDistributionSemantics._extreme_checks(normal)) == 1
+
+
+class TestOnnxBooleanConstantContext:
+    @pytest.mark.parametrize("unrelated_constants", [0, 4097])
+    @pytest.mark.parametrize(
+        "condition_mode",
+        ["local_false", "captured_false", "constant_false", "local_true", "formal_default", "producer_shadow"],
+    )
+    def test_loop_stop_proof_ignores_unrelated_initializer_context(
+        self, tmp_path: Path, condition_mode: str, unrelated_constants: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        tensor = TestOnnxShapeContinuity._t
+        incomplete = condition_mode in {"local_true", "formal_default", "producer_shadow"}
+        sources = [f"W{index}" for index in range(40)]
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        initializers = [tensor(name, np.ones(4, np.float32)) for name in sources] + [
+            tensor("axes", np.array([1], np.int64)),
+            tensor("count", np.int64(2)),
+            tensor("start", np.bool_(True)),
+            tensor("prior", prior_weights),
+        ]
+        body_initializers = [tensor(f"unrelated{index}", np.int64(index)) for index in range(unrelated_constants)]
+        if condition_mode == "constant_false":
+            condition_nodes = [helper.make_node("Constant", [], ["stop"], value=tensor("", np.bool_(False)))]
+        elif condition_mode in {"formal_default", "producer_shadow"}:
+            condition_nodes = [helper.make_node("Identity", ["condition_in"], ["stop"])]
+            if condition_mode == "formal_default":
+                body_initializers.append(tensor("condition_in", np.bool_(False)))
+            else:
+                initializers.append(tensor("stop", np.bool_(False)))
+        else:
+            condition_nodes = [helper.make_node("Identity", ["stop_value"], ["stop"])]
+            destination = initializers if condition_mode == "captured_false" else body_initializers
+            destination.append(tensor("stop_value", np.bool_(condition_mode == "local_true")))
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["consumed"]),
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next"]),
+                *condition_nodes,
+            ],
+            "condition_context_body",
+            [value("i", [], TensorProto.INT64), value("condition_in", [], TensorProto.BOOL), value("state", None)],
+            [value("stop", [], TensorProto.BOOL), value("next", None)],
+            body_initializers,
+        )
+        expected_shape = (4, 1, 1) if incomplete else (4, 1)
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                helper.make_node("Sum", sources, ["capped"]),
+                helper.make_node("Loop", ["count", "start", "capped"], ["out"], body=body),
+            ],
+            "condition_context",
+            [value("A", [1, 64]), value("X", [1, 4])],
+            [value("known", [1, 64]), value("out", list(expected_shape))],
+            initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=8)
+        onnx.checker.check_model(model)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"A": np.ones((1, 64), np.float32), "X": np.ones((1, 4), np.float32)}
+        )
+        # The independent evaluator proves whether the matrix state is reentered.
+        # In particular, the Loop's true supplied condition overrides a false default.
+        np.testing.assert_array_equal(actual[0], np.ones((1, 64), np.float32) @ prior_weights)
+        np.testing.assert_array_equal(actual[1], np.full(expected_shape, 40, np.float32))
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, incomplete, prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+
+
+class TestOnnxCallAttributeWork:
+    @pytest.mark.parametrize(
+        ("width", "attribute_count"),
+        [(8, 8), (64, 8), (8, 1024), (64, 1024), (8, 4097)],
+    )
+    def test_recurrent_call_attributes_are_admitted_before_enumeration(
+        self, tmp_path: Path, width: int, attribute_count: int
+    ) -> None:
+        import ast
+
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        tensor = TestOnnxShapeContinuity._t
+        constant = helper.make_node("Constant", [], ["W"])
+        constant.attribute.append(helper.make_attribute_ref("value_float", onnx.AttributeProto.FLOAT))
+        constant.attribute[0].ref_attr_name = "tag0"
+        function = helper.make_function(
+            "local",
+            "Probe",
+            [],
+            ["tag"],
+            [constant, helper.make_node("PRelu", ["W", "W"], ["tag"])],
+            [helper.make_opsetid("", 18)],
+            attributes=[f"tag{index}" for index in range(attribute_count)],
+        )
+        call = helper.make_node("Probe", [], ["unused"], domain="local")
+        call.attribute.extend(helper.make_attribute(f"tag{index}", 0.5) for index in range(attribute_count))
+        names = [f"state{index}" for index in range(width)]
+        body = helper.make_graph(
+            [call],
+            "recurrent_attribute_body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [1]) for name in names],
+            [value("condition", [], TensorProto.BOOL)] + [value(name, [1]) for name in names],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                helper.make_node("Loop", ["count", "start", *names], [f"out{i}" for i in range(width)], body=body),
+            ],
+            "recurrent_call_attributes",
+            [value("A", [1, 64])],
+            [value("known", [1, 64])] + [value(f"out{i}", [1]) for i in range(width)],
+            [tensor("prior", prior_weights), tensor("count", np.int64(2)), tensor("start", np.bool_(True))]
+            + [tensor(name, np.array([index], np.float32)) for index, name in enumerate(names)],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=8,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, {"A": np.ones((1, 64), np.float32)})
+        np.testing.assert_array_equal(actual[0], np.ones((1, 64), np.float32) @ prior_weights)
+        for index, output in enumerate(actual[1:]):
+            np.testing.assert_array_equal(output, np.array([index], np.float32))
+
+        source_path = Path(onnx_scanner_module.__file__)
+        binding_function = next(
+            node
+            for node in ast.walk(ast.parse(source_path.read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "bound_function_attributes"
+        )
+        raw_attribute_loop = next(
+            node
+            for node in ast.walk(binding_function)
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Name) and node.iter.id == "call_attributes"
+        )
+        attribute_visits = 0
+        binding_calls = 0
+
+        def trace_binding(frame: Any, event: str, argument: Any) -> Any:
+            nonlocal attribute_visits, binding_calls
+            if frame.f_code.co_filename != str(source_path) or frame.f_code.co_name != "bound_function_attributes":
+                return None
+            if event == "call":
+                binding_calls += 1
+            elif event == "line" and frame.f_lineno == raw_attribute_loop.body[0].lineno:
+                attribute_visits += 1
+            return trace_binding
+
+        previous = sys.gettrace()
+        try:
+            sys.settrace(trace_binding)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.settrace(previous)
+        # Count actual raw-list visits in the new recurrent helper, independently
+        # of its reported budget. The separate primary linear pass is not counted.
+        assert binding_calls > 1
+        assert attribute_visits <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        if attribute_count > onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+            assert attribute_visits == 0
+        else:
+            assert attribute_visits >= attribute_count
+        incomplete = attribute_count >= 1024
+        assert bool(plan.coverage_gaps.get("attribute_binding_work_limit")) is incomplete
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, incomplete, prior_weights, coverage_reason="attribute_binding_work_limit"
+        )
