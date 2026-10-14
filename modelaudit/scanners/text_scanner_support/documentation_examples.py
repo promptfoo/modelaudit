@@ -21,6 +21,7 @@ FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r
 INDENTED_CODE_BLOCK_PATTERN = re.compile(rb"(?m)^(?: {4}|\t)[^\n]*\n?(?:(?: {4}|\t)[^\n]*\n?|[ \t]*\n)*")
 BACKTICK_PATTERN = re.compile(rb"`+")
 QUOTE_PREFIX_PATTERN = re.compile(rb" {0,3}>[ \t]?")
+LIST_PREFIX_PATTERN = re.compile(rb" {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}(?=\S|$)")
 EXECUTION_DIRECTIVE_PATTERN = re.compile(
     r"\b(?:run|execute|invoke|launch|source)(?:[ \t]*[:\uff1a\u2014\u2013-][ \t\r\n]*|[ \t\r\n]+)", re.IGNORECASE
 )
@@ -466,7 +467,12 @@ def _command_executes_script(words: list[str]) -> bool:
         return False
     wrapped = False
     while words:
-        redirection = re.match(r"^(?:\d+)?(?:<<<|<<-|<<|<>|>>|>|<)(.*)$", words[0])
+        if words[0] in {"if", "elif", "then", "else", "while", "until", "do", "{", "!", "time"}:
+            words = words[1:]
+            if words and words[0].startswith("-"):
+                return True
+            continue
+        redirection = re.match(r"^(?:\d+|\{[A-Za-z_]\w*\})?(?:<<<|<<-|<<|<>|>>|>|<)(.*)$", words[0])
         if redirection is not None:
             if not redirection[1] and len(words) < 2:
                 return True
@@ -856,12 +862,14 @@ def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], .
     return tuple(spans)
 
 
-def _without_blockquote_prefixes(payload: bytes) -> tuple[bytes, list[tuple[int, int]]] | None:
+def _without_markdown_container_prefixes(payload: bytes) -> tuple[bytes, list[tuple[int, int]]] | None:
     normalized = bytearray()
     removals: list[tuple[int, int]] = []
     removed = 0
     opening: re.Match[bytes] | None = None
     opening_depth = 0
+    opening_list_indent = 0
+    list_indents: list[int] = []
     for line in payload.splitlines(keepends=True):
         cursor = depth = 0
         if opening is None or opening_depth:
@@ -872,6 +880,23 @@ def _without_blockquote_prefixes(payload: bytes) -> tuple[bytes, list[tuple[int,
                     break
             if opening is not None and depth < opening_depth:
                 return None
+        content = line[cursor:]
+        indent = len(content) - len(content.lstrip(b" "))
+        if opening is not None:
+            if content.strip() and indent < opening_list_indent:
+                return None
+            cursor += min(indent, opening_list_indent)
+        else:
+            if content.strip():
+                while list_indents and indent < list_indents[-1]:
+                    list_indents.pop()
+            container_indent = list_indents[-1] if list_indents else 0
+            marker = LIST_PREFIX_PATTERN.match(content, container_indent)
+            if marker is not None:
+                list_indents.append(marker.end())
+                if FENCE_PATTERN.fullmatch(content[marker.end() :].rstrip(b"\r\n")) is not None:
+                    container_indent = marker.end()
+            cursor += min(indent, container_indent) if marker is None else container_indent
         if cursor:
             removed += cursor
             removals.append((len(normalized), removed))
@@ -880,6 +905,7 @@ def _without_blockquote_prefixes(payload: bytes) -> tuple[bytes, list[tuple[int,
         if fence is not None:
             if opening is None:
                 opening, opening_depth = fence, depth
+                opening_list_indent = list_indents[-1] if list_indents else 0
             elif (
                 not fence.group("language")
                 and fence.group("fence")[:1] == opening.group("fence")[:1]
@@ -894,7 +920,7 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
     """Return original URL spans only after bounded Markdown example analysis."""
     if len(payload) > MAX_DOCUMENTATION_BYTES:
         return ()
-    result = _without_blockquote_prefixes(payload)
+    result = _without_markdown_container_prefixes(payload)
     if result is None:
         return ()
     normalized, removals = result

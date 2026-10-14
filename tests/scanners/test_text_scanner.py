@@ -5506,6 +5506,13 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         "```bash\necho foo#bar; python repo/install.py\n```\n",
         "```bash\npython${IFS}-m${IFS}repo.install\n```\n",
         "```bash\n> output.log python repo/install.py\n```\n",
+        "```bash\n{log}> output.log python repo/install.py\n```\n",
+        "```bash\nif python repo/install.py; then :; fi\n```\n",
+        "```bash\nwhile python repo/install.py; do :; done\n```\n",
+        "```bash\nuntil python repo/install.py; do :; done\n```\n",
+        "```bash\ntime python repo/install.py\n```\n",
+        "```bash\ntime -p python repo/install.py\n```\n",
+        "```bash\n{ python repo/install.py; }\n```\n",
         "```bash\n>output.log python repo/install.py\n```\n",
         "```bash\n2> output.log python repo/install.py\n```\n",
         "```bash\n2>>output.log python repo/install.py\n```\n",
@@ -5624,6 +5631,43 @@ def test_documented_clone_script_chains_across_blocks_remain_actionable(tmp_path
 
 
 @pytest.mark.parametrize(
+    "prefix,indent",
+    [
+        ("- Setup\n\n", "    "),
+        ("1. Setup\n\n", "    "),
+        ("- Setup\n  - Install\n\n", "      "),
+        ("> - Setup\n>\n", ">    "),
+    ],
+)
+@pytest.mark.parametrize("execute", [False, True])
+def test_documented_clone_in_list_fences_preserves_policy(
+    tmp_path: Path, prefix: str, indent: str, execute: bool
+) -> None:
+    content = prefix + "\n".join(
+        indent + line for line in ["```bash", "git clone https://github.com/owner/repo.git", "```", ""]
+    )
+    if execute:
+        content += "\n".join(indent + line for line in ["```bash", "python repo/install.py", "```", ""])
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, content)
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is execute
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == int(execute)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_documented_clone_fence_on_list_marker(tmp_path: Path, complete: bool) -> None:
+    content = "- ```bash\n  git clone https://github.com/owner/repo.git\n" + ("  ```\n" if complete else "")
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, content)
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is not complete
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == int(not complete)
+
+
+@pytest.mark.parametrize(
     "following",
     [
         "```bash\npip install -e .\n```\n",
@@ -5656,6 +5700,8 @@ def test_documented_clone_script_chains_across_blocks_remain_actionable(tmp_path
         "Run the following command:\npython --version\n",
         '```bash\n>output.log echo "python repo/install.py"\n```\n',
         "```bash\n> output.log python --version\n```\n",
+        '```bash\nif python --version; then echo "python repo/install.py"; fi\n```\n',
+        '```bash\ntime echo "python repo/install.py"\n```\n',
         'Run the following command:\n\necho "python repo/install.py"\n',
         "```bash\nvllm serve ./repo\n```\n",
         "```bash\nvllm serve ./repo --host 0.0.0.0 --port=8000 --tensor-parallel-size 2\n```\n",
@@ -5790,7 +5836,7 @@ def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, m
     def unexpected_parse(_payload: bytes) -> None:
         pytest.fail("An oversized document reached Markdown parsing")
 
-    monkeypatch.setattr(documentation_examples, "_without_blockquote_prefixes", unexpected_parse)
+    monkeypatch.setattr(documentation_examples, "_without_markdown_container_prefixes", unexpected_parse)
     content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n" + "x" * (
         documentation_examples.MAX_DOCUMENTATION_BYTES + 1
     )
