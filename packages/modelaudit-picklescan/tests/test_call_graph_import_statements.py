@@ -10108,6 +10108,208 @@ assert any(
     assert marker.read_text() == "sibling-called"
 
 
+def test_template_code_metadata_admits_canonical_supported_interpreter() -> None:
+    def outer(value: str) -> str:
+        def inner() -> str:
+            return value
+
+        return inner()
+
+    assert call_graph._template_code_metadata_is_hook_free(outer.__code__)
+
+
+def test_template_code_metadata_rejects_oversized_constant_container() -> None:
+    code = (lambda: None).__code__.replace(co_consts=tuple(range(call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES + 1)))
+
+    assert not call_graph._template_code_metadata_is_hook_free(code)
+
+
+@pytest.mark.parametrize(("levels", "expected"), [(3, True), (12, False)])
+def test_template_code_metadata_bounds_expanded_shared_constants(levels: int, expected: bool) -> None:
+    shared: object = None
+    for _ in range(levels):
+        shared = (shared, shared)
+    code = (lambda: None).__code__.replace(co_consts=(None, shared))
+
+    assert call_graph._template_code_metadata_is_hook_free(code) is expected
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Template runtime qualification starts in Python 3.14")
+@pytest.mark.parametrize(
+    "field",
+    [
+        "co_qualname",
+        "co_name",
+        "co_filename",
+        "co_linetable",
+        "co_exceptiontable",
+        "co_names",
+        "co_consts",
+        "nested_co_name",
+        "swap_after_admission_name",
+        "swap_after_admission_constants",
+    ],
+)
+def test_template_code_metadata_is_rejected_without_executing_hooks(tmp_path: Path, field: str) -> None:
+    receiver = _global_operand("string", "Template") + _args_tuple(_unicode_operand("plain text")) + b"R"
+    payload = _global_call_payload("string", "Template.is_valid", receiver)
+    child_code = """
+import pickle
+import string
+import sys
+from types import CodeType
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, call_graph, scan_bytes
+
+field = sys.argv[1]
+payload = bytes.fromhex(sys.argv[2])
+events = []
+
+def observe(method, name):
+    def wrapped(self, *args, **kwargs):
+        events.append(name)
+        return method(self, *args, **kwargs)
+    return wrapped
+
+class HookText(str):
+    __eq__ = observe(str.__eq__, "text-eq")
+    __ne__ = observe(str.__ne__, "text-ne")
+    __hash__ = observe(str.__hash__, "text-hash")
+    __str__ = observe(str.__str__, "text-str")
+    __repr__ = observe(str.__repr__, "text-repr")
+    replace = observe(str.replace, "text-replace")
+
+    def __bool__(self):
+        events.append("text-bool")
+        return str.__len__(self) != 0
+
+class HookBytes(bytes):
+    __eq__ = observe(bytes.__eq__, "bytes-eq")
+    __ne__ = observe(bytes.__ne__, "bytes-ne")
+    __hash__ = observe(bytes.__hash__, "bytes-hash")
+    __repr__ = observe(bytes.__repr__, "bytes-repr")
+
+class HookTuple(tuple):
+    __eq__ = observe(tuple.__eq__, "tuple-eq")
+    __ne__ = observe(tuple.__ne__, "tuple-ne")
+    __hash__ = observe(tuple.__hash__, "tuple-hash")
+    __iter__ = observe(tuple.__iter__, "tuple-iter")
+    __contains__ = observe(tuple.__contains__, "tuple-contains")
+    __len__ = observe(tuple.__len__, "tuple-len")
+    __getitem__ = observe(tuple.__getitem__, "tuple-getitem")
+    __repr__ = observe(tuple.__repr__, "tuple-repr")
+
+class HookConstant:
+    def __repr__(self):
+        events.append("constant-repr")
+        return "hook-constant"
+
+target = string.Template.substitute
+original = target.__code__
+original_admission = call_graph._template_code_metadata_is_hook_free
+if field == "nested_co_name":
+    constants = list(original.co_consts)
+    index = next(index for index, value in enumerate(constants) if type(value) is CodeType)
+    nested = constants[index]
+    constants[index] = nested.replace(co_name=HookText(nested.co_name))
+    replacement = original.replace(co_consts=tuple(constants))
+elif field == "swap_after_admission_name":
+    replacement = original.replace(co_name=HookText(original.co_name))
+elif field == "swap_after_admission_constants":
+    constants = list(original.co_consts)
+    index = next(index for index, value in enumerate(constants) if type(value) is CodeType)
+    constants[index] = HookConstant()
+    replacement = original.replace(co_consts=tuple(constants))
+else:
+    value = getattr(original, field)
+    wrapper = HookText if type(value) is str else HookBytes if type(value) is bytes else HookTuple
+    replacement = original.replace(**{field: wrapper(value)})
+    assert type(getattr(replacement, field)) is wrapper
+
+if field.startswith("swap_after_admission"):
+    def swapping_admission(code):
+        result = original_admission(code)
+        if code is original:
+            target.__code__ = replacement
+        return result
+    call_graph._template_code_metadata_is_hook_free = swapping_admission
+else:
+    target.__code__ = replacement
+
+events.clear()
+try:
+    report = scan_bytes(payload)
+    assert events == [], events
+    assert report.status == ScanStatus.INCONCLUSIVE, report
+    assert report.verdict != SafetyVerdict.CLEAN, report
+    assert any("cached string.Template runtime" in error.message for error in report.errors), report
+finally:
+    target.__code__ = original
+    call_graph._template_code_metadata_is_hook_free = original_admission
+
+control = scan_bytes(payload)
+assert events == [], events
+assert control.status == ScanStatus.COMPLETE, control
+assert control.verdict == SafetyVerdict.CLEAN, control
+assert pickle.loads(payload) is True
+assert events == [], events
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, field, payload.hex()])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 13), reason="Modern ZIP invalidation removes only the shared cache")
+def test_zip_constructor_name_container_does_not_execute_hooks(tmp_path: Path) -> None:
+    archive = tmp_path / "constructor-names.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("inert.py", "VALUE = 1\n")
+    child_code = """
+import sys
+import zipimport
+
+events = []
+
+class HookNames(tuple):
+    def __contains__(self, value):
+        events.append("contains")
+        return tuple.__contains__(self, value)
+
+    def __iter__(self):
+        events.append("iter")
+        return tuple.__iter__(self)
+
+    def __eq__(self, other):
+        events.append("eq")
+        return tuple.__eq__(self, other)
+
+    def __len__(self):
+        events.append("len")
+        return tuple.__len__(self)
+
+initializer = zipimport.zipimporter.__init__
+original = initializer.__code__
+initializer.__code__ = original.replace(co_names=HookNames(original.co_names))
+assert type(initializer.__code__.co_names) is HookNames
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+
+archive = sys.argv[1]
+finder = zipimport.zipimporter(archive)
+assert set(vars(finder)) == {"archive", "prefix"}
+finder.invalidate_caches()
+assert archive not in zipimport._zip_directory_cache
+sys.path.insert(0, archive)
+sys.path_importer_cache[archive] = finder
+events.clear()
+
+report = scan_bytes(b"\\x80\\x04cbuiltins\\nhelp\\n)R.")
+assert events == [], events
+assert report.status == ScanStatus.INCONCLUSIVE, report
+assert report.verdict != SafetyVerdict.CLEAN, report
+assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices), report
+"""
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(archive)])
+
+
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-pattern qualification starts in Python 3.14")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 @pytest.mark.parametrize("warm_after_import", [False, True])

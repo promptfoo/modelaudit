@@ -3141,7 +3141,9 @@ def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
     return tuple(dict.fromkeys(functions))
 
 
-def _function_owner_matches_trusted_source(function: FunctionType, *, expected_module: str) -> bool:
+def _function_owner_matches_trusted_source(
+    function: FunctionType, *, expected_module: str, code: CodeType | None = None
+) -> bool:
     globals_namespace = function.__globals__
     if type(globals_namespace) is not dict:
         return False
@@ -3152,10 +3154,12 @@ def _function_owner_matches_trusted_source(function: FunctionType, *, expected_m
     if source_path is None:
         return False
     try:
-        code_path = Path(function.__code__.co_filename).resolve()
+        code_path = Path((function.__code__ if code is None else code).co_filename).resolve()
     except (OSError, RuntimeError, ValueError):
         return False
-    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+    if code is None:
+        return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+    return code_path == source_path and _function_code_matches_trusted_source(function, source_path, code=code)
 
 
 def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> bool:
@@ -3175,8 +3179,10 @@ def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> boo
     return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
 
 
-def _function_code_matches_trusted_source(function: FunctionType, source_path: Path) -> bool:
-    code = function.__code__
+def _function_code_matches_trusted_source(
+    function: FunctionType, source_path: Path, *, code: CodeType | None = None
+) -> bool:
+    code = function.__code__ if code is None else code
     return any(candidate == code for candidate in _trusted_source_code_objects(str(source_path)))
 
 
@@ -4578,7 +4584,15 @@ def _zipimport_read_missing_directory_files(
     if set(instance_state) != {"archive", "prefix"} or not _zipimport_runtime_is_trusted():
         return None
     initializer = _type_member_without_hooks(zipimporter, "__init__")[1]
-    if type(initializer) is not FunctionType or "_files" in initializer.__code__.co_names:
+    if type(initializer) is not FunctionType:
+        return None
+    constructor_names = initializer.__code__.co_names
+    if (
+        type(constructor_names) is not tuple
+        or len(constructor_names) > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        or any(type(name) is not str for name in constructor_names)
+        or "_files" in constructor_names
+    ):
         # Removing _files from a legacy instance does not make its constructor modern.
         return None
     expected_state = _zipimport_constructor_state_without_cache(cache_key)
@@ -6572,14 +6586,80 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
     for name in ("__init__", "_invalid", "substitute", "safe_substitute", "is_valid", "get_identifiers"):
         member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
         _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
+        if not member[0] or type(member[1]) is not FunctionType:
+            return False
+        function = member[1]
+        code = function.__code__
         if (
-            not member[0]
-            or type(member[1]) is not FunctionType
-            or getattr(member[1].__code__, "co_qualname", None) != f"Template.{name}"
-            or not _function_owner_matches_trusted_source(member[1], expected_module="string")
-            or not _template_function_runtime_is_canonical(member[1], module, name, sentinel)
+            not _template_code_metadata_is_hook_free(code)
+            or getattr(code, "co_qualname", None) != f"Template.{name}"
+            or not _function_owner_matches_trusted_source(function, expected_module="string", code=code)
+            or not _template_function_runtime_is_canonical(function, module, name, sentinel, code=code)
+            or function.__code__ is not code
         ):
             return False
+    return True
+
+
+def _template_code_metadata_is_hook_free(code: CodeType) -> bool:
+    missing = object()
+    pending: list[tuple[object, int]] = [(code, 0)]
+    checked = 0
+    code_count = 0
+    while pending:
+        value, depth = pending.pop()
+        checked += 1
+        if checked > _MAX_SOURCE_FINGERPRINT_CANDIDATES or depth > _MAX_TRUSTED_REFERENCE_FUNCTIONS:
+            return False
+        value_type = type(value)
+        if (
+            value is None
+            or value is Ellipsis
+            or any(value_type is primitive for primitive in (bool, int, float, complex, str, bytes))
+        ):
+            continue
+        if (
+            value_type is not CodeType
+            and value_type is not tuple
+            and value_type is not frozenset
+            and value_type is not slice
+        ):
+            return False
+        remaining = _MAX_SOURCE_FINGERPRINT_CANDIDATES - checked - len(pending)
+        if value_type is CodeType:
+            current = cast(CodeType, value)
+            code_count += 1
+            if code_count > _MAX_TRUSTED_REFERENCE_FUNCTIONS:
+                return False
+            if type(current.co_name) is not str or type(current.co_filename) is not str:
+                return False
+            # Python 3.10 lacks these fields; present metadata must have exact types.
+            qualified_name = getattr(current, "co_qualname", missing)
+            exception_table = getattr(current, "co_exceptiontable", missing)
+            if qualified_name is not missing and type(qualified_name) is not str:
+                return False
+            if type(current.co_linetable) is not bytes:
+                return False
+            if exception_table is not missing and type(exception_table) is not bytes:
+                return False
+            names = current.co_names
+            constants = current.co_consts
+            if type(names) is not tuple or type(constants) is not tuple or len(names) >= remaining:
+                return False
+            checked += len(names)
+            if any(type(name) is not str for name in names):
+                return False
+            pending.append((constants, depth + 1))
+        elif value_type is slice:
+            if remaining < 3:
+                return False
+            current_slice = cast(slice, value)
+            pending.extend((item, depth + 1) for item in (current_slice.start, current_slice.stop, current_slice.step))
+        else:
+            items = cast(tuple[object, ...] | frozenset[object], value)
+            if len(items) > remaining:
+                return False
+            pending.extend((item, depth + 1) for item in items)
     return True
 
 
@@ -6613,7 +6693,7 @@ def _template_defaultdict_constructor_is_canonical(value: object) -> bool:
 
 
 def _template_function_runtime_is_canonical(
-    function: FunctionType, module: ModuleType, name: str, sentinel: object
+    function: FunctionType, module: ModuleType, name: str, sentinel: object, *, code: CodeType
 ) -> bool:
     namespace = ModuleType.__getattribute__(module, "__dict__")
     if (
@@ -6630,7 +6710,7 @@ def _template_function_runtime_is_canonical(
             return False
     elif defaults is not None:
         return False
-    for dependency in _code_loaded_global_names(function.__code__):
+    for dependency in _code_loaded_global_names(code):
         state = _loaded_reference_state_without_hooks(module, dependency)
         _track_loaded_interpreter_reference_state("string", dependency, state)
         if dependency == "_sentinel_dict":
