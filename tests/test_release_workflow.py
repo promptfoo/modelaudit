@@ -144,12 +144,16 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
             lane for lane in matrix["include"] if lane["os"] == "ubuntu-latest" and lane["python-version"] == version
         )
         assert linux["timeout-minutes"] == 30
+    intel311 = next(
+        lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.11"
+    )
+    assert intel311["timeout-minutes"] == 45
     intel314 = next(
         lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.14"
     )
     assert intel314["timeout-minutes"] == 75
     arm314 = next(lane for lane in matrix["include"] if lane["os"] == "macos-14" and lane["python-version"] == "3.14")
-    assert arm314["timeout-minutes"] == 30
+    assert arm314["timeout-minutes"] == 60
     ubuntu_arm314 = next(
         lane for lane in matrix["include"] if lane["os"] == "ubuntu-24.04-arm" and lane["python-version"] == "3.14"
     )
