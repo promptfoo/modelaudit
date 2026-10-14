@@ -16,7 +16,9 @@ MAX_FENCES = 128
 FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>\w*)[ \t]*\r?$")
 URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
-PYTHON_EXECUTION_NAMES = frozenset({"exec", "eval", "compile", "__import__", "subprocess", "system", "popen"})
+PYTHON_EXECUTION_NAMES = frozenset(
+    {"exec", "eval", "compile", "__import__", "subprocess", "system", "popen", "runpy", "run_path", "run_module"}
+)
 URL_RISK_TERMS = (
     NetworkCommDetector.INFORMATIONAL_URL_RISK_TERMS
     + tuple(term.decode("ascii") for term in NetworkCommDetector.CC_PATTERNS)
@@ -66,8 +68,27 @@ def _index_url(url: str) -> bool:
     )
 
 
+def _cmake_script_options(args: list[str]) -> bool:
+    for index, arg in enumerate(args):
+        if arg.startswith(("-P", "-C", "-E", "--workflow", "--install")):
+            return True
+        if arg.startswith("-D") or (index > 0 and args[index - 1] == "-D"):
+            key = arg.removeprefix("-D").partition("=")[0].partition(":")[0]
+            if (
+                key == "CMAKE_TOOLCHAIN_FILE"
+                or (key.startswith("CMAKE_PROJECT_") and "INCLUDE" in key)
+                or key.startswith("CMAKE_USER_MAKE_RULES_OVERRIDE")
+            ):
+                return True
+    return False
+
+
 def _setup_command_urls(words: list[str]) -> set[str] | None:
     """Accept ordinary setup commands; reject unproven flags and execution chains."""
+    if words and re.fullmatch(r"python3(?:\.\d+)?", words[0]):
+        words = ["python", *words[1:]]
+    if words[:1] == ["cmake"] and _cmake_script_options(words[1:]):
+        return None
     if words[:2] == ["git", "clone"]:
         args = words[2:]
         while args and args[0] in {"--branch", "-b", "--depth", "--single-branch"}:
@@ -269,10 +290,94 @@ def _python_url_spans(source: bytes) -> list[tuple[int, int]]:
     return spans
 
 
+def _command_executes_script(words: list[str]) -> bool:
+    if words[:2] in (["command", "-v"], ["command", "-V"]):
+        return False
+    wrapped = False
+    while words and (
+        words[0] in {"env", "command", "exec", "nohup", "--"} or re.match(r"[A-Za-z_]\w*=", words[0]) is not None
+    ):
+        wrapped = True
+        words = words[1:]
+    if not words or _setup_command_urls(words) is not None:
+        return False
+    command = words[0].rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    if (wrapped and command.startswith("-")) or command.endswith(
+        (".py", ".pyw", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd")
+    ):
+        return True
+    python_command = re.fullmatch(r"(?:python[23]?|pypy3?)(?:\.\d+)?", command) is not None
+    if not wrapped and (words[1:] in (["--version"], ["-V"], ["--help"]) or (python_command and words[1:] == ["-h"])):
+        return False
+    return (
+        python_command
+        or command
+        in {
+            "sh",
+            "bash",
+            "zsh",
+            "dash",
+            "ksh",
+            "source",
+            ".",
+            "node",
+            "nodejs",
+            "ruby",
+            "perl",
+            "php",
+            "pwsh",
+            "powershell",
+            "sudo",
+            "npx",
+        }
+        or (command in {"uv", "pipx", "npm"} and words[1:2] in (["run"], ["exec"]))
+        or (command == "cmake" and _cmake_script_options(words[1:]))
+    )
+
+
+def _example_executes_script(source: bytes, language: bytes) -> bool:
+    if language in {b"py", b"python"}:
+        try:
+            nodes = ast.walk(ast.parse(source.decode("utf-8")))
+        except (UnicodeDecodeError, SyntaxError, ValueError, RecursionError):
+            return True
+        return any(
+            (isinstance(node, ast.Name) and node.id in PYTHON_EXECUTION_NAMES)
+            or (isinstance(node, ast.Attribute) and node.attr in PYTHON_EXECUTION_NAMES)
+            or (isinstance(node, ast.alias) and node.name.split(".")[0] in PYTHON_EXECUTION_NAMES)
+            for node in nodes
+        )
+    if re.search(rb"#[^\r\n]*\\\r?\n", source):
+        return True
+    joined = re.sub(rb"\\\r?\n", b" ", source)
+    try:
+        for line in joined.decode("utf-8").splitlines():
+            # Preserve quotes so a quoted operator remains an argument.
+            lexer = shlex.shlex(line, posix=False, punctuation_chars=";&|()")
+            lexer.whitespace_split = True
+            words: list[str] = []
+            for raw in lexer:
+                if raw and all(char in ";&|()" for char in raw):
+                    if _command_executes_script(words):
+                        return True
+                    words = []
+                    continue
+                parsed = shlex.split(raw, comments=False)
+                if len(parsed) != 1:
+                    return True
+                words.extend(parsed)
+            if _command_executes_script(words):
+                return True
+    except (UnicodeDecodeError, ValueError):
+        return True
+    return False
+
+
 def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
     """Return URL spans only inside complete, recognized Markdown fences."""
     spans: list[tuple[int, int]] = []
     opening: re.Match[bytes] | None = None
+    executes_script = False
     for count, match in enumerate(FENCE_PATTERN.finditer(payload)):
         if count >= MAX_FENCES * 2:
             return ()
@@ -286,12 +391,14 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
         ):
             continue
         start, end = opening.end() + 1, match.start()
+        language = opening.group("language").lower()
         if (
             end - start <= MAX_EXAMPLE_BYTES
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
         ):
-            language = opening.group("language").lower()
             source = payload[start:end]
+            if language in {b"sh", b"bash", b"shell", b"py", b"python"}:
+                executes_script |= _example_executes_script(source, language)
             examples = (
                 _shell_url_spans(source)
                 if language in {b"sh", b"bash", b"shell"}
@@ -300,5 +407,11 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
                 else []
             )
             spans.extend((start + left, start + right) for left, right in examples)
+        elif language in {b"sh", b"bash", b"shell", b"py", b"python"}:
+            executes_script = True
         opening = None
+    if opening is not None and opening.group("language").lower() in {b"sh", b"bash", b"shell", b"py", b"python"}:
+        executes_script = True
+    if executes_script:
+        spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
     return tuple(spans)

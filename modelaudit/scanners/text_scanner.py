@@ -3336,7 +3336,7 @@ class TextScanner(BaseScanner):
         routine_url_spans = (
             routine_documentation_url_spans(payload)
             if findings
-            and os.path.splitext(filename)[1] in {".md", ".markdown"}
+            and os.path.splitext(filename)[1] in {"", ".md", ".markdown"}
             and (cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename))
             else ()
         )

