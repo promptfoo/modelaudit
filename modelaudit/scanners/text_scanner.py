@@ -1252,6 +1252,8 @@ class TextScanner(BaseScanner):
         if context is None:
             return False
         context_prefix, link_start = context
+        if cls._finding_line_prefix_is_truncated(payload, {"position": link_start}):
+            return False
         line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
         passive_line_markdown_link = cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix)
         literal_value_prefix = cls._documentation_markdown_link_leading_prefix_is_literal_value(line_prefix)
@@ -1936,7 +1938,7 @@ class TextScanner(BaseScanner):
     @staticmethod
     def _documentation_markdown_link_leading_prefix_is_literal_value(prefix: bytes) -> bool:
         stripped = prefix.strip()
-        return stripped.startswith((b'"', b"'", b"{", b"[", b"(")) or stripped.endswith((b",", b"{", b"["))
+        return stripped.startswith((b'"', b"'", b"`", b"{", b"[", b"(")) or stripped.endswith((b",", b"{", b"[", b"`"))
 
     @classmethod
     def _documentation_literal_continuation_line_is_passive_markdown_prefix(cls, line: bytes) -> bool:
