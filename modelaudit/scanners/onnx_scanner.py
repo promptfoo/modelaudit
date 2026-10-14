@@ -5687,7 +5687,11 @@ def _build_onnx_weight_analysis_plan(
         reason: str,
         node: Any | None = None,
         input_index: int | None = None,
+        *,
+        collect_weight_consumers: bool = True,
     ) -> None:
+        if not collect_weight_consumers:
+            return
         plan.exclusion_counts[reason] = plan.exclusion_counts.get(reason, 0) + 1
         if len(plan.exclusion_samples) >= _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
             return
@@ -7686,16 +7690,23 @@ def _build_onnx_weight_analysis_plan(
                         )
                     ):
                         potential_weight_input = False
-                    if potential_weight_input:
-                        terminal_weight_lineages.add(initializer_index)
-                    terminal_consumer_counts[initializer_index] += 1
-                    total_consumer_count += 1
+                    if collect_weight_consumers:
+                        if potential_weight_input:
+                            terminal_weight_lineages.add(initializer_index)
+                        terminal_consumer_counts[initializer_index] += 1
+                        total_consumer_count += 1
                     recurrent_initial_state = recurrent_initial_state_input
                     if recurrent_initial_state:
                         recurrent_state_lineages[initializer_index] = lineage
                     if lineage.unresolved_reason is not None:
                         if lineage.unresolved_reason == "shape_control_lineage":
-                            record_exclusion(initializer_index, "shape_control_input", node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                "shape_control_input",
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                             continue
                         opposite_resolved_weight = any(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
@@ -7721,7 +7732,13 @@ def _build_onnx_weight_analysis_plan(
                                 recurrent_state_lineages[initializer_index] = lineage
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
-                            record_exclusion(initializer_index, "dynamic_activation_input", node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                "dynamic_activation_input",
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                         elif potential_weight_input or (
                             (
                                 potential_weight_role
@@ -7742,7 +7759,13 @@ def _build_onnx_weight_analysis_plan(
                                 collect_weight_consumers=collect_weight_consumers,
                             )
                         else:
-                            record_exclusion(initializer_index, "unresolved_lineage_consumer", node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                "unresolved_lineage_consumer",
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                         continue
                     if has_referenced_attributes and not (supported_transform and input_index == 0):
                         if potential_weight_input:
@@ -7765,6 +7788,7 @@ def _build_onnx_weight_analysis_plan(
                                 "referenced_function_attribute_consumer",
                                 node,
                                 input_index,
+                                collect_weight_consumers=collect_weight_consumers,
                             )
                         continue
                     if is_model_local_function:
@@ -7786,7 +7810,13 @@ def _build_onnx_weight_analysis_plan(
                                 collect_weight_consumers=collect_weight_consumers,
                             )
                         else:
-                            record_exclusion(initializer_index, reason, node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                reason,
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                         continue
                     add_consumer_group(
                         lineage,
@@ -7861,29 +7891,32 @@ def _build_onnx_weight_analysis_plan(
                     num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
                 )
             )
-            node_scan8_empty_batch = False
+            node_scan8_skips_body = False
             if (
                 is_builtin_neural_operator
                 and node.op_type == "Scan"
                 and scan_sequence_lens_input_offset(node, opset_versions)
                 and node.input
                 and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
-                and constant_int64_vector_values(constants.get(str(node.input[0]))) == ()
+                and (lengths := constant_int64_vector_values(constants.get(str(node.input[0])))) is not None
             ):
-                scan_count = resolved_int_attribute(node, "num_scan_inputs", 1)
-                scan_names = tuple(str(name) for name in node.input[max(1, len(node.input) - scan_count) :])
-                node_scan8_empty_batch = (
-                    scan_count > 0
-                    and len(scan_names) == scan_count
-                    and all(
-                        name
-                        and not graph_input_is_runtime_overridable(name, graph_input_names, constants)
-                        and (shape := constant_initializer_shape(constants, name)) is not None
-                        and len(shape) >= 2
-                        and shape[0] == 0
-                        for name in scan_names
+                if lengths:
+                    node_scan8_skips_body = all(length == 0 for length in lengths)
+                else:
+                    scan_count = resolved_int_attribute(node, "num_scan_inputs", 1)
+                    scan_names = tuple(str(name) for name in node.input[max(1, len(node.input) - scan_count) :])
+                    node_scan8_skips_body = (
+                        scan_count > 0
+                        and len(scan_names) == scan_count
+                        and all(
+                            name
+                            and not graph_input_is_runtime_overridable(name, graph_input_names, constants)
+                            and (shape := constant_initializer_shape(constants, name)) is not None
+                            and len(shape) >= 2
+                            and shape[0] == 0
+                            for name in scan_names
+                        )
                     )
-                )
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
                 if is_model_local_function:
                     # Graph attributes are evaluated where the function body uses them.
@@ -9895,8 +9928,7 @@ def _build_onnx_weight_analysis_plan(
                                 ):
                                     record_weight_lineage_limit_gap(
                                         value_lineage_limit_gap_counts[parent_name],
-                                        collect_weight_consumers=collect_weight_consumers
-                                        and not node_scan8_empty_batch,
+                                        collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                                     )
                         sibling_state_rank_promotion_may_affect_weight = False
                         if (
@@ -10052,7 +10084,7 @@ def _build_onnx_weight_analysis_plan(
                                         record_weight_lineage_limit_gap(
                                             len(retained_rank_summary.lineages),
                                             collect_weight_consumers=collect_weight_consumers
-                                            and not node_scan8_empty_batch,
+                                            and not node_scan8_skips_body,
                                         )
                                     subgraph_bound_weight_lineage_gaps[graph_input_name] = (
                                         _bounded_onnx_weight_lineage_gap_count(
@@ -10334,7 +10366,7 @@ def _build_onnx_weight_analysis_plan(
                             proven_weight_inputs_out=subgraph_proven_weight_inputs,
                             proven_weight_inputs_path=subgraph_proof_path,
                             collect_weight_consumers=collect_weight_consumers
-                            and not (node_scan8_empty_batch and attribute.name == "body"),
+                            and not (node_scan8_skips_body and attribute.name == "body"),
                         ),
                     )
                     if is_builtin_neural_operator and node.op_type in {"Loop", "Scan"}:
@@ -10486,7 +10518,7 @@ def _build_onnx_weight_analysis_plan(
                                     node,
                                     current_node_index,
                                     pair_index,
-                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_empty_batch,
+                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                                 )
 
             function = functions.get(function_key)
@@ -10505,7 +10537,7 @@ def _build_onnx_weight_analysis_plan(
                             node,
                             current_node_index,
                             input_index,
-                            collect_weight_consumers=collect_weight_consumers and not node_scan8_empty_batch,
+                            collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                         )
                 function = None
             if function is not None:
@@ -11598,7 +11630,7 @@ def _build_onnx_weight_analysis_plan(
                 and node.op_type == "Loop"
                 and loop_body_is_proven_skipped(node, constants, graph_input_names)
             )
-            scan8_returns_initial_state = node_scan8_empty_batch or (
+            scan8_returns_initial_state = node_scan8_skips_body or (
                 bool(resolved_scan_input_offset)
                 and bool(node.input)
                 and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
@@ -11783,7 +11815,7 @@ def _build_onnx_weight_analysis_plan(
                                     node,
                                     current_node_index,
                                     output_index,
-                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_empty_batch,
+                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                                 )
                     if (
                         graph_output_parent_lineages
@@ -11966,7 +11998,7 @@ def _build_onnx_weight_analysis_plan(
                     ):
                         record_weight_lineage_limit_gap(
                             graph_output_weight_lineage_gap_counts[graph_output_index],
-                            collect_weight_consumers=collect_weight_consumers and not node_scan8_empty_batch,
+                            collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                         )
                         recorded_future_body_gap = True
                     if stacked_scan_output and graph_output_weight_lineage_gap_counts[graph_output_index]:
@@ -12096,7 +12128,7 @@ def _build_onnx_weight_analysis_plan(
                             if finite_loop_body_consumes_weight_rank:
                                 record_weight_lineage_limit_gap(
                                     graph_output_rank_promotable_gap_count,
-                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_empty_batch,
+                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                                 )
                                 recorded_future_body_gap = True
                             subgraph_output_weight_lineage_gap_counts[output_index] = (
@@ -12205,7 +12237,7 @@ def _build_onnx_weight_analysis_plan(
                         if future_body_may_consume_gap:
                             record_weight_lineage_limit_gap(
                                 graph_output_non_shape_lineage_gap_counts[graph_output_index],
-                                collect_weight_consumers=collect_weight_consumers and not node_scan8_empty_batch,
+                                collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
                             )
                     if (
                         standard_control_flow_operator

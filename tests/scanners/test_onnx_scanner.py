@@ -36767,13 +36767,15 @@ class TestOnnxFunctionDefaultWorkRegressions:
 
 class TestOnnxEmptyScan8BatchRegressions:
     @staticmethod
-    def _model(batch_size: int, *, runtime_lengths: bool = False, runtime_sequence: bool = False) -> Any:
+    def _model(
+        batch_size: int, *, runtime_lengths: bool = False, runtime_sequence: bool = False, sequence_length: int = 1
+    ) -> Any:
         source_names = [f"state_{index}" for index in range(33)]
         tensors = [
             onnx.numpy_helper.from_array(np.zeros((batch_size,), np.float32), name=name) for name in source_names
         ]
         tensors.append(onnx.numpy_helper.from_array(np.zeros((batch_size, 1, 1), np.float32), name="sequence"))
-        tensors.append(onnx.numpy_helper.from_array(np.ones((batch_size,), np.int64), name="lengths"))
+        tensors.append(onnx.numpy_helper.from_array(np.full((batch_size,), sequence_length, np.int64), name="lengths"))
         body = helper.make_graph(
             [
                 helper.make_node("Unsqueeze", ["state"], ["matrix"], axes=[0, 1]),
@@ -36813,30 +36815,54 @@ class TestOnnxEmptyScan8BatchRegressions:
         return model
 
     @pytest.mark.parametrize(
-        "batch_size,runtime_lengths,runtime_sequence",
-        [(0, False, False), (1, False, False), (1, True, False), (0, True, False), (0, False, True)],
+        "batch_size,runtime_lengths,runtime_sequence,sequence_length",
+        [
+            (0, False, False, 1),
+            (1, False, False, 1),
+            (1, True, False, 1),
+            (0, True, False, 1),
+            (0, False, True, 1),
+            (1, False, False, 0),
+            (2, False, False, 0),
+            (1, True, False, 0),
+        ],
     )
     @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
     def test_empty_batch_does_not_promote_unreachable_carried_gap(
-        self, tmp_path: Path, batch_size: int, runtime_lengths: bool, runtime_sequence: bool, scanner_type: Any
+        self,
+        tmp_path: Path,
+        batch_size: int,
+        runtime_lengths: bool,
+        runtime_sequence: bool,
+        sequence_length: int,
+        scanner_type: Any,
     ) -> None:
         from onnx.reference import ReferenceEvaluator
 
-        model = self._model(batch_size, runtime_lengths=runtime_lengths, runtime_sequence=runtime_sequence)
+        model = self._model(
+            batch_size,
+            runtime_lengths=runtime_lengths,
+            runtime_sequence=runtime_sequence,
+            sequence_length=sequence_length,
+        )
         path = _save_onnx_model(model, tmp_path / "empty-batch.onnx")
         body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
         runtime = ReferenceEvaluator(body, opsets={"": 8})
-        executed = []
+        executed: list[Any] = []
+        effective_length = 1 if runtime_lengths else sequence_length
         for _batch in range(batch_size):
-            values: Any = runtime.run(
-                None,
-                {"state": np.float32(0), "slice": np.zeros(1, np.float32), "X": np.ones((1, 1), np.float32)},
-            )
-            executed.append(values[1])
-        assert len(executed) == batch_size
+            for _step in range(effective_length):
+                values: Any = runtime.run(
+                    None,
+                    {"state": np.float32(0), "slice": np.zeros(1, np.float32), "X": np.ones((1, 1), np.float32)},
+                )
+                executed.append(values[1])
+        assert len(executed) == batch_size * effective_length
         result = scanner_type().scan(str(path))
         gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
-        complete = batch_size == 0 and not runtime_lengths and not runtime_sequence
+        complete = not runtime_lengths and (
+            (batch_size == 0 and not runtime_sequence) or (batch_size > 0 and sequence_length == 0)
+        )
         assert result.success is complete
         if not complete:
             assert gaps["lineages_per_value_limit"] > 0
@@ -36859,6 +36885,50 @@ class TestOnnxEmptyScan8BatchRegressions:
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize("batch_size,sequence_length", [(0, 0), (1, 0), (2, 0), (1, 1)])
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_skipped_body_preserves_unused_weight_classification(
+        self, tmp_path: Path, batch_size: int, sequence_length: int, scanner_type: Any
+    ) -> None:
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        body = helper.make_graph(
+            [helper.make_node("MatMul", ["element", "body_weight"], ["score"])],
+            "body_with_local_weight",
+            [helper.make_tensor_value_info("element", TensorProto.FLOAT, [1, 64])],
+            [helper.make_tensor_value_info("score", TensorProto.FLOAT, [1, 64])],
+            initializer=[onnx.numpy_helper.from_array(weights, name="body_weight")],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Scan", ["lengths", "sequence"], ["scores"], body=body, num_scan_inputs=1)],
+            "scan8_unused_body_weight",
+            [],
+            [helper.make_tensor_value_info("scores", TensorProto.FLOAT, [batch_size, 1, 1, 64])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.full((batch_size,), sequence_length, np.int64), name="lengths"),
+                onnx.numpy_helper.from_array(np.zeros((batch_size, 1, 1, 64), np.float32), name="sequence"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = _save_onnx_model(model, tmp_path / "unused-body-weight.onnx")
+        result = scanner_type().scan(str(path))
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        unused_weight = any(
+            sample.get("initializer") == "body_weight" and sample["reason"] == "unused_initializer"
+            for sample in semantics["exclusion_samples"]
+        )
+        assert result.success is True
+        assert semantics["coverage_gaps"] == {}
+        if sequence_length == 0:
+            assert unused_weight
+            assert not TestWeightDistributionSemantics._extreme_checks(result)
+        else:
+            assert not unused_weight
+            assert semantics["consumer_count"] > 0
+            assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
 
 
 class TestOnnxEmptyScan8OutputRegressions:
