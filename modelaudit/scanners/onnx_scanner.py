@@ -385,18 +385,6 @@ def _onnx_concat_output_shape(
     return tuple(output_dimensions)
 
 
-def _onnx_text_attribute(node: Any, name: str) -> str | None:
-    """Read a UTF-8 ONNX string attribute without importing ONNX eagerly."""
-    for attribute in getattr(node, "attribute", []):
-        if attribute.name != name:
-            continue
-        try:
-            return bytes(attribute.s).decode("utf-8")
-        except (AttributeError, UnicodeDecodeError):
-            return None
-    return None
-
-
 def _onnx_gather_axis(node: Any, rank: int, resolve_attribute: Callable[[Any], Any | None] | None = None) -> int | None:
     axis = 0
     for attribute in getattr(node, "attribute", ()):
@@ -412,7 +400,13 @@ def _onnx_gather_axis(node: Any, rank: int, resolve_attribute: Callable[[Any], A
     return axis if 0 <= axis < rank else None
 
 
-def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tuple[int, ...] | None, str]:
+def _onnx_weight_output_axes(
+    node: Any,
+    input_index: int,
+    rank: int,
+    *,
+    einsum_equation: tuple[tuple[str, ...], str] | None = None,
+) -> tuple[tuple[int, ...] | None, str]:
     """Classify an initializer consumer for statistical weight analysis."""
     op_type = node.op_type
     domain = getattr(node, "domain", "")
@@ -460,11 +454,9 @@ def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tu
         return (0, 1), "eligible_recurrent_weight"
 
     if op_type == "Einsum":
-        equation = _onnx_text_attribute(node, "equation")
-        if equation is None or "..." in equation or equation.count("->") != 1:
+        if einsum_equation is None:
             return None, "unsupported_einsum_equation"
-        input_expression, output_expression = (part.strip() for part in equation.split("->", 1))
-        input_terms = [term.strip() for term in input_expression.split(",")]
+        input_terms, output_expression = einsum_equation
         if input_index >= len(input_terms):
             return None, "unsupported_einsum_equation"
         weight_term = input_terms[input_index]
@@ -7965,7 +7957,13 @@ def _build_onnx_weight_analysis_plan(
                 for lineage in value_lineages.get(str(input_name), {}).values()
                 if is_builtin_standard_operator
                 and lineage.unresolved_reason is None
-                and _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))[0] is not None
+                and _onnx_weight_output_axes(
+                    node,
+                    input_index,
+                    len(lineage.shape or ()),
+                    einsum_equation=parsed_einsum_equation(node) if node.op_type == "Einsum" else None,
+                )[0]
+                is not None
             }
             if proven_weight_inputs_out is not None:
                 proof_work = (
@@ -8366,7 +8364,12 @@ def _build_onnx_weight_analysis_plan(
                         continue
                     if is_model_local_function:
                         continue  # The function body determines operand roles and weight axes.
-                    output_axes, reason = _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))
+                    output_axes, reason = _onnx_weight_output_axes(
+                        node,
+                        input_index,
+                        len(lineage.shape or ()),
+                        einsum_equation=parsed_einsum_equation(node) if node.op_type == "Einsum" else None,
+                    )
                     if output_axes is None:
                         if reason != "non_weight_input" and potential_weight_input:
                             record_unresolved_lineage(

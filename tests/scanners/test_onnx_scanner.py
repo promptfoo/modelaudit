@@ -39973,3 +39973,137 @@ class TestOnnxFiniteReplayConstantAdmission:
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model, tmp_path, True, prior_weights, coverage_reason="lineages_per_value_limit"
         )
+
+
+class TestOnnxPrimaryEinsumEquationBudgets:
+    @pytest.mark.parametrize("route", ["direct", "expand", "function", "expanded_function"])
+    @pytest.mark.parametrize("equation_mode", ["short", "padded", "oversized"])
+    def test_resolved_weight_orientation_uses_bounded_shared_syntax(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        route: str,
+        equation_mode: str,
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[3, 7] = 1000.0
+        nodes = [helper.make_node("MatMul", ["X", "prior"], ["known"])]
+        initializers = [
+            onnx.numpy_helper.from_array(prior_weights, name="prior"),
+            onnx.numpy_helper.from_array(np.ones((64, 64), np.float32), name="W"),
+        ]
+        weight_name = "W"
+        if route in {"expand", "expanded_function"}:
+            initializers.append(onnx.numpy_helper.from_array(np.array([64, 64], np.int64), name="target"))
+            nodes.append(helper.make_node("Expand", ["W", "target"], ["expanded"]))
+            weight_name = "expanded"
+        functions = []
+        local_function = route in {"function", "expanded_function"}
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Project",
+                    ["activation", "weight"],
+                    ["projected"],
+                    [helper.make_node("Einsum", ["activation", "weight"], ["projected"], equation="bi,io->bo")],
+                    opset_imports=[helper.make_opsetid("", 13)],
+                )
+            )
+            result_names = ["Y0", "Y1"]
+            nodes.extend(
+                helper.make_node("Project", ["X", weight_name], [name], domain="local") for name in result_names
+            )
+        else:
+            result_names = ["Y"]
+            nodes.append(helper.make_node("Einsum", ["X", weight_name], result_names, equation="bi,io->bo"))
+        graph = helper.make_graph(
+            nodes,
+            "bounded_primary_einsum_orientation",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64])],
+            [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 64]) for name in ["known", *result_names]],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        values: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        for value in values[1:]:
+            np.testing.assert_array_equal(value, np.full((1, 64), 64.0, np.float32))
+        equation_node = (
+            model.functions[0].node[0]
+            if local_function
+            else next(node for node in model.graph.node if node.op_type == "Einsum")
+        )
+        padding = {"short": 0, "padded": 24, "oversized": 128}[equation_mode]
+        equation = b" " * padding + b"bi,io->bo"
+        equation_node.attribute[0].s = equation
+        incomplete = equation_mode == "oversized"
+        if incomplete:
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES", 64)
+        path = _save_onnx_model(model, tmp_path / "primary-equation.onnx")
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        observed: dict[str, Any] = {
+            "queries": 0,
+            "materialized": [],
+            "metadata_sizes": [],
+            "cache_peak": 0,
+            "orientations": [],
+            "raw_decodes": 0,
+        }
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            name = frame.f_code.co_name
+            if name not in {"parsed_einsum_equation", "_onnx_weight_output_axes", "_onnx_text_attribute"}:
+                return
+            if event != "return" or Path(frame.f_code.co_filename).resolve() != scanner_path:
+                return
+            if name == "_onnx_text_attribute":
+                observed["raw_decodes"] += 1
+                return
+            if name == "_onnx_weight_output_axes":
+                if getattr(frame.f_locals.get("node"), "op_type", None) == "Einsum":
+                    observed["orientations"].append(arg)
+                    observed["raw_decodes"] += int(isinstance(frame.f_locals.get("equation"), str))
+                return
+            observed["queries"] += 1
+            payload = frame.f_locals.get("equation_bytes")
+            if isinstance(payload, bytes):
+                observed["materialized"].append(len(payload))
+            serialized_size = frame.f_locals.get("serialized_size")
+            if isinstance(serialized_size, int):
+                observed["metadata_sizes"].append(serialized_size)
+            observed["cache_peak"] = max(observed["cache_peak"], len(frame.f_locals.get("einsum_equation_cache", {})))
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            result = WeightDistributionScanner().scan(str(path))
+        finally:
+            sys.setprofile(previous_profile)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is not incomplete, semantics
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        assert observed["queries"] > 1
+        assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 1
+        assert observed["materialized"] == ([] if incomplete else [len(equation)])
+        assert observed["raw_decodes"] == 0
+        assert len(observed["orientations"]) >= (4 if local_function else 2)
+        if incomplete:
+            assert semantics["coverage_gaps"]["einsum_equation_byte_limit"] >= 1
+            assert all(axes is None for axes, _reason in observed["orientations"])
+            assert not any(item["consumer_op"] == "Einsum" for item in semantics["eligible"])
+        else:
+            assert semantics["coverage_gaps"] == {}
+            assert all(axes == (1,) for axes, _reason in observed["orientations"])
+            eligible = [item for item in semantics["eligible"] if item["consumer_op"] == "Einsum"]
+            assert eligible and all(item["output_axes"] == [1] for item in eligible)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, incomplete, prior_weights, coverage_reason="einsum_equation_byte_limit"
+        )
