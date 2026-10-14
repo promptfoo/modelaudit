@@ -40474,3 +40474,153 @@ class TestOnnxReentryVectorControlCaching:
         for scanner in [OnnxScanner(), WeightDistributionScanner()]:
             result = scanner.scan(str(path))
             assert result.success is True, result.metadata
+
+
+class TestOnnxBoundGraphConstantCaptures:
+    @pytest.mark.parametrize("mode", ["inline", "default", "override", "forwarded", "matrix", "mutable", "missing"])
+    def test_recurrent_graph_bindings_keep_only_immutable_captured_targets(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+
+        def branch(target: str) -> Any:
+            return helper.make_graph(
+                [helper.make_node("Reshape", ["state", target], ["reshaped"])],
+                "captured_target",
+                [],
+                [value("reshaped", None)],
+            )
+
+        chosen_graph = branch("matrix_target" if mode == "matrix" else "target")
+        default_graph = branch("matrix_target") if mode in {"override", "forwarded"} else chosen_graph
+        conditional = helper.make_node("If", ["choose"], ["next"])
+        for name in ("then_branch", "else_branch"):
+            conditional.attribute.append(
+                onnx.AttributeProto(name=name, ref_attr_name="update", type=onnx.AttributeProto.GRAPH)
+            )
+        update = helper.make_function(
+            "local",
+            "Update",
+            ["state", "choose"],
+            ["next"],
+            [conditional],
+            [helper.make_opsetid("", 18)],
+            attribute_protos=[helper.make_attribute("update", default_graph)],
+        )
+        functions = [update]
+        call = helper.make_node("Update", ["state", "condition"], ["next"], domain="local")
+        if mode == "override":
+            call.attribute.append(helper.make_attribute("update", chosen_graph))
+        elif mode == "forwarded":
+            forwarded_call = helper.make_node("Update", ["state", "choose"], ["next"], domain="local")
+            forwarded_call.attribute.append(
+                onnx.AttributeProto(name="update", ref_attr_name="outer_update", type=onnx.AttributeProto.GRAPH)
+            )
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Forward",
+                    ["state", "choose"],
+                    ["next"],
+                    [forwarded_call],
+                    [helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+                    attributes=["outer_update"],
+                )
+            )
+            call = helper.make_node("Forward", ["state", "condition"], ["next"], domain="local")
+            call.attribute.append(helper.make_attribute("outer_update", chosen_graph))
+        elif mode == "inline":
+            call = helper.make_node("If", ["condition"], ["next"], then_branch=chosen_graph, else_branch=chosen_graph)
+            functions = []
+        body = helper.make_graph(
+            [helper.make_node("PRelu", ["activation", "state"], ["used"]), call],
+            "bound_graph_capture",
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL), value("state", None)],
+            [value("condition", [], TensorProto.BOOL), value("next", None), value("used", [1, 64])],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        source_names = [f"source{index}" for index in range(33)]
+        inputs = [value("X", [1, 64]), value("activation", [1, 64])]
+        if mode == "mutable":
+            inputs.append(value("target", [1], TensorProto.INT64))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["X", "prior"], ["known"]),
+                    helper.make_node("Sum", source_names, ["initial"]),
+                    helper.make_node("Loop", ["two", "start", "initial"], ["final", "used_stack"], body=body),
+                ],
+                "recurrent_bound_graph_constants",
+                inputs,
+                [
+                    value("known", [1, 64]),
+                    value("final", [1, 64] if mode == "matrix" else [64]),
+                    value("used_stack", [2, 1, 64]),
+                ],
+                [tensor(name, np.ones(64, np.float32)) for name in source_names]
+                + [
+                    tensor("prior", prior_weights),
+                    tensor("target", np.array([64], np.int64)),
+                    tensor("matrix_target", np.array([1, 64], np.int64)),
+                    tensor("two", np.int64(2)),
+                    tensor("start", np.bool_(True)),
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=10,
+        )
+        onnx.checker.check_model(model, full_check=True)
+
+        # This evaluator cannot bind referenced graphs inside a function. Resolve
+        # the declared default, call override and forwarding on an oracle copy.
+        runtime_graph = chosen_graph
+        if mode != "inline":
+            bindings = {attribute.name: attribute for attribute in update.attribute_proto}
+            if mode == "forwarded":
+                outer = {attribute.name: attribute for attribute in call.attribute}
+                for attribute in functions[1].node[0].attribute:
+                    bindings[attribute.name] = outer[attribute.ref_attr_name]
+            else:
+                bindings.update({attribute.name: attribute for attribute in call.attribute})
+            runtime_graph = bindings["update"].g
+        runtime_body = onnx.GraphProto()
+        runtime_body.CopyFrom(body)
+        runtime_body.node[1].CopyFrom(
+            helper.make_node("If", ["condition"], ["next"], then_branch=runtime_graph, else_branch=runtime_graph)
+        )
+        if mode == "missing":
+            scanned_body = next(attribute.g for attribute in model.graph.node[2].attribute if attribute.name == "body")
+            scanned_body.node[1].attribute.append(
+                onnx.AttributeProto(name="update", ref_attr_name="missing_outer", type=onnx.AttributeProto.GRAPH)
+            )
+        scanned_bytes = model.SerializeToString()
+        runner = ReferenceEvaluator(runtime_body, opsets={"": 18})
+        state = np.full(64, 33, np.float32)
+        observed_shapes = []
+        for iteration in range(2):
+            observed_shapes.append(state.shape)
+            actual: Any = runner.run(
+                None,
+                {
+                    "iteration": np.int64(iteration),
+                    "condition": np.bool_(True),
+                    "state": state,
+                    "activation": -np.ones((1, 64), np.float32),
+                    "target": np.array([64], np.int64),
+                    "matrix_target": np.array([1, 64], np.int64),
+                },
+            )
+            np.testing.assert_array_equal(actual[2], -np.full((1, 64), 33, np.float32))
+            state = actual[1]
+        assert observed_shapes == [(64,), (1, 64) if mode == "matrix" else (64,)]
+        np.testing.assert_array_equal(state, np.full((1, 64) if mode == "matrix" else (64,), 33, np.float32))
+        assert model.SerializeToString() == scanned_bytes
+        incomplete = mode in {"matrix", "mutable", "missing"}
+        reason = "unresolved_function_attribute" if mode == "missing" else "lineages_per_value_limit"
+        plan = TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, incomplete, prior_weights, coverage_reason=reason
+        )
+        if not incomplete:
+            assert plan.coverage_gaps == {}

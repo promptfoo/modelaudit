@@ -2400,7 +2400,10 @@ def _build_onnx_weight_analysis_plan(
         return getattr(node, "attribute", ()) if function is None else ()
 
     def bound_function_constants(
-        function: Any, node_input_names: list[str], constants: dict[str, Any]
+        function: Any,
+        node_input_names: list[str],
+        constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         inherited: dict[str, Any] = {}
         bound_inputs: dict[str, Any] = {}
@@ -2411,7 +2414,7 @@ def _build_onnx_weight_analysis_plan(
             if formal_name and actual_name in constants:
                 inherited[formal_name] = constants[actual_name]
                 bound_inputs[formal_name] = constants[actual_name]
-        for captured_name in graph_external_reference_names(function):
+        for captured_name in graph_external_reference_names(function, attribute_bindings):
             if captured_name in constants:
                 inherited[captured_name] = constants[captured_name]
         return inherited, bound_inputs
@@ -3876,6 +3879,7 @@ def _build_onnx_weight_analysis_plan(
                     function,
                     function_actuals,
                     subgraph_constants,
+                    attribute_bindings=function_attributes,
                 )
                 function_versions = function_opset_versions(function, opset_versions)
                 if function_versions is None:
@@ -4646,7 +4650,10 @@ def _build_onnx_weight_analysis_plan(
                                 attribute_bindings=function_attributes,
                                 depth=depth + 1,
                                 inherited_constants=bound_function_constants(
-                                    function, node_input_slots(body_node), graph_constants
+                                    function,
+                                    node_input_slots(body_node),
+                                    graph_constants,
+                                    attribute_bindings=function_attributes,
                                 )[0],
                             ),
                         )
@@ -5367,7 +5374,10 @@ def _build_onnx_weight_analysis_plan(
                         attribute_bindings=function_attributes,
                         depth=depth + 1,
                         inherited_constants=bound_function_constants(
-                            function, node_input_slots(body_node), graph_constants
+                            function,
+                            node_input_slots(body_node),
+                            graph_constants,
+                            attribute_bindings=function_attributes,
                         )[0],
                         exclude_activation_inputs=exclude_activation_inputs,
                         proven_weight_inputs=proven_weight_inputs,
@@ -5386,7 +5396,10 @@ def _build_onnx_weight_analysis_plan(
                                 attribute_bindings=function_attributes,
                                 depth=depth + 1,
                                 inherited_constants=bound_function_constants(
-                                    function, node_input_slots(body_node), graph_constants
+                                    function,
+                                    node_input_slots(body_node),
+                                    graph_constants,
+                                    attribute_bindings=function_attributes,
                                 )[0],
                             ),
                         )
@@ -9754,6 +9767,7 @@ def _build_onnx_weight_analysis_plan(
                                     function,
                                     function_actuals,
                                     subgraph_constants,
+                                    attribute_bindings=function_attributes,
                                 )
                                 function_constants.update(function_bound_input_constants)
                                 function_context_shapes: dict[str, tuple[int, ...]] = {}
