@@ -2326,6 +2326,29 @@ def test_text_scanner_long_prose_before_markdown_link_is_informational(tmp_path:
     )
 
 
+@pytest.mark.parametrize("opening,closing", [("[", "]"), ("{", "}"), ("(", ")")])
+def test_text_scanner_indented_markdown_in_literal_remains_actionable(
+    tmp_path: Path, opening: str, closing: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"endpoint = {opening}\n    [payload](https://evil.example/payload.sh)\n{closing}\n"
+    )
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_text_scanner_long_quoted_assignment_markdown_remains_actionable(tmp_path: Path, quote: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path,
+        f"endpoint = {quote}" + "padding " * 800 + f"[payload](https://evil.example/payload.sh){quote}\n",
+    )
+
+
+def test_text_scanner_many_escaped_assignment_fragments_before_prose_link(tmp_path: Path) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, '; x=\\"' * 4000 + '" See [guide](https://docs.example.com/reference)\n'
+    )
+
+
 @pytest.mark.parametrize("prefix", ["endpoint:\n", "endpoint =\n"])
 def test_text_scanner_long_indented_config_markdown_link_remains_actionable(tmp_path: Path, prefix: str) -> None:
     _assert_model_card_payload_endpoint_actionable(
@@ -3626,7 +3649,7 @@ def test_text_scanner_port_retarget_skips_longer_numbers(tmp_path: Path, later_p
         for check in checks
     )
     if later_port:
-        assert checks[0].details["position"] == content.rindex("23")
+        assert checks[0].details["position"] == (tmp_path / "README.md").read_bytes().rindex(b"23")
 
 
 def test_text_scanner_port_retarget_exact_budget_ignores_longer_numbers() -> None:

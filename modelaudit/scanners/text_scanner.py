@@ -1178,10 +1178,7 @@ class TextScanner(BaseScanner):
         line_prefix = code_prefix.rsplit(b"\n", 1)[-1]
         return (
             cls._documentation_assignment_is_actionable(code_prefix)
-            or any(
-                cls._documentation_quoted_value_is_open(code_prefix, match.group("quote")[0], match.end())
-                for match in DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(code_prefix)
-            )
+            or cls._documentation_has_open_quoted_assignment(code_prefix)
             or (not line_prefix.lstrip().startswith(b"|") and cls._documentation_prefix_has_enclosing_call(line_prefix))
             or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
@@ -1364,6 +1361,33 @@ class TextScanner(BaseScanner):
                 continue
             if value == ord("#") and (index == 0 or line[index - 1] in b" \t;|&()"):
                 return True
+        return False
+
+    @staticmethod
+    def _documentation_has_open_quoted_assignment(source: bytes) -> bool:
+        starts_by_quote: dict[int, set[int]] = {}
+        for match in DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(source):
+            starts_by_quote.setdefault(match.group("quote")[0], set()).add(match.end())
+
+        # Reuse each suffix result instead of rescanning it for every assignment.
+        for quote, starts in starts_by_quote.items():
+            next_open = after_next_open = True
+            if len(source) in starts:
+                return True
+            for cursor in range(len(source) - 1, min(starts) - 1, -1):
+                value = source[cursor]
+                if value == ord("\\") and quote != ord("'"):
+                    is_open = after_next_open
+                elif value in {ord("\r"), ord("\n")}:
+                    is_open = False
+                elif value == quote:
+                    doubled = quote == ord("'") and source[cursor + 1 : cursor + 2] == b"'"
+                    is_open = doubled and after_next_open
+                else:
+                    is_open = next_open
+                if cursor in starts and is_open:
+                    return True
+                after_next_open, next_open = next_open, is_open
         return False
 
     @staticmethod
@@ -2111,11 +2135,11 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_position_is_in_actionable_markdown_link_context(payload, position):
             return True
+        if cls._documentation_multiline_literal_contains_position(payload, position):
+            return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
         if cls._documentation_open_call_contains_position(payload, position):
-            return True
-        if cls._documentation_multiline_literal_contains_position(payload, position):
             return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         line_start, line_end, _ = cls._documentation_line_bounds(payload, position)
