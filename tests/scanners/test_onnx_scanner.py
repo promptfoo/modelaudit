@@ -38974,3 +38974,251 @@ class TestOnnxExpandProofAdmission:
             prior_weights,
             coverage_reason="lineages_per_value_limit",
         )
+
+
+class TestOnnxLoopConsumerProofAdmission:
+    @staticmethod
+    def _model(mode: str, *, warmup: bool = False, initial_rank: int = 2) -> tuple[Any, Any]:
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        sources = [f"replacement_{index}" for index in range(33)]
+        initializers = [
+            tensor("prior", prior_weights),
+            tensor("two", np.int64(2)),
+            tensor("condition", np.bool_(True)),
+            tensor("inner_count", np.int64(0 if mode == "skipped" else 1)),
+            tensor("dummy", np.float32(0)),
+            *[tensor(name, np.ones((2, 2), np.float32)) for name in sources],
+        ]
+        inputs = [
+            value("A", [1, 64]),
+            value("X", [1, 2]),
+            value("initial", [2] if initial_rank == 1 else [2, 2]),
+        ]
+        nodes = [helper.make_node("MatMul", ["A", "prior"], ["known"])]
+        if warmup:
+            width, chain_length = 64, 64
+            warm_inputs = [f"warm_input_{index}" for index in range(width)]
+            inputs.extend(value(name, [2]) for name in warm_inputs)
+            warm_body = helper.make_graph(
+                [
+                    helper.make_node(
+                        "Identity", ["warm_state_0" if index == 0 else f"chain_{index - 1}"], [f"chain_{index}"]
+                    )
+                    for index in range(chain_length)
+                ]
+                + [
+                    helper.make_node("Identity", [f"chain_{chain_length - 1}"], [f"warm_next_{index}"])
+                    for index in range(width)
+                ],
+                "closure_warmup_body",
+                [value("warm_iteration", [], TensorProto.INT64), value("warm_condition", [], TensorProto.BOOL)]
+                + [value(f"warm_state_{index}", [2]) for index in range(width)],
+                [value("warm_condition", [], TensorProto.BOOL)]
+                + [value(f"warm_next_{index}", [2]) for index in range(width)],
+            )
+            nodes.append(
+                helper.make_node(
+                    "Loop",
+                    ["two", "condition", *warm_inputs],
+                    [f"warm_output_{index}" for index in range(width)],
+                    body=warm_body,
+                )
+            )
+        consumers = []
+        functions = []
+        if mode == "direct":
+            consumers.append(helper.make_node("MatMul", ["X", "state"], ["body_y"]))
+        elif mode != "no_consumer":
+            weight_name = "independent" if mode == "independent" else "state"
+            if mode == "independent":
+                initializers.append(tensor("independent", np.eye(2, dtype=np.float32)))
+            inner = helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["X", weight_name], ["inner_y"]),
+                    helper.make_node("Identity", ["inner_condition_in"], ["inner_condition_out"]),
+                ],
+                "zero_output_consumer",
+                [value("inner_iteration", [], TensorProto.INT64), value("inner_condition_in", [], TensorProto.BOOL)],
+                [value("inner_condition_out", [], TensorProto.BOOL)],
+            )
+            if mode == "function":
+                functions.append(
+                    helper.make_function(
+                        "local",
+                        "ConsumeCapturedState",
+                        ["state", "X", "inner_count", "function_condition"],
+                        ["unused_state"],
+                        [
+                            helper.make_node("Loop", ["inner_count", "function_condition"], [], body=inner),
+                            helper.make_node("Identity", ["state"], ["unused_state"]),
+                        ],
+                        [helper.make_opsetid("", 13)],
+                    )
+                )
+                consumers.append(
+                    helper.make_node(
+                        "ConsumeCapturedState",
+                        ["state", "X", "inner_count", "condition_in"],
+                        ["unused_function_state"],
+                        domain="local",
+                    )
+                )
+            else:
+                consumers.append(helper.make_node("Loop", ["inner_count", "condition_in"], [], body=inner))
+        body = helper.make_graph(
+            [
+                *consumers,
+                helper.make_node("Sum", sources, ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "replacement_consumer_body",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+            ],
+            [value("condition_out", [], TensorProto.BOOL), value("next_state", [2, 2])],
+        )
+        nodes.extend(
+            [
+                helper.make_node("Loop", ["two", "condition", "initial"], ["unused_final"], body=body),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ]
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "loop_consumer_proof_admission",
+                inputs,
+                [value("known", [1, 64]), value("Y", [])],
+                initializer=initializers,
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        return model, prior_weights
+
+    @pytest.mark.parametrize("consume_state,initial_rank", [(True, 2), (True, 1), (False, 2)])
+    def test_dependency_exhaustion_cannot_prove_absent_consumption(
+        self, tmp_path: Path, consume_state: bool, initial_rank: int
+    ) -> None:
+        model, prior_weights = self._model(
+            "direct" if consume_state else "no_consumer", warmup=True, initial_rank=initial_rank
+        )
+        observed = {"warmup_exhausted": False, "target_exhausted": False, "floating_replay_admitted": False}
+
+        def observe(frame: Any, event: str, result: Any) -> None:
+            if event != "return" or frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            name = frame.f_code.co_name
+            if name == "graph_output_dependency_names":
+                graph_name = getattr(frame.f_locals.get("subgraph"), "name", "")
+                exhausted = isinstance(result, frozenset) and any(
+                    "dependency_collection_limit" in item for item in result
+                )
+                if graph_name == "closure_warmup_body" and exhausted:
+                    observed["warmup_exhausted"] = True
+                caller = frame.f_back
+                if (
+                    graph_name == "replacement_consumer_body"
+                    and exhausted
+                    and caller is not None
+                    and caller.f_code.co_name == "subgraph_state_input_consumes_weight_rank_at_or_above_two"
+                    and caller.f_locals.get("require_floating") is True
+                ):
+                    observed["target_exhausted"] = True
+            elif name == "reserve_exact_loop_replay_traversal" and result is True:
+                caller = frame.f_back
+                if (
+                    getattr(frame.f_locals.get("replay_graph"), "name", "") == "replacement_consumer_body"
+                    and caller is not None
+                    and caller.f_code.co_name == "subgraph_state_input_consumes_weight_rank_at_or_above_two"
+                    and caller.f_locals.get("require_floating") is True
+                ):
+                    observed["floating_replay_admitted"] = True
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(observe)
+            TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+                model, tmp_path, consume_state, prior_weights, coverage_reason="lineages_per_value_limit"
+            )
+        finally:
+            sys.setprofile(previous)
+        assert observed["warmup_exhausted"], observed
+        if consume_state:
+            assert observed["target_exhausted"] and observed["floating_replay_admitted"], observed
+
+    @pytest.mark.parametrize("mode", ["nested", "skipped", "function", "independent"])
+    def test_zero_output_nested_consumers_preserve_later_weight_coverage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+        from onnx.reference.ops.op_matmul import MatMul
+
+        model, prior_weights = self._model(mode)
+        scanned_bytes = model.SerializeToString()
+        scanned_outer = next(node for node in model.graph.node if node.op_type == "Loop")
+        scanned_body = next(attribute.g for attribute in scanned_outer.attribute if attribute.name == "body")
+        scanned_inner = (
+            model.functions[0].node[0]
+            if mode == "function"
+            else next(node for node in scanned_body.node if node.op_type == "Loop")
+        )
+        assert len(scanned_inner.input) == 2 and not scanned_inner.output
+        runtime_model = inline_local_functions(deepcopy(model))
+        runtime_outer = next(node for node in runtime_model.graph.node if node.op_type == "Loop")
+        runtime_body = next(attribute.g for attribute in runtime_outer.attribute if attribute.name == "body")
+        runtime_inner = next(node for node in runtime_body.node if node.op_type == "Loop")
+        runtime_inner_body = next(attribute.g for attribute in runtime_inner.attribute if attribute.name == "body")
+        assert not runtime_inner.output and len(runtime_inner_body.output) == 1
+        # ReferenceEvaluator requires a result even for skipped loops. Carry
+        # an unused scalar only in the oracle copy; existing body nodes are unchanged.
+        runtime_inner.input.append("dummy")
+        runtime_inner.output.append("runtime_only_probe")
+        runtime_inner_body.input.append(TestOnnxRecurrenceReviewRegressions._value("runtime_only_probe_input", []))
+        runtime_inner_body.output.append(TestOnnxRecurrenceReviewRegressions._value("runtime_only_probe_input", []))
+        onnx.checker.check_model(runtime_model)
+        assert model.SerializeToString() == scanned_bytes and not scanned_inner.output
+        consumed = []
+        original_run = MatMul._run
+
+        def observe_weight(operator: Any, left: Any, right: Any) -> Any:
+            if tuple(right.shape) == (2, 2):
+                consumed.append(right.copy())
+            return original_run(operator, left, right)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(MatMul, "_run", observe_weight)
+            ReferenceEvaluator(runtime_model).run(
+                None,
+                {
+                    "A": np.zeros((1, 64), np.float32),
+                    "X": np.ones((1, 2), np.float32),
+                    "initial": np.zeros((2, 2), np.float32),
+                },
+            )
+        if mode == "skipped":
+            assert consumed == []
+        else:
+            assert len(consumed) == 2
+            if mode == "independent":
+                assert all(np.array_equal(weight, np.eye(2, dtype=np.float32)) for weight in consumed)
+            else:
+                np.testing.assert_array_equal(consumed[0], np.zeros((2, 2), np.float32))
+                np.testing.assert_array_equal(consumed[1], np.full((2, 2), 33, np.float32))
+        assert model.SerializeToString() == scanned_bytes and not scanned_inner.output
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            mode in {"nested", "function"},
+            prior_weights,
+            coverage_reason="lineages_per_value_limit",
+        )

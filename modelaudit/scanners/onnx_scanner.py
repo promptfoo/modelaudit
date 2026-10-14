@@ -5163,8 +5163,6 @@ def _build_onnx_weight_analysis_plan(
             graph_taint_work_remaining -= work
             body_outputs = node_output_names(body_node)
             body_output_slots = [str(output) for output in getattr(body_node, "output", ())]
-            if not body_outputs:
-                continue
             body_outputs_live_after = node_output_is_live_after_node.get(id(body_node), False)
             function_key = (
                 str(getattr(body_node, "domain", "")),
@@ -8748,54 +8746,7 @@ def _build_onnx_weight_analysis_plan(
                         )
                         attribute_reference_cache, external_reference_cache = reference_state
 
-                        def graph_input_reaches_target_output_bounded() -> bool | None:
-                            nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
-                            if not graph_output_name:
-                                return None
-                            tainted_names = {graph_input_name}
-                            for body_node in getattr(subgraph, "node", ()):
-                                body_inputs = node_input_names(body_node)
-                                body_outputs = node_output_names(body_node)
-                                if not body_outputs:
-                                    continue
-                                nested_attribute_references = nested_attribute_graph_references(
-                                    body_node,
-                                    attribute_reference_cache,
-                                    external_reference_cache,
-                                )
-                                has_tainted_nested_capture = any(
-                                    reference_names is None or bool(reference_names & tainted_names)
-                                    for _nested_graph, reference_names in nested_attribute_references
-                                )
-                                if has_tainted_nested_capture:
-                                    return None
-                                any_tainted_input = any(input_name in tainted_names for input_name in body_inputs)
-                                if not any_tainted_input:
-                                    continue
-                                input_walk_work = max(len(body_inputs), 1)
-                                if exact_loop_replay_work_remaining < input_walk_work:
-                                    exact_loop_replay_work_exhausted = True
-                                    return None
-                                exact_loop_replay_work_remaining -= input_walk_work
-                                function_key = (
-                                    str(getattr(body_node, "domain", "")),
-                                    str(getattr(body_node, "op_type", "")),
-                                    str(getattr(body_node, "overload", "")),
-                                )
-                                has_nested_attribute_graph = any(
-                                    True
-                                    for attribute in getattr(body_node, "attribute", ())
-                                    for _graph in _iter_attribute_graphs(attribute)
-                                )
-                                if functions.get(function_key) is not None or has_nested_attribute_graph:
-                                    return None
-                                tainted_names.update(body_outputs)
-                            return graph_output_name in tainted_names
-
                         if dependency_names_exceeded_limit(output_dependency_names):
-                            reaches_target_output = graph_input_reaches_target_output_bounded()
-                            if reaches_target_output is False:
-                                return False, initial_shape
                             return None
                         if dependency_names_exceeded_limit(potential_weight_dependency_names):
                             if not subgraph_state_input_can_reach_weight_consumer(
@@ -9178,8 +9129,6 @@ def _build_onnx_weight_analysis_plan(
                             for function_node in getattr(function_graph, "node", ()):
                                 function_inputs = node_input_names(function_node)
                                 function_outputs = node_output_names(function_node)
-                                if not function_outputs:
-                                    continue
                                 function_key = (
                                     str(getattr(function_node, "domain", "")),
                                     str(getattr(function_node, "op_type", "")),
@@ -9948,6 +9897,10 @@ def _build_onnx_weight_analysis_plan(
                     def state_weight_consumer_dependency_names_bounded(
                         subgraph: Any,
                         graph_input_name: str,
+                        reference_state: tuple[
+                            dict[int, tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]]],
+                            dict[int, tuple[Any, frozenset[str] | None]],
+                        ] = nested_reference_state,
                     ) -> frozenset[str] | None:
                         tainted_names = {graph_input_name}
                         dependency_names: set[str] = set()
@@ -9956,7 +9909,13 @@ def _build_onnx_weight_analysis_plan(
                                 return None
                             body_inputs = node_input_names(body_node)
                             body_outputs = node_output_names(body_node)
-                            if not body_outputs or not any(input_name in tainted_names for input_name in body_inputs):
+                            if not any(input_name in tainted_names for input_name in body_inputs):
+                                nested_references = nested_attribute_graph_references(body_node, *reference_state)
+                                if any(
+                                    reference_names is None or bool(reference_names & tainted_names)
+                                    for _nested_graph, reference_names in nested_references
+                                ):
+                                    return None
                                 continue
                             function_key = (
                                 str(getattr(body_node, "domain", "")),
