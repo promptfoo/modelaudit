@@ -3636,6 +3636,25 @@ def test_detect_file_format_plain_text_binint1_prefix_not_pickle(tmp_path: Path)
     assert detect_file_format_from_magic(str(payload)) != "pickle"
 
 
+def test_detect_file_format_global_text_with_missing_call_arguments_is_not_pickle(tmp_path: Path) -> None:
+    document = tmp_path / "LICENSE"
+    document.write_bytes(b"configuration\nReference\nR not a pickle")
+
+    assert detect_file_format(str(document)) == "unknown"
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("prefix", [b"I0\n", b"I0\np0\nI1\np0\n"])
+def test_detect_file_format_preserves_pickle_residual_stack(tmp_path: Path, prefix: bytes) -> None:
+    document = tmp_path / "LICENSE"
+    document.write_bytes(prefix + b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.")
+
+    assert detect_file_format(str(document)) == "pickle"
+    assert detect_file_format_from_magic(str(document)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(document)) == "pickle"
+
+
 @pytest.mark.parametrize("filename", ["LICENSE", "README.md", "notes.txt"])
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
 def test_detect_file_format_license_opcode_collision_is_not_pickle(

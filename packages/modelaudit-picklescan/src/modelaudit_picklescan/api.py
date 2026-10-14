@@ -3505,19 +3505,39 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
         has_security_opcode = False
         has_initial_global = False
         has_initial_global_call = False
+        initial_global_call_checked = False
         try:
             for opcode, _arg, pos in pickletools.genops(candidate):
                 opcode_count += 1
                 if opcode_count == 1 and opcode.name == "GLOBAL" and isinstance(_arg, str):
                     module, _, name = _arg.partition(" ")
                     has_initial_global = bool(module and name)
-                if has_initial_global and opcode.name in {"REDUCE", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST"}:
-                    has_initial_global_call = True
+                if (
+                    has_initial_global
+                    and not initial_global_call_checked
+                    and opcode.name in {"REDUCE", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ"}
+                    and pos is not None
+                ):
+                    initial_global_call_checked = True
+                    try:
+                        pickletools.dis(candidate[: pos + 1] + b".", out=io.StringIO())
+                        has_initial_global_call = True
+                    except ValueError as exc:
+                        has_initial_global_call = str(exc).startswith("stack not empty after STOP")
+                    except Exception:
+                        pass
                 if opcode.name == "STOP":
                     stop_pos = 0 if pos is None else pos
                     if not has_security_opcode:
                         try:
                             pickletools.dis(candidate[: stop_pos + 1], out=io.StringIO())
+                        except ValueError as exc:
+                            message = str(exc)
+                            if not (
+                                message.startswith("stack not empty after STOP")
+                                or (message.startswith("memo key ") and message.endswith(" already defined"))
+                            ):
+                                return False
                         except Exception:
                             return False
                     trailing = candidate[stop_pos + 1 :]

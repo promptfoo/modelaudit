@@ -4283,14 +4283,27 @@ def _looks_like_proto0_or_1_pickle(
         has_security_opcode = False
         has_initial_global = False
         has_initial_global_call = False
+        initial_global_call_checked = False
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
                 if opcode_count == 1 and opcode.name == "GLOBAL" and isinstance(_arg, str):
                     module, _, name = _arg.partition(" ")
                     has_initial_global = bool(module and name)
-                if has_initial_global and opcode.name in {"REDUCE", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST"}:
-                    has_initial_global_call = True
+                if (
+                    has_initial_global
+                    and not initial_global_call_checked
+                    and opcode.name in {"REDUCE", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ"}
+                    and _pos is not None
+                ):
+                    initial_global_call_checked = True
+                    try:
+                        pickletools.dis(candidate[: _pos + 1] + b".", out=StringIO())
+                        has_initial_global_call = True
+                    except ValueError as exc:
+                        has_initial_global_call = str(exc).startswith("stack not empty after STOP")
+                    except Exception:
+                        pass
                 if opcode.name == "STOP":
                     stop_pos = 0 if _pos is None else _pos
                     if not has_security_opcode:
@@ -4299,6 +4312,15 @@ def _looks_like_proto0_or_1_pickle(
                         # when a later opcode makes the stream malformed.
                         try:
                             pickletools.dis(candidate[: stop_pos + 1], out=StringIO())
+                        except ValueError as exc:
+                            # Unpicklers allow residual values and memo overwrite;
+                            # dis() enforces stricter compiler-style invariants.
+                            message = str(exc)
+                            if not (
+                                message.startswith("stack not empty after STOP")
+                                or (message.startswith("memo key ") and message.endswith(" already defined"))
+                            ):
+                                return False
                         except Exception:
                             return False
                     trailing = candidate[stop_pos + 1 :]

@@ -7558,7 +7558,12 @@ def test_scan_file_storage_reference_opcode_budget_is_aggregate(
 
 @pytest.mark.parametrize(
     "payload",
-    [b"Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\n", b"(R not a pickle", b"c\nplain text\n\xff"],
+    [
+        b"Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\n",
+        b"(R not a pickle",
+        b"c\nplain text\n\xff",
+        b"configuration\nReference\nR not a pickle",
+    ],
 )
 def test_scan_file_skips_license_opcode_near_matches(tmp_path: Path, payload: bytes) -> None:
     archive_path = tmp_path / "model.pt"
@@ -7596,6 +7601,27 @@ def test_scan_file_routes_execution_before_malformed_license_tail(tmp_path: Path
     )
     if tail == b"\xff":
         assert report.status != ScanStatus.COMPLETE
+
+
+@pytest.mark.parametrize("prefix", [b"I0\n", b"I0\np0\nI1\np0\n"])
+def test_scan_file_discovers_nested_payload_with_residual_stack(tmp_path: Path, prefix: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/constants", prefix + b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.")
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/constants" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and "archive/constants" in finding.location
+        for finding in report.findings
+    )
 
 
 def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:
