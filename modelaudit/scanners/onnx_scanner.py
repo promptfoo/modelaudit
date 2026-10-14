@@ -5439,6 +5439,9 @@ def _build_onnx_weight_analysis_plan(
             return None
         return output_rank
 
+    def graph_capture_container_size(attribute: Any) -> int:
+        return int(_onnx_has_singular_field(attribute, "g")) + len(getattr(attribute, "graphs", ()))
+
     def graph_capture_attribute_is_resolved(attribute: Any, resolved: Any | None) -> bool:
         if resolved is None or bool(getattr(resolved, "ref_attr_name", "")):
             return False
@@ -5474,19 +5477,20 @@ def _build_onnx_weight_analysis_plan(
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
-        # Name discovery unions structural references; scalar values cannot
-        # select a different reference set, but graph bindings can.
-        attribute_key = tuple(
-            entry
-            for entry in attribute_key
-            if (binding := (attribute_bindings or {}).get(entry[0])) is not None
-            and (
-                getattr(binding, "type", None) in {onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS}
-                or _onnx_has_singular_field(binding, "g")
-                or bool(getattr(binding, "graphs", ()))
-                or bool(getattr(binding, "ref_attr_name", ""))
+        # Legacy name discovery depends only on graph-valued bindings. Strict
+        # proof validity also depends on every used scalar binding's presence/type.
+        if not require_resolved_bindings:
+            attribute_key = tuple(
+                entry
+                for entry in attribute_key
+                if (binding := (attribute_bindings or {}).get(entry[0])) is not None
+                and (
+                    getattr(binding, "type", None) in {onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS}
+                    or _onnx_has_singular_field(binding, "g")
+                    or bool(getattr(binding, "graphs", ()))
+                    or bool(getattr(binding, "ref_attr_name", ""))
+                )
             )
-        )
         cache_key = (id(graph), attribute_key, depth, require_resolved_bindings, capture_opset_key)
         if depth > 6 or cache_key in graph_external_reference_in_progress:
             return frozenset({dependency_collection_limit_marker})
@@ -5551,15 +5555,18 @@ def _build_onnx_weight_analysis_plan(
                         graph_external_reference_in_progress.discard(cache_key)
                         graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
                         return dependency_collection_limit
-                referenced_names.update(
-                    graph_external_reference_names(
-                        function,
-                        function_attributes,
-                        depth=depth + 1,
-                        require_resolved_bindings=require_resolved_bindings,
-                        capture_opset_versions=nested_capture_opsets,
-                    )
+                function_references = graph_external_reference_names(
+                    function,
+                    function_attributes,
+                    depth=depth + 1,
+                    require_resolved_bindings=require_resolved_bindings,
+                    capture_opset_versions=nested_capture_opsets,
                 )
+                if require_resolved_bindings and dependency_names_exceeded_limit(function_references):
+                    graph_external_reference_in_progress.discard(cache_key)
+                    graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                    return dependency_collection_limit
+                referenced_names.update(function_references)
             for attribute in direct_graph_attributes(graph_node, function):
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = (attribute_bindings or {}).get(reference_name) if reference_name else attribute
@@ -5568,16 +5575,28 @@ def _build_onnx_weight_analysis_plan(
                     graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
                     return dependency_collection_limit
                 if resolved_attribute is not None:
+                    if require_resolved_bindings:
+                        container_work = graph_capture_container_size(resolved_attribute)
+                        if container_work > graph_external_function_work_remaining:
+                            graph_external_function_work_remaining = 0
+                            plan.coverage_gaps.setdefault("function_capture_work_limit", 1)
+                            graph_external_reference_in_progress.discard(cache_key)
+                            graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                            return dependency_collection_limit
+                        graph_external_function_work_remaining -= container_work
                     for subgraph in _iter_attribute_graphs(resolved_attribute):
-                        referenced_names.update(
-                            graph_external_reference_names(
-                                subgraph,
-                                attribute_bindings,
-                                depth=depth + 1,
-                                require_resolved_bindings=require_resolved_bindings,
-                                capture_opset_versions=capture_opset_versions,
-                            )
+                        subgraph_references = graph_external_reference_names(
+                            subgraph,
+                            attribute_bindings,
+                            depth=depth + 1,
+                            require_resolved_bindings=require_resolved_bindings,
+                            capture_opset_versions=capture_opset_versions,
                         )
+                        if require_resolved_bindings and dependency_names_exceeded_limit(subgraph_references):
+                            graph_external_reference_in_progress.discard(cache_key)
+                            graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                            return dependency_collection_limit
+                        referenced_names.update(subgraph_references)
         reference_names = frozenset(referenced_names - produced_names - local_names)
         if dependency_collection_limit_marker in referenced_names:
             reference_names |= dependency_collection_limit
@@ -8570,6 +8589,11 @@ def _build_onnx_weight_analysis_plan(
                                 resolved_attribute = resolve_attribute(attribute)
                                 if not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
                                     return None
+                                container_work = graph_capture_container_size(resolved_attribute)
+                                if container_work > nested_reference_work_remaining:
+                                    nested_reference_work_remaining = 0
+                                    return None
+                                nested_reference_work_remaining -= container_work
                                 for subgraph in _iter_attribute_graphs(resolved_attribute):
                                     subgraph_references = bounded_nested_external_reference_names(
                                         subgraph,
@@ -8590,6 +8614,7 @@ def _build_onnx_weight_analysis_plan(
                         ],
                         external_reference_cache: dict[int, tuple[Any, frozenset[str] | None]],
                     ) -> tuple[tuple[Any, frozenset[str] | None], ...]:
+                        nonlocal nested_reference_work_remaining
                         cache_key = id(body_node)
                         cached_references = attribute_reference_cache.get(cache_key)
                         if cached_references is not None and cached_references[0] is body_node:
@@ -8603,17 +8628,24 @@ def _build_onnx_weight_analysis_plan(
                             for attribute in direct_graph_attributes(body_node, None):
                                 resolved_attribute = resolve_attribute(attribute)
                                 if not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
-                                    graph_references.append((body_node, None))
+                                    graph_references = [(body_node, None)]
                                     break
+                                container_work = graph_capture_container_size(resolved_attribute)
+                                if container_work > nested_reference_work_remaining:
+                                    nested_reference_work_remaining = 0
+                                    graph_references = [(body_node, None)]
+                                    break
+                                nested_reference_work_remaining -= container_work
                                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                                    graph_references.append(
-                                        (
-                                            nested_graph,
-                                            bounded_nested_external_reference_names(
-                                                nested_graph, external_reference_cache
-                                            ),
-                                        )
+                                    nested_references = bounded_nested_external_reference_names(
+                                        nested_graph, external_reference_cache
                                     )
+                                    if nested_references is None:
+                                        graph_references = [(body_node, None)]
+                                        break
+                                    graph_references.append((nested_graph, nested_references))
+                                if graph_references and graph_references[-1][1] is None:
+                                    break
                             references = tuple(graph_references)
                         attribute_reference_cache[cache_key] = (body_node, references)
                         return references

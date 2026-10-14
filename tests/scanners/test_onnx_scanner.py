@@ -38441,7 +38441,9 @@ class TestOnnxRejectedCastAndPoolingProofs:
                 [value("known", [1, 64]), value("Y", [1, 2], dtype)],
                 initializer=[
                     tensor("prior", prior_weights),
-                    tensor("W", np.arange(4, dtype=np.int64).reshape(2, 2)),
+                    # FLOAT-to-FLOAT is the complete floating control; changing
+                    # INT64 to FLOAT remains unmaterialized baseline behavior.
+                    tensor("W", np.arange(4, dtype=np.float32 if target == "float" else np.int64).reshape(2, 2)),
                 ],
             ),
             opset_imports=[helper.make_opsetid("", 18)],
