@@ -290,6 +290,7 @@ def _has_execution_reference(nodes: list[ast.AST]) -> bool:
         )
         or (isinstance(node, ast.Attribute) and node.attr in PYTHON_EXECUTION_NAMES)
         or (isinstance(node, ast.alias) and node.name.split(".")[0] in PYTHON_EXECUTION_NAMES)
+        or (isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in PYTHON_EXECUTION_NAMES)
         for node in nodes
     )
 
@@ -427,6 +428,33 @@ def _command_executes_script(words: list[str]) -> bool:
     )
 
 
+def _without_literal_cat_heredocs(source: bytes) -> bytes | None:
+    lines = source.splitlines(keepends=True)
+    commands: list[bytes] = []
+    cursor = 0
+    while cursor < len(lines):
+        header = re.fullmatch(
+            rb"[ \t]*(?:\$[ \t]+)?cat[ \t]+<<(?P<tabs>-?)[ \t]*(?P<quote>['\"])"
+            rb"(?P<delimiter>[A-Za-z_]\w*)(?P=quote)[ \t]*(?:#[^\r\n]*)?\r?\n?",
+            lines[cursor],
+        )
+        if header is None:
+            commands.append(lines[cursor])
+        else:
+            cursor += 1
+            while cursor < len(lines):
+                closing = lines[cursor].rstrip(b"\r\n")
+                if header.group("tabs"):
+                    closing = closing.lstrip(b"\t")
+                if closing == header.group("delimiter"):
+                    break
+                cursor += 1
+            if cursor == len(lines):
+                return None
+        cursor += 1
+    return b"".join(commands)
+
+
 def _example_executes_script(source: bytes, language: bytes) -> bool:
     if language in {b"bibtex", b"json", b"text", b"plaintext"}:
         language = b""
@@ -458,9 +486,12 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
                 )
             ):
                 return executes_script
-    if re.search(rb"#[^\r\n]*\\\r?\n", source):
+    shell_source = _without_literal_cat_heredocs(source)
+    if shell_source is None:
         return True
-    joined = re.sub(rb"\\\r?\n", b"", source)
+    if re.search(rb"#[^\r\n]*\\\r?\n", shell_source):
+        return True
+    joined = re.sub(rb"\\\r?\n", b"", shell_source)
     try:
         for line in joined.decode("utf-8").splitlines():
             # Preserve quotes so a quoted operator remains an argument.
