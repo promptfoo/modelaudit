@@ -16,6 +16,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve call-graph detection after Python invalidates ZIP import caches, including Windows console-script launchers, while rejecting forged cache state.
 - Follow Python 3.14's lazy annotation helpers to retain detection of annotation evaluation.
 - Distinguish cached, benign string-template calls from deferred pattern imports, without treating an unreachable keyword-only import as executed; fail closed for customized patterns and unproven receiver state.
+- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
+- Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit.
 - Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
 
 ## [0.1.12](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.11...modelaudit-picklescan-v0.1.12) (2026-10-06)
