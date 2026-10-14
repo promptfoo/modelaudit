@@ -180,6 +180,7 @@ _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
 _ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_EINSUM_EQUATION_BYTE_LIMIT = 4 * _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_EINSUM_EQUATION_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_VECTOR_CONTROL_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -2128,27 +2129,75 @@ def _build_onnx_weight_analysis_plan(
         target_data_type = cast_output_data_type(node, resolve_attribute)
         return target_data_type is None or target_data_type in floating_types
 
+    vector_control_cache: dict[int, tuple[Any, tuple[int, ...] | None]] = {}
+    vector_control_work_remaining = _ONNX_VECTOR_CONTROL_WORK_LIMIT
+
     def constant_int64_vector_values(initializer: Any | None) -> tuple[int, ...] | None:
+        nonlocal vector_control_work_remaining
         if initializer is None:
             return None
+        cached = vector_control_cache.get(id(initializer))
+        if cached is not None and cached[0] is initializer:
+            return cached[1]
+        if vector_control_work_remaining <= 0:
+            plan.coverage_gaps.setdefault("vector_control_work_limit", 1)
+            return None
+        # Retaining failed source owners prevents repeated protobuf payload
+        # materialization; a full cache refuses new owners before field access.
+        vector_control_work_remaining -= 1
+        vector_control_cache[id(initializer)] = (initializer, None)
         dims: Any = getattr(initializer, "dims", ())
         if len(dims) != 1:
             return None
         element_count = int(dims[0])
         if (
-            len(dims) != 1
-            or element_count < 0
+            element_count < 0
             or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
             or int(getattr(initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
-            or _onnx_inline_storage_nbytes(initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
-            or _onnx_tensor_uses_external_storage(initializer, onnx=onnx)
         ):
             return None
-        try:
-            values = tuple(int(value) for value in onnx.numpy_helper.to_array(initializer).reshape(-1).tolist())
-        except Exception:
+        if element_count > vector_control_work_remaining:
+            plan.coverage_gaps.setdefault("vector_control_work_limit", 1)
             return None
-        return values if len(values) == element_count else None
+        vector_control_work_remaining -= element_count
+        if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
+            return None
+        # Container lengths do not materialize individual protobuf payloads.
+        if any(
+            len(getattr(initializer, field_name, ()))
+            for field_name in ("float_data", "int32_data", "double_data", "uint64_data", "string_data")
+        ):
+            plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+            return None
+        try:
+            if initializer.HasField("segment"):
+                plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+                return None
+            raw_present = bool(initializer.HasField("raw_data"))
+            typed_values = getattr(initializer, "int64_data", ())
+            if len(typed_values) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+                plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+                return None
+            # upb has no public pre-copy raw-size query: ByteSize serializes too.
+            # Read each retained source once, then validate before any decoding.
+            # This bounds repeated amplification, not the first payload copy.
+            if raw_present:
+                raw_data = initializer.raw_data
+                if getattr(initializer, "external_data", ()) and not raw_data:
+                    return None
+                if len(raw_data) != element_count * 8 or len(typed_values):
+                    plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+                    return None
+                values = tuple(int(value) for value in np.frombuffer(raw_data, dtype="<i8"))
+            else:
+                if getattr(initializer, "external_data", ()) or len(typed_values) != element_count:
+                    return None
+                values = tuple(int(value) for value in typed_values)
+        except Exception:
+            plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+            return None
+        vector_control_cache[id(initializer)] = (initializer, values)
+        return values
 
     scalar_control_cache: dict[tuple[int, int], tuple[Any, Any | None]] = {}
 

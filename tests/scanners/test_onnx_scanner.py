@@ -37581,7 +37581,10 @@ class TestOnnxBoundWeightTransformAttributes:
             ("Transpose", "perm", [1, 0], (2, 3), (3, 2), None),
             ("Transpose", "perm", [0, 1], (2, 3), (2, 3), None),
             ("Squeeze", "axes", [-2], (2, 1, 3), (2, 3), None),
-            ("Squeeze", "axes", [], (1, 2, 3), (2, 3), None),
+            # Present-empty axes disagree between ONNX's checker and reference
+            # evaluator at opset 11; use a shape where both are identities.
+            ("Squeeze", "axes", [], (2, 3), (2, 3), None),
+            ("Squeeze", "axes", [0], (1, 2, 3), (2, 3), None),
             ("Unsqueeze", "axes", [0], (3,), (1, 3), None),
             ("Unsqueeze", "axes", [-1], (3,), (3, 1), None),
             ("Reshape", "allowzero", 0, (2, 3), (2, 3), [0, 3]),
@@ -38857,6 +38860,7 @@ class TestOnnxReplayAttributeAdmission:
         self, tmp_path: Path, axes_kind: str, local_function: bool
     ) -> None:
         value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        state_shape = (64,) if axes_kind == "empty" else (1, 64)
         squeeze = helper.make_node("Squeeze", ["state"], ["view"], axes=[0])
         consumers = [squeeze, helper.make_node("MatMul", ["X", "view"], ["body_y"])]
         functions = []
@@ -38883,9 +38887,9 @@ class TestOnnxReplayAttributeAdmission:
             [
                 value("iteration", [], TensorProto.INT64),
                 value("condition_in", [], TensorProto.BOOL),
-                value("state", [1, 64]),
+                value("state", list(state_shape)),
             ],
-            [value("condition_out", [], TensorProto.BOOL), value("next_state", [1, 64])],
+            [value("condition_out", [], TensorProto.BOOL), value("next_state", list(state_shape))],
         )
         prior_weights = np.zeros((64, 64), np.float32)
         prior_weights[:5, 0] = 10
@@ -38897,14 +38901,14 @@ class TestOnnxReplayAttributeAdmission:
                     helper.make_node("Identity", ["dummy"], ["Y"]),
                 ],
                 "replay_attribute_admission",
-                [value("A", [1, 64]), value("X", [1, 64]), value("initial", [1, 64])],
+                [value("A", [1, 64]), value("X", [1, 64]), value("initial", list(state_shape))],
                 [value("known", [1, 64]), value("Y", [])],
                 initializer=[
                     tensor("prior", prior_weights),
                     tensor("two", np.int64(2)),
                     tensor("condition", np.bool_(True)),
                     tensor("dummy", np.float32(0)),
-                    *[tensor(name, np.ones((1, 64), np.float32)) for name in sources],
+                    *[tensor(name, np.ones(state_shape, np.float32)) for name in sources],
                 ],
             ),
             functions=functions,
@@ -40106,4 +40110,157 @@ class TestOnnxPrimaryEinsumEquationBudgets:
             assert eligible and all(item["output_axes"] == [1] for item in eligible)
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model, tmp_path, incomplete, prior_weights, coverage_reason="einsum_equation_byte_limit"
+        )
+
+
+class TestOnnxVectorControlBudgets:
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize(
+        "control_mode", ["valid", "typed", "empty_vector", "oversized", "malformed", "empty_raw", "segment", "work"]
+    )
+    def test_expand_controls_share_bounded_source_proofs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        local_function: bool,
+        control_mode: str,
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[3, 7] = 1000.0
+        targets = [f"target{index}" for index in range(3 if control_mode == "work" else 1)]
+        nodes = [helper.make_node("MatMul", ["X", "prior"], ["known"])]
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "ExpandWeight",
+                    ["weight", "target"],
+                    ["view"],
+                    [helper.make_node("Expand", ["weight", "target"], ["view"])],
+                    [helper.make_opsetid("", 13)],
+                )
+            )
+        outputs = [helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64])]
+        for index, target in enumerate(targets * 2):
+            view, output = f"view{index}", f"Y{index}"
+            nodes.append(
+                helper.make_node("ExpandWeight", ["W", target], [view], domain="local")
+                if local_function
+                else helper.make_node("Expand", ["W", target], [view])
+            )
+            nodes.append(helper.make_node("MatMul", ["X", view], [output]))
+            outputs.append(helper.make_tensor_value_info(output, TensorProto.FLOAT, [1, 64]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "bounded_vector_controls",
+                [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64])],
+                outputs,
+                initializer=[
+                    onnx.numpy_helper.from_array(prior_weights, name="prior"),
+                    onnx.numpy_helper.from_array(np.ones((64, 64), np.float32), name="W"),
+                    *[onnx.numpy_helper.from_array(np.array([64, 64], np.int64), name=name) for name in targets],
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        values: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        for value in values[1:]:
+            np.testing.assert_array_equal(value, np.full((1, 64), 64.0, np.float32))
+        target_tensors = [item for item in model.graph.initializer if item.name in targets]
+        coverage_reason = "vector_control_decode_failure"
+        if control_mode == "oversized":
+            target_tensors[0].raw_data += b"x" * 640
+        elif control_mode == "malformed":
+            target_tensors[0].raw_data = b"x"
+            coverage_reason = "vector_control_decode_failure"
+        elif control_mode == "empty_raw":
+            target_tensors[0].raw_data = b""
+            target_tensors[0].int64_data.extend([64, 64])
+        elif control_mode == "segment":
+            target_tensors[0].segment.begin = 0
+            target_tensors[0].segment.end = 2
+        elif control_mode == "empty_vector":
+            target_tensors[0].dims[0] = 0
+            target_tensors[0].raw_data = b""
+        elif control_mode == "typed":
+            for item in target_tensors:
+                item.ClearField("raw_data")
+                item.int64_data.extend([64, 64])
+        elif control_mode == "work":
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_VECTOR_CONTROL_WORK_LIMIT", 6)
+            coverage_reason = "vector_control_work_limit"
+        path = _save_onnx_model(model, tmp_path / "vector-controls.onnx")
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        observed: dict[str, Any] = {"queries": 0, "payload_reads": [], "owners": 0, "legacy_reads": 0, "values": []}
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if event == "c_call":
+                if (
+                    frame.f_code.co_name == "constant_int64_vector_values"
+                    and Path(frame.f_code.co_filename).resolve() == scanner_path
+                    and getattr(arg, "__name__", "") in {"ByteSize", "SerializeToString", "SerializePartialToString"}
+                ):
+                    observed["legacy_reads"] += 1
+                return
+            if event != "return":
+                return
+            name = frame.f_code.co_name
+            caller = frame.f_back
+            if name in {"_onnx_inline_storage_nbytes", "to_array"}:
+                if (
+                    caller is not None
+                    and caller.f_code.co_name == "constant_int64_vector_values"
+                    and Path(caller.f_code.co_filename).resolve() == scanner_path
+                ):
+                    observed["legacy_reads"] += 1
+                return
+            if name != "constant_int64_vector_values" or Path(frame.f_code.co_filename).resolve() != scanner_path:
+                return
+            if frame.f_locals.get("initializer") is None:
+                return
+            observed["queries"] += 1
+            if "raw_data" in frame.f_locals:
+                observed["payload_reads"].append(len(frame.f_locals["raw_data"]))
+            if "values" in frame.f_locals:
+                observed["values"].append(frame.f_locals["values"])
+            observed["owners"] = max(observed["owners"], len(frame.f_locals.get("vector_control_cache", {})))
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            result = WeightDistributionScanner().scan(str(path))
+        finally:
+            sys.setprofile(previous_profile)
+        incomplete = control_mode not in {"valid", "typed", "empty_vector"}
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is not incomplete, semantics
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        assert observed["queries"] > len(targets)
+        expected_owners = 2 if control_mode == "work" else len(targets)
+        assert observed["owners"] == expected_owners
+        assert observed["legacy_reads"] == 0
+        expected_bytes = {"valid": 16, "empty_vector": 0, "oversized": 656, "malformed": 1, "empty_raw": 0, "work": 16}
+        assert observed["payload_reads"] == (
+            [] if control_mode in {"typed", "segment"} else [expected_bytes[control_mode]] * expected_owners
+        )
+        expected_values = (
+            []
+            if control_mode in {"oversized", "malformed", "empty_raw", "segment"}
+            else [() if control_mode == "empty_vector" else (64, 64)] * expected_owners
+        )
+        assert observed["values"] == expected_values
+        if incomplete:
+            assert semantics["coverage_gaps"][coverage_reason] >= 1
+        else:
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["eligible"]
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, incomplete, prior_weights, coverage_reason=coverage_reason
         )
