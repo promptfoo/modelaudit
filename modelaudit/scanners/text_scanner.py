@@ -2048,13 +2048,11 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_last_closed_fence_end(cls, payload: bytes, start: int, end: int) -> int:
-        cursor = start
-        if start and payload[start - 1 : start] != b"\n":
-            newline = payload.find(b"\n", start, end)
-            if newline < 0:
-                return start
-            cursor = newline + 1
-        boundary = start
+        if start:
+            # A truncated window cannot distinguish an opener from an earlier fence's closer.
+            return start
+        cursor = 0
+        boundary = 0
         opening: bytes | None = None
         for line in payload[cursor:end].splitlines(keepends=True):
             fence = re.fullmatch(rb" {0,3}(`{3,}|~{3,})([^\r\n]*)\r?\n?", line)
