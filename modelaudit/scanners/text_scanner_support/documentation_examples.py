@@ -16,6 +16,7 @@ MAX_FENCES = 128
 PARSED_FENCE_LANGUAGES = frozenset({b"", b"sh", b"bash", b"shell", b"console", b"terminal", b"py", b"python"})
 FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r\n]*?)[ \t]*\r?$")
 INDENTED_CODE_BLOCK_PATTERN = re.compile(rb"(?m)^(?: {4}|\t)[^\n]*\n?(?:(?: {4}|\t)[^\n]*\n?|[ \t]*\n)*")
+BACKTICK_PATTERN = re.compile(rb"`+")
 URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
 PYTHON_EXECUTION_NAMES = frozenset(
@@ -420,9 +421,53 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
     return False
 
 
-def _indented_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
-    count = 0
+def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
+    delimiter_count = 0
     for start, end in regions:
+        delimiters: list[re.Match[bytes]] = []
+        for match in BACKTICK_PATTERN.finditer(payload, start, end):
+            delimiter_count += 1
+            if delimiter_count > MAX_FENCES * 2:
+                return True
+            delimiters.append(match)
+        next_by_length: dict[int, int] = {}
+        closing: dict[int, int] = {}
+        for index in range(len(delimiters) - 1, -1, -1):
+            delimiter = delimiters[index]
+            width = delimiter.end() - delimiter.start()
+            cursor = delimiter.start() - 1
+            while cursor >= start and payload[cursor] == ord("\\"):
+                cursor -= 1
+            # Escapes apply only while locating an opening delimiter.
+            opening_width = width - ((delimiter.start() - cursor - 1) % 2)
+            if opening_width in next_by_length:
+                closing[index] = next_by_length[opening_width]
+            next_by_length[width] = index
+        index = 0
+        while index < len(delimiters):
+            close = closing.get(index)
+            if close is None:
+                index += 1
+                continue
+            left, right = delimiters[index], delimiters[close]
+            if right.start() - left.end() > MAX_EXAMPLE_BYTES:
+                return True
+            source = payload[left.end() : right.start()].replace(b"\r", b" ").replace(b"\n", b" ").strip()
+            prefix = payload[max(start, left.start() - 64) : left.start()]
+            command_context = re.search(rb"\s|[();|&]", source) is not None or re.search(
+                rb"\b(?:run|execute|invoke|launch|source)[ \t]*$", prefix, re.IGNORECASE
+            )
+            if command_context and _example_executes_script(source, b""):
+                return True
+            index = close + 1
+    return False
+
+
+def _outside_fence_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
+    count = 0
+    inline_regions: list[tuple[int, int]] = []
+    for start, end in regions:
+        previous_end = start
         for match in INDENTED_CODE_BLOCK_PATTERN.finditer(payload, start, end):
             count += 1
             if count > MAX_FENCES or match.end() - match.start() > MAX_EXAMPLE_BYTES:
@@ -430,7 +475,10 @@ def _indented_examples_execute_script(payload: bytes, regions: list[tuple[int, i
             source = re.sub(rb"(?m)^(?: {4}|\t)", b"", match.group())
             if _example_executes_script(source, b""):
                 return True
-    return False
+            inline_regions.append((previous_end, match.start()))
+            previous_end = match.end()
+        inline_regions.append((previous_end, end))
+    return _inline_examples_execute_script(payload, inline_regions)
 
 
 def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
@@ -479,7 +527,7 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
     else:
         outside_fences.append((previous_end, len(payload)))
     if not executes_script:
-        executes_script = _indented_examples_execute_script(payload, outside_fences)
+        executes_script = _outside_fence_examples_execute_script(payload, outside_fences)
     if executes_script:
         spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
     return tuple(spans)
