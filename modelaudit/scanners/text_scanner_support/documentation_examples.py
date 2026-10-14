@@ -13,6 +13,7 @@ from modelaudit.detectors.network_comm import NetworkCommDetector
 
 MAX_EXAMPLE_BYTES = 16 * 1024
 MAX_FENCES = 128
+EXECUTABLE_FENCE_LANGUAGES = frozenset({b"", b"sh", b"bash", b"shell", b"console", b"terminal", b"py", b"python"})
 FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>\w*)[ \t]*\r?$")
 URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
@@ -291,6 +292,8 @@ def _python_url_spans(source: bytes) -> list[tuple[int, int]]:
 
 
 def _command_executes_script(words: list[str]) -> bool:
+    while words and words[0] in {"$", ">", ">>>"}:
+        words = words[1:]
     if words[:2] in (["command", "-v"], ["command", "-V"]):
         return False
     wrapped = False
@@ -302,8 +305,12 @@ def _command_executes_script(words: list[str]) -> bool:
     if not words or _setup_command_urls(words) is not None:
         return False
     command = words[0].rsplit("/", 1)[-1].lower().removesuffix(".exe")
-    if (wrapped and command.startswith("-")) or command.endswith(
-        (".py", ".pyw", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd")
+    if (
+        words[0].startswith("$")
+        or (wrapped and command.startswith("-"))
+        or command.endswith(
+            (".py", ".pyw", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd")
+        )
     ):
         return True
     python_command = re.fullmatch(r"(?:python[23]?|pypy3?)(?:\.\d+)?", command) is not None
@@ -319,6 +326,7 @@ def _command_executes_script(words: list[str]) -> bool:
             "dash",
             "ksh",
             "source",
+            "eval",
             ".",
             "node",
             "nodejs",
@@ -336,17 +344,36 @@ def _command_executes_script(words: list[str]) -> bool:
 
 
 def _example_executes_script(source: bytes, language: bytes) -> bool:
-    if language in {b"py", b"python"}:
+    if language in {b"", b"py", b"python"}:
         try:
-            nodes = ast.walk(ast.parse(source.decode("utf-8")))
+            tree = ast.parse(source.decode("utf-8"))
+            nodes = list(ast.walk(tree))
         except (UnicodeDecodeError, SyntaxError, ValueError, RecursionError):
-            return True
-        return any(
-            (isinstance(node, ast.Name) and node.id in PYTHON_EXECUTION_NAMES)
-            or (isinstance(node, ast.Attribute) and node.attr in PYTHON_EXECUTION_NAMES)
-            or (isinstance(node, ast.alias) and node.name.split(".")[0] in PYTHON_EXECUTION_NAMES)
-            for node in nodes
-        )
+            if language:
+                return True
+        else:
+            executes_script = any(
+                (isinstance(node, ast.Name) and node.id in PYTHON_EXECUTION_NAMES)
+                or (isinstance(node, ast.Attribute) and node.attr in PYTHON_EXECUTION_NAMES)
+                or (isinstance(node, ast.alias) and node.name.split(".")[0] in PYTHON_EXECUTION_NAMES)
+                for node in nodes
+            )
+            if (
+                language
+                or executes_script
+                or any(
+                    isinstance(
+                        node,
+                        (ast.Call, ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.Import, ast.ImportFrom),
+                    )
+                    for node in nodes
+                )
+                or all(
+                    isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+                    for statement in tree.body
+                )
+            ):
+                return executes_script
     if re.search(rb"#[^\r\n]*\\\r?\n", source):
         return True
     joined = re.sub(rb"\\\r?\n", b" ", source)
@@ -357,6 +384,8 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
             lexer.whitespace_split = True
             words: list[str] = []
             for raw in lexer:
+                if "`" in raw and not (raw.startswith("'") and raw.endswith("'")):
+                    return True
                 if raw and all(char in ";&|()" for char in raw):
                     if _command_executes_script(words):
                         return True
@@ -397,7 +426,7 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
         ):
             source = payload[start:end]
-            if language in {b"sh", b"bash", b"shell", b"py", b"python"}:
+            if language in EXECUTABLE_FENCE_LANGUAGES:
                 executes_script |= _example_executes_script(source, language)
             examples = (
                 _shell_url_spans(source)
@@ -407,10 +436,10 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
                 else []
             )
             spans.extend((start + left, start + right) for left, right in examples)
-        elif language in {b"sh", b"bash", b"shell", b"py", b"python"}:
+        elif language in EXECUTABLE_FENCE_LANGUAGES:
             executes_script = True
         opening = None
-    if opening is not None and opening.group("language").lower() in {b"sh", b"bash", b"shell", b"py", b"python"}:
+    if opening is not None and opening.group("language").lower() in EXECUTABLE_FENCE_LANGUAGES:
         executes_script = True
     if executes_script:
         spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
