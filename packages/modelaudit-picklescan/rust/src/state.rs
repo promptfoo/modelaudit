@@ -8935,6 +8935,54 @@ mod tests {
     }
 
     #[test]
+    fn template_unicode_byte_stream_preserves_lookup_proof_and_callbacks() {
+        let options = default_test_options();
+        let cases: &[(&[u8], bool)] = &[
+            (br"\u0024$x", false),
+            (br"\\u0024$x", true),
+            (br"\\\u0024$x", false),
+            (br"\\\\u0024$x", true),
+            (br"\U00000024$x", false),
+            (br"\\U00000024$x", true),
+            (br"\\\U00000024$x", false),
+            (br"\\\\U00000024$x", true),
+            (br"\ud800$x", true),
+            (br"\U0000dfff$x", true),
+            (br"\q$x", true),
+            (br"\", false),
+            (br"\u0024x", true),
+            (b"\xff$x", true),
+            (br"\u00e9$x", true),
+            (br"\U0001f40d$x", true),
+        ];
+        for method in ["Template.substitute", "Template.safe_substitute"] {
+            for (raw, lookup) in cases {
+                let mut payload = b"\x80\x04ccollections\ndefaultdict\ncbuiltins\nhelp\n\x85Rq\x000cstring\nTemplate\nV".to_vec();
+                payload.extend_from_slice(raw);
+                payload.extend_from_slice(b"\n\x85Rq\x010cstring\n");
+                payload.extend_from_slice(method.as_bytes());
+                payload.extend_from_slice(b"\nh\x01h\x00\x86R.");
+                let scan = run_test_scan("template-unicode.pkl", &payload, &options);
+                let invocation = scan
+                    .callable_invocations
+                    .iter()
+                    .find(|details| detail_string(details, "name").as_deref() == Some(method))
+                    .expect("Template invocation");
+                assert!(invocation.iter().any(|(key, value)| {
+                    key == "template_mapping_callbacks_complete"
+                        && matches!(value, DetailValue::Bool(proven) if *proven != *lookup)
+                }));
+                assert_ne!(scan.template_execution_is_complete(), *lookup);
+                let help = scan.callable_invocations.iter().any(|details| {
+                    detail_string(details, "module").as_deref() == Some("builtins")
+                        && detail_string(details, "name").as_deref() == Some("help")
+                });
+                assert_eq!(help, *lookup);
+            }
+        }
+    }
+
+    #[test]
     fn template_reduce_byte_stream_retains_complete_mapping_metadata() {
         let options = default_test_options();
         for (mapping, expected) in [

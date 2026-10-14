@@ -9645,6 +9645,119 @@ def test_scan_bytes_keeps_operator_percent_defaultdict_without_mapping_fields_cl
     )
 
 
+def _assert_template_raw_unicode_lookup(
+    tmp_path: Path,
+    method_name: str,
+    raw_template: bytes,
+    expected_template: str,
+    expected_result: str,
+    lookup: bool,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "unicode_factory_marker"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
+        "def help(*args, **kwargs):\n    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    placeholder = "raw-unicode-template"
+    payload = _builtins_help_defaultdict_template_payload(method_name, placeholder)
+    operand = _unicode_operand(placeholder)
+    assert payload.count(operand) == 1
+    payload = payload.replace(operand, b"V" + raw_template + b"\n", 1)
+    child_code = """
+import collections
+import pickle
+import pickletools
+import string
+import sys
+from pathlib import Path
+
+string.Template("warm").substitute({})
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, Severity, scan_bytes
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+method_name = sys.argv[4]
+expected_template = bytes.fromhex(sys.argv[5]).decode("utf-8", "surrogatepass")
+expected_result = bytes.fromhex(sys.argv[6]).decode("utf-8", "surrogatepass")
+lookup = sys.argv[7] == "True"
+decoded = [arg for opcode, arg, _ in pickletools.genops(payload) if opcode.name == "UNICODE"]
+assert decoded == [expected_template], decoded
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+
+report = scan_bytes(payload, source="raw-unicode-template.pkl")
+assert not marker.exists(), "scanning executed the defaultdict factory"
+assert pickle.loads(payload) == expected_result
+if lookup:
+    assert marker.read_text() == "pydoc-owned"
+else:
+    assert not marker.exists()
+invocations = report.metadata["callable_invocations"]
+template_call = next(item for item in invocations
+                     if item.get("module") == "string" and item.get("name") == method_name)
+assert template_call.get("template_mapping_callbacks_complete") is (not lookup), template_call
+assert all(item.get("template_execution_complete") is (not lookup) for item in invocations), report
+help_called = any(item.get("module") == "builtins" and item.get("name") == "help"
+                  and item.get("positional_arg_count") == 0 for item in invocations)
+assert help_called is lookup, report
+
+if lookup:
+    assert report.verdict == SafetyVerdict.MALICIOUS, report
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "_sitebuiltins"
+        and finding.details.get("name") == "_Helper.__call__"
+        and finding.details.get("sink") == "builtins.__import__"
+        for finding in report.findings
+    ), report
+else:
+    assert not marker.exists()
+    assert report.status == ScanStatus.COMPLETE, report
+    assert report.verdict == SafetyVerdict.CLEAN, report
+"""
+    _assert_isolated_python(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            method_name,
+            expected_template.encode("utf-8", "surrogatepass").hex(),
+            expected_result.encode("utf-8", "surrogatepass").hex(),
+            str(lookup),
+        ],
+    )
+    assert marker.exists() is lookup
+
+
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+@pytest.mark.parametrize("escape", ["u0024", "U00000024"])
+@pytest.mark.parametrize("slash_count", [1, 2, 3, 4])
+def test_template_raw_unicode_backslash_pairs_preserve_factory_lookup(
+    tmp_path: Path, method_name: str, escape: str, slash_count: int
+) -> None:
+    raw = b"\\" * slash_count + escape.encode("ascii") + b"$x"
+    lookup = slash_count % 2 == 0
+    prefix = "\\" * (slash_count if lookup else slash_count - 1)
+    expected_template = prefix + (escape + "$x" if lookup else "$$x")
+    expected_result = prefix + (escape + "factory-value" if lookup else "$x")
+    _assert_template_raw_unicode_lookup(tmp_path, method_name, raw, expected_template, expected_result, lookup)
+
+
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_template_raw_unicode_surrogate_prefix_keeps_factory_lookup(tmp_path: Path, method_name: str) -> None:
+    _assert_template_raw_unicode_lookup(tmp_path, method_name, b"\\ud800$x", "\ud800$x", "\ud800factory-value", True)
+
+
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 def test_scan_bytes_blocks_template_defaultdict_factory_rce(tmp_path: Path, method_name: str) -> None:
     module_dir = tmp_path / "modules"

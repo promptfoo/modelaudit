@@ -13,6 +13,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve backslash pairs in protocol 0 Unicode operands so Template callbacks remain detectable.
 - Report incomplete coverage for unmodeled string-template mapping callbacks and unavailable frozen callable bodies, preserving known dangerous callback findings.
 - Keep speculative ZIP directory metadata private so a rejected importer check cannot leave stale shared cache state.
 
