@@ -8,6 +8,8 @@ import os
 import re
 import token
 import tokenize
+from bisect import bisect_right
+from functools import lru_cache
 from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -757,8 +759,15 @@ BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\s+(?:production|generation|creation)\s+(?:may|might|could)\s+be\s+possible\b"
     rb"(?=[.;]?\s*$|[.;]\s*review\s+generated\s+outputs\.?\s*$"
+    rb"|(?:\s+and|[.;]\s*(?:it|this\s+capability))\s+is\s+enabled\s+by\s+default\.?\s*$"
     rb"|,\s*and\s+developers\s+should\s+ensure\s+that\s+their\s+applications\s+do\s+not\s+violate\s+"
     rb"applicable\s+laws\s+and\s+regulations\.?\s*$)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_MISUSE_BEHAVIOR_CLAIM_PATTERN = re.compile(
+    rb"\b(?:it|(?:the|this)\s+(?:model|code|script|capability))\s+"
+    rb"(?:(?:will|automatically)\s+|is\s+(?:configured|designed)\s+to\s+)*"
+    rb"(?:installs?|executes?|exfiltrates?|downloads?|launches?|deploys?|runs?)\b",
     re.IGNORECASE,
 )
 GENERIC_CC_PROSE_PATTERNS = frozenset({"backdoor", "botnet", "malware", "trojan", "zombie"})
@@ -2056,30 +2065,41 @@ class TextScanner(BaseScanner):
         return False
 
     @classmethod
-    def _documentation_last_closed_fence_end(cls, payload: bytes, start: int, end: int) -> int:
-        if end > MAX_TEXT_FENCE_CONTEXT_BYTES:
-            return start
+    @lru_cache(maxsize=4)
+    def _documentation_fence_boundaries(cls, context: bytes) -> tuple[tuple[int, ...], int]:
         cursor = 0
         boundary = 0
+        boundaries: list[int] = []
         opening: bytes | None = None
         markers = 0
-        for line in payload[:end].splitlines(keepends=True):
+        for line in context.splitlines(keepends=True):
             fence = re.fullmatch(rb" {0,3}(`{3,}|~{3,})([^\r\n]*)\r?\n?", line)
             if fence is not None:
                 markers += 1
                 if markers > MAX_TEXT_FENCE_MARKERS:
-                    return start
+                    return tuple(boundaries), cursor
                 delimiter, info = fence.groups()
                 if opening is None:
                     if (delimiter[:1] != b"`" or b"`" not in info) and not cls._documentation_prefix_has_enclosing_call(
-                        payload[max(boundary, cursor - MAX_TEXT_FINDING_CONTEXT_BYTES) : cursor]
+                        context[max(boundary, cursor - MAX_TEXT_FINDING_CONTEXT_BYTES) : cursor]
                     ):
                         opening = delimiter
                 elif delimiter[:1] == opening[:1] and len(delimiter) >= len(opening) and not info.strip():
                     boundary = cursor + len(line)
+                    boundaries.append(boundary)
                     opening = None
             cursor += len(line)
-        return max(start, boundary)
+        return tuple(boundaries), len(context)
+
+    @classmethod
+    def _documentation_last_closed_fence_end(cls, payload: bytes, start: int, end: int) -> int:
+        if end > MAX_TEXT_FENCE_CONTEXT_BYTES:
+            return start
+        boundaries, parsed_end = cls._documentation_fence_boundaries(payload[:MAX_TEXT_FENCE_CONTEXT_BYTES])
+        if end > parsed_end:
+            return start
+        index = bisect_right(boundaries, end)
+        return max(start, boundaries[index - 1] if index else 0)
 
     @classmethod
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
@@ -2427,6 +2447,8 @@ class TextScanner(BaseScanner):
         absolute_position = finding["position"]
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         context = payload[absolute_position - position : context_end]
+        if DOCUMENTATION_MISUSE_BEHAVIOR_CLAIM_PATTERN.search(context) is not None:
+            return False
         paragraph_end = re.search(rb"\r?\n[ \t]*\r?\n", context)
         if paragraph_end is None and context_end < len(payload):
             return False
