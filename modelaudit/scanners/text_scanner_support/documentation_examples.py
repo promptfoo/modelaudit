@@ -460,7 +460,7 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
                 return executes_script
     if re.search(rb"#[^\r\n]*\\\r?\n", source):
         return True
-    joined = re.sub(rb"\\\r?\n", b" ", source)
+    joined = re.sub(rb"\\\r?\n", b"", source)
     try:
         for line in joined.decode("utf-8").splitlines():
             # Preserve quotes so a quoted operator remains an argument.
@@ -468,7 +468,9 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
             lexer.whitespace_split = True
             words: list[str] = []
             for raw in lexer:
-                if "`" in raw and not (raw.startswith("'") and raw.endswith("'")):
+                if not (raw.startswith("'") and raw.endswith("'")) and any(
+                    len(match.group(1)) % 2 == 0 for match in re.finditer(r"(\\*)(?:`|\$\()", raw)
+                ):
                     return True
                 if raw and all(char in ";&|()" for char in raw):
                     if _command_executes_script(words):

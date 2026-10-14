@@ -2046,6 +2046,29 @@ class TextScanner(BaseScanner):
             previous_line_end = previous_line_start - 1
         return False
 
+    @staticmethod
+    def _documentation_last_closed_fence_end(payload: bytes, start: int, end: int) -> int:
+        cursor = start
+        if start and payload[start - 1 : start] != b"\n":
+            newline = payload.find(b"\n", start, end)
+            if newline < 0:
+                return start
+            cursor = newline + 1
+        boundary = start
+        opening: bytes | None = None
+        for line in payload[cursor:end].splitlines(keepends=True):
+            fence = re.fullmatch(rb" {0,3}(`{3,}|~{3,})([^\r\n]*)\r?\n?", line)
+            if fence is not None:
+                delimiter, info = fence.groups()
+                if opening is None:
+                    if delimiter[:1] != b"`" or b"`" not in info:
+                        opening = delimiter
+                elif delimiter[:1] == opening[:1] and len(delimiter) >= len(opening) and not info.strip():
+                    boundary = cursor + len(line)
+                    opening = None
+            cursor += len(line)
+        return boundary
+
     @classmethod
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
         line_start = payload.rfind(b"\n", 0, position) + 1
@@ -2057,6 +2080,7 @@ class TextScanner(BaseScanner):
         current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
 
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context_start = cls._documentation_last_closed_fence_end(payload, context_start, line_start)
         previous_line_end = line_start - 1
         while previous_line_end >= context_start:
             previous_line_start = max(
@@ -2065,8 +2089,6 @@ class TextScanner(BaseScanner):
             )
             previous_line = payload[previous_line_start:previous_line_end]
             stripped = previous_line.strip()
-            if stripped.startswith((b"```", b"~~~")):
-                return False
             if stripped and not stripped.startswith(b"#"):
                 previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
                 if current_indent == 0 and previous_indent == 0:
