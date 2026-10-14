@@ -3751,6 +3751,12 @@ def _build_onnx_weight_analysis_plan(
                 )
                 for attribute in getattr(body_node, "attribute", ())
             )
+            if (
+                standard_reentry_operator
+                and body_node.op_type in weight_transform_attribute_types
+                and weight_transform_proof_error(body_node, resolve_attribute=resolve_reentry_attribute) is not None
+            ):
+                attributes_proven = False
             standard_reentry_operator = standard_reentry_operator and attributes_proven
             is_shape_query = standard_reentry_operator and body_node.op_type in {"Shape", "Size"}
             data_input_promoted = bool(body_inputs and body_inputs[0] in promoted)
@@ -7491,6 +7497,25 @@ def _build_onnx_weight_analysis_plan(
             int_sequence_attribute_cache[key] = (node, result)
             return result
 
+        def expand_target_shape(name: str) -> tuple[int, ...] | None:
+            if graph_input_is_runtime_overridable(name, graph_input_names, constants):
+                return None
+            target_shape = constant_int64_vector_values(constants.get(name)) if name not in dynamic_values else None
+            if target_shape is None:
+                producers = graph_output_producer_nodes_by_name(current_graph).get(name, ())
+                if len(producers) == 1:
+                    producer = producers[0]
+                    if (
+                        builtin_operator(producer)
+                        and producer.op_type == "Shape"
+                        and len(producer.input) == 1
+                        and not producer.attribute
+                    ):
+                        target_shape = proven_value_shape(str(producer.input[0]))
+            if target_shape is None or any(dimension < 0 for dimension in target_shape):
+                return None
+            return target_shape
+
         def value_is_proven_nonempty_uniform(name: str) -> bool:
             for depth in range(7):
                 shape = proven_value_shape(name)
@@ -7508,18 +7533,11 @@ def _build_onnx_weight_analysis_plan(
                     if len(producer.input) != 2:
                         return False
                     extent_name = str(producer.input[1])
-                    extents = constant_int64_vector_values(constants.get(extent_name))
-                    if extents is None and producer.op_type == "Expand":
-                        extent_producers = graph_output_producer_nodes_by_name(current_graph).get(extent_name, ())
-                        if len(extent_producers) == 1:
-                            extent_producer = extent_producers[0]
-                            if (
-                                builtin_operator(extent_producer)
-                                and extent_producer.op_type == "Shape"
-                                and len(extent_producer.input) == 1
-                                and not extent_producer.attribute
-                            ):
-                                extents = proven_value_shape(str(extent_producer.input[0]))
+                    extents = (
+                        expand_target_shape(extent_name)
+                        if producer.op_type == "Expand"
+                        else constant_int64_vector_values(constants.get(extent_name))
+                    )
                     if extents is None or any(dimension <= 0 for dimension in extents):
                         return False
                 structural_alias = producer.op_type in {
@@ -8884,6 +8902,8 @@ def _build_onnx_weight_analysis_plan(
                             body_node: Any,
                             body_inputs: Sequence[str],
                         ) -> tuple[int, ...] | None:
+                            if weight_transform_proof_error(body_node, resolve_attribute=resolve_attribute) is not None:
+                                return None
                             data_input_shape = known_input_shape(body_inputs[0]) if body_inputs else None
                             index_input_shape = known_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None
                             if index_input_shape is None and len(body_inputs) > 1:
@@ -9063,6 +9083,11 @@ def _build_onnx_weight_analysis_plan(
                                 function_node: Any,
                                 function_inputs: Sequence[str],
                             ) -> tuple[int, ...] | None:
+                                if (
+                                    weight_transform_proof_error(function_node, resolve_attribute=function_attribute)
+                                    is not None
+                                ):
+                                    return None
                                 data_input_shape = (
                                     local_known_input_shape(function_inputs[0]) if function_inputs else None
                                 )
@@ -12978,6 +13003,17 @@ def _build_onnx_weight_analysis_plan(
                                 flattened_shape_extent(transform_input_shape[:axis]),
                                 flattened_shape_extent(transform_input_shape[axis:]),
                             )
+                elif node.op_type == "Expand" and len(input_names) == 2:
+                    expand_input_shape = proven_value_shape(input_names[0])
+                    target_shape = expand_target_shape(input_names[1])
+                    if (
+                        expand_input_shape is not None
+                        and all(dimension >= 0 for dimension in expand_input_shape)
+                        and target_shape is not None
+                    ):
+                        transform_output_shape = broadcast_shapes((expand_input_shape, target_shape))
+                        if transform_output_shape is not None:
+                            transform_output_rank = len(transform_output_shape)
                 elif node.op_type == "Reshape" and len(input_names) > 1:
                     shape_initializer = constants.get(input_names[1])
                     target_shape = constant_int64_vector_values(shape_initializer)

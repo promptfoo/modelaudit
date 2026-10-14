@@ -38846,3 +38846,131 @@ class TestOnnxSiblingReplayShapeAdmission:
             prior_weights,
             coverage_reason="lineages_per_value_limit",
         )
+
+
+class TestOnnxReplayAttributeAdmission:
+    @pytest.mark.parametrize("axes_kind", ["valid", "empty", "absent", "floats"])
+    @pytest.mark.parametrize("local_function", [False, True])
+    def test_finite_replay_rejects_malformed_squeeze_axes(
+        self, tmp_path: Path, axes_kind: str, local_function: bool
+    ) -> None:
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        squeeze = helper.make_node("Squeeze", ["state"], ["view"], axes=[0])
+        consumers = [squeeze, helper.make_node("MatMul", ["X", "view"], ["body_y"])]
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "ConsumeSqueezedState",
+                    ["state", "X"],
+                    ["body_y"],
+                    consumers,
+                    [helper.make_opsetid("", 11)],
+                )
+            )
+            consumers = [helper.make_node("ConsumeSqueezedState", ["state", "X"], ["body_y"], domain="local")]
+        sources = [f"replacement_{index}" for index in range(33)]
+        body = helper.make_graph(
+            [
+                *consumers,
+                helper.make_node("Sum", sources, ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "typed_replay_squeeze",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", [1, 64]),
+            ],
+            [value("condition_out", [], TensorProto.BOOL), value("next_state", [1, 64])],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Loop", ["two", "condition", "initial"], ["unused_final"], body=body),
+                    helper.make_node("Identity", ["dummy"], ["Y"]),
+                ],
+                "replay_attribute_admission",
+                [value("A", [1, 64]), value("X", [1, 64]), value("initial", [1, 64])],
+                [value("known", [1, 64]), value("Y", [])],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("two", np.int64(2)),
+                    tensor("condition", np.bool_(True)),
+                    tensor("dummy", np.float32(0)),
+                    *[tensor(name, np.ones((1, 64), np.float32)) for name in sources],
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 11), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        actual_body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+        transform = model.functions[0].node[0] if local_function else actual_body.node[0]
+        if axes_kind == "absent":
+            del transform.attribute[:]
+        elif axes_kind == "empty":
+            transform.attribute[0].CopyFrom(onnx.AttributeProto(name="axes", type=onnx.AttributeProto.INTS))
+        onnx.checker.check_model(model, full_check=True)
+        if axes_kind == "floats":
+            transform.attribute[0].CopyFrom(helper.make_attribute("axes", [0.0]))
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            axes_kind == "floats",
+            prior_weights,
+            coverage_reason="lineages_per_value_limit",
+        )
+
+
+class TestOnnxExpandProofAdmission:
+    @pytest.mark.parametrize("overridable_target", [False, True])
+    def test_expand_proof_preserves_immutable_bound_formals(self, tmp_path: Path, overridable_target: bool) -> None:
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        function = helper.make_function(
+            "local",
+            "ExpandView",
+            ["data", "target"],
+            ["view"],
+            [helper.make_node("Expand", ["data", "target"], ["view"])],
+            [helper.make_opsetid("", 13)],
+        )
+        sources = [f"source_{index}" for index in range(33)]
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        inputs = [value("A", [1, 64]), value("X", [1, 4])]
+        if overridable_target:
+            inputs.append(value("target", [1], TensorProto.INT64))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Sum", sources, ["summed"]),
+                    helper.make_node("ExpandView", ["summed", "target"], ["expanded"], domain="local"),
+                    helper.make_node("MatMul", ["X", "expanded"], ["Y"]),
+                ],
+                "bound_expand_shape_proof",
+                inputs,
+                [value("known", [1, 64]), value("Y", [1])],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("target", np.array([4], np.int64)),
+                    *[tensor(name, np.ones(4, np.float32)) for name in sources],
+                ],
+            ),
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            overridable_target,
+            prior_weights,
+            coverage_reason="lineages_per_value_limit",
+        )
