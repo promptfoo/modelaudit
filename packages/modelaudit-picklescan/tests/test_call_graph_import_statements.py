@@ -7023,6 +7023,15 @@ if marker.exists():
         (
             _builtins_help_call_iterator_operator_payload(
                 "ior",
+                _constructed_call_operand("collections", "defaultdict", b"N"),
+                b"h\x00",
+            ),
+            "[('owned-key', 'owned-value'), 'stop']",
+            "defaultdict(None, {'owned-key': 'owned-value'})",
+        ),
+        (
+            _builtins_help_call_iterator_operator_payload(
+                "ior",
                 _constructed_call_operand("collections", "OrderedDict"),
                 b"h\x00",
             ),

@@ -582,7 +582,7 @@ fn stack_value_memo_read(value: Option<&StackValue>) -> bool {
         Some(StackValue::Text { memo_read, .. } | StackValue::TextSpan { memo_read, .. }) => {
             *memo_read
         }
-        Some(StackValue::Global(reference) | StackValue::Constructed(reference)) => {
+        Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. }) => {
             reference.memo_read
         }
         _ => false,
@@ -1178,7 +1178,7 @@ impl<'a> ScanState<'a> {
                 value.len()
             }
             StackValue::Global(reference)
-            | StackValue::Constructed(reference)
+            | StackValue::Constructed { reference, .. }
             | StackValue::DefaultDict {
                 default_factory: reference,
             }
@@ -1245,7 +1245,6 @@ impl<'a> ScanState<'a> {
             }
             | StackValue::Mark
             | StackValue::ExternalBuffer
-            | StackValue::DefaultDictNoFactory
             | StackValue::Other => 0,
         }
     }
@@ -1253,11 +1252,10 @@ impl<'a> ScanState<'a> {
     fn tracked_dict_value_is_security_relevant(value: &StackValue) -> bool {
         match value {
             StackValue::Global(_)
-            | StackValue::Constructed(_)
+            | StackValue::Constructed { .. }
             | StackValue::CallIterator { .. }
             | StackValue::CallIteratorTuple { .. }
             | StackValue::DefaultDict { .. }
-            | StackValue::DefaultDictNoFactory
             | StackValue::DynamicType { .. }
             | StackValue::TrackedDict { .. }
             | StackValue::MappingWrapper { .. }
@@ -2424,7 +2422,7 @@ impl<'a> ScanState<'a> {
             keyword_arg_names,
         ) = match opcode.name {
             "REDUCE" | "NEWOBJ" => {
-                let Some(values) = self.consume_top_operand_values(2) else {
+                let Some(values) = self.consume_top_operand_values(2, opcode.name) else {
                     return Vec::new();
                 };
                 (
@@ -2436,7 +2434,7 @@ impl<'a> ScanState<'a> {
                 )
             }
             "NEWOBJ_EX" => {
-                let Some(values) = self.consume_top_operand_values(3) else {
+                let Some(values) = self.consume_top_operand_values(3, opcode.name) else {
                     return Vec::new();
                 };
                 (
@@ -2473,7 +2471,10 @@ impl<'a> ScanState<'a> {
                     memo_read: false,
                 };
                 self.record_global_ref(&reference, opcode.name);
-                self.push_stack_value(StackValue::Constructed(reference.clone()));
+                self.push_stack_value(StackValue::Constructed {
+                    reference: reference.clone(),
+                    defaultdict_without_factory: false,
+                });
                 (
                     Some(StackValue::Global(reference)),
                     Some(values.len()),
@@ -2483,7 +2484,7 @@ impl<'a> ScanState<'a> {
                 )
             }
             "BUILD" => {
-                let values = self.consume_top_operand_values(2);
+                let values = self.consume_top_operand_values(2, opcode.name);
                 let callable_value = values.as_ref().and_then(|items| items.first()).cloned();
                 let build_uses_slot_state = values
                     .as_ref()
@@ -2577,7 +2578,7 @@ impl<'a> ScanState<'a> {
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
-            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+            Some(StackValue::Constructed { reference, .. }) if !reference.malformed => {
                 let reference = match op_name {
                     "REDUCE" | "OBJ" => Self::constructed_callable_reference(reference),
                     _ => reference.clone(),
@@ -2592,7 +2593,7 @@ impl<'a> ScanState<'a> {
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+            Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
                 if reference.module == "copyreg.extension" =>
             {
                 Some(CallableInvocation {
@@ -3764,7 +3765,11 @@ impl<'a> ScanState<'a> {
         if !(1..=2).contains(&arguments.len()) {
             return Vec::new();
         }
-        let Some(StackValue::Constructed(receiver_reference)) = arguments.first() else {
+        let Some(StackValue::Constructed {
+            reference: receiver_reference,
+            ..
+        }) = arguments.first()
+        else {
             return Vec::new();
         };
         Self::format_invocation(receiver_reference, op_name, position)
@@ -3785,7 +3790,7 @@ impl<'a> ScanState<'a> {
             .iter()
             .skip(1)
             .filter_map(|argument| match argument {
-                StackValue::Constructed(reference) => {
+                StackValue::Constructed { reference, .. } => {
                     Self::format_invocation(reference, op_name, position)
                 }
                 _ => None,
@@ -4556,7 +4561,9 @@ impl<'a> ScanState<'a> {
             return true;
         };
         match mapping {
-            StackValue::DefaultDictNoFactory => true,
+            StackValue::Constructed { reference, defaultdict_without_factory: true } => {
+                !reference.malformed && reference.module == "collections" && reference.name == "defaultdict"
+            }
             StackValue::DefaultDict { default_factory } => {
                 // Its factory call is emitted separately. Only this reviewed factory
                 // also proves that converting the returned value cannot call user code.
@@ -4586,7 +4593,10 @@ impl<'a> ScanState<'a> {
                                     | StackValue::TextSpan { .. }
                                     | StackValue::Bytes { .. }
                                     | StackValue::Primitive { .. }
-                                    | StackValue::DefaultDictNoFactory
+                            ) || matches!(
+                                value,
+                                StackValue::Constructed { reference, defaultdict_without_factory: true }
+                                    if !reference.malformed && reference.module == "collections" && reference.name == "defaultdict"
                             )
                         })
             }
@@ -5076,7 +5086,7 @@ impl<'a> ScanState<'a> {
 
     fn is_constructed_builtin_instance(value: Option<&StackValue>, name: &str) -> bool {
         match value {
-            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+            Some(StackValue::Constructed { reference, .. }) if !reference.malformed => {
                 matches!(
                     reference.module.as_str(),
                     "builtins" | "__builtin__" | "__builtins__"
@@ -5101,7 +5111,8 @@ impl<'a> ScanState<'a> {
     ) -> bool {
         match value {
             Some(
-                StackValue::Constructed(reference) | StackValue::MappingWrapper { reference, .. },
+                StackValue::Constructed { reference, .. }
+                | StackValue::MappingWrapper { reference, .. },
             ) if !reference.malformed => reference.module == module && reference.name == name,
             _ => false,
         }
@@ -5267,9 +5278,15 @@ impl<'a> ScanState<'a> {
                 reference.memo_index = Some(index);
                 StackValue::Global(reference)
             }
-            StackValue::Constructed(mut reference) => {
+            StackValue::Constructed {
+                mut reference,
+                defaultdict_without_factory,
+            } => {
                 reference.memo_index = Some(index);
-                StackValue::Constructed(reference)
+                StackValue::Constructed {
+                    reference,
+                    defaultdict_without_factory,
+                }
             }
             StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
                 type_name,
@@ -5329,11 +5346,17 @@ impl<'a> ScanState<'a> {
                 reference.memo_read |= memo_read;
                 StackValue::Global(reference)
             }
-            StackValue::Constructed(reference) => {
+            StackValue::Constructed {
+                reference,
+                defaultdict_without_factory,
+            } => {
                 let mut reference = reference.clone();
                 reference.memo_index = Some(index);
                 reference.memo_read |= memo_read;
-                StackValue::Constructed(reference)
+                StackValue::Constructed {
+                    reference,
+                    defaultdict_without_factory: *defaultdict_without_factory,
+                }
             }
             value => Self::memo_read_stack_value(value, memo_read),
         }
@@ -5349,10 +5372,16 @@ impl<'a> ScanState<'a> {
                 reference.memo_read = true;
                 StackValue::Global(reference)
             }
-            StackValue::Constructed(reference) => {
+            StackValue::Constructed {
+                reference,
+                defaultdict_without_factory,
+            } => {
                 let mut reference = reference.clone();
                 reference.memo_read = true;
-                StackValue::Constructed(reference)
+                StackValue::Constructed {
+                    reference,
+                    defaultdict_without_factory: *defaultdict_without_factory,
+                }
             }
             StackValue::Text {
                 value,
@@ -5408,7 +5437,11 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn consume_top_operand_values(&mut self, operand_count: usize) -> Option<Vec<StackValue>> {
+    fn consume_top_operand_values(
+        &mut self,
+        operand_count: usize,
+        op_name: &'static str,
+    ) -> Option<Vec<StackValue>> {
         if self.stack.len() < operand_count {
             self.push_stack_value(StackValue::Other);
             return None;
@@ -5420,11 +5453,11 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        self.push_reducer_result(&values);
+        self.push_reducer_result(&values, op_name);
         Some(values)
     }
 
-    fn push_reducer_result(&mut self, values: &[StackValue]) {
+    fn push_reducer_result(&mut self, values: &[StackValue], op_name: &'static str) {
         if let Some(call_iterator) = Self::call_iterator_result(values) {
             self.push_stack_value(call_iterator);
             return;
@@ -5441,7 +5474,7 @@ impl<'a> ScanState<'a> {
             self.push_stack_value(call_iterator_tuple);
             return;
         }
-        if let Some(defaultdict) = Self::defaultdict_result(values) {
+        if let Some(defaultdict) = Self::defaultdict_result(values, op_name) {
             self.push_stack_value(defaultdict);
             return;
         }
@@ -5942,7 +5975,7 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn defaultdict_result(values: &[StackValue]) -> Option<StackValue> {
+    fn defaultdict_result(values: &[StackValue], op_name: &'static str) -> Option<StackValue> {
         let Some(StackValue::Global(callable_reference)) = values.first() else {
             return None;
         };
@@ -5955,14 +5988,19 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Tuple(arguments)) = values.get(1) else {
             return None;
         };
-        if matches!(
-            arguments.as_slice(),
-            [] | [StackValue::Primitive {
-                type_name: "NoneType",
-                ..
-            }]
-        ) {
-            return Some(StackValue::DefaultDictNoFactory);
+        if op_name == "REDUCE"
+            && matches!(
+                arguments.as_slice(),
+                [] | [StackValue::Primitive {
+                    type_name: "NoneType",
+                    ..
+                }]
+            )
+        {
+            return Some(StackValue::Constructed {
+                reference: callable_reference.clone(),
+                defaultdict_without_factory: true,
+            });
         }
         if arguments.len() != 1 {
             return None;
@@ -6156,10 +6194,10 @@ impl<'a> ScanState<'a> {
     fn callable_reference_from_value(value: Option<&StackValue>) -> Option<GlobalRef> {
         match value {
             Some(StackValue::Global(reference)) if !reference.malformed => Some(reference.clone()),
-            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+            Some(StackValue::Constructed { reference, .. }) if !reference.malformed => {
                 Some(Self::constructed_callable_reference(reference))
             }
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+            Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
                 if reference.module == "copyreg.extension" =>
             {
                 Some(reference.clone())
@@ -6170,22 +6208,28 @@ impl<'a> ScanState<'a> {
 
     fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {
         match callable_value {
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+            Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
                 if !reference.malformed =>
             {
-                self.push_stack_value(StackValue::Constructed(reference.clone()));
+                self.push_stack_value(StackValue::Constructed {
+                    reference: reference.clone(),
+                    defaultdict_without_factory: false,
+                });
             }
             Some(StackValue::DynamicType { type_name, .. }) => {
-                self.push_stack_value(StackValue::Constructed(GlobalRef {
-                    module: "__dynamic_type__".to_string(),
-                    name: type_name
-                        .clone()
-                        .unwrap_or_else(|| "__dynamic__".to_string()),
-                    position: 0,
-                    malformed: false,
-                    memo_index: None,
-                    memo_read: false,
-                }));
+                self.push_stack_value(StackValue::Constructed {
+                    reference: GlobalRef {
+                        module: "__dynamic_type__".to_string(),
+                        name: type_name
+                            .clone()
+                            .unwrap_or_else(|| "__dynamic__".to_string()),
+                        position: 0,
+                        malformed: false,
+                        memo_index: None,
+                        memo_read: false,
+                    },
+                    defaultdict_without_factory: false,
+                });
             }
             _ => self.push_stack_value(StackValue::Other),
         }
@@ -8588,7 +8632,7 @@ fn operator_mutator_protocol_target(
     if !matches!(callable_ref.module.as_str(), "operator" | "_operator") {
         return None;
     }
-    if !matches!(args.first(), Some(StackValue::Constructed(_))) {
+    if !matches!(args.first(), Some(StackValue::Constructed { .. })) {
         return None;
     }
     match callable_ref.name.as_str() {
@@ -8631,7 +8675,7 @@ fn is_container_mutator_callable(callable_ref: &GlobalRef) -> bool {
 }
 
 fn sensitive_mutation_target(value: &StackValue) -> Option<&'static str> {
-    let (StackValue::Global(reference) | StackValue::Constructed(reference)) = value else {
+    let (StackValue::Global(reference) | StackValue::Constructed { reference, .. }) = value else {
         return None;
     };
     match (reference.module.as_str(), reference.name.as_str()) {
@@ -8725,6 +8769,91 @@ mod tests {
     use crate::report::{detail_string, detail_usize};
     use std::time::Duration;
 
+    fn factoryless_defaultdict() -> StackValue {
+        StackValue::Constructed {
+            reference: GlobalRef {
+                module: "collections".to_string(),
+                name: "defaultdict".to_string(),
+                position: 0,
+                malformed: false,
+                memo_index: None,
+                memo_read: false,
+            },
+            defaultdict_without_factory: true,
+        }
+    }
+
+    #[test]
+    fn factoryless_defaultdict_retains_operator_iterator_dispatch() {
+        let options = default_test_options();
+        for arguments in [b")".as_slice(), b"N\x85".as_slice()] {
+            let mut payload = b"\x80\x04coperator\nior\nccollections\ndefaultdict\n".to_vec();
+            payload.extend_from_slice(arguments);
+            payload.extend_from_slice(
+                b"R\x940h\x00cbuiltins\niter\ncbuiltins\nhelp\n\x8c\x04stop\x86R\x86R.",
+            );
+            let scan = run_test_scan("factoryless-defaultdict-ior.pkl", &payload, &options);
+            assert!(scan.callable_invocations.iter().any(|details| {
+                detail_string(details, "module").as_deref() == Some("builtins")
+                    && detail_string(details, "name").as_deref() == Some("help")
+                    && detail_usize(details, "positional_arg_count") == Some(0)
+            }));
+        }
+    }
+
+    #[test]
+    fn constructor_provenance_survives_memo_without_blessing_unknown_aliases() {
+        let options = default_test_options();
+        let scan = ScanState::new(
+            "constructor-proof".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let known = factoryless_defaultdict();
+        let StackValue::Constructed { reference, .. } = &known else {
+            panic!("constructed fixture")
+        };
+        let unknown = StackValue::Constructed {
+            reference: reference.clone(),
+            defaultdict_without_factory: false,
+        };
+        for (value, expected) in [(&known, true), (&unknown, false), (&known, true)] {
+            let value = scan.with_memo_index(value.clone(), 7);
+            let value = ScanState::memo_value_for_stack(7, &value, true);
+            let value = ScanState::memo_read_stack_value(&value, true);
+            let StackValue::Constructed {
+                reference,
+                defaultdict_without_factory,
+            } = value
+            else {
+                panic!("memo must preserve constructed identity");
+            };
+            assert_eq!(defaultdict_without_factory, expected);
+            assert!(reference.memo_read);
+            assert_eq!(reference.memo_index, Some(7));
+        }
+        let values = [
+            StackValue::Global(reference.clone()),
+            StackValue::Tuple(Vec::new()),
+        ];
+        assert!(matches!(
+            ScanState::defaultdict_result(&values, "REDUCE"),
+            Some(StackValue::Constructed {
+                defaultdict_without_factory: true,
+                ..
+            })
+        ));
+        assert!(ScanState::defaultdict_result(&values, "NEWOBJ").is_none());
+        assert!(
+            ScanState::defaultdict_result(&[values[0].clone(), StackValue::Other], "REDUCE")
+                .is_none()
+        );
+    }
+
     #[test]
     fn template_lookup_proof_respects_canonical_identifier_and_error_order() {
         for (template, substitute, safe_substitute) in [
@@ -8814,7 +8943,7 @@ mod tests {
                 StackValue::StringTemplate {
                     template: "$x".to_string(),
                 },
-                StackValue::DefaultDictNoFactory,
+                factoryless_defaultdict(),
             ],
         };
         assert!(scan.template_mapping_callbacks_complete(&invocation));
@@ -8836,7 +8965,10 @@ mod tests {
                 template: "$x".to_string(),
             },
             StackValue::Global(invocation.reference.clone()),
-            StackValue::Constructed(invocation.reference.clone()),
+            StackValue::Constructed {
+                reference: invocation.reference.clone(),
+                defaultdict_without_factory: false,
+            },
             StackValue::TrackedDict {
                 entries: Vec::new(),
                 unknown_key_values: vec![StackValue::Other],
@@ -8862,7 +8994,7 @@ mod tests {
         assert_eq!(callbacks.len(), 1);
         assert_eq!(callbacks[0].reference.symbol(), "builtins.help");
 
-        invocation.args[1] = StackValue::DefaultDictNoFactory;
+        invocation.args[1] = factoryless_defaultdict();
         scan.push_callable_invocation(&invocation);
         let complete = scan.callable_invocations[0].clone();
         let mut incomplete = complete.clone();
@@ -10635,7 +10767,7 @@ mod tests {
             memo_read: false,
         });
 
-        assert!(scan.consume_top_operand_values(2).is_none());
+        assert!(scan.consume_top_operand_values(2, "REDUCE").is_none());
 
         assert_eq!(scan.stack.len(), 2);
         assert_eq!(stack_value_preview(&scan.stack[0], 0), "str:\"survivor\"");

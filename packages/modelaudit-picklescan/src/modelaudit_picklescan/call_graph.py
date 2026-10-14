@@ -4532,6 +4532,36 @@ def _zipimport_archive_files_match(archive: str, files: object) -> bool:
     return archive_files is not None and files == archive_files
 
 
+def _zipimport_constructor_state_without_cache(entry: str) -> tuple[str, str] | None:
+    if type(entry) is not str or not entry:
+        return None
+    path = entry.replace(os.path.altsep, os.path.sep) if os.path.altsep else entry
+    prefix_parts: list[str] = []
+    for _ in range(_MAX_ZIPIMPORT_PATH_COMPONENTS + 1):
+        try:
+            archive_stat = os.stat(path)
+        except (OSError, ValueError):
+            separator = path.rfind(os.path.sep)
+            directory = path[:separator] if separator >= 0 else ""
+            basename = path[separator + 1 :] if separator >= 0 else path
+            if directory == path:
+                return None
+            path = directory
+            prefix_parts.append(basename)
+            continue
+        if not stat.S_ISREG(archive_stat.st_mode):
+            return None
+        # CPython's Windows join delegates colon-bearing components to a native
+        # root parser. Do not approximate that parser with ntpath.join.
+        if os.path.sep == "\\" and any(":" in part for part in prefix_parts):
+            return None
+        # Components came from the constructor's last-separator split, so the
+        # remaining join is exact and preserves POSIX literal backslashes.
+        prefix = os.path.sep.join(part for part in reversed(prefix_parts) if part)
+        return path, prefix + os.path.sep if prefix else ""
+    return None
+
+
 def _zipimport_read_missing_directory_files(
     instance_state: dict[str, object],
     archive: str,
@@ -4542,11 +4572,12 @@ def _zipimport_read_missing_directory_files(
     # retain _files; a missing shared entry cannot authenticate that older state.
     if set(instance_state) != {"archive", "prefix"} or not _zipimport_runtime_is_trusted():
         return None
-    archive_state = _zipimport_archive_state_from_entry(cache_key)
-    if not isinstance(archive_state, tuple):
+    initializer = _type_member_without_hooks(zipimporter, "__init__")[1]
+    if type(initializer) is not FunctionType or "_files" in initializer.__code__.co_names:
+        # Removing _files from a legacy instance does not make its constructor modern.
         return None
-    _absolute_archive, expected_prefix, expected_archive = archive_state
-    if archive != expected_archive or prefix != expected_prefix.replace("/", os.path.sep):
+    expected_state = _zipimport_constructor_state_without_cache(cache_key)
+    if expected_state is None or (archive, prefix) != expected_state:
         return None
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
     if dict.__contains__(directory_cache, archive):
@@ -4608,6 +4639,10 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
             else _zipimport_directory_cache_files(archive) is files
         )
         and _zipimport_runtime_is_trusted()
+        and all(
+            _runtime_value_matches_snapshot(_type_member_without_hooks(zipimporter, name)[1], snapshot)
+            for name, snapshot in _TRUSTED_ZIPIMPORTER_METHODS
+        )
         and object.__getattribute__(finder, "__dict__") is instance_state
         and type(dict.get(instance_state, "archive")) is str
         and dict.get(instance_state, "archive") == archive

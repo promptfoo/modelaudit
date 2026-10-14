@@ -53,7 +53,11 @@ pub(crate) enum StackValue {
     },
     ExternalBuffer,
     Global(GlobalRef),
-    Constructed(GlobalRef),
+    Constructed {
+        reference: GlobalRef,
+        // Constructor provenance only; generic instance dispatch stays unchanged.
+        defaultdict_without_factory: bool,
+    },
     CallIterator {
         callable: GlobalRef,
     },
@@ -64,7 +68,6 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
-    DefaultDictNoFactory,
     DynamicType {
         type_name: Option<String>,
         memo_index: Option<i64>,
@@ -115,7 +118,9 @@ pub(crate) fn resolve_global_operand(value: Option<&StackValue>, payload: &[u8])
 pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
     match value {
         Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
-        Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
+        Some(StackValue::Constructed { reference, .. }) => {
+            format!("constructed:{}", reference.symbol())
+        }
         Some(StackValue::CallIterator { callable }) => {
             format!("call_iterator:{}", callable.symbol())
         }
@@ -127,7 +132,6 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
             callable.symbol(),
             item_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
         ),
-        Some(StackValue::DefaultDictNoFactory) => "defaultdict(factory=None)".to_string(),
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
