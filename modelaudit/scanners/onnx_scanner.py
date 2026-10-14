@@ -5481,20 +5481,23 @@ def _build_onnx_weight_analysis_plan(
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
-        # Legacy name discovery depends only on graph-valued bindings. Strict
-        # proof validity also depends on every used scalar binding's presence/type.
-        if not require_resolved_bindings:
-            attribute_key = tuple(
-                entry
-                for entry in attribute_key
-                if (binding := (attribute_bindings or {}).get(entry[0])) is not None
-                and (
-                    getattr(binding, "type", None) in {onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS}
-                    or _onnx_has_singular_field(binding, "g")
-                    or bool(getattr(binding, "graphs", ()))
-                    or bool(getattr(binding, "ref_attr_name", ""))
-                )
+        # Capture names depend on graph-bearing values and scalar binding
+        # validity, not scalar contents. Preserve names and types in strict
+        # proofs so missing or mismatched bindings cannot reuse a valid result.
+        capture_attribute_key: list[tuple[str, str, str]] = []
+        for entry in attribute_key:
+            binding = (attribute_bindings or {}).get(entry[0])
+            graph_dependent = binding is not None and (
+                getattr(binding, "type", None) in {onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS}
+                or _onnx_has_singular_field(binding, "g")
+                or bool(getattr(binding, "graphs", ()))
+                or bool(getattr(binding, "ref_attr_name", ""))
             )
+            if graph_dependent:
+                capture_attribute_key.append(entry)
+            elif require_resolved_bindings:
+                capture_attribute_key.append((entry[0], "capture-binding-type", str(getattr(binding, "type", None))))
+        attribute_key = tuple(capture_attribute_key)
         cache_key = (id(graph), attribute_key, depth, require_resolved_bindings, capture_opset_key)
         if depth > 6 or cache_key in graph_external_reference_in_progress:
             return frozenset({dependency_collection_limit_marker})

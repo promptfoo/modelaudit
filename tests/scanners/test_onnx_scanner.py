@@ -19780,6 +19780,8 @@ class TestWeightDistributionSemantics:
             finally:
                 sys.setprofile(None)
 
+            assert result.success is True, result.metadata
+            assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
             assert fingerprint_returns >= 6
             assert mismatch_count == 0
 
