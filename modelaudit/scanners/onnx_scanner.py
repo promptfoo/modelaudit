@@ -8858,8 +8858,9 @@ def _build_onnx_weight_analysis_plan(
                                 else:
                                     constant = replay_constants.get(input_name)
                                     data_type = int(constant.data_type) if constant is not None else None
-                                if data_type is not None:
-                                    known_types.add(data_type)
+                                if data_type is None:
+                                    return None
+                                known_types.add(data_type)
                             return next(iter(known_types)) if len(known_types) == 1 else None
 
                         context_shapes = related_input_shapes or {}
@@ -11302,12 +11303,8 @@ def _build_onnx_weight_analysis_plan(
                     or clip_operator
                     or pow_operator
                     or (batch_normalization_operator and batch_normalization_is_inference(node))
-                    or node.op_type
-                    in {
-                        "Concat",
-                        "GlobalMaxPool",
-                        "MaxPool",
-                    }
+                    or node.op_type in {"Concat", "GlobalMaxPool"}
+                    or (node.op_type == "MaxPool" and pooling_has_nonempty_samples(node))
                     or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                 )
                 preserved_shape_control_sources: frozenset[int] = frozenset()

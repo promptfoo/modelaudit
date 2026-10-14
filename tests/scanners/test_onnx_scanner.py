@@ -38158,9 +38158,16 @@ class TestOnnxFinalReviewBindingAndSqueeze:
     _tensor = staticmethod(TestOnnxShapeContinuity._t)
 
     @staticmethod
-    def _assert_standalone_contract(model: Any, tmp_path: Path, incomplete: bool, prior_weights: Any) -> Any:
+    def _assert_standalone_contract(
+        model: Any,
+        tmp_path: Path,
+        incomplete: bool,
+        prior_weights: Any,
+        *,
+        coverage_reason: str = "unresolved_initializer_lineage",
+    ) -> Any:
         plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        assert bool(plan.coverage_gaps.get("unresolved_initializer_lineage", 0)) is incomplete
+        assert bool(plan.coverage_gaps.get(coverage_reason, 0)) is incomplete
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
         path = _save_onnx_model(model, tmp_path / "review-binding-shape.onnx")
         result = WeightDistributionScanner().scan(str(path))
@@ -38463,10 +38470,98 @@ class TestOnnxRejectedCastAndPoolingProofs:
             model, tmp_path, target not in {"float", "int64"}, prior_weights
         )
 
+    @pytest.mark.parametrize("target", ["invalid", "int64", "float"])
+    @pytest.mark.parametrize("local_function", [False, True])
+    def test_finite_replay_preserves_unknown_operand_dtypes(
+        self, tmp_path: Path, target: str, local_function: bool
+    ) -> None:
+        value, tensor = self._value, self._tensor
+        output_type = TensorProto.FLOAT if target == "float" else TensorProto.INT64
+        output_dtype = np.float32 if target == "float" else np.int64
+        consumers = [
+            helper.make_node("Cast", ["state"], ["cast_state"], to=output_type),
+            helper.make_node("Add", ["cast_state", "bias"], ["weight"]),
+            helper.make_node("MatMul", ["X", "weight"], ["body_y"]),
+        ]
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "ConsumeState",
+                    ["state", "bias", "X"],
+                    ["body_y"],
+                    consumers,
+                    [helper.make_opsetid("", 18)],
+                )
+            )
+            consumers = [helper.make_node("ConsumeState", ["state", "bias", "X"], ["body_y"], domain="local")]
+        sources = [f"replacement_{index}" for index in range(33)]
+        replacements = []
+        previous = sources[0]
+        for index, name in enumerate(sources[1:], start=1):
+            output = "next_state" if index == len(sources) - 1 else f"sum_{index}"
+            replacements.append(helper.make_node("Add", [previous, name], [output]))
+            previous = output
+        body = helper.make_graph(
+            [
+                *consumers,
+                *replacements,
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "finite_replay_operand_dtypes",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", [2, 2], TensorProto.INT64),
+            ],
+            [value("condition_out", [], TensorProto.BOOL), value("next_state", [2, 2], TensorProto.INT64)],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Loop", ["two", "condition", "initial"], ["final"], body=body),
+                ],
+                "finite_replay_unknown_dtype",
+                [
+                    value("A", [1, 64]),
+                    value("X", [1, 2], output_type),
+                    value("initial", [2, 2], TensorProto.INT64),
+                ],
+                [value("known", [1, 64]), value("final", [2, 2], TensorProto.INT64)],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("bias", np.zeros((2, 2), output_dtype)),
+                    tensor("two", np.int64(2)),
+                    tensor("condition", np.bool_(True)),
+                    *[tensor(name, np.ones((2, 2), np.int64)) for name in sources],
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        if target == "invalid":
+            actual_body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+            cast = model.functions[0].node[0] if local_function else actual_body.node[0]
+            next(attribute for attribute in cast.attribute if attribute.name == "to").i = 999
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            target != "int64",
+            prior_weights,
+            coverage_reason="lineages_per_value_limit",
+        )
+
     @pytest.mark.parametrize(
         "mode", ["empty_dilated", "unit_dilation", "absent_dilation", "no_padding", "bad_dilation_type"]
     )
-    def test_pooling_uniformity_requires_nonempty_samples(self, tmp_path: Path, mode: str) -> None:
+    @pytest.mark.parametrize("operator", ["AveragePool", "MaxPool"])
+    def test_pooling_uniformity_requires_nonempty_samples(self, tmp_path: Path, mode: str, operator: str) -> None:
         value, tensor = self._value, self._tensor
         extent = 3 if mode == "no_padding" else 1
         dilation = 2 if mode in {"empty_dilated", "no_padding"} else 1
@@ -38483,7 +38578,7 @@ class TestOnnxRejectedCastAndPoolingProofs:
                     helper.make_node("MatMul", ["A", "prior"], ["known"]),
                     helper.make_node("Shape", ["source"], ["dimensions"]),
                     helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
-                    helper.make_node("AveragePool", ["expanded"], ["pooled"], **attrs),
+                    helper.make_node(operator, ["expanded"], ["pooled"], **attrs),
                     helper.make_node("MatMul", ["X", "pooled"], ["Y"]),
                 ],
                 "pooling_sampling_proof",
