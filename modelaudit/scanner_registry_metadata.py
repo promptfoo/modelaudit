@@ -98,16 +98,17 @@ EXTENSION_FORMAT_MAP: dict[str, str] = {
 
 
 def _with_scanner_defaults(metadata: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    for scanner_info in metadata.values():
+    for scanner_id, scanner_info in metadata.items():
+        scanner_info = {"module": f"modelaudit.scanners.{scanner_id}_scanner", **scanner_info}
         scanner_info.setdefault("dependencies", [])
         scanner_info.setdefault("numpy_sensitive", False)
+        metadata[scanner_id] = scanner_info
     return metadata
 
 
 SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
     {
         "pickle": {
-            "module": "modelaudit.scanners.pickle_scanner",
             "class": "PickleScanner",
             "description": "Scans Python pickle files for suspicious code references",
             "extensions": [".pkl", ".pickle", ".dill", ".bin", ".pt", ".pth", ".ckpt"],
@@ -115,14 +116,12 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 1,
         },
         "pytorch_binary": {
-            "module": "modelaudit.scanners.pytorch_binary_scanner",
             "class": "PyTorchBinaryScanner",
             "description": "Scans PyTorch binary files",
             "extensions": [".bin"],
             "priority": 3,
         },
         "tf_savedmodel": {
-            "module": "modelaudit.scanners.tf_savedmodel_scanner",
             "class": "TensorFlowSavedModelScanner",
             "description": "Scans TensorFlow SavedModel for suspicious operations",
             "extensions": [".pb", ""],
@@ -132,7 +131,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "numpy_sensitive": True,
         },
         "tf_metagraph": {
-            "module": "modelaudit.scanners.tf_metagraph_scanner",
             "class": "TensorFlowMetaGraphScanner",
             "description": "Scans TensorFlow MetaGraph .meta files",
             "extensions": [".meta"],
@@ -140,7 +138,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 4,
         },
         "keras_zip": {
-            "module": "modelaudit.scanners.keras_zip_scanner",
             "class": "KerasZipScanner",
             "description": "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers",
             "extensions": [".keras"],
@@ -148,7 +145,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 4,
         },
         "keras_h5": {
-            "module": "modelaudit.scanners.keras_h5_scanner",
             "class": "KerasH5Scanner",
             "description": "Scans Keras H5 model files for suspicious layer configurations",
             "extensions": [".h5", ".hdf5", ".keras"],
@@ -159,7 +155,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "numpy_sensitive": True,
         },
         "onnx": {
-            "module": "modelaudit.scanners.onnx_scanner",
             "class": "OnnxScanner",
             "description": "Scans ONNX model files",
             "extensions": [".onnx"],
@@ -168,7 +163,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "numpy_sensitive": True,
         },
         "protobuf_model_candidate": {
-            "module": "modelaudit.scanners.protobuf_model_candidate_scanner",
             "class": "ProtobufModelCandidateScanner",
             "description": "Tentatively analyzes bounded protobuf model candidates",
             "extensions": [],
@@ -176,35 +170,30 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 6,
         },
         "coreml": {
-            "module": "modelaudit.scanners.coreml_scanner",
             "class": "CoreMLScanner",
             "description": "Scans CoreML .mlmodel files",
             "extensions": [".mlmodel"],
             "priority": 7,
         },
         "openvino": {
-            "module": "modelaudit.scanners.openvino_scanner",
             "class": "OpenVinoScanner",
             "description": "Scans OpenVINO IR model files",
             "extensions": [".xml"],
             "priority": 6,
         },
         "pytorch_zip": {
-            "module": "modelaudit.scanners.pytorch_zip_scanner",
             "class": "PyTorchZipScanner",
             "description": "Scans PyTorch model files for suspicious code in embedded pickles",
             "extensions": [".pt", ".pth", ".ckpt", ".pkl", ".bin"],
             "priority": 2,
         },
         "executorch": {
-            "module": "modelaudit.scanners.executorch_scanner",
             "class": "ExecuTorchScanner",
             "description": "Scans ExecuTorch mobile archives",
             "extensions": [".ptl", ".pte"],
             "priority": 6,
         },
         "gguf": {
-            "module": "modelaudit.scanners.gguf_scanner",
             "class": "GgufScanner",
             "description": "Validates GGUF/GGML model file headers, metadata, and tensor integrity",
             "extensions": [".gguf", ".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"],
@@ -212,21 +201,18 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 7,
         },
         "joblib": {
-            "module": "modelaudit.scanners.joblib_scanner",
             "class": "JoblibScanner",
             "description": "Scans joblib files by decompressing and analyzing embedded pickle",
             "extensions": [".joblib"],
             "priority": 8,
         },
         "r_serialized": {
-            "module": "modelaudit.scanners.r_serialized_scanner",
             "class": "RSerializedScanner",
             "description": "Scans R serialized model files",
             "extensions": [".rds", ".rda", ".rdata"],
             "priority": 8,
         },
         "skops": {
-            "module": "modelaudit.scanners.skops_scanner",
             "class": "SkopsScanner",
             "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886 vulnerabilities",
             "extensions": [".skops"],
@@ -234,21 +220,18 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 8,
         },
         "numpy": {
-            "module": "modelaudit.scanners.numpy_scanner",
             "class": "NumPyScanner",
             "description": "Scans NumPy array files",
             "extensions": [".npy"],
             "priority": 9,
         },
         "oci_layer": {
-            "module": "modelaudit.scanners.oci_layer_scanner",
             "class": "OciLayerScanner",
             "description": "Scans OCI container layers",
             "extensions": [".manifest"],
             "priority": 10,
         },
         "text": {
-            "module": "modelaudit.scanners.text_scanner",
             "class": "TextScanner",
             "description": "Scans ML-related text files",
             "extensions": [".txt", ".md", ".markdown", ".rst", ".env"],
@@ -256,7 +239,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 0,
         },
         "manifest": {
-            "module": "modelaudit.scanners.manifest_scanner",
             "class": "ManifestScanner",
             "description": "Scans model manifest files for blacklisted names and terms",
             "extensions": [
@@ -289,14 +271,12 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 12,
         },
         "pmml": {
-            "module": "modelaudit.scanners.pmml_scanner",
             "class": "PmmlScanner",
             "description": "Scans PMML model files",
             "extensions": [".pmml"],
             "priority": 12,
         },
         "weight_distribution": {
-            "module": "modelaudit.scanners.weight_distribution_scanner",
             "class": "WeightDistributionScanner",
             "description": "Analyzes weight distributions for anomalies",
             "extensions": [
@@ -313,14 +293,12 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "numpy_sensitive": True,
         },
         "safetensors": {
-            "module": "modelaudit.scanners.safetensors_scanner",
             "class": "SafeTensorsScanner",
             "description": "Scans SafeTensors model files",
             "extensions": [".safetensors"],
             "priority": 14,
         },
         "flax_msgpack": {
-            "module": "modelaudit.scanners.flax_msgpack_scanner",
             "class": "FlaxMsgpackScanner",
             "description": "Scans Flax/JAX msgpack checkpoint files with enhanced security analysis",
             "extensions": [".msgpack", ".flax", ".orbax", ".jax"],
@@ -329,7 +307,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "dependencies": ["msgpack"],
         },
         "jax_checkpoint": {
-            "module": "modelaudit.scanners.jax_checkpoint_scanner",
             "class": "JaxCheckpointScanner",
             "description": "Scans JAX checkpoint files in various serialization formats",
             "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle", ""],
@@ -339,7 +316,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 11,
         },
         "tflite": {
-            "module": "modelaudit.scanners.tflite_scanner",
             "class": "TFLiteScanner",
             "description": "Scans TensorFlow Lite model files",
             "extensions": [".tflite"],
@@ -348,14 +324,12 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "numpy_sensitive": True,
         },
         "tensorrt": {
-            "module": "modelaudit.scanners.tensorrt_scanner",
             "class": "TensorRTScanner",
             "description": "Scans TensorRT engine files",
             "extensions": [".engine", ".plan", ".trt"],
             "priority": 17,
         },
         "paddle": {
-            "module": "modelaudit.scanners.paddle_scanner",
             "class": "PaddleScanner",
             "description": "Scans PaddlePaddle model files",
             "extensions": [".pdmodel", ".pdiparams"],
@@ -364,35 +338,30 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "numpy_sensitive": True,
         },
         "cntk": {
-            "module": "modelaudit.scanners.cntk_scanner",
             "class": "CntkScanner",
             "description": "Scans CNTK .dnn/.cmf model artifacts",
             "extensions": [".dnn", ".cmf"],
             "priority": 18,
         },
         "rknn": {
-            "module": "modelaudit.scanners.rknn_scanner",
             "class": "RknnScanner",
             "description": "Scans Rockchip RKNN model files",
             "extensions": [".rknn"],
             "priority": 19,
         },
         "torch7": {
-            "module": "modelaudit.scanners.torch7_scanner",
             "class": "Torch7Scanner",
             "description": "Scans legacy Torch7 serialized model files",
             "extensions": [".t7", ".th", ".net"],
             "priority": 19,
         },
         "tar": {
-            "module": "modelaudit.scanners.tar_scanner",
             "class": "TarScanner",
             "description": "Scans TAR archive files and their contents recursively",
             "extensions": [".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"],
             "priority": 98,
         },
         "jinja2_template": {
-            "module": "modelaudit.scanners.jinja2_template_scanner",
             "class": "Jinja2TemplateScanner",
             "description": "Scans for Jinja2 template injection vulnerabilities in ML models",
             "extensions": [".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"],
@@ -400,7 +369,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "dependencies": ["jinja2", "gguf"],
         },
         "metadata": {
-            "module": "modelaudit.scanners.metadata_scanner",
             "class": "MetadataScanner",
             "description": "Scans model documentation files for security issues",
             "extensions": [".md", ".markdown", ".rst", ".txt", ".yml", ".yaml"],
@@ -408,7 +376,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 1,
         },
         "sevenzip": {
-            "module": "modelaudit.scanners.sevenzip_scanner",
             "class": "SevenZipScanner",
             "description": "Scans 7-Zip archive files",
             "extensions": [".7z"],
@@ -416,21 +383,18 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "dependencies": ["py7zr"],
         },
         "lightgbm": {
-            "module": "modelaudit.scanners.lightgbm_scanner",
             "class": "LightGBMScanner",
             "description": "Scans native LightGBM model files",
             "extensions": [".model", ".txt", ".lgb", ".lightgbm"],
             "priority": 6,
         },
         "llamafile": {
-            "module": "modelaudit.scanners.llamafile_scanner",
             "class": "LlamafileScanner",
             "description": "Scans Llamafile executable model artifacts",
             "extensions": [".llamafile", ".exe", ""],
             "priority": 6,
         },
         "xgboost": {
-            "module": "modelaudit.scanners.xgboost_scanner",
             "class": "XGBoostScanner",
             "description": "Scans XGBoost model files for security vulnerabilities",
             "extensions": [".bst", ".model", ".json", ".ubj", ""],
@@ -442,35 +406,30 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "numpy_sensitive": True,
         },
         "mxnet": {
-            "module": "modelaudit.scanners.mxnet_scanner",
             "class": "MXNetScanner",
             "description": "Scans MXNet symbol/params model artifacts",
             "extensions": [".json", ".params"],
             "priority": 8,
         },
         "catboost": {
-            "module": "modelaudit.scanners.catboost_scanner",
             "class": "CatBoostScanner",
             "description": "Scans CatBoost .cbm model files for suspicious metadata indicators",
             "extensions": [".cbm"],
             "priority": 8,
         },
         "nemo": {
-            "module": "modelaudit.scanners.nemo_scanner",
             "class": "NemoScanner",
             "description": "Scans NVIDIA NeMo model files for Hydra _target_ injection",
             "extensions": [".nemo"],
             "priority": 14,
         },
         "torchserve_mar": {
-            "module": "modelaudit.scanners.torchserve_mar_scanner",
             "class": "TorchServeMarScanner",
             "description": "Scans TorchServe .mar model archive files",
             "extensions": [".mar"],
             "priority": 96,
         },
         "compressed": {
-            "module": "modelaudit.scanners.compressed_scanner",
             "class": "CompressedScanner",
             "description": "Scans standalone compressed wrappers and routes inner payloads to existing scanners",
             "extensions": [".gz", ".bz2", ".xz", ".lz4", ".zlib"],
@@ -478,7 +437,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 95,
         },
         "rar": {
-            "module": "modelaudit.scanners.rar_scanner",
             "class": "RarScanner",
             "description": "Fails closed on RAR archives because RAR extraction is unsupported",
             "extensions": [".rar"],
@@ -486,7 +444,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 96,
         },
         "zip": {
-            "module": "modelaudit.scanners.zip_scanner",
             "class": "ZipScanner",
             "description": "Scans ZIP archive files",
             "extensions": [".zip", ".npz", ".mar"],

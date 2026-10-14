@@ -36,6 +36,7 @@ from ._evidence_redaction import (
 )
 from .base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
+    _DANGEROUS_CONFIG_MODULE_ROOTS,
     _keras_exact_module_policy,
     check_custom_loss_config,
     check_custom_metric_config,
@@ -252,39 +253,6 @@ _KERAS_POST_OR_LOCAL_SUFFIX_PATTERN = re.compile(
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references.
 _SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
-_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
-    {
-        "os",
-        "sys",
-        "subprocess",
-        "builtins",
-        "__builtin__",
-        "importlib",
-        "shutil",
-        "socket",
-        "http",
-        "pickle",
-        "marshal",
-        "ctypes",
-        "code",
-        "codeop",
-        "compileall",
-        "runpy",
-        "webbrowser",
-        "tempfile",
-        "signal",
-        "multiprocessing",
-        "threading",
-        "pty",
-        "commands",
-        "pdb",
-        "profile",
-        "trace",
-        "pip",
-        "setuptools",
-        "distutils",
-    }
-)
 _DANGEROUS_EXACT_MODULE_SYMBOLS, _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES = _keras_exact_module_policy()
 _NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
     {

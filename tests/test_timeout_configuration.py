@@ -5,9 +5,9 @@ This tests the ability to configure timeouts, handle timeout errors gracefully,
 and provide partial results when scans exceed the configured timeout.
 """
 
-import os
-import tempfile
+import shutil
 import time
+from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 
@@ -44,14 +44,6 @@ class SlowTestScanner(BaseScanner):
             time.sleep(0.1)  # Sleep 100ms per iteration
             bytes_scanned += bytes_per_iteration
 
-            # Add some fake issues
-            if bytes_scanned % 5000 == 0:
-                result._add_issue(
-                    f"Test issue at byte {bytes_scanned}",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                )
-
         result.bytes_scanned = bytes_scanned
         result.finish(success=True)
         return result
@@ -81,70 +73,65 @@ class TestTimeoutConfiguration:
         scanner = SlowTestScanner()
         assert scanner.timeout == 3600  # Default 1 hour for large models
 
-    def test_timeout_error_handling(self):
+    def test_timeout_error_handling(self, tmp_path: Path) -> None:
         """Test that TimeoutError is caught and handled gracefully"""
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            f.write(b"\x80\x05\x95\x10\x00\x00\x00\x00\x00\x00\x00\x8c\x0ctest content\x94.")
-            temp_path = f.name
+        model_path = tmp_path / "model.pkl"
+        model_path.touch(mode=0o600)
+        model_path.write_bytes(b"\x80\x05\x95\x10\x00\x00\x00\x00\x00\x00\x00\x8c\x0ctest content\x94.")
 
-        try:
-            # Mock the scanner to raise TimeoutError
-            with patch("modelaudit.scanners.pickle_scanner.PickleScanner.scan") as mock_scan:
-                mock_scan.side_effect = TimeoutError("Test timeout")
+        # Mock the scanner to raise TimeoutError
+        with patch("modelaudit.scanners.pickle_scanner.PickleScanner.scan") as mock_scan:
+            mock_scan.side_effect = TimeoutError("Test timeout")
 
-                result = scan_file(temp_path, config={"timeout": 1})
+            result = scan_file(str(model_path), config={"timeout": 1})
 
-                # Should return a result with timeout warning
-                assert not result.success
-                assert any("timeout" in issue.message.lower() for issue in result.issues)
-
-        finally:
-            os.unlink(temp_path)
+            # Should return a result with timeout warning
+            assert not result.success
+            assert any("timeout" in issue.message.lower() for issue in result.issues)
+        # Delete before fixture teardown to catch leaked file handles.
+        model_path.unlink()
 
     @pytest.mark.slow
-    def test_partial_results_on_timeout(self):
+    def test_partial_results_on_timeout(self, tmp_path: Path) -> None:
         """Test that partial results are returned when timeout occurs"""
-        # Create a large test file
-        with tempfile.NamedTemporaryFile(suffix=".slow", delete=False) as f:
-            # Write 10KB of data
-            f.write(b"x" * 10240)
-            temp_path = f.name
+        # Create a large test file with 10KB of data
+        model_path = tmp_path / "model.slow"
+        model_path.touch(mode=0o600)
+        model_path.write_bytes(b"x" * 10240)
 
-        try:
-            scanner = SlowTestScanner(config={"timeout": 0.5})  # 500ms timeout
-            result = scanner.scan(temp_path)
+        scanner = SlowTestScanner(config={"timeout": 0.5})  # 500ms timeout
+        result = scanner.scan(str(model_path))
 
-            # Should have partial results
-            assert result.bytes_scanned > 0
-            assert result.bytes_scanned < 10240  # Should not have scanned everything
+        # Should have partial results
+        assert result.bytes_scanned > 0
+        assert result.bytes_scanned < 10240  # Should not have scanned everything
 
-            # Should have timeout warning
-            timeout_warnings = [i for i in result.issues if "timeout" in i.message.lower()]
-            assert len(timeout_warnings) > 0
+        # Should have timeout warning
+        timeout_warnings = [i for i in result.issues if "timeout" in i.message.lower()]
+        assert len(timeout_warnings) > 0
 
-            # Check the warning has proper details
-            warning = timeout_warnings[0]
-            assert warning.details["bytes_scanned"] > 0
-            assert warning.details["total_bytes"] == 10240
-            assert 0 < warning.details["percentage_complete"] < 100
+        # Check the warning has proper details
+        warning = timeout_warnings[0]
+        assert warning.details["bytes_scanned"] > 0
+        assert warning.details["total_bytes"] == 10240
+        assert 0 < warning.details["percentage_complete"] < 100
+        model_path.unlink()
 
-        finally:
-            os.unlink(temp_path)
-
-    def test_timeout_in_directory_scan(self):
+    def test_timeout_in_directory_scan(self, tmp_path: Path) -> None:
         """Test timeout handling during directory scanning"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create multiple files
-            for i in range(3):
-                with open(os.path.join(tmpdir, f"file{i}.pkl"), "wb") as f:
-                    f.write(b"\x80\x05\x95\x10\x00\x00\x00\x00\x00\x00\x00\x8c\x0ctest content\x94.")
+        # Create multiple files
+        for i in range(3):
+            (tmp_path / f"file{i}.pkl").write_bytes(
+                b"\x80\x05\x95\x10\x00\x00\x00\x00\x00\x00\x00\x8c\x0ctest content\x94."
+            )
 
-            # Scan with short timeout (1 second)
-            results = scan_model_directory_or_file(tmpdir, timeout=1)
+        # Scan with short timeout (1 second)
+        results = scan_model_directory_or_file(str(tmp_path), timeout=1)
 
-            # Should complete and return results
-            assert hasattr(results, "files_scanned")
-            assert results.files_scanned >= 0
+        # Should complete and return results
+        assert hasattr(results, "files_scanned")
+        assert results.files_scanned >= 0
+        shutil.rmtree(tmp_path)
 
     def test_check_timeout_methods(self):
         """Test the timeout checking helper methods"""

@@ -20,6 +20,7 @@ from modelaudit.scanners.executorch_scanner import (
 )
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from modelaudit.utils.file.detection import detect_file_format
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import EvalPayload
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
@@ -427,8 +428,7 @@ def test_executorch_read_failure_result_is_not_cached(
     monkeypatch.setattr(ExecuTorchScanner, "_read_header", staticmethod(raise_os_error))
     monkeypatch.setattr(ExecuTorchScanner, "can_handle", classmethod(lambda _cls, _path: True))
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = core.scan_model_directory_or_file(
             str(file_path),
             cache_enabled=True,
@@ -450,8 +450,6 @@ def test_executorch_read_failure_result_is_not_cached(
             assert any("Unable to read ExecuTorch content" in issue.message for issue in aggregate.issues)
             assert core.determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_executorch_structure_read_failure_is_inconclusive_not_security_finding(
@@ -1550,8 +1548,7 @@ def test_executorch_zip_budget_failure_propagates_exit_code_and_is_not_cached(
         zipf.writestr("weights.bin", b"A" * 32)
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for _ in range(2):
             scan_kwargs: dict[str, Any] = {
                 "cache_enabled": True,
@@ -1567,8 +1564,6 @@ def test_executorch_zip_budget_failure_propagates_exit_code_and_is_not_cached(
             assert reason in metadata["scan_outcome_reasons"]
             assert core.determine_exit_code(aggregate) == 1
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_executorch_duplicate_pickle_members_scan_malicious_first_entry(tmp_path: Path) -> None:
@@ -1849,8 +1844,7 @@ def test_executorch_pickle_discovery_entry_limit_propagates_exit_code_and_is_not
         zipf.writestr("payload", b"benign skipped discovery candidate")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         for _ in range(2):
             aggregate = core.scan_model_directory_or_file(
                 str(model_path),
@@ -1866,8 +1860,6 @@ def test_executorch_pickle_discovery_entry_limit_propagates_exit_code_and_is_not
             assert any("could not be inspected" in issue.message for issue in aggregate.issues)
             assert core.determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_executorch_pickle_discovery_entry_limit_preserves_early_malicious_finding(tmp_path: Path) -> None:

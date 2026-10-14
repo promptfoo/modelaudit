@@ -459,15 +459,9 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
     except ValueError as exc:
         raise ValueError(f"Unsupported cloud storage URL: {url}") from exc
 
-    if scheme in {"s3", "gs", "gcs"}:
-        canonical_scheme = "gcs" if protocol == "gcs" else "s3"
-        canonical_url = urlunsplit((canonical_scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+    if scheme in {"s3", "gs", "gcs", "r2"}:
+        canonical_url = urlunsplit((protocol, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
         return protocol, canonical_url, fs_args
-    if scheme == "r2":
-        canonical_url = urlunsplit(("s3", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
-        return protocol, canonical_url, fs_args
-    if scheme != "https":
-        return protocol, url, fs_args
     if parsed.query:
         return "https", url, {}
 
@@ -488,7 +482,6 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
         endpoint_host = f"{account}.r2.cloudflarestorage.com"
         if parsed.port is not None:
             endpoint_host = f"{endpoint_host}:{parsed.port}"
-        fs_args["client_kwargs"] = {"endpoint_url": f"https://{endpoint_host}"}
     elif _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname) or _S3_FIPS_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname):
         bucket, _, key = path.partition("/")
         endpoint_host = hostname
@@ -513,8 +506,7 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
         fs_args["client_kwargs"] = {"endpoint_url": f"https://{endpoint_host}"}
         if "s3-accelerate" in endpoint_host:
             fs_args["config_kwargs"] = {"s3": {"addressing_style": "virtual"}}
-    canonical_scheme = "gcs" if protocol == "gcs" else "s3"
-    canonical_url = f"{canonical_scheme}://{bucket}"
+    canonical_url = f"{protocol}://{bucket}"
     if key:
         canonical_url = f"{canonical_url}/{key}"
     return protocol, canonical_url, fs_args
@@ -607,8 +599,6 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         except (TypeError, ValueError) as exc:
             top_level_size_error = exc
 
-    total_size = 0
-    measured_file_count = 0
     measured_sizes: dict[str, int] = {}
     walk_observed = False
     walk_error: Exception | None = None
@@ -616,22 +606,16 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
     ls_error_path: str | None = None
 
     def _record_size(path: object, raw_size: object) -> None:
-        nonlocal total_size, measured_file_count
         path_key = str(path)
         parsed_size = _parse_size_value(raw_size)
         previous_size = measured_sizes.get(path_key)
-        if previous_size is None:
-            measured_sizes[path_key] = parsed_size
-            total_size += parsed_size
-            measured_file_count += 1
-            return
-        if previous_size == parsed_size:
-            return
-        if strict:
-            raise ValueError(f"inconsistent size metadata for duplicate listed object {path_key}")
-        retained_size = max(previous_size, parsed_size)
-        measured_sizes[path_key] = retained_size
-        total_size += retained_size - previous_size
+        if previous_size is not None:
+            if previous_size == parsed_size:
+                return
+            if strict:
+                raise ValueError(f"inconsistent size metadata for duplicate listed object {path_key}")
+            parsed_size = max(previous_size, parsed_size)
+        measured_sizes[path_key] = parsed_size
 
     # Try using fs.walk to traverse directories
     try:
@@ -658,14 +642,12 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                             f"{safe_path}: {safe_error}"
                         ) from exc
                     continue
-        if walk_observed and (info.get("type") == "directory" or measured_file_count > 0):
-            return total_size
+        if walk_observed and (info.get("type") == "directory" or measured_sizes):
+            return sum(measured_sizes.values())
     except _CloudObjectMetadataSizeError:
         raise
     except Exception as exc:
         walk_error = exc
-        total_size = 0
-        measured_file_count = 0
         measured_sizes.clear()
 
     # Fallback to recursive ls if walk is unavailable
@@ -673,7 +655,7 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
     visited_listing_paths: set[str] = set()
 
     def _collect(path: str) -> None:
-        nonlocal total_size, measured_file_count, ls_error, ls_error_path, ls_observed
+        nonlocal ls_error, ls_error_path, ls_observed
         if path in visited_listing_paths:
             if strict:
                 raise ValueError(
@@ -729,12 +711,8 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                 )
 
     _collect(url)
-    if (
-        (not strict or ls_error is None)
-        and ls_observed
-        and (info.get("type") == "directory" or measured_file_count > 0)
-    ):
-        return total_size
+    if (not strict or ls_error is None) and ls_observed and (info.get("type") == "directory" or measured_sizes):
+        return sum(measured_sizes.values())
 
     if strict:
         error_parts = []
@@ -1054,24 +1032,16 @@ class GCSCache:
         # Create cache subdirectory
         cache_subdir = _prepare_cache_subdirectory(self.cache_dir, cache_key)
 
-        # Determine cache path
-        if local_path.is_file():
-            cache_path = cache_subdir / local_path.name
-            # Don't copy if it's already in the cache directory
-            if not _is_within_directory(self.cache_dir, local_path):
-                _remove_path(cache_path)
+        is_file = local_path.is_file()
+        if _is_within_directory(self.cache_dir, local_path):
+            cache_path = local_path
+        else:
+            cache_path = cache_subdir / (local_path.name if is_file else "content")
+            _remove_path(cache_path)
+            if is_file:
                 shutil.copy2(local_path, cache_path)
             else:
-                cache_path = local_path
-        else:
-            # It's a directory
-            cache_path = cache_subdir / "content"
-            # Don't copy if it's already in the cache directory
-            if not _is_within_directory(self.cache_dir, local_path):
-                _remove_path(cache_path)
                 shutil.copytree(local_path, cache_path)
-            else:
-                cache_path = local_path
 
         # Update metadata
         self.metadata[cache_key] = {
@@ -1902,39 +1872,22 @@ def _build_safe_local_path(
 
 
 def _protocol_less_cloud_relative_path(base_url: str, file_url: str) -> str:
-    """Preserve provider-returned bucket/prefix paths when the scheme is omitted."""
-    try:
-        base = urlsplit(base_url)
-        parsed_file = urlsplit(file_url)
-        # Provider listings commonly return bare object keys. In that form,
-        # URL delimiters are literal key text rather than query/fragment syntax.
-        file_scheme = parsed_file.scheme.casefold()
-        structured_file_url = file_scheme in {"s3", "gs", "gcs", "r2"} or (
-            file_scheme in {"http", "https"} and _http_cloud_protocol(file_url) is not None
-        )
-        file_path = parsed_file.path if structured_file_url else file_url
-        file_path = file_path.lstrip("/")
-    except Exception:
-        return _cloud_url_local_basename(file_url)
-
+    """Preserve provider-returned bucket/prefix paths after structured URLs are rejected."""
+    base = urlsplit(base_url)
+    # URL delimiters in a bare object key are literal text.
+    file_path = file_url.lstrip("/")
     if base.scheme.casefold() in {"http", "https"}:
         try:
             _protocol, canonical_url, _fs_args = get_cloud_filesystem_config(base_url)
-            canonical = urlsplit(canonical_url)
-            provider_prefix = "/".join(
-                part.strip("/") for part in (canonical.netloc, canonical.path) if part.strip("/")
-            )
+            base = urlsplit(canonical_url)
         except ValueError:
-            provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
-    else:
-        provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
+            pass
+    provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
     if provider_prefix and file_path.startswith(f"{provider_prefix}/"):
         return file_path[len(provider_prefix) + 1 :]
     if provider_prefix and file_path == provider_prefix:
         return _cloud_url_local_basename(file_url)
-    if not structured_file_url:
-        return file_path
-    return _cloud_url_local_basename(file_url)
+    return file_path
 
 
 def _uses_windows_filename_rules() -> bool:
@@ -1942,51 +1895,40 @@ def _uses_windows_filename_rules() -> bool:
     return os.name == "nt"
 
 
-def _is_case_sensitive_directory(path: Path) -> bool:
-    """Probe the target filesystem's case behavior without retaining a file."""
+def _is_directory_spelling_sensitive(path: Path, prefix: str, alternate_name: Callable[[str], str]) -> bool:
+    """Probe filesystem name aliases, retaining the same cleanup and fail-closed behavior."""
     probe_path: Path | None = None
     probe_fd = -1
     try:
-        probe_fd, probe_name = tempfile.mkstemp(prefix=".modelaudit_case_probe_Aa", dir=path)
+        probe_fd, probe_name = tempfile.mkstemp(prefix=prefix, dir=path)
         probe_path = Path(probe_name)
         os.close(probe_fd)
         probe_fd = -1
-        alternate = probe_path.with_name(probe_path.name.swapcase())
+        alternate = probe_path.with_name(alternate_name(probe_path.name))
         if not alternate.exists():
             return True
         return not os.path.samefile(probe_path, alternate)
     except OSError:
         # Destination aliasing is security-sensitive, so uncertain filesystems
-        # are treated conservatively as case-insensitive.
+        # are treated conservatively as insensitive to alternate spellings.
         return False
     finally:
         if probe_fd >= 0:
             os.close(probe_fd)
         if probe_path is not None:
             probe_path.unlink(missing_ok=True)
+
+
+def _is_case_sensitive_directory(path: Path) -> bool:
+    """Probe the target filesystem's case behavior without retaining a file."""
+    return _is_directory_spelling_sensitive(path, ".modelaudit_case_probe_Aa", str.swapcase)
 
 
 def _is_unicode_normalization_sensitive_directory(path: Path) -> bool:
     """Probe whether canonically equivalent names remain distinct on the target filesystem."""
-    probe_path: Path | None = None
-    probe_fd = -1
-    try:
-        probe_fd, probe_name = tempfile.mkstemp(prefix=".modelaudit_unicode_probe_\u00e9_", dir=path)
-        probe_path = Path(probe_name)
-        os.close(probe_fd)
-        probe_fd = -1
-        alternate = probe_path.with_name(probe_path.name.replace("\u00e9", "e\u0301", 1))
-        if not alternate.exists():
-            return True
-        return not os.path.samefile(probe_path, alternate)
-    except OSError:
-        # Fail closed when the target filesystem's alias behavior cannot be probed.
-        return False
-    finally:
-        if probe_fd >= 0:
-            os.close(probe_fd)
-        if probe_path is not None:
-            probe_path.unlink(missing_ok=True)
+    return _is_directory_spelling_sensitive(
+        path, ".modelaudit_unicode_probe_\u00e9_", lambda name: name.replace("\u00e9", "e\u0301", 1)
+    )
 
 
 def _local_destination_key(

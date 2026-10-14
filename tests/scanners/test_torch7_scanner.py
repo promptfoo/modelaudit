@@ -10,6 +10,7 @@ from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.torch7_scanner import Torch7Scanner
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.assertions import _assert_absent
 from tests.helpers.file_creators import write_binary_fixture
 
@@ -409,8 +410,7 @@ def test_scan_read_failure_is_inconclusive_not_security_finding(
     assert "torch7_read_failed" in direct.metadata["scan_outcome_reasons"]
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -432,8 +432,6 @@ def test_scan_read_failure_is_inconclusive_not_security_finding(
             ]
             assert core.determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_string_extraction_limit_marks_late_torch7_payload_inconclusive(tmp_path: Path) -> None:
@@ -455,8 +453,7 @@ def test_scan_string_extraction_limit_marks_late_torch7_payload_inconclusive(tmp
     assert budget_checks[0].details["analysis_incomplete"] is True
 
     cache_dir = tmp_path / "cache"
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = core.scan_model_directory_or_file(
             str(path),
             torch7_max_extracted_strings=2,
@@ -476,8 +473,6 @@ def test_scan_string_extraction_limit_marks_late_torch7_payload_inconclusive(tmp
             assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert core.determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_scan_string_extraction_exact_limit_preserves_clean_torch7_result(tmp_path: Path) -> None:

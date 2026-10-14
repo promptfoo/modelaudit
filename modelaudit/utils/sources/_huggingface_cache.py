@@ -7,15 +7,10 @@ from pathlib import Path
 
 
 def _resolve_hf_cache_path(path: Path) -> Path:
-    """Resolve cache paths without depending on strict-aware Path.resolve()."""
+    """Resolve cache paths, falling back to absolute paths on resolution errors."""
     expanded_path = path.expanduser()
     try:
-        return expanded_path.resolve(strict=False)
-    except TypeError:
-        try:
-            return expanded_path.resolve()
-        except (OSError, RuntimeError):
-            return expanded_path.absolute()
+        return expanded_path.resolve()
     except (OSError, RuntimeError):
         return expanded_path.absolute()
 
@@ -50,14 +45,7 @@ def _get_hf_cache_root_spellings() -> tuple[Path, ...]:
 
 def _get_hf_cache_roots() -> tuple[Path, ...]:
     """Return configured HuggingFace hub cache roots plus the default fallback."""
-    roots: list[Path] = []
-
-    for root in _get_hf_cache_root_spellings():
-        resolved_root = _resolve_hf_cache_path(root)
-        if resolved_root not in roots:
-            roots.append(resolved_root)
-
-    return tuple(roots)
+    return tuple(dict.fromkeys(_resolve_hf_cache_path(root) for root in _get_hf_cache_root_spellings()))
 
 
 def _path_has_part(path: Path, part: str) -> bool:
@@ -89,18 +77,6 @@ def _hf_cache_snapshot_revision(path: Path, cache_root: Path | None = None) -> s
             ):
                 return relative_parts[1]
             return None
-        return None
-
-    for index, segment in enumerate(absolute_path.parts):
-        if not segment.lower().startswith("models--"):
-            continue
-        relative_parts = absolute_path.parts[index + 1 :]
-        if (
-            len(relative_parts) >= 3
-            and relative_parts[0].lower() == "snapshots"
-            and relative_parts[1] not in {"", ".", ".."}
-        ):
-            return relative_parts[1]
     return None
 
 

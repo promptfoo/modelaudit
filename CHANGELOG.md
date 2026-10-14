@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve ONNX lineage coverage when zero-length Scan paths, overridable shape defaults, or capped rank-promotable values can hide generated weights.
 - Bound ONNX repeated-state reentry work while preserving local-function, shape, and lineage coverage.
 - Preserve caller-bound ONNX Loop conditions over body initializer defaults and reuse local-function analysis across unused attribute values.
+- Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
+- Make the nested archive test fixture portable to Windows.
 
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
 

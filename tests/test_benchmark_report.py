@@ -59,6 +59,16 @@ def _benchmark_entry(
     }
 
 
+def _run_benchmark_report(args: list[str]) -> subprocess.CompletedProcess[str]:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
+    return subprocess.run(
+        [sys.executable, str(script), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def test_benchmark_report_summary_only(tmp_path: Path) -> None:
     current_json = tmp_path / "current.json"
     summary_file = tmp_path / "summary.md"
@@ -85,19 +95,13 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
         ],
     )
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
-    completed = subprocess.run(
+    completed = _run_benchmark_report(
         [
-            sys.executable,
-            str(script),
             "--current",
             str(current_json),
             "--summary-file",
             str(summary_file),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
     assert completed.returncode == 0
@@ -130,11 +134,8 @@ def test_benchmark_report_reports_regression_without_failing(tmp_path: Path) -> 
     _write_benchmark_json(baseline_json, [_benchmark_entry(benchmark_name, 0.100, 0.101)])
     _write_benchmark_json(current_json, [_benchmark_entry(benchmark_name, 0.135, 0.136)])
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
-    completed = subprocess.run(
+    completed = _run_benchmark_report(
         [
-            sys.executable,
-            str(script),
             "--current",
             str(current_json),
             "--baseline",
@@ -142,9 +143,6 @@ def test_benchmark_report_reports_regression_without_failing(tmp_path: Path) -> 
             "--threshold",
             "0.10",
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
     assert completed.returncode == 0
@@ -162,11 +160,8 @@ def test_benchmark_report_can_fail_on_regression(tmp_path: Path) -> None:
     _write_benchmark_json(baseline_json, [_benchmark_entry(benchmark_name, 0.100, 0.101)])
     _write_benchmark_json(current_json, [_benchmark_entry(benchmark_name, 0.135, 0.136)])
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
-    completed = subprocess.run(
+    completed = _run_benchmark_report(
         [
-            sys.executable,
-            str(script),
             "--current",
             str(current_json),
             "--baseline",
@@ -175,9 +170,6 @@ def test_benchmark_report_can_fail_on_regression(tmp_path: Path) -> None:
             "0.10",
             "--fail-on-regression",
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
     assert completed.returncode == 1
@@ -200,19 +192,13 @@ def test_benchmark_report_reports_missing_benchmark_without_failing(tmp_path: Pa
     )
     _write_benchmark_json(current_json, [_benchmark_entry(kept_benchmark, 0.095, 0.096)])
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
-    completed = subprocess.run(
+    completed = _run_benchmark_report(
         [
-            sys.executable,
-            str(script),
             "--current",
             str(current_json),
             "--baseline",
             str(baseline_json),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
     assert completed.returncode == 0
@@ -235,20 +221,14 @@ def test_benchmark_report_can_fail_on_missing_benchmark(tmp_path: Path) -> None:
     )
     _write_benchmark_json(current_json, [_benchmark_entry(kept_benchmark, 0.095, 0.096)])
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
-    completed = subprocess.run(
+    completed = _run_benchmark_report(
         [
-            sys.executable,
-            str(script),
             "--current",
             str(current_json),
             "--baseline",
             str(baseline_json),
             "--fail-on-missing",
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
     assert completed.returncode == 1
@@ -282,11 +262,8 @@ def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_p
         [_benchmark_entry(benchmark_name, 0.110, 0.111, extra_info={"path": "current_dir"})],
     )
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
-    completed = subprocess.run(
+    completed = _run_benchmark_report(
         [
-            sys.executable,
-            str(script),
             "--current",
             str(current_json),
             "--baseline",
@@ -294,9 +271,6 @@ def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_p
             "--threshold",
             "0.05",
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
     assert completed.returncode == 0
@@ -343,11 +317,8 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
         ],
     )
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
-    completed = subprocess.run(
+    completed = _run_benchmark_report(
         [
-            sys.executable,
-            str(script),
             "--current",
             str(current_json),
             "--baseline",
@@ -355,9 +326,6 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
             "--threshold",
             "0.10",
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
     assert completed.returncode == 0

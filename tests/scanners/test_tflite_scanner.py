@@ -12,6 +12,7 @@ from modelaudit.scanners import _registry
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
 from modelaudit.utils.file.detection import detect_file_format
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.cache import single_file_metadata as _single_file_metadata
 
 HAS_TFLITE = importlib.util.find_spec("tflite") is not None
@@ -172,8 +173,7 @@ def test_tflite_missing_dependency_result_is_not_cached(tmp_path: Path) -> None:
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", False):
             first = core.scan_model_directory_or_file(
                 str(path),
@@ -193,8 +193,6 @@ def test_tflite_missing_dependency_result_is_not_cached(tmp_path: Path) -> None:
         _assert_tflite_inconclusive_exit2(first, "tflite_dependency_unavailable")
         _assert_tflite_inconclusive_exit2(second, "tflite_dependency_unavailable")
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.parametrize(
@@ -280,8 +278,7 @@ def test_tflite_invalid_magic_uncached_rerun_preserves_exit2(tmp_path: Path) -> 
     path.write_bytes(b"invalid tflite data")
     cache_dir = tmp_path / "cache"
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True):
             first = core.scan_model_directory_or_file(
                 str(path),
@@ -301,8 +298,6 @@ def test_tflite_invalid_magic_uncached_rerun_preserves_exit2(tmp_path: Path) -> 
         _assert_tflite_inconclusive_exit2(first, "tflite_magic_validation_failed")
         _assert_tflite_inconclusive_exit2(second, "tflite_magic_validation_failed")
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")

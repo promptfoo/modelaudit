@@ -5365,28 +5365,6 @@ class Jinja2TemplateScanner(BaseScanner):
         if start_offset is not None:
             value, saturated = start_offset
             return self._constant_int_result(-value, cap, saturated=saturated)
-        if isinstance(stop, jinja2.nodes.Add):
-            if stop.left == start:
-                return self._constant_int_expression_result(stop.right, cap, int_bindings)
-            if stop.right == start:
-                return self._constant_int_expression_result(stop.left, cap, int_bindings)
-        if isinstance(stop, jinja2.nodes.Sub) and stop.left == start:
-            result = self._constant_int_expression_result(stop.right, cap, int_bindings)
-            if result is not None:
-                value, saturated = result
-                return self._constant_int_result(-value, cap, saturated=saturated)
-        if isinstance(start, jinja2.nodes.Add):
-            if start.left == stop:
-                result = self._constant_int_expression_result(start.right, cap, int_bindings)
-            elif start.right == stop:
-                result = self._constant_int_expression_result(start.left, cap, int_bindings)
-            else:
-                result = None
-            if result is not None:
-                value, saturated = result
-                return self._constant_int_result(-value, cap, saturated=saturated)
-        if isinstance(start, jinja2.nodes.Sub) and start.left == stop:
-            return self._constant_int_expression_result(start.right, cap, int_bindings)
         return None
 
     def _constant_offset_from_base(

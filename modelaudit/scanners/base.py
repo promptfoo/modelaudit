@@ -321,11 +321,6 @@ class BaseScanner(ABC):
                 return self.default_max_file_read_size
             return value
 
-        if "max_file_size" in self.config:
-            value = self.config["max_file_size"]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                return self.default_max_file_read_size
-
         return self.default_max_file_read_size
 
     def _get_bool_config(self, key: str, default: bool = True) -> bool:
@@ -1584,10 +1579,10 @@ class BaseScanner(ABC):
             result.finish(success=False)
             return result
 
+        if self._path_validation_result is None:
+            self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
+        self._path_validation_result.metadata["file_size"] = file_size
         if self.max_file_read_size and self.max_file_read_size > 0:
-            if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
-            self._path_validation_result.metadata["file_size"] = file_size
             self._path_validation_result.add_check(
                 name="File Size Limit",
                 passed=True,
@@ -1598,10 +1593,6 @@ class BaseScanner(ABC):
                     "max_file_read_size": self.max_file_read_size,
                 },
             )
-        else:
-            if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
-            self._path_validation_result.metadata["file_size"] = file_size
 
         return None
 

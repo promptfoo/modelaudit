@@ -42,6 +42,18 @@ _FunctionAliasSummary = tuple[
     _BuiltinAliasBinding | None,
     tuple[tuple[str, int], ...],
 ]
+_BuiltinAliasState = tuple[
+    list[dict[str, str | None]],
+    list[set[str]],
+    list[set[str]],
+    list[dict[str, dict[tuple[object, ...], str | None]]],
+    list[dict[tuple[str, ...], str | None]],
+    list[dict[str, int | None]],
+]
+_InstanceBindings = tuple[
+    dict[tuple[str, ...], str | None],
+    dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
+]
 _ContainerValue = TypeVar("_ContainerValue")
 _ScopeKey = TypeVar("_ScopeKey")
 _TypedMemberCallableValue = frozenset[tuple[str, str, bool]]
@@ -10986,14 +10998,12 @@ def _update_compact_runpy_aliases(
                 if isinstance(node.ctx, ast.Store):
                     runpy_aliases.discard(node.id)
 
-            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
                 runpy_aliases.discard(node.name)
 
-            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                runpy_aliases.discard(node.name)
+            visit_AsyncFunctionDef = visit_FunctionDef
 
-            def visit_ClassDef(self, node: ast.ClassDef) -> None:
-                runpy_aliases.discard(node.name)
+            visit_ClassDef = visit_FunctionDef
 
             def visit_Lambda(self, node: ast.Lambda) -> None:
                 return
@@ -16816,10 +16826,7 @@ class JITScriptDetector:
                 self.lambda_summaries: dict[int, _FunctionAliasSummary] = {}
                 self.constructor_call_bindings: dict[
                     int,
-                    tuple[
-                        dict[tuple[str, ...], str | None],
-                        dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
-                    ],
+                    _InstanceBindings,
                 ] = {}
 
             def _push_scope(
@@ -19660,14 +19667,7 @@ class JITScriptDetector:
 
             def _snapshot_alias_state(
                 self,
-            ) -> tuple[
-                list[dict[str, str | None]],
-                list[set[str]],
-                list[set[str]],
-                list[dict[str, dict[tuple[object, ...], str | None]]],
-                list[dict[tuple[str, ...], str | None]],
-                list[dict[str, int | None]],
-            ]:
+            ) -> _BuiltinAliasState:
                 return (
                     self._copy_alias_scopes(self.alias_scopes),
                     self._copy_builtins_module_aliases(self.builtins_module_aliases),
@@ -19679,14 +19679,7 @@ class JITScriptDetector:
 
             def _restore_alias_state(
                 self,
-                state: tuple[
-                    list[dict[str, str | None]],
-                    list[set[str]],
-                    list[set[str]],
-                    list[dict[str, dict[tuple[object, ...], str | None]]],
-                    list[dict[tuple[str, ...], str | None]],
-                    list[dict[str, int | None]],
-                ],
+                state: _BuiltinAliasState,
             ) -> None:
                 self.alias_scopes = self._copy_alias_scopes(state[0])
                 self.builtins_module_aliases = self._copy_builtins_module_aliases(state[1])
@@ -19697,24 +19690,8 @@ class JITScriptDetector:
 
             def _merge_alias_state_variants(
                 self,
-                original: tuple[
-                    list[dict[str, str | None]],
-                    list[set[str]],
-                    list[set[str]],
-                    list[dict[str, dict[tuple[object, ...], str | None]]],
-                    list[dict[tuple[str, ...], str | None]],
-                    list[dict[str, int | None]],
-                ],
-                variants: list[
-                    tuple[
-                        list[dict[str, str | None]],
-                        list[set[str]],
-                        list[set[str]],
-                        list[dict[str, dict[tuple[object, ...], str | None]]],
-                        list[dict[tuple[str, ...], str | None]],
-                        list[dict[str, int | None]],
-                    ]
-                ],
+                original: _BuiltinAliasState,
+                variants: list[_BuiltinAliasState],
             ) -> None:
                 merged_scopes = self._copy_alias_scopes(original[0])
                 for index, alias_scope in enumerate(merged_scopes):
@@ -20041,11 +20018,10 @@ class JITScriptDetector:
                             if default is not None:
                                 self.visit(default)
 
-                    def visit_Global(self, node: ast.Global) -> None:
+                    def visit_Global(self, node: ast.Global | ast.Nonlocal) -> None:
                         self.outer_names.update(node.names)
 
-                    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
-                        self.outer_names.update(node.names)
+                    visit_Nonlocal = visit_Global
 
                     def visit_Import(self, node: ast.Import) -> None:
                         self.local_names.update(
@@ -20073,14 +20049,12 @@ class JITScriptDetector:
 
                     _visit_comprehension = _visit_comprehension_expressions
 
-                    def visit_ListComp(self, node: ast.ListComp) -> None:
+                    def visit_ListComp(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp) -> None:
                         self._visit_comprehension(node.generators, (node.elt,))
 
-                    def visit_SetComp(self, node: ast.SetComp) -> None:
-                        self._visit_comprehension(node.generators, (node.elt,))
+                    visit_SetComp = visit_ListComp
 
-                    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-                        self._visit_comprehension(node.generators, (node.elt,))
+                    visit_GeneratorExp = visit_ListComp
 
                     def visit_DictComp(self, node: ast.DictComp) -> None:
                         self._visit_comprehension(node.generators, (node.key, node.value))
@@ -20103,17 +20077,14 @@ class JITScriptDetector:
                     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
                         self.nonlocal_names.update(node.names)
 
-                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                    def visit_FunctionDef(self, node: ast.AST) -> None:
                         return
 
-                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                        return
+                    visit_AsyncFunctionDef = visit_FunctionDef
 
-                    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-                        return
+                    visit_ClassDef = visit_FunctionDef
 
-                    def visit_Lambda(self, node: ast.Lambda) -> None:
-                        return
+                    visit_Lambda = visit_FunctionDef
 
                 visitor = OuterBindingVisitor()
                 for node in nodes:
@@ -20482,11 +20453,10 @@ class JITScriptDetector:
                             self.active_class_calls.pop()
                         self.active_function_calls.discard(function_id)
 
-            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                 self._visit_function_node(node)
 
-            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                self._visit_function_node(node)
+            visit_AsyncFunctionDef = visit_FunctionDef
 
             def visit_Lambda(self, node: ast.Lambda) -> None:
                 default_bindings = self._argument_default_bindings(node.args)
@@ -20505,10 +20475,7 @@ class JITScriptDetector:
                 self,
                 constructor: ast.FunctionDef | ast.AsyncFunctionDef,
                 call: ast.Call | None = None,
-            ) -> tuple[
-                dict[tuple[str, ...], str | None],
-                dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
-            ]:
+            ) -> _InstanceBindings:
                 positional_arguments = [
                     *constructor.args.posonlyargs,
                     *constructor.args.args,
@@ -20548,10 +20515,7 @@ class JITScriptDetector:
             def _constructor_instance_bindings(
                 self,
                 node: ast.ClassDef,
-            ) -> tuple[
-                dict[tuple[str, ...], str | None],
-                dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
-            ]:
+            ) -> _InstanceBindings:
                 constructor = next(
                     (
                         statement
@@ -20566,10 +20530,7 @@ class JITScriptDetector:
             def _constructor_call_instance_bindings(
                 self,
                 node: ast.Call,
-            ) -> tuple[
-                dict[tuple[str, ...], str | None],
-                dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
-            ]:
+            ) -> _InstanceBindings:
                 if cached := self.constructor_call_bindings.get(id(node)):
                     return cached
                 constructor = ast.Attribute(value=node.func, attr="__init__", ctx=ast.Load())
@@ -20926,14 +20887,12 @@ class JITScriptDetector:
 
                     _visit_comprehension = _visit_comprehension_expressions
 
-                    def visit_ListComp(self, node: ast.ListComp) -> None:
+                    def visit_ListComp(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp) -> None:
                         self._visit_comprehension(node.generators, (node.elt,))
 
-                    def visit_SetComp(self, node: ast.SetComp) -> None:
-                        self._visit_comprehension(node.generators, (node.elt,))
+                    visit_SetComp = visit_ListComp
 
-                    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-                        self._visit_comprehension(node.generators, (node.elt,))
+                    visit_GeneratorExp = visit_ListComp
 
                     def visit_DictComp(self, node: ast.DictComp) -> None:
                         self._visit_comprehension(node.generators, (node.key, node.value))
@@ -20952,26 +20911,20 @@ class JITScriptDetector:
                     def visit_Break(self, node: ast.Break) -> None:
                         self.found = True
 
-                    def visit_For(self, node: ast.For) -> None:
+                    def visit_For(self, node: ast.AST) -> None:
                         return
 
-                    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-                        return
+                    visit_AsyncFor = visit_For
 
-                    def visit_While(self, node: ast.While) -> None:
-                        return
+                    visit_While = visit_For
 
-                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-                        return
+                    visit_FunctionDef = visit_For
 
-                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                        return
+                    visit_AsyncFunctionDef = visit_For
 
-                    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-                        return
+                    visit_ClassDef = visit_For
 
-                    def visit_Lambda(self, node: ast.Lambda) -> None:
-                        return
+                    visit_Lambda = visit_For
 
                 visitor = LoopBreakVisitor()
                 for statement in body:
@@ -21021,11 +20974,10 @@ class JITScriptDetector:
                     variants.append(body_state)
                 self._merge_alias_state_variants(original, variants)
 
-            def visit_For(self, node: ast.For) -> None:
+            def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
                 self._visit_loop(node)
 
-            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-                self._visit_loop(node)
+            visit_AsyncFor = visit_For
 
             def visit_While(self, node: ast.While) -> ast.stmt | None:
                 self.visit(node.test)
@@ -21081,24 +21033,16 @@ class JITScriptDetector:
                             self._bind_target(item.optional_vars, None)
                 return self._visit_statements(node.body)
 
-            def visit_With(self, node: ast.With) -> ast.stmt | None:
+            def visit_With(self, node: ast.With | ast.AsyncWith) -> ast.stmt | None:
                 return self._visit_with(node)
 
-            def visit_AsyncWith(self, node: ast.AsyncWith) -> ast.stmt | None:
-                return self._visit_with(node)
+            visit_AsyncWith = visit_With
 
             def visit_Try(self, node: ast.Try) -> ast.stmt | None:
                 original = self._snapshot_alias_state()
                 handler_entry_states: list[
                     tuple[
-                        tuple[
-                            list[dict[str, str | None]],
-                            list[set[str]],
-                            list[set[str]],
-                            list[dict[str, dict[tuple[object, ...], str | None]]],
-                            list[dict[tuple[str, ...], str | None]],
-                            list[dict[str, int | None]],
-                        ],
+                        _BuiltinAliasState,
                         _BuiltinAliasBinding | None,
                     ]
                 ] = []
@@ -21285,14 +21229,12 @@ class JITScriptDetector:
                 finally:
                     self._pop_scope()
 
-            def visit_ListComp(self, node: ast.ListComp) -> None:
+            def visit_ListComp(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp) -> None:
                 self._visit_comprehension(node, node.generators, (node.elt,))
 
-            def visit_SetComp(self, node: ast.SetComp) -> None:
-                self._visit_comprehension(node, node.generators, (node.elt,))
+            visit_SetComp = visit_ListComp
 
-            def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-                self._visit_comprehension(node, node.generators, (node.elt,))
+            visit_GeneratorExp = visit_ListComp
 
             def visit_DictComp(self, node: ast.DictComp) -> None:
                 self._visit_comprehension(node, node.generators, (node.key, node.value))

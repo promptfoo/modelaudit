@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_aggregate_not_cached
 
 # Skip if msgpack is not available before importing it
@@ -232,6 +233,21 @@ def test_flax_scan_reuses_ml_structure_analysis(
     scanner.scan(str(path))
 
     assert analyze_calls == 1
+
+
+def test_flax_streamed_metadata_respects_text_budget(tmp_path: Path) -> None:
+    """Bound metadata text without losing streamed tensor accounting."""
+    path = tmp_path / "metadata.msgpack"
+    create_msgpack_file(path, {"metadata": "x" * 64, "params": {"attention": b"\0" * 4096}})
+
+    bounded = FlaxMsgpackScanner(config={"max_msgpack_bounded_text_chars": 16}).scan(str(path))
+    visible = FlaxMsgpackScanner(config={"max_msgpack_bounded_text_chars": 1024}).scan(str(path))
+
+    assert bounded.success is True
+    assert visible.success is True
+    assert "attention" not in bounded.metadata["jax_metadata"]["architecture_hints"]
+    assert "attention" in visible.metadata["jax_metadata"]["architecture_hints"]
+    assert bounded.metadata["estimated_parameters"] == visible.metadata["estimated_parameters"] == 1024
 
 
 def test_flax_ml_structure_uses_bounded_text_without_whole_object_stringification() -> None:
@@ -2226,8 +2242,7 @@ def test_flax_msgpack_visible_finding_with_deep_sibling_remains_security_finding
     assert any(issue.severity == IssueSeverity.CRITICAL and "os\\.system" in issue.message for issue in result.issues)
     assert any("Maximum recursion depth exceeded" in check.message for check in result.checks)
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         aggregates = [
             scan_model_directory_or_file(
                 str(path),
@@ -2244,8 +2259,6 @@ def test_flax_msgpack_visible_finding_with_deep_sibling_remains_security_finding
             assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
             assert determine_exit_code(aggregate) == 1
         assert get_cache_manager(str(tmp_path / "mixed-outcome-cache"), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_flax_msgpack_non_standard_structure(tmp_path):
@@ -2591,8 +2604,7 @@ def test_flax_msgpack_redacts_openai_project_key_across_persisted_outputs(tmp_pa
     create_msgpack_file(path, {token: b"0" * 4096})
     scanner = FlaxMsgpackScanner(config={"cache_enabled": True, "cache_dir": str(cache_dir)})
 
-    reset_cache_manager()
-    try:
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
         direct = scanner.scan(str(path))
         first = scanner.scan_with_cache(str(path))
         cached = scanner.scan_with_cache(str(path))
@@ -2613,8 +2625,6 @@ def test_flax_msgpack_redacts_openai_project_key_across_persisted_outputs(tmp_pa
         assert token not in cache_text
         assert cache_stats["total_entries"] == 1
         assert cache_stats["cache_hits"] == 1
-    finally:
-        reset_cache_manager()
 
 
 def test_flax_msgpack_unresolved_binary_pattern_aggregate_exits_with_error_and_is_not_cached(tmp_path: Path) -> None:

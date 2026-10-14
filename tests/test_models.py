@@ -21,6 +21,7 @@ from modelaudit.models import (
     LicenseInfoModel,
     MLContextModel,
     MLFrameworkInfo,
+    ModelAuditResultModel,
     NetworkCommFinding,
     NetworkPatternModel,
     ScanConfigModel,
@@ -476,6 +477,10 @@ class TestFileMetadataModel:
         assert score <= 1.0
 
 
+def _aggregate_scan_result(result: ModelAuditResultModel, **fields: Any) -> None:
+    result.aggregate_scan_result({"issues": [], "checks": [], "assets": [], **fields})
+
+
 class TestModelAuditResultModel:
     """Tests for ModelAuditResultModel."""
 
@@ -486,68 +491,53 @@ class TestModelAuditResultModel:
         assert result.files_scanned == 0
         assert result.has_errors is False
 
-    def test_aggregate_scan_result(self):
+    def test_aggregate_scan_result(self) -> None:
         """Test aggregating scan results."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "bytes_scanned": 1000,
-                "files_scanned": 1,
-                "issues": [],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            bytes_scanned=1000,
+            files_scanned=1,
         )
         assert result.bytes_scanned == 1000
         assert result.files_scanned == 1
 
-    def test_aggregate_scan_result_with_issues(self):
+    def test_aggregate_scan_result_with_issues(self) -> None:
         """Test aggregating results with issues."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "bytes_scanned": 500,
-                "files_scanned": 1,
-                "issues": [
-                    {
-                        "message": "Test issue",
-                        "severity": "warning",  # lowercase for enum
-                        "timestamp": time.time(),
-                    }
-                ],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            bytes_scanned=500,
+            files_scanned=1,
+            issues=[
+                {
+                    "message": "Test issue",
+                    "severity": "warning",  # lowercase for enum
+                    "timestamp": time.time(),
+                }
+            ],
         )
         assert len(result.issues) == 1
 
-    def test_aggregate_with_has_errors(self):
+    def test_aggregate_with_has_errors(self) -> None:
         """Test aggregating results with errors."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "bytes_scanned": 100,
-                "files_scanned": 1,
-                "has_errors": True,
-                "issues": [],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            bytes_scanned=100,
+            files_scanned=1,
+            has_errors=True,
         )
         assert result.has_errors is True
 
-    def test_aggregate_scanner_names(self):
+    def test_aggregate_scanner_names(self) -> None:
         """Test scanner names are tracked."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "bytes_scanned": 100,
-                "files_scanned": 1,
-                "scanners": ["PickleScanner", "ZipScanner"],
-                "issues": [],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            bytes_scanned=100,
+            files_scanned=1,
+            scanners=["PickleScanner", "ZipScanner"],
         )
         assert "PickleScanner" in result.scanner_names
 
@@ -583,15 +573,11 @@ class TestModelAuditResultModel:
     def test_aggregate_scan_result_analysis_incomplete_metadata_fails_closed(self) -> None:
         """Dict aggregation should not require scan_outcome when coverage is incomplete."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "success": True,
-                "files_scanned": 1,
-                "file_metadata": {"model.bin": {"analysis_incomplete": True}},
-                "issues": [],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            success=True,
+            files_scanned=1,
+            file_metadata={"model.bin": {"analysis_incomplete": True}},
         )
 
         assert result.has_errors is False
@@ -602,22 +588,19 @@ class TestModelAuditResultModel:
     def test_aggregate_scan_result_incomplete_reason_with_finding_fails_coverage_success(self) -> None:
         """Security findings keep exit 1 while incomplete coverage makes success false."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "success": True,
-                "files_scanned": 1,
-                "file_metadata": {"model.bin": {"scan_outcome_reasons": ["bounded_probe_exhausted"]}},
-                "issues": [
-                    {
-                        "message": "Dangerous reference found beyond bounded coverage",
-                        "severity": "warning",
-                        "location": "model.bin",
-                        "timestamp": 0.0,
-                    }
-                ],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            success=True,
+            files_scanned=1,
+            file_metadata={"model.bin": {"scan_outcome_reasons": ["bounded_probe_exhausted"]}},
+            issues=[
+                {
+                    "message": "Dangerous reference found beyond bounded coverage",
+                    "severity": "warning",
+                    "location": "model.bin",
+                    "timestamp": 0.0,
+                }
+            ],
         )
 
         assert result.has_errors is False
@@ -628,23 +611,20 @@ class TestModelAuditResultModel:
     def test_aggregate_scan_result_check_only_security_failure_is_not_operational_failure(self) -> None:
         """Dict aggregation should classify check-only security findings as completed findings."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "success": False,
-                "files_scanned": 1,
-                "issues": [],
-                "checks": [
-                    {
-                        "name": "Synthetic Security Check",
-                        "status": "failed",
-                        "message": "Synthetic check-only warning finding",
-                        "severity": "warning",
-                        "location": "synthetic.bin",
-                        "timestamp": 0.0,
-                    }
-                ],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            success=False,
+            files_scanned=1,
+            checks=[
+                {
+                    "name": "Synthetic Security Check",
+                    "status": "failed",
+                    "message": "Synthetic check-only warning finding",
+                    "severity": "warning",
+                    "location": "synthetic.bin",
+                    "timestamp": 0.0,
+                }
+            ],
         )
 
         assert result.success is False
@@ -655,27 +635,24 @@ class TestModelAuditResultModel:
     def test_aggregate_scan_result_issue_only_incomplete_coverage_fails_closed(self) -> None:
         """Dict aggregation should honor incomplete coverage retained only in issue details."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "success": True,
-                "files_scanned": 1,
-                "issues": [
-                    {
-                        "message": "DVC output limit exceeded - not all declared outputs were scanned",
-                        "severity": "info",
-                        "location": "model.dvc",
-                        "type": "dvc_output_limit_exceeded",
-                        "details": {
-                            "analysis_incomplete": True,
-                            "scan_outcome": "inconclusive",
-                            "reason": "dvc_output_limit_exceeded",
-                        },
-                        "timestamp": 0.0,
-                    }
-                ],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            success=True,
+            files_scanned=1,
+            issues=[
+                {
+                    "message": "DVC output limit exceeded - not all declared outputs were scanned",
+                    "severity": "info",
+                    "location": "model.dvc",
+                    "type": "dvc_output_limit_exceeded",
+                    "details": {
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "reason": "dvc_output_limit_exceeded",
+                    },
+                    "timestamp": 0.0,
+                }
+            ],
         )
 
         assert result.has_errors is False
@@ -686,29 +663,26 @@ class TestModelAuditResultModel:
     def test_aggregate_scan_result_runtime_version_skip_does_not_fail_coverage_success(self) -> None:
         """Expected CVE applicability skips are not scanner coverage failures."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "success": True,
-                "files_scanned": 1,
-                "issues": [],
-                "checks": [
-                    {
-                        "name": "CVE PyTorch Version Check",
-                        "status": "skipped",
-                        "message": "PyTorch runtime version unavailable",
-                        "severity": "info",
-                        "location": "weights.pt",
-                        "details": {
-                            "analysis_incomplete": True,
-                            "runtime_version_known": False,
-                            "runtime_cve_applicability": "unknown",
-                            "runtime_cve_version_gate": "local_environment_only",
-                        },
-                        "timestamp": 0.0,
-                    }
-                ],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            success=True,
+            files_scanned=1,
+            checks=[
+                {
+                    "name": "CVE PyTorch Version Check",
+                    "status": "skipped",
+                    "message": "PyTorch runtime version unavailable",
+                    "severity": "info",
+                    "location": "weights.pt",
+                    "details": {
+                        "analysis_incomplete": True,
+                        "runtime_version_known": False,
+                        "runtime_cve_applicability": "unknown",
+                        "runtime_cve_version_gate": "local_environment_only",
+                    },
+                    "timestamp": 0.0,
+                }
+            ],
         )
 
         assert result.has_errors is False
@@ -718,24 +692,21 @@ class TestModelAuditResultModel:
     def test_aggregate_scan_result_skipped_bare_analysis_incomplete_fails_closed(self) -> None:
         """Skipped incomplete checks need runtime-version metadata to remain clean."""
         result = create_initial_audit_result()
-        result.aggregate_scan_result(
-            {
-                "success": True,
-                "files_scanned": 1,
-                "issues": [],
-                "checks": [
-                    {
-                        "name": "Embedded Secret Scan",
-                        "status": "skipped",
-                        "message": "Embedded secret scan skipped after bounded read",
-                        "severity": "info",
-                        "location": "model.bin",
-                        "details": {"analysis_incomplete": True},
-                        "timestamp": 0.0,
-                    }
-                ],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            success=True,
+            files_scanned=1,
+            checks=[
+                {
+                    "name": "Embedded Secret Scan",
+                    "status": "skipped",
+                    "message": "Embedded secret scan skipped after bounded read",
+                    "severity": "info",
+                    "location": "model.bin",
+                    "details": {"analysis_incomplete": True},
+                    "timestamp": 0.0,
+                }
+            ],
         )
 
         assert result.has_errors is False
@@ -746,14 +717,10 @@ class TestModelAuditResultModel:
         """Scalar scanner fields should not be split into characters."""
         result = create_initial_audit_result()
 
-        result.aggregate_scan_result(
-            {
-                "scanner_names": "skops",
-                "scanners": "zip",
-                "issues": [],
-                "checks": [],
-                "assets": [],
-            }
+        _aggregate_scan_result(
+            result,
+            scanner_names="skops",
+            scanners="zip",
         )
 
         assert result.scanner_names == ["zip", "skops"]

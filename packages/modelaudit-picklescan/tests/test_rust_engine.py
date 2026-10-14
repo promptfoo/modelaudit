@@ -121,9 +121,9 @@ def parity_payloads() -> dict[str, tuple[bytes, ScanOptions | None]]:
 
 
 def test_rust_parser_declares_all_pickletools_opcodes() -> None:
-    source = _rust_source_text()
-    rust_opcodes = set(re.findall(r'name: "([A-Z0-9_]+)"', source))
-    rust_opcodes.update(re.findall(r'simple_opcode\("([A-Z0-9_]+)"', source))
+    source = _rust_source_text().split("pub(crate) fn parse_opcode(", 1)[1]
+    source = source.split("\nfn ", 1)[0]
+    rust_opcodes = set(re.findall(r'\(\s*"([A-Z0-9_]+)",', source))
 
     assert rust_opcodes == {opcode.name for opcode in pickletools.opcodes}
 

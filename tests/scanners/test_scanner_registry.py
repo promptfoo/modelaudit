@@ -17,6 +17,7 @@ from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
 from modelaudit.core import scan_file
 from modelaudit.scanner_registry_metadata import (
     SCANNER_REGISTRY_METADATA,
+    _with_scanner_defaults,
     get_extension_format_map,
     get_registered_scanner_extensions,
 )
@@ -258,36 +259,19 @@ def test_numpy_compatibility_detection():
     assert len(numpy_status) > 10
 
 
-@pytest.mark.parametrize("scanner_id", _REPRESENTATIVE_SCANNER_IDS)
-def test_representative_scanner_descriptors_match_scanner_class_metadata(scanner_id: str) -> None:
-    """Pin descriptor/class metadata parity and explicit routing exceptions."""
-    registry = ScannerRegistry()
-    scanner_info = registry.get_scanner_info(scanner_id)
-    scanner_class = registry.load_scanner_by_id(scanner_id)
-
-    assert scanner_info is not None
-    if scanner_class is None:
-        assert scanner_id in registry.get_failed_scanners()
-        return
-
-    assert scanner_info["class"] == scanner_class.__name__
-    assert scanner_info["description"] == scanner_class.description
-
-    explicitly_routed_extensions = set(scanner_info["extensions"])
-    scanner_extensions = set(scanner_class.supported_extensions)
-    scanner_only_extensions = set(scanner_info.get("scanner_only_extensions", []))
-    content_routed_extensions = set(scanner_info.get("content_routed_extensions", []))
-    descriptor_extensions = explicitly_routed_extensions | content_routed_extensions
-
-    assert scanner_extensions == explicitly_routed_extensions | scanner_only_extensions
-    assert not (scanner_only_extensions & explicitly_routed_extensions)
-    assert not (scanner_only_extensions & content_routed_extensions)
-    assert content_routed_extensions <= descriptor_extensions
+@pytest.mark.parametrize("module", [None, "custom.scanner"])
+def test_scanner_module_defaults_preserve_overrides(module: str | None) -> None:
+    scanner_info = {"class": "CustomScanner"}
+    if module is not None:
+        scanner_info["module"] = module
+    metadata = _with_scanner_defaults({"custom": scanner_info})
+    assert metadata["custom"]["module"] == (module or "modelaudit.scanners.custom_scanner")
+    assert next(iter(metadata["custom"])) == "module"
 
 
 @pytest.mark.parametrize("scanner_id", sorted(SCANNER_REGISTRY_METADATA))
 def test_scanner_descriptors_match_class_extension_metadata(scanner_id: str) -> None:
-    """All direct descriptor extensions must match the scanner class contract."""
+    """Descriptor identity and extensions must match the scanner class contract."""
     registry = ScannerRegistry()
     scanner_info = registry.get_scanner_info(scanner_id)
     scanner_class = registry.load_scanner_by_id(scanner_id)
@@ -296,6 +280,11 @@ def test_scanner_descriptors_match_class_extension_metadata(scanner_id: str) -> 
     if scanner_class is None:
         assert scanner_id in registry.get_failed_scanners()
         return
+
+    assert scanner_info["module"] == scanner_class.__module__
+    assert scanner_info["class"] == scanner_class.__name__
+    if scanner_id in _REPRESENTATIVE_SCANNER_IDS:
+        assert scanner_info["description"] == scanner_class.description
 
     explicitly_routed_extensions = set(scanner_info["extensions"])
     scanner_only_extensions = set(scanner_info.get("scanner_only_extensions", []))

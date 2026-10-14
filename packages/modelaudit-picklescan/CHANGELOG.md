@@ -7,6 +7,10 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
+
 ## [0.1.12](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.11...modelaudit-picklescan-v0.1.12) (2026-10-06)
 
 ### Fixed

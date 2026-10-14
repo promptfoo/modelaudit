@@ -11,6 +11,7 @@ from types import ModuleType
 from typing import Any, Final
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from modelaudit.config.name_blacklist import check_model_name_policies
 from modelaudit.core_results import mark_operational_scan_error, scan_result_has_operational_error
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
@@ -27,20 +28,7 @@ except ImportError:  # pragma: no cover - Python 3.10 compatibility
     except ImportError:
         _tomllib = None
 
-# Try to import the name policies module
-try:
-    from modelaudit.config.name_blacklist import check_model_name_policies
-
-    HAS_NAME_POLICIES = True
-except ImportError:
-    HAS_NAME_POLICIES = False
-
-    # Create a placeholder function when the module is not available
-    def check_model_name_policies(
-        model_name: str,
-        additional_patterns: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        return False, ""
+HAS_NAME_POLICIES = True
 
 
 # Try to import yaml, but handle the case where it's not installed

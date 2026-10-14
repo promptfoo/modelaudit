@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.utils.file import detection as detection_module
 from modelaudit.utils.file.detection import (
@@ -22,6 +22,17 @@ from tests.helpers.cache import assert_inconclusive_not_cached as _assert_file_i
 from tests.helpers.file_creators import (
     pickle_binunicode_text as _proto4_binunicode,
 )
+
+
+def _assert_stack_global_system_detected(result: ScanResult) -> None:
+    assert result.success
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["opcode"] == "STACK_GLOBAL"
+        and check.details["global"] == "os.system"
+        for check in result.checks
+    )
 
 
 def _write_orbax_metadata(checkpoint_dir: Path, metadata: dict[str, object]) -> None:
@@ -1125,14 +1136,7 @@ def test_stack_global_opcode_is_detected_after_interleaved_unhandled_stack_push(
 
     result = JaxCheckpointScanner().scan(str(pickle_path))
 
-    assert result.success
-    assert any(
-        check.name == "Pickle Opcode Security Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["opcode"] == "STACK_GLOBAL"
-        and check.details["global"] == "os.system"
-        for check in result.checks
-    )
+    _assert_stack_global_system_detected(result)
 
 
 def test_memoized_stack_global_opcode_is_detected(tmp_path: Path) -> None:
@@ -1160,14 +1164,7 @@ def test_memoized_stack_global_opcode_is_detected(tmp_path: Path) -> None:
 
     result = JaxCheckpointScanner().scan(str(pickle_path))
 
-    assert result.success
-    assert any(
-        check.name == "Pickle Opcode Security Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["opcode"] == "STACK_GLOBAL"
-        and check.details["global"] == "os.system"
-        for check in result.checks
-    )
+    _assert_stack_global_system_detected(result)
 
 
 def test_high_index_memoized_stack_global_opcode_is_detected_after_memo_eviction(tmp_path: Path) -> None:
@@ -1200,14 +1197,7 @@ def test_high_index_memoized_stack_global_opcode_is_detected_after_memo_eviction
 
     result = JaxCheckpointScanner().scan(str(pickle_path))
 
-    assert result.success
-    assert any(
-        check.name == "Pickle Opcode Security Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["opcode"] == "STACK_GLOBAL"
-        and check.details["global"] == "os.system"
-        for check in result.checks
-    )
+    _assert_stack_global_system_detected(result)
 
 
 def test_old_memoized_stack_global_opcode_is_detected_after_filler_memo_eviction(tmp_path: Path) -> None:
@@ -1235,14 +1225,7 @@ def test_old_memoized_stack_global_opcode_is_detected_after_filler_memo_eviction
 
     result = JaxCheckpointScanner().scan(str(pickle_path))
 
-    assert result.success
-    assert any(
-        check.name == "Pickle Opcode Security Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["opcode"] == "STACK_GLOBAL"
-        and check.details["global"] == "os.system"
-        for check in result.checks
-    )
+    _assert_stack_global_system_detected(result)
 
 
 def test_old_memoized_stack_global_opcode_is_detected_after_dangerous_token_flood(tmp_path: Path) -> None:
@@ -1270,14 +1253,7 @@ def test_old_memoized_stack_global_opcode_is_detected_after_dangerous_token_floo
 
     result = JaxCheckpointScanner().scan(str(pickle_path))
 
-    assert result.success
-    assert any(
-        check.name == "Pickle Opcode Security Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["opcode"] == "STACK_GLOBAL"
-        and check.details["global"] == "os.system"
-        for check in result.checks
-    )
+    _assert_stack_global_system_detected(result)
 
 
 def test_memoize_index_stays_aligned_after_rewriting_evicted_explicit_memo_slot(tmp_path: Path) -> None:
@@ -1309,14 +1285,7 @@ def test_memoize_index_stays_aligned_after_rewriting_evicted_explicit_memo_slot(
 
     result = JaxCheckpointScanner().scan(str(pickle_path))
 
-    assert result.success
-    assert any(
-        check.name == "Pickle Opcode Security Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["opcode"] == "STACK_GLOBAL"
-        and check.details["global"] == "os.system"
-        for check in result.checks
-    )
+    _assert_stack_global_system_detected(result)
 
 
 def test_many_memoize_events_keep_high_memo_index_resolution_bounded(tmp_path: Path) -> None:
@@ -1349,14 +1318,7 @@ def test_many_memoize_events_keep_high_memo_index_resolution_bounded(tmp_path: P
 
     result = JaxCheckpointScanner().scan(str(pickle_path))
 
-    assert result.success
-    assert any(
-        check.name == "Pickle Opcode Security Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["opcode"] == "STACK_GLOBAL"
-        and check.details["global"] == "os.system"
-        for check in result.checks
-    )
+    _assert_stack_global_system_detected(result)
 
 
 def test_pickle_opcode_findings_are_capped_for_repeated_dangerous_globals(tmp_path: Path) -> None:
