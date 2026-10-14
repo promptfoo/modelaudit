@@ -3636,6 +3636,68 @@ def test_detect_file_format_plain_text_binint1_prefix_not_pickle(tmp_path: Path)
     assert detect_file_format_from_magic(str(payload)) != "pickle"
 
 
+@pytest.mark.parametrize("opcodes", [b"R", b"NNR"])
+def test_detect_file_format_global_text_with_missing_call_arguments_is_not_pickle(
+    tmp_path: Path, opcodes: bytes
+) -> None:
+    document = tmp_path / "LICENSE"
+    document.write_bytes(b"configuration\nReference\n" + opcodes + b" not a pickle")
+
+    assert detect_file_format(str(document)) == "unknown"
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("prefix", [b"I0\n", b"I0\np0\nI1\np0\n"])
+def test_detect_file_format_preserves_pickle_residual_stack(tmp_path: Path, prefix: bytes) -> None:
+    document = tmp_path / "LICENSE"
+    document.write_bytes(prefix + b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.")
+
+    assert detect_file_format(str(document)) == "pickle"
+    assert detect_file_format_from_magic(str(document)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(document)) == "pickle"
+
+
+@pytest.mark.parametrize("filename", ["LICENSE", "README.md", "notes.txt"])
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_detect_file_format_license_opcode_collision_is_not_pickle(
+    tmp_path: Path, filename: str, newline: bytes
+) -> None:
+    document = tmp_path / filename
+    document.write_bytes(
+        newline.join([b"Microsoft.", b"Copyright (c) Microsoft Corporation.", b"", b"MIT License", b""])
+    )
+
+    assert detect_file_format(str(document)) == "unknown"
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("filename", ["LICENSE", "README.md", "notes.txt"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'cos\nsystem\n(S"echo regression"\ntR0.Microsoft.\r\n',
+        b'cbuiltins\neval\n(S"1+1"\ntR.\xff',
+        b'I0\ncbuiltins\neval\n(S"1+1"\ntR.\xff',
+    ],
+)
+def test_detect_file_format_text_named_pickle_with_malformed_tail_still_routes(
+    tmp_path: Path, filename: str, payload: bytes
+) -> None:
+    document = tmp_path / filename
+    document.write_bytes(payload)
+
+    assert detect_file_format(str(document)) == "pickle"
+    assert detect_file_format_from_magic(str(document)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(document)) == "pickle"
+
+
+@pytest.mark.parametrize("payload", [b"(R not a pickle", b"c\nplain text\n\xff", b"cbuiltins\neval\nN."])
+def test_proto0_probe_keeps_opcode_budget(payload: bytes) -> None:
+    assert not file_detection._looks_like_proto0_or_1_pickle(payload, max_probe_opcodes=1)
+
+
 def test_detect_file_format_proto1_scalar_with_trailing_text_not_pickle(tmp_path: Path) -> None:
     """A trivial scalar pickle prefix with trailing text should not force pickle detection."""
     payload = tmp_path / "proto1-scalar-prefixed-notes.txt"
