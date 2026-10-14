@@ -13,8 +13,9 @@ from modelaudit.detectors.network_comm import NetworkCommDetector
 
 MAX_EXAMPLE_BYTES = 16 * 1024
 MAX_FENCES = 128
-EXECUTABLE_FENCE_LANGUAGES = frozenset({b"", b"sh", b"bash", b"shell", b"console", b"terminal", b"py", b"python"})
-FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>\w*)[ \t]*\r?$")
+PARSED_FENCE_LANGUAGES = frozenset({b"", b"sh", b"bash", b"shell", b"console", b"terminal", b"py", b"python"})
+FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r\n]*?)[ \t]*\r?$")
+INDENTED_CODE_BLOCK_PATTERN = re.compile(rb"(?m)^(?: {4}|\t)[^\n]*\n?(?:(?: {4}|\t)[^\n]*\n?|[ \t]*\n)*")
 URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
 PYTHON_EXECUTION_NAMES = frozenset(
@@ -92,11 +93,23 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
         return None
     if words[:2] == ["git", "clone"]:
         args = words[2:]
-        while args and args[0] in {"--branch", "-b", "--depth", "--single-branch"}:
-            option = args.pop(0)
+        while args:
+            if args[0] == "--":
+                args.pop(0)
+                break
+            option, separator, value = args[0].partition("=")
+            if option not in {"--branch", "-b", "--depth", "--single-branch"}:
+                break
+            args.pop(0)
             if option == "--single-branch":
+                if separator:
+                    return None
                 continue
-            if not args or re.fullmatch(r"[\w./-]+", args.pop(0)) is None:
+            if not separator:
+                value = args.pop(0) if args else ""
+            if re.fullmatch(r"[\w./-]+", value) is None or value.startswith("-"):
+                return None
+            if option == "--depth" and (not value.isdecimal() or not value.strip("0")):
                 return None
         if len(args) == 2:
             destination = args.pop()
@@ -344,6 +357,11 @@ def _command_executes_script(words: list[str]) -> bool:
 
 
 def _example_executes_script(source: bytes, language: bytes) -> bool:
+    if language in {b"bibtex", b"json", b"text", b"plaintext"}:
+        language = b""
+    elif language not in PARSED_FENCE_LANGUAGES:
+        # An unparsed language cannot establish that a clone is setup-only.
+        return bool(source.strip())
     if language in {b"", b"py", b"python"}:
         try:
             tree = ast.parse(source.decode("utf-8"))
@@ -402,15 +420,31 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
     return False
 
 
+def _indented_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
+    count = 0
+    for start, end in regions:
+        for match in INDENTED_CODE_BLOCK_PATTERN.finditer(payload, start, end):
+            count += 1
+            if count > MAX_FENCES or match.end() - match.start() > MAX_EXAMPLE_BYTES:
+                return True
+            source = re.sub(rb"(?m)^(?: {4}|\t)", b"", match.group())
+            if _example_executes_script(source, b""):
+                return True
+    return False
+
+
 def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
     """Return URL spans only inside complete, recognized Markdown fences."""
     spans: list[tuple[int, int]] = []
     opening: re.Match[bytes] | None = None
     executes_script = False
+    outside_fences: list[tuple[int, int]] = []
+    previous_end = 0
     for count, match in enumerate(FENCE_PATTERN.finditer(payload)):
         if count >= MAX_FENCES * 2:
             return ()
         if opening is None:
+            outside_fences.append((previous_end, match.start()))
             opening = match
             continue
         if (
@@ -420,14 +454,14 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
         ):
             continue
         start, end = opening.end() + 1, match.start()
-        language = opening.group("language").lower()
+        info = opening.group("language").lower().split()
+        language = info[0] if info else b""
         if (
             end - start <= MAX_EXAMPLE_BYTES
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
         ):
             source = payload[start:end]
-            if language in EXECUTABLE_FENCE_LANGUAGES:
-                executes_script |= _example_executes_script(source, language)
+            executes_script |= _example_executes_script(source, language)
             examples = (
                 _shell_url_spans(source)
                 if language in {b"sh", b"bash", b"shell"}
@@ -436,11 +470,16 @@ def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ..
                 else []
             )
             spans.extend((start + left, start + right) for left, right in examples)
-        elif language in EXECUTABLE_FENCE_LANGUAGES:
+        else:
             executes_script = True
+        previous_end = match.end()
         opening = None
-    if opening is not None and opening.group("language").lower() in EXECUTABLE_FENCE_LANGUAGES:
+    if opening is not None:
         executes_script = True
+    else:
+        outside_fences.append((previous_end, len(payload)))
+    if not executes_script:
+        executes_script = _indented_examples_execute_script(payload, outside_fences)
     if executes_script:
         spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
     return tuple(spans)

@@ -5260,6 +5260,9 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         "git clone https://github.com/example/model.git\ncd model\npip install -e .\n```\n",
         "```bash\ngit clone https://github.com/owner/repo.git repo\n```\n",
         "```bash\ngit clone --depth 1 https://github.com/owner/repo.git ./models/repo\n```\n",
+        "```bash\ngit clone --depth=1 https://github.com/owner/repo.git\n```\n",
+        "```bash\ngit clone -- https://github.com/owner/repo.git\n```\n",
+        "```bash\ngit clone --branch=release --depth=1 -- https://github.com/owner/repo.git repo\n```\n",
         "```bash\npip install --extra-index-url=https://download.pytorch.org/whl/ torch\n```\n",
         "```bash\npython -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
         "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
@@ -5299,6 +5302,7 @@ def test_routine_documented_examples_are_informational(tmp_path: Path, content: 
         "git clone https://github.com/owner/payload.git",
         "git clone https://user:password@github.com/owner/repo.git",
         "git clone --upload-pack=payload https://github.com/owner/repo.git",
+        "git clone --depth=1 --upload-pack=payload https://github.com/owner/repo.git",
         "git clone -c core.sshCommand=payload https://github.com/owner/repo.git",
         "git clone https://github.com/owner/repo.git && python repo/payload.py",
         "git clone https://github.com/owner/repo.git # \\\npython repo/payload.py",
@@ -5351,6 +5355,14 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         "```\nrepo/install.py --help\n```\n",
         "```console\n$ python repo/install.py\n```\n",
         "```terminal\n$ python3 repo/install.py\n```\n",
+        "```powershell\n& ./repo/install.ps1\n```\n",
+        "```javascript\nrequire('child_process').execFileSync('node', ['repo/install.js']);\n```\n",
+        "```ruby\nload './repo/install.rb'\n```\n",
+        "```powershell title=setup\n& ./repo/install.ps1\n```\n",
+        "```powershell title=setup\n& ./repo/install.ps1\n",
+        "    python repo/install.py\n",
+        "\tpython repo/install.py\n",
+        "    import runpy\n\n    runpy.run_path('repo/install.py')\n",
         "```bash\n./repo/install.sh\n```\n",
         "```bash\n./repo/install.py --help\n```\n",
         "```bash\nexec -a installer python repo/install.py\n```\n",
@@ -5371,7 +5383,7 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         "```bash\npython repo/install.py\n",
     ],
 )
-def test_documented_clone_script_chains_across_fences_remain_actionable(tmp_path: Path, execution: str) -> None:
+def test_documented_clone_script_chains_across_blocks_remain_actionable(tmp_path: Path, execution: str) -> None:
     content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n\nRun the next step:\n\n" + execution
     result = _scan_text_content(tmp_path / "README.md", content)
     assert any(
@@ -5396,6 +5408,10 @@ def test_documented_clone_script_chains_across_fences_remain_actionable(tmp_path
         "```bash\necho '`python repo/install.py`'\n```\n",
         '```\nprint("repo/install.py")\n```\n',
         '```\n"repo/install.py"\n```\n',
+        '```json\n{"script": "repo/install.py"}\n```\n',
+        "```bibtex\n@article{example,\n    title = {Example model}\n}\n```\n",
+        '    print("python repo/install.py")\n',
+        "    python3 --version\n",
         '```bash\necho "&&" python repo/install.py\n```\n',
         '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
     ],
