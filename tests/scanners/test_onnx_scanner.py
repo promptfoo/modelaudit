@@ -5591,7 +5591,13 @@ class TestWeightDistributionCoverage:
     _INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 
     @staticmethod
-    def _coverage_checks(result: Any) -> list[Any]:
+    def _coverage_checks(result: Any, *, standalone: bool = False) -> list[Any]:
+        if standalone:
+            return [
+                check
+                for check in result.checks
+                if check.name == "Weight Distribution Analysis" and check.details.get("analysis_incomplete") is True
+            ]
         return [c for c in result.checks if c.name == "Weight Distribution Analysis Coverage"]
 
     def _assert_uncached_inconclusive_exit2(self, model_path: Path, cache_dir: Path, **scan_kwargs: Any) -> None:
@@ -38180,11 +38186,7 @@ class TestOnnxFinalReviewBindingAndSqueeze:
         assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
         assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
-        coverage_checks = [
-            check
-            for check in result.checks
-            if check.name == "Weight Distribution Analysis" and check.details.get("analysis_incomplete") is True
-        ]
+        coverage_checks = TestWeightDistributionCoverage._coverage_checks(result, standalone=True)
         assert bool(coverage_checks) is incomplete
         assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
         for check in coverage_checks:
@@ -38365,7 +38367,9 @@ class TestOnnxFunctionOpsetRetention:
             gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
             assert bool(gaps.get("function_opset_environment_work_limit", 0)) is incomplete
             assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
-            coverage_checks = TestWeightDistributionCoverage._coverage_checks(result)
+            coverage_checks = TestWeightDistributionCoverage._coverage_checks(
+                result, standalone=scanner_type is WeightDistributionScanner
+            )
             assert bool(coverage_checks) is incomplete
             assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
         if incomplete:
@@ -38620,7 +38624,7 @@ class TestOnnxRejectedCastAndPoolingProofs:
         assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
         assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
-        coverage_checks = TestWeightDistributionCoverage._coverage_checks(result)
+        coverage_checks = TestWeightDistributionCoverage._coverage_checks(result, standalone=True)
         assert bool(coverage_checks) is incomplete
         assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
         assert OnnxScanner().scan(str(path)).success is not incomplete
@@ -39785,7 +39789,7 @@ class TestOnnxScan8MutableDefaultBatchProofs:
         assert result.success is not incomplete, result.metadata
         assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) >= 1
-        assert bool(TestWeightDistributionCoverage._coverage_checks(result)) is incomplete
+        assert bool(TestWeightDistributionCoverage._coverage_checks(result, standalone=True)) is incomplete
         ordinary = OnnxScanner().scan(str(path))
         assert ordinary.success is not incomplete, ordinary.metadata
         if incomplete:
