@@ -9856,7 +9856,7 @@ from pathlib import Path
 
 if sys.argv[7] == "logging":
     import logging
-from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, Severity, call_graph, scan_bytes
 
 module_dir = Path(sys.argv[1])
 marker = Path(sys.argv[2])
@@ -9866,7 +9866,32 @@ original_pattern = vars(string.Template)["pattern"]
 assert original_pattern is vars(string)["_TemplatePattern"]
 sys.path.insert(0, str(module_dir))
 report = scan_bytes(payload, source="uncached-template-no-placeholder.pkl")
+descriptor_path = (
+    "string." + method_name,
+    "string.Template._compile_pattern",
+    "builtins.__import__",
+)
+# The fixture's direct REDUCE has no keywords. Check this descriptor edge
+# independently of the report's conservative whole-stream keyword coverage.
+actual_descriptor_path = call_graph._find_sink_path("string." + method_name, ())
+assert actual_descriptor_path == descriptor_path
+assert vars(string.Template)["pattern"] is original_pattern
+assert not marker.exists()
+sys.modules.pop("re", None)
+try:
+    pickle.loads(payload)
+except RuntimeError as error:
+    assert str(error) == "shadow-re-imported", error
+else:
+    raise AssertionError("the uncached pattern did not import shadow re")
+assert marker.read_text() == "imported"
 assert report.verdict == SafetyVerdict.MALICIOUS, report
+execution_complete = sys.argv[6] == "False" and sys.argv[7] == "string" and sys.argv[5] == "False"
+assert report.metadata["callable_invocations"], report
+assert all(
+    item.get("template_execution_complete") is execution_complete
+    for item in report.metadata["callable_invocations"]
+), report
 if sys.argv[6] == "True" or sys.argv[7] != "string":
     assert report.status == ScanStatus.INCONCLUSIVE, report
     assert any("receiver state cannot be proven unchanged" in error.message for error in report.errors), report
@@ -9879,24 +9904,17 @@ if sys.argv[6] == "True" or sys.argv[7] != "string":
 elif sys.argv[5] == "True":
     assert report.status == ScanStatus.INCONCLUSIVE, report
     assert any("mapping callbacks cannot be proven covered" in error.message for error in report.errors), report
+expected_report_path = (
+    ("string." + method_name, "builtins.__import__")
+    if method_name in {"Template.substitute", "Template.safe_substitute"} and not execution_complete
+    else descriptor_path
+)
 assert any(
-    finding.details.get("call_path") == (
-        "string." + method_name,
-        "string.Template._compile_pattern",
-        "builtins.__import__",
-    )
+    finding.rule_code == "DANGEROUS_CALL_GRAPH"
+    and finding.severity == Severity.CRITICAL
+    and finding.details.get("call_path") == expected_report_path
     for finding in report.findings
 ), report
-assert vars(string.Template)["pattern"] is original_pattern
-assert not marker.exists()
-sys.modules.pop("re", None)
-try:
-    pickle.loads(payload)
-except RuntimeError as error:
-    assert str(error) == "shadow-re-imported", error
-else:
-    raise AssertionError("the uncached pattern did not import shadow re")
-assert marker.read_text() == "imported"
 """
     _assert_isolated_python(
         tmp_path,
