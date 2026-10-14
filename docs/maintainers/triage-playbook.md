@@ -46,5 +46,5 @@ This playbook standardizes issue and pull request triage for maintainers.
 
 1. Validate CI status and failing checks.
 2. Ensure scope is focused and tests are present.
-3. Check compatibility claims (Python 3.10-3.13).
+3. Check compatibility claims (Python 3.10-3.14).
 4. Request follow-up changes or route to reviewer.

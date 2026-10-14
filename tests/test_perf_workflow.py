@@ -452,6 +452,7 @@ def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() ->
             {"python-version": "3.10", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
             {"python-version": "3.12", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
             {"python-version": "3.13", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
+            {"python-version": "3.14", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
         ],
         [
             {
@@ -460,7 +461,7 @@ def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() ->
                 "shard-index": shard_index,
                 "shard-name": f"{shard_index + 1}/2",
             }
-            for python_version in ("3.10", "3.11", "3.12", "3.13")
+            for python_version in ("3.10", "3.11", "3.12", "3.13", "3.14")
             for shard_index in (0, 1)
         ],
     ]
@@ -589,6 +590,7 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
         ("EXPECT_DEPENDENCY_SURFACE", "UV_LOCK_RESULT"),
         ("EXPECT_CORE_FAST", "TYPE_CHECK_RESULT"),
         ("EXPECT_CORE_FAST", "WINDOWS_RESULT"),
+        ("EXPECT_CORE_FAST", "PYTHON314_SMOKE_RESULT"),
         ("EXPECT_TEST", "TEST_RESULT"),
         ("EXPECT_SLOW", "SLOW_RESULT"),
         ("EXPECT_COVERAGE", "COVERAGE_RESULT"),
@@ -827,3 +829,28 @@ def test_python_ci_verifies_download_before_enabling_uploader(tmp_path: Path, sc
     assert json.loads(curl_args.read_text())[-1] == (
         "https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux"
     )
+
+
+def test_python314_platform_smoke_is_required_for_python_changes() -> None:
+    jobs = _jobs(_load_workflow("test.yml"))
+    smoke = jobs["python314-platform-smoke"]
+    assert smoke["if"] == jobs["lint"]["if"]
+    assert smoke["strategy"]["matrix"] == {"os": ["macos-latest", "windows-latest"]}
+    assert smoke["strategy"]["fail-fast"] is False
+    assert smoke["runs-on"] == "${{ matrix.os }}"
+    assert "python314-platform-smoke" in jobs["ci-success"]["needs"]
+    steps = smoke["steps"]
+    sync = _step_by_name(steps, "Sync Python 3.14 smoke dependencies")["run"]
+    assert "--locked --python 3.14 --extra all-ci-windows --extra h5" in sync
+    probe = _step_by_name(steps, "Verify Python 3.14 native and H5 imports")
+    # PowerShell reports the last native command's status, so the probe must own its step.
+    assert probe["run"].strip().splitlines() == [
+        'uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"'
+    ]
+    assert "if" not in probe
+    assert "continue-on-error" not in probe
+    assert "continue-on-error" not in smoke
+    test_step = _step_by_name(steps, "Test Python 3.14 native pickle and H5 scanning")
+    assert steps.index(probe) < steps.index(test_step)
+    assert "if" not in test_step
+    assert "--locked --python 3.14 pytest tests/test_python_compatibility.py -n 0" in test_step["run"]

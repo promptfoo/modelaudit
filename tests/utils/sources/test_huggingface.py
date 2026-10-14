@@ -953,6 +953,12 @@ class TestExtractModelIdFromPath:
         """Direct file URLs should retain their repository provenance."""
         assert extract_model_id_from_path(url) == (model_id, "huggingface")
 
+    @pytest.mark.parametrize("scheme", ["https", "HTTPS", "s3", "gs", "gcs", "r2", "file"])
+    def test_remote_source_labels_do_not_probe_local_metadata(self, scheme: str) -> None:
+        source = f"{scheme}://bucket/weights.pkl?token=" + "x" * (256 * 1024)
+        with patch("modelaudit.utils.sources.huggingface_paths.Path", side_effect=AssertionError("local path probe")):
+            assert extract_model_id_from_path(source) == (None, None)
+
     def test_extract_model_id_from_local_config(self, tmp_path: Path) -> None:
         """Local config metadata should still be extracted as local provenance."""
         model_dir = tmp_path / "model"
