@@ -4280,11 +4280,20 @@ def _looks_like_proto0_or_1_pickle(
 
         opcode_count = 0
         has_non_trivial_opcode = False
+        has_security_opcode = False
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
                 if opcode.name == "STOP":
                     stop_pos = 0 if _pos is None else _pos
+                    if not has_security_opcode:
+                        # Prose such as "Microsoft." can decode as opcodes with
+                        # an invalid stack. Keep execution-bearing prefixes even
+                        # when a later opcode makes the stream malformed.
+                        try:
+                            pickletools.dis(candidate[: stop_pos + 1], out=StringIO())
+                        except Exception:
+                            return False
                     trailing = candidate[stop_pos + 1 :]
                     if not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
                         return opcode_count >= 2
@@ -4302,6 +4311,8 @@ def _looks_like_proto0_or_1_pickle(
                     )
                 if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
                     has_non_trivial_opcode = True
+                if opcode.name in _BINARY_PICKLE_SECURITY_OPCODES:
+                    has_security_opcode = True
                 if opcode_count >= max_probe_opcodes:
                     return False
         except ValueError as exc:
