@@ -172,6 +172,10 @@ DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
+DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN = re.compile(
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"[\s(\[{\\]{0,4096}[rubfRUBF]*(?P<quote>[\"'`])"
+)
 DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"(?=[^\r\n]{0,4096}$)[^\r\n]*[rubfRUBF]*[\"']$"
@@ -1153,8 +1157,14 @@ class TextScanner(BaseScanner):
     @classmethod
     def _documentation_markdown_link_is_in_code_context(cls, prefix: bytes, link_start: int) -> bool:
         code_prefix = prefix[:link_start]
+        line_prefix = code_prefix.rsplit(b"\n", 1)[-1]
         return (
             cls._documentation_assignment_is_actionable(code_prefix)
+            or any(
+                cls._documentation_quoted_value_is_open(code_prefix, match.group("quote")[0], match.end())
+                for match in DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(code_prefix)
+            )
+            or (not line_prefix.lstrip().startswith(b"|") and cls._documentation_prefix_has_enclosing_call(line_prefix))
             or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
@@ -1193,6 +1203,8 @@ class TextScanner(BaseScanner):
                     return None
                 link_start = line_start + markdown_match.start()
                 context_start = max(0, link_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+                if cls._finding_line_prefix_is_truncated(payload, {"position": link_start}):
+                    context_start = max(0, link_start - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
                 if context_start > 0:
                     next_newline = payload.find(b"\n", context_start, link_start)
                     if next_newline >= 0:
@@ -1252,11 +1264,15 @@ class TextScanner(BaseScanner):
         if context is None:
             return False
         context_prefix, link_start = context
-        if cls._finding_line_prefix_is_truncated(payload, {"position": link_start}):
-            return False
         line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
+        if len(line_prefix) >= MAX_TEXT_FINDING_CONTEXT_BYTES and not line_prefix.strip():
+            return False
         passive_line_markdown_link = cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix)
         literal_value_prefix = cls._documentation_markdown_link_leading_prefix_is_literal_value(line_prefix)
+        if (passive_line_markdown_link or literal_value_prefix) and cls._documentation_open_call_contains_position(
+            payload, link_start
+        ):
+            return False
         return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is False and (
             (passive_line_markdown_link and not cls._documentation_markdown_link_config_is_actionable(context_prefix))
             or (
@@ -2008,15 +2024,17 @@ class TextScanner(BaseScanner):
             )
             previous_line = payload[previous_line_start:previous_line_end]
             stripped = previous_line.strip()
+            if stripped.startswith((b"```", b"~~~")):
+                return False
             if stripped and not stripped.startswith(b"#"):
                 previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
                 if current_indent == 0 and previous_indent == 0:
-                    if cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:line_start]):
+                    if cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:position]):
                         return True
                     previous_line_end = previous_line_start - 1
                     continue
                 if previous_indent < current_indent:
-                    return cls._documentation_prefix_has_enclosing_call(previous_line)
+                    return cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:position])
             if previous_line_start == context_start:
                 break
             previous_line_end = previous_line_start - 1
@@ -2092,7 +2110,10 @@ class TextScanner(BaseScanner):
         if html_link is not None:
             tag_line_start = html_prefix.rfind(b"\n", 0, html_link.start()) + 1
             if not html_prefix[tag_line_start : html_link.start()].strip():
-                return False
+                surrounding_prefix = html_prefix[: html_link.start()]
+                return cls._documentation_assignment_is_actionable(
+                    surrounding_prefix
+                ) or cls._documentation_markdown_link_config_is_actionable(surrounding_prefix)
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return not cls._documentation_truncated_prefix_after_closed_xml_config_is_passive(payload, position)
         line_parts = cls._finding_line_parts(payload, finding)
@@ -2163,6 +2184,11 @@ class TextScanner(BaseScanner):
     def _find_documentation_token(payload: bytes, token_bytes: bytes, start: int) -> int:
         return payload.find(token_bytes, start)
 
+    @staticmethod
+    def _find_documentation_port_token(payload: bytes, token_bytes: bytes, start: int) -> int:
+        match = re.compile(re.escape(token_bytes) + rb"(?![0-9])").search(payload, start)
+        return match.start() if match is not None else -1
+
     @classmethod
     def _retarget_documentation_finding(
         cls,
@@ -2185,9 +2211,14 @@ class TextScanner(BaseScanner):
             if isinstance(original_position, int) and original_position >= 0
             else 0
         )
+        find_token = cls._find_documentation_token
+        if finding_type == "suspicious_port":
+            # Detector positions point at the digits, while retarget tokens
+            # include their delimiter. Include the original occurrence.
+            search_start = max(0, search_start - max(map(len, token_bytes_options)) + len(str(finding["port"])))
+            find_token = cls._find_documentation_port_token
         next_positions = {
-            token_bytes: cls._find_documentation_token(lowered_payload, token_bytes, search_start)
-            for token_bytes in token_bytes_options
+            token_bytes: find_token(lowered_payload, token_bytes, search_start) for token_bytes in token_bytes_options
         }
         while True:
             if remaining_occurrences <= 0:
@@ -2222,7 +2253,7 @@ class TextScanner(BaseScanner):
             search_start = match_position + len(token_bytes)
             for option, next_position in next_positions.items():
                 if 0 <= next_position < search_start:
-                    next_positions[option] = cls._find_documentation_token(lowered_payload, option, search_start)
+                    next_positions[option] = find_token(lowered_payload, option, search_start)
             if remaining_occurrences <= 0:
                 if allow_exhaustion_probe and not any(position >= search_start for position in next_positions.values()):
                     return candidate, False, 0
