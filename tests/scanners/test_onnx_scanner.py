@@ -41067,3 +41067,359 @@ class TestOnnxCallAttributeWork:
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model, tmp_path, incomplete, prior_weights, coverage_reason="attribute_binding_work_limit"
         )
+
+
+class TestOnnxConstantAdmissionOrder:
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    @pytest.mark.parametrize("mode", ["unused", "outputs", "weights", "source_priority"])
+    def test_accepted_constant_copies_preserve_prior_weight_admission(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner_type: Any, mode: str
+    ) -> None:
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        initializers = [onnx.numpy_helper.from_array(prior, name="Bad")]
+        inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64])]
+        outputs = [helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64])]
+        known = helper.make_node("MatMul", ["X", "Bad"], ["known"])
+        nodes = [] if mode == "source_priority" else [known]
+        if mode == "source_priority":
+            # Initializer priority differs from graph-consumer discovery order.
+            initializers.append(onnx.numpy_helper.from_array(np.zeros((64, 64), np.float32), name="Good"))
+            nodes.append(helper.make_node("MatMul", ["X", "Good"], ["benign"]))
+            outputs.append(helper.make_tensor_value_info("benign", TensorProto.FLOAT, [1, 64]))
+        if mode == "weights":
+            initializers.append(onnx.numpy_helper.from_array(np.array([32, 64], np.int64), name="shape"))
+            inputs.append(helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1, 32]))
+        for index in range(3 if mode == "source_priority" else 4):
+            name = f"value_{index}"
+            if mode == "weights":
+                nodes.extend(
+                    [
+                        helper.make_node("Constant", [], [name], value_floats=[0.0] * 2048),
+                        helper.make_node("Reshape", [name, "shape"], [f"weight_{index}"]),
+                        helper.make_node("MatMul", ["Z", f"weight_{index}"], [f"output_{index}"]),
+                    ]
+                )
+                outputs.append(helper.make_tensor_value_info(f"output_{index}", TensorProto.FLOAT, [1, 64]))
+            else:
+                nodes.append(helper.make_node("Constant", [], [name], value_ints=[0] * 2048))
+                if mode == "outputs":
+                    outputs.append(helper.make_tensor_value_info(name, TensorProto.INT64, [2048]))
+        if mode == "source_priority":
+            nodes.append(known)
+        model = helper.make_model(
+            helper.make_graph(nodes, "constant_admission_order", inputs, outputs, initializer=initializers),
+            opset_imports=[helper.make_opsetid("", 18)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        # The standalone route must reach tensor admission rather than its
+        # independent serialized-model size limit.
+        assert len(model.SerializeToString()) < 65536
+        config = {"max_array_size": 32768, "max_weight_distribution_total_bytes": 65536}
+        analyzer = WeightDistributionScanner(config=config)
+        copied = TestOnnxPrimaryConstantBudgets._record_copies(monkeypatch)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=32768,
+            pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size
+            ),
+            retain_array_check=lambda name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size, retain=True
+            ),
+        )
+        expected_names = ["Bad"] + (["Good"] if mode == "source_priority" else [])
+        if mode == "weights":
+            expected_names.extend(f"value_{index}" for index in range(3))
+        assert [spec.context["initializer"] for spec in plan.specs] == expected_names
+        assert [spec.analysis_id for spec in plan.specs] == list(range(len(expected_names)))
+        np.testing.assert_array_equal(plan.specs[0].weights, prior)
+        assert [tensor.name for tensor in copied] == [
+            f"value_{index}" for index in range(2 if mode == "source_priority" else 3)
+        ]
+        assert analyzer.retained_tensor_bytes == 65536
+        assert plan.coverage_gaps["constant_attribute_decode_limit"] == 1
+        assert plan.extraction_failures == 0
+        path = _save_onnx_model(model, tmp_path / "constant-order.onnx")
+        result = scanner_type(config=config).scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        assert (
+            result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["constant_attribute_decode_limit"]
+            == 1
+        )
+        coverage = TestWeightDistributionCoverage._coverage_checks(
+            result, standalone=scanner_type is WeightDistributionScanner
+        )
+        assert coverage and all(check.status == CheckStatus.FAILED and check.message for check in coverage)
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache", **config)
+
+
+class TestOnnxExplicitEmptySqueezeAxes:
+    @pytest.mark.parametrize(
+        "mode",
+        ["empty_initializer", "empty_constant", "empty_function", "omitted", "placeholder", "axis_zero", "overridable"],
+    )
+    def test_empty_axes_input_preserves_matrix_lineage_coverage(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        sources = [f"W{index}" for index in range(33)]
+        initializers = [onnx.numpy_helper.from_array(prior, name="prior")] + [
+            onnx.numpy_helper.from_array(np.ones((1, 64), np.float32), name=name) for name in sources
+        ]
+        matrix = mode in {"empty_initializer", "empty_constant", "empty_function", "overridable"}
+        inputs = [
+            helper.make_tensor_value_info("PriorX", TensorProto.FLOAT, [1, 64]),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1] if matrix else [1, 64]),
+        ]
+        nodes = [
+            helper.make_node("MatMul", ["PriorX", "prior"], ["known"]),
+            helper.make_node("Sum", sources, ["combined"]),
+        ]
+        axes_values = [0] if mode == "axis_zero" else []
+        squeeze_inputs = ["combined"]
+        if mode == "placeholder":
+            squeeze_inputs.append("")
+        elif mode != "omitted":
+            squeeze_inputs.append("axes")
+            if mode == "empty_constant":
+                constant = helper.make_node("Constant", [], ["axes"])
+                constant.attribute.append(onnx.AttributeProto(name="value_ints", type=onnx.AttributeProto.INTS))
+                nodes.append(constant)
+            else:
+                initializers.append(onnx.numpy_helper.from_array(np.array(axes_values, np.int64), name="axes"))
+            if mode == "overridable":
+                # The runtime value is empty, but an input default is not an
+                # immutable proof of which axes a caller will supply.
+                inputs.append(helper.make_tensor_value_info("axes", TensorProto.INT64, [None]))
+        functions = []
+        if mode == "empty_function":
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "SqueezeWithAxes",
+                    ["data", "control"],
+                    ["view"],
+                    [helper.make_node("Squeeze", ["data", "control"], ["view"])],
+                    [helper.make_opsetid("", 13)],
+                )
+            )
+            nodes.append(helper.make_node("SqueezeWithAxes", squeeze_inputs, ["view"], domain="local"))
+        else:
+            nodes.append(helper.make_node("Squeeze", squeeze_inputs, ["view"]))
+        nodes.append(helper.make_node("MatMul", ["X", "view"], ["Y"]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "explicit_empty_squeeze_axes",
+                inputs,
+                [
+                    helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64]),
+                    helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 64] if matrix else [1]),
+                ],
+                initializer=initializers,
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        feeds = {
+            "PriorX": np.ones((1, 64), np.float32),
+            "X": np.ones((1, 1) if matrix else (1, 64), np.float32),
+        }
+        if mode == "overridable":
+            feeds["axes"] = np.array([], np.int64)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(
+            actual[1], np.full((1, 64) if matrix else (1,), 33.0 if matrix else 33.0 * 64, np.float32)
+        )
+        # An empty-string optional input retains the planner's existing unknown
+        # treatment; the positive empty-vector proof must not cover that case.
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, matrix or mode == "placeholder", prior, coverage_reason="lineages_per_value_limit"
+        )
+
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize("source_count", [1, 33])
+    def test_legacy_empty_axes_cannot_prove_rank_demotion(
+        self, tmp_path: Path, local_function: bool, source_count: int
+    ) -> None:
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        sources = [f"W{index}" for index in range(source_count)]
+        initializers = [onnx.numpy_helper.from_array(prior, name="prior")] + [
+            onnx.numpy_helper.from_array(np.ones((1, 64), np.float32), name=name) for name in sources
+        ]
+        nodes = [helper.make_node("MatMul", ["PriorX", "prior"], ["known"])]
+        data_name = sources[0]
+        if source_count > 1:
+            nodes.append(helper.make_node("Sum", sources, ["combined"]))
+            data_name = "combined"
+        squeeze = helper.make_node("Squeeze", ["data" if local_function else data_name], ["view"])
+        squeeze.attribute.append(onnx.AttributeProto(name="axes", type=onnx.AttributeProto.INTS))
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local", "LegacySqueeze", ["data"], ["view"], [squeeze], [helper.make_opsetid("", 11)]
+                )
+            )
+            nodes.append(helper.make_node("LegacySqueeze", [data_name], ["view"], domain="local"))
+        else:
+            nodes.append(squeeze)
+        nodes.append(helper.make_node("MatMul", ["X", "view"], ["Y"]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "legacy_empty_axes_ambiguity",
+                [
+                    helper.make_tensor_value_info("PriorX", TensorProto.FLOAT, [1, 64]),
+                    helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+                ],
+                [
+                    helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64]),
+                    helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 64]),
+                    helper.make_tensor_value_info("view", TensorProto.FLOAT, None),
+                ],
+                initializer=initializers,
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 11), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        # The schema preserves the singleton axis. The legacy reference
+        # implementation disagrees, so it cannot justify dropping coverage.
+        model = onnx.shape_inference.infer_shapes(model, strict_mode=True)
+        onnx.checker.check_model(model, full_check=True)
+        view = next(output for output in model.graph.output if output.name == "view")
+        assert [dimension.dim_value for dimension in view.type.tensor_type.shape.dim] == [1, 64]
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model,
+            tmp_path,
+            True,
+            prior,
+            coverage_reason="lineages_per_value_limit" if source_count > 1 else "unresolved_initializer_lineage",
+        )
+
+
+class TestOnnxDeferredConstantProofIdentity:
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_equal_metadata_constants_keep_distinct_reentry_proofs(self, tmp_path: Path, reverse: bool) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        body = helper.make_graph(
+            [helper.make_node("Reshape", ["current", "target"], ["next"])],
+            "bound_shape_replay",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition", [], TensorProto.BOOL),
+                value("current", None),
+            ],
+            [value("condition", [], TensorProto.BOOL), value("next", None)],
+        )
+        analyze = helper.make_function(
+            "local",
+            "Analyze",
+            ["state", "target", "two", "start"],
+            ["final"],
+            [helper.make_node("Loop", ["two", "start", "state"], ["final"], body=body)],
+            [helper.make_opsetid("", 14)],
+        )
+        constant = helper.make_node("Constant", [], ["shape"])
+        constant.attribute.append(
+            onnx.AttributeProto(name="value_ints", ref_attr_name="payload", type=onnx.AttributeProto.INTS)
+        )
+        wrapper = helper.make_function(
+            "local",
+            "Wrapper",
+            ["state", "two", "start"],
+            ["first", "again"],
+            [constant]
+            + [
+                helper.make_node("Analyze", ["state", "shape", "two", "start"], [name], domain="local")
+                for name in ("first", "again")
+            ],
+            [helper.make_opsetid("", 14), helper.make_opsetid("local", 1)],
+            attributes=["payload"],
+        )
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        shapes = [(4, 1), (2, 2)] if reverse else [(2, 2), (4, 1)]
+        nodes = [helper.make_node("MatMul", ["PriorX", "prior"], ["known"])]
+        inputs = [value("PriorX", [1, 64])]
+        outputs = [value("known", [1, 64])]
+        for index, shape in enumerate(shapes):
+            nodes.append(
+                helper.make_node(
+                    "Wrapper",
+                    ["W", "two", "start"],
+                    [f"first{index}", f"again{index}"],
+                    domain="local",
+                    payload=list(shape),
+                )
+            )
+            inputs.append(value(f"X{index}", [1, shape[0]]))
+            for name in ("first", "again"):
+                nodes.append(helper.make_node("MatMul", [f"X{index}", f"{name}{index}"], [f"Y_{name}{index}"]))
+                outputs.append(value(f"Y_{name}{index}", [1, shape[1]]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "distinct_deferred_constant_proofs",
+                inputs,
+                outputs,
+                initializer=[
+                    onnx.numpy_helper.from_array(prior, name="prior"),
+                    onnx.numpy_helper.from_array(np.arange(4, dtype=np.float32), name="W"),
+                    onnx.numpy_helper.from_array(np.array(2, np.int64), name="two"),
+                    onnx.numpy_helper.from_array(np.array(True, np.bool_), name="start"),
+                ],
+            ),
+            functions=[wrapper, analyze],
+            opset_imports=[helper.make_opsetid("", 14), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        feeds = {"PriorX": np.ones((1, 64), np.float32)}
+        feeds.update({f"X{index}": np.ones((1, shape[0]), np.float32) for index, shape in enumerate(shapes)})
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        for index, shape in enumerate(shapes):
+            expected = feeds[f"X{index}"] @ np.arange(4, dtype=np.float32).reshape(shape)
+            for offset in (1, 2):
+                np.testing.assert_array_equal(actual[2 * index + offset], expected)
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        fingerprints: dict[int, set[Any]] = {}
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_name == "semantic_cache_fingerprint_with_owner"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+            ):
+                owner = frame.f_locals.get("value")
+                if getattr(owner, "name", None) == "shape":
+                    fingerprints.setdefault(id(owner), set()).add(arg)
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous_profile)
+        assert len(fingerprints) == 2, fingerprints
+        assert all(len(keys) == 1 for keys in fingerprints.values())
+        assert len(set().union(*fingerprints.values())) == 2
+        assert plan.coverage_gaps == {}
+        for shape in shapes:
+            assert any(
+                np.array_equal(spec.weights, np.arange(4, dtype=np.float32).reshape(shape)) for spec in plan.specs
+            )
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(model, tmp_path, False, prior)

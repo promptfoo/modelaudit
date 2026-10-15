@@ -2179,6 +2179,13 @@ def _build_onnx_weight_analysis_plan(
             plan.coverage_gaps.setdefault("vector_control_work_limit", 1)
             return None
         vector_control_work_remaining -= element_count
+        pending = pending_constant_values.get(id(initializer))
+        if pending is not None and pending[0] is initializer:
+            # The source field is already typed; read only this admitted small
+            # control vector without copying its full TensorProto payload.
+            values = tuple(int(value) for value in pending[1])
+            vector_control_cache[id(initializer)] = (initializer, values)
+            return values
         if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
             return None
         # Container lengths do not materialize individual protobuf payloads.
@@ -2241,8 +2248,12 @@ def _build_onnx_weight_analysis_plan(
         ):
             dims = tuple(int(dimension) for dimension in raw_dims)
             if (_onnx_shape_extent_product(dims) if dims else 1) == 1:
-                with suppress(Exception):
-                    value = onnx.numpy_helper.to_array(initializer).reshape(-1)[0].item()
+                pending = pending_constant_values.get(id(initializer))
+                if pending is not None and pending[0] is initializer:
+                    value = pending[1][0]
+                else:
+                    with suppress(Exception):
+                        value = onnx.numpy_helper.to_array(initializer).reshape(-1)[0].item()
         # Keep the immutable protobuf owner, including failed proofs, so repeated
         # queries neither decode again nor reuse an unrelated wrapper's id.
         scalar_control_cache[key] = (initializer, value)
@@ -2470,7 +2481,8 @@ def _build_onnx_weight_analysis_plan(
                 return resolved_attribute.sparse_tensor
         return None
 
-    constant_attribute_tensors: dict[tuple[Any, ...], tuple[Any, Any, str | None]] = {}
+    constant_attribute_tensors: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+    pending_constant_values: dict[int, tuple[Any, Any]] = {}
     constant_attribute_bytes_remaining = _ONNX_CONSTANT_ATTRIBUTE_FALLBACK_BYTE_LIMIT
 
     def primary_repeated_constant_tensor(
@@ -2479,17 +2491,30 @@ def _build_onnx_weight_analysis_plan(
         data_type: int,
         source_key: tuple[Any, ...],
         name: str,
-    ) -> tuple[Any, str | None]:
-        nonlocal constant_attribute_bytes_remaining
+    ) -> Any:
         cached = constant_attribute_tensors.get(source_key)
         if cached is not None:
-            return cached[1], cached[2]
-
-        count = len(values)
+            return cached[1]
         tensor = onnx.TensorProto()
         tensor.name = name
         tensor.data_type = data_type
-        tensor.dims.append(count)
+        tensor.dims.append(len(values))
+        # Retain the immutable source and metadata during graph discovery.
+        # Payload copies join weight arrays in source-index admission order.
+        constant_attribute_tensors[source_key] = (attribute, tensor)
+        pending_constant_values[id(tensor)] = (tensor, values)
+        return tensor
+
+    def materialize_primary_constant(initializer: Any) -> bool:
+        nonlocal constant_attribute_bytes_remaining
+        pending = pending_constant_values.pop(id(initializer), None)
+        if pending is None:
+            return True
+        tensor, values = pending
+        assert tensor is initializer
+        count = len(values)
+        name = str(tensor.name)
+        data_type = int(tensor.data_type)
         tensor_bytes = count * (4 if data_type == int(onnx.TensorProto.FLOAT) else 8)
         bounded_name, _length, _truncated = _bounded_onnx_metadata_text(plan, name)
         reason: str | None = None
@@ -2523,10 +2548,9 @@ def _build_onnx_weight_analysis_plan(
             plan.oversized_initializers_skipped += 1
         if reason is not None:
             plan.record_coverage_gap(reason)
-        # Preserve both successful payloads and failed source identities. Their
-        # reservation remains charged while the tensor and later arrays coexist.
-        constant_attribute_tensors[source_key] = (attribute, tensor, reason)
-        return tensor, reason
+        # A source is attempted once in the final initializer walk. Successful
+        # copies stay charged while their payload and analysis arrays coexist.
+        return reason is None
 
     def graph_value_is_constant_bool(
         current_graph: Any,
@@ -2731,7 +2755,12 @@ def _build_onnx_weight_analysis_plan(
             resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
             noop_value = int(getattr(resolved_attribute, "i", 0)) if resolved_attribute is not None else 0
             break
-        return node.op_type == "Squeeze" and not axes and bool(noop_value)
+        input_form = (
+            len(getattr(node, "input", ())) > 1
+            and bool(node.input[1])
+            and not any(attribute.name == "axes" for attribute in getattr(node, "attribute", ()))
+        )
+        return node.op_type == "Squeeze" and not axes and (input_form or bool(noop_value))
 
     def squeeze_axes_are_valid(
         axes: tuple[int, ...],
@@ -2752,6 +2781,10 @@ def _build_onnx_weight_analysis_plan(
         if squeeze_with_empty_axes_is_noop(node, (), resolve_attribute):
             return shape
         if any(dimension < 0 for dimension in shape):
+            return None
+        # Legacy explicit-empty attributes disagree between ONNX schema and
+        # reference execution. Do not prove a rank reduction from that ambiguity.
+        if 1 in shape and any(attribute.name == "axes" for attribute in getattr(node, "attribute", ())):
             return None
         return tuple(dimension for dimension in shape if dimension != 1)
 
@@ -3067,6 +3100,14 @@ def _build_onnx_weight_analysis_plan(
             if cached_fingerprint is not None and cached_fingerprint[0] is value:
                 return cached_fingerprint[1]
         type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+        pending = pending_constant_values.get(value_id)
+        if pending is not None and pending[0] is value:
+            # Metadata-only tensors cannot identify their deferred values. Their
+            # retained source owners distinguish bindings without copying data.
+            fingerprint = (type_name, f"pending-constant:{value_id}")
+            if retain_owner:
+                cache_fingerprints[value_id] = (value, fingerprint)
+            return fingerprint
         byte_size = getattr(value, "ByteSize", None)
         if callable(byte_size):
             try:
@@ -12066,7 +12107,6 @@ def _build_onnx_weight_analysis_plan(
                 constant_tensor = None
                 sparse_constant = None
                 unresolved_constant_attribute = False
-                constant_unresolved_reason: str | None = None
                 constant_source_key: tuple[Any, ...] | None = None
                 for attribute_position, attribute in enumerate(node.attribute):
                     resolved_attribute = resolve_attribute(attribute)
@@ -12089,7 +12129,7 @@ def _build_onnx_weight_analysis_plan(
                             "constant_value",
                             *attribute_source_key(attribute, local_node_index, attribute_position),
                         )
-                        constant_tensor, constant_unresolved_reason = primary_repeated_constant_tensor(
+                        constant_tensor = primary_repeated_constant_tensor(
                             resolved_attribute,
                             resolved_attribute.floats if is_float else resolved_attribute.ints,
                             int(onnx.TensorProto.FLOAT if is_float else onnx.TensorProto.INT64),
@@ -12132,7 +12172,6 @@ def _build_onnx_weight_analysis_plan(
                     lineage = register_initializer(
                         constant_tensor,
                         current_graph_index,
-                        unresolved_reason=constant_unresolved_reason,
                         source_key=constant_source_key,
                     )
                     constants[name] = constant_tensor
@@ -14104,8 +14143,14 @@ def _build_onnx_weight_analysis_plan(
     analyzed_initializer_indexes: set[int] = set()
     eligible_metadata: list[dict[str, Any]] = []
     analysis_id = 0
-    for initializer_index in sorted(eligible_initializer_indexes):
-        initializer = initializers[initializer_index]
+    for initializer_index, initializer in enumerate(initializers):
+        # Preserve source priority, including initializers whose consumers were
+        # discovered after a Constant. Output-only Constants retain their copy
+        # admission checks without consuming earlier weight-view capacity.
+        if not materialize_primary_constant(initializer):
+            continue
+        if initializer_index not in eligible_initializer_indexes:
+            continue
         initializer_groups = groups[initializer_index]
         if not initializer_groups:
             continue
