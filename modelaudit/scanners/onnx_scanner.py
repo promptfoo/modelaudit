@@ -170,7 +170,6 @@ _ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES = 128 * 1024 * 1024
 _ONNX_STRUCTURE_RETAINED_OBJECT_BYTES = 1024
 _ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
 _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
-_ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
 _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -2813,6 +2812,8 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         axes: tuple[int, ...],
         resolve_attribute: Callable[[Any], Any | None] | None = None,
+        *,
+        shape: tuple[int, ...] | None = None,
     ) -> bool:
         noop_value = 0
         for attribute in getattr(node, "attribute", ()):
@@ -2826,7 +2827,14 @@ def _build_onnx_weight_analysis_plan(
             and bool(node.input[1])
             and not any(attribute.name == "axes" for attribute in getattr(node, "attribute", ()))
         )
-        return node.op_type == "Squeeze" and not axes and (input_form or bool(noop_value))
+        return (
+            node.op_type == "Squeeze"
+            and not axes
+            and (
+                bool(noop_value)
+                or (input_form and shape is not None and all(dimension >= 0 and dimension != 1 for dimension in shape))
+            )
+        )
 
     def squeeze_axes_are_valid(
         axes: tuple[int, ...],
@@ -2844,13 +2852,16 @@ def _build_onnx_weight_analysis_plan(
         shape: tuple[int, ...],
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> tuple[int, ...] | None:
-        if squeeze_with_empty_axes_is_noop(node, (), resolve_attribute):
+        if squeeze_with_empty_axes_is_noop(node, (), resolve_attribute, shape=shape):
             return shape
         if any(dimension < 0 for dimension in shape):
             return None
-        # Legacy explicit-empty attributes disagree between ONNX schema and
-        # reference execution. Do not prove a rank reduction from that ambiguity.
-        if 1 in shape and any(attribute.name == "axes" for attribute in getattr(node, "attribute", ())):
+        # Present-empty axes disagree across ONNX schema/reference and runtime
+        # implementations. Neither singleton removal nor identity is proven.
+        explicit_axes = (len(getattr(node, "input", ())) > 1 and bool(node.input[1])) or any(
+            attribute.name == "axes" for attribute in getattr(node, "attribute", ())
+        )
+        if 1 in shape and explicit_axes:
             return None
         return tuple(dimension for dimension in shape if dimension != 1)
 
@@ -3161,50 +3172,11 @@ def _build_onnx_weight_analysis_plan(
             if cached_fingerprint is not None and cached_fingerprint[0] is value:
                 return cached_fingerprint[1]
         type_name = f"{type(value).__module__}.{type(value).__qualname__}"
-        pending = pending_constant_values.get(value_id)
-        if pending is not None and pending[0] is value:
-            # Metadata-only tensors cannot identify their deferred values. Their
-            # retained source owners distinguish bindings without copying data.
-            fingerprint = (type_name, f"pending-constant:{value_id}")
-            if retain_owner:
-                cache_fingerprints[value_id] = (value, fingerprint)
-            return fingerprint
-        byte_size = getattr(value, "ByteSize", None)
-        if callable(byte_size):
-            try:
-                protobuf_size = int(byte_size())
-            except Exception:
-                protobuf_size = None
-            if protobuf_size is not None and protobuf_size > _ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES:
-                descriptor = getattr(value, "DESCRIPTOR", None)
-                descriptor_name = str(getattr(descriptor, "full_name", ""))
-                payload = (
-                    f"protobuf:{descriptor_name}:bytes={protobuf_size}:owner={value_id}".encode(
-                        "utf-8", errors="surrogatepass"
-                    )
-                    if retain_owner
-                    else f"protobuf:{descriptor_name}:bytes={protobuf_size}:bounded".encode(
-                        "utf-8", errors="surrogatepass"
-                    )
-                )
-                fingerprint = (type_name, hashlib.sha256(payload).hexdigest())
-                if retain_owner:
-                    cache_fingerprints[value_id] = (value, fingerprint)
-                return fingerprint
-        serializer = getattr(value, "SerializeToString", None)
-        try:
-            if callable(serializer):
-                try:
-                    payload = serializer(deterministic=True)
-                except TypeError:
-                    payload = serializer()
-            elif isinstance(value, (bytes, bytearray, memoryview)):
-                payload = bytes(value)
-            else:
-                payload = repr(value).encode("utf-8", errors="surrogatepass")
-        except Exception:
-            payload = repr(value).encode("utf-8", errors="surrogatepass")
-        fingerprint = (type_name, hashlib.sha256(payload).hexdigest())
+        # Proof keys are optional reuse aids, not payload consumers. Even
+        # protobuf ByteSize can serialize an unadmitted message. Keep identity
+        # without inspecting its data; the cache retains every participating
+        # owner for this plan, so Python cannot reuse its id for another binding.
+        fingerprint = (type_name, f"owner:{value_id}")
         if retain_owner:
             cache_fingerprints[value_id] = (value, fingerprint)
         return fingerprint
@@ -6606,17 +6578,8 @@ def _build_onnx_weight_analysis_plan(
             if node.op_type == "Squeeze":
                 normalized_axes = tuple(axis if axis >= 0 else len(lineage.shape) + axis for axis in axes)
                 if not normalized_axes:
-                    if squeeze_with_empty_axes_is_noop(node, axes, resolved_transform_attribute):
-                        output_shape = lineage.shape
-                        transform = _OnnxWeightTransform("Reshape", output_shape)
-                        transformed = _OnnxWeightLineage(
-                            initializer_index=lineage.initializer_index,
-                            shape=output_shape,
-                            data_type=lineage.data_type,
-                            transforms=(*lineage.transforms, transform),
-                            unresolved_reason=lineage.unresolved_reason,
-                        )
-                        return transformed if transformed != lineage else lineage
+                    if squeeze_with_empty_axes_is_noop(node, axes, resolved_transform_attribute, shape=lineage.shape):
+                        return lineage
                     normalized_axes = tuple(index for index, dimension in enumerate(lineage.shape) if dimension == 1)
                 if (
                     not axes and implicit_squeeze_shape(node, lineage.shape, resolved_transform_attribute) is None

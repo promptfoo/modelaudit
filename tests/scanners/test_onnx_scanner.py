@@ -18,6 +18,7 @@ pytest.importorskip("onnx")
 
 import numpy as np
 import onnx
+from google.protobuf.message import Message
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
@@ -19782,83 +19783,88 @@ class TestWeightDistributionSemantics:
         assert sum(shape_key_lengths) <= width * 3
 
     def test_local_function_attribute_fingerprint_cache_retains_protobuf_wrappers(self, tmp_path: Path) -> None:
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
-
         for distinct_cache_tags in (False, True):
+            # Preserve the original fixture size, tag modes and public contract.
             path = self._write_local_function_rank_reentry_fanout_model(
                 tmp_path / ("distinct" if distinct_cache_tags else "same"),
                 distinct_cache_tags=distinct_cache_tags,
                 use_cache_tag_value=True,
             )
-            mismatch_count = 0
-            fingerprint_returns = 0
-
-            def profile(frame: Any, event: str, arg: Any) -> None:
-                nonlocal fingerprint_returns, mismatch_count
-                if (
-                    event != "return"
-                    or frame.f_code.co_name
-                    not in {"semantic_cache_fingerprint", "semantic_cache_fingerprint_with_owner"}
-                    or Path(frame.f_code.co_filename).resolve() != scanner_path
-                ):
-                    return
-                value = frame.f_locals.get("value")
-                serializer = getattr(value, "SerializeToString", None)
-                if not callable(serializer):
-                    return
-                expected = (
-                    f"{type(value).__module__}.{type(value).__qualname__}",
-                    hashlib.sha256(serializer(deterministic=True)).hexdigest(),
-                )
-                fingerprint_returns += 1
-                if arg != expected:
-                    mismatch_count += 1
-
+            observed = _OnnxFingerprintObserver()
+            previous_profile = sys.getprofile()
             try:
-                sys.setprofile(profile)
+                sys.setprofile(observed.profile)
+                observed.calibrate()
                 result = OnnxScanner().scan(str(path))
             finally:
-                sys.setprofile(None)
+                sys.setprofile(previous_profile)
 
             assert result.success is True, result.metadata
             assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
-            assert fingerprint_returns >= 6
-            assert mismatch_count == 0
+            # The original observer counted wrapper AND inner-helper returns.
+            assert observed.wrapper_and_helper_returns >= 6
+            observed.assert_no_serialization_and_retained_identity()
+            tag_owners = [
+                owner_id
+                for owner_id, metadata in observed.owner_metadata.items()
+                if metadata[:3] == ("onnx.AttributeProto", "cache_tag", onnx.AttributeProto.FLOAT)
+            ]
+            assert len(tag_owners) >= 2
+            if not distinct_cache_tags:
+                # Equal small semantic values intentionally receive distinct
+                # owner keys under the new policy; this is an explicit migration.
+                assert {observed.owner_metadata[owner_id][3] for owner_id in tag_owners} == {7.0}
+            tag_tokens = [observed.tokens_by_owner[owner_id][0] for owner_id in tag_owners]
+            assert len(set(tag_tokens)) == len(tag_tokens)
 
-    def test_reentry_constant_uses_bounded_semantic_fingerprint_when_protobuf_exceeds_cap(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(onnx_scanner_module, "_ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES", 0)
+    def test_reentry_constant_fingerprints_do_not_inspect_payloads(self, tmp_path: Path) -> None:
         path = self._write_local_function_rank_reentry_fanout_model(
             tmp_path,
             distinct_cache_tags=True,
             use_cache_tag_value=True,
         )
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
-        bounded_payload_lengths: list[int] = []
-
-        def profile(frame: Any, event: str, arg: Any) -> None:
-            if (
-                event == "return"
-                and frame.f_code.co_name == "semantic_cache_fingerprint_with_owner"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
-                and frame.f_locals.get("protobuf_size", 0)
-                > onnx_scanner_module._ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES
-            ):
-                payload = frame.f_locals.get("payload")
-                if isinstance(payload, bytes):
-                    bounded_payload_lengths.append(len(payload))
-
+        observed = _OnnxFingerprintObserver()
+        accesses: list[str] = []
+        first = onnx.TensorProto(name="identity_probe", data_type=TensorProto.FLOAT, dims=[1], float_data=[1.0])
+        same_contents = onnx.TensorProto()
+        same_contents.CopyFrom(first)
+        first_attribute = helper.make_attribute("identity_probe", 7.0)
+        equal_attribute = onnx.AttributeProto()
+        equal_attribute.CopyFrom(first_attribute)
+        sentinel = _OnnxFingerprintPayloadSentinel(accesses)
+        previous_profile = sys.getprofile()
         try:
-            sys.setprofile(profile)
+            sys.setprofile(observed.profile)
+            observed.calibrate()
             result = OnnxScanner().scan(str(path))
+            # Establish nonvacuous PUBLIC-route observation before direct probes.
+            assert observed.helper_entries > 0
+            assert callable(observed.fingerprint)
+            public_entries = observed.helper_entries
+            first_token = observed.fingerprint(first, retain_owner=True)
+            repeated_token = observed.fingerprint(first, retain_owner=True)
+            distinct_token = observed.fingerprint(same_contents, retain_owner=True)
+            sentinel_token = observed.fingerprint(sentinel, retain_owner=True)
+            repeated_sentinel_token = observed.fingerprint(sentinel, retain_owner=True)
+            attribute_token = observed.fingerprint(first_attribute, retain_owner=True)
+            repeated_attribute_token = observed.fingerprint(first_attribute, retain_owner=True)
+            distinct_attribute_token = observed.fingerprint(equal_attribute, retain_owner=True)
         finally:
-            sys.setprofile(None)
+            sys.setprofile(previous_profile)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
-        assert bounded_payload_lengths
-        assert max(bounded_payload_lengths) < 256
+        observed.assert_no_serialization_and_retained_identity()
+        assert observed.helper_entries == public_entries + 8
+        assert first_token == repeated_token
+        assert first_token != distinct_token
+        assert sentinel_token == repeated_sentinel_token
+        assert attribute_token == repeated_attribute_token
+        assert attribute_token != distinct_attribute_token
+        assert accesses == []
+        assert len(observed.tokens_by_owner[id(first)]) == 2
+        assert len(observed.tokens_by_owner[id(sentinel)]) == 2
+        assert len(observed.tokens_by_owner[id(first_attribute)]) == 2
 
     def _write_local_size_function_output_shape_model(self, tmp_path: Path, *, matrix_clean_output: bool) -> Path:
         tmp_path.mkdir(parents=True, exist_ok=True)
@@ -41191,6 +41197,8 @@ class TestOnnxExplicitEmptySqueezeAxes:
         initializers = [onnx.numpy_helper.from_array(prior, name="prior")] + [
             onnx.numpy_helper.from_array(np.ones((1, 64), np.float32), name=name) for name in sources
         ]
+        # This flag describes the reference evaluator only. Singleton-containing
+        # empty-axis inputs remain ambiguous for the scanner across runtimes.
         matrix = mode in {"empty_initializer", "empty_constant", "empty_function", "overridable"}
         inputs = [
             helper.make_tensor_value_info("PriorX", TensorProto.FLOAT, [1, 64]),
@@ -41259,7 +41267,8 @@ class TestOnnxExplicitEmptySqueezeAxes:
             actual[1], np.full((1, 64) if matrix else (1,), 33.0 if matrix else 33.0 * 64, np.float32)
         )
         # An empty-string optional input retains the planner's existing unknown
-        # treatment; the positive empty-vector proof must not cover that case.
+        # treatment. Present-empty singleton inputs are ambiguous as well;
+        # neither case may erase the upstream potentially matrix-relevant gap.
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model, tmp_path, matrix or mode == "placeholder", prior, coverage_reason="lineages_per_value_limit"
         )
@@ -44165,3 +44174,552 @@ class TestOnnxScan8ProducerAttributeAdmission:
         assert (report.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is exhausted
         if exhausted:
             assert any(check.details.get("coverage_gap") == "unresolved_initializer_lineage" for check in report.checks)
+
+
+class _OnnxFingerprintObserver:
+    """Observe real protobuf calls, scoped to the production fingerprint stack."""
+
+    _helper_names = frozenset({"semantic_cache_fingerprint", "semantic_cache_fingerprint_with_owner"})
+    _serialization_names = frozenset({"ByteSize", "SerializeToString", "SerializePartialToString"})
+
+    def __init__(self) -> None:
+        self.scanner_filename = onnx_scanner_module._build_onnx_weight_analysis_plan.__code__.co_filename
+        self.active_frames: set[int] = set()
+        self.helper_entries = 0
+        self.wrapper_and_helper_returns = 0
+        self.serialization_calls: list[tuple[str, str]] = []
+        self.calibration_calls: set[tuple[str, str]] = set()
+        self.calibrating = False
+        self.retention_failures: list[int] = []
+        self.token_shape_failures: list[int] = []
+        self.tokens_by_owner: dict[int, list[Any]] = {}
+        self.owner_metadata: dict[int, tuple[str, str, int, float | None]] = {}
+        # Capturing the real closure permits direct identity probes after its
+        # public scanner call; it does not retain additional protobuf wrappers.
+        self.fingerprint: Any = None
+
+    def profile(self, frame: Any, event: str, arg: Any) -> None:
+        function_name = frame.f_code.co_name
+        helper_frame = frame.f_code.co_filename == self.scanner_filename and function_name in self._helper_names
+        if event == "call" and helper_frame:
+            self.active_frames.add(id(frame))
+            if function_name == "semantic_cache_fingerprint":
+                self.fingerprint = frame.f_locals.get("semantic_cache_fingerprint_with_owner")
+            else:
+                self.helper_entries += 1
+
+        method_name = ""
+        receiver: Any = None
+        if event == "c_call":
+            method_name = str(getattr(arg, "__name__", ""))
+            receiver = getattr(arg, "__self__", None)
+        elif event == "call":
+            method_name = function_name
+            receiver = frame.f_locals.get("self")
+        if method_name in self._serialization_names and isinstance(receiver, Message):
+            descriptor_name = str(receiver.DESCRIPTOR.full_name)
+            if self.calibrating:
+                # Calibration is intentionally outside the fingerprint helper.
+                assert not self.active_frames
+                self.calibration_calls.add((descriptor_name, method_name))
+            elif self.active_frames:
+                self.serialization_calls.append((descriptor_name, method_name))
+
+        if event == "return" and helper_frame:
+            self.wrapper_and_helper_returns += 1
+            if function_name == "semantic_cache_fingerprint_with_owner":
+                value = frame.f_locals["value"]
+                owner_id = id(value)
+                cache = frame.f_locals.get("cache_fingerprints", {})
+                retained = cache.get(owner_id)
+                if retained is None or retained[0] is not value or retained[1] != arg:
+                    self.retention_failures.append(owner_id)
+                type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+                if (
+                    not isinstance(arg, tuple)
+                    or len(arg) != 2
+                    or not all(isinstance(part, str) for part in arg)
+                    or arg[0] != type_name
+                    or sum(len(part) for part in arg) >= 256
+                ):
+                    self.token_shape_failures.append(owner_id)
+                self.tokens_by_owner.setdefault(owner_id, []).append(arg)
+                # Never retain value in the observer: doing so can mask id reuse
+                # if the production cache stops retaining its owners.
+                descriptor_name = ""
+                label = ""
+                attribute_type = -1
+                scalar_float: float | None = None
+                if isinstance(value, Message):
+                    descriptor_name = str(value.DESCRIPTOR.full_name)
+                    if isinstance(value, (onnx.TensorProto, onnx.AttributeProto)):
+                        label = str(value.name)
+                    if isinstance(value, onnx.AttributeProto):
+                        attribute_type = int(value.type)
+                        if value.name == "cache_tag" and value.type == onnx.AttributeProto.FLOAT:
+                            scalar_float = float(value.f)
+                self.owner_metadata[owner_id] = (descriptor_name, label, attribute_type, scalar_float)
+            self.active_frames.remove(id(frame))
+
+    def calibrate(self) -> None:
+        """Called outside the planner while this observer is installed."""
+        tensor = onnx.TensorProto(name="calibration", data_type=TensorProto.FLOAT, dims=[1], float_data=[1.0])
+        attribute = helper.make_attribute("calibration", 1.0)
+        self.calibrating = True
+        try:
+            for message in (tensor, attribute):
+                message.ByteSize()
+                message.SerializeToString(deterministic=True)
+                message.SerializePartialToString(deterministic=True)
+        finally:
+            self.calibrating = False
+        expected = {
+            (descriptor_name, name)
+            for descriptor_name in ("onnx.TensorProto", "onnx.AttributeProto")
+            for name in self._serialization_names
+        }
+        assert self.calibration_calls >= expected
+        assert self.helper_entries == 0
+        assert self.serialization_calls == []
+
+    def assert_no_serialization_and_retained_identity(self) -> None:
+        """Check observed method calls and ownership; native getters need source review."""
+        assert not self.active_frames
+        assert self.helper_entries > 0
+        assert self.tokens_by_owner
+        assert self.serialization_calls == [], self.serialization_calls
+        assert self.retention_failures == [], self.retention_failures
+        assert self.token_shape_failures == [], self.token_shape_failures
+        for owner_id, tokens in self.tokens_by_owner.items():
+            assert all(token == tokens[0] for token in tokens), owner_id
+        # Tokens are used as dictionary-key components by production callers.
+        tokens = [values[0] for values in self.tokens_by_owner.values()]
+        assert len(set(tokens)) == len(tokens)
+
+
+class _OnnxFingerprintPayloadSentinel:
+    """Direct helper probe; never inserted into a model or passed to a loader."""
+
+    def __init__(self, accesses: list[str]) -> None:
+        self.accesses = accesses
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {
+            "ByteSize",
+            "SerializeToString",
+            "SerializePartialToString",
+            "raw_data",
+            "float_data",
+            "int32_data",
+            "int64_data",
+            "double_data",
+            "uint64_data",
+            "string_data",
+            "s",
+            "strings",
+            "t",
+            "tensors",
+            "g",
+            "graphs",
+        }:
+            object.__getattribute__(self, "accesses").append(name)
+            raise AssertionError("Fingerprint attempted a payload accessor")
+        return object.__getattribute__(self, name)
+
+    def __repr__(self) -> str:
+        self.accesses.append("repr")
+        raise AssertionError("Fingerprint attempted repr")
+
+    def __bytes__(self) -> bytes:
+        self.accesses.append("bytes")
+        raise AssertionError("Fingerprint attempted bytes conversion")
+
+
+class TestOnnxFingerprintPrecopyAdmission:
+    @staticmethod
+    def _model(payload_kind: str, payload_bytes: int) -> Any:
+        elements = payload_bytes // 4
+
+        def value(name: str, dtype: int = TensorProto.FLOAT, shape: list[int] | None = None) -> Any:
+            return helper.make_tensor_value_info(name, dtype, [elements] if shape is None else shape)
+
+        def tensor(name: str) -> Any:
+            return onnx.TensorProto(
+                name=name, data_type=TensorProto.FLOAT, dims=[elements], raw_data=b"\0" * payload_bytes
+            )
+
+        functions = []
+        initializers = [
+            helper.make_tensor("count", TensorProto.INT64, [], [2]),
+            helper.make_tensor("start", TensorProto.BOOL, [], [True]),
+        ]
+        if payload_kind == "captured_tensor":
+            initializers.append(tensor("captured_W"))
+            body_nodes = [helper.make_node("Add", ["state", "captured_W"], ["next_state"])]
+        else:
+            if payload_kind == "tensor_attribute":
+                constant = helper.make_node("Constant", [], ["delta"])
+                constant.attribute.append(
+                    onnx.AttributeProto(name="value", ref_attr_name="payload", type=onnx.AttributeProto.TENSOR)
+                )
+                function_nodes = [constant]
+                payload = helper.make_attribute("payload", tensor("attribute_W"))
+            else:
+                assert payload_kind == "graph_attribute"
+                branch = helper.make_graph(
+                    [helper.make_node("Constant", [], ["delta"], value=tensor("graph_W"))],
+                    "payload_branch",
+                    [],
+                    [value("delta")],
+                )
+                conditional = helper.make_node("If", ["condition"], ["delta"])
+                for branch_name in ("then_branch", "else_branch"):
+                    conditional.attribute.append(
+                        onnx.AttributeProto(name=branch_name, ref_attr_name="payload", type=onnx.AttributeProto.GRAPH)
+                    )
+                function_nodes = [conditional]
+                payload = helper.make_attribute("payload", branch)
+            function_nodes.append(helper.make_node("Add", ["state", "delta"], ["next_state"]))
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "PayloadStep",
+                    ["state", "condition"],
+                    ["next_state"],
+                    function_nodes,
+                    [helper.make_opsetid("", 18)],
+                    attributes=["payload"],
+                )
+            )
+            call = helper.make_node("PayloadStep", ["state", "condition"], ["next_state"], domain="local")
+            call.attribute.append(payload)
+            body_nodes = [call]
+        body = helper.make_graph(
+            body_nodes,
+            "fingerprint_loop_body",
+            [value("iteration", TensorProto.INT64, []), value("condition", TensorProto.BOOL, []), value("state")],
+            [value("condition", TensorProto.BOOL, []), value("next_state")],
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node("Loop", ["count", "start", "initial_state"], ["final_state"], body=body)],
+                "fingerprint_admission",
+                [value("initial_state")],
+                [value("final_state")],
+                initializers,
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=8,
+        )
+        return model
+
+    @pytest.mark.parametrize("route", ["onnx", "weight_distribution"])
+    @pytest.mark.parametrize("payload_kind", ["captured_tensor", "tensor_attribute", "graph_attribute"])
+    @pytest.mark.parametrize("payload_bytes", [64, 1024 * 1024 + 4], ids=["small", "above_old_fingerprint_cap"])
+    def test_public_fingerprint_admission_precedes_serialization(
+        self, tmp_path: Path, route: str, payload_kind: str, payload_bytes: int
+    ) -> None:
+        model = self._model(payload_kind, payload_bytes)
+        # This valid fixture is test-owned; construction/check/save are outside
+        # observation. No ReferenceEvaluator executes the large tensor graph.
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "fingerprint-payload.onnx"
+        onnx.save(model, str(path))
+        # Captured Add-only W must remain non-weight even above this array cap.
+        # Attribute Constants use the existing default primary-copy allowance.
+        config = {"max_array_size": 64 * 1024} if payload_kind == "captured_tensor" else {}
+        scanner = OnnxScanner(config) if route == "onnx" else WeightDistributionScanner(config)
+        observed = _OnnxFingerprintObserver()
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(observed.profile)
+            observed.calibrate()
+            result = scanner.scan(str(path))
+        finally:
+            sys.setprofile(previous_profile)
+
+        assert result.success is True, result.metadata
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["analyzed_layer_count"] == 0
+        observed.assert_no_serialization_and_retained_identity()
+        if payload_kind == "captured_tensor":
+            expected = ("onnx.TensorProto", "captured_W", -1)
+        else:
+            expected_type = (
+                onnx.AttributeProto.TENSOR if payload_kind == "tensor_attribute" else onnx.AttributeProto.GRAPH
+            )
+            expected = ("onnx.AttributeProto", "payload", expected_type)
+        assert any(metadata[:3] == expected for metadata in observed.owner_metadata.values()), expected
+
+
+class TestOnnxEmptySqueezeRuntimeAmbiguity:
+    @pytest.mark.parametrize("local_function", [False, True], ids=["direct", "function"])
+    def test_single_source_empty_axes_refuses_ambiguous_view(self, tmp_path: Path, local_function: bool) -> None:
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        weights = np.ones((1, 64, 64), np.float32)
+        initializers = [
+            onnx.numpy_helper.from_array(prior, name="prior"),
+            onnx.numpy_helper.from_array(weights, name="W"),
+            onnx.numpy_helper.from_array(np.array([], np.int64), name="axes"),
+            onnx.numpy_helper.from_array(np.array([0, -1], np.int64), name="target"),
+        ]
+        functions = []
+        nodes = [helper.make_node("MatMul", ["PriorX", "prior"], ["known"])]
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "EmptyAxesView",
+                    ["data", "control"],
+                    ["squeezed"],
+                    [helper.make_node("Squeeze", ["data", "control"], ["squeezed"])],
+                    [helper.make_opsetid("", 13)],
+                )
+            )
+            nodes.append(helper.make_node("EmptyAxesView", ["W", "axes"], ["squeezed"], domain="local"))
+        else:
+            nodes.append(helper.make_node("Squeeze", ["W", "axes"], ["squeezed"]))
+        nodes.extend(
+            [
+                helper.make_node("Reshape", ["squeezed", "target"], ["view"]),
+                helper.make_node("MatMul", ["X", "view"], ["Y"]),
+            ]
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "empty_axes_shape_ambiguity",
+                [
+                    helper.make_tensor_value_info("PriorX", TensorProto.FLOAT, [1, 64]),
+                    helper.make_tensor_value_info("X", TensorProto.FLOAT, [None, None]),
+                ],
+                [
+                    helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64]),
+                    helper.make_tensor_value_info("view", TensorProto.FLOAT, [None, None]),
+                    helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None]),
+                ],
+                initializer=initializers,
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+            ir_version=8,
+        )
+
+        # The official ONNX checker/inliner/reference runner establishes its
+        # own valid interpretation. This is not an ONNX Runtime oracle:
+        # the inspected ORT kernels remove W's singleton axis for empty axes.
+        # Unconstrained rank-two X/Y declarations avoid a separate schema
+        # mismatch from choosing either interpretation's fixed MatMul width.
+        actual = TestOnnxBuiltinOperatorIdentity._inlined_runtime(
+            model,
+            {"PriorX": np.ones((1, 64), np.float32), "X": np.full((1, 1), 2, np.float32)},
+        )
+        np.testing.assert_array_equal(actual[0], np.ones((1, 64), np.float32) @ prior)
+        np.testing.assert_array_equal(actual[1], np.ones((1, 4096), np.float32))
+        np.testing.assert_array_equal(actual[2], np.full((1, 4096), 2, np.float32))
+
+        # One W source cannot exhaust the 32-lineage cap. The only refused
+        # statistical view must be the ambiguous Squeeze/Reshape path.
+        plan = TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, True, prior, coverage_reason="unresolved_initializer_lineage"
+        )
+        assert set(plan.coverage_gaps) == {"unresolved_initializer_lineage"}
+        assert {spec.context["initializer"] for spec in plan.specs} == {"prior"}
+        assert any(
+            sample["initializer"] == "W" and sample["consumer_op"] == "MatMul"
+            for sample in plan.unresolved_lineage_samples
+        )
+
+        # Inspect the same path saved and scanned by the shared contract helper.
+        # A schema failure must not satisfy this well-formed coverage regression.
+        normal = OnnxScanner().scan(str(tmp_path / "review-binding-shape.onnx"))
+        schema_checks = [check for check in normal.checks if check.name == "ONNX Schema Validation"]
+        assert len(schema_checks) == 1
+        assert schema_checks[0].status == CheckStatus.PASSED
+        assert normal.success is False
+        assert normal.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON not in normal.metadata["scan_outcome_reasons"]
+        assert ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON in normal.metadata["scan_outcome_reasons"]
+        normal_gaps = normal.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+        assert set(normal_gaps) == {"unresolved_initializer_lineage"}
+        assert normal_gaps["unresolved_initializer_lineage"] > 0
+        coverage = TestWeightDistributionCoverage._coverage_checks(normal)
+        assert len(coverage) == 1
+        assert coverage[0].status == CheckStatus.FAILED
+        assert coverage[0].message == "Weight distribution analysis skipped one or more eligible ONNX initializers"
+        assert len(TestWeightDistributionSemantics._extreme_checks(normal)) == 1
+
+
+class TestOnnxNoopSqueezeLineageRegressions:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)
+
+    @classmethod
+    def _model(cls, noop_count: int, *, direct_consumer: bool = False) -> tuple[Any, Any]:
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        initializers = [cls._tensor("W", weights)]
+        nodes = []
+        outputs = []
+        if direct_consumer:
+            nodes.append(helper.make_node("MatMul", ["X", "W"], ["direct"], name="direct_weight"))
+            outputs.append(cls._value("direct", [64, 64]))
+        if noop_count:
+            # A shared typed empty vector avoids raw-control admission and
+            # per-owner control-budget differences in the identity regression.
+            initializers.append(helper.make_tensor("empty_axes", TensorProto.INT64, [0], []))
+        value_name = "W"
+        for index in range(noop_count):
+            output_name = f"noop_{index}"
+            nodes.append(helper.make_node("Squeeze", [value_name, "empty_axes"], [output_name], name=f"noop_{index}"))
+            value_name = output_name
+        nodes.append(helper.make_node("MatMul", ["X", value_name], ["Y"], name="final_weight"))
+        outputs.append(cls._value("Y", [64, 64]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "noop_squeeze_weight_lineage",
+                [cls._value("X", [64, 64])],
+                outputs,
+                initializer=initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        model.ir_version = 8
+        return model, weights
+
+    @staticmethod
+    def _assert_reference_identity(model: Any, weights: Any) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        onnx.checker.check_model(model, full_check=True)
+        # No dimension of W is singleton, so both empty-axes interpretations
+        # preserve this view. Identity activation exposes every weight value.
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.eye(64, dtype=np.float32)})
+        assert len(actual) == len(model.graph.output)
+        for output in actual:
+            np.testing.assert_array_equal(output, weights)
+
+    @staticmethod
+    def _assert_single_view(plan: Any, weights: Any, *, consumer_count: int) -> None:
+        assert plan.coverage_gaps == {}
+        assert plan.unresolved_lineage_samples == []
+        assert plan.extraction_failures == 0
+        assert plan.oversized_initializers_skipped == 0
+        assert plan.eligible_initializer_count == plan.analyzed_initializer_count == 1
+        assert len(plan.specs) == 1
+        spec = plan.specs[0]
+        np.testing.assert_array_equal(spec.weights, weights)
+        assert spec.analysis_id == spec.context["analysis_id"] == 0
+        assert spec.context["initializer"] == "W"
+        assert spec.context["lineage"] == []
+        assert spec.context["lineage_transform_count"] == 0
+        assert spec.context["consumer_count"] == consumer_count
+        assert spec.output_axes == (1,)
+        assert plan.metadata["analyzed_layer_count"] == 1
+
+    @staticmethod
+    def _assert_public_contract(
+        model: Any, tmp_path: Path, weights: Any, *, consumer_count: int, total_limit: int
+    ) -> None:
+        path = _save_onnx_model(model, tmp_path / "noop-squeeze-lineage.onnx")
+        # The standalone route admits the serialized file against this same
+        # total budget before charging views. Keep that separate admission
+        # satisfied while the tight public budget still rejects two views.
+        assert path.stat().st_size <= total_limit
+        config = {"max_array_size": weights.nbytes, "max_weight_distribution_total_bytes": total_limit}
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result = scanner_type(config=config).scan(str(path))
+            assert result.success is True
+            assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+            assert (
+                TestWeightDistributionCoverage._coverage_checks(
+                    result, standalone=scanner_type is WeightDistributionScanner
+                )
+                == []
+            )
+            semantics = result.metadata["onnx_weight_distribution_semantics"]
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["unresolved_lineage_samples"] == []
+            assert semantics["eligible_initializer_count"] == 1
+            assert semantics["analyzed_layer_count"] == 1
+            assert semantics["eligible"][0]["consumer_count"] == consumer_count
+            checks = TestWeightDistributionSemantics._extreme_checks(result)
+            assert len(checks) == 1
+            assert checks[0].details["affected_neurons"] == [0]
+            assert checks[0].details["lineage"] == []
+            assert checks[0].details["lineage_transform_count"] == 0
+            assert checks[0].details["consumer_count"] == consumer_count
+
+    @pytest.mark.parametrize("noop_count", [0, 1, 32, 33], ids=["direct", "one_noop", "32_noops", "33_noops"])
+    def test_empty_axes_noop_chain_preserves_weight_lineage(self, tmp_path: Path, noop_count: int) -> None:
+        model, weights = self._model(noop_count)
+        assert sum(node.op_type == "Squeeze" for node in model.graph.node) == noop_count
+        self._assert_reference_identity(model, weights)
+        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=weights.nbytes)
+        self._assert_single_view(plan, weights, consumer_count=1)
+        self._assert_public_contract(model, tmp_path, weights, consumer_count=1, total_limit=24576)
+
+    @pytest.mark.parametrize("noop_count", [0, 1], ids=["two_direct_consumers", "direct_and_noop"])
+    @pytest.mark.parametrize(
+        ("total_limit", "public_total_limit"),
+        [(16384, 24576), (32768, 32768)],
+        ids=["one_view_budget", "two_view_budget"],
+    )
+    def test_noop_alias_shares_group_and_logical_charge(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        noop_count: int,
+        total_limit: int,
+        public_total_limit: int,
+    ) -> None:
+        model, weights = self._model(noop_count, direct_consumer=True)
+        self._assert_reference_identity(model, weights)
+        analyzer = WeightDistributionScanner(
+            config={"max_array_size": weights.nbytes, "max_weight_distribution_total_bytes": total_limit}
+        )
+        loaded_weights: list[Any] = []
+        retention_attempts: list[tuple[str, int, bool]] = []
+        original_to_array = onnx.numpy_helper.to_array
+
+        def record_load(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            array = original_to_array(tensor, *args, **kwargs)
+            if tensor.name == "W":
+                loaded_weights.append(array)
+            return array
+
+        def retain(name: str, size: int) -> bool:
+            admitted = analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size, retain=True
+            )
+            retention_attempts.append((name, size, admitted))
+            return admitted
+
+        # Observe only the plan, independently from reference execution and
+        # the two public scanner runs below.
+        with monkeypatch.context() as patch:
+            patch.setattr(onnx.numpy_helper, "to_array", record_load)
+            plan = _build_fixture_weight_plan(
+                model,
+                onnx=onnx,
+                np=np,
+                max_array_size=weights.nbytes,
+                pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
+                    "onnx_initializer_size_limit", name, tensor_nbytes=size
+                ),
+                retain_array_check=retain,
+            )
+        # R31 already shares source storage. The separate logical-charge
+        # assertions distinguish the redundant-view regression from a copy.
+        assert len(loaded_weights) == 1
+        assert retention_attempts == [("W", weights.nbytes, True)]
+        assert analyzer.retained_tensor_bytes == weights.nbytes == 16384
+        assert analyzer.extraction_incomplete is False
+        self._assert_single_view(plan, weights, consumer_count=2)
+        assert np.shares_memory(loaded_weights[0], plan.specs[0].weights)
+        self._assert_public_contract(model, tmp_path, weights, consumer_count=2, total_limit=public_total_limit)
