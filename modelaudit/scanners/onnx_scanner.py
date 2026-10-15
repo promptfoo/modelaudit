@@ -3205,12 +3205,14 @@ def _build_onnx_weight_analysis_plan(
         nonlocal constant_binding_work_remaining
         if not constants or not names:
             return ()
-        # Scope filtering is bounded by the graph dependency-name limit. Only
-        # actual bindings allocate fingerprints and retained cache-key entries.
-        if len(names) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK or constant_binding_work_remaining <= 0:
+        # Charge every candidate lookup, including scopes with no constant
+        # matches, before filtering. Fingerprint work is admitted separately.
+        if len(names) > constant_binding_work_remaining:
+            constant_binding_work_remaining = 0
             plan.coverage_gaps.setdefault("constant_binding_work_limit", 1)
             return None
-        relevant_names = frozenset(constants.keys() & names)
+        constant_binding_work_remaining -= len(names)
+        relevant_names = frozenset(name for name in names if name in constants)
         if len(relevant_names) > constant_binding_work_remaining:
             constant_binding_work_remaining = 0
             plan.coverage_gaps.setdefault("constant_binding_work_limit", 1)
@@ -3485,6 +3487,9 @@ def _build_onnx_weight_analysis_plan(
         while pending:
             value_name = pending.pop()
             for producer_node in producer_nodes.get(value_name, ()):
+                if dependency_closure_work_remaining <= 0:
+                    return dependency_collection_limit
+                dependency_closure_work_remaining -= 1
                 node_id = id(producer_node)
                 if node_id in visited_node_ids:
                     continue
@@ -8965,8 +8970,8 @@ def _build_onnx_weight_analysis_plan(
                                 exact_loop_replay_work_remaining = 0
                                 return False
                             for replay_node in graph_nodes:
-                                graph_work += len(getattr(replay_node, "input", ())) + len(
-                                    getattr(replay_node, "output", ())
+                                graph_work += sum(
+                                    len(getattr(replay_node, field, ())) for field in ("input", "output", "attribute")
                                 )
                                 if graph_work > exact_loop_replay_work_remaining:
                                     exact_loop_replay_work_exhausted = True

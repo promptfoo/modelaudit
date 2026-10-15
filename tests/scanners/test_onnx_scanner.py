@@ -41423,3 +41423,211 @@ class TestOnnxDeferredConstantProofIdentity:
                 np.array_equal(spec.weights, np.arange(4, dtype=np.float32).reshape(shape)) for spec in plan.specs
             )
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(model, tmp_path, False, prior)
+
+
+class TestOnnxRepeatedProofAdmission:
+    @pytest.mark.parametrize("captures", [2, 512])
+    def test_empty_constant_intersections_charge_candidate_lookups(self, tmp_path: Path, captures: int) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        states = [f"state{index}" for index in range(16)]
+        runtime = [f"runtime{index}" for index in range(captures)]
+        body = helper.make_graph(
+            [
+                helper.make_node("Sum", runtime, ["summed"]),
+                helper.make_node("PRelu", ["summed", runtime[0]], ["unused"]),
+            ],
+            "empty_binding_intersections",
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [2]) for name in states],
+            [value("condition", [], TensorProto.BOOL)] + [value(name, [2]) for name in states],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Loop", ["two", "start", *states], [f"out{i}" for i in range(16)], body=body),
+                ],
+                "bounded_empty_binding_work",
+                [value("A", [1, 64])] + [value(name, [2]) for name in states + runtime],
+                [value("known", [1, 64]), value("out0", [2])],
+                [tensor("prior", prior_weights), tensor("two", np.array(2, np.int64)), tensor("start", np.array(True))]
+                + [tensor(f"unrelated{index}", np.ones(2, np.float32)) for index in range(captures)],
+            ),
+            opset_imports=[helper.make_opsetid("", 18)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(
+            None,
+            {"A": np.ones((1, 64), np.float32), **{name: np.ones(2, np.float32) for name in states + runtime}},
+        )
+        np.testing.assert_array_equal(actual[1], np.ones(2, np.float32))
+        observed = {"lookups": 0, "empty_admissions": 0, "refusals": 0}
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if event != "return" or frame.f_code.co_name != "constant_binding_cache_key":
+                return
+            if frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            names = frame.f_locals["names"]
+            if "relevant_names" in frame.f_locals:
+                observed["lookups"] += len(names)
+                if names == frozenset(runtime) and not frame.f_locals["relevant_names"]:
+                    observed["empty_admissions"] += 1
+            if names == frozenset(runtime) and arg is None:
+                observed["refusals"] += 1
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                model, onnx=onnx, np=np, max_array_size=64 * 1024
+            )
+        finally:
+            sys.setprofile(previous_profile)
+        assert observed["empty_admissions"] > 0
+        assert observed["lookups"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert bool(observed["refusals"]) is (captures == 512)
+        assert bool(plan.coverage_gaps.get("constant_binding_work_limit")) is (captures == 512)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, captures == 512, prior_weights, coverage_reason="constant_binding_work_limit"
+        )
+
+    @pytest.mark.parametrize("padding", [0, 2048])
+    def test_finite_replay_admits_literal_attribute_work(self, tmp_path: Path, padding: int) -> None:
+        model, prior_weights, _nodes = TestOnnxEinsumEquationBudgets._model([b"i->i"], local_function=False)
+        loop = next(node for node in model.graph.node if node.op_type == "Loop")
+        body = next(attribute.g for attribute in loop.attribute if attribute.name == "body")
+        concat = next(node for node in body.node if node.op_type == "Concat")
+        # The helper independently checks and executes the valid growing-vector
+        # model first. Extra literal attributes intentionally make this malformed;
+        # rejected schema checks still require bounded subsequent weight analysis.
+        concat.attribute.extend(helper.make_attribute(f"unused{index}", 0) for index in range(padding))
+        attribute_count = sum(len(node.attribute) for node in body.node)
+        observed = {"admissions": 0, "attribute_visits": 0, "refusals": 0}
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if event != "return" or frame.f_code.co_name != "reserve_exact_loop_replay_traversal":
+                return
+            if frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            if getattr(frame.f_locals.get("replay_graph"), "name", None) != body.name:
+                return
+            if arg:
+                observed["admissions"] += 1
+                observed["attribute_visits"] += attribute_count
+            else:
+                observed["refusals"] += 1
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                model, onnx=onnx, np=np, max_array_size=64 * 1024
+            )
+        finally:
+            sys.setprofile(previous_profile)
+        assert observed["admissions"] > 0
+        assert observed["attribute_visits"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert bool(observed["refusals"]) is bool(padding)
+        assert bool(plan.coverage_gaps.get("lineages_per_value_limit")) is bool(padding)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, bool(padding), prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+
+    @pytest.mark.parametrize("same_owner", [False, True])
+    def test_duplicate_producer_occurrences_share_dependency_budget(self, tmp_path: Path, same_owner: bool) -> None:
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        states = [f"state{index}" for index in range(16)]
+        duplicate_count = 512
+        producers = [
+            helper.make_node(
+                "Constant",
+                [],
+                ["replacement"] * (duplicate_count if same_owner else 1),
+                value=tensor("", np.ones((2, 2), np.float32)),
+            )
+            for _ in range(1 if same_owner else duplicate_count)
+        ]
+        body = helper.make_graph(
+            [*producers, helper.make_node("PRelu", ["activation", "replacement"], ["unused"])],
+            "duplicate_producer_dependency_work",
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [2, 2]) for name in states],
+            [value("condition", [], TensorProto.BOOL)] + [value("replacement", [2, 2]) for _ in states],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Loop", ["two", "start", *states], [f"out{i}" for i in range(16)], body=body),
+                ],
+                "bounded_duplicate_producers",
+                [value("A", [1, 64]), value("activation", [2, 2])] + [value(name, [2, 2]) for name in states],
+                [value("known", [1, 64]), value("out0", [2, 2])],
+                [tensor("prior", prior_weights), tensor("two", np.array(2, np.int64)), tensor("start", np.array(True))],
+            ),
+            opset_imports=[helper.make_opsetid("", 18)],
+        )
+        model.ir_version = 9
+        with pytest.raises(onnx.checker.ValidationError):
+            onnx.checker.check_model(model)
+        source_path = Path(onnx_scanner_module.__file__)
+        tree = ast.parse(source_path.read_text())
+        closure = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "graph_dependency_closure_names"
+        )
+        visit_line = next(
+            node.lineno
+            for node in ast.walk(closure)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "node_id" for target in node.targets)
+        )
+        observed = {"producer_visits": 0, "refusals": 0}
+
+        def trace(frame: Any, event: str, arg: Any) -> Any:
+            if (
+                frame.f_code.co_filename == str(source_path)
+                and frame.f_code.co_name == "graph_dependency_closure_names"
+            ):
+                if event == "line" and frame.f_lineno == visit_line:
+                    observed["producer_visits"] += 1
+                if event == "return" and arg == frame.f_locals.get("dependency_collection_limit"):
+                    observed["refusals"] += 1
+            return trace
+
+        previous_trace = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                model, onnx=onnx, np=np, max_array_size=64 * 1024
+            )
+        finally:
+            sys.settrace(previous_trace)
+        assert 0 < observed["producer_visits"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert observed["refusals"] > 0
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "duplicate-producer-budget.onnx")
+        standalone = WeightDistributionScanner().scan(str(path))
+        assert len(TestWeightDistributionSemantics._extreme_checks(standalone)) == 1
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                aggregate = scan_model_directory_or_file(
+                    str(path), cache_enabled=True, cache_dir=str(tmp_path / "cache"), min_cache_file_size=0
+                )
+                assert aggregate.success is False
+                assert determine_exit_code(aggregate) == 2
+                assert aggregate.file_metadata[str(path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            stats = get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()
+            assert stats["total_entries"] == stats["cache_hits"] == 0
+        finally:
+            reset_cache_manager()
