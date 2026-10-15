@@ -799,6 +799,17 @@ BENIGN_DOCUMENTATION_MISUSE_CONTINUATION_PATTERN = re.compile(
     rb"(?:\*\*\s*)?https?://[^\s<>]+)",
     re.IGNORECASE,
 )
+DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN = re.compile(
+    rb"(?:^|(?<=[.!?\n]))[ \t]*(?:[-*+]\s+)?"
+    rb"(?:(?:\*\*)?misuse(?::(?:\*\*)?|(?:\*\*)?:)\s*)?(?:"
+    rb"(?:it|(?:the|this)\s+(?:model|code|script|package))\s+(?:automatically\s+)?"
+    rb"(?:(?:steals?|exfiltrates?)\b|(?:installs?|executes?|runs?|launches?|deploys?)\s+"
+    rb"(?:it|code|scripts?|commands?)\b)"
+    rb"|(?:user\s+)?(?:data|inputs?|files?|credentials?|secrets?)\s+"
+    rb"(?:leaves?|is\s+(?:copied|sent|transmitted))\b[^.!?\r\n]{0,128}\bwithout\s+(?:user\s+)?consent\b"
+    rb")",
+    re.IGNORECASE,
+)
 GENERIC_CC_PROSE_PATTERNS = frozenset({"backdoor", "botnet", "malware", "trojan", "zombie"})
 REQUIREMENTS_URL_DIRECTIVE_PATTERN = re.compile(
     rb"^(?:(?:--index-url|--extra-index-url|--find-links)(?:\s+|=)"
@@ -1466,6 +1477,7 @@ class TextScanner(BaseScanner):
             for character in source:
                 byte_offsets.append(byte_offsets[-1] + len(character.encode("utf-8")))
         spans: list[tuple[int, int]] = []
+        previous_byte_end = 0
         try:
             for item in tokenize.generate_tokens(io.StringIO(source).readline):
                 if item.type == token.ENDMARKER:
@@ -1477,9 +1489,13 @@ class TextScanner(BaseScanner):
                     spans.append((byte_offsets[start] if byte_offsets is not None else start, byte_end))
                 if byte_end > last_assignment_start:
                     break
-                # Python's tokenizer can rescan a long line for each error token.
-                # Charge its line length before asking for another token.
-                charge_work(len(item.line.encode("utf-8")))
+                # Error tokens can trigger repeated full-line rescans; ordinary tokens advance linearly.
+                charge_work(
+                    len(item.line.encode("utf-8"))
+                    if item.type == token.ERRORTOKEN
+                    else max(0, byte_end - previous_byte_end)
+                )
+                previous_byte_end = byte_end
         except (IndentationError, SyntaxError, tokenize.TokenError):
             pass  # Only complete literals proved before the tokenizer stopped can suppress nested assignments.
         return tuple(spans)
@@ -2669,6 +2685,11 @@ class TextScanner(BaseScanner):
             and not cls._documentation_prefix_has_enclosing_call(prefix)
         )
 
+    @staticmethod
+    @lru_cache(maxsize=4)
+    def _bounded_documentation_has_harmful_behavior_claim(payload: bytes) -> bool:
+        return DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN.search(payload) is not None
+
     @classmethod
     def _documentation_cc_finding_is_benign_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         pattern = finding.get("pattern")
@@ -2686,6 +2707,10 @@ class TextScanner(BaseScanner):
             return False
         if any(match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_CC_PATTERN.finditer(line)):
             return True
+        if len(payload) > MAX_TEXT_FENCE_CONTEXT_BYTES or cls._bounded_documentation_has_harmful_behavior_claim(
+            payload
+        ):
+            return False
         absolute_position = finding["position"]
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         if context_end < len(payload):

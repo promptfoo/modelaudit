@@ -2437,6 +2437,34 @@ def test_documentation_quote_index_skips_tokenization_without_assignments(monkey
         TextScanner._documentation_quoted_assignment_index.cache_clear()
 
 
+@pytest.mark.parametrize("word", ["item", "élément"])
+def test_documentation_quote_index_allows_dense_valid_token_lines(word: str) -> None:
+    source = ("Z; (" + f"{word}, " * 18000 + '); message="literal ; inner=\'text"\n').encode()
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    try:
+        assert not TextScanner._documentation_has_open_quoted_assignment(source, 0, len(source) - 1)
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 1
+    finally:
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_text_scanner_dense_valid_quote_context_keeps_completed_security_verdict(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("Z; (" + "item, " * 18000 + '); value="[guide](https://docs.example.com)"\n')
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize("simulate_error_tokens", [False, True])
 def test_documentation_quote_index_bounds_repeated_tokenizer_line_work(
     monkeypatch: pytest.MonkeyPatch, simulate_error_tokens: bool
@@ -4241,7 +4269,7 @@ def test_text_scanner_possible_misuse_keeps_paragraph_continuations_actionable(
     )
 
 
-@pytest.mark.parametrize("separator", [" ", "\n", "\r\n"])
+@pytest.mark.parametrize("separator", [" ", "\n", "\r\n", "\n\n", "\r\n\r\n"])
 @pytest.mark.parametrize(
     "prefix",
     [
@@ -4280,6 +4308,48 @@ def test_text_scanner_misuse_exemption_rejects_hostile_paragraph_prefixes(
 )
 def test_text_scanner_misuse_exemption_accepts_recognized_paragraph_prefixes(tmp_path: Path, prefix: str) -> None:
     _assert_documentation_informational(tmp_path, prefix + "Malware production may be possible.\n")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model steals user data.\n\nThis is a language model.",
+        "This model steals user data.\n\n" + "Ordinary context.\n\n" * 300,
+        "This model exfiltrates inputs to a server.",
+        "The model installs it on the scanner host by default.",
+        "This model executes it during loading.",
+        "User data leaves the host without consent.",
+    ],
+)
+def test_text_scanner_misuse_exemption_keeps_surrounding_harmful_claims(tmp_path: Path, prefix: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, prefix + "\n\nMalware production may be possible.\n", "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model does not steal user data.",
+        "The model will not execute code.",
+        "Some models may exfiltrate inputs.",
+        'The phrase "This model steals user data" is a warning example.',
+        "* **Generation of Harmful Content:** Developers should assess outputs for their context and use available "
+        "safety classifiers or custom solutions appropriate for their use case.",
+    ],
+)
+def test_text_scanner_misuse_exemption_keeps_surrounding_safety_guidance_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_documentation_informational(tmp_path, prefix + "\n\nMalware production may be possible.\n")
+
+
+def test_text_scanner_misuse_document_context_limit_retains_alerts(tmp_path: Path) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path,
+        "# Model card\n\n" + "Description.\n\n" * 20000 + "Malware production may be possible.\n",
+        "cc_pattern",
+    )
 
 
 def test_text_scanner_misuse_exemption_rejects_truncated_paragraph_prefix(tmp_path: Path) -> None:
