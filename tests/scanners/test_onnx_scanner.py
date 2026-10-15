@@ -50386,3 +50386,636 @@ class TestOnnxFiniteReplayValueNamePreparation:
         # Ordinary helper users keep their existing callback=None semantics.
         assert observed.run(lambda: captures(warm)) == frozenset()
         assert observed.run(lambda: nested(short, {})) == frozenset()
+
+
+class TestOnnxRepeatedOutputSlotAdmission:
+    @staticmethod
+    def _model(width: int) -> Any:
+        value = TestOnnxShapeContinuity._v
+        states = [f"state{index}" for index in range(8)]
+        outputs = [f"piece{index}_" + "x" * 129 for index in range(width)]
+        body = helper.make_graph(
+            [helper.make_node("Split", ["X"], outputs, name="r38_slots_split")],
+            "r38_slots_body",
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [1]) for name in states],
+            [value("condition", [], TensorProto.BOOL)] + [value(name, [1]) for name in outputs[:8]],
+        )
+        return helper.make_model(
+            helper.make_graph(
+                [helper.make_node("Loop", ["trip", "start", *states], [f"out{i}" for i in range(8)], body=body)],
+                "r38_slots",
+                [value("trip", [], TensorProto.INT64), value("start", [], TensorProto.BOOL), value("X", [width])]
+                + [value(name, [1]) for name in states],
+                [value(f"out{i}", [1]) for i in range(8)],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+            ir_version=8,
+        )
+
+    @staticmethod
+    def _observe(monkeypatch: pytest.MonkeyPatch, run: Any) -> tuple[Any, dict[str, Any]]:
+        observed: dict[str, Any] = {"reads": {}, "owners": {}, "rank": [], "helpers": {}}
+        original_getattr: Any = getattr
+
+        class CountedSlots:
+            def __init__(self, owner: Any, field: str, values: Any) -> None:
+                self.owner, self.field, self.values = owner, field, values
+
+            def __len__(self) -> int:
+                return len(self.values)
+
+            def __getitem__(self, index: int | slice) -> Any:
+                if isinstance(index, slice):
+                    return [self[position] for position in range(*index.indices(len(self.values)))]
+                frame: Any = sys._getframe(1)
+                while frame is not None and (
+                    frame.f_code.co_filename != onnx_scanner_module.__file__ or frame.f_code.co_name.startswith("<")
+                ):
+                    frame = frame.f_back
+                context = "" if frame is None else frame.f_code.co_name
+                key = (id(self.owner), self.field, context)
+                observed["reads"][key] = observed["reads"].get(key, 0) + 1
+                # Advance the actual protobuf scalar container, not copied names.
+                return self.values[index]
+
+            def __iter__(self) -> Any:
+                for index in range(len(self.values)):
+                    yield self[index]
+
+        def counted_getattr(owner: Any, field: str, *default: Any) -> Any:
+            values = original_getattr(owner, field, *default)
+            if (
+                field in {"input", "output"}
+                and isinstance(owner, onnx.NodeProto)
+                and owner.name.startswith("r38_slots")
+            ):
+                observed["owners"][id(owner)] = owner
+                return CountedSlots(owner, field, values)
+            return values
+
+        def profile(frame: Any, event: str, _answer: Any) -> None:
+            if event != "return" or frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            name, local = frame.f_code.co_name, frame.f_locals
+            if name == "subgraph_reenters_state_with_rank_promotion" and local["subgraph"].name == "r38_slots_body":
+                observed["rank"].append(
+                    {
+                        "input": local["graph_input_name"],
+                        "callback": local["replay_name_work"],
+                        "cold": "attribute_work" in local,
+                        "processed": "body_output_slots" in local,
+                        "work": local.get("attribute_work"),
+                        "remaining": local["reentry_attribute_work_remaining"],
+                    }
+                )
+            elif name == "walk_graph" and "reserve_exact_loop_replay_name_work" in local:
+                observed["reserve"] = local["reserve_exact_loop_replay_name_work"]
+                observed["replay_remaining"] = local["exact_loop_replay_work_remaining"]
+            elif name == "_build_onnx_weight_analysis_plan":
+                observed["helpers"] = {
+                    key: local[key]
+                    for key in (
+                        "node_input_slots",
+                        "node_output_slots",
+                        "node_input_names",
+                        "node_output_names",
+                        "node_io_slots_cache",
+                        "bound_control_flow_graph_inputs",
+                        "bound_control_flow_graph_constant_inputs",
+                    )
+                    if key in local
+                }
+
+        with monkeypatch.context() as patch:
+            patch.setattr(onnx_scanner_module, "getattr", counted_getattr, raising=False)
+            previous = sys.getprofile()
+            try:
+                sys.setprofile(profile)
+                result = run(observed)
+            finally:
+                sys.setprofile(previous)
+        return result, observed
+
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    @pytest.mark.parametrize("width,expected", [(8, 8), (32, 2)], ids=["admitted", "bounded"])
+    def test_ordinary_state_proofs_share_output_slots_and_admission(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner_type: Any, width: int, expected: int
+    ) -> None:
+        model = self._model(width)
+        onnx.checker.check_model(model, full_check=True)
+        path = _save_onnx_model(model, tmp_path / "repeated-output-slots.onnx")
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 64)
+        result, observed = self._observe(monkeypatch, lambda _observed: scanner_type().scan(str(path)))
+        rows = observed["rank"]
+        assert {row["input"] for row in rows} == {f"state{index}" for index in range(8)}
+        assert all(row["callback"] is None for row in rows)
+        admitted = [row for row in rows if row["processed"]]
+        refused = [row for row in rows if row["cold"] and not row["processed"]]
+        assert len(admitted) == expected
+        assert all(row["work"] == width - 1 for row in admitted)
+        assert sum(row["work"] for row in admitted) <= 64
+        assert bool(refused) is (width == 32)
+        assert all(row["remaining"] == 0 for row in refused)
+        assert any(not row["cold"] for row in rows)  # Completed proofs are reused.
+        reads = observed["reads"]
+        assert (
+            sum(
+                count
+                for (_owner, field, context), count in reads.items()
+                if field == "output" and context == "node_io_slots"
+            )
+            == width
+        )
+        assert not any(
+            count
+            for (_owner, field, context), count in reads.items()
+            if field == "output" and context == "replay_admitted_values"
+        )
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+    def test_io_slot_snapshots_keep_owners_positions_and_zero_work_guards(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def run(observed: dict[str, Any]) -> None:
+            plan = _build_fixture_weight_plan(self._model(8), onnx=onnx, np=np, max_array_size=None)
+            assert plan.coverage_gaps == {} and observed["rank"]
+            helpers = observed["helpers"]
+            value = TestOnnxShapeContinuity._v
+            body = helper.make_graph(
+                [],
+                "r38_slots_binding_body",
+                [
+                    value("i", [], TensorProto.INT64),
+                    value("c", [], TensorProto.BOOL),
+                    value("a", [1]),
+                    value("b", [1]),
+                ],
+                [value("c", [], TensorProto.BOOL), value("a", [1]), value("b", [1])],
+            )
+            first = helper.make_node(
+                "Loop", ["", "condition", "left", "right"], ["", "next"], body=body, name="r38_slots_holes"
+            )
+            second = onnx.NodeProto()
+            second.CopyFrom(first)
+            slots_by_owner: list[list[str]] = []
+            for node in (first, second):
+                inputs = helpers["node_input_slots"](node)
+                outputs = helpers["node_output_slots"](node)
+                assert inputs == ["", "condition", "left", "right"] and outputs == ["", "next"]
+                assert helpers["node_input_names"](node)[1] is inputs[2]
+                assert helpers["node_output_names"](node)[0] is outputs[1]
+                cache = helpers["node_io_slots_cache"]
+                assert cache[(id(node), "input")][0] is node and cache[(id(node), "output")][0] is node
+                before = dict(observed["reads"])
+                assert helpers["node_input_slots"](node) is inputs
+                assert helpers["node_output_slots"](node) is outputs
+                assert observed["reads"] == before
+                slots_by_owner.append(outputs)
+            assert slots_by_owner[0] is not slots_by_owner[1]
+            assert (
+                sum(
+                    count
+                    for (owner, _field, _context), count in observed["reads"].items()
+                    if owner in {id(first), id(second)}
+                )
+                == 12
+            )
+
+            reserve = observed["reserve"]
+            assert reserve(64 * observed["replay_remaining"] + 1) is True
+            constants = {"left": helper.make_tensor("left", TensorProto.FLOAT, [1], [1.0])}
+            bindings = helpers["bound_control_flow_graph_inputs"]
+            constant_bindings = helpers["bound_control_flow_graph_constant_inputs"]
+            before = dict(observed["reads"])
+            assert bindings(
+                first, body, {"left", "right"}, {"": 13}, identifier=("", "Loop", ""), replay_name_work=reserve
+            ) == {"a": "left", "b": "right"}
+            assert constant_bindings(
+                first, body, constants, {"": 13}, identifier=("", "Loop", ""), replay_name_work=reserve
+            ) == {"a": "left"}
+            assert observed["reads"] == before  # Successful zero extra work uses retained short slots.
+            assert reserve(65) is False
+            cold = onnx.NodeProto()
+            cold.CopyFrom(first)
+            for node in (first, cold):
+                assert (
+                    bindings(
+                        node, body, {"left", "right"}, {"": 13}, identifier=("", "Loop", ""), replay_name_work=reserve
+                    )
+                    == {}
+                )
+                assert (
+                    constant_bindings(
+                        node, body, constants, {"": 13}, identifier=("", "Loop", ""), replay_name_work=reserve
+                    )
+                    == {}
+                )
+            assert observed["reads"] == before
+            assert (id(cold), "input") not in helpers["node_io_slots_cache"]
+
+        self._observe(monkeypatch, run)
+
+    def test_single_output_constant_keeps_full_post_attribute_copy_allowance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        value = TestOnnxShapeContinuity._v
+        count = 4095
+        body = helper.make_graph(
+            [helper.make_node("Constant", [], ["next"], value_floats=[1.0] * count)],
+            "copy_split_body_r38_boundary",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [count])],
+            [value("c", [], TensorProto.BOOL), value("next", [count])],
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node("Loop", ["trip", "start", "initial"], ["out"], body=body)],
+                "r38_constant_boundary",
+                [
+                    value("trip", [], TensorProto.INT64),
+                    value("start", [], TensorProto.BOOL),
+                    value("initial", [count]),
+                ],
+                [value("out", [count])],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+            ir_version=8,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        plan, observed = TestOnnxRecurrentConstantCopyAdmission._observe(
+            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        )
+        rank_copies = [copy for copy in observed["copies"] if copy["owner"] == "rank"]
+        assert [(copy["yielded"], copy["appended"]) for copy in rank_copies] == [(count, count)]
+        assert not [row for row in observed["denials"] if row[0] == "rank"]
+        assert plan.coverage_gaps == {}
+
+
+class TestOnnxDroppedShapeControlConversion:
+    @staticmethod
+    def _model(source: str, mode: str, prior_finding: bool) -> tuple[Any, Any | None]:
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        inputs = [value("trip", [], TensorProto.INT64)]
+        initializers = [tensor("start", np.bool_(True))]
+        if source == "initializer":
+            # Keep the numeric vector before the controls in initializer order.
+            initializers.append(tensor("initial", np.ones(4, np.float32)))
+        else:
+            inputs.append(value("initial", [4]))
+        nodes = []
+        state = "initial"
+        for index in range(33):
+            target, output = f"target_{index}", f"view_{index}"
+            initializers.append(tensor(target, np.array([4], np.int64)))
+            nodes.append(helper.make_node("Reshape", [state, target], [output]))
+            state = output
+
+        consumed = mode != "unused"
+        if consumed:
+            inputs.append(value("activation", [2, 4]))
+            body_nodes = [helper.make_node("PRelu", ["activation", "state"], ["body_y"])]
+            body_y = value("body_y", [2, 4])
+            output = value("Y", [None, 2, 4])
+        else:
+            body_nodes = [helper.make_node("Identity", ["iteration"], ["body_y"])]
+            body_y = value("body_y", [], TensorProto.INT64)
+            output = value("Y", [None], TensorProto.INT64)
+        if mode == "identity":
+            body_nodes.append(helper.make_node("Identity", ["state"], ["next_state"]))
+        else:
+            body_nodes.extend(
+                [
+                    helper.make_node("NonZero", ["state"], ["positions"]),
+                    helper.make_node("Cast", ["positions"], ["next_state"], to=TensorProto.FLOAT),
+                ]
+            )
+        body_nodes.append(helper.make_node("Identity", ["condition_in"], ["condition_out"]))
+        body = helper.make_graph(
+            body_nodes,
+            "dropped_shape_control_body",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+            ],
+            [value("condition_out", [], TensorProto.BOOL), value("next_state", None), body_y],
+        )
+        # The live scan output observes the consumer. No outer weight consumer
+        # can mask lost deferred provenance by reporting retained final lineages.
+        nodes.append(helper.make_node("Loop", ["trip", "start", state], ["final", "Y"], body=body))
+        outputs = [output]
+        prior_weights = None
+        if prior_finding:
+            prior_weights = np.zeros((64, 64), np.float32)
+            prior_weights[:5, 0] = 10
+            nodes.insert(0, helper.make_node("MatMul", ["A", "prior"], ["known"]))
+            inputs.append(value("A", [1, 64]))
+            outputs.append(value("known", [1, 64]))
+            initializers.append(tensor("prior", prior_weights))
+        model = helper.make_model(
+            helper.make_graph(nodes, "dropped_shape_control_conversion", inputs, outputs, initializer=initializers),
+            opset_imports=[helper.make_opsetid("", 18)],
+            ir_version=9,
+        )
+        return model, prior_weights
+
+    @staticmethod
+    def _assert_reference_trace(model: Any, source: str, mode: str, prior_weights: Any | None) -> None:
+        from copy import deepcopy
+
+        from onnx.reference import ReferenceEvaluator
+
+        scanned_bytes = model.SerializeToString()
+        # The carried rank changes. As in the existing finite-replay oracle,
+        # check schema without imposing a fixed rank through full inference.
+        onnx.checker.check_model(model)
+        oracle = deepcopy(model)
+        loop = next(node for node in oracle.graph.node if node.op_type == "Loop")
+        body = next(attribute.g for attribute in loop.attribute if attribute.name == "body")
+        evaluator = ReferenceEvaluator(body, opsets={"": 18})
+        state = np.ones(4, np.float32)
+        activation = np.full((2, 4), -1, np.float32)
+        expected_states = (
+            [np.ones(4, np.float32), np.ones(4, np.float32)]
+            if mode == "identity"
+            else [np.array([[0, 1, 2, 3]], np.float32), np.array([[0, 0, 0], [1, 2, 3]], np.float32)]
+        )
+        expected_outputs = (
+            [np.int64(0), np.int64(1)]
+            if mode == "unused"
+            else [
+                activation,
+                activation if mode == "identity" else np.array([[0, -1, -2, -3], [0, -1, -2, -3]], np.float32),
+            ]
+        )
+        consumed_shapes = []
+        for iteration in range(2):
+            if mode != "unused":
+                consumed_shapes.append(state.shape)
+            body_feeds: dict[str, Any] = {
+                "iteration": np.int64(iteration),
+                "condition_in": np.bool_(True),
+                "state": state,
+            }
+            if mode != "unused":
+                body_feeds["activation"] = activation
+            actual: Any = evaluator.run(None, body_feeds)
+            assert bool(actual[0]) is True
+            assert actual[1].dtype == np.dtype(np.float32)
+            assert actual[2].dtype == np.dtype(np.int64 if mode == "unused" else np.float32)
+            np.testing.assert_array_equal(actual[1], expected_states[iteration])
+            np.testing.assert_array_equal(actual[2], expected_outputs[iteration])
+            state = actual[1]
+        assert consumed_shapes == ([] if mode == "unused" else [(4,), (4,) if mode == "identity" else (1, 4)])
+
+        # Two is a feed, not a model constant: the scanner cannot use exact
+        # finite replay to hide the runtime-bounded recurrence. Both consumed
+        # slopes broadcast to [2, 4]; a third converted state is not this oracle.
+        feeds: dict[str, Any] = {"trip": np.int64(2)}
+        if source == "runtime":
+            feeds["initial"] = np.ones(4, np.float32)
+        if mode != "unused":
+            feeds["activation"] = activation
+        if prior_weights is not None:
+            feeds["A"] = np.ones((1, 64), np.float32)
+        value = TestOnnxRecurrenceReviewRegressions._value
+        oracle.graph.output.append(value("final", list(expected_states[-1].shape)))
+        onnx.checker.check_model(oracle)
+        outputs: Any = ReferenceEvaluator(oracle).run(None, feeds)
+        np.testing.assert_array_equal(outputs[0], np.stack(expected_outputs))
+        np.testing.assert_array_equal(outputs[-1], expected_states[-1])
+        if prior_weights is not None:
+            np.testing.assert_array_equal(outputs[1], feeds["A"] @ prior_weights)
+        assert model.SerializeToString() == scanned_bytes
+
+    @pytest.mark.parametrize(
+        ("source", "mode", "prior_finding", "incomplete"),
+        [
+            pytest.param("runtime", "converted", False, True, id="runtime-later-matrix"),
+            pytest.param("runtime", "converted", True, True, id="runtime-later-matrix-prior"),
+            pytest.param("initializer", "converted", True, True, id="retained-vector-later-matrix-prior"),
+            pytest.param("runtime", "identity", False, False, id="runtime-layout-only"),
+            pytest.param("initializer", "identity", True, False, id="retained-vector-layout-only-prior"),
+            pytest.param("runtime", "unused", False, False, id="converted-without-weight-consumer"),
+        ],
+    )
+    def test_dropped_shape_controls_follow_later_numeric_use(
+        self, tmp_path: Path, source: str, mode: str, prior_finding: bool, incomplete: bool
+    ) -> None:
+        model, prior_weights = self._model(source, mode, prior_finding)
+        self._assert_reference_trace(model, source, mode, prior_weights)
+        TestOnnxFiniteReplayFlatten._assert_public_contract(model, tmp_path, prior_weights, incomplete)
+
+
+class TestOnnxShapeControlGapSummary:
+    @staticmethod
+    def _capture() -> tuple[dict[str, Any], list[Any], dict[str, tuple[int, Any]]]:
+        import sys
+
+        names = {
+            "empty_weight_gap_summary",
+            "summarize_lineage_gap",
+            "summarize_non_shape_lineage_gap",
+            "summarize_weight_lineage_gap",
+            "summarize_rank_promotable_lineage_gap",
+            "merge_weight_lineage_gap_summaries",
+            "known_weight_gap_summary",
+            "converted_shape_control_gap_summary",
+            "summary_has_shape_control_provenance",
+            "transform_non_shape_gap_summary",
+            "transform_weight_gap_summary",
+            "transform_rank_promotable_gap_summary",
+            "non_shape_gap_summary_after_rank_increase",
+            "floating_cast_non_shape_gap_may_be_weight",
+            "gap_summary_is_dynamic_activation",
+        }
+        captured: dict[str, Any] = {}
+        capped: list[Any] = []
+        transported: dict[str, tuple[int, Any]] = {}
+
+        def observe(frame: Any, event: str, result: Any) -> None:
+            if event != "return" or frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            if frame.f_code.co_name == "_build_onnx_weight_analysis_plan":
+                captured.update({name: frame.f_locals[name] for name in names})
+            elif frame.f_code.co_name == "bounded_lineages":
+                dropped = frame.f_locals.get("dropped_lineages", ())
+                if dropped and all(lineage.unresolved_reason == "shape_control_lineage" for _, lineage in dropped):
+                    capped.append((dict(result[0]), *result[1:]))
+            elif frame.f_code.co_name == "walk_graph":
+                assert all(index >= 0 for lineages in frame.f_locals["value_lineages"].values() for index in lineages)
+                graph_name = getattr(frame.f_locals.get("current_graph"), "name", "")
+                value_name = {
+                    "dropped_shape_control_conversion": "view_32",
+                    "dropped_shape_control_body": "state",
+                }.get(graph_name)
+                if value_name is not None:
+                    counts = frame.f_locals["value_non_shape_lineage_limit_gap_counts"]
+                    summaries = frame.f_locals["value_non_shape_lineage_limit_gap_summaries"]
+                    transported[graph_name] = (counts.get(value_name, 0), summaries.get(value_name))
+
+        model, _prior = TestOnnxDroppedShapeControlConversion._model("runtime", "converted", False)
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(observe)
+            _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        finally:
+            sys.setprofile(previous)
+        assert set(captured) == names
+        assert capped
+        assert set(transported) == {"dropped_shape_control_conversion", "dropped_shape_control_body"}
+        return captured, capped, transported
+
+    def test_pending_shape_control_survives_real_cap_and_zero_count_transport(self) -> None:
+        from dataclasses import replace
+
+        captured, capped, transported = self._capture()
+        empty = captured["empty_weight_gap_summary"]
+        for row in capped:
+            retained, total, numeric, pending, weight, rank, weight_summary, rank_summary = row
+            assert len(retained) == 32 and total == 1
+            assert numeric == weight == rank == 0
+            assert pending.shape_control and not pending.lineages and not pending.truncated
+            assert not pending.converted_shape_control
+            assert weight_summary == rank_summary == empty
+        pending = capped[0][3]
+        assert captured["summary_has_shape_control_provenance"](pending) is True
+        assert captured["summary_has_shape_control_provenance"](empty) is False
+        for count, summary in transported.values():
+            assert count == 0 and summary == pending
+
+        known = captured["known_weight_gap_summary"]
+        merge = captured["merge_weight_lineage_gap_summaries"]
+        assert known(pending, 0) == pending
+        assert merge(empty, pending, empty) == pending
+        assert captured["non_shape_gap_summary_after_rank_increase"](pending, 0) == pending
+        identity = helper.make_node("Identity", ["x"], ["y"])
+        assert (
+            captured["transform_non_shape_gap_summary"](pending, identity, {}, resolve_value_shape=lambda _name: None)
+            == pending
+        )
+        for name in ("transform_weight_gap_summary", "transform_rank_promotable_gap_summary"):
+            assert captured[name](pending, identity, {}, resolve_value_shape=lambda _name: None) == empty
+        for name in ("summarize_weight_lineage_gap", "summarize_rank_promotable_lineage_gap"):
+            assert captured[name](pending.lineages) == empty
+
+        # Exercise the real representative cap with distinct facts, retaining
+        # the pending flag even if it appears after the truncating merge input.
+        retained_lineage = next(iter(capped[0][0].values()))
+        facts = [
+            replace(
+                retained_lineage,
+                shape=(1, index + 1),
+                data_type=TensorProto.FLOAT,
+                unresolved_reason="shape_dimensions_lineage",
+            )
+            for index in range(33)
+        ]
+        summarize = captured["summarize_non_shape_lineage_gap"]
+        truncated = summarize(facts, shape_control=True)
+        assert len(truncated.lineages) == 32 and truncated.truncated and truncated.shape_control
+        assert not truncated.converted_shape_control
+        merged = merge(summarize(facts[:32]), summarize(facts[32:]), pending)
+        assert merged == truncated
+        assert known(merged, 0) == pending
+
+    def test_converted_facts_keep_identity_and_precise_exclusions(self) -> None:
+        from dataclasses import replace
+
+        captured, capped, _transported = self._capture()
+        empty = captured["empty_weight_gap_summary"]
+        convert = captured["converted_shape_control_gap_summary"]
+        numeric = captured["summarize_non_shape_lineage_gap"]
+        weight = captured["summarize_weight_lineage_gap"]
+        rank = captured["summarize_rank_promotable_lineage_gap"]
+        integer = convert(shape=(2, 3), data_type=TensorProto.INT64)
+        assert not integer.shape_control and not integer.truncated and len(integer.lineages) == 1
+        assert integer.converted_shape_control
+        fact = integer.lineages[0]
+        assert fact.initializer_index == -1
+        assert (fact.shape, fact.data_type, fact.unresolved_reason) == (
+            (2, 3),
+            TensorProto.INT64,
+            "shape_dimensions_lineage",
+        )
+        source_id = next(iter(capped[0][0]))
+        ordinary = numeric([replace(fact, initializer_index=source_id)])
+        assert captured["summary_has_shape_control_provenance"](integer) is True
+        assert captured["summary_has_shape_control_provenance"](ordinary) is False
+        merge = captured["merge_weight_lineage_gap_summaries"]
+        for left, right in ((ordinary, integer), (integer, ordinary)):
+            merged = merge(left, right)
+            assert len(merged.lineages) == 2
+            # A real source-role filter must not erase the aggregate fact just
+            # because a retained source has otherwise identical shape/type.
+            filtered = captured["summarize_lineage_gap"](
+                merged.lineages, lambda lineage: lineage.initializer_index != source_id
+            )
+            assert (filtered.lineages, filtered.truncated) == (integer.lineages, integer.truncated)
+            assert not filtered.shape_control and not filtered.converted_shape_control
+        assert weight(integer.lineages) == rank(integer.lineages) == empty
+
+        # If the aggregate representative falls beyond the real cap, its origin
+        # must still survive without inserting a synthetic ordinary source ID.
+        ordinary_facts = [replace(fact, initializer_index=source_id, shape=(2, index + 1)) for index in range(32)]
+        truncated = merge(numeric(ordinary_facts), integer)
+        assert len(truncated.lineages) == 32 and truncated.truncated
+        assert all(lineage.initializer_index == source_id for lineage in truncated.lineages)
+        assert truncated.converted_shape_control and not truncated.shape_control
+        assert captured["summary_has_shape_control_provenance"](truncated) is True
+        assert captured["known_weight_gap_summary"](truncated, 33) == truncated
+        assert numeric(truncated.lineages, truncated=True, converted_shape_control=True) == truncated
+        identity = helper.make_node("Identity", ["x"], ["y"])
+        assert (
+            captured["transform_non_shape_gap_summary"](truncated, identity, {}, resolve_value_shape=lambda _name: None)
+            == truncated
+        )
+
+        scalar = convert(shape=(), data_type=TensorProto.FLOAT)
+        assert weight(scalar.lineages) == empty
+        scalar_rank = rank(scalar.lineages)
+        assert (scalar_rank.lineages, scalar_rank.truncated) == (scalar.lineages, scalar.truncated)
+        assert not scalar_rank.shape_control and not scalar_rank.converted_shape_control
+        floating = convert(shape=(2, 3), data_type=TensorProto.FLOAT)
+        floating_weight = weight(floating.lineages)
+        assert (floating_weight.lineages, floating_weight.truncated) == (floating.lineages, floating.truncated)
+        assert not floating_weight.shape_control and not floating_weight.converted_shape_control
+        dynamic = convert(shape=(2, 3), data_type=TensorProto.FLOAT, reason="dynamic_activation_lineage")
+        activation = captured["gap_summary_is_dynamic_activation"]
+        assert activation(dynamic, 1) is True
+        assert activation(floating, 1) is False
+        assert activation(merge(dynamic, floating), 2) is False
+
+        cast = helper.make_node("Cast", ["x"], ["y"], to=TensorProto.FLOAT)
+        transformed = captured["transform_weight_gap_summary"](
+            integer, cast, {}, resolve_value_shape=lambda _name: None
+        )
+        assert (transformed.lineages, transformed.truncated) == (floating.lineages, floating.truncated)
+        assert not transformed.shape_control and not transformed.converted_shape_control
+        assert (
+            captured["floating_cast_non_shape_gap_may_be_weight"](
+                integer, cast, {}, resolve_value_shape=lambda _name: None
+            )
+            is True
+        )
+        assert (
+            captured["floating_cast_non_shape_gap_may_be_weight"](
+                scalar, cast, {}, resolve_value_shape=lambda _name: None
+            )
+            is False
+        )
+        cast_to_integer = helper.make_node("Cast", ["x"], ["y"], to=TensorProto.INT64)
+        assert (
+            captured["transform_weight_gap_summary"](
+                floating, cast_to_integer, {}, resolve_value_shape=lambda _name: None
+            )
+            == empty
+        )
+        assert (
+            captured["transform_non_shape_gap_summary"](
+                floating, cast_to_integer, {}, resolve_value_shape=lambda _name: None
+            )
+            == integer
+        )
