@@ -2792,6 +2792,71 @@ def test_text_scanner_total_call_budget_is_scoped_to_each_scan(tmp_path: Path, m
     TextScanner._documentation_open_call_prefix_status.cache_clear()
 
 
+def test_documentation_call_parser_caches_results_without_caching_budget_failures() -> None:
+    prefix = b"source (context) "
+    other_prefix = b"another (context) "
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(len(prefix))
+    try:
+        assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+        assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() == 0
+        assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+        with pytest.raises(text_scanner_module._DocumentationCallBudgetExceeded):
+            TextScanner._documentation_prefix_has_enclosing_call(other_prefix)
+        assert TextScanner._documentation_cached_call_prefix.cache_info().currsize == 1
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(len(other_prefix))
+        assert TextScanner._documentation_prefix_has_enclosing_call(other_prefix) is False
+        assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.reset(budget_token)
+        TextScanner._documentation_cached_call_prefix.cache_clear()
+
+
+def test_documentation_call_parser_does_not_cache_oversized_prefixes() -> None:
+    prefix = b"source " + b" " * text_scanner_module.MAX_DOCUMENTATION_CALL_PARSE_BYTES + b"(context)"
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+    assert TextScanner._documentation_cached_call_prefix.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "completed_exit_code"),
+    [
+        ("source (context) [guide](https://docs.example.com/reference)\n", 0),
+        ("source (context) mentions import urllib.\n\nimport urllib\n", 1),
+    ],
+)
+def test_text_scanner_same_line_call_limit_is_inconclusive_and_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str, completed_exit_code: int
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(content)
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    cache_dir = tmp_path / "cache"
+    with monkeypatch.context() as limited, IsolatedCacheManager(reset_cache_manager):
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES", 0)
+        result = TextScanner(config={"check_secrets": False}).scan(str(path))
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "Text Content Security Coverage"
+            and check.details.get("classification_limit_sources") == ["documentation_call_context"]
+            for check in result.checks
+        )
+        assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() is None
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == completed_exit_code
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+
+
 @pytest.mark.parametrize(
     "content",
     [

@@ -1086,6 +1086,24 @@ class TextScanner(BaseScanner):
     @staticmethod
     def _documentation_prefix_has_enclosing_call(prefix: bytes) -> bool:
         """Return whether a bounded Python prefix leaves a function call open at the finding."""
+        if b"(" not in prefix:
+            return False
+        if len(prefix) <= MAX_DOCUMENTATION_CALL_PARSE_BYTES:
+            return TextScanner._documentation_cached_call_prefix(prefix)
+        return TextScanner._documentation_parse_call_prefix(prefix)
+
+    @staticmethod
+    @lru_cache(maxsize=8)
+    def _documentation_cached_call_prefix(prefix: bytes) -> bool:
+        return TextScanner._documentation_parse_call_prefix(prefix)
+
+    @staticmethod
+    def _documentation_parse_call_prefix(prefix: bytes) -> bool:
+        budget = _DOCUMENTATION_CALL_BUDGET.get()
+        if budget is not None:
+            if budget < len(prefix):
+                raise _DocumentationCallBudgetExceeded
+            _DOCUMENTATION_CALL_BUDGET.set(budget - len(prefix))
         source = prefix.strip()
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
@@ -1217,11 +1235,11 @@ class TextScanner(BaseScanner):
                 if quoted_assignment is None
                 else quoted_assignment
             )
-            or (not line_prefix.lstrip().startswith(b"|") and cls._documentation_prefix_has_enclosing_call(line_prefix))
             or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
             or cls._documentation_markdown_link_config_is_actionable(code_prefix)
+            or (not line_prefix.lstrip().startswith(b"|") and cls._documentation_prefix_has_enclosing_call(line_prefix))
         )
 
     @classmethod
@@ -2247,11 +2265,6 @@ class TextScanner(BaseScanner):
                         remaining_bytes -= 2 * len(prefix)
                         if remaining_bytes < 0:
                             return None
-                        budget = _DOCUMENTATION_CALL_BUDGET.get()
-                        if budget is not None:
-                            if budget < 2 * len(prefix):
-                                raise _DocumentationCallBudgetExceeded
-                            _DOCUMENTATION_CALL_BUDGET.set(budget - 2 * len(prefix))
                         is_call = cls._documentation_prefix_has_enclosing_call(prefix)
                     if is_call or previous_indent < current_indent:
                         return is_call
@@ -3037,9 +3050,12 @@ class TextScanner(BaseScanner):
         if finding_limit.get(
             "truncated_finding_type"
         ) == "endpoint_redaction_classification" and cls._is_documentation_sidecar(path):
-            return all(
-                cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
-            ) and cls._documentation_network_token_lines_are_passive(payload)
+            try:
+                return all(
+                    cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
+                ) and cls._documentation_network_token_lines_are_passive(payload)
+            except _DocumentationCallBudgetExceeded:
+                return False
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
         truncated_finding = finding_limit.get("truncated_finding")
@@ -3627,13 +3643,19 @@ class TextScanner(BaseScanner):
         for index, finding in enumerate(findings):
             retarget_incomplete = False
             if documentation_sidecar:
-                finding, retarget_incomplete, remaining_occurrences = cls._retarget_documentation_finding(
-                    payload,
-                    lowered_payload,
-                    finding,
-                    remaining_occurrences,
-                    index == last_retargetable_index,
-                )
+                try:
+                    finding, retarget_incomplete, remaining_occurrences = cls._retarget_documentation_finding(
+                        payload,
+                        lowered_payload,
+                        finding,
+                        remaining_occurrences,
+                        index == last_retargetable_index,
+                    )
+                except _DocumentationCallBudgetExceeded:
+                    classification_incomplete = True
+                    classification_limit_sources.add("documentation_call_context")
+                    classified_findings.append(finding)
+                    continue
                 classification_incomplete = classification_incomplete or retarget_incomplete
                 if retarget_incomplete:
                     classification_limit_sources.add("documentation")
@@ -3648,19 +3670,25 @@ class TextScanner(BaseScanner):
                 if retargeted_finding is None:
                     continue
                 finding = retargeted_finding
-            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(
-                path,
-                payload,
-                finding,
-                allow_documentation_image_examples=allow_documentation_image_examples,
-                documentation_image_example_spans=documentation_image_example_spans,
-            ):
-                finding = {**finding, "severity": "INFO"}
-            elif (
-                documentation_sidecar
-                and (finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES or finding.get("type") == "suspicious_port")
-                and cls._documentation_finding_actionability(payload, finding) is None
-            ):
+            try:
+                if not retarget_incomplete and cls._sidecar_network_finding_is_informational(
+                    path,
+                    payload,
+                    finding,
+                    allow_documentation_image_examples=allow_documentation_image_examples,
+                    documentation_image_example_spans=documentation_image_example_spans,
+                ):
+                    finding = {**finding, "severity": "INFO"}
+                elif (
+                    documentation_sidecar
+                    and (
+                        finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES or finding.get("type") == "suspicious_port"
+                    )
+                    and cls._documentation_finding_actionability(payload, finding) is None
+                ):
+                    classification_incomplete = True
+                    classification_limit_sources.add("documentation_call_context")
+            except _DocumentationCallBudgetExceeded:
                 classification_incomplete = True
                 classification_limit_sources.add("documentation_call_context")
             classified_findings.append(finding)
