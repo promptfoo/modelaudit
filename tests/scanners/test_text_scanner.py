@@ -2293,6 +2293,40 @@ def test_text_scanner_reuses_quote_analysis_across_many_links(tmp_path: Path, as
     TextScanner._documentation_quoted_assignment_index.cache_clear()
 
 
+def test_documentation_quote_index_retains_compact_read_only_storage() -> None:
+    context = b';a=""' * ((2 * 256 * 1024) // 5)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    positions, starts = TextScanner._documentation_quoted_assignment_index(context)
+    assert positions.readonly and starts.readonly
+    assert len(positions) == len(starts)
+    assert positions.nbytes + starts.nbytes <= 4 * len(context) + 32
+    assert TextScanner._documentation_has_open_quoted_assignment(context, 0, 4)
+    assert not TextScanner._documentation_has_open_quoted_assignment(context, 0, 5)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize("prefix", ["endpoint = '", 'endpoint: "', 'download("', "endpoint =\n"])
+def test_text_scanner_long_html_assignment_context_remains_actionable(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + " " * 5120 + '<a href="https://evil.example/payload.sh">download</a>\n'
+    )
+
+
+@pytest.mark.parametrize("prefix", [b"endpoint = '", b'endpoint: "', b'download("', b"endpoint =\n"])
+def test_text_scanner_html_context_beyond_lookback_remains_actionable(prefix: bytes) -> None:
+    payload = prefix + b" " * (256 * 1024 + 1) + b'<a href="https://evil.example/payload.sh">download</a>\n'
+    assert TextScanner._documentation_finding_is_actionable(payload, {"position": payload.index(b"https://")})
+
+
+@pytest.mark.parametrize("prefix", ["", 'endpoint = "closed" ', 'endpoint = "closed"\n'])
+def test_text_scanner_long_html_whitespace_without_open_assignment_is_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, prefix + " " * 5120 + '<a href="https://docs.example.com/reference">guide</a>\n'
+    )
+
+
 @pytest.mark.parametrize(
     "source,marker,expected",
     [

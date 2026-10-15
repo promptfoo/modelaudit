@@ -8,6 +8,7 @@ import os
 import re
 import token
 import tokenize
+from array import array
 from bisect import bisect_right
 from functools import lru_cache
 from typing import Any, ClassVar
@@ -1422,7 +1423,7 @@ class TextScanner(BaseScanner):
 
     @staticmethod
     @lru_cache(maxsize=4)
-    def _documentation_quoted_assignment_index(context: bytes) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def _documentation_quoted_assignment_index(context: bytes) -> tuple[memoryview, memoryview]:
         literals = TextScanner._documentation_string_literal_spans(context)
         literal_starts = [start for start, _end in literals]
 
@@ -1436,13 +1437,13 @@ class TextScanner(BaseScanner):
             if not nested_in_literal(match.start())
         )
         following = next(matches, None)
+        positions = array("I", [0])
+        starts = array("i", [-1])
         if following is None:
-            return (0,), (-1,)
+            return memoryview(positions).toreadonly(), memoryview(starts).toreadonly()
         # Keep the most recent still-open assignment for each quote/escape state.
         # A pending single quote can reopen only when the next quote doubles it.
         states = dict.fromkeys(b"\"'`", (-1, -1))
-        positions = [0]
-        starts = [-1]
         for position, value in enumerate(context, 1):
             for quote, (opened, pending) in states.items():
                 if quote == ord("'"):
@@ -1469,7 +1470,7 @@ class TextScanner(BaseScanner):
             if latest != starts[-1]:
                 positions.append(position)
                 starts.append(latest)
-        return tuple(positions), tuple(starts)
+        return memoryview(positions).toreadonly(), memoryview(starts).toreadonly()
 
     @classmethod
     def _documentation_has_open_quoted_assignment(cls, source: bytes, start: int = 0, end: int | None = None) -> bool:
@@ -2278,12 +2279,21 @@ class TextScanner(BaseScanner):
         line_start, line_end, _ = cls._documentation_line_bounds(payload, position)
         url_span = cls._documentation_bare_url_span_at_position(payload, position, line_start, line_end)
         html_position = url_span[0] if url_span is not None else position
-        html_prefix = payload[max(0, html_position - MAX_TEXT_FINDING_CONTEXT_BYTES) : html_position]
+        html_prefix_start = max(0, html_position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        html_prefix = payload[html_prefix_start:html_position]
         html_link = DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN.search(html_prefix)
         if html_link is not None:
             tag_line_start = html_prefix.rfind(b"\n", 0, html_link.start()) + 1
             if not html_prefix[tag_line_start : html_link.start()].strip():
                 surrounding_prefix = html_prefix[: html_link.start()].rstrip(b" \t\r\n")
+                tag_start = html_prefix_start + html_link.start()
+                if cls._finding_line_prefix_is_truncated(payload, {"position": tag_start}):
+                    context_start = max(0, tag_start - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+                    if context_start and payload[context_start - 1 : context_start] not in {b"\r", b"\n"}:
+                        return True
+                    surrounding_prefix = payload[context_start:tag_start].rstrip(b" \t\r\n")
+                    if len(surrounding_prefix) > MAX_TEXT_FINDING_CONTEXT_BYTES:
+                        return True
                 return (
                     cls._documentation_assignment_is_actionable(surrounding_prefix)
                     or cls._documentation_markdown_link_config_is_actionable(surrounding_prefix)
