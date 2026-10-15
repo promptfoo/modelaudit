@@ -41631,3 +41631,327 @@ class TestOnnxRepeatedProofAdmission:
             assert stats["total_entries"] == stats["cache_hits"] == 0
         finally:
             reset_cache_manager()
+
+
+class TestOnnxReentryAttributeAdmission:
+    @pytest.mark.parametrize("local_function", [False, True], ids=["transpose", "function_call"])
+    @pytest.mark.parametrize("padding", [0, 512])
+    def test_reentry_literal_attributes_share_work_across_states(
+        self, tmp_path: Path, local_function: bool, padding: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        states = [f"state{index}" for index in range(16)]
+        functions = []
+        imports = [helper.make_opsetid("", 18)]
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "TransposeState",
+                    ["input"],
+                    ["output"],
+                    [helper.make_node("Transpose", ["input"], ["output"], perm=[1, 0])],
+                    [helper.make_opsetid("", 18)],
+                )
+            )
+            imports.append(helper.make_opsetid("local", 1))
+            probe = helper.make_node("TransposeState", [states[0]], ["shared"], domain="local")
+        else:
+            probe = helper.make_node("Transpose", [states[0]], ["shared"], perm=[1, 0])
+        body_name = "shared_reentry_attribute_work"
+        body = helper.make_graph(
+            [probe] + [helper.make_node("Identity", ["shared"], [f"next{index}"]) for index in range(16)],
+            body_name,
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [2, 2]) for name in states],
+            [value("condition", [], TensorProto.BOOL)] + [value(f"next{index}", [2, 2]) for index in range(16)],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Loop", ["two", "start", *states], [f"out{i}" for i in range(16)], body=body),
+                ],
+                "bounded_reentry_literal_attributes",
+                [value("A", [1, 64])] + [value(name, [2, 2]) for name in states],
+                [value("known", [1, 64])] + [value(f"out{i}", [2, 2]) for i in range(16)],
+                [tensor("prior", prior_weights), tensor("two", np.array(2, np.int64)), tensor("start", np.array(True))],
+            ),
+            functions=functions,
+            opset_imports=imports,
+            ir_version=9,
+        )
+        feeds = {"A": np.ones((1, 64), np.float32)}
+        feeds.update({name: np.arange(4, dtype=np.float32).reshape(2, 2) + index for index, name in enumerate(states)})
+
+        def assert_valid_outputs() -> None:
+            onnx.checker.check_model(model, full_check=True)
+            actual: Any = ReferenceEvaluator(model).run(None, feeds)
+            np.testing.assert_array_equal(actual[0], feeds["A"] @ prior_weights)
+            # Both iterations replace every state with the transposed first
+            # state, so the second iteration restores the original first state.
+            assert len(actual) == 17
+            for output in actual[1:]:
+                np.testing.assert_array_equal(output, feeds[states[0]])
+
+        assert_valid_outputs()
+        actual_body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+        actual_probe = actual_body.node[0]
+        if padding:
+            names = [f"unused{index}" for index in range(padding)]
+            actual_probe.attribute.extend(helper.make_attribute(name, 0) for name in names)
+            if local_function:
+                # These declared call attributes are unused by the callee and
+                # remain valid; its cached shape proof cannot skip the outer
+                # call's literal checks for each distinct carried-state probe.
+                model.functions[0].attribute.extend(names)
+                assert_valid_outputs()
+            else:
+                # Built-in Transpose rejects unknown literal attributes, but
+                # schema failure must not leave later analysis work unbounded.
+                with pytest.raises(onnx.checker.ValidationError):
+                    onnx.checker.check_model(model, full_check=True)
+
+        source_path = Path(onnx_scanner_module.__file__)
+        reentry = next(
+            node
+            for node in ast.walk(ast.parse(source_path.read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "subgraph_reenters_state_with_rank_promotion"
+        )
+        literal_check = next(
+            node
+            for node in ast.walk(reentry)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "attributes_proven" for target in node.targets)
+        )
+        literal_generator = next(node for node in ast.walk(literal_check) if isinstance(node, ast.GeneratorExp))
+        literal_check_end = literal_check.end_lineno
+        assert literal_check_end is not None
+        refusal = next(
+            node
+            for node in ast.walk(reentry)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "attribute_work"
+            and any(
+                isinstance(operand, ast.Name) and operand.id == "reentry_attribute_work_remaining"
+                for operand in node.test.comparators
+            )
+        )
+        refusal_line = next(node.lineno for node in refusal.body if isinstance(node, ast.Return))
+        observed = {"attribute_visits": 0, "refusals": 0}
+        outer_inputs: set[str] = set()
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if event != "return" or frame.f_code.co_filename != str(source_path):
+                return
+            if (
+                frame.f_code.co_name == "<genexpr>"
+                and literal_generator.lineno <= frame.f_code.co_firstlineno <= literal_check_end
+                and isinstance(arg, bool)
+            ):
+                # A predicate yield emits its bool; generator exhaustion emits
+                # None. Count actual inspected attributes, excluding that exit.
+                observed["attribute_visits"] += 1
+                caller = frame.f_back
+                if caller is not None and getattr(caller.f_locals.get("subgraph"), "name", None) == body_name:
+                    outer_inputs.add(str(caller.f_locals["graph_input_name"]))
+            elif frame.f_code.co_name == reentry.name and frame.f_lineno == refusal_line and arg is True:
+                observed["refusals"] += 1
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                model, onnx=onnx, np=np, max_array_size=64 * 1024
+            )
+        finally:
+            sys.setprofile(previous_profile)
+        assert 0 < observed["attribute_visits"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert bool(observed["refusals"]) is bool(padding)
+        if padding:
+            assert len(outer_inputs) > 1
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+
+        path = _save_onnx_model(model, tmp_path / "reentry-literal-attribute-budget.onnx")
+        standalone = WeightDistributionScanner().scan(str(path))
+        normal = OnnxScanner().scan(str(path))
+        assert len(TestWeightDistributionSemantics._extreme_checks(standalone)) == 1
+        assert len(TestWeightDistributionSemantics._extreme_checks(normal)) == 1
+        if padding and not local_function:
+            assert normal.success is False
+            assert normal.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert any(
+                check.name == "ONNX Schema Validation" and check.status == CheckStatus.FAILED for check in normal.checks
+            )
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            # All carried values are runtime inputs and the body only transforms
+            # them. Refusing an optional shape proof loses no initializer-weight
+            # coverage, including for valid, unused local-function attributes.
+            assert plan.coverage_gaps == {}
+            assert standalone.success is True
+            assert normal.success is True
+            assert normal.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+
+class TestOnnxFiniteReplayTransposeAndDeadConstants:
+    @staticmethod
+    def _model(
+        *,
+        local_function: bool,
+        transpose: bool = True,
+        explicit_permutation: bool = False,
+        matrix_consumer: bool = False,
+        constant_use: str = "absent",
+    ) -> tuple[Any, Any]:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        update = [helper.make_node("Squeeze", ["state"], ["vector"])]
+        vector_name = "vector"
+        if constant_use != "absent":
+            constant = helper.make_node("Constant", [], ["offset_value"])
+            constant.attribute.append(
+                onnx.AttributeProto(name="value_float", ref_attr_name="offset", type=onnx.AttributeProto.FLOAT)
+            )
+            update.insert(0, constant)
+            if constant_use == "live":
+                update.append(helper.make_node("Add", ["vector", "offset_value"], ["adjusted"]))
+                vector_name = "adjusted"
+        if transpose:
+            attributes: dict[str, Any] = {"perm": [0]} if explicit_permutation else {}
+            update.append(helper.make_node("Transpose", [vector_name], ["transposed"], **attributes))
+            vector_name = "transposed"
+        update.extend(
+            [
+                helper.make_node("PRelu", ["X", "state" if matrix_consumer else vector_name], ["used"]),
+                helper.make_node("Unsqueeze", [vector_name, "axes"], ["next"]),
+            ]
+        )
+        functions = []
+        body_nodes = update
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "ReplayUpdate",
+                    ["state", "X", "axes"],
+                    ["next"],
+                    update,
+                    [helper.make_opsetid("", 18)],
+                    attributes=["offset"] if constant_use != "absent" else [],
+                )
+            )
+            call_attributes: dict[str, Any] = {"offset": 0.5} if constant_use != "absent" else {}
+            body_nodes = [
+                helper.make_node("ReplayUpdate", ["state", "X", "axes"], ["next"], domain="local", **call_attributes)
+            ]
+        body = helper.make_graph(
+            body_nodes,
+            "finite_vector_restoration_body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", None)],
+            [value("c", [], TensorProto.BOOL), value("next", None)],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Loop", ["two", "start", "initial"], ["final"], body=body),
+                ],
+                "finite_vector_restoration",
+                [value("A", [1, 64]), value("X", [1, 4])],
+                [value("known", [1, 64]), value("final", [1, 4])],
+                initializer=[
+                    tensor("prior", prior_weights),
+                    tensor("initial", np.arange(1, 5, dtype=np.float32)),
+                    tensor("axes", np.array([0], np.int64)),
+                    tensor("two", np.int64(2)),
+                    tensor("start", np.bool_(True)),
+                ],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=9,
+        )
+        # Carried rank changes once; qualify each actual slope before the next-state fallback.
+        onnx.checker.check_model(model)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined)
+        loop = next(node for node in inlined.graph.node if node.op_type == "Loop")
+        runtime_body = deepcopy(next(attribute.g for attribute in loop.attribute if attribute.name == "body"))
+        prelu = next(node for node in runtime_body.node if node.op_type == "PRelu")
+        runtime_body.output.extend([value(prelu.input[1], None), value(prelu.output[0], [1, 4])])
+        runner = ReferenceEvaluator(runtime_body, opsets={"": 18})
+        state = np.arange(1, 5, dtype=np.float32)
+        activation = np.array([[-1, 2, -3, 4]], np.float32)
+        observed_slope_shapes = []
+        for iteration in range(2):
+            expected_vector = np.squeeze(state)
+            if constant_use == "live":
+                expected_vector = expected_vector + np.float32(0.5)
+            if transpose:
+                expected_vector = np.transpose(expected_vector, (0,) if explicit_permutation else None)
+            expected_slope = state if matrix_consumer else expected_vector
+            actual: Any = runner.run(
+                None,
+                {
+                    "i": np.int64(iteration),
+                    "c": np.bool_(True),
+                    "state": state,
+                    "X": activation,
+                    "axes": np.array([0], np.int64),
+                },
+            )
+            assert bool(actual[0]) is True
+            np.testing.assert_array_equal(actual[1], np.expand_dims(expected_vector, 0))
+            np.testing.assert_array_equal(actual[2], expected_slope)
+            np.testing.assert_array_equal(actual[3], np.where(activation >= 0, activation, activation * expected_slope))
+            observed_slope_shapes.append(actual[2].shape)
+            state = actual[1]
+        assert observed_slope_shapes == ([(4,), (1, 4)] if matrix_consumer else [(4,), (4,)])
+        expected_final = np.arange(1, 5, dtype=np.float32) + (
+            np.float32(1) if constant_use == "live" else np.float32(0)
+        )
+        np.testing.assert_array_equal(state, expected_final.reshape(1, 4))
+        return model, prior_weights
+
+    @staticmethod
+    def _assert_contract(model: Any, prior_weights: Any, tmp_path: Path, *, incomplete: bool) -> None:
+        plan = TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, incomplete, prior_weights, coverage_reason="lineages_per_value_limit"
+        )
+        assert bool(plan.coverage_gaps) is incomplete
+        normal = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "finite-replay-normal.onnx")))
+        assert normal.success is not incomplete, normal.metadata
+        assert (normal.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(normal)) == 1
+
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize("explicit_permutation", [False, True])
+    def test_transpose_preserves_finite_vector_consumers(
+        self, tmp_path: Path, local_function: bool, explicit_permutation: bool
+    ) -> None:
+        model, prior = self._model(local_function=local_function, explicit_permutation=explicit_permutation)
+        self._assert_contract(model, prior, tmp_path, incomplete=False)
+
+    @pytest.mark.parametrize("local_function", [False, True])
+    def test_transpose_does_not_hide_later_matrix_consumers(self, tmp_path: Path, local_function: bool) -> None:
+        model, prior = self._model(local_function=local_function, explicit_permutation=True, matrix_consumer=True)
+        self._assert_contract(model, prior, tmp_path, incomplete=True)
+
+    @pytest.mark.parametrize("constant_use", ["absent", "dead", "live"])
+    def test_function_replay_ignores_only_dead_bound_constants(self, tmp_path: Path, constant_use: str) -> None:
+        model, prior = self._model(local_function=True, transpose=False, constant_use=constant_use)
+        # Live referenced constants retain the existing conservative replay restriction.
+        self._assert_contract(model, prior, tmp_path, incomplete=constant_use == "live")

@@ -3329,6 +3329,7 @@ def _build_onnx_weight_analysis_plan(
     reentry_promotion_cache: dict[tuple[Any, ...], frozenset[int]] = {}
     reentry_shape_cache: dict[tuple[Any, ...], dict[int, tuple[int, ...]]] = {}
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
+    reentry_attribute_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
     reentry_external_context_shape_cache: dict[tuple[Any, ...], dict[str, tuple[int, ...]]] = {}
     graph_output_dependency_cache: dict[
         tuple[int, tuple[int, ...], tuple[tuple[str, str, str], ...]], frozenset[str]
@@ -3733,6 +3734,7 @@ def _build_onnx_weight_analysis_plan(
         *,
         depth: int = 0,
     ) -> bool:
+        nonlocal reentry_attribute_work_remaining
         if depth > 6:
             return True
         graph_outputs = getattr(subgraph, "output", ())
@@ -3806,6 +3808,13 @@ def _build_onnx_weight_analysis_plan(
             return graph_output_index in promoted_output_indexes
         if cache_key in reentry_promotion_in_progress:
             return True
+        # State and binding contexts share one allowance for repeated attribute scans.
+        live_nodes = graph_nodes_in_dependency_order(subgraph, output_dependency_names)
+        attribute_work = sum(len(getattr(node, "attribute", ())) for node in live_nodes)
+        if attribute_work > reentry_attribute_work_remaining:
+            reentry_attribute_work_remaining = 0
+            return True
+        reentry_attribute_work_remaining -= attribute_work
         reentry_promotion_in_progress.add(cache_key)
         local_attribute_bindings = attribute_bindings or {}
 
@@ -3831,7 +3840,7 @@ def _build_onnx_weight_analysis_plan(
             return trusted_context_shapes.get(input_name)
 
         output_dependency_node_ids = graph_nodes_producing_names(subgraph, output_dependency_names)
-        for body_node in graph_nodes_in_dependency_order(subgraph, output_dependency_names):
+        for body_node in live_nodes:
             body_outputs = node_output_names(body_node)
             body_output_slots = [str(output) for output in getattr(body_node, "output", ())]
             if not body_outputs:
@@ -9223,6 +9232,13 @@ def _build_onnx_weight_analysis_plan(
                                 and data_input_shape is not None
                             ):
                                 return data_input_shape
+                            if body_node.op_type == "Transpose" and data_input_shape is not None:
+                                permutation = transpose_permutation(body_node, len(data_input_shape), resolve_attribute)
+                                return (
+                                    inferred_shape(len(permutation), (data_input_shape[axis] for axis in permutation))
+                                    if permutation is not None
+                                    else None
+                                )
                             if body_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
                                 return concat_shape(
                                     body_node,
@@ -9337,23 +9353,6 @@ def _build_onnx_weight_analysis_plan(
                             )
                             if dependency_names_exceeded_limit(weight_dependency_names):
                                 return None
-                            # Cast preserves shape for every valid target dtype.
-                            # Other referenced attributes can change shape, so the
-                            # literal-attribute helpers cannot prove their replay.
-                            for function_node in getattr(function_graph, "node", ()):
-                                for attribute in getattr(function_node, "attribute", ()):
-                                    reference = str(getattr(attribute, "ref_attr_name", ""))
-                                    if not reference:
-                                        continue
-                                    bound_attribute = function_attributes.get(reference)
-                                    if not (
-                                        getattr(function_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                                        and function_node.op_type == "Cast"
-                                        and attribute.name == "to"
-                                        and bound_attribute is not None
-                                        and int(getattr(bound_attribute, "type", 0)) == 2
-                                    ):
-                                        return None
                             if output_shapes_out is not None:
                                 function_outputs = getattr(function_graph, "output", ())
                                 if len(function_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
@@ -9372,6 +9371,29 @@ def _build_onnx_weight_analysis_plan(
                             if dependency_names_exceeded_limit(weight_dependency_names):
                                 return None
                             live_node_ids = graph_nodes_producing_names(function_graph, weight_dependency_names)
+                            # Cast preserves shape for every valid target dtype.
+                            # Other referenced attributes can change shape, so the
+                            # literal-attribute helpers cannot prove their replay.
+                            for function_node in getattr(function_graph, "node", ()):
+                                # Match the dead-Constant skip in replay; retain all consumer checks.
+                                if (
+                                    builtin_operator(function_node, "Constant")
+                                    and id(function_node) not in live_node_ids
+                                ):
+                                    continue
+                                for attribute in getattr(function_node, "attribute", ()):
+                                    reference = str(getattr(attribute, "ref_attr_name", ""))
+                                    if not reference:
+                                        continue
+                                    bound_attribute = function_attributes.get(reference)
+                                    if not (
+                                        getattr(function_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                                        and function_node.op_type == "Cast"
+                                        and attribute.name == "to"
+                                        and bound_attribute is not None
+                                        and int(getattr(bound_attribute, "type", 0)) == 2
+                                    ):
+                                        return None
                             function_producers = graph_output_producer_nodes_by_name(function_graph)
                             if function_input_name in function_producers:
                                 return None
@@ -9418,6 +9440,17 @@ def _build_onnx_weight_analysis_plan(
                                     and data_input_shape is not None
                                 ):
                                     return data_input_shape
+                                if function_node.op_type == "Transpose" and data_input_shape is not None:
+                                    permutation = transpose_permutation(
+                                        function_node, len(data_input_shape), function_attribute
+                                    )
+                                    return (
+                                        inferred_shape(
+                                            len(permutation), (data_input_shape[axis] for axis in permutation)
+                                        )
+                                        if permutation is not None
+                                        else None
+                                    )
                                 if function_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
                                     return concat_shape(
                                         function_node,
