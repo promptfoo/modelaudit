@@ -43048,3 +43048,622 @@ def test_schema_admission_refuses_unhandled_tensor_bearing_edges(
     assert onnx_scanner_module._onnx_raw_control_schema_supported() is supported
     if not supported:
         assert onnx_scanner_module._preflight_onnx_raw_controls(b"") == (False, False, "raw_control_schema_unsupported")
+
+
+class TestOnnxFiniteReplayFlatten:
+    @staticmethod
+    def _model(mode: str, local_function: bool) -> tuple[Any, Any, Any | None]:
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        later_matrix = mode == "later_matrix"
+        activation = np.array([-4, -3, 2, 1], np.float32)
+        if later_matrix:
+            activation = activation.reshape(1, 4)
+        flatten = helper.make_node("Flatten", ["state"], ["flat"], axis=0)
+        functions = []
+        if local_function:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "FlattenState",
+                    ["S"],
+                    ["F"],
+                    [helper.make_node("Flatten", ["S"], ["F"], axis=0)],
+                    [helper.make_opsetid("", 11)],
+                )
+            )
+            flatten = helper.make_node("FlattenState", ["state"], ["flat"], domain="local")
+        consumer = helper.make_node("PRelu", ["activation", "state" if later_matrix else "slope"], ["body_y"])
+        body_nodes = [
+            flatten,
+            helper.make_node("Squeeze", ["flat"], ["slope"], axes=[0]),
+            helper.make_node("Unsqueeze", ["slope"], ["next"], axes=[0]),
+            helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+        ]
+        body_nodes.insert(0 if later_matrix else 2, consumer)
+        body = helper.make_graph(
+            body_nodes,
+            "flatten_replay_body",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+            ],
+            [value("condition_out", [], TensorProto.BOOL), value("next", None)],
+        )
+        nodes = [
+            helper.make_node("Loop", ["trip", "start", "initial"], ["final"], body=body),
+            helper.make_node("Identity", ["activation"], ["Y"]),
+        ]
+        inputs = [value("activation", list(activation.shape))]
+        outputs = [value("Y", list(activation.shape))]
+        initializers = [
+            tensor("initial", np.array([1, 2, 3, 4], np.float32)),
+            tensor("trip", np.int64(2)),
+            tensor("start", np.bool_(True)),
+        ]
+        prior_weights = None
+        if mode != "benign":
+            prior_weights = np.zeros((64, 64), np.float32)
+            prior_weights[:5, 0] = 10
+            nodes.insert(0, helper.make_node("MatMul", ["A", "prior"], ["known"]))
+            inputs.append(value("A", [1, 64]))
+            outputs.append(value("known", [1, 64]))
+            initializers.append(tensor("prior", prior_weights))
+        model = helper.make_model(
+            helper.make_graph(nodes, "finite_flatten_replay", inputs, outputs, initializer=initializers),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 11), helper.make_opsetid("local", 1)],
+            ir_version=9,
+        )
+        return model, activation, prior_weights
+
+    @staticmethod
+    def _assert_reference_trace(model: Any, activation: Any, prior_weights: Any | None, later_matrix: bool) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        scanned_bytes = model.SerializeToString()
+        # The carried rank changes from one to two. Do not impose a common rank
+        # through full shape inference or fixed carried input/output annotations.
+        onnx.checker.check_model(model)
+        oracle = inline_local_functions(deepcopy(model))
+        onnx.checker.check_model(oracle)
+        loop = next(node for node in oracle.graph.node if node.op_type == "Loop")
+        runtime_body = deepcopy(next(attribute.g for attribute in loop.attribute if attribute.name == "body"))
+        runtime_body.output.extend([value("flat", None), value("slope", None), value("body_y", None)])
+        if later_matrix:
+            runtime_body.output.append(value("state", None))
+        evaluator = ReferenceEvaluator(runtime_body, opsets={"": 11})
+        state = np.array([1, 2, 3, 4], np.float32)
+        expected_state = state.copy()
+        observed_slope_shapes = []
+        for iteration in range(2):
+            expected_flat = expected_state.reshape(1, 4)
+            expected_vector = np.squeeze(expected_flat, axis=0)
+            expected_next = np.expand_dims(expected_vector, axis=0)
+            expected_consumed = expected_state if later_matrix else expected_vector
+            actual: Any = evaluator.run(
+                None,
+                {
+                    "iteration": np.int64(iteration),
+                    "condition_in": np.bool_(True),
+                    "state": state,
+                    "activation": activation,
+                },
+            )
+            assert bool(actual[0]) is True
+            assert actual[1].shape == actual[2].shape == (1, 4)
+            assert actual[3].shape == (4,)
+            assert actual[4].shape == activation.shape
+            np.testing.assert_array_equal(actual[1], expected_next)
+            np.testing.assert_array_equal(actual[2], expected_flat)
+            np.testing.assert_array_equal(actual[3], expected_vector)
+            np.testing.assert_array_equal(actual[4], np.array([-4, -6, 2, 1], np.float32).reshape(activation.shape))
+            consumed = actual[5] if later_matrix else actual[3]
+            assert consumed.shape == expected_consumed.shape
+            np.testing.assert_array_equal(consumed, expected_consumed)
+            observed_slope_shapes.append(consumed.shape)
+            state, expected_state = actual[1], expected_next
+        assert observed_slope_shapes == ([(4,), (1, 4)] if later_matrix else [(4,), (4,)])
+        assert state.shape == (1, 4)
+
+        # Only the oracle exposes the final state; its expected shape comes from
+        # the independent trace above, not from scanner-inferred value_info.
+        oracle.graph.output.append(value("final", [1, 4]))
+        onnx.checker.check_model(oracle)
+        feeds: dict[str, Any] = {"activation": activation}
+        if prior_weights is not None:
+            feeds["A"] = np.ones((1, 64), np.float32)
+        outputs: Any = ReferenceEvaluator(oracle).run(None, feeds)
+        np.testing.assert_array_equal(outputs[0], activation)
+        np.testing.assert_array_equal(outputs[-1], expected_state)
+        if prior_weights is not None:
+            np.testing.assert_array_equal(outputs[1], feeds["A"] @ prior_weights)
+        assert model.SerializeToString() == scanned_bytes
+
+    @pytest.mark.parametrize("local_function", [False, True], ids=["direct", "function"])
+    @pytest.mark.parametrize("mode", ["benign", "prior_finding", "later_matrix"])
+    def test_flatten_preserves_finite_consumed_slope_rank(
+        self, tmp_path: Path, mode: str, local_function: bool
+    ) -> None:
+        model, activation, prior_weights = self._model(mode, local_function)
+        incomplete = mode == "later_matrix"
+        self._assert_reference_trace(model, activation, prior_weights, incomplete)
+        path = _save_onnx_model(model, tmp_path / "finite-flatten-replay.onnx")
+        onnx.checker.check_model(str(path))
+        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        assert bool(plan.coverage_gaps.get("lineages_per_value_limit", 0)) is incomplete
+        if not incomplete:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == int(prior_weights is not None)
+        if prior_weights is not None:
+            assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            standalone = scanner_type is WeightDistributionScanner
+            reason = (
+                "weight_distribution_analysis_incomplete"
+                if standalone
+                else ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON
+            )
+            result = scanner_type().scan(str(path))
+            assert result.success is not incomplete, result.metadata
+            assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+            assert (reason in result.metadata.get("scan_outcome_reasons", [])) is incomplete
+            gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            assert bool(gaps.get("lineages_per_value_limit", 0)) is incomplete
+            if not incomplete:
+                assert gaps == {}
+            findings = TestWeightDistributionSemantics._extreme_checks(result)
+            assert len(findings) == int(prior_weights is not None)
+            assert all(check.status == CheckStatus.FAILED for check in findings)
+            coverage = TestWeightDistributionCoverage._coverage_checks(result, standalone=standalone)
+            assert len(coverage) == int(incomplete)
+            if incomplete:
+                check = coverage[0]
+                assert check.status == CheckStatus.FAILED
+                assert check.severity == IssueSeverity.INFO
+                assert check.message
+                assert check.details["scan_outcome_reason"] == reason
+                if standalone:
+                    assert "onnx_lineages_per_value_limit" in check.details["extraction_incomplete_reasons"]
+                else:
+                    assert (
+                        check.message == "Weight distribution analysis skipped one or more eligible ONNX initializers"
+                    )
+                    assert check.details["coverage_gaps"]["lineages_per_value_limit"] > 0
+            else:
+                assert not any(check.details.get("scan_outcome_reason") == reason for check in result.checks)
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            hits_after_first = 0
+            first_issues: list[tuple[Any, str]] = []
+            for scan_index in range(2):
+                aggregate = scan_model_directory_or_file(
+                    str(path),
+                    recursive=False,
+                    cache_enabled=True,
+                    cache_dir=str(cache_dir),
+                    min_cache_file_size=0,
+                )
+                assert aggregate.success is not incomplete
+                assert determine_exit_code(aggregate) == (2 if incomplete else int(prior_weights is not None))
+                metadata = aggregate.file_metadata[str(path)]
+                assert (metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+                assert (
+                    ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON in metadata.get("scan_outcome_reasons", [])
+                ) is incomplete
+                assert sum("extremely large weight values" in issue.message for issue in aggregate.issues) == int(
+                    prior_weights is not None
+                )
+                issue_signature = [(issue.severity, issue.message) for issue in aggregate.issues]
+                manager = get_cache_manager(str(cache_dir), enabled=True)
+                if scan_index == 0:
+                    hits_after_first = manager.get_stats()["cache_hits"]
+                    first_issues = issue_signature
+                else:
+                    assert issue_signature == first_issues
+            stats = manager.get_stats()
+            assert (stats["cache_hits"] > hits_after_first) is not incomplete
+            if incomplete:
+                assert stats["total_entries"] == stats["cache_hits"] == 0
+            else:
+                assert stats["total_entries"] > 0
+        finally:
+            reset_cache_manager()
+
+
+class TestOnnxRecurrentConstantCopyAdmission:
+    _proof_owners: ClassVar[dict[str, str]] = {
+        "subgraph_reenters_state_with_rank_promotion": "rank",
+        "graph_tainted_output_indexes": "taint",
+        "subgraph_state_input_can_reach_weight_consumer": "reachability",
+        "graph_value_is_constant_bool": "bool",
+        "replay_constant_tensor": "finite",
+        "materialize_primary_constant": "primary",
+    }
+
+    @classmethod
+    def _owner(cls, frame: Any) -> str:
+        while frame is not None:
+            if frame.f_code.co_filename == onnx_scanner_module.__file__:
+                owner = cls._proof_owners.get(frame.f_code.co_name)
+                if owner is not None:
+                    return owner
+            frame = frame.f_back
+        return "other"
+
+    @classmethod
+    def _observe(cls, monkeypatch: pytest.MonkeyPatch, run: Any) -> tuple[Any, dict[str, Any]]:
+        observed: dict[str, Any] = {
+            "copies": [],
+            "requests": [],
+            "rank_states": set(),
+            "denials": [],
+            "scalars": [],
+            "bool_outcomes": [],
+            "finite_debits": [],
+        }
+        copy_values = onnx_scanner_module._copy_onnx_repeated_constant_values
+        make_tensor = onnx.helper.make_tensor
+        replay_entries: dict[int, tuple[int, int]] = {}
+
+        def record_copy(tensor: Any, values: Any, **kwargs: Any) -> bool:
+            event: dict[str, Any] = {
+                "owner": cls._owner(sys._getframe(1)),
+                "dtype": int(tensor.data_type),
+                "dims": tuple(tensor.dims),
+                "name": str(tensor.name),
+                "yielded": 0,
+                "appended": 0,
+            }
+            observed["copies"].append(event)
+            destination = tensor.int64_data if tensor.data_type == TensorProto.INT64 else tensor.float_data
+            before = len(destination)
+
+            class CountedValues:
+                def __len__(self) -> int:
+                    return len(values)
+
+                def __iter__(self) -> Any:
+                    for value in values:
+                        event["yielded"] += 1
+                        yield value
+
+            result = copy_values(tensor, CountedValues(), **kwargs)
+            event["appended"] = len(destination) - before
+            assert result is True
+            assert event["yielded"] == event["appended"] == len(values)
+            return result
+
+        def record_scalar(*args: Any, **kwargs: Any) -> Any:
+            frame = sys._getframe(1)
+            if (
+                frame.f_code.co_filename == onnx_scanner_module.__file__
+                and frame.f_code.co_name == "resolved_constant_node_tensor"
+            ):
+                observed["scalars"].append(cls._owner(frame))
+            return make_tensor(*args, **kwargs)
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            name = frame.f_code.co_name
+            if event == "call" and name == "resolved_constant_node_tensor":
+                observed["requests"].append(cls._owner(frame))
+            elif event == "call" and name == "subgraph_reenters_state_with_rank_promotion":
+                if getattr(frame.f_locals.get("subgraph"), "name", "").startswith("copy_split_body_"):
+                    observed["rank_states"].add(str(frame.f_locals["graph_input_name"]))
+            elif event == "return" and name == "repeated_attribute_tensor" and arg is None:
+                # A refusal must precede both TensorProto construction and the
+                # instrumented payload iterator. Retain only scalars, not frames.
+                observed["denials"].append(
+                    (cls._owner(frame), int(frame.f_locals["count"]), "tensor" in frame.f_locals)
+                )
+            elif event == "return" and name == "graph_value_is_constant_bool":
+                observed["bool_outcomes"].append(
+                    (str(frame.f_locals["value_name"]), bool(frame.f_locals["expected_value"]), arg)
+                )
+            elif name == "replay_constant_tensor":
+                if event == "call":
+                    replay_entries[id(frame)] = (
+                        int(frame.f_locals["exact_loop_replay_work_remaining"]),
+                        len(observed["copies"]),
+                    )
+                elif event == "return":
+                    before, first_copy = replay_entries.pop(id(frame))
+                    copies = [copy for copy in observed["copies"][first_copy:] if copy["owner"] == "finite"]
+                    observed["finite_debits"].append(
+                        {
+                            "accepted": arg is not None,
+                            "debit": before - int(frame.f_locals["exact_loop_replay_work_remaining"]),
+                            "metadata": int(frame.f_locals["metadata_work"]),
+                            "elements": sum(copy["yielded"] for copy in copies),
+                            "scalar_copies": int(
+                                arg is not None and frame.f_locals["attribute"].name in {"value_int", "value_float"}
+                            ),
+                        }
+                    )
+
+        with monkeypatch.context() as patch:
+            patch.setattr(onnx_scanner_module, "_copy_onnx_repeated_constant_values", record_copy)
+            patch.setattr(onnx.helper, "make_tensor", record_scalar)
+            previous = sys.getprofile()
+            try:
+                sys.setprofile(profile)
+                result = run()
+            finally:
+                sys.setprofile(previous)
+        assert not replay_entries
+        assert all(not allocated for _owner, _count, allocated in observed["denials"])
+        assert all(copy["owner"] != "other" for copy in observed["copies"])
+        return result, observed
+
+    @staticmethod
+    def _split_model(topology: str, *, ints: bool = False, dense: bool = False) -> tuple[Any, Any, int, int]:
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        states, pieces = {
+            "small": (2, 2),
+            "shared": (128, 128),
+            "large": (512, 512),
+            "scan_control": (1, 512),
+        }[topology]
+        count = pieces * 8
+        dtype = TensorProto.INT64 if ints else TensorProto.FLOAT
+        payload = np.arange(count, dtype=np.int64 if ints else np.float32)
+        attributes = (
+            {"value": tensor("", payload)} if dense else {"value_ints" if ints else "value_floats": payload.tolist()}
+        )
+        names = [f"state{index}" for index in range(states)]
+        outputs = [f"piece{index}" for index in range(pieces)]
+        body = helper.make_graph(
+            [
+                helper.make_node("Constant", [], ["flat"], **attributes),
+                helper.make_node("Split", ["flat"], outputs),
+            ],
+            f"copy_split_body_{topology}",
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [8], dtype) for name in names],
+            [value("condition", [], TensorProto.BOOL)] + [value(name, [8], dtype) for name in outputs],
+        )
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node(
+                        "Loop",
+                        ["trip", "start", *(["initial"] * states)],
+                        [f"out{index}" for index in range(pieces)],
+                        body=body,
+                    ),
+                ],
+                f"recurrent_constant_copy_{topology}",
+                [value("A", [1, 64]), value("trip", [], TensorProto.INT64)],
+                [value("known", [1, 64])]
+                + [value(f"out{index}", [8] if index < states else [None, 8], dtype) for index in range(pieces)],
+                [tensor("prior", prior), tensor("start", np.bool_(True)), tensor("initial", payload[:8])],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+            ir_version=8,
+        )
+        loop = model.graph.node[1]
+        actual_body = next(attribute.g for attribute in loop.attribute if attribute.name == "body")
+        assert len(loop.input) - 2 == len(actual_body.input) - 2 == states
+        assert len({item.name for item in actual_body.input[2:]}) == states
+        assert len(loop.output) == len(actual_body.output) - 1 == pieces
+        assert len(loop.output) - (len(loop.input) - 2) == pieces - states
+        onnx.checker.check_model(model, full_check=topology == "small")
+        if topology == "small":
+            from onnx.reference import ReferenceEvaluator
+
+            # Independent execution is deliberately bounded to the small model.
+            actual: Any = ReferenceEvaluator(model).run(None, {"A": np.ones((1, 64), np.float32), "trip": np.int64(2)})
+            np.testing.assert_array_equal(actual[0], np.ones((1, 64), np.float32) @ prior)
+            assert len(actual) == states + 1
+            for index, output in enumerate(actual[1:]):
+                np.testing.assert_array_equal(output, payload[index * 8 : (index + 1) * 8])
+                assert output.dtype == payload.dtype
+        return model, prior, states, count
+
+    @staticmethod
+    def _scan(path: Path, scanner: str) -> Any:
+        return (OnnxScanner() if scanner == "onnx" else WeightDistributionScanner()).scan(str(path))
+
+    @pytest.mark.parametrize("scanner", ["onnx", "standalone"])
+    @pytest.mark.parametrize("ints", [False, True], ids=["floats", "ints"])
+    @pytest.mark.parametrize("topology", ["small", "shared", "large", "scan_control"])
+    def test_recurrent_copies_share_admission_before_payload_access(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner: str, ints: bool, topology: str
+    ) -> None:
+        model, _prior, states, count = self._split_model(topology, ints=ints)
+        path = _save_onnx_model(model, tmp_path / "recurrent-copies.onnx")
+        result, observed = self._observe(monkeypatch, lambda: self._scan(path, scanner))
+        rank = [copy for copy in observed["copies"] if copy["owner"] == "rank"]
+        primary = [copy for copy in observed["copies"] if copy["owner"] == "primary"]
+        assert observed["rank_states"] == {f"state{index}" for index in range(states)}
+        assert "rank" in observed["requests"]
+        assert sum(copy["yielded"] for copy in rank) <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert all(copy["dims"] == (count,) for copy in rank)
+        assert all(copy["dtype"] == (TensorProto.INT64 if ints else TensorProto.FLOAT) for copy in rank)
+        rank_denials = [item for item in observed["denials"] if item[0] == "rank"]
+        if topology == "small":
+            assert rank and len(rank) >= 2
+            assert not rank_denials
+        elif topology == "shared":
+            # Default allowance admits some 1,024-element copies, then refuses
+            # a later distinct state. This is actual work, not budget arithmetic.
+            assert rank and rank_denials
+            assert len(rank) < states
+        else:
+            # The literal attribute debit precedes the 4,096-element request.
+            assert rank == []
+            assert rank_denials
+        assert [(copy["yielded"], copy["appended"]) for copy in primary] == [(count, count)]
+        assert all(copy["owner"] != "finite" for copy in observed["copies"])
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize("scanner", ["onnx", "standalone"])
+    def test_dense_constant_is_reused_without_repeated_payload_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner: str
+    ) -> None:
+        model, _prior, states, _count = self._split_model("large", dense=True)
+        path = _save_onnx_model(model, tmp_path / "dense-recurrent-copies.onnx")
+        result, observed = self._observe(monkeypatch, lambda: self._scan(path, scanner))
+        assert len(observed["rank_states"]) == states == 512
+        assert "rank" in observed["requests"]
+        assert observed["copies"] == observed["denials"] == []
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize("scanner", ["onnx", "standalone"])
+    @pytest.mark.parametrize("form", ["dense_bool", "floats", "ints", "float", "int"])
+    def test_bool_proof_does_not_allocate_non_bool_constants(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner: str, form: str
+    ) -> None:
+        model, _prior, _states, _count = self._split_model("small")
+        body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+        attributes: dict[str, Any] = {
+            "dense_bool": {"value": TestOnnxShapeContinuity._t("", np.bool_(False))},
+            "floats": {"value_floats": [0.0] * 4096},
+            "ints": {"value_ints": [0] * 4096},
+            "float": {"value_float": 0.0},
+            "int": {"value_int": 0},
+        }[form]
+        body.node.append(helper.make_node("Constant", [], ["stop"], **attributes))
+        body.output[0].name = "stop"
+        if form == "dense_bool":
+            from onnx.reference import ReferenceEvaluator
+
+            onnx.checker.check_model(model, full_check=True)
+            outputs: Any = ReferenceEvaluator(model).run(None, {"A": np.ones((1, 64), np.float32), "trip": np.int64(2)})
+            np.testing.assert_array_equal(outputs[1], np.arange(8, dtype=np.float32))
+        else:
+            # Constant itself is legal; assigning FLOAT/INT64 as Loop's BOOL
+            # output is intentionally invalid. It must not allocate for a BOOL proof.
+            with pytest.raises((onnx.checker.ValidationError, onnx.shape_inference.InferenceError)):
+                onnx.checker.check_model(model, full_check=True)
+        path = _save_onnx_model(model, tmp_path / "constant-bool-proof.onnx")
+        result, observed = self._observe(monkeypatch, lambda: self._scan(path, scanner))
+        assert "bool" in observed["requests"]
+        stop_proofs = [
+            result for name, expected, result in observed["bool_outcomes"] if name == "stop" and expected is False
+        ]
+        assert stop_proofs and all(proven is (form == "dense_bool") for proven in stop_proofs)
+        assert not [copy for copy in observed["copies"] if copy["owner"] == "bool"]
+        assert "bool" not in observed["scalars"]
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize("local_function", [False, True])
+    @pytest.mark.parametrize("form", ["ints", "tensor"])
+    def test_finite_replay_charges_real_copy_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local_function: bool, form: str
+    ) -> None:
+        model, _constant, prior = TestOnnxFiniteReplayConstantAdmission._model(form, local_function, False)
+        plan, observed = self._observe(
+            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        )
+        admitted = [debit for debit in observed["finite_debits"] if debit["accepted"]]
+        assert admitted
+        assert all(
+            debit["debit"] == debit["metadata"] + debit["elements"] + debit["scalar_copies"] for debit in admitted
+        )
+        assert bool([copy for copy in observed["copies"] if copy["owner"] == "finite"]) is (form == "ints")
+        assert plan.coverage_gaps == {}
+        assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(model, tmp_path, False, prior)
+
+    @pytest.mark.parametrize("proof", ["reachability", "output_taint"])
+    @pytest.mark.parametrize("count", [4, 4096], ids=["accepted", "refused"])
+    def test_taint_and_reachability_copy_work_uses_shared_allowance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proof: str, count: int
+    ) -> None:
+        model, prior, feeds, _target = TestOnnxReachabilityAttributeAdmission._model(proof)
+        body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+        if proof == "reachability":
+            del body.node[:]
+            body.node.extend(
+                [
+                    helper.make_node("Constant", [], ["proof_slope"], value_floats=[1.0] * count),
+                    helper.make_node("PRelu", ["X", "proof_slope"], ["unused_weight_result"]),
+                ]
+            )
+            activation = next(value for value in model.graph.input if value.name == "X")
+            activation.CopyFrom(TestOnnxShapeContinuity._v("X", [count]))
+            feeds["X"] = np.arange(count, dtype=np.float32) - 2
+        else:
+            function = model.functions[0]
+            del function.node[:]
+            function.node.extend(
+                [
+                    helper.make_node("Constant", [], ["zeros"], value_floats=[0.0] * count),
+                    helper.make_node("ReduceSum", ["zeros"], ["zero"], keepdims=0),
+                    *[
+                        helper.make_node("Add", [formal, "zero"], [output])
+                        for formal, output in zip(function.input, function.output, strict=True)
+                    ],
+                ]
+            )
+        onnx.checker.check_model(model, full_check=count == 4)
+        if count == 4:
+            from onnx.reference import ReferenceEvaluator
+
+            actual: Any = ReferenceEvaluator(model).run(None, feeds)
+            np.testing.assert_array_equal(actual[0], feeds["A"] @ prior)
+            assert len(actual) == 17
+            for index, output in enumerate(actual[1:]):
+                np.testing.assert_array_equal(output, feeds[f"state{index}"])
+        plan, observed = self._observe(
+            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        )
+        target_owner = "taint" if proof == "output_taint" else "reachability"
+        assert target_owner in observed["requests"]
+        target_copies = [copy for copy in observed["copies"] if copy["owner"] == target_owner]
+        assert bool(target_copies) is (count == 4)
+        assert bool([denial for denial in observed["denials"] if denial[0] == target_owner]) is (count == 4096)
+        shared_elements = sum(
+            copy["yielded"] for copy in observed["copies"] if copy["owner"] in {"taint", "reachability"}
+        )
+        assert shared_elements <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "taint-copy-admission.onnx")
+        for scanner in ("onnx", "standalone"):
+            result = self._scan(path, scanner)
+            assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize("count", [1, 128], ids=["accepted", "refused"])
+    def test_proof_refusal_preserves_prior_findings_and_incomplete_contract(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int
+    ) -> None:
+        model, constant, prior = TestOnnxFiniteReplayConstantAdmission._model("ints", False, False)
+        constant.attribute[0].ints[:] = [64] + [1] * (count - 1)
+        if count == 128:
+            # Reuse the exact existing finite-refusal setup; the accepted small
+            # control keeps default quotas and its independent runtime oracle.
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 200)
+        plan, observed = self._observe(
+            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        )
+        incomplete = count == 128
+        finite = [copy for copy in observed["copies"] if copy["owner"] == "finite"]
+        assert bool(finite) is not incomplete
+        assert bool(plan.coverage_gaps.get("lineages_per_value_limit")) is incomplete
+        assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
+        # Existing contract helper checks standalone failed coverage messages,
+        # prior anomaly precedence, and two aggregate scans with exit 2 and no
+        # cache entries/hits when incomplete. Keep the original case unchanged.
+        TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
+            model, tmp_path, incomplete, prior, coverage_reason="lineages_per_value_limit"
+        )
+        normal = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "copy-proof-coverage.onnx")))
+        assert normal.success is not incomplete
+        assert (normal.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(normal)) == 1
+        checks = TestWeightDistributionCoverage._coverage_checks(normal)
+        assert bool(checks) is incomplete
+        assert all(check.status == CheckStatus.FAILED and check.message for check in checks)

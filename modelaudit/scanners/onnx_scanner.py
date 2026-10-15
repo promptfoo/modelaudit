@@ -2504,13 +2504,14 @@ def _build_onnx_weight_analysis_plan(
     def resolved_constant_node_tensor(
         node: Any,
         resolve_attribute: Callable[[Any], Any | None],
+        reserve_copy_work: Callable[[int], bool],
     ) -> Any | None:
         if not builtin_operator(node, "Constant"):
             return None
 
         def repeated_attribute_tensor(values: Any, data_type: int) -> Any | None:
             count = len(values)
-            if count > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+            if count > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK or not reserve_copy_work(count):
                 return None
             tensor = onnx.TensorProto()
             tensor.data_type = data_type
@@ -2530,10 +2531,14 @@ def _build_onnx_weight_analysis_plan(
             if attribute.name == "value_ints":
                 return repeated_attribute_tensor(resolved_attribute.ints, int(onnx.TensorProto.INT64))
             if attribute.name == "value_int":
+                if not reserve_copy_work(1):
+                    return None
                 return onnx.helper.make_tensor("", onnx.TensorProto.INT64, [], [resolved_attribute.i])
             if attribute.name == "value_floats":
                 return repeated_attribute_tensor(resolved_attribute.floats, int(onnx.TensorProto.FLOAT))
             if attribute.name == "value_float":
+                if not reserve_copy_work(1):
+                    return None
                 return onnx.helper.make_tensor("", onnx.TensorProto.FLOAT, [], [resolved_attribute.f])
             if attribute.name == "sparse_value" and _onnx_has_singular_field(resolved_attribute, "sparse_tensor"):
                 return resolved_attribute.sparse_tensor
@@ -2651,6 +2656,9 @@ def _build_onnx_weight_analysis_plan(
                         if getattr(attribute, "ref_attr_name", "")
                         else attribute
                     ),
+                    # Scalar/repeated Constant attributes produce INT64/FLOAT,
+                    # never BOOL. A condition proof only needs the dense owner.
+                    reserve_copy_work=lambda _count: False,
                 )
                 constant_value = constant_scalar_value(tensor, int(onnx.TensorProto.BOOL))
                 return constant_value is expected_value if constant_value is not None else False
@@ -3388,6 +3396,15 @@ def _build_onnx_weight_analysis_plan(
     reentry_shape_cache: dict[tuple[Any, ...], dict[int, tuple[int, ...]]] = {}
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
     reentry_attribute_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def reserve_reentry_constant_copy_work(count: int) -> bool:
+        nonlocal reentry_attribute_work_remaining
+        if count > reentry_attribute_work_remaining:
+            reentry_attribute_work_remaining = 0
+            return False
+        reentry_attribute_work_remaining -= count
+        return True
+
     # Recursive graph/function visits share one finite-replay allowance.
     exact_loop_replay_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
     reentry_external_context_shape_cache: dict[tuple[Any, ...], dict[str, tuple[int, ...]]] = {}
@@ -3910,7 +3927,9 @@ def _build_onnx_weight_analysis_plan(
                 continue
             body_inputs = node_input_names(body_node)
             if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and body_node.op_type == "Constant":
-                constant_tensor = resolved_constant_node_tensor(body_node, resolve_reentry_attribute)
+                constant_tensor = resolved_constant_node_tensor(
+                    body_node, resolve_reentry_attribute, reserve_reentry_constant_copy_work
+                )
                 if constant_tensor is not None:
                     for output_name in body_outputs:
                         subgraph_constants[output_name] = constant_tensor
@@ -4476,6 +4495,13 @@ def _build_onnx_weight_analysis_plan(
                     and data_input_shape is not None
                 ):
                     output_shape = data_input_shape
+                elif standard_reentry_operator and body_node.op_type == "Flatten" and data_input_shape is not None:
+                    flattened_shape = flattened_output_shape(
+                        data_input_shape,
+                        resolved_onnx_int_attribute(body_node, "axis", 1, resolve_reentry_attribute),
+                    )
+                    if flattened_shape is not None:
+                        output_shape = inferred_shape(2, flattened_shape)
                 elif standard_reentry_operator and body_node.op_type == "Transpose" and data_input_shape is not None:
                     permutation = transpose_permutation(body_node, len(data_input_shape), resolve_reentry_attribute)
                     if permutation is not None:
@@ -4660,6 +4686,14 @@ def _build_onnx_weight_analysis_plan(
     graph_taint_nodes_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}
     graph_taint_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
+    def reserve_taint_constant_copy_work(count: int) -> bool:
+        nonlocal graph_taint_work_remaining
+        if count > graph_taint_work_remaining:
+            graph_taint_work_remaining = 0
+            return False
+        graph_taint_work_remaining -= count
+        return True
+
     def graph_taint_work_is_exhausted() -> bool:
         return graph_taint_work_remaining <= 0
 
@@ -4730,7 +4764,9 @@ def _build_onnx_weight_analysis_plan(
                 return result
             graph_taint_work_remaining -= work
             if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and body_node.op_type == "Constant":
-                constant = resolved_constant_node_tensor(body_node, resolve_reentry_attribute)
+                constant = resolved_constant_node_tensor(
+                    body_node, resolve_reentry_attribute, reserve_taint_constant_copy_work
+                )
                 if constant is not None:
                     for name in node_output_names(body_node):
                         graph_constants[name] = constant
@@ -5420,7 +5456,9 @@ def _build_onnx_weight_analysis_plan(
                 if not direct_potential_weight_input and not has_nested_graph:
                     continue
             if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and body_node.op_type == "Constant":
-                constant = resolved_constant_node_tensor(body_node, resolve_reentry_attribute)
+                constant = resolved_constant_node_tensor(
+                    body_node, resolve_reentry_attribute, reserve_taint_constant_copy_work
+                )
                 if constant is not None:
                     for name in node_output_names(body_node):
                         graph_constants[name] = constant
@@ -6177,6 +6215,15 @@ def _build_onnx_weight_analysis_plan(
     def flattened_shape_extent(dimensions: tuple[int, ...]) -> int:
         return _onnx_shape_extent_product(dimensions)
 
+    def flattened_output_shape(input_shape: tuple[int, ...], axis: int | None) -> tuple[int, ...] | None:
+        if axis is None:
+            return None
+        if axis < 0:
+            axis += len(input_shape)
+        if axis < 0 or axis > len(input_shape):
+            return None
+        return (flattened_shape_extent(input_shape[:axis]), flattened_shape_extent(input_shape[axis:]))
+
     def broadcast_rank_from_input_ranks(ranks: Iterable[int | None]) -> int | None:
         observed_ranks = list(ranks)
         known_ranks = [rank for rank in observed_ranks if rank is not None]
@@ -6525,10 +6572,8 @@ def _build_onnx_weight_analysis_plan(
         output_shape: tuple[int, ...]
         transform: _OnnxWeightTransform
         if node.op_type == "Flatten":
-            axis = transform_int_attribute("axis", 1)
-            if axis is not None and axis < 0:
-                axis += len(lineage.shape)
-            if axis is None or axis < 0 or axis > len(lineage.shape):
+            flattened_shape = flattened_output_shape(lineage.shape, transform_int_attribute("axis", 1))
+            if flattened_shape is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
                     shape=None,
@@ -6536,7 +6581,7 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "invalid_flatten_lineage",
                 )
-            output_shape = (flattened_shape_extent(lineage.shape[:axis]), flattened_shape_extent(lineage.shape[axis:]))
+            output_shape = flattened_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type in {"Squeeze", "Unsqueeze"}:
             axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolved_transform_attribute)
@@ -9185,7 +9230,9 @@ def _build_onnx_weight_analysis_plan(
                             exact_loop_replay_work_remaining -= copy_work
                             # Dense value reuses its TensorProto. Repeated/scalar
                             # forms are copied only after shared replay admission.
-                            return resolved_constant_node_tensor(constant_node, lambda _attribute: resolved)
+                            return resolved_constant_node_tensor(
+                                constant_node, lambda _attribute: resolved, lambda count: count == copy_work
+                            )
 
                         def output_data_type(
                             replay_node: Any,
@@ -9304,6 +9351,12 @@ def _build_onnx_weight_analysis_plan(
                                 and data_input_shape is not None
                             ):
                                 return data_input_shape
+                            if body_node.op_type == "Flatten" and data_input_shape is not None:
+                                flattened_shape = flattened_output_shape(
+                                    data_input_shape,
+                                    resolved_onnx_int_attribute(body_node, "axis", 1, resolve_attribute),
+                                )
+                                return inferred_shape(2, flattened_shape) if flattened_shape is not None else None
                             if body_node.op_type == "Transpose" and data_input_shape is not None:
                                 permutation = transpose_permutation(body_node, len(data_input_shape), resolve_attribute)
                                 return (
@@ -9512,6 +9565,12 @@ def _build_onnx_weight_analysis_plan(
                                     and data_input_shape is not None
                                 ):
                                     return data_input_shape
+                                if function_node.op_type == "Flatten" and data_input_shape is not None:
+                                    flattened_shape = flattened_output_shape(
+                                        data_input_shape,
+                                        resolved_onnx_int_attribute(function_node, "axis", 1, function_attribute),
+                                    )
+                                    return inferred_shape(2, flattened_shape) if flattened_shape is not None else None
                                 if function_node.op_type == "Transpose" and data_input_shape is not None:
                                     permutation = transpose_permutation(
                                         function_node, len(data_input_shape), function_attribute
@@ -13482,10 +13541,7 @@ def _build_onnx_weight_analysis_plan(
                     if 0 <= axis <= transform_input_rank:
                         transform_output_rank = 2
                         if transform_input_shape is not None:
-                            transform_output_shape = (
-                                flattened_shape_extent(transform_input_shape[:axis]),
-                                flattened_shape_extent(transform_input_shape[axis:]),
-                            )
+                            transform_output_shape = flattened_output_shape(transform_input_shape, axis)
                 elif node.op_type == "Expand" and len(input_names) == 2:
                     expand_input_shape = proven_value_shape(input_names[0])
                     target_shape = expand_target_shape(input_names[1])
