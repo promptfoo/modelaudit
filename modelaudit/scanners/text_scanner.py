@@ -1172,7 +1172,7 @@ class TextScanner(BaseScanner):
                     match.group()
                     if keyword.iskeyword(match[1].decode())
                     or match[1].lower() in {b"r", b"u", b"b", b"f", b"br", b"rb", b"fr", b"rf"}
-                    else match[1] + b"_" + match[2]
+                    else match[1] + b" " + match[2]
                 ),
                 source,
                 flags=re.IGNORECASE,

