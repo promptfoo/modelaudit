@@ -1893,6 +1893,13 @@ class _OnnxAttributeStringPreflight:
     lengths: list[int | None] | None = None
 
 
+@dataclass
+class _OnnxTrainingStatePreflight:
+    # Root graph uses scope -1; other scopes index TrainingInfo.algorithm.
+    # None means no complete provenance, whereas [] proves no mutable owners.
+    positions: list[tuple[int, int]] | None = None
+
+
 @dataclass(frozen=True)
 class _OnnxRawControlAdmission:
     """Private proof bound to a model loaded from the preflighted byte snapshot.
@@ -1900,7 +1907,9 @@ class _OnnxRawControlAdmission:
     Until analysis completes, callers must preserve graph/attribute membership,
     attribute strings, tensor membership, dtypes, dimensions, and raw bytes;
     loading external data invalidates this proof.
-    Renaming tensors and discarding unknown fields preserve these invariants.
+    Initializer names, training membership and binding keys must also remain
+    unchanged throughout analysis. Discarding unknown
+    fields preserves these invariants.
     This is an internal loader contract, not permission to certify arbitrary
     mutable ModelProto instances supplied by callers.
     """
@@ -1910,6 +1919,7 @@ class _OnnxRawControlAdmission:
     scalars_bounded: bool
     error_reason: str | None = None
     string_attribute_lengths: dict[int, tuple[Any, int]] = field(default_factory=dict)
+    mutable_initializer_owners: dict[int, Any] | None = None
 
 
 def _build_onnx_weight_analysis_plan(
@@ -1925,7 +1935,8 @@ def _build_onnx_weight_analysis_plan(
 ) -> _OnnxWeightAnalysisPlan:
     """Build a bounded plan; raw controls require exact-input loader provenance.
 
-    Private in-memory callers without provenance retain typed-control support.
+    Private in-memory callers without provenance retain typed-control support
+    except for potentially mutable training initializer values.
     Never manufacture provenance by serializing an untrusted ModelProto here.
     """
     plan = _OnnxWeightAnalysisPlan()
@@ -2034,6 +2045,37 @@ def _build_onnx_weight_analysis_plan(
         str(getattr(opset, "domain", "") or ""): int(opset.version) for opset in getattr(model, "opset_import", ())
     }
     training_infos = list(getattr(model, "training_info", ()))
+    mutable_initializer_owners = (
+        raw_control_admission.mutable_initializer_owners
+        if raw_control_admission is not None and raw_control_admission.model is model
+        else None
+    )
+    training_control_scopes: dict[int, Any] | None = {}
+    if mutable_initializer_owners is None:
+        # Missing wire provenance cannot make a training target immutable.
+        # Scope discovery reads container lengths, never protobuf binding keys.
+        training_scope_work = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        if len(training_infos) > training_scope_work:
+            training_control_scopes = None
+        else:
+            scopes: dict[int, Any] = {}
+            training_control_scopes = scopes
+            training_scope_work -= len(training_infos)
+            for training_info in training_infos:
+                if not len(training_info.initialization_binding) and not len(training_info.update_binding):
+                    continue
+                if training_scope_work < 2:
+                    training_control_scopes = None
+                    break
+                training_scope_work -= 2
+                scopes[id(graph)] = graph
+                scopes[id(training_info.algorithm)] = training_info.algorithm
+
+    def initializer_value_is_immutable(current_graph: Any, initializer: Any) -> bool:
+        if mutable_initializer_owners is not None:
+            return mutable_initializer_owners.get(id(initializer)) is not initializer
+        return training_control_scopes is not None and id(current_graph) not in training_control_scopes
+
     analysis_graph_roots: list[tuple[tuple[Any, ...], Any]] = [(("root_graph",), graph)]
     for training_index, training_info in enumerate(training_infos):
         for field_name in ("initialization", "algorithm"):
@@ -2335,7 +2377,9 @@ def _build_onnx_weight_analysis_plan(
             local_constants = {
                 str(initializer.name): initializer
                 for initializer in getattr(current_graph, "initializer", ())
-                if getattr(initializer, "name", "") and str(initializer.name) not in graph_input_names
+                if getattr(initializer, "name", "")
+                and str(initializer.name) not in graph_input_names
+                and initializer_value_is_immutable(current_graph, initializer)
             }
             cached_context = (current_graph, local_declared_names, local_constants)
             graph_constant_context_cache[id(current_graph)] = cached_context
@@ -3645,7 +3689,8 @@ def _build_onnx_weight_analysis_plan(
             and (len(inputs) == 1 or node.op_type in {"Clip", "Dropout"})
         )
 
-    graph_potential_weight_work_cache: dict[tuple[Any, ...], tuple[Any, dict[int, int], int]] = {}
+    graph_potential_weight_work_cache: dict[tuple[Any, ...], tuple[Any, dict[int, int] | None, int]] = {}
+    graph_potential_weight_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
     def subgraph_analysis_work_exceeds_limit(
         subgraph: Any,
@@ -3655,6 +3700,7 @@ def _build_onnx_weight_analysis_plan(
         opset_versions: dict[str, int] | None = None,
         attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
+        nonlocal graph_potential_weight_work_remaining
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return True
@@ -3703,6 +3749,15 @@ def _build_onnx_weight_analysis_plan(
                 )
                 cached_work = graph_potential_weight_work_cache.get(cache_key)
                 if cached_work is None or cached_work[0] is not subgraph:
+                    # Retain refusals as well as complete inventories. Charge the
+                    # owner before retention, then dispatch before enumeration.
+                    if graph_potential_weight_work_remaining < 1:
+                        return True
+                    graph_potential_weight_work_remaining -= 1
+                    graph_potential_weight_work_cache[cache_key] = (subgraph, None, 0)
+                    if len(graph_nodes) > graph_potential_weight_work_remaining:
+                        return True
+                    graph_potential_weight_work_remaining -= len(graph_nodes)
                     potential_inputs: dict[int, int] = {}
                     for node in graph_nodes:
                         function_key = (
@@ -3723,6 +3778,10 @@ def _build_onnx_weight_analysis_plan(
                             if subgraph_has_potential_weight_consumer(
                                 function, function_versions, attribute_bindings=function_attributes
                             ):
+                                input_count = len(getattr(node, "input", ()))
+                                if input_count > graph_potential_weight_work_remaining:
+                                    return True
+                                graph_potential_weight_work_remaining -= input_count
                                 potential_inputs[id(node)] = len(node_input_names(node))
                             continue
                         if not node_may_have_potential_weight_input(
@@ -3731,6 +3790,10 @@ def _build_onnx_weight_analysis_plan(
                             is_registered_standard_operator=is_registered_standard_operator,
                         ):
                             continue
+                        input_count = len(getattr(node, "input", ()))
+                        if input_count > graph_potential_weight_work_remaining:
+                            return True
+                        graph_potential_weight_work_remaining -= input_count
                         input_count = len(node_input_names(node))
                         if any(
                             _onnx_potential_weight_input(
@@ -3749,7 +3812,10 @@ def _build_onnx_weight_analysis_plan(
                         total_potential_input_edges,
                     )
                 else:
-                    _owner, potential_inputs, total_potential_input_edges = cached_work
+                    _owner, cached_inputs, total_potential_input_edges = cached_work
+                    if cached_inputs is None:
+                        return True
+                    potential_inputs = cached_inputs
                 live_potential_nodes = [node for node in live_nodes if id(node) in potential_inputs]
                 potential_weight_consumer_seen = len(potential_inputs) > len(live_potential_nodes)
                 potential_weight_consumer_input_edges = total_potential_input_edges - sum(
@@ -8131,10 +8197,15 @@ def _build_onnx_weight_analysis_plan(
                     )
                     value_lineages[name] = {lineage.initializer_index: lineage}
                 if name not in graph_input_names:
-                    constants[name] = initializer
+                    if initializer_value_is_immutable(current_graph, initializer):
+                        constants[name] = initializer
+                    else:
+                        constants.pop(name, None)
+                    # Mutable values cannot prove controls, but their stored
+                    # weight lineage and shape remain available for analysis.
+                    dynamic_values.discard(name)
                     if not preserve_bound_runtime_state:
                         set_known_value_shape(name, lineage.shape or (), proven=True)
-                    dynamic_values.discard(name)
                     clear_value_gap_state(name)
                 elif name not in constants:
                     dynamic_values.add(name)
@@ -9468,6 +9539,7 @@ def _build_onnx_weight_analysis_plan(
                             output_shapes_out: dict[str, tuple[int, ...]] | None = None,
                             input_data_type: int | None = None,
                             output_data_types_out: dict[str, int | None] | None = None,
+                            requested_output_indexes: tuple[int, ...] = (),
                         ) -> bool | None:
                             nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
                             if not reserve_exact_loop_replay_traversal(
@@ -9488,8 +9560,11 @@ def _build_onnx_weight_analysis_plan(
                                 if len(function_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
                                     return None
                                 combined_names = set(weight_dependency_names)
+                                if any(index >= len(function_outputs) for index in requested_output_indexes):
+                                    return None
                                 if merge_dependency_names(
-                                    combined_names, (_onnx_value_name(output) for output in function_outputs)
+                                    combined_names,
+                                    (_onnx_value_name(function_outputs[index]) for index in requested_output_indexes),
                                 ):
                                     return None
                                 weight_dependency_names = frozenset(combined_names)
@@ -9775,8 +9850,8 @@ def _build_onnx_weight_analysis_plan(
                                     )
                                     local_tainted_shapes[output_name] = output_shape
                             if output_shapes_out is not None:
-                                for function_output in getattr(function_graph, "output", ()):
-                                    output_name = _onnx_value_name(function_output)
+                                for output_index in requested_output_indexes:
+                                    output_name = _onnx_value_name(function_graph.output[output_index])
                                     known_output_shape = local_tainted_shapes.get(output_name)
                                     if known_output_shape is None:
                                         return None
@@ -10013,6 +10088,13 @@ def _build_onnx_weight_analysis_plan(
                                         )
                                 function_output_shapes: dict[str, tuple[int, ...]] = {}
                                 function_output_data_types: dict[str, int | None] = {}
+                                # Shape publication follows the selected result's
+                                # dependency cone, not every result of a live call.
+                                requested_function_output_indexes = tuple(
+                                    output_index
+                                    for output_index, output_name in enumerate(getattr(body_node, "output", ()))
+                                    if output_name and output_name in output_dependency_names
+                                )
                                 for input_index, input_name in enumerate(function_actuals):
                                     if input_name not in tainted_shapes or input_index >= len(
                                         getattr(function, "input", ())
@@ -10045,15 +10127,15 @@ def _build_onnx_weight_analysis_plan(
                                         function_output_shapes if node_is_live_for_output else None,
                                         tainted_data_types.get(input_name),
                                         function_output_data_types if node_is_live_for_output else None,
+                                        requested_function_output_indexes,
                                     )
                                     if function_consumes_weight_rank is None:
                                         return None
                                     if function_consumes_weight_rank:
                                         return True, None
                                 if node_is_live_for_output:
-                                    for output_index, output_name in enumerate(getattr(body_node, "output", ())):
-                                        if not output_name:
-                                            continue
+                                    for output_index in requested_function_output_indexes:
+                                        output_name = body_node.output[output_index]
                                         if output_index >= len(getattr(function, "output", ())):
                                             return None
                                         function_output_name = _onnx_value_name(function.output[output_index])
@@ -10421,6 +10503,13 @@ def _build_onnx_weight_analysis_plan(
                             )
                         work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
                         for body_node in body_nodes:
+                            if not has_multiple_loop_states and not reserve_cross_state_work(
+                                1
+                                + len(getattr(body_node, "input", ()))
+                                + len(getattr(body_node, "output", ()))
+                                + len(getattr(body_node, "attribute", ()))
+                            ):
+                                return None
                             body_inputs = node_input_names(body_node)
                             body_outputs = node_output_names(body_node)
                             nested_attribute_references = nested_attribute_graph_references(
@@ -10436,9 +10525,10 @@ def _build_onnx_weight_analysis_plan(
                                 return None
                             if not body_outputs or not any(input_name in tainted_names for input_name in body_inputs):
                                 continue
-                            work_remaining -= max(len(body_inputs), 1)
-                            if work_remaining < 0:
-                                return None
+                            if has_multiple_loop_states:
+                                work_remaining -= max(len(body_inputs), 1)
+                                if work_remaining < 0:
+                                    return None
                             function_key = (
                                 str(getattr(body_node, "domain", "")),
                                 str(getattr(body_node, "op_type", "")),
@@ -16034,11 +16124,86 @@ def _bind_onnx_attribute_string_lengths(
     return owners
 
 
+def _onnx_training_mutable_initializer_positions(
+    structure: _OnnxLiteModel, state: _OnnxStructureParseState
+) -> list[tuple[int, int]]:
+    """Resolve already bounded, merged binding keys without native key getters."""
+    import onnx
+
+    training_fields = onnx.TrainingInfoProto.DESCRIPTOR.fields_by_number
+    for number in (3, 4):
+        binding_field = training_fields[number]
+        if (
+            not _onnx_proto_field_is_repeated(binding_field)
+            or binding_field.message_type is None
+            or binding_field.message_type.full_name != "onnx.StringStringEntryProto"
+        ):
+            raise ValueError("Unsupported ONNX training binding schema")
+        key_field = binding_field.message_type.fields_by_number[1]
+        if key_field.type != 9 or _onnx_proto_field_is_repeated(key_field):
+            raise ValueError("Unsupported ONNX training binding key schema")
+
+    def initializer_positions(graph: _OnnxLiteGraph) -> dict[str, int]:
+        positions: dict[str, int] = {}
+        for position, initializer in enumerate(graph.initializer):
+            state.check_interrupted()
+            state.record_retained_object(2)
+            state.record_retained_sequence_entry()
+            positions[initializer.name] = position
+        return positions
+
+    main_positions: dict[str, int] | None = None
+    positions: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for training_index, info in enumerate(structure.training_info):
+        state.check_interrupted()
+        state.record_retained_sequence_entry()
+        if not info.initialization_binding and not info.update_binding:
+            continue
+        if main_positions is None:
+            main_positions = initializer_positions(structure.graph)
+        local_positions = initializer_positions(info.algorithm)
+        for binding in chain(info.initialization_binding, info.update_binding):
+            state.check_interrupted()
+            state.record_retained_sequence_entry()
+            position = local_positions.get(binding.key)
+            source_scope = training_index
+            if position is None:
+                position = main_positions.get(binding.key)
+                source_scope = -1
+            if position is None or (source_scope, position) in seen:
+                continue
+            # Account for this index, its duplicate guard, and the future
+            # retained native owner dictionary before publishing metadata.
+            state.record_retained_object(4)
+            state.record_retained_sequence_entry()
+            state.record_retained_sequence_entry()
+            key = (source_scope, position)
+            seen.add(key)
+            positions.append(key)
+    return positions
+
+
+def _bind_onnx_mutable_initializer_owners(model: Any, preflight: _OnnxTrainingStatePreflight) -> dict[int, Any] | None:
+    if preflight.positions is None:
+        return None
+    owners: dict[int, Any] = {}
+    try:
+        for scope, position in preflight.positions:
+            graph = model.graph if scope == -1 else model.training_info[scope].algorithm
+            initializer = graph.initializer[position]
+            owners[id(initializer)] = initializer
+    except (IndexError, AttributeError, TypeError):
+        return None
+    return owners
+
+
 def _preflight_onnx_raw_controls(
     data: bytes,
     *,
     interrupt_check: Callable[[], None] | None = None,
     attribute_strings: _OnnxAttributeStringPreflight | None = None,
+    training_state: _OnnxTrainingStatePreflight | None = None,
 ) -> tuple[bool, bool, str | None]:
     """Certify raw-control lengths without accessing protobuf payload fields.
 
@@ -16048,6 +16213,8 @@ def _preflight_onnx_raw_controls(
     """
     if attribute_strings is not None:
         attribute_strings.lengths = None
+    if training_state is not None:
+        training_state.positions = None
     if type(data) is not bytes:
         return False, False, "raw_control_preflight_failed"
     if not _onnx_raw_control_schema_supported():
@@ -16083,6 +16250,10 @@ def _preflight_onnx_raw_controls(
                 and raw_length > 8
             ):
                 scalars_bounded = False
+        training_positions = (
+            _onnx_training_mutable_initializer_positions(structure, state) if training_state is not None else None
+        )
+        lengths: list[int | None] | None = None
         if attribute_strings is not None:
             import onnx
 
@@ -16091,7 +16262,7 @@ def _preflight_onnx_raw_controls(
                 # The descriptor reachability check above covers every current
                 # attribute-bearing edge. Merge before this canonical traversal:
                 # protobuf wire order is not the loaded repeated-field order.
-                lengths: list[int | None] = []
+                lengths = []
                 for attribute in _iter_onnx_attribute_owners(structure, state.check_interrupted):
                     state.record_retained_sequence_entry()
                     if attribute.string_payload_length is not None:
@@ -16100,7 +16271,12 @@ def _preflight_onnx_raw_controls(
                         state.record_retained_object(3)
                         state.record_retained_sequence_entry()
                     lengths.append(attribute.string_payload_length)
-                attribute_strings.lengths = lengths
+        # Publish both complete inventories only after every parse/retention
+        # check succeeds; a failed later collection must expose no prefix.
+        if attribute_strings is not None:
+            attribute_strings.lengths = lengths
+        if training_state is not None:
+            training_state.positions = training_positions
         return vectors_bounded, scalars_bounded, None
     except Exception:
         return False, False, "raw_control_preflight_failed"
@@ -16116,8 +16292,9 @@ def _load_onnx_model_with_control_admission(
     if type(data) is not bytes:
         raise TypeError("ONNX control admission requires an immutable bytes snapshot")
     attribute_strings = _OnnxAttributeStringPreflight()
+    training_state = _OnnxTrainingStatePreflight()
     vectors_bounded, scalars_bounded, error_reason = _preflight_onnx_raw_controls(
-        data, interrupt_check=interrupt_check, attribute_strings=attribute_strings
+        data, interrupt_check=interrupt_check, attribute_strings=attribute_strings, training_state=training_state
     )
     if interrupt_check is not None:
         interrupt_check()
@@ -16128,6 +16305,7 @@ def _load_onnx_model_with_control_admission(
         scalars_bounded,
         error_reason,
         _bind_onnx_attribute_string_lengths(model, attribute_strings, interrupt_check),
+        _bind_onnx_mutable_initializer_owners(model, training_state),
     )
 
 

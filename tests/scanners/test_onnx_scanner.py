@@ -56,8 +56,8 @@ def _fixture_raw_control_admission(model: Any, *, fixture_model: Any | None = No
     boundary and must never serialize an untrusted ModelProto for admission.
 
     Instrumentation proxies must explicitly name their underlying fixture and
-    preserve its graph/attribute membership, strings, tensor payloads, dimensions,
-    and dtypes. The admission binds to
+    preserve its graph/attribute/training membership, binding keys, initializer
+    names, strings, tensor payloads, dimensions, and dtypes. The admission binds to
     the original analysis model so owner-identity and access-count assertions
     continue to measure the original objects. It is recomputed on every call;
     callers must not mutate control storage or metadata after this step.
@@ -67,8 +67,9 @@ def _fixture_raw_control_admission(model: Any, *, fixture_model: Any | None = No
         raise TypeError("Admission requires an explicit test-created ModelProto fixture")
     data = source.SerializeToString()
     attribute_strings = onnx_scanner_module._OnnxAttributeStringPreflight()
+    training_state = onnx_scanner_module._OnnxTrainingStatePreflight()
     vectors_bounded, scalars_bounded, error_reason = onnx_scanner_module._preflight_onnx_raw_controls(
-        data, attribute_strings=attribute_strings
+        data, attribute_strings=attribute_strings, training_state=training_state
     )
     return onnx_scanner_module._OnnxRawControlAdmission(
         model=model,
@@ -76,6 +77,7 @@ def _fixture_raw_control_admission(model: Any, *, fixture_model: Any | None = No
         scalars_bounded=scalars_bounded,
         error_reason=error_reason,
         string_attribute_lengths=onnx_scanner_module._bind_onnx_attribute_string_lengths(model, attribute_strings),
+        mutable_initializer_owners=onnx_scanner_module._bind_onnx_mutable_initializer_owners(model, training_state),
     )
 
 
@@ -45656,3 +45658,1492 @@ class TestOnnxPaddingStringAdmission:
             assert all(retained for _owner, _name, result, retained, _size in observed.parses if result is not None)
             outcomes = [result for name, _node, result in observed.proofs if name == "pooling_has_nonempty_samples"]
             assert outcomes == [True, True, True, True, False, True, False]
+
+
+class _OnnxResourceAdmissionObserver:
+    @staticmethod
+    def observe(run: Any) -> tuple[Any, dict[str, Any]]:
+        source_path = Path(onnx_scanner_module.__file__)
+        definition = next(
+            node
+            for node in ast.walk(ast.parse(source_path.read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "subgraph_analysis_work_exceeds_limit"
+        )
+        dispatch_lines = {
+            node.lineno
+            for node in ast.walk(definition)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "function_key" for target in node.targets)
+        }
+        assert len(dispatch_lines) == 1
+        observed: dict[str, Any] = {
+            "helper": None,
+            "inventory": [],
+            "fallback": [],
+            "dependency_limits": [],
+            "closure_limits": [],
+        }
+        inventory_frames: dict[int, dict[str, Any]] = {}
+        fallback_frames: dict[int, dict[str, Any]] = {}
+
+        def inventory_entry(frame: Any) -> dict[str, Any]:
+            return inventory_frames.setdefault(
+                id(frame),
+                {
+                    "graph": frame.f_locals["subgraph"],
+                    "dispatches": 0,
+                    "dispatched_owners": set(),
+                    "input_reads": 0,
+                },
+            )
+
+        def trace(frame: Any, event: str, _arg: Any) -> Any:
+            if (
+                frame.f_code.co_filename != str(source_path)
+                or frame.f_code.co_name != "subgraph_analysis_work_exceeds_limit"
+            ):
+                return None
+            if event == "line" and frame.f_lineno in dispatch_lines:
+                # Observe real inventory dispatch, including the cached tuple.
+                # A multiline assignment may emit this line more than once;
+                # every fixture node is a distinct retained protobuf owner.
+                entry = inventory_entry(frame)
+                node_id = id(frame.f_locals["node"])
+                if node_id not in entry["dispatched_owners"]:
+                    entry["dispatched_owners"].add(node_id)
+                    entry["dispatches"] += 1
+            return trace
+
+        def profile(frame: Any, event: str, result: Any) -> None:
+            if frame.f_code.co_filename != str(source_path):
+                return
+            name = frame.f_code.co_name
+            local = frame.f_locals
+            caller = frame.f_back
+            caller_name = caller.f_code.co_name if caller is not None else ""
+            if name == "subgraph_analysis_work_exceeds_limit":
+                if event == "call":
+                    inventory_entry(frame)
+                elif event == "return":
+                    entry = inventory_frames.pop(id(frame))
+                    cache = local["graph_potential_weight_work_cache"]
+                    key = local.get("cache_key")
+                    cached = cache.get(key)
+                    entry.update(
+                        result=result,
+                        key=key,
+                        remaining=local["graph_potential_weight_work_remaining"],
+                        cache_size=len(cache),
+                        cache_owner_matches=cached is not None and cached[0] is entry["graph"],
+                        inventory_kind=(
+                            "missing" if cached is None else "refused" if cached[1] is None else "complete"
+                        ),
+                        potential_count=None if cached is None or cached[1] is None else len(cached[1]),
+                        potential_edges=None if cached is None else cached[2],
+                    )
+                    observed["inventory"].append(entry)
+            elif (
+                name == "node_input_names"
+                and event == "call"
+                and caller_name == ("subgraph_analysis_work_exceeds_limit")
+            ):
+                inventory_entry(caller)["input_reads"] += 1
+            elif name == "repeated_state_input_reaches_output_bounded":
+                if event == "call":
+                    fallback_frames[id(frame)] = {
+                        "graph": local["subgraph"],
+                        "input": local["graph_input_name"],
+                        "multiple_loop_states": local["has_multiple_loop_states"],
+                        "reads": {
+                            "node_input_names": 0,
+                            "node_output_names": 0,
+                            "nested_attribute_graph_references": 0,
+                        },
+                        "reservations": [],
+                        "refused": False,
+                        "reads_after_refusal": 0,
+                    }
+                elif event == "return":
+                    entry = fallback_frames.pop(id(frame))
+                    dependencies = local.get("output_dependencies", frozenset())
+                    entry.update(
+                        result=result,
+                        dependency_limit=any("dependency_collection_limit" in value for value in dependencies),
+                        selected_nodes=len(local.get("body_nodes", ())),
+                    )
+                    observed["fallback"].append(entry)
+            elif (
+                caller_name == "repeated_state_input_reaches_output_bounded"
+                and caller is not None
+                and name
+                in {
+                    "reserve_cross_state_work",
+                    "node_input_names",
+                    "node_output_names",
+                    "nested_attribute_graph_references",
+                }
+            ):
+                entry = fallback_frames[id(caller)]
+                if name == "reserve_cross_state_work" and event == "return":
+                    entry["reservations"].append((local["work"], result, local["cross_state_work_remaining"]))
+                    entry["refused"] |= result is False
+                elif event == "call" and name in entry["reads"]:
+                    entry["reads"][name] += 1
+                    entry["reads_after_refusal"] += int(entry["refused"])
+            elif event == "return" and name in {"graph_output_dependency_names", "graph_dependency_closure_names"}:
+                if isinstance(result, frozenset) and any("dependency_collection_limit" in value for value in result):
+                    entry = {"graph": local["subgraph"], "outputs": len(local["subgraph"].output)}
+                    if name == "graph_dependency_closure_names":
+                        entry["remaining"] = local["dependency_closure_work_remaining"]
+                        observed["closure_limits"].append(entry)
+                    else:
+                        observed["dependency_limits"].append(entry)
+            elif event == "return" and name == "_build_onnx_weight_analysis_plan":
+                observed["helper"] = local["subgraph_analysis_work_exceeds_limit"]
+
+        previous_trace, previous_profile = sys.gettrace(), sys.getprofile()
+        try:
+            sys.settrace(trace)
+            sys.setprofile(profile)
+            result = run(observed)
+        finally:
+            sys.setprofile(previous_profile)
+            sys.settrace(previous_trace)
+        return result, observed
+
+    @staticmethod
+    def assert_public_result(result: Any, *, incomplete: bool, standalone: bool) -> None:
+        assert result.success is not incomplete
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        coverage = TestWeightDistributionCoverage._coverage_checks(result, standalone=standalone)
+        assert bool(coverage) is incomplete
+        assert all(check.status == CheckStatus.FAILED and check.message for check in coverage)
+
+
+class TestOnnxConsumerInventoryAdmission:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+
+    @classmethod
+    def _loop_model(
+        cls,
+        *,
+        dead_nodes: int = 1,
+        consumer: bool = False,
+        rejected_function: bool = False,
+        lineage_gap: bool = False,
+        functions: tuple[Any, ...] = (),
+        state_count: int = 4,
+    ) -> Any:
+        value, tensor = cls._value, cls._tensor
+        states = [f"state{i}" for i in range(state_count)]
+        body_nodes = [helper.make_node("Identity", [states[0]], [f"dead{i}"]) for i in range(dead_nodes)]
+        local_functions = list(functions)
+        if rejected_function:
+            local_functions.append(
+                helper.make_function(
+                    "local",
+                    "Rejected",
+                    ["x"],
+                    ["y"],
+                    [helper.make_node("Identity", ["x"], ["y"])],
+                    [helper.make_opsetid("", 13)],
+                )
+            )
+            body_nodes.append(helper.make_node("Rejected", [states[0]], ["late"], domain="local"))
+        if consumer:
+            body_nodes.append(helper.make_node("MatMul", ["X", states[-1]], ["body_weight"]))
+        body = helper.make_graph(
+            body_nodes,
+            "inventory_public_body",
+            [value("iteration", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [2, 2]) for name in states],
+            [value("condition", [], TensorProto.BOOL)] + [value(name, [2, 2]) for name in states],
+        )
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        initializers = [
+            tensor("prior", prior),
+            helper.make_tensor("count", TensorProto.INT64, [], [2]),
+            helper.make_tensor("start", TensorProto.BOOL, [], [True]),
+        ]
+        nodes = [helper.make_node("MatMul", ["A", "prior"], ["known"])]
+        if lineage_gap:
+            source_names = [f"source{i}" for i in range(40)]
+            initializers.extend(tensor(name, np.ones((2, 2), np.float32)) for name in source_names)
+            nodes.append(helper.make_node("Sum", source_names, ["initial"]))
+        else:
+            initializers.append(tensor("initial", np.ones((2, 2), np.float32)))
+        nodes.append(
+            helper.make_node(
+                "Loop",
+                ["count", "start", *(["initial"] * state_count)],
+                [f"out{i}" for i in range(state_count)],
+                body=body,
+            )
+        )
+        outputs = [value("known", [1, 64])] + [value(f"out{i}", [2, 2]) for i in range(state_count)]
+        if lineage_gap:
+            nodes.append(helper.make_node("MatMul", ["X", f"out{state_count - 1}"], ["Y"]))
+            outputs.append(value("Y", [1, 2]))
+        graph = helper.make_graph(
+            nodes,
+            "inventory_public",
+            [value("A", [1, 64]), value("X", [1, 2])],
+            outputs,
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=local_functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        return model
+
+    @classmethod
+    def _probe_graph(cls, name: str, count: int, *, input_count: int = 1) -> Any:
+        return helper.make_graph(
+            [helper.make_node("Identity", ["x"], [f"dead{i}"]) for i in range(count)],
+            name,
+            [cls._value("x", [2, 2])] + [cls._value(f"unused{i}", [2, 2]) for i in range(input_count - 1)],
+            [cls._value("x", [2, 2])],
+        )
+
+    @pytest.mark.parametrize("mode", ["node_inventory", "rejected_function", "small_consumer"])
+    def test_public_inventory_refusal_bounds_dispatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        limit = 16 if mode == "node_inventory" else 64
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", limit)
+        if mode == "rejected_function":
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT", 1)
+        model = self._loop_model(
+            dead_nodes=17 if mode == "node_inventory" else 4 if mode == "rejected_function" else 1,
+            consumer=mode != "rejected_function",
+            rejected_function=mode == "rejected_function",
+            lineage_gap=mode != "small_consumer",
+        )
+        path = _save_onnx_model(model, tmp_path / f"inventory-{mode}.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result, observed = _OnnxResourceAdmissionObserver.observe(
+                lambda _seen, scanner_type=scanner_type: scanner_type().scan(str(path))
+            )
+            rows = [row for row in observed["inventory"] if row["graph"].name == "inventory_public_body"]
+            assert len(rows) >= 4
+            assert len({row["key"] for row in rows}) == 1
+            assert all(row["cache_owner_matches"] for row in rows)
+            assert all(0 <= row["remaining"] <= limit and row["cache_size"] <= limit for row in rows)
+            assert all(row["dispatches"] == row["input_reads"] == 0 for row in rows[1:])
+            if mode == "node_inventory":
+                assert rows[0]["dispatches"] == rows[0]["input_reads"] == 0
+                assert rows[0]["remaining"] == limit - 1
+            elif mode == "rejected_function":
+                assert rows[0]["dispatches"] == 5
+                assert rows[0]["input_reads"] == 0
+                assert rows[0]["remaining"] == limit - 6
+            else:
+                assert rows[0]["dispatches"] == 2
+                assert rows[0]["input_reads"] == 1
+                assert rows[0]["potential_count"] == 1
+                assert rows[0]["remaining"] == limit - 5
+            expected_kind = "complete" if mode == "small_consumer" else "refused"
+            assert all(row["inventory_kind"] == expected_kind for row in rows)
+            if mode != "small_consumer":
+                # The missing source lineages survive direct-formal recurrence
+                # and feed the final MatMul; inventory refusal alone is not a gap.
+                gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+                assert gaps["lineages_per_value_limit"] > 0
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=mode != "small_consumer", standalone=scanner_type is WeightDistributionScanner
+            )
+        if mode != "small_consumer":
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("context", ["opset", "binding"])
+    def test_inventory_context_reuse_and_refusal_retention(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context: str
+    ) -> None:
+        limit = 12
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", limit)
+        path = _save_onnx_model(self._loop_model(state_count=1), tmp_path / f"inventory-context-{context}.onnx")
+        large = self._probe_graph("inventory_large_probe", limit + 1)
+        # Empty dependency and consumer inventories must not charge a blanket
+        # node-count multiplied by every unrelated formal input.
+        small = self._probe_graph("inventory_small_probe", 2, input_count=limit + 1)
+        bindings = [{"parameter": helper.make_attribute("parameter", 1)} for _ in range(9)]
+        environments = [{"": 13, "unused_context": index + 1} for index in range(9)]
+
+        def run(observed: dict[str, Any]) -> Any:
+            result = OnnxScanner().scan(str(path))
+            # Public traversal establishes the real closure and an admitted
+            # inventory before these explicitly owned, payload-free probes.
+            assert any(row["dispatches"] for row in observed["inventory"])
+            analyze = observed["helper"]
+            assert callable(analyze)
+
+            def probe(graph: Any, index: int, *, equivalent_mapping: bool = False) -> dict[str, Any]:
+                versions = environments[index] if context == "opset" else {"": 13}
+                attributes = bindings[index] if context == "binding" else {}
+                if equivalent_mapping:
+                    versions, attributes = dict(versions), dict(attributes)
+                answer = analyze(
+                    graph,
+                    frozenset(),
+                    include_potential_weight_consumers=True,
+                    opset_versions=versions,
+                    attribute_bindings=attributes,
+                )
+                row: dict[str, Any] = observed["inventory"][-1]
+                assert row["graph"] is graph and row["result"] is answer
+                return row
+
+            first = probe(large, 0)
+            repeated = probe(large, 0, equivalent_mapping=True)
+            assert first["result"] is repeated["result"] is True
+            assert first["inventory_kind"] == repeated["inventory_kind"] == "refused"
+            assert first["dispatches"] == repeated["dispatches"] == 0
+            assert first["key"] == repeated["key"]
+            assert first["remaining"] == repeated["remaining"]
+            admitted = probe(small, 0)
+            assert admitted["result"] is False and admitted["dispatches"] == 2
+            assert admitted["inventory_kind"] == "complete" and admitted["potential_count"] == 0
+            assert admitted["remaining"] == repeated["remaining"] - 3
+            reused = probe(small, 0, equivalent_mapping=True)
+            assert reused["result"] is False and reused["dispatches"] == 0
+            assert reused["key"] == admitted["key"] and reused["remaining"] == admitted["remaining"]
+            later = [probe(large, index) for index in range(1, 9)]
+            assert all(row["result"] is True and row["dispatches"] == row["input_reads"] == 0 for row in later)
+            assert len({first["key"], *(row["key"] for row in later)}) == 9
+            assert any(row["inventory_kind"] == "refused" for row in later)
+            assert any(row["inventory_kind"] == "missing" for row in later)
+            exhausted = [row for row in later if row["remaining"] == 0]
+            assert len(exhausted) >= 2
+            assert len({row["cache_size"] for row in exhausted}) == 1
+            retained = probe(large, 0)
+            assert retained["inventory_kind"] == "refused" and retained["dispatches"] == 0
+            assert retained["remaining"] == 0
+            assert all(row["cache_size"] <= limit and row["remaining"] >= 0 for row in observed["inventory"])
+            return result
+
+        result, _observed = _OnnxResourceAdmissionObserver.observe(run)
+        # These outcomes belong to the public scan preceding the direct probes.
+        _OnnxResourceAdmissionObserver.assert_public_result(result, incomplete=False, standalone=False)
+
+    def test_inventory_input_edges_are_admitted_before_name_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        limit = 12
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", limit)
+        width = limit + 1
+        function = helper.make_function(
+            "local",
+            "WideConsumer",
+            [f"x{i}" for i in range(width)],
+            ["y"],
+            [helper.make_node("MatMul", ["x0", "x1"], ["y"])],
+            [helper.make_opsetid("", 13)],
+        )
+        path = _save_onnx_model(
+            self._loop_model(functions=(function,), state_count=1), tmp_path / "inventory-input-edges.onnx"
+        )
+        wide = helper.make_graph(
+            [helper.make_node("WideConsumer", ["x"] * width, ["y"], domain="local")],
+            "inventory_wide_probe",
+            [self._value("x", [2, 2])],
+            [self._value("y", [2, 2])],
+        )
+        consumer = helper.make_graph(
+            [helper.make_node("MatMul", ["x", "x"], ["y"])],
+            "inventory_consumer_probe",
+            [self._value("x", [2, 2])],
+            [self._value("y", [2, 2])],
+        )
+        empty = self._probe_graph("inventory_empty_probe", 0)
+
+        def run(observed: dict[str, Any]) -> Any:
+            result = OnnxScanner().scan(str(path))
+            assert any(row["dispatches"] for row in observed["inventory"])
+            analyze = observed["helper"]
+            assert callable(analyze)
+            answers = [
+                analyze(
+                    graph,
+                    frozenset(),
+                    include_potential_weight_consumers=True,
+                    opset_versions={"": 13, "local": 1},
+                )
+                for graph in (wide, wide, consumer, empty)
+            ]
+            assert answers == [True, True, False, False]
+            rows = observed["inventory"][-4:]
+            assert [row["dispatches"] for row in rows] == [1, 0, 1, 0]
+            assert [row["input_reads"] for row in rows] == [0, 0, 1, 0]
+            assert rows[0]["inventory_kind"] == rows[1]["inventory_kind"] == "refused"
+            assert rows[0]["remaining"] == rows[1]["remaining"]
+            assert rows[2]["inventory_kind"] == rows[3]["inventory_kind"] == "complete"
+            assert rows[2]["remaining"] == rows[1]["remaining"] - 4
+            assert rows[3]["remaining"] == rows[2]["remaining"] - 1
+            assert rows[2]["potential_count"] == 1 and rows[2]["potential_edges"] == 2
+            assert rows[3]["potential_count"] == rows[3]["potential_edges"] == 0
+            return result
+
+        result, _observed = _OnnxResourceAdmissionObserver.observe(run)
+        _OnnxResourceAdmissionObserver.assert_public_result(result, incomplete=False, standalone=False)
+
+
+class TestOnnxScanFallbackAdmission:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+
+    @classmethod
+    def _model(cls, *, incomplete: bool, discarded: bool = False) -> Any:
+        value, tensor = cls._value, cls._tensor
+        width = 16 if incomplete else 2
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        initializers = [tensor("prior", prior)]
+        nodes = [helper.make_node("MatMul", ["A", "prior"], ["known"])]
+        if incomplete:
+            source_names = [f"source{i}" for i in range(40)]
+            initializers.extend(tensor(name, np.ones((2, 2), np.float32)) for name in source_names)
+            nodes.append(helper.make_node("Sum", source_names, ["initial"]))
+        else:
+            initializers.append(tensor("initial", np.ones((2, 2), np.float32)))
+        body_nodes = [
+            helper.make_node("Identity", ["element"], [f"unrelated{i}"]) for i in range(32 if incomplete else 2)
+        ]
+        for index in range(width):
+            body_nodes.extend(
+                [
+                    helper.make_node("Identity", ["element" if discarded else f"state{index}"], [f"middle{index}"]),
+                    helper.make_node("Identity", [f"middle{index}"], [f"next{index}"]),
+                ]
+            )
+        if incomplete:
+            body_nodes.append(helper.make_node("MatMul", ["X", f"state{width - 1}"], ["body_weight"]))
+        body_nodes.append(helper.make_node("Identity", ["element"], ["scan_element"]))
+        body = helper.make_graph(
+            body_nodes,
+            "scan_fallback_admission_body",
+            [value(f"state{i}", [2, 2]) for i in range(width)] + [value("element", [2, 2])],
+            [value(f"next{i}", [2, 2]) for i in range(width)] + [value("scan_element", [2, 2])],
+        )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    [*(["initial"] * width), "sequence"],
+                    [*[f"out{i}" for i in range(width)], "sequence_out"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", f"out{width - 1}"], ["Y"]),
+            ]
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "scan_fallback_admission",
+                [value("A", [1, 64]), value("X", [1, 2]), value("sequence", [2, 2, 2])],
+                [value("known", [1, 64]), value("Y", [1, 2])],
+                initializer=initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        return model
+
+    @pytest.mark.parametrize("trigger", ["output_count", "dependency_work"])
+    def test_repeated_state_fallback_uses_shared_admission(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str
+    ) -> None:
+        limit = 64
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", limit)
+        if trigger == "output_count":
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS", 16)
+        model = self._model(incomplete=True)
+        path = _save_onnx_model(model, tmp_path / f"scan-fallback-{trigger}.onnx")
+        target_name = "scan_fallback_admission_body"
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result, observed = _OnnxResourceAdmissionObserver.observe(
+                lambda _seen, scanner_type=scanner_type: scanner_type().scan(str(path))
+            )
+            rows = [row for row in observed["fallback"] if row["graph"].name == target_name]
+            assert len({row["input"] for row in rows}) == 16
+            assert all(not row["multiple_loop_states"] for row in rows)
+            broad = [row for row in rows if row["dependency_limit"]]
+            assert broad and all(row["selected_nodes"] == len(row["graph"].node) for row in broad)
+            reservations = [reservation for row in rows for reservation in row["reservations"]]
+            admitted = [work for work, accepted, _remaining in reservations if accepted]
+            assert admitted and sum(admitted) <= limit
+            assert any(not accepted for _work, accepted, _remaining in reservations)
+            remaining = [remaining for _work, _accepted, remaining in reservations]
+            assert all(0 <= value <= limit for value in remaining)
+            assert remaining == sorted(remaining, reverse=True)
+            assert 0 < sum(row["reads"]["node_input_names"] for row in rows) <= limit
+            assert all(row["reads_after_refusal"] == 0 for row in rows)
+            refused = [row for row in rows if row["refused"]]
+            assert refused and all(row["result"] is None for row in refused)
+            no_admission = [
+                row for row in refused if not any(accepted for _work, accepted, _remaining in row["reservations"])
+            ]
+            assert no_admission and all(not any(row["reads"].values()) for row in no_admission)
+            dependency_limits = [row for row in observed["dependency_limits"] if row["graph"].name == target_name]
+            assert dependency_limits
+            if trigger == "output_count":
+                assert all(row["outputs"] > 16 for row in dependency_limits)
+            else:
+                assert all(
+                    row["outputs"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS
+                    for row in dependency_limits
+                )
+                exhausted = [row for row in observed["closure_limits"] if row["graph"].name == target_name]
+                assert exhausted and all(row["remaining"] == 0 for row in exhausted)
+            # The initial forty-source Sum has live recurrence and both body
+            # and final-state weight consumers. None must not erase its gap.
+            gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            assert gaps["lineages_per_value_limit"] > 0
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=True, standalone=scanner_type is WeightDistributionScanner
+            )
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("discarded", [False, True], ids=["preserved", "discarded"])
+    def test_admitted_scan_state_reachability(self, tmp_path: Path, discarded: bool) -> None:
+        path = _save_onnx_model(self._model(incomplete=False, discarded=discarded), tmp_path / "scan-small.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result, observed = _OnnxResourceAdmissionObserver.observe(
+                lambda _seen, scanner_type=scanner_type: scanner_type().scan(str(path))
+            )
+            rows = [row for row in observed["fallback"] if row["graph"].name == "scan_fallback_admission_body"]
+            assert len({row["input"] for row in rows}) == 2
+            assert all(row["result"] is (not discarded) for row in rows)
+            assert all(not row["refused"] and row["reads_after_refusal"] == 0 for row in rows)
+            assert all(
+                row["reservations"] and all(accepted for _work, accepted, _remaining in row["reservations"])
+                for row in rows
+            )
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=False, standalone=scanner_type is WeightDistributionScanner
+            )
+
+
+class TestOnnxFiniteReplaySelectedFunctionResults:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+
+    @classmethod
+    def _model(cls, trip_count: int, dead_kind: str, live_index: int, mode: str) -> tuple[Any, Any]:
+        value, tensor = cls._value, cls._tensor
+        required_control = mode == "required_independent_control"
+        function_nodes = [
+            helper.make_node("Identity", ["S"], ["N"])
+            if required_control
+            else helper.make_node("Unsqueeze", ["S", "axes"], ["N"])
+        ]
+        independent_name = "axes" if dead_kind == "formal" else "D"
+        if dead_kind == "literal":
+            function_nodes.append(
+                helper.make_node("Constant", [], ["D"], value=tensor("independent_axes", np.array([0], np.int64)))
+            )
+        elif dead_kind == "computed":
+            function_nodes.append(helper.make_node("Identity", ["axes"], ["D"]))
+        function_inputs = ["S", "axes"]
+        actual_inputs = ["state", "axes"]
+        if mode == "internal_consumer":
+            function_inputs.append("X")
+            actual_inputs.append("activation")
+            # An unused consumer result does not make its slope irrelevant.
+            function_nodes.append(helper.make_node("PRelu", ["X", "N"], ["internal_y"]))
+        function_outputs = [independent_name]
+        function_outputs.insert(live_index, "N")
+        call_outputs = ["independent_result"]
+        call_outputs.insert(live_index, "updated_state" if required_control else "next_state")
+        function = helper.make_function(
+            "local",
+            "SelectedResultUpdate",
+            function_inputs,
+            function_outputs,
+            function_nodes,
+            [helper.make_opsetid("", 13)],
+        )
+        body_nodes = [
+            helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
+            helper.make_node("SelectedResultUpdate", actual_inputs, call_outputs, domain="local"),
+        ]
+        if required_control:
+            body_nodes.append(helper.make_node("Unsqueeze", ["updated_state", "independent_result"], ["next_state"]))
+        body_nodes.append(helper.make_node("Identity", ["condition_in"], ["condition_out"]))
+        body = helper.make_graph(
+            body_nodes,
+            "finite_selected_function_result_body",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+            ],
+            [value("condition_out", [], TensorProto.BOOL), value("next_state", None)],
+        )
+        prior_weights = np.zeros((64, 64), np.float32)
+        prior_weights[:5, 0] = 10
+        inputs = [value("A", [1, 64]), value("activation", [1, 1])]
+        initializers = [
+            tensor("prior", prior_weights),
+            tensor("initial_state", np.float32(1)),
+            tensor("trip_count", np.int64(trip_count)),
+            tensor("initial_condition", np.bool_(True)),
+            tensor("dummy", np.float32(0)),
+        ]
+        if mode == "runtime_axes":
+            inputs.append(value("axes", [1], TensorProto.INT64))
+        else:
+            initializers.append(tensor("axes", np.array([0], np.int64)))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node(
+                        "Loop", ["trip_count", "initial_condition", "initial_state"], ["final_state"], body=body
+                    ),
+                    helper.make_node("Identity", ["dummy"], ["Y"]),
+                ],
+                "finite_selected_function_results",
+                inputs,
+                [value("known", [1, 64]), value("Y", [])],
+                initializer=initializers,
+            ),
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 9
+        return model, prior_weights
+
+    @classmethod
+    def _assert_runtime_ranks(cls, model: Any, trip_count: int, internal_consumer: bool) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        # As in the existing finite scalar regression, validate structure and
+        # qualify changing carried ranks through actual per-iteration values.
+        onnx.checker.check_model(model)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined)
+        loop = next(node for node in inlined.graph.node if node.op_type == "Loop")
+        runtime_body = deepcopy(next(attribute.g for attribute in loop.attribute if attribute.name == "body"))
+        consumers = [node for node in runtime_body.node if node.op_type == "PRelu"]
+        assert len(consumers) == (2 if internal_consumer else 1)
+        for index, consumer in enumerate(consumers):
+            # Observe each real consumer's operand, including the one whose
+            # ordinary result is unused; output order is independent of names
+            # assigned by the inliner.
+            for kind, source in (("slope", consumer.input[1]), ("result", consumer.output[0])):
+                name = f"observed_{kind}_{index}"
+                runtime_body.node.append(helper.make_node("Identity", [source], [name]))
+                runtime_body.output.append(cls._value(name, None))
+        evaluator = ReferenceEvaluator(runtime_body, opsets={"": 13})
+        state = np.asarray(1, np.float32)
+        activation = np.array([[-2]], np.float32)
+        observed_ranks: list[list[int]] = [[] for _ in consumers]
+        for iteration in range(trip_count):
+            actual: Any = evaluator.run(
+                None,
+                {
+                    "iteration": np.int64(iteration),
+                    "condition_in": np.bool_(True),
+                    "state": state,
+                    "axes": np.array([0], np.int64),
+                    "activation": activation,
+                },
+            )
+            np.testing.assert_array_equal(actual[0], np.bool_(True))
+            np.testing.assert_array_equal(actual[1], np.expand_dims(state, 0))
+            for index in range(len(consumers)):
+                slope, result = actual[2 + 2 * index : 4 + 2 * index]
+                expected_slope = state if index == 0 else np.expand_dims(state, 0)
+                np.testing.assert_array_equal(slope, expected_slope)
+                np.testing.assert_array_equal(result, activation)
+                observed_ranks[index].append(slope.ndim)
+            state = actual[1]
+        assert observed_ranks[0] == list(range(trip_count))
+        if internal_consumer:
+            assert observed_ranks[1] == list(range(1, trip_count + 1))
+        assert state.shape == (1,) * trip_count
+
+    @pytest.mark.parametrize(
+        ("trip_count", "dead_kind", "live_index", "mode", "incomplete"),
+        [
+            pytest.param(2, "literal", 0, "unused", False, id="literal-live-first-two"),
+            pytest.param(2, "literal", 1, "unused", False, id="literal-live-last-two"),
+            pytest.param(2, "formal", 0, "unused", False, id="formal-live-first-two"),
+            pytest.param(2, "formal", 1, "unused", False, id="formal-live-last-two"),
+            pytest.param(2, "computed", 0, "unused", False, id="computed-live-first-two"),
+            pytest.param(2, "computed", 1, "unused", False, id="computed-live-last-two"),
+            pytest.param(3, "literal", 0, "unused", True, id="literal-live-first-three"),
+            pytest.param(3, "literal", 1, "unused", True, id="literal-live-last-three"),
+            pytest.param(2, "literal", 1, "internal_consumer", True, id="unused-internal-consumer-result"),
+            pytest.param(2, "literal", 1, "runtime_axes", True, id="required-unknown-shape"),
+            pytest.param(2, "computed", 1, "required_independent_control", True, id="required-independent-control"),
+        ],
+    )
+    def test_finite_replay_requests_only_live_function_results(
+        self, tmp_path: Path, trip_count: int, dead_kind: str, live_index: int, mode: str, incomplete: bool
+    ) -> None:
+        model, prior_weights = self._model(trip_count, dead_kind, live_index, mode)
+        self._assert_runtime_ranks(model, trip_count, mode == "internal_consumer")
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        function_results: list[tuple[Any, tuple[int, ...], set[str]]] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event != "return"
+                or frame.f_code.co_name != "function_input_consumes_weight_rank_at_or_above_two"
+                or Path(frame.f_code.co_filename).resolve() != scanner_path
+                or getattr(frame.f_locals.get("function_graph"), "name", None) != "SelectedResultUpdate"
+            ):
+                return
+            published = frame.f_locals.get("output_shapes_out")
+            if published is not None:
+                function_results.append((arg, frame.f_locals["requested_output_indexes"], set(published)))
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        finally:
+            sys.setprofile(previous_profile)
+        assert function_results
+        requested = (0, 1) if mode == "required_independent_control" else (live_index,)
+        assert all(indexes == requested for _, indexes, _ in function_results)
+        if mode in {"runtime_axes", "required_independent_control"}:
+            assert any(result is None for result, _, _ in function_results)
+        else:
+            assert all(result is not None for result, _, _ in function_results)
+            assert all(names == {"N"} for result, _, names in function_results if result is False)
+            if mode == "internal_consumer":
+                assert any(result is True for result, _, _ in function_results)
+            else:
+                assert all(result is False for result, _, _ in function_results)
+        assert bool(plan.coverage_gaps.get("lineages_per_value_limit", 0)) is incomplete
+        if not incomplete:
+            assert plan.coverage_gaps == {}
+        assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "finite-selected-function-results.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result = scanner_type().scan(str(path))
+            assert result.success is not incomplete
+            assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+            gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            assert bool(gaps.get("lineages_per_value_limit", 0)) is incomplete
+            if not incomplete:
+                assert gaps == {}
+            assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+            checks = TestWeightDistributionCoverage._coverage_checks(
+                result, standalone=scanner_type is WeightDistributionScanner
+            )
+            assert bool(checks) is incomplete
+            assert all(check.status == CheckStatus.FAILED and check.message for check in checks)
+        if incomplete:
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxTrainingMutableLoopControls:
+    @staticmethod
+    def _value(name: str, shape: list[int], data_type: int = TensorProto.FLOAT) -> Any:
+        return helper.make_tensor_value_info(name, data_type, shape)
+
+    @staticmethod
+    def _tensor(name: str, values: Any, dtype: Any = None) -> Any:
+        return onnx.numpy_helper.from_array(np.asarray(values, dtype=dtype), name=name)
+
+    @classmethod
+    def _loop(cls, count: str, start: str, initial: str, weight: str, output: str) -> Any:
+        body = helper.make_graph(
+            [helper.make_node("Identity", [weight], ["body_next"])],
+            "training_control_body",
+            [
+                cls._value("body_iteration", [], TensorProto.INT64),
+                cls._value("body_condition", [], TensorProto.BOOL),
+                cls._value("body_state", [64, 64]),
+            ],
+            [cls._value("body_condition", [], TensorProto.BOOL), cls._value("body_next", [64, 64])],
+        )
+        return helper.make_node("Loop", [count, start, initial], [output], body=body)
+
+    @classmethod
+    def _model(
+        cls,
+        *,
+        binding_kind: str,
+        owner_scope: str,
+        control: str,
+        route: str,
+        bound: bool = True,
+        false_start: bool = False,
+        independent_literal: bool = False,
+    ) -> tuple[Any, Any, str]:
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        initializers = [
+            cls._tensor("count", np.int64(0 if control == "count" else 1)),
+            cls._tensor("start", np.bool_(control != "condition" and not false_start)),
+            cls._tensor("initial", np.zeros_like(weights)),
+            cls._tensor("W", weights),
+        ]
+        functions = []
+        if route == "function":
+            function_nodes = []
+            function_count = "formal_count"
+            if independent_literal:
+                # Function-local names are independent of root initializer names.
+                function_count = "count"
+                function_nodes.append(
+                    helper.make_node("Constant", [], ["count"], value=cls._tensor("literal", np.int64(0)))
+                )
+            function_nodes.append(
+                cls._loop(function_count, "formal_start", "formal_initial", "formal_weight", "function_final")
+            )
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "TrainingControlledLoop",
+                    ["formal_count", "formal_start", "formal_initial", "formal_weight"],
+                    ["function_final"],
+                    function_nodes,
+                    [helper.make_opsetid("", 18)],
+                )
+            )
+            nodes = [
+                helper.make_node(
+                    "TrainingControlledLoop", ["count", "start", "initial", "W"], ["final"], domain="local"
+                )
+            ]
+        elif route == "captured":
+            then_graph = helper.make_graph(
+                [cls._loop("count", "start", "initial", "W", "then_final")],
+                "captured_training_control",
+                [],
+                [cls._value("then_final", [64, 64])],
+            )
+            else_graph = helper.make_graph(
+                [helper.make_node("Identity", ["initial"], ["else_final"])],
+                "unchanged_initial_state",
+                [],
+                [cls._value("else_final", [64, 64])],
+            )
+            initializers.append(cls._tensor("choose_then", np.bool_(True)))
+            nodes = [helper.make_node("If", ["choose_then"], ["final"], then_branch=then_graph, else_branch=else_graph)]
+        else:
+            assert route == "direct"
+            nodes = [cls._loop("count", "start", "initial", "W", "final")]
+        nodes.append(helper.make_node("MatMul", ["X", "final"], ["Y"]))
+        algorithm = helper.make_graph([], "training_algorithm", [], [])
+        if owner_scope == "algorithm":
+            graph = helper.make_graph(
+                [helper.make_node("Identity", ["X"], ["root_output"])],
+                "training_control_root",
+                [cls._value("X", [1, 64])],
+                [cls._value("root_output", [1, 64])],
+            )
+            algorithm.CopyFrom(
+                helper.make_graph(nodes, "training_algorithm", [], [cls._value("Y", [1, 64])], initializers)
+            )
+        else:
+            assert owner_scope == "root"
+            graph = helper.make_graph(
+                nodes,
+                "training_control_root",
+                [cls._value("X", [1, 64])],
+                [cls._value("Y", [1, 64])],
+                initializers,
+            )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=9,
+        )
+        state_name = "count" if control == "count" else "start"
+        if bound:
+            training = onnx.TrainingInfoProto()
+            training.algorithm.CopyFrom(algorithm)
+            next_value = np.int64(1) if control == "count" else np.bool_(True)
+            next_type = TensorProto.INT64 if control == "count" else TensorProto.BOOL
+            source_node = helper.make_node(
+                "Constant", [], ["state_next"], value=cls._tensor("state_replacement", next_value)
+            )
+            source_output = cls._value("state_next", [], next_type)
+            if binding_kind == "initialization":
+                training.initialization.CopyFrom(
+                    helper.make_graph([source_node], "training_initialization", [], [source_output])
+                )
+                binding = training.initialization_binding.add()
+            else:
+                assert binding_kind == "update"
+                training.algorithm.node.append(source_node)
+                training.algorithm.output.append(source_output)
+                binding = training.update_binding.add()
+            binding.key = state_name
+            binding.value = "state_next"
+            model.training_info.append(training)
+        return model, weights, state_name
+
+    @classmethod
+    def _ordinary_copy(cls, model: Any, outputs: list[Any]) -> Any:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+
+        # This is the combined-graph rule from TrainingInfoProto, expressed as
+        # an ordinary inference model. ReferenceEvaluator need not run training.
+        oracle = deepcopy(model)
+        nodes = list(oracle.graph.node)
+        initializers = list(oracle.graph.initializer)
+        inputs = list(oracle.graph.input)
+        if oracle.training_info:
+            assert len(oracle.training_info) == 1
+            algorithm = oracle.training_info[0].algorithm
+            nodes.extend(algorithm.node)
+            initializers.extend(algorithm.initializer)
+            inputs.extend(algorithm.input)
+        ordinary_graph = helper.make_graph(nodes, "ordinary_current_state", inputs, outputs, initializers)
+        del oracle.training_info[:]
+        oracle.graph.CopyFrom(ordinary_graph)
+        return inline_local_functions(oracle)
+
+    @classmethod
+    def _assert_state_transition(
+        cls, model: Any, weights: Any, state_name: str, *, binding_kind: str, enters_after: bool = True
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.reference import ReferenceEvaluator
+
+        original_bytes = model.SerializeToString()
+        onnx.checker.check_model(model)
+        output_infos = [cls._value("Y", [1, 64]), cls._value("final", [64, 64])]
+        before = cls._ordinary_copy(model, output_infos)
+        onnx.checker.check_model(before, full_check=True)
+        feeds = {"X": np.ones((1, 64), np.float32)}
+        before_values: Any = ReferenceEvaluator(before).run(None, feeds)
+        np.testing.assert_array_equal(before_values[0], np.zeros((1, 64), np.float32))
+        np.testing.assert_array_equal(before_values[1], np.zeros_like(weights))
+
+        data_type = TensorProto.INT64 if state_name == "count" else TensorProto.BOOL
+        if binding_kind == "initialization":
+            source = helper.make_model(
+                deepcopy(model.training_info[0].initialization),
+                opset_imports=list(model.opset_import),
+                ir_version=model.ir_version,
+            )
+            source_feeds = {}
+        else:
+            source = cls._ordinary_copy(model, [cls._value("state_next", [], data_type)])
+            source_feeds = feeds
+        onnx.checker.check_model(source, full_check=True)
+        source_values: Any = ReferenceEvaluator(source).run(None, source_feeds)
+        replacement: Any = source_values[0]
+        expected = np.asarray(1, dtype=np.int64) if state_name == "count" else np.asarray(True, dtype=np.bool_)
+        assert replacement.shape == ()
+        assert replacement.dtype == expected.dtype
+        np.testing.assert_array_equal(replacement, expected)
+
+        # Explicit assignment models initialization or the next training step.
+        # Neither the scanned model nor any scanner-derived proof is the oracle.
+        after = deepcopy(before)
+        targets = [initializer for initializer in after.graph.initializer if initializer.name == state_name]
+        assert len(targets) == 1
+        targets[0].CopyFrom(cls._tensor(state_name, replacement))
+        onnx.checker.check_model(after, full_check=True)
+        after_values: Any = ReferenceEvaluator(after).run(None, feeds)
+        expected_matrix = weights if enters_after else np.zeros_like(weights)
+        np.testing.assert_array_equal(after_values[1], expected_matrix)
+        np.testing.assert_array_equal(after_values[0], feeds["X"] @ expected_matrix)
+        assert model.SerializeToString() == original_bytes
+
+    @staticmethod
+    def _admission_with_exact_target(model: Any, owner_scope: str, state_name: str) -> Any:
+        graph = model.graph if owner_scope == "root" else model.training_info[0].algorithm
+        target = next(initializer for initializer in graph.initializer if initializer.name == state_name)
+        admission = _fixture_raw_control_admission(model)
+        assert admission.error_reason is None
+        owners = admission.mutable_initializer_owners
+        assert owners is not None and len(owners) == 1
+        assert owners.get(id(target)) is target
+        assert all(owners.get(id(tensor)) is None for tensor in graph.initializer if tensor is not target)
+        return admission
+
+    @pytest.mark.parametrize(
+        ("binding_kind", "owner_scope", "control", "route"),
+        [
+            pytest.param("update", "root", "count", "direct", id="root-update-count"),
+            pytest.param("initialization", "root", "condition", "direct", id="root-init-condition"),
+            pytest.param("update", "root", "condition", "function", id="renamed-update-condition"),
+            pytest.param("initialization", "root", "count", "function", id="renamed-init-count"),
+            pytest.param("update", "algorithm", "count", "direct", id="algorithm-update-count"),
+            pytest.param("initialization", "algorithm", "condition", "direct", id="algorithm-init-condition"),
+            pytest.param("update", "root", "count", "captured", id="captured-update-count"),
+        ],
+    )
+    def test_mutable_training_control_preserves_returned_weight(
+        self, tmp_path: Path, binding_kind: str, owner_scope: str, control: str, route: str
+    ) -> None:
+        model, weights, state_name = self._model(
+            binding_kind=binding_kind, owner_scope=owner_scope, control=control, route=route
+        )
+        self._assert_state_transition(model, weights, state_name, binding_kind=binding_kind)
+        admission = self._admission_with_exact_target(model, owner_scope, state_name)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model, onnx=onnx, np=np, max_array_size=None, raw_control_admission=admission
+        )
+        assert plan.coverage_gaps == {}
+        assert sum(np.array_equal(spec.weights, weights) for spec in plan.specs) == 1
+        if owner_scope == "root" and route == "direct":
+            path = _save_onnx_model(model, tmp_path / "training-control.onnx")
+            for scanner in (OnnxScanner(), WeightDistributionScanner()):
+                result = scanner.scan(str(path))
+                assert result.success is True
+                assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+                assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+                findings = TestWeightDistributionSemantics._extreme_checks(result)
+                assert len(findings) == 1
+                assert findings[0].status == CheckStatus.FAILED
+                assert findings[0].severity == IssueSeverity.INFO
+            aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+            assert aggregate.success is True
+            assert determine_exit_code(aggregate) == 1
+
+    @pytest.mark.parametrize("mode", ["immutable_zero", "immutable_false", "independent_function_constant"])
+    def test_mutable_inventory_preserves_independent_skip_proofs(self, tmp_path: Path, mode: str) -> None:
+        bound = mode != "immutable_zero"
+        model, weights, state_name = self._model(
+            binding_kind="update",
+            owner_scope="root",
+            control="count",
+            route="function" if mode == "independent_function_constant" else "direct",
+            bound=bound,
+            false_start=mode == "immutable_false",
+            independent_literal=mode == "independent_function_constant",
+        )
+        if bound:
+            self._assert_state_transition(model, weights, state_name, binding_kind="update", enters_after=False)
+            admission = self._admission_with_exact_target(model, "root", state_name)
+        else:
+            from onnx.reference import ReferenceEvaluator
+
+            onnx.checker.check_model(model, full_check=True)
+            runtime: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+            np.testing.assert_array_equal(runtime[0], np.zeros((1, 64), np.float32))
+            admission = _fixture_raw_control_admission(model)
+            assert admission.mutable_initializer_owners == {}
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model, onnx=onnx, np=np, max_array_size=None, raw_control_admission=admission
+        )
+        assert plan.coverage_gaps == {}
+        assert not any(np.array_equal(spec.weights, weights) for spec in plan.specs)
+        assert any(np.array_equal(spec.weights, np.zeros_like(weights)) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "independent-training-control.onnx")
+        TestOnnxReviewShapeRegressions._assert_clean(path)
+        standalone = WeightDistributionScanner().scan(str(path))
+        assert standalone.success is True
+        assert standalone.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert not TestWeightDistributionSemantics._extreme_checks(standalone)
+
+    @pytest.mark.parametrize("independent_literal", [False, True], ids=["root-control", "local-literal"])
+    def test_missing_inventory_withholds_root_proofs_without_disabling_function_constants(
+        self, independent_literal: bool
+    ) -> None:
+        from dataclasses import replace
+
+        model, weights, _state_name = self._model(
+            binding_kind="update",
+            owner_scope="root",
+            control="count",
+            route="function" if independent_literal else "direct",
+            independent_literal=independent_literal,
+        )
+        onnx.checker.check_model(model)
+        admission = replace(_fixture_raw_control_admission(model), mutable_initializer_owners=None)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model, onnx=onnx, np=np, max_array_size=None, raw_control_admission=admission
+        )
+        assert plan.coverage_gaps == {}
+        assert any(np.array_equal(spec.weights, weights) for spec in plan.specs) is not independent_literal
+
+    @pytest.mark.parametrize("through_loop", [False, True], ids=["function", "function-and-loop"])
+    def test_mutable_stored_weight_keeps_function_return_lineage(self, tmp_path: Path, through_loop: bool) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        keep = helper.make_function(
+            "local",
+            "KeepStoredWeight",
+            ["function_weight"],
+            ["function_result"],
+            [helper.make_node("Identity", ["function_weight"], ["function_result"])],
+            [helper.make_opsetid("", 18)],
+        )
+        nodes = [helper.make_node("KeepStoredWeight", ["W"], ["kept"], domain="local")]
+        initializers = [self._tensor("W", weights)]
+        consumer_weight = "kept"
+        if through_loop:
+            body = helper.make_graph(
+                [helper.make_node("Identity", ["carried"], ["next_carried"])],
+                "stored_weight_identity_body",
+                [
+                    self._value("iteration", [], TensorProto.INT64),
+                    self._value("condition", [], TensorProto.BOOL),
+                    self._value("carried", [64, 64]),
+                ],
+                [self._value("condition", [], TensorProto.BOOL), self._value("next_carried", [64, 64])],
+            )
+            initializers.extend([self._tensor("count", np.int64(1)), self._tensor("start", np.bool_(True))])
+            nodes.append(helper.make_node("Loop", ["count", "start", "kept"], ["final"], body=body))
+            consumer_weight = "final"
+        nodes.append(helper.make_node("MatMul", ["X", consumer_weight], ["Y"]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes, "mutable_stored_weight", [self._value("X", [1, 64])], [self._value("Y", [1, 64])], initializers
+            ),
+            functions=[keep],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=9,
+        )
+        training = onnx.TrainingInfoProto()
+        training.algorithm.CopyFrom(
+            helper.make_graph(
+                [helper.make_node("Identity", ["W"], ["updated_weight"])],
+                "stored_weight_update",
+                [],
+                [self._value("updated_weight", [64, 64])],
+            )
+        )
+        binding = training.update_binding.add()
+        binding.key, binding.value = "W", "updated_weight"
+        model.training_info.append(training)
+        original_bytes = model.SerializeToString()
+        onnx.checker.check_model(model)
+        oracle = deepcopy(model)
+        del oracle.training_info[:]
+        oracle = inline_local_functions(oracle)
+        onnx.checker.check_model(oracle, full_check=True)
+        feeds = {"X": np.ones((1, 64), np.float32)}
+        runtime: Any = ReferenceEvaluator(oracle).run(None, feeds)
+        np.testing.assert_array_equal(runtime[0], feeds["X"] @ weights)
+        assert model.SerializeToString() == original_bytes
+        admission = self._admission_with_exact_target(model, "root", "W")
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model, onnx=onnx, np=np, max_array_size=None, raw_control_admission=admission
+        )
+        assert plan.coverage_gaps == {"unresolved_initializer_lineage": 1}
+        assert sum(np.array_equal(spec.weights, weights) for spec in plan.specs) == 1
+        assert any(sample["reason"] == "unresolved_update_binding" for sample in plan.unresolved_lineage_samples)
+        path = _save_onnx_model(model, tmp_path / "mutable-function-weight.onnx")
+        for scanner, standalone in ((OnnxScanner(), False), (WeightDistributionScanner(), True)):
+            result = scanner.scan(str(path))
+            assert result.success is False
+            assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {
+                "unresolved_initializer_lineage": 1
+            }
+            findings = TestWeightDistributionSemantics._extreme_checks(result)
+            assert len(findings) == 1
+            assert findings[0].status == CheckStatus.FAILED
+            assert findings[0].severity == IssueSeverity.INFO
+            coverage = TestWeightDistributionCoverage._coverage_checks(result, standalone=standalone)
+            assert len(coverage) == 1
+            assert coverage[0].status == CheckStatus.FAILED
+            assert coverage[0].message == (
+                "Model tensor analysis incomplete; one or more matching tensors could not be read."
+                if standalone
+                else "Weight distribution analysis skipped one or more eligible ONNX initializers"
+            )
+            assert coverage[0].details["scan_outcome_reason"] == (
+                "weight_distribution_analysis_incomplete"
+                if standalone
+                else ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON
+            )
+        if not through_loop:
+            reset_cache_manager()
+            try:
+                cache_dir = tmp_path / "mutable-weight-cache"
+                for _ in range(2):
+                    aggregate = scan_model_directory_or_file(
+                        str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                    )
+                    assert aggregate.success is False
+                    assert aggregate.file_metadata[str(path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+                    # Incomplete coverage precedes these informational weight findings.
+                    assert determine_exit_code(aggregate) == 2
+                    assert any("extremely large weight values" in issue.message for issue in aggregate.issues)
+                stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+                assert stats["total_entries"] == stats["cache_hits"] == 0
+            finally:
+                reset_cache_manager()
+
+
+class TestOnnxTrainingStateProvenance:
+    class _KeySentinel(_RawControlFixtureProxy):
+        def __init__(self, owner: Any) -> None:
+            super().__init__(owner)
+            self.key_reads: list[str] = []
+
+        @property
+        def key(self) -> str:
+            # Record before raising because preflight/owner binding may catch.
+            self.key_reads.append("key")
+            raise AssertionError("Owner admission must not read a native binding key")
+
+    @staticmethod
+    def _wire(
+        keys: tuple[bytes, ...] = (b"a",),
+        *,
+        scoped: bool = False,
+        repeat_binding: bool = False,
+        string_attribute: bool = False,
+    ) -> bytes:
+        field, integer = _raw_control_bytes_field, _raw_control_int_field
+
+        def graph(name: bytes) -> bytes:
+            return field(5, field(8, name) + integer(2, 7) + integer(7, 0))
+
+        entry = b"".join(field(1, key) for key in keys) + field(2, b"v")
+        root = graph(b"a")
+        if string_attribute:
+            attribute = field(1, b"s") + integer(20, 3) + field(4, b"x")
+            root += field(1, field(5, attribute))
+        training = field(4, entry)
+        if repeat_binding:
+            training += field(4, entry)
+        if scoped:
+            # Singular graph fragments merge; repeated initializer positions
+            # follow their own graph, not global wire order.
+            training += (
+                field(2, graph(b"c"))
+                + field(3, field(1, b"d") + field(2, b"v"))
+                + field(3, field(1, keys[-1]) + field(2, b"v"))
+                + field(2, graph(b"d"))
+            )
+        data = field(7, root) + field(20, training)
+        if scoped:
+            data += field(7, graph(b"b")) + field(20, field(2, graph(b"e")))
+        return data
+
+    @pytest.mark.parametrize("keys", [(b"a", b"b"), (b"b", b"a")])
+    def test_final_binding_key_binds_scoped_owners_without_native_key_getters(self, keys: tuple[bytes, ...]) -> None:
+        data = self._wire(keys, scoped=True)
+        capture = onnx_scanner_module._OnnxTrainingStatePreflight()
+        assert onnx_scanner_module._preflight_onnx_raw_controls(data, training_state=capture) == (True, True, None)
+        root_position = 1 if keys[-1] == b"b" else 0
+        assert capture.positions == [(0, 1), (-1, root_position)]
+
+        native = onnx.load_model_from_string(data)
+        # Independent native-parser oracle, outside the observed loader path.
+        assert native.training_info[0].update_binding[0].key == keys[-1].decode()
+        sentinels = []
+        infos = []
+        for info in native.training_info:
+            overrides = {}
+            for field_name in ("initialization_binding", "update_binding"):
+                entries = [self._KeySentinel(entry) for entry in getattr(info, field_name)]
+                sentinels.extend(entries)
+                overrides[field_name] = entries
+            infos.append(_RawControlFixtureProxy(info, **overrides))
+        proxy = _RawControlFixtureProxy(native, training_info=infos)
+        seen: list[bytes] = []
+
+        def load(actual: bytes) -> Any:
+            seen.append(actual)
+            return proxy
+
+        model, admission = onnx_scanner_module._load_onnx_model_with_control_admission(
+            data, onnx=SimpleNamespace(load_model_from_string=load)
+        )
+        expected = [native.training_info[0].algorithm.initializer[1], native.graph.initializer[root_position]]
+        assert model is admission.model is proxy
+        assert len(seen) == 1 and seen[0] is data
+        assert admission.error_reason is None
+        assert admission.mutable_initializer_owners is not None
+        assert set(admission.mutable_initializer_owners) == {id(owner) for owner in expected}
+        assert all(admission.mutable_initializer_owners[id(owner)] is owner for owner in expected)
+        assert sentinels and all(sentinel.key_reads == [] for sentinel in sentinels)
+
+    @pytest.mark.parametrize("mode", ["absent", "empty", "refused", "bad_owner_position"])
+    def test_empty_inventory_is_distinct_from_missing_or_refused_provenance(self, mode: str) -> None:
+        owner = object()
+        model = SimpleNamespace(graph=SimpleNamespace(initializer=[owner]), training_info=[])
+        capture = onnx_scanner_module._OnnxTrainingStatePreflight()
+        if mode == "empty":
+            assert onnx_scanner_module._preflight_onnx_raw_controls(
+                _raw_control_bytes_field(7, b""), training_state=capture
+            ) == (True, True, None)
+        elif mode == "refused":
+            capture.positions = [(-1, 0)]
+            assert onnx_scanner_module._preflight_onnx_raw_controls(
+                self._wire() + b"\x3a\x80", training_state=capture
+            ) == (False, False, "raw_control_preflight_failed")
+        elif mode == "bad_owner_position":
+            # A valid prefix must not survive an unavailable later owner.
+            capture.positions = [(-1, 0), (-1, 99)]
+        owners = onnx_scanner_module._bind_onnx_mutable_initializer_owners(model, capture)
+        if mode == "empty":
+            assert capture.positions == []
+            assert owners == {} and owners is not None
+        else:
+            assert owners is None
+            if mode != "bad_owner_position":
+                assert capture.positions is None
+
+    @pytest.mark.parametrize("guard", ["truncated", "unknown_field", "invalid_utf8", "large_key", "binding_count"])
+    def test_parser_refusal_clears_inventory_before_owner_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, guard: str
+    ) -> None:
+        key = b"\xff" if guard == "invalid_utf8" else b"kkkkk" if guard == "large_key" else b"a"
+        data = self._wire((key,), repeat_binding=guard == "binding_count")
+        if guard == "truncated":
+            data += b"\x3a\x80"
+        elif guard == "unknown_field":
+            data += _raw_control_int_field(127, 1)
+        elif guard == "large_key":
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_STRING_MAX_BYTES", 4)
+        elif guard == "binding_count":
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES", 1)
+        resolutions: list[bool] = []
+        reads: list[int] = []
+        original = onnx_scanner_module._onnx_training_mutable_initializer_positions
+        original_read = onnx_scanner_module._OnnxSerializedInput.read
+
+        def resolve(structure: Any, state: Any) -> Any:
+            resolutions.append(True)
+            return original(structure, state)
+
+        def read(reader: Any, size: int = -1) -> bytes:
+            reads.append(size)
+            return original_read(reader, size)
+
+        monkeypatch.setattr(onnx_scanner_module, "_onnx_training_mutable_initializer_positions", resolve)
+        monkeypatch.setattr(onnx_scanner_module._OnnxSerializedInput, "read", read)
+        capture = onnx_scanner_module._OnnxTrainingStatePreflight(positions=[(-1, 0)])
+        assert onnx_scanner_module._preflight_onnx_raw_controls(data, training_state=capture) == (
+            False,
+            False,
+            "raw_control_preflight_failed",
+        )
+        assert capture.positions is None
+        assert resolutions == []
+        assert reads
+        if guard == "large_key":
+            assert max(reads) == 1  # Oversized key bytes are skipped, never read.
+
+    @pytest.mark.parametrize(
+        ("field_number", "schema"),
+        [(3, "valid"), (3, "singular_binding"), (4, "wrong_entry"), (3, "bytes_key"), (4, "repeated_key")],
+    )
+    def test_binding_inventory_requires_repeated_entries_and_singular_string_keys(
+        self, monkeypatch: pytest.MonkeyPatch, field_number: int, schema: str
+    ) -> None:
+        fields = {}
+        for number in (3, 4):
+            changed = number == field_number
+            key = SimpleNamespace(
+                type=12 if changed and schema == "bytes_key" else 9,
+                is_repeated=changed and schema == "repeated_key",
+            )
+            entry = SimpleNamespace(
+                full_name="onnx.OtherEntry" if changed and schema == "wrong_entry" else "onnx.StringStringEntryProto",
+                fields_by_number={1: key},
+            )
+            fields[number] = SimpleNamespace(
+                is_repeated=not (changed and schema == "singular_binding"), message_type=entry
+            )
+        # ModelProto's native descriptor graph is unchanged. Exercise the
+        # additional direct binding/key schema guard independently.
+        monkeypatch.setattr(
+            onnx, "TrainingInfoProto", SimpleNamespace(DESCRIPTOR=SimpleNamespace(fields_by_number=fields))
+        )
+        capture = onnx_scanner_module._OnnxTrainingStatePreflight(positions=[(-1, 99)])
+        attributes = onnx_scanner_module._OnnxAttributeStringPreflight(lengths=[99])
+        result = onnx_scanner_module._preflight_onnx_raw_controls(
+            self._wire(), training_state=capture, attribute_strings=attributes
+        )
+        if schema == "valid":
+            assert result == (True, True, None)
+            assert capture.positions == [(-1, 0)]
+            assert attributes.lengths == []
+        else:
+            assert result == (False, False, "raw_control_preflight_failed")
+            assert capture.positions is None
+            assert attributes.lengths is None
+
+    @pytest.mark.parametrize("allowance", ["none", "training_only", "complete"])
+    def test_metadata_budget_never_publishes_training_or_attribute_prefixes(
+        self, monkeypatch: pytest.MonkeyPatch, allowance: str
+    ) -> None:
+        data = self._wire(string_attribute=True)
+        state = onnx_scanner_module._OnnxStructureParseState(merge_singular_messages=True)
+        reader = onnx_scanner_module._OnnxSerializedInput(data)
+        onnx_scanner_module._parse_onnx_model(cast(BinaryIO, reader), len(data), state, 0)
+        obj = onnx_scanner_module._ONNX_STRUCTURE_RETAINED_OBJECT_BYTES
+        slot = onnx_scanner_module._ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES
+        # One TrainingInfo visit, name index, binding visit, position/seen
+        # entry, and future owner; then the separate attribute inventory.
+        training_bytes = 6 * obj + 5 * slot
+        attribute_bytes = 3 * obj + 2 * slot
+        extra = 0 if allowance == "none" else training_bytes
+        if allowance == "complete":
+            extra += attribute_bytes
+        monkeypatch.setattr(
+            onnx_scanner_module,
+            "_ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES",
+            state.retained_allocation_bytes + extra,
+        )
+        assert onnx_scanner_module._preflight_onnx_raw_controls(data) == (True, True, None)
+        completed: list[list[tuple[int, int]]] = []
+        original = onnx_scanner_module._onnx_training_mutable_initializer_positions
+
+        def resolve(structure: Any, parse_state: Any) -> Any:
+            positions = original(structure, parse_state)
+            completed.append(positions)
+            return positions
+
+        monkeypatch.setattr(onnx_scanner_module, "_onnx_training_mutable_initializer_positions", resolve)
+        capture = onnx_scanner_module._OnnxTrainingStatePreflight(positions=[(-1, 99)])
+        attributes = onnx_scanner_module._OnnxAttributeStringPreflight(lengths=[99])
+        result = onnx_scanner_module._preflight_onnx_raw_controls(
+            data, training_state=capture, attribute_strings=attributes
+        )
+        assert completed == ([] if allowance == "none" else [[(-1, 0)]])
+        if allowance == "complete":
+            assert result == (True, True, None)
+            assert capture.positions == [(-1, 0)]
+            assert attributes.lengths == [1]
+        else:
+            assert result == (False, False, "raw_control_preflight_failed")
+            assert capture.positions is None
+            assert attributes.lengths is None
+
+    @pytest.mark.parametrize(("data_type", "op_type"), [(TensorProto.INT64, "Sub"), (TensorProto.BOOL, "Not")])
+    def test_missing_training_provenance_keeps_noncontrol_scalar_updates_clean(
+        self, tmp_path: Path, data_type: int, op_type: str
+    ) -> None:
+        from dataclasses import replace
+
+        path = create_non_weight_training_update_model(tmp_path, data_type=data_type, op_type=op_type)
+        model = onnx.load(str(path))
+        admission = replace(_fixture_raw_control_admission(model), mutable_initializer_owners=None)
+        assert admission.model is model and admission.mutable_initializer_owners is None
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model, onnx=onnx, np=np, max_array_size=None, raw_control_admission=admission
+        )
+        assert plan.coverage_gaps == {}
+        assert plan.specs == []

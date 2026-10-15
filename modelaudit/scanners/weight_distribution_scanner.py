@@ -1561,6 +1561,7 @@ class WeightDistributionScanner(BaseScanner):
                 # Preserve ONNX's public format selection for private nonbinary
                 # callers. Raw tensor controls and attribute-string proofs lack
                 # binary-wire admission and remain explicitly inconclusive.
+                # Potential training targets also cannot supply constant proofs.
                 model = onnx.load_model_from_string(model_data, format=selected_format)
             del model_data
 
