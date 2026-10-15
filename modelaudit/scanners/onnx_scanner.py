@@ -13,7 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from itertools import chain, islice, repeat
 from pathlib import Path
-from typing import Any, BinaryIO, ClassVar, NoReturn
+from typing import Any, BinaryIO, ClassVar, NoReturn, cast
 
 from ..scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY, VALIDATED_FORMAT_METADATA_KEY
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
@@ -1888,6 +1888,23 @@ def _onnx_opaque_activation_input_candidate(node: Any, _input_index: int) -> boo
     return getattr(node, "domain", "") == "ai.onnx.ml"
 
 
+@dataclass(frozen=True)
+class _OnnxRawControlAdmission:
+    """Private proof bound to a model loaded from the preflighted byte snapshot.
+
+    Until analysis completes, callers must preserve tensor membership, dtypes,
+    dimensions, and raw bytes; loading external data invalidates this proof.
+    Renaming tensors and discarding unknown fields preserve these invariants.
+    This is an internal loader contract, not permission to certify arbitrary
+    mutable ModelProto instances supplied by callers.
+    """
+
+    model: Any
+    vectors_bounded: bool
+    scalars_bounded: bool
+    error_reason: str | None = None
+
+
 def _build_onnx_weight_analysis_plan(
     model: Any,
     *,
@@ -1897,8 +1914,13 @@ def _build_onnx_weight_analysis_plan(
     pre_materialization_check: Callable[[Any, str, int], bool] | None = None,
     pre_view_check: Callable[[str, int], bool] | None = None,
     retain_array_check: Callable[[str, int], bool] | None = None,
+    raw_control_admission: _OnnxRawControlAdmission | None = None,
 ) -> _OnnxWeightAnalysisPlan:
-    """Build a bounded, semantically oriented plan for ONNX weight analysis."""
+    """Build a bounded plan; raw controls require exact-input loader provenance.
+
+    Private in-memory callers without provenance retain typed-control support.
+    Never manufacture provenance by serializing an untrusted ModelProto here.
+    """
     plan = _OnnxWeightAnalysisPlan()
     inferred_dimensions = 0
     scan_axis_decode_work_remaining = _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT
@@ -2151,6 +2173,15 @@ def _build_onnx_weight_analysis_plan(
     vector_control_cache: dict[int, tuple[Any, tuple[int, ...] | None]] = {}
     vector_control_work_remaining = _ONNX_VECTOR_CONTROL_WORK_LIMIT
 
+    def raw_control_read_admitted(*, scalar: bool = False) -> bool:
+        if raw_control_admission is None or raw_control_admission.model is not model:
+            plan.coverage_gaps.setdefault("raw_control_provenance_missing", 1)
+            return False
+        allowed = raw_control_admission.scalars_bounded if scalar else raw_control_admission.vectors_bounded
+        if not allowed:
+            plan.coverage_gaps.setdefault(raw_control_admission.error_reason or "raw_control_payload_size_limit", 1)
+        return allowed
+
     def constant_int64_vector_values(initializer: Any | None) -> tuple[int, ...] | None:
         nonlocal vector_control_work_remaining
         if initializer is None:
@@ -2204,10 +2235,9 @@ def _build_onnx_weight_analysis_plan(
             if len(typed_values) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
                 plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
                 return None
-            # upb has no public pre-copy raw-size query: ByteSize serializes too.
-            # Read each retained source once, then validate before any decoding.
-            # This bounds repeated amplification, not the first payload copy.
             if raw_present:
+                if not raw_control_read_admitted():
+                    return None
                 raw_data = initializer.raw_data
                 if getattr(initializer, "external_data", ()) and not raw_data:
                     return None
@@ -2237,25 +2267,53 @@ def _build_onnx_weight_analysis_plan(
         if len(scalar_control_cache) >= _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
             plan.coverage_gaps.setdefault("control_value_work_limit", 1)
             return None
-        raw_dims = getattr(initializer, "dims", ())
-        value = None
-        if len(raw_dims) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
-            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
-        elif (
-            int(getattr(initializer, "data_type", -1)) == expected_data_type
-            and _onnx_inline_storage_nbytes(initializer) <= 8
-            and not _onnx_tensor_uses_external_storage(initializer, onnx=onnx)
-        ):
-            dims = tuple(int(dimension) for dimension in raw_dims)
-            if (_onnx_shape_extent_product(dims) if dims else 1) == 1:
-                pending = pending_constant_values.get(id(initializer))
-                if pending is not None and pending[0] is initializer:
-                    value = pending[1][0]
-                else:
-                    with suppress(Exception):
-                        value = onnx.numpy_helper.to_array(initializer).reshape(-1)[0].item()
         # Keep the immutable protobuf owner, including failed proofs, so repeated
         # queries neither decode again nor reuse an unrelated wrapper's id.
+        scalar_control_cache[key] = (initializer, None)
+        raw_dims = getattr(initializer, "dims", ())
+        if len(raw_dims) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+            return None
+        if (
+            int(getattr(initializer, "data_type", -1)) != expected_data_type
+            or expected_data_type not in {int(onnx.TensorProto.INT64), int(onnx.TensorProto.BOOL)}
+            or any(int(dimension) != 1 for dimension in raw_dims)
+            or getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL
+        ):
+            return None
+        pending = pending_constant_values.get(id(initializer))
+        if pending is not None and pending[0] is initializer:
+            value = pending[1][0]
+            scalar_control_cache[key] = (initializer, value)
+            return value
+        is_bool = expected_data_type == int(onnx.TensorProto.BOOL)
+        typed_field = "int32_data" if is_bool else "int64_data"
+        if any(
+            len(getattr(initializer, field_name, ()))
+            for field_name in ("float_data", "int32_data", "int64_data", "double_data", "uint64_data", "string_data")
+            if field_name != typed_field
+        ):
+            plan.coverage_gaps.setdefault("scalar_control_decode_failure", 1)
+            return None
+        try:
+            if initializer.HasField("segment"):
+                return None
+            typed_values: Any = getattr(initializer, typed_field, ())
+            if initializer.HasField("raw_data"):
+                if len(typed_values) or not raw_control_read_admitted(scalar=True):
+                    return None
+                raw_data = initializer.raw_data
+                if len(raw_data) != (1 if is_bool else 8):
+                    plan.coverage_gaps.setdefault("scalar_control_decode_failure", 1)
+                    return None
+                value = bool(raw_data[0]) if is_bool else int.from_bytes(raw_data, "little", signed=True)
+            else:
+                if getattr(initializer, "external_data", ()) or len(typed_values) != 1:
+                    return None
+                value = bool(typed_values[0]) if is_bool else int(typed_values[0])
+        except Exception:
+            plan.coverage_gaps.setdefault("scalar_control_decode_failure", 1)
+            return None
         scalar_control_cache[key] = (initializer, value)
         return value
 
@@ -3330,6 +3388,8 @@ def _build_onnx_weight_analysis_plan(
     reentry_shape_cache: dict[tuple[Any, ...], dict[int, tuple[int, ...]]] = {}
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
     reentry_attribute_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+    # Recursive graph/function visits share one finite-replay allowance.
+    exact_loop_replay_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
     reentry_external_context_shape_cache: dict[tuple[Any, ...], dict[str, tuple[int, ...]]] = {}
     graph_output_dependency_cache: dict[
         tuple[int, tuple[int, ...], tuple[tuple[str, str, str], ...]], frozenset[str]
@@ -4658,7 +4718,10 @@ def _build_onnx_weight_analysis_plan(
         if nodes_key not in graph_taint_nodes_cache:
             graph_taint_nodes_cache[nodes_key] = graph_nodes_in_dependency_order(subgraph, output_dependency_names)
         for body_node in graph_taint_nodes_cache[nodes_key]:
-            work = max(len(getattr(body_node, "input", ())) + len(getattr(body_node, "output", ())), 1)
+            # Admit the attribute inventory before resolving Constants or nested graphs.
+            work = max(len(getattr(body_node, "input", ())) + len(getattr(body_node, "output", ())), 1) + len(
+                getattr(body_node, "attribute", ())
+            )
             if work > graph_taint_work_remaining:
                 graph_taint_work_remaining = 0
                 graph_taint_in_progress.discard(cache_key)
@@ -5239,7 +5302,12 @@ def _build_onnx_weight_analysis_plan(
         live_node_ids = set(graph_nodes_producing_names(subgraph, live_names))
         node_output_is_live_after_node: dict[int, bool] = {}
         for body_node in reversed(body_nodes):
-            work = 1 + len(getattr(body_node, "input", ())) + len(getattr(body_node, "output", ()))
+            work = (
+                1
+                + len(getattr(body_node, "input", ()))
+                + len(getattr(body_node, "output", ()))
+                + len(getattr(body_node, "attribute", ()))
+            )
             if work > graph_taint_work_remaining:
                 graph_taint_work_remaining = 0
                 return finish(True)
@@ -5291,7 +5359,12 @@ def _build_onnx_weight_analysis_plan(
 
         tainted = {graph_input_name}
         for body_node in body_nodes:
-            work = 1 + len(getattr(body_node, "input", ())) + len(getattr(body_node, "output", ()))
+            work = (
+                1
+                + len(getattr(body_node, "input", ()))
+                + len(getattr(body_node, "output", ()))
+                + len(getattr(body_node, "attribute", ()))
+            )
             if work > graph_taint_work_remaining:
                 graph_taint_work_remaining = 0
                 return finish(True)
@@ -8808,7 +8881,6 @@ def _build_onnx_weight_analysis_plan(
                         count_cache[cache_key] = exact_count if exact_count <= max_count else None
                         return count_cache[cache_key]
 
-                    exact_loop_replay_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
                     exact_loop_replay_work_exhausted = False
                     nested_attribute_reference_cache: dict[
                         int,
@@ -12601,6 +12673,7 @@ def _build_onnx_weight_analysis_plan(
                     graph_output_rank = graph_output_ranks[graph_output_index]
                     graph_output_rank_proven = graph_output_proven_ranks[graph_output_index]
                     repeated_carried_state_rank_may_increase = False
+                    repeated_carried_state_rank_decreases = False
                     repeated_carried_state_input_may_feed_weight = False
                     scan_output_insert_axis = stacked_scan_output_insert_axis(
                         scan_output_axes,
@@ -12705,6 +12778,11 @@ def _build_onnx_weight_analysis_plan(
                             and repeated_state_fallback_reachability.get(id(subgraph)) is not False
                         )
                         if graph_output_rank != state_input_rank or sibling_state_shape_is_unproven:
+                            repeated_carried_state_rank_decreases = (
+                                graph_output_rank is not None
+                                and state_input_rank is not None
+                                and graph_output_rank < state_input_rank
+                            )
                             repeated_carried_state_rank_may_increase = (
                                 sibling_state_shape_is_unproven
                                 or graph_output_rank is None
@@ -12872,6 +12950,7 @@ def _build_onnx_weight_analysis_plan(
                     if (
                         (
                             repeated_carried_state_rank_may_increase
+                            or repeated_carried_state_rank_decreases
                             or graph_output_weight_lineage_gap_counts[graph_output_index]
                         )
                         and subgraph_state_input_name
@@ -12900,11 +12979,13 @@ def _build_onnx_weight_analysis_plan(
                             finite_loop_body_consumes_output_weight_gap = finite_loop_rank_bounds[0]
                             finite_loop_output_shape = finite_loop_rank_bounds[2]
                             finite_loop_output_rank = len(finite_loop_output_shape)
-                            if len(getattr(node, "input", ())) <= 3:
+                            if len(getattr(node, "input", ())) <= 3 and len(subgraph_results) == 1:
                                 graph_output_shape = finite_loop_output_shape
                                 graph_output_rank = finite_loop_output_rank
+                                graph_output_rank_proven = True
                                 subgraph_output_shapes[output_index] = finite_loop_output_shape
                                 subgraph_output_ranks[output_index] = finite_loop_output_rank
+                                subgraph_output_proven_ranks[output_index] = True
                                 subgraph_output_rank_seen[output_index] = True
                                 subgraph_output_rank_unknown[output_index] = False
                     recorded_future_body_gap = False
@@ -13020,11 +13101,13 @@ def _build_onnx_weight_analysis_plan(
                                 finite_loop_output_reaches_weight_rank = finite_loop_rank_bounds[1]
                                 finite_loop_output_shape = finite_loop_rank_bounds[2]
                                 finite_loop_output_rank = len(finite_loop_output_shape)
-                                if len(getattr(node, "input", ())) <= 3:
+                                if len(getattr(node, "input", ())) <= 3 and len(subgraph_results) == 1:
                                     graph_output_shape = finite_loop_output_shape
                                     graph_output_rank = finite_loop_output_rank
+                                    graph_output_rank_proven = True
                                     subgraph_output_shapes[output_index] = finite_loop_output_shape
                                     subgraph_output_ranks[output_index] = finite_loop_output_rank
+                                    subgraph_output_proven_ranks[output_index] = True
                                     subgraph_output_rank_seen[output_index] = True
                                     subgraph_output_rank_unknown[output_index] = False
                         if repeated_carried_state_rank_may_increase and finite_loop_output_reaches_weight_rank:
@@ -14668,6 +14751,9 @@ class _OnnxLiteModel:
 @dataclass
 class _OnnxStructureParseState:
     interrupt_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    # Strict duplicate rejection remains the structural scanner default.
+    merge_singular_messages: bool = False
+    raw_control_tensors: list[_OnnxLiteTensor] = field(default_factory=list, repr=False)
     omitted_raw_data_fields: int = 0
     omitted_raw_data_bytes: int = 0
     omitted_packed_varint_fields: int = 0
@@ -15000,11 +15086,16 @@ def _read_onnx_submessage(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
-    parser: Callable[[BinaryIO, int, _OnnxStructureParseState, int], Any],
+    parser: Callable[..., Any],
+    *,
+    existing: Any | None = None,
 ) -> Any:
     _ensure_onnx_parse_depth(depth + 1)
     _length, payload_end = _read_onnx_length_bounds(handle, end)
-    value = parser(handle, payload_end, state, depth + 1)
+    if existing is None:
+        value = parser(handle, payload_end, state, depth + 1)
+    else:
+        value = parser(handle, payload_end, state, depth + 1, existing=existing)
     handle.seek(payload_end)
     return value
 
@@ -15034,25 +15125,31 @@ def _parse_onnx_tensor(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
+    *,
+    existing: _OnnxLiteTensor | None = None,
 ) -> _OnnxLiteTensor:
     _ensure_onnx_parse_depth(depth)
-    state.record_retained_object()
+    if existing is None:
+        state.record_retained_object()
     state.tensor_count += 1
     if state.tensor_count > _ONNX_STRUCTURE_MAX_TENSORS:
         raise _OnnxStructureParseError(
             "tensor_count_limit_exceeded",
             f"ONNX tensor count exceeds limit ({_ONNX_STRUCTURE_MAX_TENSORS})",
         )
-    tensor = _OnnxLiteTensor()
+    tensor = existing if existing is not None else _OnnxLiteTensor()
+    if state.merge_singular_messages and existing is None:
+        state.record_retained_sequence_entry()
+        state.raw_control_tensors.append(tensor)
     counts = {
-        "float_data": 0,
-        "int32_data": 0,
-        "int64_data": 0,
-        "double_data": 0,
-        "uint64_data": 0,
+        "float_data": len(tensor.float_data),
+        "int32_data": len(tensor.int32_data),
+        "int64_data": len(tensor.int64_data),
+        "double_data": len(tensor.double_data),
+        "uint64_data": len(tensor.uint64_data),
     }
-    string_data_count = 0
-    string_data_bytes = 0
+    string_data_count = len(tensor.string_data)
+    string_data_bytes = sum(len(value) for value in tensor.string_data)
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.TensorProto")
         if field_number == 1:
@@ -15167,24 +15264,45 @@ def _parse_onnx_sparse_tensor(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
+    *,
+    existing: _OnnxLiteSparseTensor | None = None,
 ) -> _OnnxLiteSparseTensor:
     _ensure_onnx_parse_depth(depth)
-    state.record_retained_object(3)
-    sparse = _OnnxLiteSparseTensor()
+    if existing is None:
+        state.record_retained_object(3)
+    sparse = existing if existing is not None else _OnnxLiteSparseTensor()
+    if state.merge_singular_messages and existing is None:
+        for tensor in (sparse.values, sparse.indices):
+            state.record_retained_sequence_entry()
+            state.raw_control_tensors.append(tensor)
     seen_values = False
     seen_indices = False
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.SparseTensorProto")
         if field_number == 1 and wire_type == 2:
-            if seen_values:
+            if seen_values and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("SparseTensorProto.values")
             seen_values = True
-            sparse.values = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+            sparse.values = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_tensor,
+                existing=sparse.values if state.merge_singular_messages else None,
+            )
         elif field_number == 2 and wire_type == 2:
-            if seen_indices:
+            if seen_indices and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("SparseTensorProto.indices")
             seen_indices = True
-            sparse.indices = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+            sparse.indices = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_tensor,
+                existing=sparse.indices if state.merge_singular_messages else None,
+            )
         elif field_number == 3:
             if wire_type == 0:
                 _append_onnx_dimension(sparse.dims, _decode_int64_varint(_read_onnx_varint(handle, end)), state)
@@ -15223,13 +15341,13 @@ def _parse_onnx_attribute(
         elif field_number == 3 and wire_type == 0:
             attribute.i = _decode_int64_varint(_read_onnx_varint(handle, end))
         elif field_number == 5 and wire_type == 2:
-            if attribute.t is not None:
+            if attribute.t is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("AttributeProto.t")
-            attribute.t = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+            attribute.t = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor, existing=attribute.t)
         elif field_number == 6 and wire_type == 2:
-            if attribute.g is not None:
+            if attribute.g is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("AttributeProto.g")
-            attribute.g = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            attribute.g = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph, existing=attribute.g)
         elif field_number == 8:
             if wire_type == 0:
                 _append_onnx_sequence_value(
@@ -15273,9 +15391,11 @@ def _parse_onnx_attribute(
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 22 and wire_type == 2:
-            if attribute.sparse_tensor is not None:
+            if attribute.sparse_tensor is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("AttributeProto.sparse_tensor")
-            attribute.sparse_tensor = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_sparse_tensor)
+            attribute.sparse_tensor = _read_onnx_submessage(
+                handle, end, state, depth, _parse_onnx_sparse_tensor, existing=attribute.sparse_tensor
+            )
         elif field_number == 23 and wire_type == 2:
             _append_onnx_submessage_value(
                 attribute.sparse_tensors,
@@ -15374,16 +15494,19 @@ def _parse_onnx_graph(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
+    *,
+    existing: _OnnxLiteGraph | None = None,
 ) -> _OnnxLiteGraph:
     _ensure_onnx_parse_depth(depth)
-    state.record_retained_object()
+    if existing is None:
+        state.record_retained_object()
     state.graph_count += 1
     if state.graph_count > _ONNX_STRUCTURE_MAX_GRAPHS:
         raise _OnnxStructureParseError(
             "graph_count_limit_exceeded",
             f"ONNX graph count exceeds limit ({_ONNX_STRUCTURE_MAX_GRAPHS})",
         )
-    graph = _OnnxLiteGraph()
+    graph = existing if existing is not None else _OnnxLiteGraph()
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.GraphProto")
         if field_number == 1 and wire_type == 2:
@@ -15586,15 +15709,29 @@ def _parse_onnx_training_info(
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.TrainingInfoProto")
         if field_number == 1 and wire_type == 2:
-            if seen_initialization:
+            if seen_initialization and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("TrainingInfoProto.initialization")
             seen_initialization = True
-            training_info.initialization = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            training_info.initialization = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_graph,
+                existing=training_info.initialization if state.merge_singular_messages else None,
+            )
         elif field_number == 2 and wire_type == 2:
-            if seen_algorithm:
+            if seen_algorithm and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("TrainingInfoProto.algorithm")
             seen_algorithm = True
-            training_info.algorithm = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            training_info.algorithm = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_graph,
+                existing=training_info.algorithm if state.merge_singular_messages else None,
+            )
         elif field_number == 3 and wire_type == 2:
             _append_onnx_submessage_value(
                 training_info.initialization_binding,
@@ -15638,9 +15775,9 @@ def _parse_onnx_model(
         elif field_number == 2 and wire_type == 2:
             model.producer_name = _read_onnx_string(handle, end, state, field_name="producer_name")
         elif field_number == 7 and wire_type == 2:
-            if model._graph is not None:
+            if model._graph is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("ModelProto.graph")
-            model._graph = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            model._graph = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph, existing=model._graph)
         elif field_number == 8 and wire_type == 2:
             _append_onnx_submessage_value(
                 model.opset_import,
@@ -15677,6 +15814,178 @@ def _parse_onnx_model(
         else:
             _skip_onnx_unknown_field(handle, wire_type, end)
     return model
+
+
+class _OnnxSerializedInput:
+    """Seek over admitted immutable input; copy only explicit bounded reads."""
+
+    def __init__(self, data: bytes):
+        self._data = memoryview(data)
+        self._position = 0
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        origin = 0 if whence == os.SEEK_SET else self._position if whence == os.SEEK_CUR else len(self._data)
+        if whence not in {os.SEEK_SET, os.SEEK_CUR, os.SEEK_END}:
+            raise ValueError("Unsupported seek origin")
+        position = origin + offset
+        if not 0 <= position <= len(self._data):
+            raise ValueError("ONNX preflight seek exceeds input")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise ValueError("ONNX preflight requires an explicit read bound")
+        end = min(self._position + size, len(self._data))
+        value = self._data[self._position : end].tobytes()
+        self._position = end
+        return value
+
+
+def _onnx_raw_control_schema_supported() -> bool:
+    """Refuse a schema with tensor-bearing edges the wire parser cannot visit."""
+    traversed_fields = {
+        "onnx.ModelProto": {
+            7: ("onnx.GraphProto", False),
+            20: ("onnx.TrainingInfoProto", True),
+            25: ("onnx.FunctionProto", True),
+        },
+        "onnx.GraphProto": {
+            1: ("onnx.NodeProto", True),
+            5: ("onnx.TensorProto", True),
+            15: ("onnx.SparseTensorProto", True),
+        },
+        "onnx.NodeProto": {5: ("onnx.AttributeProto", True)},
+        "onnx.AttributeProto": {
+            5: ("onnx.TensorProto", False),
+            6: ("onnx.GraphProto", False),
+            10: ("onnx.TensorProto", True),
+            11: ("onnx.GraphProto", True),
+            22: ("onnx.SparseTensorProto", False),
+            23: ("onnx.SparseTensorProto", True),
+        },
+        "onnx.FunctionProto": {7: ("onnx.NodeProto", True), 11: ("onnx.AttributeProto", True)},
+        "onnx.TrainingInfoProto": {1: ("onnx.GraphProto", False), 2: ("onnx.GraphProto", False)},
+        "onnx.SparseTensorProto": {1: ("onnx.TensorProto", False), 2: ("onnx.TensorProto", False)},
+    }
+    try:
+        import onnx
+
+        pending = [onnx.ModelProto.DESCRIPTOR]
+        descriptors: dict[str, Any] = {}
+        parents: dict[str, set[str]] = {}
+        field_work = 0
+        while pending:
+            descriptor = pending.pop()
+            name = descriptor.full_name
+            if name in descriptors:
+                continue
+            if len(descriptors) >= 1024:
+                return False
+            descriptors[name] = descriptor
+            for proto_field in descriptor.fields:
+                field_work += 1
+                if field_work > 8192:
+                    return False
+                child = proto_field.message_type
+                if child is not None:
+                    parents.setdefault(child.full_name, set()).add(name)
+                    pending.append(child)
+        if "onnx.TensorProto" not in descriptors:
+            return False
+        tensor_fields = descriptors["onnx.TensorProto"].fields_by_number
+        # Protobuf descriptor kinds: INT64=3, INT32=5, BYTES=12.
+        for number, kind, repeated in ((1, 3, True), (2, 5, False), (9, 12, False)):
+            proto_field = tensor_fields[number]
+            if proto_field.type != kind or _onnx_proto_field_is_repeated(proto_field) != repeated:
+                return False
+        tensor_bearing = {"onnx.TensorProto"}
+        pending_names = ["onnx.TensorProto"]
+        while pending_names:
+            for parent in parents.get(pending_names.pop(), ()):
+                if parent not in tensor_bearing:
+                    tensor_bearing.add(parent)
+                    pending_names.append(parent)
+        for name in tensor_bearing:
+            for proto_field in descriptors[name].fields:
+                child = proto_field.message_type
+                if child is not None and child.full_name in tensor_bearing:
+                    edge = (child.full_name, _onnx_proto_field_is_repeated(proto_field))
+                    if traversed_fields.get(name, {}).get(proto_field.number) != edge:
+                        return False
+        return True
+    except Exception:
+        return False
+
+
+def _preflight_onnx_raw_controls(
+    data: bytes,
+    *,
+    interrupt_check: Callable[[], None] | None = None,
+) -> tuple[bool, bool, str | None]:
+    """Certify raw-control lengths without accessing protobuf payload fields.
+
+    Check final merged tensor metadata, including fragments that had no dtype
+    or dimensions when encountered. This is not a certificate for other raw
+    readers or for a different/mutated ModelProto.
+    """
+    if type(data) is not bytes:
+        return False, False, "raw_control_preflight_failed"
+    if not _onnx_raw_control_schema_supported():
+        return False, False, "raw_control_schema_unsupported"
+    state = _OnnxStructureParseState(
+        interrupt_check=interrupt_check,
+        merge_singular_messages=True,
+    )
+    handle = _OnnxSerializedInput(data)
+    try:
+        _parse_onnx_model(cast(BinaryIO, handle), len(data), state, 0)
+        if handle.tell() != len(data) or state.coverage_gaps:
+            return False, False, "raw_control_preflight_failed"
+        vectors_bounded = True
+        scalars_bounded = True
+        for tensor in state.raw_control_tensors:
+            state.check_interrupted()
+            if not isinstance(tensor.raw_data, _OnnxOmittedBytes):
+                continue
+            raw_length = len(tensor.raw_data)
+            # ONNX TensorProto enum values are stable: INT64=7 and BOOL=9.
+            if (
+                tensor.data_type == 7
+                and len(tensor.dims) == 1
+                and 0 <= tensor.dims[0] <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+                and raw_length > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
+            ):
+                vectors_bounded = False
+            if (
+                tensor.data_type in {7, 9}
+                and len(tensor.dims) <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+                and all(dimension == 1 for dimension in tensor.dims)
+                and raw_length > 8
+            ):
+                scalars_bounded = False
+        return vectors_bounded, scalars_bounded, None
+    except Exception:
+        return False, False, "raw_control_preflight_failed"
+
+
+def _load_onnx_model_with_control_admission(
+    data: bytes,
+    *,
+    onnx: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> tuple[Any, _OnnxRawControlAdmission]:
+    """Load binary ONNX and bind control admission to the same byte snapshot."""
+    if type(data) is not bytes:
+        raise TypeError("ONNX control admission requires an immutable bytes snapshot")
+    vectors_bounded, scalars_bounded, error_reason = _preflight_onnx_raw_controls(data, interrupt_check=interrupt_check)
+    if interrupt_check is not None:
+        interrupt_check()
+    model = onnx.load_model_from_string(data)
+    return model, _OnnxRawControlAdmission(model, vectors_bounded, scalars_bounded, error_reason)
 
 
 def _load_onnx_structure_file_backed(
@@ -16096,6 +16405,7 @@ class OnnxScanner(BaseScanner):
             self.check_interrupted()
             file_backed_parse_state: _OnnxStructureParseState | None = None
             in_memory_unknown_field_bytes_discarded = 0
+            raw_control_admission: _OnnxRawControlAdmission | None = None
             model: Any
             if model_data is None:
                 model, file_backed_parse_state = _load_onnx_structure_file_backed(
@@ -16106,7 +16416,9 @@ class OnnxScanner(BaseScanner):
                 )
                 result.metadata["onnx_structure_parse"] = file_backed_parse_state.metadata()
             else:
-                model = onnx.load_model_from_string(model_data)
+                model, raw_control_admission = _load_onnx_model_with_control_admission(
+                    model_data, onnx=onnx, interrupt_check=self.check_interrupted
+                )
                 result.metadata["onnx_structure_parse"] = {"parse_mode": "in_memory_model_proto"}
                 in_memory_unknown_field_bytes_discarded = _discard_onnx_unknown_field_bytes(model)
             # Check for interrupts after loading completes.
@@ -16505,7 +16817,7 @@ class OnnxScanner(BaseScanner):
                 },
             )
         else:
-            self._check_weight_distribution(model, path, result)
+            self._check_weight_distribution(model, path, result, raw_control_admission=raw_control_admission)
 
         _finish_scan_result(result)
         return result
@@ -17260,7 +17572,14 @@ class OnnxScanner(BaseScanner):
                 },
             )
 
-    def _check_weight_distribution(self, model: Any, path: str, result: ScanResult) -> None:
+    def _check_weight_distribution(
+        self,
+        model: Any,
+        path: str,
+        result: ScanResult,
+        *,
+        raw_control_admission: _OnnxRawControlAdmission | None = None,
+    ) -> None:
         """Run bounded semantic weight analysis over eligible ONNX initializers."""
         try:
             import numpy as np
@@ -17291,6 +17610,7 @@ class OnnxScanner(BaseScanner):
             onnx=onnx,
             np=np,
             max_array_size=max_array_size,
+            raw_control_admission=raw_control_admission,
             pre_materialization_check=inline_storage_fits_budget,
             pre_view_check=lambda name, nbytes: wd_scanner._tensor_fits_budget(
                 "onnx_initializer_size_limit", name, tensor_nbytes=nbytes
