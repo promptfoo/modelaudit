@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -2410,7 +2410,7 @@ def test_text_scanner_reuses_quote_analysis_across_many_links(tmp_path: Path, as
 
 
 def test_documentation_quote_index_retains_compact_read_only_storage() -> None:
-    context = b';a=""' * ((2 * 256 * 1024) // 5)
+    context = b';a=""\n' * ((2 * 256 * 1024) // 6)
     TextScanner._documentation_quoted_assignment_index.cache_clear()
     positions, starts = TextScanner._documentation_quoted_assignment_index(context)
     assert positions.readonly and starts.readonly
@@ -2418,6 +2418,104 @@ def test_documentation_quote_index_retains_compact_read_only_storage() -> None:
     assert positions.nbytes + starts.nbytes <= 4 * len(context) + 32
     assert TextScanner._documentation_has_open_quoted_assignment(context, 0, 4)
     assert not TextScanner._documentation_has_open_quoted_assignment(context, 0, 5)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_index_skips_tokenization_without_assignments(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_tokenization(_readline: Callable[[], str]) -> Iterator[text_scanner_module.tokenize.TokenInfo]:
+        raise AssertionError("A window without assignment candidates must not be tokenized")
+
+    monkeypatch.setattr(text_scanner_module.tokenize, "generate_tokens", unexpected_tokenization)
+    source = b"Z " + b" " * (2 * 256 * 1024 - 32) + b"` [guide]"
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(0)
+    try:
+        assert not TextScanner._documentation_has_open_quoted_assignment(source)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.reset(budget_token)
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_index_bounds_repeated_tokenizer_line_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = b"Z " + b" " * 2048 + b"` ;b='text'"
+    original = text_scanner_module.tokenize.generate_tokens
+    emitted = 0
+
+    def counted(readline: Callable[[], str]) -> Iterator[text_scanner_module.tokenize.TokenInfo]:
+        nonlocal emitted
+        for item in original(readline):
+            emitted += 1
+            yield item
+
+    monkeypatch.setattr(text_scanner_module.tokenize, "generate_tokens", counted)
+    monkeypatch.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 3 * len(source))
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    with pytest.raises(text_scanner_module._DocumentationQuoteBudgetExceeded):
+        TextScanner._documentation_quoted_assignment_index(source)
+    assert 0 < emitted <= 3
+    assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 0
+
+
+def test_documentation_quote_budget_is_shared_and_does_not_cache_failures() -> None:
+    first = b'a="first'
+    second = b'b="second'
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(len(first))
+    try:
+        assert TextScanner._documentation_has_open_quoted_assignment(first)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+        assert TextScanner._documentation_has_open_quoted_assignment(first)
+        with pytest.raises(text_scanner_module._DocumentationQuoteBudgetExceeded):
+            TextScanner._documentation_has_open_quoted_assignment(second)
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 1
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(len(second))
+        assert TextScanner._documentation_has_open_quoted_assignment(second)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.reset(budget_token)
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "content,completed_exit_code",
+    [
+        ('The literal "; b=\'text" is described by [guide](https://docs.example.com)\n', 0),
+        ('endpoint="[download](https://evil.example/payload.sh)"\n', 1),
+    ],
+)
+def test_text_scanner_quote_limit_retains_findings_and_is_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str, completed_exit_code: int
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(content)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    cache_dir = tmp_path / "cache"
+    with monkeypatch.context() as limited, IsolatedCacheManager(reset_cache_manager):
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 0)
+        result = TextScanner(config={"check_secrets": False}).scan(str(path))
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+        assert any(
+            check.name == "Text Content Security Coverage"
+            and check.message == "Text network finding classification exceeded the work limit"
+            and check.details.get("classification_limit_sources") == ["documentation_quote_context"]
+            and check.details.get("max_documentation_quote_parse_work") == 0
+            for check in result.checks
+        )
+        assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() is None
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == completed_exit_code
     TextScanner._documentation_quoted_assignment_index.cache_clear()
 
 

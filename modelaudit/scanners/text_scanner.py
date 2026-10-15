@@ -178,13 +178,19 @@ MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 MAX_DOCUMENTATION_CALL_PARSE_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_DOCUMENTATION_CALL_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 4
 MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES = 8 * 1024 * 1024
+MAX_DOCUMENTATION_QUOTE_PARSE_WORK = 8 * 1024 * 1024
 
 
 class _DocumentationCallBudgetExceeded(Exception):
-    pass
+    limit_source = "documentation_call_context"
+
+
+class _DocumentationQuoteBudgetExceeded(Exception):
+    limit_source = "documentation_quote_context"
 
 
 _DOCUMENTATION_CALL_BUDGET: ContextVar[int | None] = ContextVar("documentation_call_budget", default=None)
+_DOCUMENTATION_QUOTE_BUDGET: ContextVar[int | None] = ContextVar("documentation_quote_budget", default=None)
 _DOCUMENTATION_QUOTE_WINDOWS: ContextVar[tuple[bytes, dict[int, tuple[memoryview, memoryview]]] | None] = ContextVar(
     "documentation_quote_windows", default=None
 )
@@ -1434,7 +1440,19 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _documentation_string_literal_spans(context: bytes) -> tuple[tuple[int, int], ...]:
+    def _documentation_string_literal_spans(context: bytes, last_assignment_start: int) -> tuple[tuple[int, int], ...]:
+        remaining_work = MAX_DOCUMENTATION_QUOTE_PARSE_WORK
+
+        def charge_work(amount: int) -> None:
+            nonlocal remaining_work
+            shared = _DOCUMENTATION_QUOTE_BUDGET.get()
+            if amount > remaining_work or (shared is not None and amount > shared):
+                raise _DocumentationQuoteBudgetExceeded
+            remaining_work -= amount
+            if shared is not None:
+                _DOCUMENTATION_QUOTE_BUDGET.set(shared - amount)
+
+        charge_work(len(context))
         try:
             source = context.decode("utf-8")
         except UnicodeDecodeError:
@@ -1448,10 +1466,18 @@ class TextScanner(BaseScanner):
         spans: list[tuple[int, int]] = []
         try:
             for item in tokenize.generate_tokens(io.StringIO(source).readline):
+                if item.type == token.ENDMARKER:
+                    break
+                end = lines[item.end[0] - 1] + item.end[1]
+                byte_end = byte_offsets[end] if byte_offsets is not None else end
                 if item.type == token.STRING:
                     start = lines[item.start[0] - 1] + item.start[1]
-                    end = lines[item.end[0] - 1] + item.end[1]
-                    spans.append((byte_offsets[start], byte_offsets[end]) if byte_offsets is not None else (start, end))
+                    spans.append((byte_offsets[start] if byte_offsets is not None else start, byte_end))
+                if byte_end > last_assignment_start:
+                    break
+                # Python's tokenizer can rescan a long line for each error token.
+                # Charge its line length before asking for another token.
+                charge_work(len(item.line.encode("utf-8")))
         except (IndentationError, SyntaxError, tokenize.TokenError):
             pass  # Only complete literals proved before the tokenizer stopped can suppress nested assignments.
         return tuple(spans)
@@ -1490,7 +1516,14 @@ class TextScanner(BaseScanner):
     @staticmethod
     @lru_cache(maxsize=4)
     def _documentation_quoted_assignment_index(context: bytes) -> tuple[memoryview, memoryview]:
-        literals = TextScanner._documentation_string_literal_spans(context)
+        positions = array("I", [0])
+        starts = array("i", [-1])
+        last_assignment_start = -1
+        for candidate in DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(context):
+            last_assignment_start = candidate.start()
+        if last_assignment_start < 0:
+            return memoryview(positions).toreadonly(), memoryview(starts).toreadonly()
+        literals = TextScanner._documentation_string_literal_spans(context, last_assignment_start)
         literal_starts = [start for start, _end in literals]
 
         def nested_in_literal(position: int) -> bool:
@@ -1503,8 +1536,6 @@ class TextScanner(BaseScanner):
             if not nested_in_literal(match.start())
         )
         following = next(matches, None)
-        positions = array("I", [0])
-        starts = array("i", [-1])
         if following is None:
             return memoryview(positions).toreadonly(), memoryview(starts).toreadonly()
         # Keep the most recent still-open assignment for each quote/escape state.
@@ -3109,7 +3140,7 @@ class TextScanner(BaseScanner):
                 return all(
                     cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
                 ) and cls._documentation_network_token_lines_are_passive(payload)
-            except _DocumentationCallBudgetExceeded:
+            except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded):
                 return False
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
@@ -3706,9 +3737,9 @@ class TextScanner(BaseScanner):
                         remaining_occurrences,
                         index == last_retargetable_index,
                     )
-                except _DocumentationCallBudgetExceeded:
+                except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True
-                    classification_limit_sources.add("documentation_call_context")
+                    classification_limit_sources.add(error.limit_source)
                     classified_findings.append(finding)
                     continue
                 classification_incomplete = classification_incomplete or retarget_incomplete
@@ -3743,9 +3774,9 @@ class TextScanner(BaseScanner):
                 ):
                     classification_incomplete = True
                     classification_limit_sources.add("documentation_call_context")
-            except _DocumentationCallBudgetExceeded:
+            except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                 classification_incomplete = True
-                classification_limit_sources.add("documentation_call_context")
+                classification_limit_sources.add(error.limit_source)
             classified_findings.append(finding)
         return classified_findings, classification_incomplete, classification_limit_sources
 
@@ -3827,9 +3858,11 @@ class TextScanner(BaseScanner):
     def _run_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
         budget_token = _DOCUMENTATION_CALL_BUDGET.set(MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES)
         quote_windows_token = _DOCUMENTATION_QUOTE_WINDOWS.set(None)
+        quote_budget_token = _DOCUMENTATION_QUOTE_BUDGET.set(MAX_DOCUMENTATION_QUOTE_PARSE_WORK)
         try:
             return self._run_bounded_content_security_checks(path, result, file_size)
         finally:
+            _DOCUMENTATION_QUOTE_BUDGET.reset(quote_budget_token)
             _DOCUMENTATION_QUOTE_WINDOWS.reset(quote_windows_token)
             _DOCUMENTATION_CALL_BUDGET.reset(budget_token)
 
@@ -3972,6 +4005,10 @@ class TextScanner(BaseScanner):
                         )
                         classification_details["max_documentation_total_call_parse_bytes"] = (
                             MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES
+                        )
+                    if "documentation_quote_context" in classification_limit_sources:
+                        classification_details["max_documentation_quote_parse_work"] = (
+                            MAX_DOCUMENTATION_QUOTE_PARSE_WORK
                         )
                     self._mark_content_security_scan_incomplete(
                         result,
