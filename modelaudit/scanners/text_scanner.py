@@ -10,6 +10,7 @@ import token
 import tokenize
 from array import array
 from bisect import bisect_right
+from collections.abc import Iterator
 from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, ClassVar
@@ -184,6 +185,9 @@ class _DocumentationCallBudgetExceeded(Exception):
 
 
 _DOCUMENTATION_CALL_BUDGET: ContextVar[int | None] = ContextVar("documentation_call_budget", default=None)
+_DOCUMENTATION_QUOTE_WINDOWS: ContextVar[tuple[bytes, dict[int, tuple[memoryview, memoryview]]] | None] = ContextVar(
+    "documentation_quote_windows", default=None
+)
 
 
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
@@ -1453,6 +1457,24 @@ class TextScanner(BaseScanner):
         return tuple(spans)
 
     @staticmethod
+    def _documentation_closed_inline_code_spans(context: bytes) -> Iterator[tuple[int, int]]:
+        markers = re.finditer(rb"`+", context)
+        for opening in markers:
+            if opening.start() > 0 and context[opening.start() - 1] == ord("\\"):
+                continue
+            previous_end = opening.end()
+            for closing in markers:
+                if (
+                    context.find(b"\n", previous_end, closing.start()) >= 0
+                    or context.find(b"\r", previous_end, closing.start()) >= 0
+                ):
+                    break
+                if closing.end() - closing.start() == opening.end() - opening.start():
+                    yield opening.start(), closing.end()
+                    break
+                previous_end = closing.end()
+
+    @staticmethod
     @lru_cache(maxsize=4)
     def _documentation_quoted_assignment_index(context: bytes) -> tuple[memoryview, memoryview]:
         literals = TextScanner._documentation_string_literal_spans(context)
@@ -1475,7 +1497,12 @@ class TextScanner(BaseScanner):
         # Keep the most recent still-open assignment for each quote/escape state.
         # A pending single quote can reopen only when the next quote doubles it.
         states = dict.fromkeys(b"\"'`", (-1, -1))
+        inline_spans = TextScanner._documentation_closed_inline_code_spans(context)
+        inline_span = next(inline_spans, None)
+        reset_after_inline = False
         for position, value in enumerate(context, 1):
+            if inline_span is not None and position - 1 == inline_span[0]:
+                reset_after_inline = all(opened < 0 and pending < 0 for opened, pending in states.values())
             for quote, (opened, pending) in states.items():
                 if quote == ord("'"):
                     states[quote] = (
@@ -1494,7 +1521,14 @@ class TextScanner(BaseScanner):
                 if context[assignment_start] in b"\r\n{[(,;":
                     assignment_start += 1
                 states[quote] = max(opened, assignment_start), pending
+                if inline_span is not None and assignment_start < inline_span[0]:
+                    reset_after_inline = False
                 following = next(matches, None)
+            if inline_span is not None and position == inline_span[1]:
+                if reset_after_inline:
+                    # An inline example cannot leave a synthetic assignment open in later prose.
+                    states = dict.fromkeys(states, (-1, -1))
+                inline_span = next(inline_spans, None)
             latest = max(
                 max(opened, pending) if quote != ord("'") else opened for quote, (opened, pending) in states.items()
             )
@@ -1511,8 +1545,16 @@ class TextScanner(BaseScanner):
         # the existing 256 KiB lookback, including across a window boundary.
         window = MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES
         origin = start // window * window
-        context = source[origin : origin + 2 * window]
-        positions, starts = cls._documentation_quoted_assignment_index(context)
+        shared = _DOCUMENTATION_QUOTE_WINDOWS.get()
+        if shared is not None and shared[0] is source:
+            windows = shared[1]
+            if origin not in windows:
+                windows[origin] = cls._documentation_quoted_assignment_index(source[origin : origin + 2 * window])
+                if len(windows) > 4:
+                    del windows[next(iter(windows))]
+            positions, starts = windows[origin]
+        else:
+            positions, starts = cls._documentation_quoted_assignment_index(source[origin : origin + 2 * window])
         index = bisect_right(positions, end - origin) - 1
         if starts[index] >= start - origin:
             return True
@@ -3771,9 +3813,11 @@ class TextScanner(BaseScanner):
 
     def _run_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
         budget_token = _DOCUMENTATION_CALL_BUDGET.set(MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES)
+        quote_windows_token = _DOCUMENTATION_QUOTE_WINDOWS.set(None)
         try:
             return self._run_bounded_content_security_checks(path, result, file_size)
         finally:
+            _DOCUMENTATION_QUOTE_WINDOWS.reset(quote_windows_token)
             _DOCUMENTATION_CALL_BUDGET.reset(budget_token)
 
     def _run_bounded_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
@@ -3809,6 +3853,7 @@ class TextScanner(BaseScanner):
         truncated = len(payload) > read_limit
         inspected_payload = payload[:read_limit]
         inspected_bytes = len(inspected_payload)
+        _DOCUMENTATION_QUOTE_WINDOWS.set((inspected_payload, {}))
 
         detector_incomplete = False
         if check_secrets:

@@ -2267,7 +2267,16 @@ def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionabl
 
 @pytest.mark.parametrize(
     "prefix",
-    ['The literal "; b=\'text"', "The literal '; b=\"text'", '文字列 "; b=\'text"'],
+    [
+        'The literal "; b=\'text"',
+        "The literal '; b=\"text'",
+        '文字列 "; b=\'text"',
+        "The literal `; b='text`",
+        'The literal ``; b="text``',
+        "The literal ```; b='text```",
+        "文字列 `; b='text`",
+        "The literal ``; b='text ` nested``",
+    ],
 )
 def test_text_scanner_quoted_prose_assignment_is_informational(tmp_path: Path, prefix: str) -> None:
     _assert_model_card_endpoint_informational(tmp_path, prefix + " is described by [guide](https://docs.example.com)\n")
@@ -2278,6 +2287,82 @@ def test_text_scanner_assignment_after_quoted_literal_remains_actionable(tmp_pat
     _assert_model_card_payload_endpoint_actionable(
         tmp_path, prefix + 'endpoint="' + "x" * 8192 + '[download](https://evil.example/payload.sh)"\n'
     )
+
+
+@pytest.mark.parametrize(
+    "prefix,suffix",
+    [
+        ("The literal `; b='", "`"),
+        ("The literal ``; b='", "``"),
+        ("The literal `; b='", ""),
+        ("The literal ``; b='text` ", ""),
+        ("The literal \\`; b='text` ", ""),
+        ("The literal `; b='text` is shown; endpoint='", "'"),
+        ("endpoint=\"text `; b='text` ", '"'),
+    ],
+)
+def test_text_scanner_inline_code_does_not_hide_real_assignment_values(
+    tmp_path: Path, prefix: str, suffix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + "[download](https://evil.example/payload.sh)" + suffix + "\n"
+    )
+
+
+def test_documentation_quote_windows_reuse_indexes_without_copying_and_preserve_source_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = b"plain\n" * 100_000
+    original = TextScanner._documentation_quoted_assignment_index
+    indexed_sizes: list[int] = []
+
+    def record_index(context: bytes) -> tuple[memoryview, memoryview]:
+        indexed_sizes.append(len(context))
+        return original(context)
+
+    monkeypatch.setattr(TextScanner, "_documentation_quoted_assignment_index", staticmethod(record_index))
+    windows: dict[int, tuple[memoryview, memoryview]] = {}
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set((source, windows))
+    try:
+        for index in range(1024):
+            start = index * 6
+            assert not TextScanner._documentation_has_open_quoted_assignment(source, start, start + 5)
+        assert indexed_sizes == [2 * 256 * 1024]
+        other_source = b'endpoint="[download]'
+        assert TextScanner._documentation_has_open_quoted_assignment(other_source)
+        assert indexed_sizes == [2 * 256 * 1024, len(other_source)]
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
+
+
+def test_documentation_quote_windows_are_bounded() -> None:
+    source = b"plain\n" * 300_000
+    windows: dict[int, tuple[memoryview, memoryview]] = {}
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set((source, windows))
+    try:
+        for index in range(6):
+            start = (index * 256 * 1024) // 6 * 6
+            assert not TextScanner._documentation_has_open_quoted_assignment(source, start, start + 5)
+        assert len(windows) == 4
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
+
+
+@pytest.mark.parametrize("fail_detector", [False, True])
+def test_text_scanner_releases_quote_windows_after_scan(tmp_path: Path, fail_detector: bool) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("See [guide](https://docs.example.com)\n")
+    scanner_type = _FailingNetworkDetectorTextScanner if fail_detector else TextScanner
+    scanner = scanner_type(config={"check_secrets": False})
+    parent_context: tuple[bytes, dict[int, tuple[memoryview, memoryview]]] = (b"parent", {})
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set(parent_context)
+    try:
+        result = scanner.scan(str(path))
+        assert result.success is not fail_detector
+        assert text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.get() is parent_context
+        assert parent_context[1] == {}
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
 
 
 @pytest.mark.parametrize("assigned", [False, True])
