@@ -1559,7 +1559,8 @@ class WeightDistributionScanner(BaseScanner):
                 )
             else:
                 # Preserve ONNX's public format selection for private nonbinary
-                # callers. Raw controls explicitly lack binary-wire admission.
+                # callers. Raw tensor controls and attribute-string proofs lack
+                # binary-wire admission and remain explicitly inconclusive.
                 model = onnx.load_model_from_string(model_data, format=selected_format)
             del model_data
 

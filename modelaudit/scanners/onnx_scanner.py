@@ -176,7 +176,7 @@ _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_RUNTIME_INPUT_TYPE_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
-_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
+_ONNX_EINSUM_EQUATION_MAX_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_EINSUM_EQUATION_BYTE_LIMIT = 4 * _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_EINSUM_EQUATION_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_VECTOR_CONTROL_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -1887,12 +1887,19 @@ def _onnx_opaque_activation_input_candidate(node: Any, _input_index: int) -> boo
     return getattr(node, "domain", "") == "ai.onnx.ml"
 
 
+@dataclass
+class _OnnxAttributeStringPreflight:
+    # None means no complete wire provenance, including a refused prefix.
+    lengths: list[int | None] | None = None
+
+
 @dataclass(frozen=True)
 class _OnnxRawControlAdmission:
     """Private proof bound to a model loaded from the preflighted byte snapshot.
 
-    Until analysis completes, callers must preserve tensor membership, dtypes,
-    dimensions, and raw bytes; loading external data invalidates this proof.
+    Until analysis completes, callers must preserve graph/attribute membership,
+    attribute strings, tensor membership, dtypes, dimensions, and raw bytes;
+    loading external data invalidates this proof.
     Renaming tensors and discarding unknown fields preserve these invariants.
     This is an internal loader contract, not permission to certify arbitrary
     mutable ModelProto instances supplied by callers.
@@ -1902,6 +1909,7 @@ class _OnnxRawControlAdmission:
     vectors_bounded: bool
     scalars_bounded: bool
     error_reason: str | None = None
+    string_attribute_lengths: dict[int, tuple[Any, int]] = field(default_factory=dict)
 
 
 def _build_onnx_weight_analysis_plan(
@@ -5845,6 +5853,36 @@ def _build_onnx_weight_analysis_plan(
         graph_external_reference_cache[cache_key] = (graph, reference_names)
         return reference_names
 
+    def attribute_string_payload_size(attribute: Any) -> int | None:
+        if raw_control_admission is not None and raw_control_admission.model is model:
+            entry = raw_control_admission.string_attribute_lengths.get(id(attribute))
+            if entry is not None and entry[0] is attribute:
+                return entry[1]
+        plan.coverage_gaps.setdefault("attribute_string_provenance_missing", 1)
+        return None
+
+    padding_mode_cache: dict[int, tuple[Any, bytes | None]] = {}
+
+    def parsed_padding_mode(attribute: Any) -> bytes | None:
+        cached = padding_mode_cache.get(id(attribute))
+        if cached is not None and cached[0] is attribute:
+            return cached[1]
+        # Share the existing plan-wide attribute allowance, including refusals.
+        if not reserve_function_default_work(1):
+            return None
+        padding_mode_cache[id(attribute)] = (attribute, None)
+        payload_size = attribute_string_payload_size(attribute)
+        if payload_size is None:
+            return None
+        if payload_size > 10:  # The longest supported enum is SAME_UPPER/LOWER.
+            plan.coverage_gaps.setdefault("padding_mode_byte_limit", 1)
+            return None
+        value: bytes = attribute.s
+        if value not in {b"", b"NOTSET", b"VALID", b"SAME_UPPER", b"SAME_LOWER"}:
+            return None
+        padding_mode_cache[id(attribute)] = (attribute, value)
+        return value
+
     einsum_equation_cache: dict[int, tuple[Any, tuple[tuple[str, ...], str] | None]] = {}
     einsum_equation_work_remaining = _ONNX_EINSUM_EQUATION_WORK_LIMIT
     einsum_equation_bytes_remaining = _ONNX_EINSUM_EQUATION_BYTE_LIMIT
@@ -5857,7 +5895,7 @@ def _build_onnx_weight_analysis_plan(
         if einsum_equation_work_remaining <= 0:
             plan.coverage_gaps.setdefault("einsum_equation_work_limit", 1)
             return None
-        if einsum_equation_bytes_remaining <= 0 or _ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES <= 0:
+        if einsum_equation_bytes_remaining <= 0 or _ONNX_EINSUM_EQUATION_MAX_BYTES <= 0:
             einsum_equation_work_remaining -= 1
             einsum_equation_cache[id(node)] = (node, None)
             plan.coverage_gaps.setdefault("einsum_equation_byte_limit", 1)
@@ -5877,27 +5915,17 @@ def _build_onnx_weight_analysis_plan(
         attribute = next((item for item in attributes if item.name == "equation"), None)
         if attribute is None or int(getattr(attribute, "type", 0)) != int(onnx.AttributeProto.STRING):
             return None
-        try:
-            byte_size = getattr(attribute, "ByteSize", None)
-            if not callable(byte_size):
-                raise ValueError("Equation attribute size is unavailable")
-            serialized_size = int(byte_size())
-            if serialized_size < 0:
-                raise ValueError("Equation attribute size is invalid")
-        except Exception:
-            plan.coverage_gaps.setdefault("einsum_equation_decode_failure", 1)
-            return None
-        if (
-            serialized_size > _ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES
-            or serialized_size > einsum_equation_bytes_remaining
-        ):
-            plan.coverage_gaps.setdefault("einsum_equation_byte_limit", 1)
-            return None
-        # AttributeProto.s can materialize a fresh bytes object. Reserve its
-        # serialized upper bound before field access, decoding or normalization.
-        einsum_equation_bytes_remaining -= serialized_size
         if getattr(attribute, "ref_attr_name", "") or not _onnx_has_singular_field(attribute, "s"):
             return None
+        payload_size = attribute_string_payload_size(attribute)
+        if payload_size is None:
+            return None
+        if payload_size > _ONNX_EINSUM_EQUATION_MAX_BYTES or payload_size > einsum_equation_bytes_remaining:
+            plan.coverage_gaps.setdefault("einsum_equation_byte_limit", 1)
+            return None
+        # The exact final wire-field length admits the allocating protobuf getter.
+        # Message ByteSize can itself serialize unrelated payloads on upb.
+        einsum_equation_bytes_remaining -= payload_size
         try:
             equation_bytes = bytes(attribute.s)
             equation = equation_bytes.decode("utf-8")
@@ -7953,7 +7981,7 @@ def _build_onnx_weight_analysis_plan(
                 if resolved is None:
                     return False
                 if attribute.name == "auto_pad":
-                    if resolved.s not in {b"", b"NOTSET", b"VALID"}:
+                    if parsed_padding_mode(resolved) not in {b"", b"NOTSET", b"VALID"}:
                         return False
                 elif len(resolved.ints) > 2 * _ONNX_WEIGHT_RESHAPE_RANK_LIMIT or any(resolved.ints):
                     return False
@@ -8013,9 +8041,12 @@ def _build_onnx_weight_analysis_plan(
                         explicit_pads = True
                 elif attribute.name == "auto_pad":
                     resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.STRING), "s")
-                    if resolved is None or resolved.s not in {b"", b"NOTSET", b"VALID", b"SAME_UPPER", b"SAME_LOWER"}:
+                    if resolved is None:
                         return False
-                    padding_mode = resolved.s
+                    mode = parsed_padding_mode(resolved)
+                    if mode is None:
+                        return False
+                    padding_mode = mode
                 elif attribute.name == "ceil_mode":
                     resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INT), "i")
                     if resolved is None or int(resolved.i) not in {0, 1}:
@@ -14704,6 +14735,7 @@ class _OnnxLiteValueInfo:
 @dataclass
 class _OnnxLiteAttribute:
     name: str = ""
+    string_payload_length: int | None = None
     ref_attr_name: str = ""
     i: int = 0
     ints: list[int] = field(default_factory=list)
@@ -15381,6 +15413,10 @@ def _parse_onnx_attribute(
             attribute.ref_attr_name = _read_onnx_string(handle, end, state, field_name="attribute_ref_name")
         elif field_number == 3 and wire_type == 0:
             attribute.i = _decode_int64_varint(_read_onnx_varint(handle, end))
+        elif field_number == 4 and wire_type == 2:
+            # Singular bytes use the final occurrence, without reading payloads.
+            attribute.string_payload_length, payload_end = _read_onnx_length_bounds(handle, end)
+            handle.seek(payload_end)
         elif field_number == 5 and wire_type == 2:
             if attribute.t is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("AttributeProto.t")
@@ -15962,10 +15998,47 @@ def _onnx_raw_control_schema_supported() -> bool:
         return False
 
 
+def _iter_onnx_attribute_owners(model: Any, interrupt_check: Callable[[], None] | None = None) -> Any:
+    """Use the same canonical order for the fully merged lite and loaded models."""
+    for graph in _iter_model_initializer_graphs(model, interrupt_check):
+        for node in getattr(graph, "node", ()):
+            _check_onnx_traversal_interrupted(interrupt_check)
+            for attribute in getattr(node, "attribute", ()):
+                _check_onnx_traversal_interrupted(interrupt_check)
+                yield attribute
+    for function in getattr(model, "functions", ()):
+        for attribute in getattr(function, "attribute_proto", ()):
+            _check_onnx_traversal_interrupted(interrupt_check)
+            yield attribute
+
+
+def _bind_onnx_attribute_string_lengths(
+    model: Any,
+    preflight: _OnnxAttributeStringPreflight,
+    interrupt_check: Callable[[], None] | None = None,
+) -> dict[int, tuple[Any, int]]:
+    """Retain source owners from the same immutable snapshot, never a prefix."""
+    if preflight.lengths is None:
+        return {}
+    owners: dict[int, tuple[Any, int]] = {}
+    try:
+        for attribute, length in zip(
+            _iter_onnx_attribute_owners(model, interrupt_check), preflight.lengths, strict=True
+        ):
+            if _onnx_has_singular_field(attribute, "s") != (length is not None):
+                return {}
+            if length is not None:
+                owners[id(attribute)] = (attribute, length)
+    except Exception:
+        return {}
+    return owners
+
+
 def _preflight_onnx_raw_controls(
     data: bytes,
     *,
     interrupt_check: Callable[[], None] | None = None,
+    attribute_strings: _OnnxAttributeStringPreflight | None = None,
 ) -> tuple[bool, bool, str | None]:
     """Certify raw-control lengths without accessing protobuf payload fields.
 
@@ -15973,6 +16046,8 @@ def _preflight_onnx_raw_controls(
     or dimensions when encountered. This is not a certificate for other raw
     readers or for a different/mutated ModelProto.
     """
+    if attribute_strings is not None:
+        attribute_strings.lengths = None
     if type(data) is not bytes:
         return False, False, "raw_control_preflight_failed"
     if not _onnx_raw_control_schema_supported():
@@ -15983,7 +16058,7 @@ def _preflight_onnx_raw_controls(
     )
     handle = _OnnxSerializedInput(data)
     try:
-        _parse_onnx_model(cast(BinaryIO, handle), len(data), state, 0)
+        structure = _parse_onnx_model(cast(BinaryIO, handle), len(data), state, 0)
         if handle.tell() != len(data) or state.coverage_gaps:
             return False, False, "raw_control_preflight_failed"
         vectors_bounded = True
@@ -16008,6 +16083,24 @@ def _preflight_onnx_raw_controls(
                 and raw_length > 8
             ):
                 scalars_bounded = False
+        if attribute_strings is not None:
+            import onnx
+
+            string_field = onnx.AttributeProto.DESCRIPTOR.fields_by_number[4]
+            if string_field.type == 12 and not _onnx_proto_field_is_repeated(string_field):
+                # The descriptor reachability check above covers every current
+                # attribute-bearing edge. Merge before this canonical traversal:
+                # protobuf wire order is not the loaded repeated-field order.
+                lengths: list[int | None] = []
+                for attribute in _iter_onnx_attribute_owners(structure, state.check_interrupted):
+                    state.record_retained_sequence_entry()
+                    if attribute.string_payload_length is not None:
+                        # Reserve the future retained owner, id key and tuple,
+                        # plus its index entry before publishing any metadata.
+                        state.record_retained_object(3)
+                        state.record_retained_sequence_entry()
+                    lengths.append(attribute.string_payload_length)
+                attribute_strings.lengths = lengths
         return vectors_bounded, scalars_bounded, None
     except Exception:
         return False, False, "raw_control_preflight_failed"
@@ -16022,11 +16115,20 @@ def _load_onnx_model_with_control_admission(
     """Load binary ONNX and bind control admission to the same byte snapshot."""
     if type(data) is not bytes:
         raise TypeError("ONNX control admission requires an immutable bytes snapshot")
-    vectors_bounded, scalars_bounded, error_reason = _preflight_onnx_raw_controls(data, interrupt_check=interrupt_check)
+    attribute_strings = _OnnxAttributeStringPreflight()
+    vectors_bounded, scalars_bounded, error_reason = _preflight_onnx_raw_controls(
+        data, interrupt_check=interrupt_check, attribute_strings=attribute_strings
+    )
     if interrupt_check is not None:
         interrupt_check()
     model = onnx.load_model_from_string(data)
-    return model, _OnnxRawControlAdmission(model, vectors_bounded, scalars_bounded, error_reason)
+    return model, _OnnxRawControlAdmission(
+        model,
+        vectors_bounded,
+        scalars_bounded,
+        error_reason,
+        _bind_onnx_attribute_string_lengths(model, attribute_strings, interrupt_check),
+    )
 
 
 def _load_onnx_structure_file_backed(

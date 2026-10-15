@@ -56,7 +56,8 @@ def _fixture_raw_control_admission(model: Any, *, fixture_model: Any | None = No
     boundary and must never serialize an untrusted ModelProto for admission.
 
     Instrumentation proxies must explicitly name their underlying fixture and
-    preserve its tensor payloads, dimensions, and dtypes. The admission binds to
+    preserve its graph/attribute membership, strings, tensor payloads, dimensions,
+    and dtypes. The admission binds to
     the original analysis model so owner-identity and access-count assertions
     continue to measure the original objects. It is recomputed on every call;
     callers must not mutate control storage or metadata after this step.
@@ -65,12 +66,16 @@ def _fixture_raw_control_admission(model: Any, *, fixture_model: Any | None = No
     if not isinstance(source, onnx.ModelProto):
         raise TypeError("Admission requires an explicit test-created ModelProto fixture")
     data = source.SerializeToString()
-    vectors_bounded, scalars_bounded, error_reason = onnx_scanner_module._preflight_onnx_raw_controls(data)
+    attribute_strings = onnx_scanner_module._OnnxAttributeStringPreflight()
+    vectors_bounded, scalars_bounded, error_reason = onnx_scanner_module._preflight_onnx_raw_controls(
+        data, attribute_strings=attribute_strings
+    )
     return onnx_scanner_module._OnnxRawControlAdmission(
         model=model,
         vectors_bounded=vectors_bounded,
         scalars_bounded=scalars_bounded,
         error_reason=error_reason,
+        string_attribute_lengths=onnx_scanner_module._bind_onnx_attribute_string_lengths(model, attribute_strings),
     )
 
 
@@ -39382,7 +39387,7 @@ class TestOnnxEinsumEquationBudgets:
         observations: dict[str, Any] = {
             "queries": 0,
             "materialized": [],
-            "metadata_sizes": [],
+            "payload_sizes": [],
             "cache_peak": 0,
             "shapes": [],
         }
@@ -39401,9 +39406,9 @@ class TestOnnxEinsumEquationBudgets:
             payload = frame.f_locals.get("equation_bytes")
             if isinstance(payload, bytes):
                 observations["materialized"].append(len(payload))
-            serialized_size = frame.f_locals.get("serialized_size")
-            if isinstance(serialized_size, int):
-                observations["metadata_sizes"].append(serialized_size)
+            payload_size = frame.f_locals.get("payload_size")
+            if isinstance(payload_size, int):
+                observations["payload_sizes"].append(payload_size)
             cache = frame.f_locals.get("einsum_equation_cache", {})
             observations["cache_peak"] = max(observations["cache_peak"], len(cache))
 
@@ -39432,7 +39437,8 @@ class TestOnnxEinsumEquationBudgets:
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
         assert observed["queries"] > 1
         assert observed["materialized"] == [len(equation)]
-        assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 1
+        assert len(observed["payload_sizes"]) == observed["cache_peak"] == 1
+        assert observed["payload_sizes"] == [len(equation)]
         assert {(1,), (2,), (3,)} <= set(observed["shapes"])
         assert all(len(shape) == 1 for shape in observed["shapes"])
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(model, tmp_path, False, prior_weights)
@@ -39448,14 +39454,15 @@ class TestOnnxEinsumEquationBudgets:
     ) -> None:
         equation = b" " * 128 + b"i->i" if failure == "oversized" else b"\xff"
         model, prior_weights, _nodes = self._model([equation], local_function=local_function)
-        monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES", 64)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_BYTES", 64)
         result, observed = self._scan_profiled(model, tmp_path)
         reason = "einsum_equation_byte_limit" if failure == "oversized" else "einsum_equation_decode_failure"
 
         assert result.success is False
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][reason] >= 1
         assert observed["queries"] > 1
-        assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 1
+        assert len(observed["payload_sizes"]) == observed["cache_peak"] == 1
+        assert observed["payload_sizes"] == [len(equation)]
         assert observed["materialized"] == ([] if failure == "oversized" else [1])
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model,
@@ -39475,12 +39482,12 @@ class TestOnnxEinsumEquationBudgets:
         equations = [b"i->i"] * 3 if limit == "aggregate_bytes" else [b" " * 128 + b"i->i"] * 6
         model, prior_weights, nodes = self._model(equations, local_function=False)
         if limit == "aggregate_bytes":
-            byte_limit = sum(node.attribute[0].ByteSize() for node in nodes[:2])
+            byte_limit = sum(len(node.attribute[0].s) for node in nodes[:2])
             monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_BYTE_LIMIT", byte_limit)
             reason = "einsum_equation_byte_limit"
         else:
             monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_WORK_LIMIT", 9)
-            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES", 64)
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_BYTES", 64)
             reason = "einsum_equation_work_limit"
         result, observed = self._scan_profiled(model, tmp_path)
 
@@ -39488,11 +39495,11 @@ class TestOnnxEinsumEquationBudgets:
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][reason] >= 1
         if limit == "aggregate_bytes":
             assert observed["queries"] > 2
-            assert sum(observed["metadata_sizes"]) == byte_limit
+            assert sum(observed["payload_sizes"]) == byte_limit
             assert observed["materialized"] == [4, 4]
         else:
             assert observed["queries"] > 3
-            assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 3
+            assert len(observed["payload_sizes"]) == observed["cache_peak"] == 3
             assert observed["materialized"] == []
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model,
@@ -40097,13 +40104,13 @@ class TestOnnxPrimaryEinsumEquationBudgets:
         equation_node.attribute[0].s = equation
         incomplete = equation_mode == "oversized"
         if incomplete:
-            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_SERIALIZED_BYTES", 64)
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_BYTES", 64)
         path = _save_onnx_model(model, tmp_path / "primary-equation.onnx")
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         observed: dict[str, Any] = {
             "queries": 0,
             "materialized": [],
-            "metadata_sizes": [],
+            "payload_sizes": [],
             "cache_peak": 0,
             "orientations": [],
             "raw_decodes": 0,
@@ -40127,9 +40134,9 @@ class TestOnnxPrimaryEinsumEquationBudgets:
             payload = frame.f_locals.get("equation_bytes")
             if isinstance(payload, bytes):
                 observed["materialized"].append(len(payload))
-            serialized_size = frame.f_locals.get("serialized_size")
-            if isinstance(serialized_size, int):
-                observed["metadata_sizes"].append(serialized_size)
+            payload_size = frame.f_locals.get("payload_size")
+            if isinstance(payload_size, int):
+                observed["payload_sizes"].append(payload_size)
             observed["cache_peak"] = max(observed["cache_peak"], len(frame.f_locals.get("einsum_equation_cache", {})))
 
         previous_profile = sys.getprofile()
@@ -40142,7 +40149,8 @@ class TestOnnxPrimaryEinsumEquationBudgets:
         assert result.success is not incomplete, semantics
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
         assert observed["queries"] > 1
-        assert len(observed["metadata_sizes"]) == observed["cache_peak"] == 1
+        assert len(observed["payload_sizes"]) == observed["cache_peak"] == 1
+        assert observed["payload_sizes"] == [len(equation)]
         assert observed["materialized"] == ([] if incomplete else [len(equation)])
         assert observed["raw_decodes"] == 0
         assert len(observed["orientations"]) >= (4 if local_function else 2)
@@ -44723,3 +44731,928 @@ class TestOnnxNoopSqueezeLineageRegressions:
         self._assert_single_view(plan, weights, consumer_count=2)
         assert np.shares_memory(loaded_weights[0], plan.specs[0].weights)
         self._assert_public_contract(model, tmp_path, weights, consumer_count=2, total_limit=public_total_limit)
+
+
+class _OnnxEquationPrecopyObserver:
+    """Observe protobuf calls and the equation helper's actual payload-read site."""
+
+    _serialization_names = frozenset({"ByteSize", "SerializeToString", "SerializePartialToString"})
+
+    def __init__(self) -> None:
+        self.scanner_filename = onnx_scanner_module._build_onnx_weight_analysis_plan.__code__.co_filename
+        definitions = [
+            node
+            for node in ast.walk(ast.parse(Path(self.scanner_filename).read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "parsed_einsum_equation"
+        ]
+        assert len(definitions) == 1
+        reads = [node for node in ast.walk(definitions[0]) if isinstance(node, ast.Attribute) and node.attr == "s"]
+        # A moved or indirect getter needs an explicit observer update; it must
+        # not silently turn the refused-read assertion into a vacuous zero.
+        assert len(reads) == 1 and isinstance(reads[0].value, ast.Name) and reads[0].value.id == "attribute"
+        self.getter_lines = set(range(reads[0].lineno, (reads[0].end_lineno or reads[0].lineno) + 1))
+        self.offsets: dict[Any, set[int]] = {}
+        self.active_profile_frames: set[int] = set()
+        self.active_queries: dict[int, dict[str, Any]] = {}
+        self.queries: list[dict[str, Any]] = []
+        self.serialization_calls: list[str] = []
+        self.calibration_calls: set[str] = set()
+        self.calibration_getters = 0
+        self.calibrating = False
+        self.retention_failures: list[int] = []
+        self.cache_peak = 0
+
+    @staticmethod
+    def _calibration_getter(attribute: Any) -> bytes:
+        value: bytes = attribute.s
+        return value
+
+    def profile(self, frame: Any, event: str, argument: Any) -> None:
+        protected = (
+            frame.f_code.co_filename == self.scanner_filename and frame.f_code.co_name == "parsed_einsum_equation"
+        )
+        if protected and event == "call":
+            self.active_profile_frames.add(id(frame))
+        method_name = ""
+        receiver: Any = None
+        if event == "c_call":
+            method_name = str(getattr(argument, "__name__", ""))
+            receiver = getattr(argument, "__self__", None)
+        elif event == "call":
+            method_name = frame.f_code.co_name
+            receiver = frame.f_locals.get("self")
+        if method_name in self._serialization_names and isinstance(receiver, Message):
+            if self.calibrating:
+                assert not self.active_profile_frames
+                self.calibration_calls.add(method_name)
+            elif self.active_profile_frames:
+                self.serialization_calls.append(method_name)
+        if protected and event == "return":
+            self.active_profile_frames.remove(id(frame))
+
+    def trace(self, frame: Any, event: str, argument: Any) -> Any:
+        calibration = frame.f_code is self._calibration_getter.__code__
+        protected = (
+            frame.f_code.co_filename == self.scanner_filename and frame.f_code.co_name == "parsed_einsum_equation"
+        )
+        if not calibration and not protected:
+            return None
+        if event == "call":
+            if frame.f_code not in self.offsets:
+                import dis
+
+                offsets = set()
+                line_ranges = tuple(frame.f_code.co_lines())
+                for instruction in dis.get_instructions(frame.f_code):
+                    if instruction.opname != "LOAD_ATTR" or instruction.argval != "s":
+                        continue
+                    line = next(line for start, end, line in line_ranges if start <= instruction.offset < end)
+                    if calibration or line in self.getter_lines:
+                        offsets.add(instruction.offset)
+                assert len(offsets) == 1
+                self.offsets[frame.f_code] = offsets
+            frame.f_trace_opcodes = True
+            if protected:
+                node = frame.f_locals["node"]
+                record: dict[str, Any] = {
+                    "node_id": id(node),
+                    "node_name": str(node.name),
+                    "getters": [],
+                    "materialized": None,
+                    "payload_size": None,
+                    "before": frame.f_locals["einsum_equation_bytes_remaining"],
+                }
+                self.active_queries[id(frame)] = record
+                self.queries.append(record)
+        elif event == "opcode" and frame.f_lasti in self.offsets[frame.f_code]:
+            if calibration:
+                assert self.calibrating and not self.active_profile_frames
+                self.calibration_getters += 1
+            else:
+                attribute = frame.f_locals["attribute"]
+                assert isinstance(attribute, onnx.AttributeProto)
+                assert attribute.name == "equation" and attribute.type == onnx.AttributeProto.STRING
+                record = self.active_queries[id(frame)]
+                # This event precedes LOAD_ATTR. Do not read attribute.s here.
+                record["getters"].append(
+                    (
+                        id(attribute),
+                        frame.f_locals.get("payload_size"),
+                        frame.f_locals["einsum_equation_bytes_remaining"],
+                    )
+                )
+        elif event == "return" and protected:
+            record = self.active_queries.pop(id(frame))
+            payload = frame.f_locals.get("equation_bytes")
+            if isinstance(payload, bytes):
+                record["materialized"] = len(payload)
+            record["payload_size"] = frame.f_locals.get("payload_size")
+            record["after"] = frame.f_locals["einsum_equation_bytes_remaining"]
+            record["parsed"] = argument is not None
+            node = frame.f_locals["node"]
+            cache = frame.f_locals["einsum_equation_cache"]
+            retained = cache.get(id(node))
+            if retained is None or retained[0] is not node or retained[1] != argument:
+                self.retention_failures.append(id(node))
+            self.cache_peak = max(self.cache_peak, len(cache))
+        return self.trace
+
+    def run(self, run: Any) -> Any:
+        # Test-owned calibration is outside production planning and observation
+        # of forbidden calls. Native property getters are observed by opcode,
+        # not by pretending sys.setprofile receives implicit C slot calls.
+        attribute = helper.make_attribute("calibration", b"i->i")
+        previous_profile, previous_trace = sys.getprofile(), sys.gettrace()
+        current_frame = sys._getframe()
+        previous_opcodes = current_frame.f_trace_opcodes
+        try:
+            current_frame.f_trace_opcodes = True  # Python 3.12 opcode-tracing priming.
+            sys.setprofile(self.profile)
+            sys.settrace(self.trace)
+            self.calibrating = True
+            try:
+                assert self._calibration_getter(attribute) == b"i->i"
+                attribute.ByteSize()
+                attribute.SerializeToString(deterministic=True)
+                attribute.SerializePartialToString(deterministic=True)
+            finally:
+                self.calibrating = False
+            assert self.calibration_getters == 1
+            assert self.calibration_calls == self._serialization_names
+            assert not self.queries and not self.serialization_calls
+            return run()
+        finally:
+            sys.settrace(previous_trace)
+            sys.setprofile(previous_profile)
+            current_frame.f_trace_opcodes = previous_opcodes
+
+    def assert_observed(self, *, expected_owners: int, expected_reads: int, byte_limit: int) -> None:
+        assert not self.active_queries and not self.active_profile_frames
+        assert self.queries and self.serialization_calls == []
+        assert self.retention_failures == []
+        assert self.cache_peak == expected_owners
+        by_owner: dict[int, list[dict[str, Any]]] = {}
+        for record in self.queries:
+            by_owner.setdefault(record["node_id"], []).append(record)
+        assert len(by_owner) == expected_owners
+        reads = [record for record in self.queries if record["getters"]]
+        assert len(reads) == expected_reads
+        assert sum(record["materialized"] or 0 for record in self.queries) == 4 * expected_reads
+        for owner_queries in by_owner.values():
+            # Public shape/proof queries must reuse the same retained owner;
+            # even repeated rejected queries cannot materialize a second copy.
+            assert sum(len(record["getters"]) for record in owner_queries) <= 1
+        for record in self.queries:
+            assert 0 <= record["after"] <= record["before"] <= byte_limit
+            if record["getters"]:
+                assert len(record["getters"]) == 1
+                _attribute_id, payload_size, remaining_before_getter = record["getters"][0]
+                assert payload_size == record["materialized"] == 4
+                assert record["before"] - remaining_before_getter == 4
+                assert record["after"] == remaining_before_getter
+                assert record["parsed"] is True
+            else:
+                assert record["materialized"] is None
+                assert record["after"] == record["before"]
+        # Owner ids are recorded without retaining wrappers in the observer.
+        assert len({record["getters"][0][0] for record in reads}) == expected_reads
+
+
+class TestOnnxEquationPrecopyAdmission:
+    @pytest.mark.parametrize("route", ["onnx", "weight_distribution"])
+    @pytest.mark.parametrize("case", ["large_documentation", "oversized_equation", "unrelated_string", "aggregate"])
+    def test_public_equation_reads_use_exact_source_lengths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, case: str
+    ) -> None:
+        equation = b"i->i"
+        equations = [equation] * 3 if case == "aggregate" else [equation]
+        if case == "oversized_equation":
+            equations = [b" " * 128 + equation]
+        model, _prior_weights, nodes = TestOnnxEinsumEquationBudgets._model(equations, local_function=False)
+        if case == "large_documentation":
+            nodes[0].attribute[0].doc_string = "documentation " * 256
+        elif case == "unrelated_string":
+            # A valid unused STRING Constant has an s payload much larger than
+            # the admitted equation. It must not globally poison string reads.
+            model.graph.node.append(helper.make_node("Constant", [], ["unused_text"], value_string=b"x" * 132))
+        # The existing builder checks and evaluates its base model. Check the
+        # final source fixture too; no malformed-schema bypass is requested.
+        onnx.checker.check_model(model)
+        path = _save_onnx_model(model, tmp_path / f"equation-precopy-{case}.onnx")
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_BYTES", 32)
+        byte_limit = 8 if case == "aggregate" else 64
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_BYTE_LIMIT", byte_limit)
+        scanner = OnnxScanner() if route == "onnx" else WeightDistributionScanner()
+        observed = _OnnxEquationPrecopyObserver()
+        result = observed.run(lambda: scanner.scan(str(path)))
+        incomplete = case in {"oversized_equation", "aggregate"}
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is not incomplete, result.metadata
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        if incomplete:
+            assert semantics["coverage_gaps"]["einsum_equation_byte_limit"] >= 1
+        else:
+            assert semantics["coverage_gaps"] == {}
+        expected_owners = 3 if case == "aggregate" else 1
+        expected_reads = 0 if case == "oversized_equation" else (2 if case == "aggregate" else 1)
+        observed.assert_observed(expected_owners=expected_owners, expected_reads=expected_reads, byte_limit=byte_limit)
+        if case != "aggregate":
+            assert len(observed.queries) > 1
+        if case == "aggregate":
+            # Two content-equal distinct owners consume the exact eight-byte
+            # allowance; the third is refused without a getter. This also
+            # distinguishes owner reuse from content-based admission reuse.
+            assert sum(record["before"] - record["after"] for record in observed.queries) == byte_limit
+            assert {record["node_name"] for record in observed.queries} == {"equation0", "equation1", "equation2"}
+
+
+class TestOnnxAttributeStringWireAdmission:
+    @staticmethod
+    def _attribute(name: str, *values: bytes) -> bytes:
+        return (
+            _raw_control_bytes_field(1, name.encode())
+            + _raw_control_int_field(20, int(onnx.AttributeProto.STRING))
+            + b"".join(_raw_control_bytes_field(4, value) for value in values)
+        )
+
+    @staticmethod
+    def _node(*attributes: bytes) -> bytes:
+        return b"".join(_raw_control_bytes_field(5, attribute) for attribute in attributes)
+
+    @staticmethod
+    def _graph(*nodes: bytes) -> bytes:
+        return b"".join(_raw_control_bytes_field(1, node) for node in nodes)
+
+    @pytest.mark.parametrize("reverse_fields", [False, True])
+    def test_canonical_owner_mapping_follows_merged_topology(self, reverse_fields: bool) -> None:
+        field, integer = _raw_control_bytes_field, _raw_control_int_field
+        attribute, node, graph = self._attribute, self._node, self._graph
+        payloads = {name: bytes([97 + index]) * (index + 1) for index, name in enumerate("ABCDEFGHIJKL")}
+        nested = (
+            field(6, graph(node(attribute("B", payloads["B"]))))
+            + field(1, b"g")
+            + integer(20, int(onnx.AttributeProto.GRAPH))
+            + field(6, graph(node(attribute("C", payloads["C"]))))
+        )
+        repeated = (
+            field(11, graph(node(attribute("D", payloads["D"]))))
+            + field(1, b"gs")
+            + integer(20, int(onnx.AttributeProto.GRAPHS))
+            + field(11, graph(node(attribute("E", payloads["E"]))))
+        )
+        first_graph = graph(node(attribute("A", payloads["A"]), nested, repeated))
+        second_graph = graph(node(attribute("L", payloads["L"])))
+        default_graph = (
+            field(1, b"body")
+            + integer(20, int(onnx.AttributeProto.GRAPH))
+            + field(6, graph(node(attribute("H", payloads["H"]))))
+        )
+        function = (
+            field(11, attribute("G", payloads["G"]))
+            + field(7, node(attribute("F", payloads["F"])))
+            + field(11, default_graph)
+            + field(11, attribute("I", payloads["I"]))
+        )
+        training = field(2, graph(node(attribute("K", payloads["K"])))) + field(
+            1, graph(node(attribute("J", payloads["J"])))
+        )
+        fields = [field(7, first_graph), field(25, function), field(20, training), field(7, second_graph)]
+        data = b"".join(reversed(fields) if reverse_fields else fields)
+        model, admission = onnx_scanner_module._load_onnx_model_with_control_admission(data, onnx=onnx)
+        # These direct protobuf paths are independent of the new canonical iterator.
+        primary = model.graph.node[1 if reverse_fields else 0]
+        other = model.graph.node[0 if reverse_fields else 1]
+        nested_graph = primary.attribute[1].g
+        owners = [
+            primary.attribute[0],
+            nested_graph.node[0].attribute[0],
+            nested_graph.node[1].attribute[0],
+            primary.attribute[2].graphs[0].node[0].attribute[0],
+            primary.attribute[2].graphs[1].node[0].attribute[0],
+            model.functions[0].node[0].attribute[0],
+            model.functions[0].attribute_proto[0],
+            model.functions[0].attribute_proto[1].g.node[0].attribute[0],
+            model.functions[0].attribute_proto[2],
+            model.training_info[0].initialization.node[0].attribute[0],
+            model.training_info[0].algorithm.node[0].attribute[0],
+            other.attribute[0],
+        ]
+        assert len(nested_graph.node) == 2  # Duplicate singular g fragments merge.
+        assert {owner.name: owner.s for owner in owners} == payloads
+        assert set(admission.string_attribute_lengths) == {id(owner) for owner in owners}
+        for owner in owners:
+            retained, size = admission.string_attribute_lengths[id(owner)]
+            assert retained is owner
+            assert size == len(payloads[owner.name])
+        assert admission.model is model
+        assert admission.error_reason is None
+
+    @pytest.mark.parametrize("values", [(), (b"",), (b"x" * 65, b"q"), (b"q", b"x" * 65)])
+    def test_final_singular_bytes_presence_and_length_are_read_without_payload(
+        self, monkeypatch: pytest.MonkeyPatch, values: tuple[bytes, ...]
+    ) -> None:
+        attribute = self._attribute("x", *values) + _raw_control_bytes_field(13, b"documentation" * 16)
+        data = _raw_control_bytes_field(7, self._graph(self._node(attribute)))
+        oracle = onnx.load_model_from_string(data).graph.node[0].attribute[0]
+        assert oracle.HasField("s") is bool(values)
+        if values:
+            assert oracle.s == values[-1]
+        reads: list[int] = []
+        original_read = onnx_scanner_module._OnnxSerializedInput.read
+
+        def bounded_read(reader: Any, size: int = -1) -> bytes:
+            reads.append(size)
+            assert 0 <= size <= 1  # Only one-byte names and wire varints are read.
+            return original_read(reader, size)
+
+        capture = onnx_scanner_module._OnnxAttributeStringPreflight()
+        with monkeypatch.context() as scoped:
+            scoped.setattr(onnx_scanner_module._OnnxSerializedInput, "read", bounded_read)
+            result = onnx_scanner_module._preflight_onnx_raw_controls(data, attribute_strings=capture)
+        assert result == (True, True, None)
+        assert reads and max(reads) == 1
+        assert capture.lengths == [len(values[-1]) if values else None]
+        model, admission = onnx_scanner_module._load_onnx_model_with_control_admission(data, onnx=onnx)
+        owner = model.graph.node[0].attribute[0]
+        if values:
+            assert admission.string_attribute_lengths[id(owner)] == (owner, len(values[-1]))
+        else:
+            assert admission.string_attribute_lengths == {}
+
+    @pytest.mark.parametrize("failure", ["truncated", "mismatched_count", "mismatched_presence"])
+    def test_incomplete_or_mismatched_provenance_never_binds_a_prefix(self, failure: str) -> None:
+        field = _raw_control_bytes_field
+        data = field(7, self._graph(self._node(self._attribute("x", b"first"), self._attribute("y", b"next"))))
+        capture = onnx_scanner_module._OnnxAttributeStringPreflight(lengths=[123])
+        if failure == "truncated":
+            result = onnx_scanner_module._preflight_onnx_raw_controls(data + b"\x3a\x80", attribute_strings=capture)
+            assert result == (False, False, "raw_control_preflight_failed")
+            assert capture.lengths is None
+            model = onnx.load_model_from_string(data)
+        else:
+            assert onnx_scanner_module._preflight_onnx_raw_controls(data, attribute_strings=capture) == (
+                True,
+                True,
+                None,
+            )
+            model = onnx.load_model_from_string(data)
+            if failure == "mismatched_count":
+                del model.graph.node[0].attribute[-1]
+            else:
+                model.graph.node[0].attribute[-1].ClearField("s")
+        assert onnx_scanner_module._bind_onnx_attribute_string_lengths(model, capture) == {}
+
+    @pytest.mark.parametrize("schema", ["bytes", "string", "repeated_bytes"])
+    def test_attribute_payload_admission_requires_singular_bytes_schema(
+        self, monkeypatch: pytest.MonkeyPatch, schema: str
+    ) -> None:
+        data = _raw_control_bytes_field(7, self._graph(self._node(self._attribute("x", b"ok"))))
+        descriptor = SimpleNamespace(
+            fields_by_number={
+                4: SimpleNamespace(type=9 if schema == "string" else 12, is_repeated=schema == "repeated_bytes")
+            }
+        )
+        capture = onnx_scanner_module._OnnxAttributeStringPreflight()
+        with monkeypatch.context() as scoped:
+            scoped.setattr(onnx, "AttributeProto", SimpleNamespace(DESCRIPTOR=descriptor))
+            # Existing ModelProto descriptor graph is unchanged; the extra guard
+            # independently refuses an unsupported direct bytes-field contract.
+            result = onnx_scanner_module._preflight_onnx_raw_controls(data, attribute_strings=capture)
+        assert result == (True, True, None)
+        assert capture.lengths == ([2] if schema == "bytes" else None)
+
+    @pytest.mark.parametrize("admit_metadata", [False, True])
+    def test_attribute_metadata_and_owner_index_share_structural_allocation_admission(
+        self, monkeypatch: pytest.MonkeyPatch, admit_metadata: bool
+    ) -> None:
+        data = _raw_control_bytes_field(7, self._graph(self._node(self._attribute("x", b"ok"))))
+        state = onnx_scanner_module._OnnxStructureParseState(merge_singular_messages=True)
+        reader = onnx_scanner_module._OnnxSerializedInput(data)
+        onnx_scanner_module._parse_onnx_model(cast(BinaryIO, reader), len(data), state, 0)
+        # Existing parse retention plus two entries (metadata and owner index)
+        # and three retained objects (owner, identity key and index tuple).
+        metadata_allowance = (
+            2 * onnx_scanner_module._ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES
+            + 3 * onnx_scanner_module._ONNX_STRUCTURE_RETAINED_OBJECT_BYTES
+        )
+        limit = state.retained_allocation_bytes + (metadata_allowance if admit_metadata else 0)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES", limit)
+        # Existing raw-only preflight fits the same budget in both controls.
+        assert onnx_scanner_module._preflight_onnx_raw_controls(data) == (True, True, None)
+        capture = onnx_scanner_module._OnnxAttributeStringPreflight()
+        result = onnx_scanner_module._preflight_onnx_raw_controls(data, attribute_strings=capture)
+        if admit_metadata:
+            assert result == (True, True, None)
+            assert capture.lengths == [2]
+        else:
+            assert result == (False, False, "raw_control_preflight_failed")
+            assert capture.lengths is None
+
+
+class TestOnnxPrivateNonbinaryStringAdmission:
+    @pytest.mark.parametrize("include_equation", [False, True])
+    def test_private_json_loading_preserves_typed_analysis_and_refuses_uncertified_strings(
+        self, tmp_path: Path, include_equation: bool
+    ) -> None:
+        from google.protobuf.json_format import MessageToJson
+
+        weights = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        nodes = [helper.make_node("MatMul", ["X", "W"], ["known"])]
+        outputs = [helper.make_tensor_value_info("known", TensorProto.FLOAT, [1, 64])]
+        if include_equation:
+            nodes.append(helper.make_node("Einsum", ["X", "W"], ["equation"], equation="bi,io->bo"))
+            outputs.append(helper.make_tensor_value_info("equation", TensorProto.FLOAT, [1, 64]))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "private_json_string_provenance",
+                [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64])],
+                outputs,
+                initializer=[helper.make_tensor("W", TensorProto.FLOAT, [64, 64], weights.ravel().tolist())],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "private.json"
+        path.write_text(MessageToJson(model))
+        # The public scanner selects ONNX only for .onnx. This private helper
+        # still loads JSON, but does not invent binary-wire string provenance.
+        plan = WeightDistributionScanner()._extract_semantic_onnx_weight_plan(str(path))
+        assert any(spec.context["initializer"] == "W" and np.array_equal(spec.weights, weights) for spec in plan.specs)
+        if include_equation:
+            assert plan.coverage_gaps["attribute_string_provenance_missing"] >= 1
+        else:
+            assert plan.coverage_gaps == {}
+
+
+class _OnnxPaddingReadObserver:
+    """Observe real padding reads without treating native getter silence as proof."""
+
+    _protected = frozenset({"parsed_padding_mode", "has_no_padding", "pooling_has_nonempty_samples"})
+    _serializers = frozenset({"ByteSize", "SerializeToString", "SerializePartialToString"})
+
+    def __init__(self) -> None:
+        self.filename = onnx_scanner_module._build_onnx_weight_analysis_plan.__code__.co_filename
+        self.active_frames: set[int] = set()
+        self.instructions: dict[Any, dict[int, Any]] = {}
+        self.calibrating = False
+        self.calibration_getters = 0
+        self.calibration_serializers: set[str] = set()
+        self.getters: list[tuple[str, int]] = []
+        self.serializers: list[str] = []
+        self.parses: list[tuple[int, str, bytes | None, bool, int]] = []
+        self.proofs: list[tuple[str, str, bool]] = []
+        self.reservation_entries: dict[int, tuple[str, int, int]] = {}
+        self.reservations: list[tuple[str, int, int, int, bool]] = []
+        self.primer_defaults: list[tuple[tuple[str, ...], tuple[str, ...], int, int, str]] = []
+
+    @staticmethod
+    def _calibration_getter(attribute: Any) -> bytes:
+        value: bytes = attribute.s
+        return value
+
+    def trace(self, frame: Any, event: str, arg: Any) -> Any:
+        import dis
+
+        code = frame.f_code
+        calibration = code is self._calibration_getter.__code__
+        protected = code.co_filename == self.filename and code.co_name in self._protected
+        if not calibration and not protected:
+            return None
+        if event == "call":
+            frame.f_trace_opcodes = True
+        elif event == "opcode":
+            if code not in self.instructions:
+                self.instructions[code] = {
+                    instruction.offset: instruction for instruction in dis.get_instructions(code)
+                }
+            instruction = self.instructions[code].get(frame.f_lasti)
+            if instruction is not None and instruction.opname == "LOAD_ATTR" and instruction.argval == "s":
+                if calibration:
+                    self.calibration_getters += 1
+                else:
+                    owner = frame.f_locals.get("attribute" if code.co_name == "parsed_padding_mode" else "resolved")
+                    self.getters.append((code.co_name, id(owner)))
+        return self.trace
+
+    def profile(self, frame: Any, event: str, arg: Any) -> None:
+        name = frame.f_code.co_name
+        local = frame.f_locals
+        production = frame.f_code.co_filename == self.filename
+        protected = production and name in self._protected
+        if event == "call" and protected:
+            self.active_frames.add(id(frame))
+        if production and name == "reserve_function_default_work":
+            if event == "call":
+                caller = frame.f_back.f_code.co_name if frame.f_back is not None else ""
+                self.reservation_entries[id(frame)] = (caller, local["work"], local["function_default_work_remaining"])
+            elif event == "return":
+                entry = self.reservation_entries.pop(id(frame))
+                self.reservations.append((*entry, local["function_default_work_remaining"], bool(arg)))
+        if (
+            production
+            and name == "default_function_attribute_maps"
+            and event == "return"
+            and getattr(local.get("function"), "name", "") == "SpendDefaultWork"
+        ):
+            attributes, source_keys = arg
+            target = attributes.get("tag0")
+            self.primer_defaults.append(
+                (
+                    tuple(sorted(attributes)),
+                    tuple(sorted(source_keys)),
+                    int(getattr(target, "type", 0)),
+                    int(getattr(target, "i", 0)),
+                    str(getattr(target, "ref_attr_name", "")),
+                )
+            )
+
+        method_name = ""
+        receiver: Any = None
+        if event == "c_call":
+            method_name, receiver = str(getattr(arg, "__name__", "")), getattr(arg, "__self__", None)
+        elif event == "call":
+            method_name, receiver = name, local.get("self")
+        if method_name in self._serializers and isinstance(receiver, Message):
+            if self.calibrating:
+                self.calibration_serializers.add(method_name)
+            elif self.active_frames:
+                self.serializers.append(method_name)
+
+        if event == "return" and protected:
+            if name == "parsed_padding_mode":
+                owner = local["attribute"]
+                cache = local["padding_mode_cache"]
+                retained = cache.get(id(owner))
+                retains_result = retained is not None and retained[0] is owner and retained[1] == arg
+                self.parses.append((id(owner), str(owner.name), arg, retains_result, len(cache)))
+            else:
+                self.proofs.append((name, str(local["node"].name), bool(arg)))
+            self.active_frames.remove(id(frame))
+
+    def run(self, action: Any) -> Any:
+        calibration = helper.make_attribute("padding_observer_calibration", b"VALID")
+        previous_trace, previous_profile = sys.gettrace(), sys.getprofile()
+        current_frame = sys._getframe()
+        previous_opcodes = current_frame.f_trace_opcodes
+        try:
+            # Python 3.12 enables opcode events only when an existing frame is
+            # already opted in as the tracer is installed.
+            current_frame.f_trace_opcodes = True
+            sys.setprofile(self.profile)
+            sys.settrace(self.trace)
+            self.calibrating = True
+            self._calibration_getter(calibration)
+            calibration.ByteSize()
+            calibration.SerializeToString(deterministic=True)
+            calibration.SerializePartialToString(deterministic=True)
+            self.calibrating = False
+            return action()
+        finally:
+            self.calibrating = False
+            sys.settrace(previous_trace)
+            sys.setprofile(previous_profile)
+            current_frame.f_trace_opcodes = previous_opcodes
+
+    def assert_observation_available(self) -> None:
+        assert self.calibration_getters == 1
+        assert self.calibration_serializers == self._serializers
+        assert not self.active_frames and not self.reservation_entries
+        assert self.parses
+        assert self.serializers == []
+        assert all(name == "parsed_padding_mode" for name, _owner in self.getters)
+        # The opcode observer is calibrated for direct .s access. Keep the
+        # source-level contract explicit instead of silently missing getattr.
+        tree = ast.parse(Path(onnx_scanner_module.__file__).read_text())
+        definitions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name in self._protected
+        }
+        assert definitions.keys() == self._protected
+        for name, definition in definitions.items():
+            reads = [node for node in ast.walk(definition) if isinstance(node, ast.Attribute) and node.attr == "s"]
+            assert len(reads) == int(name == "parsed_padding_mode")
+            assert not any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "s"
+                for node in ast.walk(definition)
+            )
+
+
+class TestOnnxPaddingStringAdmission:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)
+
+    @classmethod
+    def _model(cls, functions: list[Any], nodes: list[Any], results: list[str]) -> tuple[Any, Any, dict[str, Any]]:
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["A", "prior"], ["known"]),
+                    helper.make_node("Shape", ["source"], ["dimensions"]),
+                    helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
+                    *nodes,
+                    *[helper.make_node("MatMul", ["left", name], [f"Y_{name}"]) for name in results],
+                    # This valid unused STRING is unrelated to all padding
+                    # proofs and exceeds their ten-byte limit deliberately.
+                    helper.make_node("Constant", [], ["unused_string"], value_string=b"x" * 128),
+                ],
+                "padding_string_admission",
+                [
+                    cls._value("A", [1, 64]),
+                    cls._value("runtime", []),
+                    cls._value("left", [1, 1]),
+                    cls._value("kernel", [1, 1, 1]),
+                ],
+                [cls._value("known", [1, 64]), *[cls._value(f"Y_{name}", [1, 1, 3]) for name in results]],
+                initializer=[cls._tensor("prior", prior), cls._tensor("source", np.zeros((1, 1, 3), np.float32))],
+            ),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("padding.test", 1)],
+            ir_version=8,
+        )
+        feeds = {
+            "A": np.ones((1, 64), np.float32),
+            "runtime": np.float32(1),
+            "left": np.ones((1, 1), np.float32),
+            "kernel": np.ones((1, 1, 1), np.float32),
+        }
+        return model, prior, feeds
+
+    @staticmethod
+    def _literal_function(name: str, operator: str = "MaxPool") -> Any:
+        inputs = ["data", "kernel"] if operator == "Conv" else ["data"]
+        return helper.make_function(
+            "padding.test",
+            name,
+            ["data", "kernel"],
+            ["out"],
+            [helper.make_node(operator, inputs, ["out"], name="padding_probe", kernel_shape=[1], auto_pad="VALID")],
+            [helper.make_opsetid("", 18)],
+        )
+
+    @staticmethod
+    def _check_reference(model: Any, prior: Any, feeds: dict[str, Any]) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        onnx.checker.check_model(model, full_check=True)
+        oracle = TestOnnxLoopControlProofs._inline_with_defaults(model)
+        actual: Any = ReferenceEvaluator(oracle).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], feeds["A"] @ prior)
+        for output in actual[1:]:
+            np.testing.assert_array_equal(output, np.ones((1, 1, 3), np.float32))
+
+    @staticmethod
+    def _observe_plan(model: Any) -> tuple[Any, _OnnxPaddingReadObserver]:
+        observer = _OnnxPaddingReadObserver()
+        plan = observer.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024))
+        observer.assert_observation_available()
+        return plan, observer
+
+    @staticmethod
+    def _assert_plan(plan: Any, prior: Any, *, incomplete: bool, reason: str | None) -> None:
+        assert bool(plan.coverage_gaps) is incomplete
+        if reason is not None:
+            assert plan.coverage_gaps[reason] >= 1
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, prior)
+        assert plan.specs[0].context["initializer"] == "prior"
+        assert plan.extraction_failures == plan.oversized_initializers_skipped == 0
+
+    @staticmethod
+    def _public_observations(
+        model: Any, tmp_path: Path, *, incomplete: bool, reason: str | None
+    ) -> list[_OnnxPaddingReadObserver]:
+        path = _save_onnx_model(model, tmp_path / "padding-strings.onnx")
+        observations = []
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            observer = _OnnxPaddingReadObserver()
+            result = observer.run(lambda scanner_type=scanner_type: scanner_type().scan(str(path)))
+            observer.assert_observation_available()
+            assert result.success is not incomplete, result.metadata
+            assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+            semantics = result.metadata["onnx_weight_distribution_semantics"]
+            assert bool(semantics["coverage_gaps"]) is incomplete
+            if reason is not None:
+                assert semantics["coverage_gaps"][reason] >= 1
+            assert semantics["analyzed_layer_count"] == 1
+            checks = TestWeightDistributionSemantics._extreme_checks(result)
+            assert len(checks) == 1
+            assert checks[0].details["initializer"] == "prior"
+            assert checks[0].details["affected_neurons"] == [0]
+            coverage = TestWeightDistributionCoverage._coverage_checks(
+                result, standalone=scanner_type is WeightDistributionScanner
+            )
+            assert bool(coverage) is incomplete
+            assert all(check.status == CheckStatus.FAILED and check.message for check in coverage)
+            observations.append(observer)
+        return observations
+
+    @pytest.mark.parametrize("operator", ["MaxPool", "Conv"])
+    @pytest.mark.parametrize("payload", ["valid", "oversized"])
+    def test_repeated_literal_padding_is_admitted_once(self, tmp_path: Path, operator: str, payload: str) -> None:
+        function = self._literal_function("LiteralPadding", operator)
+        results = [f"out{index}" for index in range(3)]
+        nodes = [
+            helper.make_node("LiteralPadding", ["expanded", "kernel"], [name], domain="padding.test")
+            for name in results
+        ]
+        model, prior, feeds = self._model([function], nodes, results)
+        self._check_reference(model, prior, feeds)
+        if payload == "oversized":
+            attribute = next(item for item in model.functions[0].node[0].attribute if item.name == "auto_pad")
+            attribute.s = b"x" * 11
+        incomplete = payload == "oversized"
+        reason = "padding_mode_byte_limit" if incomplete else None
+        plan, observation = self._observe_plan(model)
+        self._assert_plan(plan, prior, incomplete=incomplete, reason=reason)
+        observations = [observation, *self._public_observations(model, tmp_path, incomplete=incomplete, reason=reason)]
+        for observed in observations:
+            owners = {owner for owner, _name, _result, _retained, _size in observed.parses}
+            assert len(owners) == 1
+            assert len(observed.parses) >= 3
+            assert all(retained and size == 1 for _owner, _name, _result, retained, size in observed.parses)
+            assert {result for _owner, _name, result, _retained, _size in observed.parses} == {
+                None if incomplete else b"VALID"
+            }
+            assert len(observed.getters) == int(not incomplete)
+            debits = [entry for entry in observed.reservations if entry[0] == "parsed_padding_mode"]
+            assert len(debits) == 1 and debits[0][1] == 1 and debits[0][-1]
+            proof = "pooling_has_nonempty_samples" if operator == "MaxPool" else "has_no_padding"
+            outcomes = [result for name, node, result in observed.proofs if name == proof and node == "padding_probe"]
+            assert outcomes == [not incomplete] * 3
+
+    def test_forwarded_padding_owners_keep_defaults_overrides_and_enum_meanings(self, tmp_path: Path) -> None:
+        inner_nodes = []
+        for operator, node_name, output in (
+            ("MaxPool", "padding_pool", "pooled"),
+            ("Conv", "padding_conv", "convolved"),
+        ):
+            node = helper.make_node(
+                operator,
+                ["data", "kernel"] if operator == "Conv" else ["data"],
+                [output],
+                name=node_name,
+                kernel_shape=[1],
+            )
+            node.attribute.append(
+                onnx.AttributeProto(name="auto_pad", ref_attr_name="inner_pad", type=onnx.AttributeProto.STRING)
+            )
+            inner_nodes.append(node)
+        inner = helper.make_function(
+            "padding.test",
+            "InnerPadding",
+            ["data", "kernel"],
+            ["pooled", "convolved"],
+            inner_nodes,
+            [helper.make_opsetid("", 18)],
+            attribute_protos=[helper.make_attribute("inner_pad", b"VALID")],
+        )
+        call = helper.make_node("InnerPadding", ["data", "kernel"], ["pooled", "convolved"], domain="padding.test")
+        call.attribute.append(
+            onnx.AttributeProto(name="inner_pad", ref_attr_name="outer_mode", type=onnx.AttributeProto.STRING)
+        )
+        outer = helper.make_function(
+            "padding.test",
+            "ForwardPadding",
+            ["data", "kernel"],
+            ["pooled", "convolved"],
+            [call],
+            [helper.make_opsetid("", 18), helper.make_opsetid("padding.test", 1)],
+            attribute_protos=[helper.make_attribute("outer_mode", b"VALID")],
+        )
+        # All calls are first checked/reference-evaluated with VALID. Mutations
+        # below test conservative parsing, not a fabricated malformed runtime.
+        modes: list[bytes | None] = [
+            None,
+            b"x" * 11,
+            None,
+            b"VALID",
+            b"INVALID",
+            b"",
+            b"NOTSET",
+            b"SAME_UPPER",
+            b"SAME_LOWER",
+            b"unresolved",
+        ]
+        nodes, results = [], []
+        for index, mode in enumerate(modes):
+            outputs = [f"pool{index}", f"conv{index}"]
+            node = helper.make_node("ForwardPadding", ["expanded", "kernel"], outputs, domain="padding.test")
+            if mode is not None:
+                node.attribute.append(helper.make_attribute("outer_mode", b"VALID"))
+            nodes.append(node)
+            results.extend(outputs)
+        model, prior, feeds = self._model([inner, outer], nodes, results)
+        self._check_reference(model, prior, feeds)
+        calls = [node for node in model.graph.node if node.op_type == "ForwardPadding"]
+        for node, mode in zip(calls, modes, strict=True):
+            if mode is None:
+                continue
+            attribute = node.attribute[0]
+            attribute.s = mode
+            if mode == b"unresolved":
+                attribute.ClearField("s")
+                attribute.ref_attr_name = "missing_outer_mode"
+        plan, observation = self._observe_plan(model)
+        self._assert_plan(plan, prior, incomplete=True, reason="padding_mode_byte_limit")
+        observations = [
+            observation,
+            *self._public_observations(model, tmp_path, incomplete=True, reason="padding_mode_byte_limit"),
+        ]
+        for observed in observations:
+            owners = {owner for owner, _name, _result, _retained, _size in observed.parses}
+            assert len(owners) == 8
+            assert {name for _owner, name, _result, _retained, _size in observed.parses} == {"outer_mode"}
+            assert all(retained for _owner, _name, _result, retained, _size in observed.parses)
+            assert max(size for _owner, _name, _result, _retained, size in observed.parses) == 8
+            assert {result for _owner, _name, result, _retained, _size in observed.parses} == {
+                None,
+                b"",
+                b"NOTSET",
+                b"VALID",
+                b"SAME_UPPER",
+                b"SAME_LOWER",
+            }
+            assert len(observed.getters) == len({owner for _name, owner in observed.getters}) == 7
+            pool_results = [
+                result
+                for name, node, result in observed.proofs
+                if name == "pooling_has_nonempty_samples" and node == "padding_pool"
+            ]
+            conv_results = [
+                result for name, node, result in observed.proofs if name == "has_no_padding" and node == "padding_conv"
+            ]
+            assert pool_results == [True, False, True, True, False, True, True, True, True, False]
+            assert conv_results == [True, False, True, True, False, True, True, False, False, False]
+
+    def test_padding_owners_share_default_work_and_reuse_cache_after_exhaustion(self, tmp_path: Path) -> None:
+        budget = onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert budget == 4096
+        cast = helper.make_node("Cast", ["data"], ["out"])
+        cast.attribute.append(onnx.AttributeProto(name="to", ref_attr_name="tag0", type=onnx.AttributeProto.INT))
+        primer = helper.make_function(
+            "padding.test",
+            "SpendDefaultWork",
+            ["data"],
+            ["out"],
+            [cast],
+            [helper.make_opsetid("", 18)],
+            attribute_protos=[helper.make_attribute(f"tag{index}", int(TensorProto.FLOAT)) for index in range(2046)],
+        )
+        nodes = [helper.make_node("SpendDefaultWork", ["expanded"], ["unused_primer"], domain="padding.test")]
+        results = []
+        for index, owner in enumerate(("A", "B", "C", "D", "E", "A", "E")):
+            output = f"out{index}"
+            if owner in {"A", "E"}:
+                node = helper.make_node(f"Padding{owner}", ["expanded", "kernel"], [output], domain="padding.test")
+            else:
+                node = helper.make_node("MaxPool", ["expanded"], [output], kernel_shape=[1], auto_pad="VALID")
+            nodes.append(node)
+            results.append(output)
+        model, prior, feeds = self._model(
+            [primer, self._literal_function("PaddingA"), self._literal_function("PaddingE")], nodes, results
+        )
+        self._check_reference(model, prior, feeds)
+        plan, observation = self._observe_plan(model)
+        self._assert_plan(plan, prior, incomplete=True, reason="attribute_binding_work_limit")
+        observations = [
+            observation,
+            *self._public_observations(model, tmp_path, incomplete=True, reason="attribute_binding_work_limit"),
+        ]
+        for observed in observations:
+            defaults = [entry for entry in observed.reservations if entry[0] == "default_function_attribute_maps"]
+            assert defaults == [("default_function_attribute_maps", 4092, 4096, 4, True)]
+            assert observed.primer_defaults
+            assert all(
+                entry == (("tag0",), ("tag0",), int(onnx.AttributeProto.INT), int(TensorProto.FLOAT), "")
+                for entry in observed.primer_defaults
+            )
+            debits = [entry for entry in observed.reservations if entry[0] == "parsed_padding_mode"]
+            assert [(work, before, after, allowed) for _caller, work, before, after, allowed in debits] == [
+                (1, 4, 3, True),
+                (1, 3, 2, True),
+                (1, 2, 1, True),
+                (1, 1, 0, True),
+                (1, 0, 0, False),
+                (1, 0, 0, False),
+            ]
+            assert len(observed.getters) == len({owner for _name, owner in observed.getters}) == 4
+            assert max(size for _owner, _name, _result, _retained, size in observed.parses) == 4
+            rejected = [
+                (owner, retained) for owner, _name, result, retained, _size in observed.parses if result is None
+            ]
+            assert len(rejected) == 2 and len({owner for owner, _retained in rejected}) == 1
+            assert all(not retained for _owner, retained in rejected)
+            assert all(retained for _owner, _name, result, retained, _size in observed.parses if result is not None)
+            outcomes = [result for name, _node, result in observed.proofs if name == "pooling_has_nonempty_samples"]
+            assert outcomes == [True, True, True, True, False, True, False]
