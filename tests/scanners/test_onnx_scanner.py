@@ -48070,7 +48070,13 @@ class TestOnnxReplayReferenceNameWork:
             and any(isinstance(target, ast.Name) and target.id == "reference" for target in node.targets)
             and any(isinstance(item, ast.Constant) and item.value == "ref_attr_name" for item in ast.walk(node))
         }
+        targets: dict[int, Any] = {}
+        target_graphs: dict[int, Any] = {}
         observed: dict[str, Any] = {
+            "targets": targets,
+            "target_graphs": target_graphs,
+            "binding_keys": [],
+            "replay_helper": None,
             "inventory": [],
             "reservations": [],
             "references": [],
@@ -48079,7 +48085,7 @@ class TestOnnxReplayReferenceNameWork:
             "resolved_attributes": [],
         }
         frames: dict[int, dict[str, Any]] = {}
-        targets: dict[int, Any] = {}
+        binding_frames: dict[int, dict[str, Any]] = {}
 
         def trace(frame: Any, event: str, _arg: Any) -> Any:
             if frame.f_code.co_filename != str(source_path):
@@ -48119,8 +48125,36 @@ class TestOnnxReplayReferenceNameWork:
             if frame.f_code.co_filename != str(source_path):
                 return
             name, local = frame.f_code.co_name, frame.f_locals
-            if name == "reserve_exact_loop_replay_traversal":
+            if name == "graph_external_reference_names" and event == "call":
+                # Discover the reference before binding admission can stop replay.
+                for graph_node in getattr(local["graph"], "node", ()):
+                    if graph_node.name == "r35_reference_cast":
+                        target_graphs[id(local["graph"])] = local["graph"]
+                        for attribute in graph_node.attribute:
+                            targets[id(attribute)] = attribute
+            elif name == "attribute_binding_cache_key":
+                if event == "call" and local["attribute_bindings"]:
+                    binding_frames[id(frame)] = {
+                        "bindings": local["attribute_bindings"],
+                        "before": local["attribute_binding_work_remaining"],
+                    }
+                elif event == "return" and id(frame) in binding_frames:
+                    entry = binding_frames.pop(id(frame))
+                    bindings = entry["bindings"]
+                    cached = local["attribute_binding_keys"].get(id(bindings))
+                    entry.update(
+                        result=result,
+                        after=local["attribute_binding_work_remaining"],
+                        retained=cached is not None and cached[0] is bindings,
+                        work=local.get("binding_work"),
+                    )
+                    observed["binding_keys"].append(entry)
+            elif name == "reserve_exact_loop_replay_traversal":
                 if event == "call":
+                    if frame.f_back is not None:
+                        replay_helper = frame.f_back.f_locals.get("reserve_exact_loop_replay_traversal")
+                        if callable(replay_helper):
+                            observed["replay_helper"] = replay_helper
                     graph, cache = local["replay_graph"], local["graph_work_cache"]
                     cached = cache.get(id(graph))
                     frames[id(frame)] = {
@@ -48177,7 +48211,7 @@ class TestOnnxReplayReferenceNameWork:
         finally:
             sys.setprofile(previous_profile)
             sys.settrace(previous_trace)
-        assert not frames
+        assert not frames and not binding_frames
         return result, observed
 
     @pytest.mark.parametrize("mode", ["default", "override", "work_limit", "wire_limit"])
@@ -48195,19 +48229,30 @@ class TestOnnxReplayReferenceNameWork:
             semantics = result.metadata["onnx_weight_distribution_semantics"]
             assert bool(semantics["coverage_gaps"].get("lineages_per_value_limit")) is incomplete
             inventory = [row for row in observed["inventory"] if row[5]]
-            assert len(inventory) == 1
-            assert inventory[0][3] == name_length + len("to")
-            assert inventory[0][4] == max(0, (name_length + 1) // 64)
-            graph = inventory[0][1]
-            calls = [row for row in observed["reservations"] if row["graph"] is graph]
-            assert calls
             if incomplete:
-                assert calls[0]["result"] is False
-                assert calls[0]["after"] == 0 and calls[0]["exhausted"] is True
-                assert observed["references"] == []
-                assert (None, True) in observed["bounds"]
-                assert all(row["result"] is False and row["after"] == 0 for row in calls)
+                assert semantics["coverage_gaps"]["attribute_binding_work_limit"] >= 1
+                bindings = [
+                    row
+                    for row in observed["binding_keys"]
+                    if len(row["bindings"]) == 1 and {len(key) for key in row["bindings"]} == {name_length}
+                ]
+                assert bindings
+                for row in bindings:
+                    assert row["result"] is None and row["retained"] is False
+                    assert 0 < row["before"] == row["after"] <= 4096
+                    assert row["work"] == {"work_limit": 4097, "wire_limit": 16385}[mode]
+                assert inventory == []
+                assert not any(id(row["graph"]) in observed["target_graphs"] for row in observed["reservations"])
+                assert observed["targets"] and observed["references"] == []
+                assert (None, False) in observed["bounds"]
+                assert all(not exhausted for _bound, exhausted in observed["bounds"])
             else:
+                assert len(inventory) == 1
+                assert inventory[0][3] == name_length + len("to")
+                assert inventory[0][4] == max(0, (name_length + 1) // 64)
+                graph = inventory[0][1]
+                calls = [row for row in observed["reservations"] if row["graph"] is graph]
+                assert calls
                 assert len(calls) >= 3 and all(row["result"] is True for row in calls)
                 assert calls[0]["cache_hit"] is False and all(row["cache_hit"] for row in calls[1:])
                 assert all(row["before"] - row["after"] == row["traversal_work"] > 0 for row in calls)
@@ -48218,6 +48263,66 @@ class TestOnnxReplayReferenceNameWork:
             assert sum(admitted) <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
         if incomplete:
             TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("name_length", [64 * 4096 + 1, 1024 * 1024 + 1])
+    def test_finite_replay_reference_guard_survives_earlier_binding_refusal(
+        self, tmp_path: Path, name_length: int
+    ) -> None:
+        from copy import deepcopy
+
+        model, prior = self._model("dtype_parameter")
+        self._oracle(model, prior, [False])
+        path = _save_onnx_model(model, tmp_path / "finite-reference-guard.onnx")
+        result, admitted = self._observe(lambda: WeightDistributionScanner().scan(str(path)))
+        _OnnxResourceAdmissionObserver.assert_public_result(result, incomplete=False, standalone=True)
+        reserve = admitted["replay_helper"]
+        assert callable(reserve)
+        assert onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK == 4096
+
+        # Real function owners retain the original three-node geometry. Only
+        # equal declaration/reference names change; the live quota is not reset.
+        graphs = []
+        for length in (62, 63, 126, 127, name_length):
+            graph = deepcopy(model.functions[0])
+            graph.node[0].attribute[0].ref_attr_name = "d" * length
+            graph.attribute_proto[0].name = "d" * length
+            graphs.append(graph)
+
+        def probe() -> list[bool]:
+            outcomes: list[bool] = []
+            for graph in graphs[:-1]:
+                outcomes.extend((reserve(graph, 0, 0), reserve(graph, 0, 0)))
+            outcomes.extend((reserve(graphs[-1], 0, 0), reserve(graphs[-1], 0, 0), reserve(graphs[0], 0, 0)))
+            return outcomes
+
+        outcomes, observed = self._observe(probe)
+        assert observed["reservations"][0]["before"] > 128
+        assert outcomes == [True] * 8 + [False] * 3
+        # Three nodes, one input, two outputs and nine node slots cost 15.
+        # Combined name/reference lengths 64, 65, 128, 129 add 0, 1, 1, 2.
+        for graph, work in zip(graphs[:-1], (15, 16, 16, 17), strict=True):
+            calls = [row for row in observed["reservations"] if row["graph"] is graph]
+            assert [row["cache_hit"] for row in calls[:2]] == [False, True]
+            assert all(row["before"] - row["after"] == row["traversal_work"] == work for row in calls[:2])
+            inventory = [row for row in observed["inventory"] if row[1] is graph and row[5]]
+            assert len(inventory) == 1 and inventory[0][4] == work - 15
+        refused = [row for row in observed["reservations"] if row["graph"] is graphs[-1]]
+        assert len(refused) == 2
+        assert all(row["result"] is False and row["after"] == 0 and row["exhausted"] for row in refused)
+        assert all(row["cache_hit"] is False and id(graphs[-1]) not in row["cache"] for row in refused)
+        inventory = [row for row in observed["inventory"] if row[1] is graphs[-1] and row[5]]
+        assert len(inventory) == 1 and inventory[0][3] == name_length + 2
+        assert inventory[0][4] == (4096 if name_length == 262145 else 16384)
+        assert refused[0]["before"] > 0 and refused[1]["before"] == 0
+        final = observed["reservations"][-1]
+        assert final["graph"] is graphs[0] and final["result"] is False and final["exhausted"] is True
+        successful_work = [
+            row["traversal_work"]
+            for batch in (admitted, observed)
+            for row in batch["reservations"]
+            if row["result"] is True
+        ]
+        assert sum(successful_work) <= 4096
 
     def test_cast_dtype_arity_refuses_before_bound_reference_resolution(self, tmp_path: Path) -> None:
         model, prior = self._model("dtype_parameter")
@@ -48241,7 +48346,16 @@ class TestOnnxReplayReferenceNameWork:
             )
             resolutions.clear()
             dtypes = [
-                dtype_probe(cast, index, {"value": TensorProto.FLOAT}, {}, resolve, True, lambda _name: None)
+                dtype_probe(
+                    cast,
+                    index,
+                    {"value": TensorProto.FLOAT},
+                    {},
+                    resolve,
+                    True,
+                    lambda _name: None,
+                    identifier=("", "Cast", ""),
+                )
                 for index in range(output_count)
             ]
             if output_count == 1:
@@ -48293,3 +48407,809 @@ class TestOnnxReplayReferenceNameWork:
                 }
         if incomplete:
             TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class _OnnxBindingNameObserver:
+    def __init__(self) -> None:
+        self.filename = onnx_scanner_module._build_onnx_weight_analysis_plan.__code__.co_filename
+        tree = ast.parse(Path(self.filename).read_text())
+        helpers = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"bound_function_attributes", "attribute_binding_cache_key", "walk_graph"}
+        }
+        self.lines: dict[tuple[str, int], str] = {}
+        for function, variable, label in (
+            ("bound_function_attributes", "name", "helper_name"),
+            ("bound_function_attributes", "reference_name", "helper_reference"),
+            ("walk_graph", "attribute_name", "primary_name"),
+        ):
+            assignments = [
+                node
+                for node in ast.walk(helpers[function])
+                if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == variable for target in node.targets)
+            ]
+            assert len(assignments) == 1
+            self.lines[function, assignments[0].lineno] = label
+        self.environment: dict[str, Any] = {}
+        self.reads: list[tuple[str, Any]] = []
+        self.helper_returns: list[tuple[Any, Any, Any]] = []
+        self.keys: list[dict[str, Any]] = []
+        self.semantic_owners: list[Any] = []
+        self.default_work: list[tuple[int, int, int, bool]] = []
+        self.pending: dict[int, Any] = {}
+
+    def trace(self, frame: Any, event: str, _argument: Any) -> Any:
+        if frame.f_code.co_filename != self.filename:
+            return None
+        if frame.f_code.co_name not in {name for name, _line in self.lines}:
+            return None
+        if event == "line":
+            label = self.lines.get((frame.f_code.co_name, frame.f_lineno))
+            if label is not None:
+                self.reads.append((label, frame.f_locals["attribute"]))
+        return self.trace
+
+    def profile(self, frame: Any, event: str, argument: Any) -> None:
+        if frame.f_code.co_filename != self.filename:
+            return
+        name, local = frame.f_code.co_name, frame.f_locals
+        if name == "attribute_binding_cache_key":
+            if event == "call":
+                self.pending[id(frame)] = {
+                    "owner": local["attribute_bindings"],
+                    "before": local["attribute_binding_work_remaining"],
+                }
+            elif event == "return":
+                row = self.pending.pop(id(frame))
+                owner = row["owner"]
+                cache = local["attribute_binding_keys"]
+                cached = cache.get(id(owner))
+                row.update(
+                    result=argument,
+                    after=local["attribute_binding_work_remaining"],
+                    retained=cached is not None and cached[0] is owner,
+                    size=len(cache),
+                )
+                self.keys.append(row)
+        elif name == "semantic_mapping_cache_key" and event == "call":
+            caller = frame.f_back
+            if caller is not None and caller.f_code.co_name == "attribute_binding_cache_key":
+                self.semantic_owners.append(local["mapping"])
+        elif name == "reserve_function_default_work":
+            if event == "call":
+                self.pending[id(frame)] = (local["work"], local["function_default_work_remaining"])
+            elif event == "return":
+                work, before = self.pending.pop(id(frame))
+                self.default_work.append((work, before, local["function_default_work_remaining"], bool(argument)))
+        elif name == "bound_function_attributes" and event == "return":
+            self.helper_returns.append((local["function"], local["node"], argument))
+        elif name == "_build_onnx_weight_analysis_plan" and event == "return":
+            for key in ("bound_function_attributes", "attribute_binding_cache_key", "attribute_binding_keys", "plan"):
+                self.environment[key] = local[key]
+            self.environment["remaining_work"] = {
+                key: value for key, value in local.items() if key.endswith("_work_remaining") and isinstance(value, int)
+            }
+
+    def run(self, action: Any) -> Any:
+        previous_trace, previous_profile = sys.gettrace(), sys.getprofile()
+        try:
+            sys.settrace(self.trace)
+            sys.setprofile(self.profile)
+            return action()
+        finally:
+            sys.settrace(previous_trace)
+            sys.setprofile(previous_profile)
+            assert not self.pending
+
+    def read_count(self, label: str, owner: Any) -> int:
+        return sum(kind == label and attribute is owner for kind, attribute in self.reads)
+
+    def retained_characters(self) -> int:
+        # Inspect production retention; observer records themselves are not a memory measurement.
+        cache = self.environment["attribute_binding_keys"]
+        characters = 0
+        for owner, key in cache.values():
+            names = list(owner)
+            assert len(names) == len(key)
+            for name, entry in zip(sorted(names), key, strict=True):
+                assert entry[0] is name
+                characters += len(name)
+        return characters
+
+
+class TestOnnxBindingNameAdmission:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+
+    @staticmethod
+    def _function(parameter: str) -> Any:
+        cast = helper.make_node("Cast", ["x"], ["y"])
+        cast.attribute.append(onnx.AttributeProto(name="to", ref_attr_name=parameter, type=onnx.AttributeProto.INT))
+        return helper.make_function(
+            "binding.test",
+            "Project",
+            ["x"],
+            ["y"],
+            [cast],
+            [helper.make_opsetid("", 18)],
+            attributes=[parameter],
+        )
+
+    @classmethod
+    def _capture(cls, parameter: str) -> tuple[Any, _OnnxBindingNameObserver]:
+        model = helper.make_model(
+            helper.make_graph([], "binding_capture", [cls._value("X", [1])], [cls._value("X", [1])]),
+            functions=[cls._function(parameter)],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("binding.test", 1)],
+            ir_version=8,
+        )
+        onnx.checker.check_model(model)
+        observed = _OnnxBindingNameObserver()
+        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        assert plan.coverage_gaps == {} and plan.specs == []
+        assert observed.environment["attribute_binding_keys"] == {}
+        return model.functions[0], observed
+
+    @pytest.mark.parametrize("mode", ["short", "forwarded", "unreferenced_limit", "unreferenced_reference"])
+    def test_helper_name_work_precedes_membership_resolution_and_repeat_getters(
+        self, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 8)
+        parameter = "p" * 64 if mode == "short" else "p"
+        function, observed = self._capture(parameter)
+        bind = observed.environment["bound_function_attributes"]
+        key = observed.environment["attribute_binding_cache_key"]
+        call = helper.make_node("Project", ["x"], ["y"], domain="binding.test")
+        if mode == "forwarded":
+            call.attribute.append(
+                onnx.AttributeProto(name=parameter, ref_attr_name="r" * 64, type=onnx.AttributeProto.INT)
+            )
+        elif mode == "unreferenced_reference":
+            call.attribute.append(
+                onnx.AttributeProto(name="unused", ref_attr_name="r" * 513, type=onnx.AttributeProto.INT)
+            )
+        else:
+            call.attribute.append(helper.make_attribute("u" * 513 if mode == "unreferenced_limit" else parameter, 1))
+        owner = call.attribute[0]
+        resolutions: list[Any] = []
+        resolved = helper.make_attribute("resolved", TensorProto.FLOAT)
+
+        def resolve(attribute: Any) -> Any:
+            resolutions.append(attribute)
+            return resolved
+
+        answer = observed.run(lambda: bind(function, call, resolve))
+        assert observed.read_count("helper_name", owner) == 1
+        if mode == "unreferenced_reference":
+            assert answer == {} and resolutions == []
+            assert observed.read_count("helper_reference", owner) == 0
+            assert observed.default_work == [(0, 8, 8, True), (1, 8, 7, True)]
+            assert observed.environment["plan"].coverage_gaps == {}
+            return
+        if mode == "unreferenced_limit":
+            assert answer == {} and resolutions == []
+            assert observed.read_count("helper_reference", owner) == 0
+            assert observed.default_work == [(0, 8, 8, True), (1, 8, 7, True), (8, 7, 0, False)]
+            assert observed.run(lambda: bind(function, call, resolve)) == {}
+            assert observed.default_work[-1] == (1, 0, 0, False)
+            assert observed.read_count("helper_name", owner) == 1
+            assert observed.read_count("helper_reference", owner) == 0
+            assert observed.environment["plan"].coverage_gaps["attribute_binding_work_limit"] == 1
+            return
+        assert answer == {parameter: resolved} and resolutions == [owner]
+        assert observed.read_count("helper_reference", owner) == 1
+        first_key = observed.run(lambda: key(answer))
+        assert first_key is not None
+        if mode == "short":
+            assert observed.default_work == [(0, 8, 8, True), (1, 8, 7, True)]
+            return
+        assert observed.default_work == [(0, 8, 8, True), (1, 8, 7, True), (1, 7, 6, True)]
+        second = helper.make_attribute("resolved", TensorProto.INT64)
+        other = observed.run(lambda: bind(function, call, lambda _attribute: second))
+        other_key = observed.run(lambda: key(other))
+        assert other_key is not None and other_key != first_key
+        failed = observed.run(lambda: bind(function, call, lambda _attribute: None))
+        assert failed == {} and observed.run(lambda: key(failed)) == ()
+        assert answer[parameter] is resolved and other[parameter] is second
+        assert observed.read_count("helper_name", owner) == observed.read_count("helper_reference", owner) == 3
+        assert [row[0] for row in observed.default_work] == [0, 1, 1, 1, 1, 1, 1]
+        assert observed.environment["plan"].coverage_gaps == {}
+
+    def test_central_key_budget_bounds_aggregate_names_and_preserves_cached_contexts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 12)
+        _function, observed = self._capture("p")
+        key = observed.environment["attribute_binding_cache_key"]
+        first = helper.make_attribute("value", TensorProto.FLOAT)
+        second = helper.make_attribute("value", TensorProto.INT64)
+        name = "n" * 129
+        environments = [{name: first}, {name: second}, {name: first}]
+        keys = [observed.run(lambda owner=owner: key(owner)) for owner in environments]
+        assert keys[0] == keys[2] and keys[0] != keys[1]
+        assert [row["before"] - row["after"] for row in observed.keys] == [3, 3, 3]
+        rejected = {"r" * 257: first}
+        semantic_count = len(observed.semantic_owners)
+        assert observed.run(lambda: key(rejected)) is None
+        assert observed.keys[-1]["before"] == observed.keys[-1]["after"] == 3
+        assert not observed.keys[-1]["retained"] and len(observed.semantic_owners) == semantic_count
+        small = {"s" * 64: first}
+        final = {"f" * 65: second}
+        assert observed.run(lambda: key(small)) is not None
+        assert observed.run(lambda: key(final)) is not None
+        assert observed.keys[-1]["after"] == 0
+        assert observed.run(lambda: key(environments[0])) is keys[0]
+        assert observed.keys[-1]["before"] == observed.keys[-1]["after"] == 0
+        assert observed.keys[-1]["retained"]
+        late = {"late": first}
+        semantic_count = len(observed.semantic_owners)
+        assert observed.run(lambda: key(late)) is None
+        assert not observed.keys[-1]["retained"] and len(observed.semantic_owners) == semantic_count
+        cache = observed.environment["attribute_binding_keys"]
+        assert len(cache) == 5 and all(cache[id(owner)][0] is owner for owner in [*environments, small, final])
+        assert id(rejected) not in cache and id(late) not in cache
+        assert observed.retained_characters() == 3 * 129 + 64 + 65 <= 64 * 12
+        assert observed.environment["plan"].coverage_gaps["attribute_binding_work_limit"] == 1
+
+    @classmethod
+    def _prior(cls) -> tuple[Any, Any]:
+        prior = np.zeros((64, 64), np.float32)
+        prior[3, 7] = 1000
+        return prior, cls._tensor("known_weight", prior)
+
+    @classmethod
+    def _recurrent_model(cls, parameter: str, *, consumer: bool) -> tuple[Any, Any]:
+        prior, prior_tensor = cls._prior()
+        states = [f"state{i}" for i in range(4)]
+        call = helper.make_node("Project", ["A"], ["unused_projection"], domain="binding.test")
+        call.attribute.append(helper.make_attribute(parameter, TensorProto.FLOAT))
+        nodes = [call]
+        if consumer:
+            nodes.append(helper.make_node("MatMul", ["A", "A"], ["unused_product"]))
+        body = helper.make_graph(
+            nodes,
+            "binding_recurrence",
+            [
+                cls._value("i", [], TensorProto.INT64),
+                cls._value("c", [], TensorProto.BOOL),
+                *[cls._value(name, []) for name in states],
+            ],
+            [cls._value("c", [], TensorProto.BOOL), *[cls._value(name, []) for name in states]],
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["X", "known_weight"], ["known_Y"]),
+                    helper.make_node(
+                        "Loop", ["count", "start", *["initial"] * 4], [f"final{i}" for i in range(4)], body=body
+                    ),
+                ],
+                "recurrent_binding_names",
+                [cls._value("X", [1, 64]), cls._value("A", [1, 1])],
+                [cls._value("known_Y", [1, 64]), *[cls._value(f"final{i}", []) for i in range(4)]],
+                [
+                    prior_tensor,
+                    helper.make_tensor("count", TensorProto.INT64, [], [2]),
+                    helper.make_tensor("start", TensorProto.BOOL, [], [True]),
+                    cls._tensor("initial", np.float32(0)),
+                ],
+            ),
+            functions=[cls._function(parameter)],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("binding.test", 1)],
+            ir_version=8,
+        )
+        return model, prior
+
+    @classmethod
+    def _primary_model(cls, parameter: str) -> tuple[Any, Any]:
+        prior, prior_tensor = cls._prior()
+        cast = helper.make_node("Cast", ["x"], ["typed"])
+        cast.attribute.append(onnx.AttributeProto(name="to", ref_attr_name=parameter, type=onnx.AttributeProto.INT))
+        branch = helper.make_graph(
+            [helper.make_node("Identity", ["typed"], ["chosen"])],
+            "binding_branch",
+            [],
+            [cls._value("chosen", [64, 64])],
+        )
+        inner = helper.make_function(
+            "binding.test",
+            "Inner",
+            ["x", "condition"],
+            ["y"],
+            [cast, helper.make_node("If", ["condition"], ["y"], then_branch=branch, else_branch=branch)],
+            [helper.make_opsetid("", 18)],
+            attributes=[parameter],
+        )
+        shared = helper.make_node("Inner", ["x", "condition"], ["y"], domain="binding.test")
+        shared.attribute.append(helper.make_attribute(parameter, TensorProto.FLOAT))
+        outer = helper.make_function(
+            "binding.test",
+            "Outer",
+            ["x", "condition"],
+            ["y"],
+            [shared],
+            [helper.make_opsetid("", 18), helper.make_opsetid("binding.test", 1)],
+        )
+        nodes = [helper.make_node("MatMul", ["X", "known_weight"], ["known_Y"])]
+        for index in range(5):
+            nodes.extend(
+                [
+                    helper.make_node("Outer", ["W", "condition"], [f"W{index}"], domain="binding.test"),
+                    helper.make_node("MatMul", ["X", f"W{index}"], [f"Y{index}"]),
+                ]
+            )
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "primary_binding_names",
+                [cls._value("X", [1, 64]), cls._value("condition", [], TensorProto.BOOL)],
+                [cls._value("known_Y", [1, 64]), cls._value("Y4", [1, 64])],
+                [prior_tensor, cls._tensor("W", np.zeros((64, 64), np.float32))],
+            ),
+            functions=[outer, inner],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("binding.test", 1)],
+            ir_version=8,
+        )
+        return model, prior
+
+    @staticmethod
+    def _oracle(model: Any, prior: Any, *, recurrent: bool) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        feeds: dict[str, Any] = {"X": np.ones((1, 64), np.float32)}
+        feeds.update({"A": np.ones((1, 1), np.float32)} if recurrent else {"condition": np.bool_(True)})
+        actual: Any = ReferenceEvaluator(inlined).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], feeds["X"] @ prior)
+        for output in actual[1:]:
+            np.testing.assert_array_equal(output, np.float32(0) if recurrent else np.zeros((1, 64), np.float32))
+
+    @staticmethod
+    def _named_rows(observed: _OnnxBindingNameObserver, parameter: str) -> list[dict[str, Any]]:
+        return [row for row in observed.keys if row["owner"] and parameter in row["owner"]]
+
+    @pytest.mark.parametrize("mode", ["small", "aggregate", "no_consumer"])
+    def test_recurrent_required_names_share_work_and_preserve_public_findings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        parameter = "p" * (129 if mode == "small" else 2049)
+        model, prior = self._recurrent_model(parameter, consumer=mode != "no_consumer")
+        self._oracle(model, prior, recurrent=True)
+        path = _save_onnx_model(model, tmp_path / f"recurrent-binding-{mode}.onnx")
+        # Four passthrough states need no finite replay; two body nodes fit the other work ledgers.
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 128)
+        incomplete = mode == "aggregate"
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            observed = _OnnxBindingNameObserver()
+            result = observed.run(lambda scanner_type=scanner_type: scanner_type().scan(str(path)))
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=incomplete, standalone=scanner_type is WeightDistributionScanner
+            )
+            assert observed.retained_characters() <= 64 * 128
+            named = self._named_rows(observed, parameter)
+            assert named and any(row["retained"] for row in named)
+            calls = [row for row in observed.helper_returns if row[0].name == "Project"]
+            assert calls and any(parameter in answer for _function, _node, answer in calls)
+            if incomplete:
+                assert (
+                    result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][
+                        "attribute_binding_work_limit"
+                    ]
+                    == 1
+                )
+                assert any(not answer for _function, _node, answer in calls)
+                assert any(not success for _work, _before, _after, success in observed.default_work)
+                owners = {id(node.attribute[0]): node.attribute[0] for _function, node, _answer in calls}
+                assert len(owners) == 1
+                owner = next(iter(owners.values()))
+                assert observed.read_count("helper_name", owner) < len(calls)
+                assert observed.read_count("helper_reference", owner) < observed.read_count("helper_name", owner)
+            else:
+                assert all(success for _work, _before, _after, success in observed.default_work)
+                for ledger in (
+                    "graph_taint",
+                    "constant_binding",
+                    "graph_constant_context",
+                    "dependency_closure",
+                    "graph_potential_weight",
+                    "function_reference",
+                    "graph_external_function",
+                    "reentry_attribute",
+                    "invariant_state",
+                    "stack_invariance",
+                ):
+                    assert observed.environment["remaining_work"][f"{ledger}_work_remaining"] > 0
+        if incomplete:
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("large", [False, True], ids=["small", "aggregate"])
+    def test_primary_shared_inner_calls_admit_key_characters_before_retention(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, large: bool
+    ) -> None:
+        parameter = "p" * (2049 if large else 129)
+        model, prior = self._primary_model(parameter)
+        self._oracle(model, prior, recurrent=False)
+        path = _save_onnx_model(model, tmp_path / f"primary-binding-{large}.onnx")
+        # Each required 2,049-character key costs 33 units: three maps fit, with 29 units left.
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 128)
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            observed = _OnnxBindingNameObserver()
+            result = observed.run(lambda scanner_type=scanner_type: scanner_type().scan(str(path)))
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=large, standalone=scanner_type is WeightDistributionScanner
+            )
+            named = self._named_rows(observed, parameter)
+            owners = {id(row["owner"]): row["owner"] for row in named}
+            assert len(owners) == 5
+            retained = [
+                owner for owner in owners.values() if id(owner) in observed.environment["attribute_binding_keys"]
+            ]
+            assert len(retained) == (3 if large else 5)
+            assert observed.retained_characters() == len(retained) * len(parameter) <= 64 * 128
+            raw_owners = {id(owner): owner for label, owner in observed.reads if label == "primary_name"}
+            assert len(raw_owners) == 1
+            raw_owner = next(iter(raw_owners.values()))
+            assert observed.read_count("primary_name", raw_owner) == 5
+            assert observed.read_count("helper_name", raw_owner) == 0
+            assert all(success for _work, _before, _after, success in observed.default_work)
+            for row in named:
+                if not row["retained"]:
+                    assert row["result"] is None and row["before"] == row["after"] == 29
+                    assert all(owner is not row["owner"] for owner in observed.semantic_owners)
+            if large:
+                assert (
+                    result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][
+                        "attribute_binding_work_limit"
+                    ]
+                    == 1
+                )
+        if large:
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class _OnnxOperatorIdentifierObserver:
+    @staticmethod
+    def observe(run: Any) -> tuple[Any, dict[str, Any]]:
+        source_path = str(Path(onnx_scanner_module.__file__))
+        observed: dict[str, Any] = {"identifiers": [], "helpers": {}, "scan_offsets": []}
+        active: dict[int, dict[str, Any]] = {}
+
+        def profile(frame: Any, event: str, answer: Any) -> None:
+            if frame.f_code.co_filename != source_path:
+                return
+            name, local = frame.f_code.co_name, frame.f_locals
+            if name == "bounded_operator_identifier":
+                if event == "call":
+                    caller = frame.f_back
+                    caller_local = {} if caller is None else caller.f_locals
+                    active[id(frame)] = {
+                        "owner": local["node"],
+                        "before": local["operator_identifier_work_remaining"],
+                        "caller": "" if caller is None else caller.f_code.co_name,
+                        "graph": caller_local.get("subgraph"),
+                        "graph_input_name": caller_local.get("graph_input_name"),
+                    }
+                elif event == "return":
+                    row = active.pop(id(frame))
+                    cache = local["operator_identifier_cache"]
+                    cached = cache.get(id(row["owner"]))
+                    remaining = local["operator_identifier_work_remaining"]
+                    row.update(
+                        result=answer,
+                        remaining=remaining,
+                        debit=row["before"] - remaining,
+                        cache_size=len(cache),
+                        retained=cached is not None and cached[0] is row["owner"],
+                        cached_result=None if cached is None else cached[1],
+                    )
+                    observed["remaining"] = remaining
+                    observed["identifiers"].append(row)
+            elif name == "scan_sequence_lens_input_offset" and event == "return":
+                observed["scan_offsets"].append((local.get("identifier"), answer))
+            elif name == "_build_onnx_weight_analysis_plan" and event == "return":
+                observed["helpers"] = {
+                    key: local[key]
+                    for key in (
+                        "bounded_operator_identifier",
+                        "builtin_operator",
+                        "has_registered_standard_operator",
+                    )
+                }
+                observed["remaining"] = local["operator_identifier_work_remaining"]
+                observed["cache"] = local["operator_identifier_cache"]
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            result = run(observed)
+        finally:
+            sys.setprofile(previous)
+        assert not active
+        return result, observed
+
+
+class _CountedOnnxOperatorOwner:
+    """Owned metadata probe; never passed to a protobuf checker or public loader."""
+
+    def __init__(self, domain: str = "", op_type: str = "Identity", overload: str = "") -> None:
+        self.values = {"domain": domain, "op_type": op_type, "overload": overload}
+        self.reads: list[str] = []
+
+    def _read(self, field: str) -> str:
+        self.reads.append(field)
+        return self.values[field]
+
+    domain = property(lambda self: self._read("domain"))
+    op_type = property(lambda self: self._read("op_type"))
+    overload = property(lambda self: self._read("overload"))
+
+
+class TestOnnxOperatorIdentifierAdmission:
+    @staticmethod
+    def _primer_model(functions: tuple[Any, ...] = ()) -> Any:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [helper.make_node("MatMul", ["X", "W"], ["Y"])],
+            [value("X", [1, 64])],
+            [value("Y", [1, 64])],
+            [onnx.numpy_helper.from_array(weights, name="W")],
+            list(functions),
+        )
+        onnx.checker.check_model(model)
+        return model
+
+    @staticmethod
+    def _query(observed: dict[str, Any], owner: Any) -> dict[str, Any]:
+        answer = observed["helpers"]["bounded_operator_identifier"](owner)
+        row: dict[str, Any] = observed["identifiers"][-1]
+        assert row["owner"] is owner and row["result"] is answer
+        return row
+
+    @classmethod
+    def _drain_to(cls, observed: dict[str, Any], remaining: int) -> None:
+        assert observed["remaining"] >= remaining
+        while observed["remaining"] > remaining:
+            owner = _CountedOnnxOperatorOwner()
+            row = cls._query(observed, owner)
+            assert row["result"] == ("", "Identity", "") and row["debit"] == 1
+            assert owner.reads == ["domain", "op_type", "overload"]
+
+    def test_cached_success_and_refusal_survive_exhaustion_without_new_getters(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        limit = 32
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT", limit)
+        path = _save_onnx_model(self._primer_model(), tmp_path / "operator-owners.onnx")
+
+        def run(observed: dict[str, Any]) -> Any:
+            result = OnnxScanner().scan(str(path))
+            assert observed["remaining"] >= 3
+            good = _CountedOnnxOperatorOwner(overload="unmatched")
+            success = self._query(observed, good)
+            assert success["result"] == ("", "Identity", "unmatched") and success["retained"]
+            assert success["debit"] == 1
+            repeated = self._query(observed, good)
+            assert repeated["result"] is success["result"] and repeated["debit"] == 0
+            assert good.reads == ["domain", "op_type", "overload"]
+
+            oversized = _CountedOnnxOperatorOwner(overload="x" * (64 * (observed["remaining"] + 1)))
+            refusal = self._query(observed, oversized)
+            assert refusal["result"] is None and refusal["retained"] and refusal["remaining"] == 0
+            assert oversized.reads == ["domain", "op_type", "overload"]
+            cache_size = refusal["cache_size"]
+            assert cache_size <= limit
+            for _ in range(3):
+                fresh = _CountedOnnxOperatorOwner()
+                row = self._query(observed, fresh)
+                assert row["result"] is None and not row["retained"]
+                assert row["remaining"] == row["debit"] == 0 and row["cache_size"] == cache_size
+                assert fresh.reads == []
+            for owner, expected in ((good, success["result"]), (oversized, None)):
+                reused = self._query(observed, owner)
+                assert reused["result"] is expected and reused["retained"]
+                assert reused["debit"] == reused["remaining"] == 0
+                assert reused["cache_size"] == cache_size
+                assert owner.reads == ["domain", "op_type", "overload"]
+            return result
+
+        result, _observed = _OnnxOperatorIdentifierObserver.observe(run)
+        _OnnxResourceAdmissionObserver.assert_public_result(result, incomplete=False, standalone=False)
+
+    @pytest.mark.parametrize(
+        "lengths,allowance,expected_reads,admitted",
+        [
+            ((65, 0, 0), 1, ["domain"], False),
+            ((64, 1, 0), 1, ["domain", "op_type"], False),
+            ((63, 1, 1), 1, ["domain", "op_type", "overload"], False),
+            ((63, 1, 0), 1, ["domain", "op_type", "overload"], True),
+            ((64, 1, 0), 2, ["domain", "op_type", "overload"], True),
+        ],
+        ids=["domain-refusal", "type-refusal", "overload-refusal", "64-characters", "65-characters"],
+    )
+    def test_character_admission_stops_before_the_next_component(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        lengths: tuple[int, int, int],
+        allowance: int,
+        expected_reads: list[str],
+        admitted: bool,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT", 32)
+        path = _save_onnx_model(self._primer_model(), tmp_path / "operator-components.onnx")
+
+        def run(observed: dict[str, Any]) -> Any:
+            result = OnnxScanner().scan(str(path))
+            self._drain_to(observed, allowance)
+            values = tuple(character * length for character, length in zip("dto", lengths, strict=True))
+            owner = _CountedOnnxOperatorOwner(*values)
+            row = self._query(observed, owner)
+            assert row["result"] == (values if admitted else None)
+            assert row["retained"] and row["remaining"] == 0
+            assert row["debit"] == allowance and owner.reads == expected_reads
+            reused = self._query(observed, owner)
+            assert reused["result"] is row["result"] and reused["debit"] == 0
+            assert owner.reads == expected_reads
+            return result
+
+        result, _observed = _OnnxOperatorIdentifierObserver.observe(run)
+        _OnnxResourceAdmissionObserver.assert_public_result(result, incomplete=False, standalone=False)
+
+    def test_dispatch_preserves_exact_overloads_domains_and_effective_schema_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT", 32)
+        function = helper.make_function(
+            "",
+            "Identity",
+            ["x"],
+            ["y"],
+            [helper.make_node("Identity", ["x"], ["y"])],
+            [helper.make_opsetid("", 18)],
+            overload="local",
+        )
+        path = _save_onnx_model(self._primer_model((function,)), tmp_path / "operator-context.onnx")
+
+        def run(observed: dict[str, Any]) -> Any:
+            result = OnnxScanner().scan(str(path))
+            builtin = observed["helpers"]["builtin_operator"]
+            schema = observed["helpers"]["has_registered_standard_operator"]
+            owners = [
+                _CountedOnnxOperatorOwner(overload="local"),
+                _CountedOnnxOperatorOwner(overload="unmatched"),
+                _CountedOnnxOperatorOwner(),
+                _CountedOnnxOperatorOwner(domain="ai.onnx", overload="local"),
+                _CountedOnnxOperatorOwner(domain="local"),
+            ]
+            assert [builtin(owner, "Identity") for owner in owners] == [False, True, True, True, False]
+            assert builtin(owners[1], "Constant") is False
+            # Expand begins at opset 8. Reusing the node identity must not reuse
+            # a schema verdict from a different effective opset environment.
+            expand = _CountedOnnxOperatorOwner(domain="ai.onnx", op_type="Expand", overload="unmatched")
+            assert schema(expand, {"": 7}) is False
+            assert schema(expand, {"ai.onnx": 8}) is True
+            assert schema(expand, {"": 8}) is True
+            assert schema(expand, {"ai.onnx": 7, "": 8}) is False
+            assert schema(expand, {}) is False
+            assert builtin(expand, "Expand") is True
+            assert all(owner.reads == ["domain", "op_type", "overload"] for owner in [*owners, expand])
+            self._drain_to(observed, 0)
+            # Registry and schema contexts remain separate from the retained
+            # identity even when no fresh owner can be admitted.
+            assert builtin(owners[0]) is False and builtin(owners[1]) is True
+            assert schema(expand, {"": 8}) is True and schema(expand, {"": 7}) is False
+            fresh = _CountedOnnxOperatorOwner(op_type="Expand")
+            assert builtin(fresh) is False and schema(fresh, {"": 8}) is False
+            assert fresh.reads == [] and id(fresh) not in observed["cache"]
+            return result
+
+        result, _observed = _OnnxOperatorIdentifierObserver.observe(run)
+        _OnnxResourceAdmissionObserver.assert_public_result(result, incomplete=False, standalone=False)
+
+    def test_primary_scan8_offsets_and_reachable_finding_survive_zero_optional_allowance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT", 0)
+        model = TestOnnxEmptyScan8BatchRegressions._model(0)
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        model.graph.initializer.append(onnx.numpy_helper.from_array(weights, name="prior"))
+        model.graph.input.append(value("A", [1, 64]))
+        model.graph.node.insert(0, helper.make_node("MatMul", ["A", "prior"], ["known"]))
+        model.graph.output.append(value("known", [1, 64]))
+        onnx.checker.check_model(model, full_check=True)
+        path = _save_onnx_model(model, tmp_path / "operator-primary-scan8.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result, observed = _OnnxOperatorIdentifierObserver.observe(
+                lambda _seen, scanner_type=scanner_type: scanner_type().scan(str(path))
+            )
+            assert (("", "Scan", ""), 1) in observed["scan_offsets"]
+            assert observed["remaining"] == 0 and observed["cache"] == {}
+            assert all(row["result"] is None and not row["retained"] for row in observed["identifiers"])
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=False, standalone=scanner_type is WeightDistributionScanner
+            )
+
+    def test_public_recurrent_states_reuse_one_admitted_operator_identifier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT", 64)
+        model = TestOnnxConsumerInventoryAdmission._loop_model(
+            dead_nodes=0, consumer=True, lineage_gap=False, state_count=4
+        )
+        loop = next(node for node in model.graph.node if node.op_type == "Loop")
+        body = next(attribute.g for attribute in loop.attribute if attribute.name == "body")
+        consumer = body.node[0]
+        assert consumer.op_type == "MatMul"
+        consumer.name = "reused_recurrent_matmul"
+        consumer.overload = "unmatched_recurrent"
+        model.ir_version = 10
+        onnx.checker.check_model(model)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"A": np.ones((1, 64), np.float32), "X": np.ones((1, 2), np.float32)}
+        )
+        # The body consumes the last state but carries all four states through
+        # unchanged for both iterations. This oracle is independent of analysis.
+        expected_known = np.zeros((1, 64), np.float32)
+        expected_known[0, 0] = 50
+        assert len(actual) == 5
+        np.testing.assert_array_equal(actual[0], expected_known)
+        for state in actual[1:]:
+            np.testing.assert_array_equal(state, np.ones((2, 2), np.float32))
+        path = _save_onnx_model(model, tmp_path / "operator-recurrent-reuse.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result, observed = _OnnxOperatorIdentifierObserver.observe(
+                lambda _seen, scanner_type=scanner_type: scanner_type().scan(str(path))
+            )
+            rows = [
+                row for row in observed["identifiers"] if getattr(row["owner"], "name", "") == "reused_recurrent_matmul"
+            ]
+            assert rows and len({id(row["owner"]) for row in rows}) == 1
+            assert rows[0]["debit"] == 1 and all(row["debit"] == 0 for row in rows[1:])
+            assert all(row["retained"] and row["result"] is rows[0]["result"] for row in rows)
+            assert rows[0]["result"] == ("", "MatMul", "unmatched_recurrent")
+            recurrent_rows = [
+                row
+                for row in rows
+                if row["caller"] == "subgraph_state_input_can_reach_weight_consumer"
+                and row["graph"].name == "inventory_public_body"
+            ]
+            states = {row["graph_input_name"] for row in recurrent_rows}
+            assert len(states) >= 2 and states <= {f"state{index}" for index in range(4)}
+            assert all(row["debit"] == 0 for row in recurrent_rows)
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=False, standalone=scanner_type is WeightDistributionScanner
+            )
+
+    def test_public_identifier_refusal_preserves_live_lineage_gap_and_prior_finding(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT", 1)
+        model = TestOnnxConsumerInventoryAdmission._loop_model(dead_nodes=4, consumer=True, lineage_gap=True)
+        path = _save_onnx_model(model, tmp_path / "operator-live-gap.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result, observed = _OnnxOperatorIdentifierObserver.observe(
+                lambda _seen, scanner_type=scanner_type: scanner_type().scan(str(path))
+            )
+            rows = observed["identifiers"]
+            assert rows and any(row["result"] is None and row["remaining"] == 0 for row in rows)
+            assert all(row["cache_size"] <= 1 for row in rows)
+            # The forty source lineages feed live body/final MatMul consumers;
+            # refusal alone is not evidence of an incomplete public result.
+            gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            assert gaps["lineages_per_value_limit"] > 0
+            _OnnxResourceAdmissionObserver.assert_public_result(
+                result, incomplete=True, standalone=scanner_type is WeightDistributionScanner
+            )
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
