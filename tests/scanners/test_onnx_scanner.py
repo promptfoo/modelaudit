@@ -43667,3 +43667,501 @@ class TestOnnxRecurrentConstantCopyAdmission:
         checks = TestWeightDistributionCoverage._coverage_checks(normal)
         assert bool(checks) is incomplete
         assert all(check.status == CheckStatus.FAILED and check.message for check in checks)
+
+
+class TestOnnxScanStackAttributeAdmission:
+    _probe_name = "scan_attribute_work_probe"
+    _stack_proof = "control_flow_stack_values_are_invariant"
+
+    @classmethod
+    def _model(
+        cls, width: int, *, bound: bool = False, body_consumer: bool = False
+    ) -> tuple[Any, Any, dict[str, Any], list[Any]]:
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        states = [f"state{index}" for index in range(width)]
+        initial_names = [f"initial{index}" for index in range(width)]
+        final_names = [f"final{index}" for index in range(width)]
+        weights = [np.eye(2, dtype=np.float32) * ((index + 1) / width) for index in range(width)]
+        body_nodes = [helper.make_node("Identity", [states[0]], ["stack_slice"])]
+        if body_consumer:
+            assert not bound  # This mode uses a direct Scan's lexical root capture.
+            body_nodes.append(
+                helper.make_node("MatMul", ["X", states[-1]], ["body_used"], name="consume_carried_state")
+            )
+        body = helper.make_graph(
+            body_nodes,
+            "scan_attribute_passthrough_body",
+            [value(name, [2, 2]) for name in states] + [value("element", [1])],
+            [value(name, [2, 2]) for name in states] + [value("stack_slice", [2, 2])],
+        )
+        scan_inputs, scan_outputs = [*initial_names, "sequence"], [*final_names, "stacked"]
+        scan = helper.make_node(
+            "Scan",
+            scan_inputs,
+            scan_outputs,
+            name=cls._probe_name,
+            body=body,
+            num_scan_inputs=1,
+            scan_input_axes=[0],
+        )
+        functions = []
+        node = scan
+        if bound:
+            for attribute in scan.attribute:
+                if attribute.name in {"num_scan_inputs", "scan_input_axes"}:
+                    name, kind = attribute.name, attribute.type
+                    attribute.Clear()
+                    attribute.name, attribute.type = name, kind
+                    attribute.ref_attr_name = "count" if name == "num_scan_inputs" else "axes"
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "BoundAttributeScan",
+                    scan_inputs,
+                    scan_outputs,
+                    [scan],
+                    [helper.make_opsetid("", 18)],
+                    attributes=["count", "axes"],
+                )
+            )
+            node = helper.make_node("BoundAttributeScan", scan_inputs, scan_outputs, domain="local", count=1, axes=[0])
+        prior = np.zeros((64, 64), np.float32)
+        prior[:5, 0] = 10
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [
+                helper.make_node("MatMul", ["A", "prior"], ["known"], name="prior_weight_consumer"),
+                node,
+                helper.make_node("MatMul", ["X", final_names[-1]], ["used"], name="consume_last_state"),
+            ],
+            [value("A", [1, 64]), value("X", [1, 2]), value("sequence", [2, 1])],
+            [value("known", [1, 64])]
+            + [value(name, [2, 2]) for name in final_names]
+            + [value("stacked", [2, 2, 2]), value("used", [1, 2])],
+            [tensor("prior", prior)]
+            + [tensor(name, weight) for name, weight in zip(initial_names, weights, strict=True)],
+            functions,
+        )
+        feeds = {
+            "A": np.ones((1, 64), np.float32),
+            "X": np.ones((1, 2), np.float32),
+            "sequence": np.array([[3], [7]], np.float32),
+        }
+        expected = [feeds["A"] @ prior, *weights, np.stack([weights[0], weights[0]]), feeds["X"] @ weights[-1]]
+        return model, prior, feeds, expected
+
+    @classmethod
+    def _pad(cls, model: Any, padding: int, late: str) -> int:
+        # Unknown scalar attributes are malformed scanner inputs. They are not
+        # represented as valid ONNX extension attributes or evaluator inputs.
+        scan = model.graph.node[1]
+        attributes = {attribute.name: attribute for attribute in scan.attribute}
+        delayed = "num_scan_inputs" if late == "count" else "scan_input_axes"
+        early = "scan_input_axes" if late == "count" else "num_scan_inputs"
+        ordered = [attributes["body"], attributes[early]]
+        ordered.extend(helper.make_attribute(f"unused{index}", 0) for index in range(padding))
+        ordered.append(attributes[delayed])
+        scan.ClearField("attribute")
+        scan.attribute.extend(ordered)
+        return len(scan.attribute)
+
+    @classmethod
+    def _observe(cls, run: Any) -> tuple[Any, dict[str, Any]]:
+        import dis
+
+        source_path = Path(onnx_scanner_module.__file__)
+        raw_helpers = {cls._stack_proof, "resolved_onnx_int_attribute", "resolved_int_attribute"}
+        owners = raw_helpers | {
+            "subgraph_reenters_state_with_rank_promotion",
+            "subgraph_state_input_can_reach_weight_consumer",
+            "graph_tainted_output_indexes",
+            "walk_graph",
+        }
+        definitions = {
+            node.name: node
+            for node in ast.walk(ast.parse(source_path.read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name in raw_helpers
+        }
+        loop_lines: dict[str, tuple[set[int], set[int]]] = {}
+        for name, definition in definitions.items():
+            loops = [
+                node
+                for node in ast.walk(definition)
+                if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == "attribute"
+            ]
+            # Locate the real loops, not a debit formula or a fixed line number.
+            assert len(loops) == 1, name
+            loop_lines[name] = ({loops[0].lineno}, {loops[0].body[0].lineno})
+        assert set(loop_lines) == raw_helpers
+        # Distinguish the pre-metadata refusal from a later conservative result
+        # (for example, exhaustion while proving a dependency). Do not recreate
+        # the repair's work formula in the expected outcome.
+        budget_guards = [
+            node
+            for node in ast.walk(definitions[cls._stack_proof])
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(part, ast.Name) and part.id == "stack_invariance_work_remaining"
+                for part in ast.walk(node.test)
+            )
+            and any(isinstance(part, ast.Return) for part in node.body)
+        ]
+        admission_guard = min(budget_guards, key=lambda node: node.lineno)
+        admission_refusal_lines = {part.lineno for part in admission_guard.body if isinstance(part, ast.Return)}
+        assert len(admission_refusal_lines) == 1
+        observed: dict[str, Any] = {"proofs": [], "work": {}, "extent_calls": 0}
+        active_proofs: dict[int, dict[str, Any]] = {}
+        iterator_offsets: dict[Any, set[int]] = {}
+
+        def context(frame: Any) -> tuple[tuple[str, ...], dict[str, Any] | None]:
+            chain = []
+            current = frame
+            proof = None
+            while current is not None:
+                if current.f_code.co_filename == str(source_path):
+                    name = current.f_code.co_name
+                    chain.append(name)
+                    if name == cls._stack_proof:
+                        proof = active_proofs.get(id(current))
+                        break
+                    if current is not frame and name in owners - raw_helpers:
+                        break
+                current = current.f_back
+            return tuple(chain), proof
+
+        def trace(frame: Any, event: str, argument: Any) -> Any:
+            if frame.f_code.co_filename != str(source_path):
+                return None
+            name, local = frame.f_code.co_name, frame.f_locals
+            if name == "scan_stacked_output_extent" and event == "call":
+                if getattr(local.get("current_node"), "name", None) == cls._probe_name:
+                    observed["extent_calls"] += 1
+                return None
+            if name not in raw_helpers or getattr(local.get("node"), "name", None) != cls._probe_name:
+                return None
+            if event == "call":
+                if name == cls._stack_proof:
+                    record = {
+                        "output": local["graph_output_index"],
+                        "required_state_input": local["required_state_input"],
+                        "before": local["stack_invariance_work_remaining"],
+                        "iterators": 0,
+                        "visits": 0,
+                    }
+                    active_proofs[id(frame)] = record
+                    observed["proofs"].append(record)
+                if frame.f_code not in iterator_offsets:
+                    offsets = set()
+                    line_ranges = tuple(frame.f_code.co_lines())
+                    for instruction in dis.get_instructions(frame.f_code):
+                        if instruction.opname != "GET_ITER":
+                            continue
+                        line = next(line for start, end, line in line_ranges if start <= instruction.offset < end)
+                        if line in loop_lines[name][0]:
+                            offsets.add(instruction.offset)
+                    assert len(offsets) == 1, name
+                    iterator_offsets[frame.f_code] = offsets
+                frame.f_trace_opcodes = True
+            kind = None
+            if event == "opcode" and frame.f_lasti in iterator_offsets[frame.f_code]:
+                kind = "iterators"
+            elif event == "line" and frame.f_lineno in loop_lines[name][1]:
+                kind = "visits"
+            if kind is not None:
+                chain, proof = context(frame)
+                work = observed["work"].setdefault(chain, {"iterators": 0, "visits": 0})
+                work[kind] += 1
+                if proof is not None:
+                    proof[kind] += 1
+            if name == cls._stack_proof and event == "return":
+                record = active_proofs.pop(id(frame))
+                record.update(
+                    result=argument,
+                    after=local["stack_invariance_work_remaining"],
+                    admission_refused=frame.f_lineno in admission_refusal_lines,
+                )
+            return trace
+
+        previous = sys.gettrace()
+        current_frame = sys._getframe()
+        previous_opcodes = current_frame.f_trace_opcodes
+        try:
+            # Python 3.12 requires an opcode-enabled frame when tracing starts.
+            current_frame.f_trace_opcodes = True
+            sys.settrace(trace)
+            result = run()
+        finally:
+            sys.settrace(previous)
+            current_frame.f_trace_opcodes = previous_opcodes
+        assert not active_proofs
+        return result, observed
+
+    @classmethod
+    def _assert_work(cls, observed: dict[str, Any], *, width: int, oversized: bool, padded: bool) -> None:
+        from itertools import pairwise
+
+        proofs = observed["proofs"]
+        budget = onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert {item["output"] for item in proofs} >= set(range(width))
+        assert all(item["result"] in (True, False) for item in proofs)
+        assert all(0 <= item["after"] <= item["before"] <= budget for item in proofs)
+        assert proofs[0]["before"] == budget
+        assert all(earlier["after"] == later["before"] for earlier, later in pairwise(proofs))
+        # Admission refusal must precede BOTH raw iterators in that same frame,
+        # including the first partially exhausted frame. Other False results
+        # can legitimately follow admitted shape or dependency work.
+        refused = [item for item in proofs if item["admission_refused"]]
+        assert bool(refused) is padded
+        assert all(item["result"] is False for item in refused)
+        assert all(item["iterators"] == item["visits"] == 0 for item in refused)
+        assert sum(item["visits"] for item in proofs) <= budget
+        if oversized:
+            assert all(item["admission_refused"] for item in proofs)
+            assert sum(item["iterators"] for item in proofs) == 0
+        else:
+            assert any(item["result"] is True and item["iterators"] > 0 and item["visits"] > 0 for item in proofs)
+        if not padded:
+            assert all(item["result"] is True for item in proofs)
+        if padded and not oversized:
+            assert any(item["before"] > 0 for item in refused)
+        # This model also has a real stacked result. Its extent is queried, but
+        # a per-output extent query must reuse the current Scan's resolved count.
+        assert observed["extent_calls"] > 0
+        assert not any(
+            "scan_stacked_output_extent" in chain
+            for chain, work in observed["work"].items()
+            if work["iterators"] or work["visits"]
+        )
+
+    @pytest.mark.parametrize("bound", [False, True], ids=["literal", "function-bound"])
+    def test_small_scan_attribute_proofs_preserve_runtime_values(self, tmp_path: Path, bound: bool) -> None:
+        model, prior, feeds, expected = self._model(2, bound=bound)
+        # This existing helper runs the independent ONNX checker and official
+        # inliner, then ReferenceEvaluator; expected values come from the inputs.
+        actual = TestOnnxBuiltinOperatorIdentity._inlined_runtime(model, feeds)
+        assert len(actual) == len(expected)
+        for output, wanted in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(output, wanted)
+        plan, observed = self._observe(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        self._assert_work(observed, width=2, oversized=False, padded=False)
+        assert plan.coverage_gaps == {}
+        assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
+        assert any(
+            spec.context["initializer"] == "initial1" and np.array_equal(spec.weights, expected[2])
+            for spec in plan.specs
+        )
+        path = _save_onnx_model(model, tmp_path / "small-scan-attributes.onnx")
+        for scanner in (OnnxScanner(), WeightDistributionScanner()):
+            result = scanner.scan(str(path))
+            assert result.success is True
+            assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+            assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize(
+        ("width", "padding", "late", "body_consumer"),
+        [
+            (8, 512, "count", False),
+            (64, 512, "axes", False),
+            (8, 4097, "count", False),
+            (512, 4097, "axes", False),
+            (8, 512, "count", True),
+        ],
+    )
+    def test_scan_attribute_work_is_admitted_in_the_refusing_frame(
+        self, tmp_path: Path, width: int, padding: int, late: str, body_consumer: bool
+    ) -> None:
+        model, prior, _feeds, _expected = self._model(width, body_consumer=body_consumer)
+        if body_consumer:
+            onnx.checker.check_model(model, full_check=True)
+        attribute_count = self._pad(model, padding, late)
+        with pytest.raises(onnx.checker.ValidationError):
+            onnx.checker.check_model(model)
+        plan, observed = self._observe(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        self._assert_work(
+            observed,
+            width=width,
+            oversized=attribute_count > onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+            padded=True,
+        )
+        forced_proofs = [item for item in observed["proofs"] if item["required_state_input"] is not None]
+        assert bool(forced_proofs) is body_consumer
+        if body_consumer:
+            # The earlier carried-input caller is reached only after a real
+            # body weight consumer is found. It must admit this first proof;
+            # later output proofs still exhaust the same plan-wide allowance.
+            assert any(
+                item["required_state_input"] == f"state{width - 1}" and item["result"] is True and item["visits"] > 0
+                for item in forced_proofs
+            )
+        assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
+        assert plan.coverage_gaps.get("unresolved_initializer_lineage", 0) > 0
+        assert any(
+            sample["consumer_node"] == "consume_last_state"
+            and sample["consumer_op"] == "MatMul"
+            and sample["reason"] == "unresolved_control_flow_stack_lineage"
+            for sample in plan.unresolved_lineage_samples
+        )
+        if body_consumer:
+            path = _save_onnx_model(model, tmp_path / "scan-body-consumer-attributes.onnx")
+            for scanner in (OnnxScanner(), WeightDistributionScanner()):
+                result = scanner.scan(str(path))
+                assert result.success is False
+                assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+                assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+
+    @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
+    def test_public_scan_attribute_refusal_preserves_prior_findings(self, tmp_path: Path, scanner_type: Any) -> None:
+        model, _prior, _feeds, _expected = self._model(512)
+        self._pad(model, 4097, "count")
+        admission = _fixture_raw_control_admission(model)
+        assert admission.vectors_bounded is admission.scalars_bounded is False
+        assert admission.error_reason == "raw_control_preflight_failed"
+        path = _save_onnx_model(model, tmp_path / "malformed-scan-attribute-work.onnx")
+        result, observed = self._observe(lambda: scanner_type().scan(str(path)))
+        self._assert_work(observed, width=512, oversized=True, padded=True)
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert (
+            result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"].get(
+                "unresolved_initializer_lineage", 0
+            )
+            > 0
+        )
+        assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+        coverage = TestWeightDistributionCoverage._coverage_checks(
+            result, standalone=scanner_type is WeightDistributionScanner
+        )
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        if scanner_type is OnnxScanner:
+            assert any(
+                check.name == "ONNX Schema Validation" and check.status == CheckStatus.FAILED for check in result.checks
+            )
+            # Cache and CLI exit semantics belong to the normal aggregate route.
+            # Do not attribute schema validation or this cache API to standalone.
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxScan8ProducerAttributeAdmission:
+    @pytest.mark.parametrize("exhausted", [False, True], ids=["admitted", "refused"])
+    def test_foreign_scan8_extent_proof_admits_attributes_before_fallback(
+        self, tmp_path: Path, exhausted: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxScan8Boundaries._value, TestOnnxScan8Boundaries._tensor
+        first = helper.make_graph(
+            [helper.make_node("Identity", ["element"], ["element_out"])],
+            "padding_producer_body",
+            [value("element", [1])],
+            [value("element_out", [1])],
+        )
+        second = helper.make_graph(
+            [
+                helper.make_node("Constant", [], ["replacement"], value=tensor("", np.zeros((2, 2), np.float32))),
+                helper.make_node("Identity", ["element"], ["element_out"]),
+            ],
+            "padding_consumer_body",
+            [value("state", [2, 2]), value("element", [1])],
+            [value("replacement", [2, 2]), value("element_out", [1])],
+        )
+        # Same semantic shape as the existing omitted-sequence_lens case in
+        # test_scan8_producer_padding_bounds_later_iterations. Scan8 executes
+        # twice, replacing Add(W, W) with zeros. The producer's ordinary output
+        # shape has an unknown sequence extent when sequence_lens is omitted;
+        # the consumer therefore needs the foreign-producer padding proof.
+        model = TestOnnxScan8Boundaries._model(
+            [
+                helper.make_node("Add", ["W", "W"], ["initial"]),
+                helper.make_node(
+                    "Scan", ["", "data"], ["padded"], body=first, num_scan_inputs=1, name="padding_producer"
+                ),
+                helper.make_node(
+                    "Scan", ["", "initial", "padded"], ["final", "elements"], body=second, num_scan_inputs=1
+                ),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            [value("data", [1, 2, 1]), value("X", [1, 1, 2])],
+            [value("Y", [1, 1, 2])],
+            [tensor("W", np.ones((1, 2, 2), np.float32))],
+            [],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        # The installed evaluator cannot execute the full legacy Scan8 input
+        # signature. Reuse the existing padding regression's body-only oracle;
+        # do not present this as an independently executed full-model oracle.
+        state = np.full((2, 2), 2, np.float32)
+        evaluator = ReferenceEvaluator(second, opsets={"": 8})
+        for _ in range(2):
+            runtime: Any = evaluator.run(None, {"state": state, "element": np.zeros(1, np.float32)})
+            state = runtime[0]
+        np.testing.assert_array_equal(state, np.zeros((2, 2), np.float32))
+        producer = model.graph.node[1]
+        budget = onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        if exhausted:
+            producer.attribute.extend(helper.make_attribute(f"unused{index}", 0) for index in range(budget // 3 + 1))
+            # Unsupported builtin attributes are intentional malformed-input
+            # pressure. They do not claim an executable wide-schema model.
+            with pytest.raises(onnx.checker.ValidationError):
+                onnx.checker.check_model(model, full_check=True)
+
+        attempts: list[dict[str, Any]] = []
+        active: dict[int, dict[str, Any]] = {}
+
+        def profile(frame: Any, event: str, result: Any) -> None:
+            if frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            name = frame.f_code.co_name
+            if name == "produced_scan8_sequence_extent":
+                if event == "call" and frame.f_locals.get("value_name") == "padded":
+                    record: dict[str, Any] = {
+                        "before": frame.f_locals["stack_invariance_work_remaining"],
+                        "boundary_calls": 0,
+                        "extent_calls": 0,
+                    }
+                    active[id(frame)] = record
+                    attempts.append(record)
+                elif event == "return" and id(frame) in active:
+                    record = active.pop(id(frame))
+                    record.update(
+                        after=frame.f_locals["stack_invariance_work_remaining"],
+                        work=frame.f_locals.get("work"),
+                        extent=result,
+                    )
+            elif event == "call" and name in {"scan_stacked_output_start", "scan_stacked_output_extent"}:
+                # These are direct descendants of the foreign callback. A
+                # refused admission must never begin either attribute scan.
+                parent_record = active.get(id(frame.f_back))
+                if parent_record is not None:
+                    parent_record["boundary_calls" if name == "scan_stacked_output_start" else "extent_calls"] += 1
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous)
+        assert attempts
+        assert not active
+        for attempt in attempts:
+            if exhausted:
+                assert attempt["work"] > attempt["before"]
+                assert attempt["after"] == attempt["before"]
+                assert attempt["extent"] == -1
+                assert attempt["boundary_calls"] == attempt["extent_calls"] == 0
+            else:
+                assert 0 < attempt["work"] <= attempt["before"]
+                assert attempt["before"] - attempt["after"] == attempt["work"]
+                assert attempt["extent"] == 2
+                assert attempt["boundary_calls"] == attempt["extent_calls"] == 1
+
+        # Unknown extent must preserve possible initial-state execution. The
+        # unresolved Add-derived weight cannot disappear just because this
+        # optional padding proof ran out of its existing allowance.
+        assert bool(plan.coverage_gaps.get("unresolved_initializer_lineage")) is exhausted
+        if not exhausted:
+            assert plan.coverage_gaps == {}
+        path = TestOnnxScan8Boundaries._save(model, tmp_path, validate=not exhausted)
+        report = OnnxScanner().scan(str(path))
+        assert report.success is not exhausted
+        assert (report.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is exhausted
+        if exhausted:
+            assert any(check.details.get("coverage_gap") == "unresolved_initializer_lineage" for check in report.checks)

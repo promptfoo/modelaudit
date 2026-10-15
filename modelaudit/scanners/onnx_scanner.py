@@ -3135,8 +3135,7 @@ def _build_onnx_weight_analysis_plan(
     def control_flow_graph_output_is_stacked_output(
         node: Any,
         graph_output_index: int,
-        opset_versions: dict[str, int],
-        resolve_attribute: Callable[[Any], Any | None] | None = None,
+        scan_output_start: int,
     ) -> bool:
         if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
             return False
@@ -3146,11 +3145,7 @@ def _build_onnx_weight_analysis_plan(
         if node.op_type == "Loop":
             return parent_output_index >= max(len(getattr(node, "input", ())) - 2, 0)
         if node.op_type == "Scan":
-            return parent_output_index >= scan_stacked_output_start(
-                node,
-                opset_versions,
-                resolve_attribute=resolve_attribute,
-            )
+            return parent_output_index >= scan_output_start
         return False
 
     cache_fingerprints: dict[int, tuple[Any, tuple[str, str]]] = {}
@@ -4192,6 +4187,11 @@ def _build_onnx_weight_analysis_plan(
                     scan_input_axes=axes,
                 )[0]
 
+            # The enclosing live-node admission pays for a fixed number of
+            # attribute passes, not another pass for every nested output.
+            nested_stacked_output_start = scan_stacked_output_start(
+                body_node, opset_versions, resolve_reentry_attribute
+            )
             nested_branch_shapes: list[dict[str, tuple[int, ...]]] = []
             for attribute in direct_graph_attributes(body_node, function):
                 resolved_attribute = resolve_reentry_attribute(attribute)
@@ -4330,7 +4330,7 @@ def _build_onnx_weight_analysis_plan(
                         state_count = (
                             max(len(body_node.input) - 2, 0)
                             if body_node.op_type == "Loop"
-                            else scan_stacked_output_start(body_node, opset_versions, resolve_reentry_attribute)
+                            else nested_stacked_output_start
                         )
                         state_outputs = {
                             _onnx_value_name(value): index - state_input_offset + nested_output_offset
@@ -4363,10 +4363,7 @@ def _build_onnx_weight_analysis_plan(
                     nested_promoted_output_indexes: set[int] = set()
                     for output_index in nested_tainted_output_indexes:
                         if control_flow_graph_output_is_stacked_output(
-                            body_node,
-                            output_index,
-                            opset_versions,
-                            resolve_attribute=resolve_reentry_attribute,
+                            body_node, output_index, nested_stacked_output_start
                         ):
                             nested_promoted_output_indexes.add(output_index)
                     nested_promotion_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -4429,7 +4426,7 @@ def _build_onnx_weight_analysis_plan(
                                 and (
                                     scan_sequence_lens_input_offset(body_node, opset_versions)
                                     or control_flow_graph_output_is_stacked_output(
-                                        body_node, output_index, opset_versions, resolve_reentry_attribute
+                                        body_node, output_index, nested_stacked_output_start
                                     )
                                     or not nested_recurrence_proven
                                 )
@@ -4925,6 +4922,12 @@ def _build_onnx_weight_analysis_plan(
         output_offset = control_flow_output_offset(node)
         is_loop = node.op_type == "Loop" and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
         is_scan = node.op_type == "Scan" and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+        if is_scan:
+            attribute_work = len(getattr(node, "attribute", ()))
+            if attribute_work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return set(range(len(graph_outputs))), {_onnx_value_name(value) for value in graph_inputs} | input_names
+            graph_taint_work_remaining -= attribute_work
         state_count = (
             max(len(node.input) - 2, 0)
             if is_loop
@@ -5297,9 +5300,16 @@ def _build_onnx_weight_analysis_plan(
                     if control_flow_owner.op_type == "Loop" and input_index >= 2:
                         parent_input_index = input_index
                         output_index = input_index - 1
-                    elif control_flow_owner.op_type == "Scan" and input_index < scan_stacked_output_start(
-                        control_flow_owner, opset_versions, resolve_reentry_attribute
-                    ):
+                    elif control_flow_owner.op_type == "Scan":
+                        attribute_work = len(getattr(control_flow_owner, "attribute", ()))
+                        if attribute_work > graph_taint_work_remaining:
+                            graph_taint_work_remaining = 0
+                            return False
+                        graph_taint_work_remaining -= attribute_work
+                        if input_index >= scan_stacked_output_start(
+                            control_flow_owner, opset_versions, resolve_reentry_attribute
+                        ):
+                            return False
                         parent_input_index = input_index + scan_sequence_lens_input_offset(
                             control_flow_owner, opset_versions
                         )
@@ -7127,6 +7137,11 @@ def _build_onnx_weight_analysis_plan(
                 else attribute
             )
 
+        graph_inputs: Any = getattr(subgraph, "input", ())
+        work = len(graph_inputs) + (2 * len(getattr(node, "attribute", ())) if node.op_type == "Scan" else 0)
+        if work > stack_invariance_work_remaining:
+            return False
+        stack_invariance_work_remaining -= work
         state_count = (
             len(node.input) - 2
             if node.op_type == "Loop"
@@ -7136,10 +7151,6 @@ def _build_onnx_weight_analysis_plan(
                 resolve_attribute=resolve_attribute,
             )
         )
-        graph_inputs: Any = getattr(subgraph, "input", ())
-        if len(graph_inputs) > stack_invariance_work_remaining:
-            return False
-        stack_invariance_work_remaining -= len(graph_inputs)
         state_inputs = {
             _onnx_value_name(graph_inputs[index + input_offset]): (
                 index + output_offset,
@@ -12585,9 +12596,9 @@ def _build_onnx_weight_analysis_plan(
                 stacked_output: bool,
                 current_node: Any = node,
                 input_offset: int = resolved_scan_input_offset,
+                num_scan_inputs: int = resolved_scan_input_count,
             ) -> int:
                 if stacked_output:
-                    num_scan_inputs = resolved_int_attribute(current_node, "num_scan_inputs", 1)
                     scan_input_start = max(len(current_node.input) - max(num_scan_inputs, 0), input_offset)
                     scan_output_index = output_index - max(len(current_node.input) - input_offset - num_scan_inputs, 0)
                     scan_input_index = min(max(scan_output_index, 0), max(num_scan_inputs - 1, 0))
@@ -12625,8 +12636,14 @@ def _build_onnx_weight_analysis_plan(
                 untrusted_shape_names: set[str] = untrusted_scan_shape_names,
                 allow_omitted_sequence_lens: bool = False,
                 common_extent: int | None = common_scan_extent,
+                owner_node: Any = node,
+                owner_scan_input_count: int = resolved_scan_input_count,
             ) -> int:
-                num_scan_inputs = resolved_int_attribute(current_node, "num_scan_inputs", 1)
+                num_scan_inputs = (
+                    owner_scan_input_count
+                    if current_node is owner_node
+                    else resolved_int_attribute(current_node, "num_scan_inputs", 1)
+                )
                 if num_scan_inputs <= 0:
                     return -1
                 input_offset = scan_sequence_lens_input_offset(current_node, opset_versions)
@@ -12663,12 +12680,17 @@ def _build_onnx_weight_analysis_plan(
                 return value_shape[axis]
 
             def produced_scan8_sequence_extent(value_name: str) -> int:
+                nonlocal stack_invariance_work_remaining
                 producers = graph_output_producer_nodes_by_name(current_graph).get(value_name, ())
                 if len(producers) != 1:
                     return -1
                 producer = producers[0]
                 if producer.op_type != "Scan" or not scan_sequence_lens_input_offset(producer, opset_versions):
                     return -1
+                work = len(producer.output) + 3 * len(getattr(producer, "attribute", ()))
+                if work > stack_invariance_work_remaining:
+                    return -1
+                stack_invariance_work_remaining -= work
                 output_index = tuple(str(name) for name in producer.output).index(value_name)
                 if output_index < scan_stacked_output_start(
                     producer, opset_versions, resolve_attribute=resolve_attribute
