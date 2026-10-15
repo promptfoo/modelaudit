@@ -39126,7 +39126,14 @@ class TestOnnxLoopConsumerProofAdmission:
         model, prior_weights = self._model(
             "direct" if consume_state else "no_consumer", warmup=True, initial_rank=initial_rank
         )
-        observed = {"warmup_exhausted": False, "target_exhausted": False, "floating_replay_admitted": False}
+        observed = {
+            "warmup_exhausted": False,
+            "target_exhausted": False,
+            "target_replay_admitted": False,
+            "target_refused": False,
+            "unexpected_target_result": False,
+        }
+        admitted_calls: set[int] = set()
 
         def observe(frame: Any, event: str, result: Any) -> None:
             if event != "return" or frame.f_code.co_filename != onnx_scanner_module.__file__:
@@ -39139,24 +39146,31 @@ class TestOnnxLoopConsumerProofAdmission:
                 )
                 if graph_name == "closure_warmup_body" and exhausted:
                     observed["warmup_exhausted"] = True
-                caller = frame.f_back
-                if (
-                    graph_name == "replacement_consumer_body"
-                    and exhausted
-                    and caller is not None
-                    and caller.f_code.co_name == "subgraph_state_input_consumes_weight_rank_at_or_above_two"
-                    and caller.f_locals.get("require_floating") is True
-                ):
-                    observed["target_exhausted"] = True
             elif name == "reserve_exact_loop_replay_traversal" and result is True:
                 caller = frame.f_back
                 if (
                     getattr(frame.f_locals.get("replay_graph"), "name", "") == "replacement_consumer_body"
                     and caller is not None
                     and caller.f_code.co_name == "subgraph_state_input_consumes_weight_rank_at_or_above_two"
-                    and caller.f_locals.get("require_floating") is True
                 ):
-                    observed["floating_replay_admitted"] = True
+                    admitted_calls.add(id(caller))
+            elif name == "subgraph_state_input_consumes_weight_rank_at_or_above_two":
+                admitted = id(frame) in admitted_calls
+                admitted_calls.discard(id(frame))
+                dependencies = frame.f_locals.get("output_dependency_names")
+                if (
+                    admitted
+                    and getattr(frame.f_locals.get("subgraph"), "name", "") == "replacement_consumer_body"
+                    and isinstance(dependencies, frozenset)
+                    and any("dependency_collection_limit" in item for item in dependencies)
+                ):
+                    # Matrix replacements can record the gap in the ordinary rank
+                    # replay, before a later floating-only replay would be needed.
+                    # Correlate admission, exhaustion and refusal in this one call.
+                    observed["target_replay_admitted"] = True
+                    observed["target_exhausted"] = True
+                    observed["target_refused"] |= result is None
+                    observed["unexpected_target_result"] |= result is not None
 
         previous = sys.getprofile()
         try:
@@ -39168,7 +39182,8 @@ class TestOnnxLoopConsumerProofAdmission:
             sys.setprofile(previous)
         assert observed["warmup_exhausted"], observed
         if consume_state:
-            assert observed["target_exhausted"] and observed["floating_replay_admitted"], observed
+            assert observed["target_exhausted"] and observed["target_replay_admitted"], observed
+            assert observed["target_refused"] and not observed["unexpected_target_result"], observed
 
     @pytest.mark.parametrize("mode", ["nested", "skipped", "function", "independent"])
     def test_zero_output_nested_consumers_preserve_later_weight_coverage(
