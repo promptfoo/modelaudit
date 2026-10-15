@@ -3656,7 +3656,11 @@ class TextScanner(BaseScanner):
                 documentation_image_example_spans=documentation_image_example_spans,
             ):
                 finding = {**finding, "severity": "INFO"}
-            elif documentation_sidecar and cls._documentation_finding_actionability(payload, finding) is None:
+            elif (
+                documentation_sidecar
+                and (finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES or finding.get("type") == "suspicious_port")
+                and cls._documentation_finding_actionability(payload, finding) is None
+            ):
                 classification_incomplete = True
                 classification_limit_sources.add("documentation_call_context")
             classified_findings.append(finding)

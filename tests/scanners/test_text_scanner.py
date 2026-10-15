@@ -2717,7 +2717,7 @@ def test_text_scanner_call_context_limit_is_inconclusive_and_not_cached(tmp_path
     )
     assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         for _ in range(2):
             aggregate = scan_model_directory_or_file(
                 str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
@@ -2725,6 +2725,29 @@ def test_text_scanner_call_context_limit_is_inconclusive_and_not_cached(tmp_path
             assert aggregate.success is False
             assert determine_exit_code(aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_text_scanner_call_context_limit_does_not_reclassify_cc_findings(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("''\nIt's (a)\n" * 256 + "This model installs a backdoor payload.\n")
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.success is False
+    assert not result.metadata.get("analysis_incomplete")
+    assert any(
+        check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "backdoor"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_text_scanner_completed_fence_bounds_dense_call_context(tmp_path: Path) -> None:
