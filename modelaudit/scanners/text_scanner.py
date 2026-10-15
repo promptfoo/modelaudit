@@ -764,10 +764,14 @@ BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
     rb"applicable\s+laws\s+and\s+regulations\.?\s*$)",
     re.IGNORECASE,
 )
-DOCUMENTATION_MISUSE_BEHAVIOR_CLAIM_PATTERN = re.compile(
-    rb"\b(?:it|(?:the|this)\s+(?:model|code|script|capability))\s+"
-    rb"(?:(?:will|automatically)\s+|is\s+(?:configured|designed)\s+to\s+)*"
-    rb"(?:installs?|executes?|exfiltrates?|downloads?|launches?|deploys?|runs?)\b",
+BENIGN_DOCUMENTATION_MISUSE_CONTINUATION_PATTERN = re.compile(
+    rb"(?:review\s+generated\s+outputs\.?"
+    rb"|(?:it|this\s+capability)\s+is\s+enabled\s+by\s+default\.?"
+    rb"|(?:it|(?:the|this)\s+(?:model|code|script|capability))\s+(?:does|will)\s+not\s+"
+    rb"(?:install|execute|run|download|launch|deploy|exfiltrate)\s+(?:it|anything|code|scripts?|commands?|data)\.?"
+    rb"|\#{1,6}\s+(?:usage|examples?|installation|license|references|limitations|safety|misuse)\s*\#*"
+    rb"|(?:[-*+]\s+)?(?:\*\*)?(?:data\s+summary|documentation|references?)\s*(?:\*\*)?:\s*"
+    rb"(?:\*\*\s*)?https?://[^\s<>]+)",
     re.IGNORECASE,
 )
 GENERIC_CC_PROSE_PATTERNS = frozenset({"backdoor", "botnet", "malware", "trojan", "zombie"})
@@ -1395,9 +1399,43 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _documentation_string_literal_spans(context: bytes) -> tuple[tuple[int, int], ...]:
+        try:
+            source = context.decode("utf-8")
+        except UnicodeDecodeError:
+            return ()
+        lines = [0, *(match.end() for match in re.finditer("\n", source))]
+        byte_offsets: list[int] | None = None
+        if not source.isascii():
+            byte_offsets = [0]
+            for character in source:
+                byte_offsets.append(byte_offsets[-1] + len(character.encode("utf-8")))
+        spans: list[tuple[int, int]] = []
+        try:
+            for item in tokenize.generate_tokens(io.StringIO(source).readline):
+                if item.type == token.STRING:
+                    start = lines[item.start[0] - 1] + item.start[1]
+                    end = lines[item.end[0] - 1] + item.end[1]
+                    spans.append((byte_offsets[start], byte_offsets[end]) if byte_offsets is not None else (start, end))
+        except (IndentationError, SyntaxError, tokenize.TokenError):
+            pass  # Only complete literals proved before the tokenizer stopped can suppress nested assignments.
+        return tuple(spans)
+
+    @staticmethod
     @lru_cache(maxsize=4)
     def _documentation_quoted_assignment_index(context: bytes) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        matches = iter(DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(context))
+        literals = TextScanner._documentation_string_literal_spans(context)
+        literal_starts = [start for start, _end in literals]
+
+        def nested_in_literal(position: int) -> bool:
+            index = bisect_right(literal_starts, position) - 1
+            return index >= 0 and position < literals[index][1]
+
+        matches = (
+            match
+            for match in DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(context)
+            if not nested_in_literal(match.start())
+        )
         following = next(matches, None)
         if following is None:
             return (0,), (-1,)
@@ -2488,14 +2526,17 @@ class TextScanner(BaseScanner):
         absolute_position = finding["position"]
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         context = payload[absolute_position - position : context_end]
-        if DOCUMENTATION_MISUSE_BEHAVIOR_CLAIM_PATTERN.search(context) is not None:
+        if context_end < len(payload):
             return False
-        paragraph_end = re.search(rb"\r?\n[ \t]*\r?\n", context)
-        if paragraph_end is None and context_end < len(payload):
+        paragraphs = re.split(rb"\r?\n[ \t]*\r?\n", context)
+        if any(
+            paragraph.strip() and BENIGN_DOCUMENTATION_MISUSE_CONTINUATION_PATTERN.fullmatch(paragraph.strip()) is None
+            for paragraph in paragraphs[1:]
+        ):
             return False
-        paragraph = context[: paragraph_end.start()] if paragraph_end is not None else context
         return any(
-            match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_MISUSE_PATTERN.finditer(paragraph)
+            match.start() <= position < match.end()
+            for match in BENIGN_DOCUMENTATION_MISUSE_PATTERN.finditer(paragraphs[0])
         )
 
     @classmethod

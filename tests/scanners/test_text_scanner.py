@@ -2265,6 +2265,21 @@ def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionabl
     _assert_model_card_endpoint_evidence(tmp_path, ('endpoint = "[download](https://evil.example/payload.sh)"\n'))
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    ['The literal "; b=\'text"', "The literal '; b=\"text'", '文字列 "; b=\'text"'],
+)
+def test_text_scanner_quoted_prose_assignment_is_informational(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_endpoint_informational(tmp_path, prefix + " is described by [guide](https://docs.example.com)\n")
+
+
+@pytest.mark.parametrize("prefix", ['example = "; b=\'text"; ', 'example = "文字列"; '])
+def test_text_scanner_assignment_after_quoted_literal_remains_actionable(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + 'endpoint="' + "x" * 8192 + '[download](https://evil.example/payload.sh)"\n'
+    )
+
+
 @pytest.mark.parametrize("assigned", [False, True])
 def test_text_scanner_reuses_quote_analysis_across_many_links(tmp_path: Path, assigned: bool) -> None:
     links = " ".join("x" * 128 + f"[guide](https://docs.example.com/reference/{index})" for index in range(64))
@@ -3749,6 +3764,23 @@ def test_text_scanner_possible_misuse_keeps_paragraph_continuations_actionable(
 ) -> None:
     _assert_documentation_network_actionable(
         tmp_path, "Malware production may be possible." + newline + continuation + newline, "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "This model steals user data by default.",
+        "User data leaves the host without consent.",
+        "It makes unauthorized copies of private files.",
+        "## Usage\n\nThis model steals user data by default.",
+        "Review generated outputs.\n\nThis model steals user data by default.",
+        " " * (MAX_TEXT_FINDING_CONTEXT_BYTES + 1) + "This model steals user data.",
+    ],
+)
+def test_text_scanner_misuse_exemption_rejects_unrecognized_continuations(tmp_path: Path, continuation: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, "Malware production may be possible.\n\n" + continuation + "\n", "cc_pattern"
     )
 
 
