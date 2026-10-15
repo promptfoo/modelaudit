@@ -43265,14 +43265,8 @@ class TestOnnxFiniteReplayFlatten:
             np.testing.assert_array_equal(outputs[1], feeds["A"] @ prior_weights)
         assert model.SerializeToString() == scanned_bytes
 
-    @pytest.mark.parametrize("local_function", [False, True], ids=["direct", "function"])
-    @pytest.mark.parametrize("mode", ["benign", "prior_finding", "later_matrix"])
-    def test_flatten_preserves_finite_consumed_slope_rank(
-        self, tmp_path: Path, mode: str, local_function: bool
-    ) -> None:
-        model, activation, prior_weights = self._model(mode, local_function)
-        incomplete = mode == "later_matrix"
-        self._assert_reference_trace(model, activation, prior_weights, incomplete)
+    @staticmethod
+    def _assert_public_contract(model: Any, tmp_path: Path, prior_weights: Any | None, incomplete: bool) -> None:
         path = _save_onnx_model(model, tmp_path / "finite-flatten-replay.onnx")
         onnx.checker.check_model(str(path))
         plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
@@ -43357,6 +43351,238 @@ class TestOnnxFiniteReplayFlatten:
                 assert stats["total_entries"] > 0
         finally:
             reset_cache_manager()
+
+    @pytest.mark.parametrize("local_function", [False, True], ids=["direct", "function"])
+    @pytest.mark.parametrize("mode", ["benign", "prior_finding", "later_matrix"])
+    def test_flatten_preserves_finite_consumed_slope_rank(
+        self, tmp_path: Path, mode: str, local_function: bool
+    ) -> None:
+        model, activation, prior_weights = self._model(mode, local_function)
+        incomplete = mode == "later_matrix"
+        self._assert_reference_trace(model, activation, prior_weights, incomplete)
+        self._assert_public_contract(model, tmp_path, prior_weights, incomplete)
+
+    @staticmethod
+    def _matmul_model(
+        mode: str, local_function: bool, *, clean_left: bool = False, unknown_operand: bool = False
+    ) -> tuple[Any, Any, Any | None]:
+        model, activation, prior_weights = TestOnnxFiniteReplayFlatten._model(mode, False)
+        value, tensor = TestOnnxRecurrenceReviewRegressions._value, TestOnnxShapeContinuity._t
+        loop_index = next(index for index, node in enumerate(model.graph.node) if node.op_type == "Loop")
+        body = next(attribute.g for attribute in model.graph.node[loop_index].attribute if attribute.name == "body")
+        body.name = "matmul_replay_body"
+        operands = ["coefficient", "vector"] if clean_left else ["vector", "coefficient"]
+        dot = helper.make_node("MatMul", operands, ["dot"])
+        if local_function:
+            model.functions.append(
+                helper.make_function(
+                    "local",
+                    "FiniteDot",
+                    ["left", "right"],
+                    ["product"],
+                    [helper.make_node("MatMul", ["left", "right"], ["product"])],
+                    [helper.make_opsetid("", 11)],
+                )
+            )
+            dot = helper.make_node("FiniteDot", operands, ["dot"], domain="local")
+        del body.node[:]
+        body.node.extend(
+            [
+                helper.make_node("Reshape", ["state", "vector_shape"], ["vector"]),
+                dot,
+                helper.make_node("Neg", ["dot"], ["slope"]),
+                helper.make_node("PRelu", ["activation", "state" if mode == "later_matrix" else "slope"], ["body_y"]),
+                helper.make_node("Unsqueeze", ["vector"], ["next"], axes=[0]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ]
+        )
+        if not unknown_operand:
+            # Main needs this correct scalar annotation to propagate Neg's rank.
+            # R36 finite replay must derive it from the actual operand shapes.
+            body.value_info.append(value("dot", []))
+        model.graph.initializer.extend(
+            [
+                tensor("vector_shape", np.array([4], np.int64)),
+                tensor("coefficient_values" if unknown_operand else "coefficient", np.array([1, 2, 3, 4], np.float32)),
+            ]
+        )
+        if unknown_operand:
+            # A runtime reshape can produce either a vector or a matrix. Its
+            # output rank is not proved by the immutable data vector's rank.
+            model.graph.input.append(value("coefficient_shape", [None], TensorProto.INT64))
+            model.graph.node.insert(
+                loop_index,
+                helper.make_node("Reshape", ["coefficient_values", "coefficient_shape"], ["coefficient"]),
+            )
+        return model, activation, prior_weights
+
+    @staticmethod
+    def _assert_matmul_reference_trace(
+        model: Any, activation: Any, prior_weights: Any | None, *, later_matrix: bool, unknown_operand: bool
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        scanned_bytes = model.SerializeToString()
+        scanned_loop = next(node for node in model.graph.node if node.op_type == "Loop")
+        scanned_body = next(attribute.g for attribute in scanned_loop.attribute if attribute.name == "body")
+        declared_dot = next((item for item in scanned_body.value_info if item.name == "dot"), None)
+        if unknown_operand:
+            assert declared_dot is None
+        else:
+            assert declared_dot is not None
+            assert declared_dot.type.tensor_type.elem_type == TensorProto.FLOAT
+            assert declared_dot.type.tensor_type.HasField("shape")
+            assert len(declared_dot.type.tensor_type.shape.dim) == 0
+        onnx.checker.check_model(model)
+        oracle = inline_local_functions(deepcopy(model))
+        onnx.checker.check_model(oracle)
+        loop = next(node for node in oracle.graph.node if node.op_type == "Loop")
+        runtime_body = deepcopy(next(attribute.g for attribute in loop.attribute if attribute.name == "body"))
+        dot = next(node for node in runtime_body.node if node.op_type == "MatMul")
+        runtime_body.output.extend(
+            [
+                value("vector", [4]),
+                value(dot.output[0], None),
+                value("slope", None),
+                value("body_y", list(activation.shape)),
+            ]
+        )
+        if later_matrix:
+            runtime_body.output.append(value("state", None))
+        evaluator = ReferenceEvaluator(runtime_body, opsets={"": 11})
+        state = np.array([1, 2, 3, 4], np.float32)
+        expected_state = state.copy()
+        coefficient = np.array([1, 2, 3, 4], np.float32)
+        observed_slope_shapes = []
+        for iteration in range(2):
+            expected_vector = expected_state.reshape(4)
+            expected_dot = np.array(
+                sum(float(left) * float(right) for left, right in zip(expected_vector, coefficient, strict=True)),
+                np.float32,
+            )
+            expected_slope = -expected_dot
+            expected_next = expected_vector.reshape(1, 4)
+            expected_consumed = expected_state if later_matrix else expected_slope
+            actual: Any = evaluator.run(
+                None,
+                {
+                    "iteration": np.int64(iteration),
+                    "condition_in": np.bool_(True),
+                    "state": state,
+                    "activation": activation,
+                    "coefficient": coefficient,
+                    "vector_shape": np.array([4], np.int64),
+                },
+            )
+            assert bool(actual[0]) is True
+            assert actual[1].shape == (1, 4)
+            assert actual[2].shape == (4,)
+            assert actual[3].shape == actual[4].shape == ()
+            assert expected_dot == np.float32(30)
+            np.testing.assert_array_equal(actual[1], expected_next)
+            np.testing.assert_array_equal(actual[2], expected_vector)
+            np.testing.assert_array_equal(actual[3], expected_dot)
+            np.testing.assert_array_equal(actual[4], expected_slope)
+            np.testing.assert_array_equal(
+                actual[5], np.where(activation >= 0, activation, activation * expected_consumed)
+            )
+            consumed = actual[6] if later_matrix else actual[4]
+            assert consumed.shape == expected_consumed.shape
+            np.testing.assert_array_equal(consumed, expected_consumed)
+            observed_slope_shapes.append(consumed.shape)
+            state, expected_state = actual[1], expected_next
+        assert observed_slope_shapes == ([(4,), (1, 4)] if later_matrix else [(), ()])
+        assert state.shape == (1, 4)
+
+        oracle.graph.output.append(value("final", [1, 4]))
+        onnx.checker.check_model(oracle)
+        feeds: dict[str, Any] = {"activation": activation}
+        if prior_weights is not None:
+            feeds["A"] = np.ones((1, 64), np.float32)
+        if unknown_operand:
+            feeds["coefficient_shape"] = np.array([4], np.int64)
+        outputs: Any = ReferenceEvaluator(oracle).run(None, feeds)
+        np.testing.assert_array_equal(outputs[0], activation)
+        np.testing.assert_array_equal(outputs[-1], expected_state)
+        if prior_weights is not None:
+            np.testing.assert_array_equal(outputs[1], feeds["A"] @ prior_weights)
+        if unknown_operand:
+            # A second valid feed changes the clean operand's rank. This is an
+            # actual missing static proof, not a malformed value_info control.
+            matrix_coefficient = coefficient.reshape(4, 1)
+            alternate: Any = evaluator.run(
+                None,
+                {
+                    "iteration": np.int64(0),
+                    "condition_in": np.bool_(True),
+                    "state": coefficient,
+                    "activation": activation,
+                    "coefficient": matrix_coefficient,
+                    "vector_shape": np.array([4], np.int64),
+                },
+            )
+            assert alternate[3].shape == alternate[4].shape == (1,)
+            np.testing.assert_array_equal(alternate[3], np.array([30], np.float32))
+            np.testing.assert_array_equal(alternate[4], np.array([-30], np.float32))
+            np.testing.assert_array_equal(alternate[5], np.array([120, 90, 2, 1], np.float32))
+            alternate_outputs: Any = ReferenceEvaluator(oracle).run(
+                None, {**feeds, "coefficient_shape": np.array([4, 1], np.int64)}
+            )
+            np.testing.assert_array_equal(alternate_outputs[0], activation)
+            np.testing.assert_array_equal(alternate_outputs[-1], expected_state)
+        assert model.SerializeToString() == scanned_bytes
+
+    @pytest.mark.parametrize(
+        ("mode", "local_function", "clean_left", "unknown_operand"),
+        [
+            pytest.param("benign", False, False, False, id="direct-benign"),
+            pytest.param("benign", True, False, False, id="function-benign"),
+            pytest.param("prior_finding", False, False, False, id="direct-prior"),
+            pytest.param("prior_finding", True, False, False, id="function-prior"),
+            pytest.param("later_matrix", False, False, False, id="direct-later-matrix"),
+            pytest.param("later_matrix", True, False, False, id="function-later-matrix"),
+            pytest.param("benign", False, True, False, id="direct-clean-left"),
+            pytest.param("prior_finding", False, False, True, id="direct-unknown-operand"),
+        ],
+    )
+    def test_matmul_preserves_finite_consumed_slope_rank(
+        self, tmp_path: Path, mode: str, local_function: bool, clean_left: bool, unknown_operand: bool
+    ) -> None:
+        model, activation, prior_weights = self._matmul_model(
+            mode, local_function, clean_left=clean_left, unknown_operand=unknown_operand
+        )
+        later_matrix = mode == "later_matrix"
+        incomplete = later_matrix or unknown_operand
+        self._assert_matmul_reference_trace(
+            model, activation, prior_weights, later_matrix=later_matrix, unknown_operand=unknown_operand
+        )
+        outcomes: list[Any] = []
+
+        def observe(frame: Any, event: str, result: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_filename == onnx_scanner_module.__file__
+                and frame.f_code.co_name == "exact_loop_repeated_state_weight_rank_bounds"
+                and getattr(frame.f_locals.get("subgraph"), "name", "") == "matmul_replay_body"
+                and frame.f_locals.get("initial_shape") == (4,)
+                and frame.f_locals.get("exact_loop_iterations") == 2
+                and frame.f_locals.get("require_floating") is False
+            ):
+                outcomes.append(result)
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(observe)
+            self._assert_public_contract(model, tmp_path, prior_weights, incomplete)
+        finally:
+            sys.setprofile(previous)
+        assert outcomes
+        expected = None if unknown_operand else (later_matrix, True, (1, 4))
+        assert all(outcome == expected for outcome in outcomes), outcomes
 
 
 class TestOnnxRecurrentConstantCopyAdmission:
@@ -49213,3 +49439,950 @@ class TestOnnxOperatorIdentifierAdmission:
                 result, incomplete=True, standalone=scanner_type is WeightDistributionScanner
             )
         TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class _SiblingAttributeWalkObserver:
+    """Count actual target iterator entries, excluding other attribute walks."""
+
+    target = "state_weight_consumer_dependency_names_bounded"
+
+    def __init__(self) -> None:
+        self.path = str(Path(onnx_scanner_module.__file__))
+        tree = ast.parse(Path(self.path).read_text())
+        definitions = [
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == self.target
+        ]
+        assert len(definitions) == 1
+        definition = definitions[0]
+        scans = [
+            node
+            for node in ast.walk(definition)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "has_nested_attribute_graph" for target in node.targets
+            )
+        ]
+        assert len(scans) == 1 and scans[0].end_lineno is not None
+        self.scan_lines = range(scans[0].lineno, scans[0].end_lineno + 1)
+        # Optional when observing the unfixed source: the behavioral assertions,
+        # rather than a required source spelling, should reject the old walk.
+        self.attribute_guard_lines = {
+            line
+            for node in ast.walk(definition)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "reserve_cross_state_work"
+                and len(call.args) == 1
+                and isinstance(call.args[0], ast.Call)
+                and isinstance(call.args[0].func, ast.Name)
+                and call.args[0].func.id == "len"
+                for call in ast.walk(node.test)
+            )
+            for line in range(node.lineno, (node.test.end_lineno or node.lineno) + 1)
+        }
+        iterator = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_iter_attribute_graphs"
+        )
+        first_work = next(
+            statement
+            for statement in iterator.body
+            if not (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            )
+        )
+        self.iterator_entry_line = first_work.lineno
+        self.rows: list[dict[str, Any]] = []
+        self.active: dict[int, dict[str, Any]] = {}
+        self.reserves: dict[int, tuple[dict[str, Any], tuple[Any, ...]]] = {}
+        self.environment: dict[str, Any] = {}
+
+    def trace(self, frame: Any, event: str, _argument: Any) -> Any:
+        if frame.f_code.co_filename != self.path:
+            return None
+        if (
+            event == "line"
+            and frame.f_code.co_name == "_iter_attribute_graphs"
+            and frame.f_lineno == self.iterator_entry_line
+        ):
+            generator = frame.f_back
+            caller = generator.f_back if generator is not None else None
+            if (
+                generator is not None
+                and generator.f_code.co_name == "<genexpr>"
+                and generator.f_code.co_firstlineno in self.scan_lines
+                and caller is not None
+                and caller.f_code.co_name == self.target
+            ):
+                # This runs once at real iterator entry, not for a generator's
+                # repeated call/return notifications on yield and resume.
+                row = self.active[id(caller)]
+                row["attributes"].append(frame.f_locals["attribute"])
+                row["visited_nodes"].append(caller.f_locals["body_node"].name)
+        return self.trace
+
+    def profile(self, frame: Any, event: str, answer: Any) -> None:
+        if frame.f_code.co_filename != self.path:
+            return
+        name, local, caller = frame.f_code.co_name, frame.f_locals, frame.f_back
+        if name == self.target:
+            if event == "call":
+                self.active[id(frame)] = {
+                    "graph": local["subgraph"],
+                    "state": local["graph_input_name"],
+                    "attributes": [],
+                    "visited_nodes": [],
+                    "reservations": [],
+                }
+            elif event == "return":
+                row = self.active.pop(id(frame))
+                row["answer"] = answer
+                self.rows.append(row)
+        elif name == "reserve_cross_state_work" and caller is not None and caller.f_code.co_name == self.target:
+            if event == "call":
+                purpose = "attributes" if caller.f_lineno in self.attribute_guard_lines else "inputs"
+                self.reserves[id(frame)] = (
+                    self.active[id(caller)],
+                    (
+                        purpose,
+                        caller.f_locals["body_node"].name,
+                        local["work"],
+                        local["cross_state_work_remaining"],
+                    ),
+                )
+            elif event == "return":
+                row, before = self.reserves.pop(id(frame))
+                row["reservations"].append((*before, local["cross_state_work_remaining"], bool(answer)))
+        elif (
+            name == "walk_graph"
+            and event == "return"
+            and getattr(local.get("current_graph"), "name", None) == "r37_sibling_attribute_primer"
+        ):
+            self.environment["helper"] = local[self.target]
+            self.environment["reserve"] = local["reserve_cross_state_work"]
+
+    def run(self, action: Any) -> Any:
+        previous_trace, previous_profile = sys.gettrace(), sys.getprofile()
+        try:
+            sys.settrace(self.trace)
+            sys.setprofile(self.profile)
+            return action()
+        finally:
+            sys.setprofile(previous_profile)
+            sys.settrace(previous_trace)
+            assert not self.active and not self.reserves
+
+    def leave_work(self, remaining: int) -> None:
+        reserve = self.environment["reserve"]
+        cells = dict(zip(reserve.__code__.co_freevars, reserve.__closure__, strict=True))
+        before = cells["cross_state_work_remaining"].cell_contents
+        assert before >= remaining
+        if before > remaining:
+            assert reserve(before - remaining) is True
+        assert cells["cross_state_work_remaining"].cell_contents == remaining
+
+
+class TestOnnxSiblingAttributeAdmission:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+
+    @classmethod
+    def _capture_helper(cls) -> _SiblingAttributeWalkObserver:
+        value, tensor = cls._value, cls._tensor
+        body = helper.make_graph(
+            [],
+            "r37_empty_passthrough_body",
+            [
+                value("i", [], TensorProto.INT64),
+                value("c", [], TensorProto.BOOL),
+                value("a", [2]),
+                value("b", [2]),
+            ],
+            [value("c", [], TensorProto.BOOL), value("a", [2]), value("b", [2])],
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node("Loop", ["trip", "start", "A", "B"], ["Y", "Z"], body=body)],
+                "r37_sibling_attribute_primer",
+                [value("A", [2]), value("B", [2])],
+                [value("Y", [2]), value("Z", [2])],
+                [tensor("trip", np.int64(2)), tensor("start", np.bool_(True))],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+            ir_version=8,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        observed = _SiblingAttributeWalkObserver()
+        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        assert plan.coverage_gaps == {} and plan.specs == []
+        assert callable(observed.environment["helper"])
+        return observed
+
+    @classmethod
+    def _probe(cls, kind: str, padding: int = 0) -> Any:
+        inputs = ["left", "right"] if kind == "Add" else ["left"]
+        node = helper.make_node(kind, inputs, ["out"], name="owned_attribute_probe")
+        if kind == "Transpose":
+            node.attribute.append(helper.make_attribute("perm", [0]))
+        node.attribute.extend(helper.make_attribute(f"unused{index}", 0) for index in range(padding))
+        graph = helper.make_graph(
+            [node],
+            "owned_sibling_probe",
+            [cls._value("left", [2]), cls._value("right", [2])],
+            [cls._value("out", [2])],
+        )
+        checked = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=8)
+        if padding:
+            # Unknown builtin attributes are deliberately malformed. This is an
+            # owned helper stress probe, never a claimed executable valid model.
+            with pytest.raises(onnx.checker.ValidationError):
+                onnx.checker.check_model(checked, full_check=True)
+        else:
+            onnx.checker.check_model(checked, full_check=True)
+        return graph
+
+    @pytest.mark.parametrize("kind,allowance,visits", [("Identity", 1, 0), ("Transpose", 2, 1)])
+    def test_valid_attribute_walk_finishes_at_exact_zero(self, kind: str, allowance: int, visits: int) -> None:
+        observed = self._capture_helper()
+        graph = self._probe(kind)
+        observed.leave_work(allowance)
+        answer = observed.run(lambda: observed.environment["helper"](graph, "left"))
+        row = observed.rows[-1]
+        assert answer == frozenset() and row["graph"] is graph
+        assert len(row["attributes"]) == visits
+        assert row["reservations"][-1][-2:] == (0, True)
+        # Identity has no attributes: reserve(0) at zero would wrongly refuse.
+        assert [item[0] for item in row["reservations"]] == (["inputs", "attributes"] if visits else ["inputs"])
+
+    def test_actual_attribute_visits_share_one_sibling_allowance(self) -> None:
+        observed = self._capture_helper()
+        graph = self._probe("Add", padding=2)
+        observed.leave_work(7)
+        answers = [
+            observed.run(lambda state=state: observed.environment["helper"](graph, state))
+            for state in ("left", "right", "left")
+        ]
+        rows = observed.rows[-3:]
+        assert answers == [frozenset(), None, None]
+        assert [row["state"] for row in rows] == ["left", "right", "left"]
+        # Positive calibration: both scalar attributes really enter the target
+        # iterator once. The second sibling cannot restart the shared allowance.
+        assert [len(row["attributes"]) for row in rows] == [2, 0, 0]
+        reservations = [
+            [(kind, work, before, after, allowed) for kind, _node, work, before, after, allowed in row["reservations"]]
+            for row in rows
+        ]
+        assert reservations == [
+            [("inputs", 2, 7, 5, True), ("attributes", 2, 5, 3, True)],
+            [("inputs", 2, 3, 1, True), ("attributes", 2, 1, 0, False)],
+            [("inputs", 2, 0, 0, False)],
+        ]
+
+    @classmethod
+    def _public_model(cls, *, prior_finding: bool) -> tuple[Any, Any | None]:
+        value, tensor = cls._value, cls._tensor
+        sources = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["state"], ["state_alias"], name="r37_sibling_attribute_probe"),
+                helper.make_node("Add", ["state", "sibling"], ["combined"]),
+                helper.make_node("PRelu", ["activation", "state_alias"], ["unused_consumer"]),
+                helper.make_node("Identity", ["state"], ["next_state"]),
+                helper.make_node("Unsqueeze", ["sibling", "axes"], ["next_sibling"]),
+                helper.make_node("PRelu", ["activation", "next_sibling"], ["unused_sibling_consumer"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "r37_sibling_attribute_body",
+            [
+                value("iteration", [], TensorProto.INT64),
+                value("condition_in", [], TensorProto.BOOL),
+                value("state", None),
+                value("sibling", None),
+            ],
+            [
+                value("condition_out", [], TensorProto.BOOL),
+                value("next_state", None),
+                value("next_sibling", None),
+            ],
+        )
+        prior = np.zeros((64, 64), np.float32) if prior_finding else None
+        if prior is not None:
+            prior[:5, 0] = 10
+        nodes = [helper.make_node("MatMul", ["A", "prior"], ["known"])] if prior is not None else []
+        nodes.extend(
+            [
+                helper.make_node("Sum", sources, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip", "start", "initial_state", "initial_sibling"],
+                    ["final_state", "final_sibling"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ]
+        )
+        initializers = [tensor(name, np.ones(1, np.float32)) for name in sources]
+        initializers.extend(
+            [
+                tensor("axes", np.array([0], np.int64)),
+                tensor("trip", np.int64(2)),
+                tensor("start", np.bool_(True)),
+                tensor("dummy", np.float32(0)),
+            ]
+        )
+        if prior is not None:
+            initializers.append(tensor("prior", prior))
+        model = helper.make_model(
+            helper.make_graph(
+                nodes,
+                "r37_sibling_attribute_public",
+                # PRelu slopes reach rank three on trip two; all-one extents
+                # keep both iterations valid for unidirectional broadcasting.
+                [value("activation", [1, 1, 1]), value("initial_sibling", [1])]
+                + ([value("A", [1, 64])] if prior is not None else []),
+                [value("Y", [])] + ([value("known", [1, 64])] if prior is not None else []),
+                initializers,
+                value_info=[value("initial_state", [1])],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+            ir_version=8,
+        )
+        return model, prior
+
+    @pytest.mark.parametrize("padding,prior_finding", [(0, False), (0, True), (4097, True)])
+    def test_public_live_refusal_keeps_prior_finding_and_cache_contract(
+        self, tmp_path: Path, padding: int, prior_finding: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, prior = self._public_model(prior_finding=prior_finding)
+        onnx.checker.check_model(model, full_check=True)
+        feeds = {
+            "activation": np.ones((1, 1, 1), np.float32),
+            "initial_sibling": np.ones(1, np.float32),
+        }
+        if prior is not None:
+            feeds["A"] = np.ones((1, 64), np.float32)
+        oracle = onnx.ModelProto()
+        oracle.CopyFrom(model)
+        oracle.graph.output.extend([self._value("final_state", [1]), self._value("final_sibling", [1, 1, 1])])
+        actual: Any = ReferenceEvaluator(oracle).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], np.float32(0))
+        if prior is not None:
+            np.testing.assert_array_equal(actual[1], feeds["A"] @ prior)
+        np.testing.assert_array_equal(actual[-2], np.full(1, 40, np.float32))
+        np.testing.assert_array_equal(actual[-1], np.ones((1, 1, 1), np.float32))
+        loop = next(node for node in model.graph.node if node.op_type == "Loop")
+        body = next(attribute.g for attribute in loop.attribute if attribute.name == "body")
+        if padding:
+            assert padding > onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+            body.node[0].attribute.extend(helper.make_attribute(f"unused{index}", 0) for index in range(padding))
+            with pytest.raises(onnx.checker.ValidationError):
+                onnx.checker.check_model(model, full_check=True)
+        # Runtime above belongs only to the valid near-match. Unknown Identity
+        # attributes intentionally test conservative handling of malformed data.
+        incomplete = bool(padding)
+        observed = _SiblingAttributeWalkObserver()
+        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        self._assert_observed(observed, padding)
+        assert bool(plan.coverage_gaps.get("lineages_per_value_limit", 0)) is incomplete
+        if not incomplete:
+            assert plan.coverage_gaps == {}
+        if prior is not None:
+            assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
+        path = _save_onnx_model(model, tmp_path / "sibling-attribute-admission.onnx")
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            observed = _SiblingAttributeWalkObserver()
+            result = observed.run(lambda scanner_type=scanner_type: scanner_type().scan(str(path)))
+            self._assert_observed(observed, padding)
+            assert result.success is not incomplete
+            assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+            gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            assert bool(gaps.get("lineages_per_value_limit", 0)) is incomplete
+            if not incomplete:
+                assert gaps == {}
+            findings = TestWeightDistributionSemantics._extreme_checks(result)
+            assert len(findings) == int(prior_finding)
+            if findings:
+                assert findings[0].details["initializer"] == "prior"
+                assert findings[0].status == CheckStatus.FAILED
+                assert findings[0].severity == IssueSeverity.INFO
+            standalone = scanner_type is WeightDistributionScanner
+            reason = (
+                "weight_distribution_analysis_incomplete"
+                if standalone
+                else ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON
+            )
+            assert (reason in result.metadata.get("scan_outcome_reasons", [])) is incomplete
+            coverage = TestWeightDistributionCoverage._coverage_checks(result, standalone=standalone)
+            assert len(coverage) == int(incomplete)
+            assert all(check.status == CheckStatus.FAILED and check.message for check in coverage)
+            if incomplete and not standalone:
+                assert any(
+                    check.name == "ONNX Schema Validation" and check.status == CheckStatus.FAILED
+                    for check in result.checks
+                )
+        # Cache and CLI assertions are exclusively on the normal aggregate route.
+        reset_cache_manager()
+        try:
+            cache_dir = tmp_path / "cache"
+            signatures = []
+            hits_after_first = 0
+            for index in range(2):
+                aggregate = scan_model_directory_or_file(
+                    str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                )
+                assert aggregate.success is not incomplete
+                assert determine_exit_code(aggregate) == (2 if incomplete else int(prior_finding))
+                metadata = aggregate.file_metadata[str(path)]
+                assert (metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+                assert sum("extremely large weight values" in issue.message for issue in aggregate.issues) == int(
+                    prior_finding
+                )
+                signatures.append([(issue.severity, issue.message) for issue in aggregate.issues])
+                stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+                if index == 0:
+                    hits_after_first = stats["cache_hits"]
+            assert signatures[0] == signatures[1]
+            if incomplete:
+                assert stats["total_entries"] == stats["cache_hits"] == 0
+            else:
+                assert stats["total_entries"] > 0 and stats["cache_hits"] > hits_after_first
+        finally:
+            reset_cache_manager()
+
+    @staticmethod
+    def _assert_observed(observed: _SiblingAttributeWalkObserver, padding: int) -> None:
+        rows = [row for row in observed.rows if row["graph"].name == "r37_sibling_attribute_body"]
+        assert rows, "The public scan must reach the exact sibling dependency helper"
+        if padding:
+            refusals = [
+                item
+                for row in rows
+                for item in row["reservations"]
+                if item[0] == "attributes" and item[1] == "r37_sibling_attribute_probe" and item[-1] is False
+            ]
+            assert refusals and all(item[2] == padding and item[-2] == 0 for item in refusals)
+            assert not any("r37_sibling_attribute_probe" in row["visited_nodes"] for row in rows)
+            assert any(row["answer"] is None for row in rows)
+        assert sum(len(row["attributes"]) for row in rows) <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+
+class TestOnnxFiniteReplayValueNameWork:
+    @staticmethod
+    def _observe(run: Any) -> tuple[Any, dict[str, Any]]:
+        reservations: list[dict[str, Any]] = []
+        active: dict[int, dict[str, Any]] = {}
+        name_reservations: list[dict[str, Any]] = []
+        active_names: dict[int, dict[str, Any]] = {}
+        replay_results: list[Any] = []
+        selected_output_getters = 0
+
+        def profile(frame: Any, event: str, result: Any) -> None:
+            nonlocal selected_output_getters
+            if frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            name, local = frame.f_code.co_name, frame.f_locals
+            if name == "reserve_exact_loop_replay_traversal":
+                graph = local["replay_graph"]
+                if getattr(graph, "name", "") != "r37_value_name_identity_body":
+                    return
+                if event == "call":
+                    cache = local["graph_work_cache"]
+                    cached = cache.get(id(graph))
+                    active[id(frame)] = {
+                        "graph": graph,
+                        "cache": cache,
+                        "cache_hit": cached is not None and cached[0] is graph,
+                        "before": local["exact_loop_replay_work_remaining"],
+                    }
+                elif event == "return":
+                    row = active.pop(id(frame))
+                    row.update(
+                        result=result,
+                        after=local["exact_loop_replay_work_remaining"],
+                        work=local.get("traversal_work"),
+                    )
+                    reservations.append(row)
+            elif name == "reserve_exact_loop_replay_name_work":
+                if event == "call":
+                    active_names[id(frame)] = {
+                        "characters": local["name_characters"],
+                        "before": local["exact_loop_replay_work_remaining"],
+                    }
+                elif event == "return":
+                    row = active_names.pop(id(frame))
+                    row.update(result=result, after=local["exact_loop_replay_work_remaining"])
+                    name_reservations.append(row)
+            elif name == "_onnx_value_name" and event == "call":
+                caller = frame.f_back
+                if (
+                    caller is not None
+                    and caller.f_code.co_name == "subgraph_state_input_consumes_weight_rank_at_or_above_two"
+                    and getattr(caller.f_locals.get("subgraph"), "name", "") == "r37_value_name_identity_body"
+                ):
+                    selected_output_getters += 1
+            elif name == "exact_loop_repeated_state_weight_rank_bounds" and event == "return":
+                if getattr(local.get("subgraph"), "name", "") == "r37_value_name_identity_body":
+                    replay_results.append(result)
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            result = run()
+        finally:
+            sys.setprofile(previous_profile)
+
+        assert not active and not active_names
+        return result, {
+            "reservations": reservations,
+            "name_reservations": name_reservations,
+            "replay_results": replay_results,
+            "selected_output_getters": selected_output_getters,
+        }
+
+    @pytest.mark.parametrize("name_length", [64, 65, 129, 193, 64 * 4096 + 1, 1024 * 1024 + 1])
+    def test_symbolic_identity_names_share_the_existing_replay_allowance(
+        self, tmp_path: Path, name_length: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        long_name = "v" * name_length
+        body = helper.make_graph(
+            [helper.make_node("Identity", ["state"], [long_name])],
+            "r37_value_name_identity_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [None]),
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info(long_name.encode().decode(), TensorProto.FLOAT, [None]),
+            ],
+        )
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node("Loop", ["trip", "start", "X"], ["Y"], body=body)],
+                "r37_value_name_identity",
+                [helper.make_tensor_value_info("X", TensorProto.FLOAT, ["n"])],
+                [helper.make_tensor_value_info("Y", TensorProto.FLOAT, ["n"])],
+                initializer=[
+                    helper.make_tensor("trip", TensorProto.INT64, [], [256]),
+                    helper.make_tensor("start", TensorProto.BOOL, [], [True]),
+                ],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+            ir_version=8,
+        )
+        assert all(not tensor.HasField("raw_data") for tensor in model.graph.initializer)
+        assert list(model.graph.initializer[0].int64_data) == [256]
+        assert list(model.graph.initializer[1].int32_data) == [1]
+        onnx.checker.check_model(model, full_check=True)
+        values = np.array([2, -3, 5, 7], np.float32)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": values})
+        assert len(actual) == 1
+        np.testing.assert_array_equal(actual[0], values)
+        path = _save_onnx_model(model, tmp_path / "value-name-replay.onnx")
+        assert path.stat().st_size < 4 * 1024 * 1024
+
+        # One node, three formals, two results and two node slots cost eight;
+        # two constants, one rank and one live input add four per iteration.
+        # The two separately stored equal output names each add 64-char blocks.
+        extra = (name_length - 1) // 64
+        per_iteration = 12 + 2 * extra
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            result, observed = self._observe(lambda scanner_type=scanner_type: scanner_type().scan(str(path)))
+            reservations = observed["reservations"]
+            replay_results = observed["replay_results"]
+            selected_output_getters = observed["selected_output_getters"]
+            # Cold external-reference inventory can read the long graph result
+            # and node result once each; cold selected-output dependency work
+            # can read the graph result once more. Warm cache hits do neither.
+            # These real preparation debits are additional to traversal work.
+            name_rows = observed["name_reservations"]
+            admitted_names = [row for row in name_rows if row["result"] is True]
+            preparation_work = sum(row["before"] - row["after"] for row in admitted_names)
+            assert all(row["before"] - row["after"] == max(0, (row["characters"] - 1) // 64) for row in admitted_names)
+            assert all(row["characters"] == name_length for row in admitted_names if row["before"] != row["after"])
+            assert 0 <= preparation_work <= 3 * extra
+            # The rank unit precedes traversal admission; the live-input unit
+            # follows it. An admitted final traversal can therefore lack only
+            # that final input unit. Count admission and proof separately.
+            expected_admissions = min(256, (4096 - preparation_work + 1) // per_iteration)
+            complete = 256 * per_iteration + preparation_work <= 4096
+
+            admitted = [row for row in reservations if row["result"] is True]
+            refused = [row for row in reservations if row["result"] is False]
+            assert len(admitted) == expected_admissions
+            assert selected_output_getters == expected_admissions
+            assert all(row["before"] - row["after"] == row["work"] == 10 + 2 * extra for row in admitted)
+            assert sum(row["work"] for row in admitted) + preparation_work <= 4096
+            assert replay_results == ([(False, False, (-1,))] if complete else [None])
+            if name_length in (64, 65):
+                assert complete and expected_admissions == 256
+            if admitted:
+                assert admitted[0]["cache_hit"] is False
+                assert all(row["cache_hit"] is True for row in admitted[1:])
+            if complete:
+                assert refused == []
+            else:
+                assert all(row["after"] == 0 for row in refused)
+                assert refused or expected_admissions == 256
+            if name_length > 64 * 4096:
+                assert not admitted and selected_output_getters == 0
+                assert all(id(row["graph"]) not in row["cache"] for row in refused)
+            # No initializer weight reaches this runtime-only Identity state.
+            # Optional proof exhaustion must not manufacture a coverage failure.
+            assert result.success is True, result.metadata
+            assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+            assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+            assert not TestWeightDistributionSemantics._extreme_checks(result)
+
+
+class _OnnxReplayPreparationObserver:
+    def __init__(self) -> None:
+        self.names: list[dict[str, Any]] = []
+        self.work: list[dict[str, Any]] = []
+        self.inventories: list[dict[str, Any]] = []
+        self.solvers: list[Any] = []
+        self.bounds: list[Any] = []
+        self.helpers: dict[str, Any] = {}
+        self.replay_helpers: dict[str, Any] = {}
+        self.remaining = -1
+        self.active: dict[int, dict[str, Any]] = {}
+
+    def profile(self, frame: Any, event: str, answer: Any) -> None:
+        if frame.f_code.co_filename != onnx_scanner_module.__file__:
+            return
+        name, local = frame.f_code.co_name, frame.f_locals
+        if name == "reserve_exact_loop_replay_name_work":
+            if event == "call":
+                self.active[id(frame)] = {
+                    "characters": local["name_characters"],
+                    "before": local["exact_loop_replay_work_remaining"],
+                }
+            elif event == "return":
+                row = self.active.pop(id(frame))
+                self.remaining = local["exact_loop_replay_work_remaining"]
+                row.update(answer=answer, after=self.remaining)
+                self.work.append(row)
+        elif name == "admitted_replay_value_name" and event == "return" and local["replay_name_work"] is not None:
+            caller = frame.f_back
+            self.names.append(
+                {
+                    "read": "name" in local,
+                    "characters": len(local["name"]) if "name" in local else None,
+                    "answer": answer is not None,
+                    "caller": "" if caller is None else caller.f_code.co_name,
+                    "name_only": local["name_only"],
+                }
+            )
+        elif name in {
+            "bounded_nested_external_reference_names",
+            "graph_external_reference_names",
+            "subgraph_has_potential_weight_consumer",
+        }:
+            if local.get("replay_name_work") is None:
+                return
+            if event == "call":
+                graph = local.get("graph", local.get("subgraph"))
+                cache = (
+                    local["potential_weight_consumer_cache"]
+                    if name == "subgraph_has_potential_weight_consumer"
+                    else local.get("external_reference_cache", local.get("graph_external_reference_cache"))
+                )
+                self.active[id(frame)] = {
+                    "helper": name,
+                    "graph": graph,
+                    "cache": cache,
+                    "keys_before": frozenset(cache),
+                    "reads_before": sum(row["read"] for row in self.names),
+                    "work_before": self.remaining,
+                }
+            elif event == "return":
+                row = self.active.pop(id(frame))
+                key = local.get("cache_key")
+                cached = row["cache"].get(key)
+                row.update(
+                    answer=answer,
+                    key=key,
+                    retained=(
+                        key in row["cache"]
+                        if name == "subgraph_has_potential_weight_consumer"
+                        else cached is not None and cached[0] is row["graph"]
+                    ),
+                    cold=key is not None and key not in row["keys_before"],
+                    reads_after=sum(item["read"] for item in self.names),
+                    in_progress=frozenset(local.get("graph_external_reference_in_progress", ())),
+                )
+                self.inventories.append(row)
+        elif name == "function_input_consumes_weight_rank_at_or_above_two" and event == "call":
+            self.solvers.append(local["function_graph"])
+        elif name == "subgraph_state_input_consumes_weight_rank_at_or_above_two" and event == "call":
+            self.solvers.append(local["subgraph"])
+        elif name == "exact_loop_repeated_state_weight_rank_bounds" and event == "return":
+            if getattr(local["subgraph"], "name", "") == "r37_preparation_body":
+                self.bounds.append(answer)
+        elif name == "walk_graph" and event == "return" and "reserve_exact_loop_replay_name_work" in local:
+            self.replay_helpers = {
+                key: local[key]
+                for key in ("reserve_exact_loop_replay_name_work", "bounded_nested_external_reference_names")
+            }
+            self.remaining = local["exact_loop_replay_work_remaining"]
+        elif name == "_build_onnx_weight_analysis_plan" and event == "return":
+            self.helpers = {
+                key: local[key]
+                for key in (
+                    "graph_external_reference_names",
+                    "graph_external_reference_cache",
+                    "graph_external_reference_in_progress",
+                    "dependency_names_exceeded_limit",
+                )
+            }
+            self.remaining = local["exact_loop_replay_work_remaining"]
+
+    def run(self, operation: Any) -> Any:
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(self.profile)
+            return operation()
+        finally:
+            sys.setprofile(previous)
+            assert not self.active
+
+    def read_count(self) -> int:
+        return sum(row["read"] for row in self.names)
+
+
+class TestOnnxFiniteReplayValueNamePreparation:
+    @staticmethod
+    def _child(state_name: str, initializer_name: str = "") -> Any:
+        child = TestOnnxReplayReferenceNameWork._body(TestOnnxFiniteReplayPlanAdmission._identity_function().node[0])
+        child.name = "r37_preparation_child"
+        child.input[2].name = state_name
+        child.node[0].input[0] = state_name
+        if initializer_name:
+            child.initializer.append(helper.make_tensor(initializer_name, TensorProto.FLOAT, [1], [0]))
+        return child
+
+    @classmethod
+    def _model(cls, field: str, length: int) -> Any:
+        outer = TestOnnxFiniteReplayPlanAdmission._identity_function()
+        outer.name = "PrepareOuter"
+        body = TestOnnxReplayReferenceNameWork._body(outer.node[0])
+        body.name = "r37_preparation_body"
+        functions = [outer]
+        if field == "formal":
+            formal = "f" * length
+            inner = helper.make_function(
+                "local",
+                "PrepareInner",
+                [formal],
+                ["result"],
+                [helper.make_node("Identity", [formal], ["result"])],
+                [helper.make_opsetid("", 13)],
+            )
+            body.node[0].CopyFrom(helper.make_node("PrepareInner", ["state"], ["next"], domain="local"))
+            outer.opset_import.append(helper.make_opsetid("local", 1))
+            functions.append(inner)
+        else:
+            child = cls._child(
+                "c" * length if field == "child_io" else "child_state", "i" * length if field == "initializer" else ""
+            )
+            body.node.insert(0, helper.make_node("Loop", ["one", "start", "state"], ["dead"], body=child))
+            outer.input.append("one")
+        model = TestOnnxOperatorIdentifierAdmission._primer_model(tuple(functions))
+        model.graph.input.append(helper.make_tensor_value_info("replay_X", TensorProto.FLOAT, ["n"]))
+        model.graph.initializer.extend(
+            [
+                helper.make_tensor("trip", TensorProto.INT64, [], [2]),
+                helper.make_tensor("start", TensorProto.BOOL, [], [True]),
+                helper.make_tensor("one", TensorProto.INT64, [], [1]),
+            ]
+        )
+        for index in range(2):
+            actuals = ["replay_X", "trip", "start"] + ([] if field == "formal" else ["one"])
+            model.graph.node.append(helper.make_node("PrepareOuter", actuals, [f"out{index}"], domain="local"))
+            model.graph.output.append(helper.make_tensor_value_info(f"out{index}", TensorProto.FLOAT, ["n"]))
+        assert all(
+            not tensor.HasField("raw_data")
+            for tensor in model.graph.initializer
+            if tensor.name in {"trip", "start", "one"}
+        )
+        return model
+
+    @pytest.mark.parametrize(
+        ("field", "length"),
+        [
+            pytest.param("formal", 64, id="short-formal"),
+            pytest.param("formal", 65, id="positive-formal-extra"),
+            pytest.param("formal", 64 * 4096 + 1, id="formal-before-solver"),
+            pytest.param("child_io", 64 * 4096 + 1, id="dead-child-formal"),
+            pytest.param("initializer", 64 * 4096 + 1, id="dead-child-local-initializer"),
+        ],
+    )
+    def test_preparation_names_use_shared_work_before_child_solver(
+        self, tmp_path: Path, field: str, length: int
+    ) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._model(field, length)
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        activation = np.ones((1, 64), np.float32)
+        values = np.array([2, -3, 5, 7], np.float32)
+        actual: Any = ReferenceEvaluator(inlined).run(None, {"X": activation, "replay_X": values})
+        prior = onnx.numpy_helper.to_array(model.graph.initializer[0])
+        assert len(actual) == 3
+        np.testing.assert_array_equal(actual[0], activation @ prior)
+        for output in actual[1:]:
+            np.testing.assert_array_equal(output, values)
+        path = _save_onnx_model(model, tmp_path / f"preparation-{field}-{length}.onnx")
+        assert path.stat().st_size < 4 * 1024 * 1024
+        refused = length > 64 * 4096
+
+        for scanner_type in (OnnxScanner, WeightDistributionScanner):
+            observed = _OnnxReplayPreparationObserver()
+            result = observed.run(lambda scanner_type=scanner_type: scanner_type().scan(str(path)))
+            measured = [row for row in observed.names if row["read"] and row["characters"] == length]
+            assert measured
+            assert all(
+                row["before"] - row["after"] == max(0, (row["characters"] - 1) // 64)
+                for row in observed.work
+                if row["answer"]
+            )
+            child_solvers = [
+                graph
+                for graph in observed.solvers
+                if getattr(graph, "name", "") in {"PrepareInner", "r37_preparation_child"}
+            ]
+            if refused:
+                assert any(
+                    row["characters"] == length and row["answer"] is False and row["after"] == 0
+                    for row in observed.work
+                )
+                assert observed.bounds and all(answer is None for answer in observed.bounds)
+                assert child_solvers == []
+                assert any(not row["answer"] for row in measured)
+                first_refusal = next(index for index, row in enumerate(observed.names) if not row["answer"])
+                assert not any(row["read"] for row in observed.names[first_refusal + 1 :])
+                if field != "formal":
+                    # A cold potential/capture pass can refuse before the later
+                    # nested inventory. Observe the actual first cold path.
+                    cold = [
+                        row
+                        for row in observed.inventories
+                        if row["cold"] and getattr(row["graph"], "name", "") == "r37_preparation_child"
+                    ]
+                    assert cold and all(not row["retained"] for row in cold)
+                    assert any(row["reads_after"] > row["reads_before"] for row in cold)
+                    assert any(
+                        row["caller"]
+                        in {
+                            "bounded_nested_external_reference_names",
+                            "graph_external_reference_names",
+                            "subgraph_has_potential_weight_consumer",
+                        }
+                        and row["name_only"] is (field == "initializer")
+                        for row in measured
+                    )
+            else:
+                assert observed.bounds == [(False, False, (-1,))] * 2
+                assert child_solvers and all(getattr(graph, "name", "") == "PrepareInner" for graph in child_solvers)
+                assert all(row["answer"] for row in observed.work)
+                if length == 64:
+                    assert all(row["before"] == row["after"] for row in observed.work)
+                else:
+                    assert any(row["characters"] == 65 and row["before"] - row["after"] == 1 for row in observed.work)
+            # Only runtime vector state uses these optional proofs. The earlier
+            # independent MatMul finding survives; refusal alone adds no gap.
+            assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
+            assert result.success is True, result.metadata
+            assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+            assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+    def test_real_cold_inventories_preserve_zero_completion_cache_and_cleanup(self) -> None:
+        observed = _OnnxReplayPreparationObserver()
+        model = self._model("formal", 64)
+        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        assert plan.coverage_gaps == {} and len(plan.specs) == 1
+        reserve = observed.replay_helpers["reserve_exact_loop_replay_name_work"]
+        nested = observed.replay_helpers["bounded_nested_external_reference_names"]
+        captures = observed.helpers["graph_external_reference_names"]
+        exceeds = observed.helpers["dependency_names_exceeded_limit"]
+        cache = observed.helpers["graph_external_reference_cache"]
+        in_progress = observed.helpers["graph_external_reference_in_progress"]
+        local_cache: dict[int, tuple[Any, Any]] = {}
+        warm = self._child("s" * 65)
+        before = observed.remaining
+        assert observed.run(lambda: nested(warm, local_cache, reserve)) == frozenset()
+        assert before - observed.remaining == 2  # Formal plus Identity input.
+        reads = observed.read_count()
+        assert observed.run(lambda: nested(warm, local_cache, reserve)) == frozenset()
+        assert observed.read_count() == reads
+        assert local_cache[id(warm)][0] is warm
+
+        # Distinct real depth contexts produce separate cold capture inventories.
+        for depth in (0, 1):
+            before, reads = observed.remaining, observed.read_count()
+            answer = observed.run(lambda depth=depth: captures(warm, depth=depth, replay_name_work=reserve))
+            assert answer == frozenset()
+            assert before - observed.remaining == 2 and observed.read_count() > reads
+        reads = observed.read_count()
+        assert observed.run(lambda: captures(warm, replay_name_work=reserve)) == frozenset()
+        assert observed.read_count() == reads
+
+        # Spend existing allowance using the real debit, leaving successful zero.
+        remaining = observed.remaining
+        assert remaining > 0
+        assert observed.run(lambda: reserve(64 * remaining + 1)) is True
+        assert observed.remaining == 0
+        short = self._child("short")
+        assert observed.run(lambda: nested(short, local_cache, reserve)) == frozenset()
+        assert observed.remaining == 0
+        reads = observed.read_count()
+        assert observed.run(lambda: nested(warm, local_cache, reserve)) == frozenset()
+        assert observed.read_count() == reads
+
+        rejected_child = self._child("r" * 65)
+        ancestor = helper.make_graph(
+            [helper.make_node("Loop", ["trip", "start", "state"], ["out"], body=rejected_child)],
+            "r37_preparation_capture_ancestor",
+            [helper.make_tensor_value_info("state", TensorProto.FLOAT, [None])],
+            [helper.make_tensor_value_info("out", TensorProto.FLOAT, [None])],
+            initializer=[
+                helper.make_tensor("trip", TensorProto.INT64, [], [1]),
+                helper.make_tensor("start", TensorProto.BOOL, [], [True]),
+            ],
+        )
+        # Use the stored protobuf child owner, not the pre-CopyFrom builder.
+        rejected_child = TestOnnxReplayReferenceNameWork._body(ancestor.node[0])
+        assert exceeds(observed.run(lambda: captures(ancestor, replay_name_work=reserve)))
+        child_row = next(row for row in reversed(observed.inventories) if row["graph"] is rejected_child)
+        assert not child_row["retained"] and child_row["key"] not in child_row["in_progress"]
+        assert any(key[0] == id(ancestor) for key in child_row["in_progress"])
+        assert not in_progress
+        assert not any(key[0] in {id(ancestor), id(rejected_child)} for key in cache)
+
+        # Explicit refusal is sticky even for warm results or a fresh context.
+        # Only calls carrying the finite callback participate in this claim.
+        reads = observed.read_count()
+        assert observed.run(lambda: nested(warm, local_cache, reserve)) is None
+        assert observed.run(lambda: nested(short, {}, reserve)) is None
+        assert exceeds(observed.run(lambda: captures(warm, replay_name_work=reserve)))
+        assert exceeds(observed.run(lambda: captures(warm, depth=2, replay_name_work=reserve)))
+        assert observed.run(lambda: reserve(0)) is False
+        assert observed.read_count() == reads and observed.remaining == 0
+        assert not in_progress
+        assert not any(key[0] == id(warm) and key[2] == 2 for key in cache)
+        # Ordinary helper users keep their existing callback=None semantics.
+        assert observed.run(lambda: captures(warm)) == frozenset()
+        assert observed.run(lambda: nested(short, {})) == frozenset()

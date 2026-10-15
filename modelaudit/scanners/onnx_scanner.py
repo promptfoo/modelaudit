@@ -2397,20 +2397,28 @@ def _build_onnx_weight_analysis_plan(
         current_graph: Any,
         inherited_constants: dict[str, Any],
         attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> dict[str, Any]:
         nonlocal graph_constant_context_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
         _owner, local_declared_names, local_constants = graph_initializer_context(current_graph)
-        external_names = graph_external_reference_names(current_graph, attribute_bindings=attribute_bindings)
+        external_names = graph_external_reference_names(
+            current_graph, attribute_bindings=attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
         work = len(external_names) + len(local_constants)
         if work > graph_constant_context_work_remaining:
             graph_constant_context_work_remaining = 0
             return {}
         graph_constant_context_work_remaining -= work
-        graph_constants = {
-            name: inherited_constants[name]
-            for name in external_names
-            if name not in local_declared_names and name in inherited_constants
-        }
+        graph_constants: dict[str, Any] = {}
+        for name in replay_admitted_values(external_names, replay_name_work):
+            if replay_name_work is not None and not replay_name_work(len(name)):
+                return {}
+            if name not in local_declared_names and name in inherited_constants:
+                graph_constants[name] = inherited_constants[name]
         graph_constants.update(local_constants)
         return graph_constants
 
@@ -2570,22 +2578,67 @@ def _build_onnx_weight_analysis_plan(
         # graphs are followed only at reference sites in the resolved callee.
         return getattr(node, "attribute", ()) if function is None else ()
 
+    def replay_admitted_values(values: Iterable[Any], replay_name_work: Callable[[int], bool] | None) -> Iterable[Any]:
+        iterator = iter(values)
+        while replay_name_work is None or replay_name_work(0):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                return
+            yield value
+
+    def prepared_replay_value_name(value: Any, replay_name_work: Callable[[int], bool] | None) -> str:
+        # A local comprehension may contain one empty placeholder on refusal;
+        # its caller checks the sticky refusal before retaining any result.
+        name = admitted_replay_value_name(value, replay_name_work)
+        return name if name is not None else ""
+
+    def admitted_replay_value_name(
+        value: Any,
+        replay_name_work: Callable[[int], bool] | None,
+        *,
+        name_only: bool = False,
+    ) -> str | None:
+        # The first getter needed to measure a name is not a pre-copy guarantee.
+        # A previous refusal stops the next getter; successful zero-extra work
+        # may finish inside a traversal whose reservation consumed the allowance.
+        if replay_name_work is not None and not replay_name_work(0):
+            return None
+        if name_only:
+            raw_name = getattr(value, "name", "")
+            name = str(raw_name) if raw_name else ""
+        else:
+            name = _onnx_value_name(value)
+        if replay_name_work is not None and not replay_name_work(len(name)):
+            return None
+        return name
+
     def bound_function_constants(
         function: Any,
         node_input_names: list[str],
         constants: dict[str, Any],
         attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}, {}
         inherited: dict[str, Any] = {}
         bound_inputs: dict[str, Any] = {}
         for input_index, actual_name in enumerate(node_input_names):
             if input_index >= len(getattr(function, "input", ())):
                 break
-            formal_name = _onnx_value_name(function.input[input_index])
+            formal_name = admitted_replay_value_name(function.input[input_index], replay_name_work)
+            if formal_name is None:
+                return {}, {}
             if formal_name and actual_name in constants:
                 inherited[formal_name] = constants[actual_name]
                 bound_inputs[formal_name] = constants[actual_name]
-        for captured_name in graph_external_reference_names(function, attribute_bindings):
+        captured_names = graph_external_reference_names(function, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}, {}
+        for captured_name in captured_names:
+            if replay_name_work is not None and not replay_name_work(len(captured_name)):
+                return {}, {}
             if captured_name in constants:
                 inherited[captured_name] = constants[captured_name]
         return inherited, bound_inputs
@@ -3492,7 +3545,10 @@ def _build_onnx_weight_analysis_plan(
         opset_versions: dict[str, int],
         *,
         identifier: tuple[str, str, str],
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> dict[str, str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
         operator_type = identifier[1]
         if operator_type == "Loop":
             input_pairs = zip(node.input[2:], nested_graph.input[2:], strict=False)
@@ -3504,7 +3560,9 @@ def _build_onnx_weight_analysis_plan(
         bindings: dict[str, str] = {}
         for parent_input, graph_input in input_pairs:
             parent_name = str(parent_input)
-            graph_input_name = _onnx_value_name(graph_input)
+            graph_input_name = admitted_replay_value_name(graph_input, replay_name_work)
+            if graph_input_name is None:
+                return {}
             if parent_name in source_names and graph_input_name:
                 bindings[graph_input_name] = parent_name
         return bindings
@@ -3517,7 +3575,10 @@ def _build_onnx_weight_analysis_plan(
         local_constants: dict[str, Any] | None = None,
         *,
         identifier: tuple[str, str, str] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> dict[str, str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
         operator_type = node.op_type if identifier is None else identifier[1]
         local_constants = local_constants or {}
         if operator_type == "Loop":
@@ -3528,8 +3589,12 @@ def _build_onnx_weight_analysis_plan(
             return {}
         bindings: dict[str, str] = {}
         for parent_input, graph_input in input_pairs:
-            parent_name = str(parent_input)
-            graph_input_name = _onnx_value_name(graph_input)
+            parent_name = prepared_replay_value_name(parent_input, replay_name_work)
+            if replay_name_work is not None and not replay_name_work(0):
+                return {}
+            graph_input_name = prepared_replay_value_name(graph_input, replay_name_work)
+            if replay_name_work is not None and not replay_name_work(0):
+                return {}
             if (parent_name in inherited_constants or parent_name in local_constants) and graph_input_name:
                 bindings[graph_input_name] = parent_name
         return bindings
@@ -3539,7 +3604,10 @@ def _build_onnx_weight_analysis_plan(
         attribute_bindings: dict[str, Any] | None = None,
         *,
         include_bound_inputs: bool = False,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
@@ -3550,8 +3618,20 @@ def _build_onnx_weight_analysis_plan(
         # environment. Formal inputs matter only for explicit argument bindings.
         names: set[str] = set()
         if include_bound_inputs:
-            merge_dependency_names(names, (_onnx_value_name(value) for value in getattr(subgraph, "input", ())))
-        merge_dependency_names(names, graph_external_reference_names(subgraph, attribute_bindings))
+            merge_dependency_names(
+                names,
+                (
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(getattr(subgraph, "input", ()), replay_name_work)
+                ),
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return dependency_collection_limit
+        merge_dependency_names(
+            names, graph_external_reference_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         result = frozenset(names)
         rank_reentry_constant_name_cache[cache_key] = result
         return result
@@ -3690,7 +3770,10 @@ def _build_onnx_weight_analysis_plan(
     def graph_node_direct_dependency_names(
         node: Any,
         local_attribute_bindings: dict[str, Any],
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         attribute_key = attribute_binding_cache_key(local_attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
@@ -3699,7 +3782,15 @@ def _build_onnx_weight_analysis_plan(
         if cached is not None and cached[0] is node:
             return cached[1]
         dependencies: set[str] = set()
-        merge_dependency_names(dependencies, getattr(node, "input", ()))
+        merge_dependency_names(
+            dependencies,
+            (
+                prepared_replay_value_name(value, replay_name_work)
+                for value in replay_admitted_values(getattr(node, "input", ()), replay_name_work)
+            ),
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         identifier = bounded_operator_identifier(node)
         if identifier is None:
             return dependency_collection_limit
@@ -3714,7 +3805,12 @@ def _build_onnx_weight_analysis_plan(
                     else attribute
                 ),
             )
-            merge_dependency_names(dependencies, graph_external_reference_names(function, function_attributes))
+            merge_dependency_names(
+                dependencies,
+                graph_external_reference_names(function, function_attributes, replay_name_work=replay_name_work),
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return dependency_collection_limit
         if not dependency_names_exceeded_limit(frozenset(dependencies)):
             for attribute in direct_graph_attributes(node, function):
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
@@ -3723,9 +3819,16 @@ def _build_onnx_weight_analysis_plan(
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
                     if merge_dependency_names(
-                        dependencies, graph_external_reference_names(nested_graph, local_attribute_bindings)
+                        dependencies,
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        ),
                     ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
                         break
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
                 if dependency_collection_limit_marker in dependencies:
                     break
         result = frozenset(dependencies)
@@ -3736,8 +3839,11 @@ def _build_onnx_weight_analysis_plan(
         subgraph: Any,
         value_names: Iterable[str],
         local_attribute_bindings: dict[str, Any],
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> frozenset[str]:
         nonlocal dependency_closure_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         dependencies: set[str] = set()
         for value_name in value_names:
             if dependency_closure_work_remaining <= 0:
@@ -3760,13 +3866,19 @@ def _build_onnx_weight_analysis_plan(
                 if node_id in visited_node_ids:
                     continue
                 visited_node_ids.add(node_id)
-                for dependency_name in graph_node_direct_dependency_names(producer_node, local_attribute_bindings):
+                for dependency_name in graph_node_direct_dependency_names(
+                    producer_node, local_attribute_bindings, replay_name_work=replay_name_work
+                ):
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
                     if dependency_closure_work_remaining <= 0 or dependency_name == dependency_collection_limit_marker:
                         return dependency_collection_limit
                     dependency_closure_work_remaining -= 1
                     if dependency_name and dependency_name not in dependencies:
                         dependencies.add(dependency_name)
                         pending.append(dependency_name)
+                if replay_name_work is not None and not replay_name_work(0):
+                    return dependency_collection_limit
         return frozenset(dependencies)
 
     invariant_state_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -3816,7 +3928,10 @@ def _build_onnx_weight_analysis_plan(
         subgraph: Any,
         output_indexes: Iterable[int] | None = None,
         attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
@@ -3833,9 +3948,17 @@ def _build_onnx_weight_analysis_plan(
         if cache_key in graph_output_dependency_cache:
             return graph_output_dependency_cache[cache_key]
         initial_outputs = {
-            output_name for index in cache_output_indexes if (output_name := _onnx_value_name(graph_outputs[index]))
+            output_name
+            for index in replay_admitted_values(cache_output_indexes, replay_name_work)
+            if (output_name := prepared_replay_value_name(graph_outputs[index], replay_name_work))
         }
-        result = graph_dependency_closure_names(subgraph, initial_outputs, attribute_bindings or {})
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        result = graph_dependency_closure_names(
+            subgraph, initial_outputs, attribute_bindings or {}, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         graph_output_dependency_cache[cache_key] = result
         return result
 
@@ -3843,7 +3966,10 @@ def _build_onnx_weight_analysis_plan(
         subgraph: Any,
         value_names: Iterable[str],
         attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         value_name_key = tuple(sorted(str(value_name) for value_name in value_names if value_name))
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
@@ -3853,7 +3979,11 @@ def _build_onnx_weight_analysis_plan(
         if cached_dependencies is not None and cached_dependencies[0] is subgraph:
             return cached_dependencies[1]
         local_attribute_bindings = attribute_bindings or {}
-        result = graph_dependency_closure_names(subgraph, value_name_key, local_attribute_bindings)
+        result = graph_dependency_closure_names(
+            subgraph, value_name_key, local_attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         graph_value_dependency_cache[cache_key] = (subgraph, result)
         return result
 
@@ -3883,8 +4013,12 @@ def _build_onnx_weight_analysis_plan(
         include_potential_weight_consumers: bool = False,
         opset_versions: dict[str, int] | None = None,
         attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> bool:
         nonlocal graph_potential_weight_work_remaining
+        replay_potential_entry_owned = False
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return True
@@ -3943,6 +4077,7 @@ def _build_onnx_weight_analysis_plan(
                         return True
                     graph_potential_weight_work_remaining -= 1
                     graph_potential_weight_work_cache[cache_key] = (subgraph, None, 0)
+                    replay_potential_entry_owned = True
                     if len(graph_nodes) > graph_potential_weight_work_remaining:
                         return True
                     graph_potential_weight_work_remaining -= len(graph_nodes)
@@ -3964,13 +4099,24 @@ def _build_onnx_weight_analysis_plan(
                             if function_versions is None:
                                 return True
                             if subgraph_has_potential_weight_consumer(
-                                function, function_versions, attribute_bindings=function_attributes
+                                function,
+                                function_versions,
+                                attribute_bindings=function_attributes,
+                                replay_name_work=replay_name_work,
                             ):
+                                if replay_name_work is not None and not replay_name_work(0):
+                                    if replay_potential_entry_owned:
+                                        graph_potential_weight_work_cache.pop(cache_key, None)
+                                    return True
                                 input_count = len(getattr(node, "input", ()))
                                 if input_count > graph_potential_weight_work_remaining:
                                     return True
                                 graph_potential_weight_work_remaining -= input_count
                                 potential_inputs[id(node)] = len(node_input_names(node))
+                            if replay_name_work is not None and not replay_name_work(0):
+                                if replay_potential_entry_owned:
+                                    graph_potential_weight_work_cache.pop(cache_key, None)
+                                return True
                             continue
                         if not node_may_have_potential_weight_input(
                             node,
@@ -4041,14 +4187,19 @@ def _build_onnx_weight_analysis_plan(
         related_graph_input_shapes_cache_key: tuple[tuple[str, tuple[int, ...] | None], ...] | None = None,
         *,
         depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> bool:
         nonlocal reentry_attribute_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if depth > 6:
             return True
         graph_outputs = getattr(subgraph, "output", ())
         if graph_output_index < 0 or graph_output_index >= len(graph_outputs):
             return False
-        graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
+        graph_output_name = prepared_replay_value_name(graph_outputs[graph_output_index], replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if not graph_output_name:
             return False
         if output_dependency_names_override is None:
@@ -4056,7 +4207,10 @@ def _build_onnx_weight_analysis_plan(
                 subgraph,
                 (graph_output_index,),
                 attribute_bindings=attribute_bindings,
+                replay_name_work=replay_name_work,
             )
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
         else:
             output_dependency_names = output_dependency_names_override
         if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS or subgraph_analysis_work_exceeds_limit(
@@ -4065,7 +4219,12 @@ def _build_onnx_weight_analysis_plan(
             include_potential_weight_consumers=True,
             opset_versions=opset_versions,
             attribute_bindings=attribute_bindings,
+            replay_name_work=replay_name_work,
         ):
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
+            return True
+        if replay_name_work is not None and not replay_name_work(0):
             return True
         restorable_output_indexes = (
             restorable_output_indexes_override
@@ -4076,15 +4235,21 @@ def _build_onnx_weight_analysis_plan(
         related_graph_input_shapes = related_graph_input_shapes or {}
         if related_graph_input_shapes_cache_key is None:
             related_graph_input_shapes_cache_key = tuple(sorted(related_graph_input_shapes.items()))
-        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if dependency_names_exceeded_limit(constant_names):
             return True
         constants_key = constant_binding_cache_key(constants, constant_names)
         bound_constant_names = (
-            rank_reentry_constant_names(subgraph, attribute_bindings, include_bound_inputs=True)
+            rank_reentry_constant_names(
+                subgraph, attribute_bindings, include_bound_inputs=True, replay_name_work=replay_name_work
+            )
             if bound_input_constants
             else frozenset()
         )
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if dependency_names_exceeded_limit(bound_constant_names):
             return True
         bound_constants_key = constant_binding_cache_key(bound_input_constants or {}, bound_constant_names)
@@ -4132,7 +4297,12 @@ def _build_onnx_weight_analysis_plan(
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return local_attribute_bindings.get(reference_name) if reference_name else attribute
 
-        subgraph_constants = graph_initializer_constants(subgraph, constants, attribute_bindings)
+        subgraph_constants = graph_initializer_constants(
+            subgraph, constants, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            reentry_promotion_in_progress.discard(cache_key)
+            return True
         if bound_input_constants:
             subgraph_constants.update(bound_input_constants)
         tainted = {graph_input_name}
@@ -4155,7 +4325,13 @@ def _build_onnx_weight_analysis_plan(
             return True
         for body_node in live_nodes:
             body_outputs = node_output_names(body_node)
-            body_output_slots = [str(output) for output in getattr(body_node, "output", ())]
+            body_output_slots = [
+                prepared_replay_value_name(output, replay_name_work)
+                for output in replay_admitted_values(getattr(body_node, "output", ()), replay_name_work)
+            ]
+            if replay_name_work is not None and not replay_name_work(0):
+                reentry_promotion_in_progress.discard(cache_key)
+                return True
             if not body_outputs:
                 continue
             body_outputs_feed_selected_output = id(body_node) in output_dependency_node_ids
@@ -4253,14 +4429,24 @@ def _build_onnx_weight_analysis_plan(
             nested_promoted_outputs: set[str] = set()
             if function is not None and (any_tainted or body_outputs_feed_selected_output):
                 function_actuals = node_input_slots(body_node)
-                function_outputs = [str(output) for output in getattr(body_node, "output", ())]
+                function_outputs = [
+                    prepared_replay_value_name(output, replay_name_work)
+                    for output in replay_admitted_values(getattr(body_node, "output", ()), replay_name_work)
+                ]
+                if replay_name_work is not None and not replay_name_work(0):
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_constants, function_bound_input_constants = bound_function_constants(
                     function,
                     function_actuals,
                     subgraph_constants,
                     attribute_bindings=function_attributes,
+                    replay_name_work=replay_name_work,
                 )
+                if replay_name_work is not None and not replay_name_work(0):
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
                 function_versions = function_opset_versions(function, opset_versions)
                 if function_versions is None:
                     reentry_promotion_in_progress.discard(cache_key)
@@ -4269,7 +4455,10 @@ def _build_onnx_weight_analysis_plan(
                 for input_index, input_name in enumerate(function_actuals):
                     if input_index >= len(getattr(function, "input", ())):
                         continue
-                    function_input_name = _onnx_value_name(function.input[input_index])
+                    function_input_name = prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     input_shape = input_shapes_by_name.get(input_name)
                     if function_input_name and input_shape is not None:
                         function_context_shapes[function_input_name] = input_shape
@@ -4277,7 +4466,10 @@ def _build_onnx_weight_analysis_plan(
                 for input_index, input_name in enumerate(function_actuals):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                         continue
-                    function_input_name = _onnx_value_name(function.input[input_index])
+                    function_input_name = prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     if function_input_name:
                         function_tainted_inputs[function_input_name] = tainted_shapes.get(input_name)
                 downstream_live_function_output_indexes = {
@@ -4293,7 +4485,11 @@ def _build_onnx_weight_analysis_plan(
                         function_versions,
                         attribute_bindings=function_attributes,
                         depth=depth + 1,
+                        replay_name_work=replay_name_work,
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     function_tainted_outputs.update(
                         mapped_node_outputs(
                             function_outputs,
@@ -4313,7 +4509,11 @@ def _build_onnx_weight_analysis_plan(
                         function,
                         restorable_function_output_indexes,
                         attribute_bindings=function_attributes,
+                        replay_name_work=replay_name_work,
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     relevant_function_inputs: dict[str, tuple[int, ...] | None] = {
                         function_input_name: function_input_shape
                         for function_input_name, function_input_shape in function_tainted_inputs.items()
@@ -4347,8 +4547,12 @@ def _build_onnx_weight_analysis_plan(
                             include_potential_weight_consumers=True,
                             opset_versions=function_versions,
                             attribute_bindings=function_attributes,
+                            replay_name_work=replay_name_work,
                         )
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     if function_analysis_exceeds_limit:
                         function_promoted_outputs.update(
                             mapped_node_outputs(
@@ -4375,7 +4579,11 @@ def _build_onnx_weight_analysis_plan(
                                 restorable_output_indexes_override=frozenset(restorable_function_output_indexes),
                                 promoted_outputs_out=function_promoted_output_indexes,
                                 depth=depth + 1,
+                                replay_name_work=replay_name_work,
                             )
+                            if replay_name_work is not None and not replay_name_work(0):
+                                reentry_promotion_in_progress.discard(cache_key)
+                                return True
                             if representative_promoted and not function_promoted_output_indexes:
                                 function_promoted_output_indexes.update(valid_function_tainted_output_indexes)
                             function_promoted_outputs.update(
@@ -4458,18 +4666,29 @@ def _build_onnx_weight_analysis_plan(
                         opset_versions,
                         subgraph_constants,
                         identifier=function_key,
+                        replay_name_work=replay_name_work,
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     nested_graph_inputs = bound_control_flow_graph_inputs(
                         body_node,
                         nested_graph,
                         tainted,
                         opset_versions,
                         identifier=function_key,
+                        replay_name_work=replay_name_work,
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     nested_tainted_shapes: dict[str, tuple[int, ...] | None] = {}
                     nested_context_shapes: dict[str, tuple[int, ...]] = {}
                     for pair_index, graph_input in enumerate(nested_graph.input, start=nested_scan_offset):
-                        input_name = _onnx_value_name(graph_input)
+                        input_name = prepared_replay_value_name(graph_input, replay_name_work)
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
                         parent_name = nested_graph_inputs.get(input_name)
                         if parent_name is None:
                             continue
@@ -4479,7 +4698,12 @@ def _build_onnx_weight_analysis_plan(
                         shape = nested_bound_shape(reentry_input_shape(parent_name), pair_index)
                         if shape is not None:
                             nested_context_shapes[input_name] = shape
-                    nested_external_names = graph_external_reference_names(nested_graph, local_attribute_bindings)
+                    nested_external_names = graph_external_reference_names(
+                        nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     captured_names = nested_external_names & tainted
                     related_nested_tainted_shapes = {
                         name: shape
@@ -4533,8 +4757,14 @@ def _build_onnx_weight_analysis_plan(
                             if parent_input in available_nested_constants
                         }
                     nested_constants = graph_initializer_constants(
-                        nested_graph, available_nested_constants, local_attribute_bindings
+                        nested_graph,
+                        available_nested_constants,
+                        local_attribute_bindings,
+                        replay_name_work=replay_name_work,
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     nested_constants.update(nested_bound_input_constants)
                     nested_output_shapes: dict[int, tuple[int, ...]] = {}
                     nested_captured_names = set(nested_tainted_shapes)
@@ -4547,7 +4777,11 @@ def _build_onnx_weight_analysis_plan(
                             opset_versions,
                             attribute_bindings=local_attribute_bindings,
                             depth=depth + 1,
+                            replay_name_work=replay_name_work,
                         )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
                     if related_nested_output_indexes == set():
                         nested_tainted_output_indexes = set()
                     else:
@@ -4557,7 +4791,11 @@ def _build_onnx_weight_analysis_plan(
                             opset_versions,
                             attribute_bindings=local_attribute_bindings,
                             depth=depth + 1,
+                            replay_name_work=replay_name_work,
                         )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
                     nested_output_offset = control_flow_output_offset(body_node, identifier=function_key)
                     downstream_live_nested_output_indexes = {
                         output_index + nested_output_offset
@@ -4586,16 +4824,29 @@ def _build_onnx_weight_analysis_plan(
                             else nested_stacked_output_start
                         )
                         state_outputs = {
-                            _onnx_value_name(value): index - state_input_offset + nested_output_offset
-                            for index, value in enumerate(getattr(nested_graph, "input", ()))
+                            prepared_replay_value_name(value, replay_name_work): index
+                            - state_input_offset
+                            + nested_output_offset
+                            for index, value in replay_admitted_values(
+                                enumerate(getattr(nested_graph, "input", ())), replay_name_work
+                            )
                             if state_input_offset <= index < state_input_offset + state_count
                         }
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
                         pending_outputs = list(nested_recurrence_outputs)
                         dependency_work = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
                         while pending_outputs:
                             dependencies = graph_output_dependency_names(
-                                nested_graph, (pending_outputs.pop(),), attribute_bindings=local_attribute_bindings
+                                nested_graph,
+                                (pending_outputs.pop(),),
+                                attribute_bindings=local_attribute_bindings,
+                                replay_name_work=replay_name_work,
                             )
+                            if replay_name_work is not None and not replay_name_work(0):
+                                reentry_promotion_in_progress.discard(cache_key)
+                                return True
                             dependency_work -= max(len(dependencies), 1)
                             if dependency_work < 0 or dependency_names_exceeded_limit(dependencies):
                                 nested_recurrence_proven = False
@@ -4646,8 +4897,15 @@ def _build_onnx_weight_analysis_plan(
                                 trusted_context_shapes=nested_context_shapes,
                                 related_graph_input_shapes=related_nested_tainted_shapes,
                                 depth=depth + 1,
+                                replay_name_work=replay_name_work,
                             ):
+                                if replay_name_work is not None and not replay_name_work(0):
+                                    reentry_promotion_in_progress.discard(cache_key)
+                                    return True
                                 nested_promoted_output_indexes.add(output_index)
+                            if replay_name_work is not None and not replay_name_work(0):
+                                reentry_promotion_in_progress.discard(cache_key)
+                                return True
                     if nested_state_repeats:
                         input_slots = node_input_slots(body_node)
                         parent_input_offset = (
@@ -4887,7 +5145,12 @@ def _build_onnx_weight_analysis_plan(
         if cached_output_indexes is None or cached_output_indexes[0] is not subgraph:
             output_indexes_by_name: dict[str, list[int]] = {}
             for output_index, output in enumerate(graph_outputs):
-                output_indexes_by_name.setdefault(_onnx_value_name(output), []).append(output_index)
+                output_indexes_by_name.setdefault(prepared_replay_value_name(output, replay_name_work), []).append(
+                    output_index
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
             graph_output_name_indexes_cache[id(subgraph)] = (subgraph, output_indexes_by_name)
         else:
             _owner, output_indexes_by_name = cached_output_indexes
@@ -4912,10 +5175,18 @@ def _build_onnx_weight_analysis_plan(
         )
         output_shapes = {
             output_index: output_shape
-            for output_index in sorted(restorable_output_indexes)
+            for output_index in replay_admitted_values(sorted(restorable_output_indexes), replay_name_work)
             if 0 <= output_index < len(graph_outputs)
-            and (output_shape := reentry_input_shape(_onnx_value_name(graph_outputs[output_index]))) is not None
+            and (
+                output_shape := reentry_input_shape(
+                    prepared_replay_value_name(graph_outputs[output_index], replay_name_work)
+                )
+            )
+            is not None
         }
+        if replay_name_work is not None and not replay_name_work(0):
+            reentry_promotion_in_progress.discard(cache_key)
+            return True
         reentry_promotion_in_progress.discard(cache_key)
         reentry_promotion_cache[cache_key] = promoted_output_indexes
         reentry_shape_cache[cache_key] = output_shapes
@@ -4967,14 +5238,19 @@ def _build_onnx_weight_analysis_plan(
         *,
         depth: int = 0,
         inherited_constants: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> set[int]:
         nonlocal graph_taint_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return set(range(len(getattr(subgraph, "output", ()))))
         if not graph_input_names:
             return set()
         graph_outputs = getattr(subgraph, "output", ())
         if depth > 6 or graph_taint_work_remaining <= 0:
             return set(range(len(graph_outputs)))
-        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return set(range(len(getattr(subgraph, "output", ()))))
         if dependency_names_exceeded_limit(constant_names):
             return set(range(len(graph_outputs)))
         constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
@@ -4997,8 +5273,18 @@ def _build_onnx_weight_analysis_plan(
             return set(range(len(graph_outputs)))
         graph_taint_in_progress.add(cache_key)
         local_attribute_bindings = attribute_bindings or {}
-        graph_constants = graph_initializer_constants(subgraph, inherited_constants or {}, attribute_bindings)
-        output_dependency_names = graph_output_dependency_names(subgraph, attribute_bindings=attribute_bindings)
+        graph_constants = graph_initializer_constants(
+            subgraph, inherited_constants or {}, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            graph_taint_in_progress.discard(cache_key)
+            return set(range(len(getattr(subgraph, "output", ()))))
+        output_dependency_names = graph_output_dependency_names(
+            subgraph, attribute_bindings=attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            graph_taint_in_progress.discard(cache_key)
+            return set(range(len(getattr(subgraph, "output", ()))))
         if dependency_names_exceeded_limit(output_dependency_names):
             graph_taint_in_progress.discard(cache_key)
             result = set(range(len(graph_outputs)))
@@ -5046,7 +5332,13 @@ def _build_onnx_weight_analysis_plan(
                         graph_constants[name] = constant
             body_inputs = node_input_names(body_node)
             body_outputs = node_output_names(body_node)
-            body_output_slots = [str(output) for output in getattr(body_node, "output", ())]
+            body_output_slots = [
+                prepared_replay_value_name(output, replay_name_work)
+                for output in replay_admitted_values(getattr(body_node, "output", ()), replay_name_work)
+            ]
+            if replay_name_work is not None and not replay_name_work(0):
+                graph_taint_in_progress.discard(cache_key)
+                return set(range(len(getattr(subgraph, "output", ()))))
             if not body_outputs:
                 continue
             function = functions.get(function_key)
@@ -5060,15 +5352,25 @@ def _build_onnx_weight_analysis_plan(
                 if function_versions is None:
                     tainted.update(body_outputs)
                     continue
-                function_captures = graph_external_reference_names(function, function_attributes)
+                function_captures = graph_external_reference_names(
+                    function, function_attributes, replay_name_work=replay_name_work
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    graph_taint_in_progress.discard(cache_key)
+                    return set(range(len(getattr(subgraph, "output", ()))))
                 if dependency_names_exceeded_limit(function_captures):
                     tainted.update(body_outputs)
                     continue
                 function_input_names = {
-                    _onnx_value_name(function.input[input_index])
-                    for input_index, input_name in enumerate(node_input_slots(body_node))
+                    prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    for input_index, input_name in replay_admitted_values(
+                        enumerate(node_input_slots(body_node)), replay_name_work
+                    )
                     if input_name in tainted and input_index < len(getattr(function, "input", ()))
                 }
+                if replay_name_work is not None and not replay_name_work(0):
+                    graph_taint_in_progress.discard(cache_key)
+                    return set(range(len(getattr(subgraph, "output", ()))))
                 function_input_names.discard("")
                 function_input_names.update(function_captures & tainted)
                 if function_input_names:
@@ -5086,10 +5388,15 @@ def _build_onnx_weight_analysis_plan(
                                     node_input_slots(body_node),
                                     graph_constants,
                                     attribute_bindings=function_attributes,
+                                    replay_name_work=replay_name_work,
                                 )[0],
+                                replay_name_work=replay_name_work,
                             ),
                         )
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
                 tainted.update(mapped_outputs)
                 continue
             nested_outputs: set[str] = set()
@@ -5100,8 +5407,14 @@ def _build_onnx_weight_analysis_plan(
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
                     captured_names = set(
-                        graph_external_reference_names(nested_graph, local_attribute_bindings) & tainted
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                        & tainted
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
                     nested_input_names = set(
                         bound_control_flow_graph_inputs(
                             body_node,
@@ -5109,8 +5422,12 @@ def _build_onnx_weight_analysis_plan(
                             tainted,
                             opset_versions,
                             identifier=function_key,
+                            replay_name_work=replay_name_work,
                         )
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
                     captured_names |= nested_input_names
                     if not captured_names:
                         continue
@@ -5126,10 +5443,14 @@ def _build_onnx_weight_analysis_plan(
                                 graph_constants,
                                 local_attribute_bindings,
                                 depth=depth + 1,
+                                replay_name_work=replay_name_work,
                             )[0],
                             graph_output_offset=control_flow_output_offset(body_node, identifier=function_key),
                         )
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
             if nested_outputs:
                 tainted.update(nested_outputs)
             elif any_tainted and not inspected_nested_taint and not inspected_function_taint:
@@ -5142,8 +5463,13 @@ def _build_onnx_weight_analysis_plan(
                 # discards every tainted capture or recurrent input.
                 tainted.update(body_outputs)
         result = {
-            output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in tainted
+            output_index
+            for output_index, output in replay_admitted_values(enumerate(graph_outputs), replay_name_work)
+            if prepared_replay_value_name(output, replay_name_work) in tainted
         }
+        if replay_name_work is not None and not replay_name_work(0):
+            graph_taint_in_progress.discard(cache_key)
+            return set(range(len(getattr(subgraph, "output", ()))))
         graph_taint_in_progress.discard(cache_key)
         graph_taint_cache[cache_key] = set(result)
         return result
@@ -5160,27 +5486,72 @@ def _build_onnx_weight_analysis_plan(
         attribute_bindings: dict[str, Any] | None = None,
         *,
         depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> tuple[set[int], set[str]]:
         nonlocal graph_taint_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
         if not input_names:
             return set(), set()
         identifier = bounded_operator_identifier(node)
         if identifier is None:
-            return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
 
         def resolve_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return (attribute_bindings or {}).get(reference_name) if reference_name else attribute
 
-        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
         if dependency_names_exceeded_limit(constant_names):
-            return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
         constants_key = constant_binding_cache_key(constants, constant_names | frozenset(node_input_slots(node)[:2]))
         if constants_key is None:
-            return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
         opset_key = opset_cache_key(opset_versions)
         if opset_key is None:
-            return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
         key = (
             id(node),
             id(subgraph),
@@ -5203,7 +5574,17 @@ def _build_onnx_weight_analysis_plan(
             attribute_work = len(getattr(node, "attribute", ()))
             if attribute_work > graph_taint_work_remaining:
                 graph_taint_work_remaining = 0
-                return set(range(len(graph_outputs))), {_onnx_value_name(value) for value in graph_inputs} | input_names
+                replay_result = (
+                    set(range(len(graph_outputs))),
+                    {
+                        prepared_replay_value_name(value, replay_name_work)
+                        for value in replay_admitted_values(graph_inputs, replay_name_work)
+                    }
+                    | input_names,
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+                return replay_result
             graph_taint_work_remaining -= attribute_work
         state_count = (
             max(len(node.input) - 2, 0)
@@ -5217,9 +5598,13 @@ def _build_onnx_weight_analysis_plan(
         maps_key = (id(node), id(subgraph), state_count, input_offset, output_offset)
         if maps_key not in control_flow_state_maps:
             state_output_by_input = {
-                _onnx_value_name(graph_inputs[index + input_offset]): index + output_offset
-                for index in range(min(state_count, max(len(graph_inputs) - input_offset, 0)))
+                prepared_replay_value_name(graph_inputs[index + input_offset], replay_name_work): index + output_offset
+                for index in replay_admitted_values(
+                    range(min(state_count, max(len(graph_inputs) - input_offset, 0))), replay_name_work
+                )
             }
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
             state_input_by_output = {index: name for name, index in state_output_by_input.items() if name}
             control_flow_state_maps[maps_key] = (state_output_by_input, state_input_by_output)
         else:
@@ -5229,15 +5614,25 @@ def _build_onnx_weight_analysis_plan(
         if is_loop:
             may_skip = loop_may_skip_body(node, constants, set())
             count = (
-                constant_scalar_value(constants.get(str(node.input[0])), int(onnx.TensorProto.INT64))
+                constant_scalar_value(
+                    constants.get(prepared_replay_value_name(node.input[0], replay_name_work)),
+                    int(onnx.TensorProto.INT64),
+                )
                 if node.input and node.input[0]
                 else None
             )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
             condition = (
-                constant_scalar_value(constants.get(str(node.input[1])), int(onnx.TensorProto.BOOL))
+                constant_scalar_value(
+                    constants.get(prepared_replay_value_name(node.input[1], replay_name_work)),
+                    int(onnx.TensorProto.BOOL),
+                )
                 if len(node.input) > 1 and node.input[1]
                 else True
             )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
             if count is not None:
                 iterations = max(int(count), 0)
             if condition is False:
@@ -5257,7 +5652,17 @@ def _build_onnx_weight_analysis_plan(
             work = max(len(current_names), 1)
             if depth > 6 or work > graph_taint_work_remaining:
                 graph_taint_work_remaining = 0
-                return set(range(len(graph_outputs))), {_onnx_value_name(value) for value in graph_inputs} | input_names
+                replay_result = (
+                    set(range(len(graph_outputs))),
+                    {
+                        prepared_replay_value_name(value, replay_name_work)
+                        for value in replay_admitted_values(graph_inputs, replay_name_work)
+                    }
+                    | input_names,
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+                return replay_result
             graph_taint_work_remaining -= work
             recurrent_names.update(current_names)
             body_outputs = graph_tainted_output_indexes(
@@ -5267,7 +5672,10 @@ def _build_onnx_weight_analysis_plan(
                 attribute_bindings=attribute_bindings,
                 depth=depth,
                 inherited_constants=constants,
+                replay_name_work=replay_name_work,
             )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
             if len(body_outputs) > graph_taint_work_remaining:
                 graph_taint_work_remaining = 0
                 return set(range(len(graph_outputs))), set(state_output_by_input) | input_names
@@ -5295,7 +5703,10 @@ def _build_onnx_weight_analysis_plan(
         *,
         attribute_bindings: dict[str, Any] | None = None,
         depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> bool:
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if depth > 6:
             return True
         attribute_key = attribute_binding_cache_key(attribute_bindings)
@@ -5319,7 +5730,12 @@ def _build_onnx_weight_analysis_plan(
             return local_attribute_bindings.get(reference_name) if reference_name else attribute
 
         for body_node in getattr(subgraph, "node", ()):
-            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
+            body_inputs: list[str] = []
+            for input_value in getattr(body_node, "input", ()):
+                input_name = admitted_replay_value_name(input_value, replay_name_work)
+                if input_name is None:
+                    return True
+                body_inputs.append(input_name)
             function_key = bounded_operator_identifier(body_node)
             if function_key is None:
                 potential_weight_consumer_cache[cache_key] = True
@@ -5342,7 +5758,10 @@ def _build_onnx_weight_analysis_plan(
                     function_versions,
                     attribute_bindings=function_attributes,
                     depth=depth + 1,
+                    replay_name_work=replay_name_work,
                 ):
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return True
                     potential_weight_consumer_cache[cache_key] = True
                     return True
                 continue
@@ -5368,7 +5787,10 @@ def _build_onnx_weight_analysis_plan(
                         opset_versions,
                         attribute_bindings=local_attribute_bindings,
                         depth=depth + 1,
+                        replay_name_work=replay_name_work,
                     ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return True
                         potential_weight_consumer_cache[cache_key] = True
                         return True
         potential_weight_consumer_cache[cache_key] = False
@@ -5380,7 +5802,10 @@ def _build_onnx_weight_analysis_plan(
         *,
         attribute_bindings: dict[str, Any] | None = None,
         depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
@@ -5426,13 +5851,25 @@ def _build_onnx_weight_analysis_plan(
                     function_versions,
                     attribute_bindings=function_attributes,
                     depth=depth + 1,
+                    replay_name_work=replay_name_work,
                 ):
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
                     dependencies.update(input_name for input_name in body_input_slots if input_name)
                     if merge_dependency_names(
-                        dependencies, graph_external_reference_names(function, function_attributes)
+                        dependencies,
+                        graph_external_reference_names(
+                            function, function_attributes, replay_name_work=replay_name_work
+                        ),
                     ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
                         potential_weight_consumer_dependency_cache[cache_key] = dependency_collection_limit
                         return dependency_collection_limit
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                if replay_name_work is not None and not replay_name_work(0):
+                    return dependency_collection_limit
                 continue
             for input_index, input_name in enumerate(body_input_slots):
                 if input_name and _onnx_potential_weight_input(
@@ -5454,9 +5891,20 @@ def _build_onnx_weight_analysis_plan(
                         opset_versions,
                         attribute_bindings=local_attribute_bindings,
                         depth=depth + 1,
+                        replay_name_work=replay_name_work,
                     ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
                         continue
-                    dependencies.update(graph_external_reference_names(nested_graph, local_attribute_bindings))
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                    dependencies.update(
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
                     if parent_inputs:
                         dependencies.update(
                             bound_control_flow_graph_inputs(
@@ -5465,8 +5913,11 @@ def _build_onnx_weight_analysis_plan(
                                 parent_inputs,
                                 opset_versions,
                                 identifier=function_key,
+                                replay_name_work=replay_name_work,
                             ).values()
                         )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
         result = frozenset(dependencies)
         potential_weight_consumer_dependency_cache[cache_key] = result
         return result
@@ -5484,8 +5935,11 @@ def _build_onnx_weight_analysis_plan(
         proven_weight_inputs_path: tuple[int, ...] = (),
         inherited_independent_value: Callable[[str], bool] | None = None,
         control_flow_owner: Any | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> bool:
         nonlocal graph_taint_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if not graph_input_name:
             return False
         if depth > 6:
@@ -5494,7 +5948,10 @@ def _build_onnx_weight_analysis_plan(
             subgraph,
             attribute_bindings,
             include_bound_inputs=exclude_activation_inputs and isinstance(subgraph, onnx.FunctionProto),
+            replay_name_work=replay_name_work,
         )
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if dependency_names_exceeded_limit(constant_names):
             return True
         constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
@@ -5515,29 +5972,47 @@ def _build_onnx_weight_analysis_plan(
         if not exclude_activation_inputs and cache_key in weight_reachability_cache:
             return weight_reachability_cache[cache_key]
         if not subgraph_has_potential_weight_consumer(
-            subgraph, opset_versions, attribute_bindings=attribute_bindings, depth=depth
+            subgraph,
+            opset_versions,
+            attribute_bindings=attribute_bindings,
+            depth=depth,
+            replay_name_work=replay_name_work,
         ):
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
             if not exclude_activation_inputs:
                 weight_reachability_cache[cache_key] = False
             return False
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if graph_taint_work_remaining <= 0:
             return True
         if subgraph_analysis_work_exceeds_limit(
             subgraph,
-            graph_output_dependency_names(subgraph, attribute_bindings=attribute_bindings),
+            graph_output_dependency_names(
+                subgraph, attribute_bindings=attribute_bindings, replay_name_work=replay_name_work
+            ),
             include_potential_weight_consumers=True,
             opset_versions=opset_versions,
             attribute_bindings=attribute_bindings,
+            replay_name_work=replay_name_work,
         ):
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
             result = subgraph_has_potential_weight_consumer(
                 subgraph,
                 opset_versions,
                 attribute_bindings=attribute_bindings,
                 depth=depth,
+                replay_name_work=replay_name_work,
             )
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
             if not exclude_activation_inputs:
                 weight_reachability_cache[cache_key] = result
             return result
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
         if cache_key in weight_reachability_in_progress:
             return True
         weight_reachability_in_progress.add(cache_key)
@@ -5549,7 +6024,12 @@ def _build_onnx_weight_analysis_plan(
             return result
 
         local_attribute_bindings = attribute_bindings or {}
-        graph_constants = graph_initializer_constants(subgraph, inherited_constants or {}, attribute_bindings)
+        graph_constants = graph_initializer_constants(
+            subgraph, inherited_constants or {}, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
         if exclude_activation_inputs and isinstance(subgraph, onnx.FunctionProto):
             graph_constants.update(
                 (name, inherited_constants[name])
@@ -5562,8 +6042,19 @@ def _build_onnx_weight_analysis_plan(
             graph_taint_work_remaining = 0
             return finish(True)
         graph_taint_work_remaining -= len(graph_inputs)
-        graph_formals = {_onnx_value_name(value): index for index, value in enumerate(graph_inputs)}
-        current_graph_external_names = graph_external_reference_names(subgraph, attribute_bindings)
+        graph_formals = {
+            prepared_replay_value_name(value, replay_name_work): index
+            for index, value in replay_admitted_values(enumerate(graph_inputs), replay_name_work)
+        }
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
+        current_graph_external_names = graph_external_reference_names(
+            subgraph, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
 
         def independent_value(name: str) -> bool:
             nonlocal graph_taint_work_remaining
@@ -5629,15 +6120,26 @@ def _build_onnx_weight_analysis_plan(
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return local_attribute_bindings.get(reference_name) if reference_name else attribute
 
-        live_names = {name for output in getattr(subgraph, "output", ()) if (name := _onnx_value_name(output))}
+        live_names = {
+            name
+            for output in replay_admitted_values(getattr(subgraph, "output", ()), replay_name_work)
+            if (name := prepared_replay_value_name(output, replay_name_work))
+        }
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
         live_names.update(
             subgraph_potential_weight_consumer_dependency_names(
                 subgraph,
                 opset_versions,
                 attribute_bindings=attribute_bindings,
                 depth=depth,
+                replay_name_work=replay_name_work,
             )
         )
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
         initial_live_node_ids = graph_nodes_producing_names(subgraph, live_names)
         if initial_live_node_ids is None:
             return finish(True)
@@ -5672,9 +6174,21 @@ def _build_onnx_weight_analysis_plan(
                             opset_versions,
                             attribute_bindings=local_attribute_bindings,
                             depth=depth + 1,
+                            replay_name_work=replay_name_work,
                         ):
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
                             continue
-                        external_names = graph_external_reference_names(nested_graph, local_attribute_bindings)
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                        external_names = graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
                         live_names.update(external_names)
                         dependency_node_ids = graph_nodes_producing_names(subgraph, external_names)
                         if dependency_node_ids is None:
@@ -5685,7 +6199,12 @@ def _build_onnx_weight_analysis_plan(
                 live_function_attributes = bound_function_attributes(
                     body_function, body_node, resolve_reentry_attribute
                 )
-                live_function_captures = graph_external_reference_names(body_function, live_function_attributes)
+                live_function_captures = graph_external_reference_names(
+                    body_function, live_function_attributes, replay_name_work=replay_name_work
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
                 if dependency_names_exceeded_limit(live_function_captures):
                     return finish(True)
                 if len(live_function_captures) > graph_taint_work_remaining:
@@ -5708,7 +6227,12 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    external_names = graph_external_reference_names(nested_graph, local_attribute_bindings)
+                    external_names = graph_external_reference_names(
+                        nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                     live_names.update(external_names)
                     dependency_node_ids = graph_nodes_producing_names(subgraph, external_names)
                     if dependency_node_ids is None:
@@ -5728,7 +6252,13 @@ def _build_onnx_weight_analysis_plan(
                 return finish(True)
             graph_taint_work_remaining -= work
             body_outputs = node_output_names(body_node)
-            body_output_slots = [str(output) for output in getattr(body_node, "output", ())]
+            body_output_slots = [
+                prepared_replay_value_name(output, replay_name_work)
+                for output in replay_admitted_values(getattr(body_node, "output", ()), replay_name_work)
+            ]
+            if replay_name_work is not None and not replay_name_work(0):
+                weight_reachability_in_progress.discard(cache_key)
+                return True
             body_outputs_live_after = node_output_is_live_after_node.get(id(body_node), False)
             function_key = bounded_operator_identifier(body_node)
             if function_key is None:
@@ -5753,7 +6283,11 @@ def _build_onnx_weight_analysis_plan(
                     function_versions,
                     attribute_bindings=function_attributes,
                     depth=depth + 1,
+                    replay_name_work=replay_name_work,
                 )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
                 if not function_has_weight_consumer:
                     continue
             if not body_outputs_live_after and function is None:
@@ -5788,17 +6322,29 @@ def _build_onnx_weight_analysis_plan(
                 exclude_activation_inputs
                 and builtin_operator(body_node, "Identity", identifier=function_key)
                 and len(body_node.input) == 1
-                and (constant := graph_constants.get(str(body_node.input[0]))) is not None
+                and (constant := graph_constants.get(prepared_replay_value_name(body_node.input[0], replay_name_work)))
+                is not None
             ):
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
                 for name in body_outputs:
                     graph_constants[name] = constant
+            if replay_name_work is not None and not replay_name_work(0):
+                weight_reachability_in_progress.discard(cache_key)
+                return True
             body_inputs = node_input_names(body_node)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
             function_captures: frozenset[str] = frozenset()
             if function is not None:
                 if function_attributes is None:
                     function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
-                function_captures = graph_external_reference_names(function, function_attributes)
+                function_captures = graph_external_reference_names(
+                    function, function_attributes, replay_name_work=replay_name_work
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
                 if dependency_names_exceeded_limit(function_captures):
                     return finish(True)
             tainted_function_captures = function_captures & tainted
@@ -5814,11 +6360,29 @@ def _build_onnx_weight_analysis_plan(
                             opset_versions,
                             attribute_bindings=local_attribute_bindings,
                             depth=depth + 1,
+                            replay_name_work=replay_name_work,
                         ):
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
                             continue
-                        if graph_external_reference_names(nested_graph, local_attribute_bindings) & tainted:
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                        if (
+                            graph_external_reference_names(
+                                nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                            )
+                            & tainted
+                        ):
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
                             has_tainted_nested_capture = True
                             break
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
                     if has_tainted_nested_capture:
                         break
             if (
@@ -5843,9 +6407,25 @@ def _build_onnx_weight_analysis_plan(
                         function_versions,
                         attribute_bindings=function_attributes,
                         depth=depth + 1,
+                        replay_name_work=replay_name_work,
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                 function_input_names = set(tainted_function_captures)
-                function_bindings = dict(zip(function.input, node_input_slots(body_node), strict=False))
+                function_bindings = dict(
+                    zip(
+                        (
+                            prepared_replay_value_name(value, replay_name_work)
+                            for value in replay_admitted_values(function.input, replay_name_work)
+                        ),
+                        node_input_slots(body_node),
+                        strict=False,
+                    )
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
 
                 def independent_function_value(
                     name: str,
@@ -5859,7 +6439,10 @@ def _build_onnx_weight_analysis_plan(
                 for input_index, input_name in enumerate(node_input_slots(body_node)):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                         continue
-                    function_input_name = _onnx_value_name(function.input[input_index])
+                    function_input_name = prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                     if not function_input_name:
                         continue
                     function_input_names.add(function_input_name)
@@ -5875,17 +6458,28 @@ def _build_onnx_weight_analysis_plan(
                             node_input_slots(body_node),
                             graph_constants,
                             attribute_bindings=function_attributes,
+                            replay_name_work=replay_name_work,
                         )[0],
                         exclude_activation_inputs=exclude_activation_inputs,
                         proven_weight_inputs=proven_weight_inputs,
                         proven_weight_inputs_path=(*proven_weight_inputs_path, id(body_node), id(function)),
                         inherited_independent_value=independent_function_value,
+                        replay_name_work=replay_name_work,
                     ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
                         return finish(True)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                 if function_input_names:
                     function_tainted_outputs.update(
                         mapped_node_outputs(
-                            [str(output) for output in getattr(body_node, "output", ())],
+                            [
+                                prepared_replay_value_name(output, replay_name_work)
+                                for output in replay_admitted_values(getattr(body_node, "output", ()), replay_name_work)
+                            ],
                             graph_tainted_output_indexes(
                                 function,
                                 function_input_names,
@@ -5897,10 +6491,15 @@ def _build_onnx_weight_analysis_plan(
                                     node_input_slots(body_node),
                                     graph_constants,
                                     attribute_bindings=function_attributes,
+                                    replay_name_work=replay_name_work,
                                 )[0],
+                                replay_name_work=replay_name_work,
                             ),
                         )
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                 tainted.update(function_tainted_outputs)
             for attribute in direct_graph_attributes(body_node, function):
                 resolved_attribute = resolve_reentry_attribute(attribute)
@@ -5908,13 +6507,27 @@ def _build_onnx_weight_analysis_plan(
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
                     captured_names = set(
-                        graph_external_reference_names(nested_graph, local_attribute_bindings) & tainted
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                        & tainted
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                     captured_names.update(
                         bound_control_flow_graph_inputs(
-                            body_node, nested_graph, tainted, opset_versions, identifier=function_key
+                            body_node,
+                            nested_graph,
+                            tainted,
+                            opset_versions,
+                            identifier=function_key,
+                            replay_name_work=replay_name_work,
                         )
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                     if not captured_names:
                         continue
                     inspected_nested_taint = True
@@ -5926,13 +6539,21 @@ def _build_onnx_weight_analysis_plan(
                         graph_constants,
                         local_attribute_bindings,
                         depth=depth + 1,
+                        replay_name_work=replay_name_work,
                     )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                     if subgraph_has_potential_weight_consumer(
                         nested_graph,
                         opset_versions,
                         attribute_bindings=local_attribute_bindings,
                         depth=depth + 1,
+                        replay_name_work=replay_name_work,
                     ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
                         if recurrent_names and graph_taint_work_remaining <= 0:
                             return finish(True)
                         for input_name in recurrent_names:
@@ -5948,8 +6569,18 @@ def _build_onnx_weight_analysis_plan(
                                 proven_weight_inputs_path=(*proven_weight_inputs_path, id(body_node), id(nested_graph)),
                                 inherited_independent_value=independent_value,
                                 control_flow_owner=body_node,
+                                replay_name_work=replay_name_work,
                             ):
+                                if replay_name_work is not None and not replay_name_work(0):
+                                    weight_reachability_in_progress.discard(cache_key)
+                                    return True
                                 return finish(True)
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
                     if body_outputs_live_after:
                         tainted.update(
                             mapped_node_outputs(
@@ -6046,8 +6677,11 @@ def _build_onnx_weight_analysis_plan(
         depth: int = 0,
         require_resolved_bindings: bool = False,
         capture_opset_versions: dict[str, int] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
     ) -> frozenset[str]:
         nonlocal graph_external_function_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
         capture_opset_key = None
         if require_resolved_bindings:
             if capture_opset_versions is None:
@@ -6096,25 +6730,37 @@ def _build_onnx_weight_analysis_plan(
                 return dependency_collection_limit
             graph_external_function_work_remaining -= work
         graph_external_reference_in_progress.add(cache_key)
-        local_names = {name for value_info in getattr(graph, "input", ()) if (name := _onnx_value_name(value_info))}
-        local_names.update(
-            str(initializer.name)
-            for initializer in getattr(graph, "initializer", ())
-            if getattr(initializer, "name", "")
-        )
-        local_names.update(
-            str(sparse_initializer.values.name)
-            for sparse_initializer in getattr(graph, "sparse_initializer", ())
-            if getattr(getattr(sparse_initializer, "values", None), "name", "")
-        )
+        local_names: set[str] = set()
+        for values, name_only in (
+            (getattr(graph, "input", ()), False),
+            (getattr(graph, "initializer", ()), True),
+            ((getattr(item, "values", None) for item in getattr(graph, "sparse_initializer", ())), True),
+        ):
+            for value in values:
+                name = admitted_replay_value_name(value, replay_name_work, name_only=name_only)
+                if name is None:
+                    graph_external_reference_in_progress.discard(cache_key)
+                    return dependency_collection_limit
+                if name:
+                    local_names.add(name)
         produced_names = set(local_names)
         referenced_names: set[str] = set()
         for graph_output in getattr(graph, "output", ()):
-            if output_name := _onnx_value_name(graph_output):
+            output_name = admitted_replay_value_name(graph_output, replay_name_work)
+            if output_name is None:
+                graph_external_reference_in_progress.discard(cache_key)
+                return dependency_collection_limit
+            if output_name:
                 referenced_names.add(output_name)
         for graph_node in getattr(graph, "node", ()):
-            referenced_names.update(str(input_name) for input_name in getattr(graph_node, "input", ()) if input_name)
-            produced_names.update(str(output_name) for output_name in getattr(graph_node, "output", ()) if output_name)
+            for io_field, names in (("input", referenced_names), ("output", produced_names)):
+                for value in getattr(graph_node, io_field, ()):
+                    name = admitted_replay_value_name(value, replay_name_work)
+                    if name is None:
+                        graph_external_reference_in_progress.discard(cache_key)
+                        return dependency_collection_limit
+                    if name:
+                        names.add(name)
             identifier = bounded_operator_identifier(graph_node)
             if identifier is None:
                 graph_external_reference_in_progress.discard(cache_key)
@@ -6144,7 +6790,11 @@ def _build_onnx_weight_analysis_plan(
                     depth=depth + 1,
                     require_resolved_bindings=require_resolved_bindings,
                     capture_opset_versions=nested_capture_opsets,
+                    replay_name_work=replay_name_work,
                 )
+                if replay_name_work is not None and not replay_name_work(0):
+                    graph_external_reference_in_progress.discard(cache_key)
+                    return dependency_collection_limit
                 if require_resolved_bindings and dependency_names_exceeded_limit(function_references):
                     graph_external_reference_in_progress.discard(cache_key)
                     graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
@@ -6174,7 +6824,11 @@ def _build_onnx_weight_analysis_plan(
                             depth=depth + 1,
                             require_resolved_bindings=require_resolved_bindings,
                             capture_opset_versions=capture_opset_versions,
+                            replay_name_work=replay_name_work,
                         )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            graph_external_reference_in_progress.discard(cache_key)
+                            return dependency_collection_limit
                         if require_resolved_bindings and dependency_names_exceeded_limit(subgraph_references):
                             graph_external_reference_in_progress.discard(cache_key)
                             graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
@@ -9311,6 +9965,19 @@ def _build_onnx_weight_analysis_plan(
                         return count_cache[cache_key]
 
                     exact_loop_replay_work_exhausted = False
+
+                    def reserve_exact_loop_replay_name_work(name_characters: int = 0) -> bool:
+                        nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
+                        if exact_loop_replay_work_exhausted:
+                            return False
+                        extra_work = max(0, (name_characters - 1) // 64)
+                        if extra_work > exact_loop_replay_work_remaining:
+                            exact_loop_replay_work_exhausted = True
+                            exact_loop_replay_work_remaining = 0
+                            return False
+                        exact_loop_replay_work_remaining -= extra_work
+                        return True
+
                     nested_attribute_reference_cache: dict[
                         int,
                         tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]],
@@ -9322,7 +9989,11 @@ def _build_onnx_weight_analysis_plan(
                     )
                     nested_reference_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
-                    def resolved_replay_function_reference(body_node: Any) -> tuple[Any, frozenset[str] | None] | None:
+                    def resolved_replay_function_reference(
+                        body_node: Any, replay_name_work: Callable[[int], bool] | None = None
+                    ) -> tuple[Any, frozenset[str] | None] | None:
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return body_node, None
                         identifier = bounded_operator_identifier(body_node)
                         if identifier is None:
                             return body_node, None
@@ -9338,6 +10009,7 @@ def _build_onnx_weight_analysis_plan(
                             replay_bindings,
                             require_resolved_bindings=True,
                             capture_opset_versions=replay_versions,
+                            replay_name_work=replay_name_work,
                         )
                         return (
                             replay_function,
@@ -9347,8 +10019,11 @@ def _build_onnx_weight_analysis_plan(
                     def bounded_nested_external_reference_names(
                         graph: Any,
                         external_reference_cache: dict[int, tuple[Any, frozenset[str] | None]],
+                        replay_name_work: Callable[[int], bool] | None = None,
                     ) -> frozenset[str] | None:
                         nonlocal nested_reference_work_remaining
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return None
                         cache_key = id(graph)
                         cached_reference_names = external_reference_cache.get(cache_key)
                         if cached_reference_names is not None and cached_reference_names[0] is graph:
@@ -9357,32 +10032,38 @@ def _build_onnx_weight_analysis_plan(
                         nested_reference_work_remaining -= max(len(graph_nodes), 1)
                         if nested_reference_work_remaining < 0:
                             return None
-                        local_names = {
-                            name for value_info in getattr(graph, "input", ()) if (name := _onnx_value_name(value_info))
-                        }
-                        local_names.update(
-                            str(initializer.name)
-                            for initializer in getattr(graph, "initializer", ())
-                            if getattr(initializer, "name", "")
-                        )
-                        local_names.update(
-                            str(sparse_initializer.values.name)
-                            for sparse_initializer in getattr(graph, "sparse_initializer", ())
-                            if getattr(getattr(sparse_initializer, "values", None), "name", "")
-                        )
+                        local_names: set[str] = set()
+                        for values, name_only in (
+                            (getattr(graph, "input", ()), False),
+                            (getattr(graph, "initializer", ()), True),
+                            (
+                                (getattr(item, "values", None) for item in getattr(graph, "sparse_initializer", ())),
+                                True,
+                            ),
+                        ):
+                            for value in values:
+                                name = admitted_replay_value_name(value, replay_name_work, name_only=name_only)
+                                if name is None:
+                                    return None
+                                if name:
+                                    local_names.add(name)
                         produced_names = set(local_names)
                         referenced_names: set[str] = set()
                         for graph_output in getattr(graph, "output", ()):
-                            if output_name := _onnx_value_name(graph_output):
+                            output_name = admitted_replay_value_name(graph_output, replay_name_work)
+                            if output_name is None:
+                                return None
+                            if output_name:
                                 referenced_names.add(output_name)
                         for graph_node in graph_nodes:
-                            referenced_names.update(
-                                str(input_name) for input_name in getattr(graph_node, "input", ()) if input_name
-                            )
-                            produced_names.update(
-                                str(output_name) for output_name in getattr(graph_node, "output", ()) if output_name
-                            )
-                            function_reference = resolved_replay_function_reference(graph_node)
+                            for io_field, names in (("input", referenced_names), ("output", produced_names)):
+                                for value in getattr(graph_node, io_field, ()):
+                                    name = admitted_replay_value_name(value, replay_name_work)
+                                    if name is None:
+                                        return None
+                                    if name:
+                                        names.add(name)
+                            function_reference = resolved_replay_function_reference(graph_node, replay_name_work)
                             nested_function = function_reference[0] if function_reference is not None else None
                             if function_reference is not None:
                                 function_captures = function_reference[1]
@@ -9406,6 +10087,7 @@ def _build_onnx_weight_analysis_plan(
                                     subgraph_references = bounded_nested_external_reference_names(
                                         subgraph,
                                         external_reference_cache,
+                                        replay_name_work,
                                     )
                                     if subgraph_references is None:
                                         return None
@@ -9421,13 +10103,16 @@ def _build_onnx_weight_analysis_plan(
                             tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]],
                         ],
                         external_reference_cache: dict[int, tuple[Any, frozenset[str] | None]],
+                        replay_name_work: Callable[[int], bool] | None = None,
                     ) -> tuple[tuple[Any, frozenset[str] | None], ...]:
                         nonlocal nested_reference_work_remaining
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return ((body_node, None),)
                         cache_key = id(body_node)
                         cached_references = attribute_reference_cache.get(cache_key)
                         if cached_references is not None and cached_references[0] is body_node:
                             return cached_references[1]
-                        function_reference = resolved_replay_function_reference(body_node)
+                        function_reference = resolved_replay_function_reference(body_node, replay_name_work)
                         references: tuple[tuple[Any, frozenset[str] | None], ...]
                         if function_reference is not None:
                             references = (function_reference,)
@@ -9446,7 +10131,7 @@ def _build_onnx_weight_analysis_plan(
                                 nested_reference_work_remaining -= container_work
                                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
                                     nested_references = bounded_nested_external_reference_names(
-                                        nested_graph, external_reference_cache
+                                        nested_graph, external_reference_cache, replay_name_work
                                     )
                                     if nested_references is None:
                                         graph_references = [(body_node, None)]
@@ -9455,6 +10140,8 @@ def _build_onnx_weight_analysis_plan(
                                 if graph_references and graph_references[-1][1] is None:
                                     break
                             references = tuple(graph_references)
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return ((body_node, None),)
                         attribute_reference_cache[cache_key] = (body_node, references)
                         return references
 
@@ -9482,6 +10169,12 @@ def _build_onnx_weight_analysis_plan(
                                 exact_loop_replay_work_exhausted = True
                                 exact_loop_replay_work_remaining = 0
                                 return False
+                            for value in chain(getattr(replay_graph, "input", ()), getattr(replay_graph, "output", ())):
+                                graph_work += max(0, (len(_onnx_value_name(value)) - 1) // 64)
+                                if graph_work > exact_loop_replay_work_remaining:
+                                    exact_loop_replay_work_exhausted = True
+                                    exact_loop_replay_work_remaining = 0
+                                    return False
                             for replay_node in graph_nodes:
                                 graph_work += sum(
                                     len(getattr(replay_node, field, ())) for field in ("input", "output", "attribute")
@@ -9490,6 +10183,14 @@ def _build_onnx_weight_analysis_plan(
                                     exact_loop_replay_work_exhausted = True
                                     exact_loop_replay_work_remaining = 0
                                     return False
+                                for value in chain(
+                                    getattr(replay_node, "input", ()), getattr(replay_node, "output", ())
+                                ):
+                                    graph_work += max(0, (len(str(value)) - 1) // 64)
+                                    if graph_work > exact_loop_replay_work_remaining:
+                                        exact_loop_replay_work_exhausted = True
+                                        exact_loop_replay_work_remaining = 0
+                                        return False
                                 for replay_attribute in getattr(replay_node, "attribute", ()):
                                     # The existing attribute unit covers the first 64
                                     # combined name/reference characters; charge further
@@ -9542,14 +10243,29 @@ def _build_onnx_weight_analysis_plan(
                             else ""
                         )
                         subgraph_constants = graph_initializer_constants(
-                            subgraph, constants, attribute_bindings=attribute_bindings
+                            subgraph,
+                            constants,
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
                         )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
                         output_dependency_names = graph_output_dependency_names(
-                            subgraph, (target_graph_output_index,), attribute_bindings=attribute_bindings
+                            subgraph,
+                            (target_graph_output_index,),
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
                         )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
                         potential_weight_dependency_names = subgraph_potential_weight_consumer_dependency_names(
-                            subgraph, opset_versions, attribute_bindings=attribute_bindings
+                            subgraph,
+                            opset_versions,
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
                         )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
                         attribute_reference_cache, external_reference_cache = reference_state
 
                         if dependency_names_exceeded_limit(output_dependency_names):
@@ -9561,13 +10277,23 @@ def _build_onnx_weight_analysis_plan(
                                 opset_versions,
                                 inherited_constants=constants,
                                 attribute_bindings=attribute_bindings,
+                                replay_name_work=reserve_exact_loop_replay_name_work,
                             ):
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
                                 potential_weight_dependency_names = frozenset()
                             else:
                                 return None
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
                         transitive_weight_dependency_names = graph_value_dependency_names(
-                            subgraph, potential_weight_dependency_names, attribute_bindings=attribute_bindings
+                            subgraph,
+                            potential_weight_dependency_names,
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
                         )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
                         if dependency_names_exceeded_limit(transitive_weight_dependency_names):
                             return None
                         combined_dependency_names = set(output_dependency_names)
@@ -9705,7 +10431,9 @@ def _build_onnx_weight_analysis_plan(
                             return next(iter(known_types)) if len(known_types) == 1 else None
 
                         context_shapes = related_input_shapes or {}
-                        external_shape_names = graph_external_reference_names(subgraph, attribute_bindings)
+                        external_shape_names = graph_external_reference_names(
+                            subgraph, attribute_bindings, replay_name_work=reserve_exact_loop_replay_name_work
+                        )
                         if dependency_names_exceeded_limit(external_shape_names):
                             return None
 
@@ -9779,8 +10507,8 @@ def _build_onnx_weight_analysis_plan(
                                 )
                             if identifier[1] == "MatMul":
                                 return matmul_output_shape(
-                                    tainted_shapes.get(body_inputs[0]) if body_inputs else None,
-                                    tainted_shapes.get(body_inputs[1]) if len(body_inputs) > 1 else None,
+                                    known_input_shape(body_inputs[0]) if body_inputs else None,
+                                    known_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None,
                                 )
                             if identifier[1] == "OneHot":
                                 return onehot_output_shape(
@@ -9883,7 +10611,10 @@ def _build_onnx_weight_analysis_plan(
                                 function_graph,
                                 function_versions,
                                 attribute_bindings=function_attributes,
+                                replay_name_work=reserve_exact_loop_replay_name_work,
                             )
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
                             if dependency_names_exceeded_limit(weight_dependency_names):
                                 return None
                             if output_shapes_out is not None:
@@ -9903,7 +10634,10 @@ def _build_onnx_weight_analysis_plan(
                                 function_graph,
                                 weight_dependency_names,
                                 attribute_bindings=function_attributes,
+                                replay_name_work=reserve_exact_loop_replay_name_work,
                             )
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
                             if dependency_names_exceeded_limit(weight_dependency_names):
                                 return None
                             live_node_ids = graph_nodes_producing_names(function_graph, weight_dependency_names)
@@ -10248,7 +10982,10 @@ def _build_onnx_weight_analysis_plan(
                                     function,
                                     function_versions,
                                     attribute_bindings=function_attributes,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
                                 )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
                             standard_operator = (
                                 is_registered_standard_operator
                                 and not is_model_local_function
@@ -10276,8 +11013,11 @@ def _build_onnx_weight_analysis_plan(
                                     body_node,
                                     attribute_reference_cache,
                                     external_reference_cache,
+                                    reserve_exact_loop_replay_name_work,
                                 )
                             )
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
                             tainted_shape_names = set(tainted_shapes)
                             has_tainted_nested_capture = any(
                                 reference_names is None or reference_names & tainted_shape_names
@@ -10300,7 +11040,9 @@ def _build_onnx_weight_analysis_plan(
                             )
                             node_is_live_for_output = id(body_node) in output_dependency_node_ids
                             if function is not None:
-                                function_captures = graph_external_reference_names(function, function_attributes)
+                                function_captures = graph_external_reference_names(
+                                    function, function_attributes, replay_name_work=reserve_exact_loop_replay_name_work
+                                )
                                 if dependency_names_exceeded_limit(function_captures):
                                     return None
                                 for captured_name in sorted(function_captures & tainted_shape_names):
@@ -10313,10 +11055,15 @@ def _build_onnx_weight_analysis_plan(
                                             function_versions,
                                             attribute_bindings=function_attributes,
                                             inherited_constants=subgraph_constants,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
                                         )
                                     ):
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
                                         has_tainted_nested_capture = True
                                         break
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
                             if (
                                 not node_is_live_for_output
                                 and not has_tainted_potential_weight_input
@@ -10366,8 +11113,13 @@ def _build_onnx_weight_analysis_plan(
                                         name: known_input_data_type(name) for name in reference_names
                                     }
                                     nested_constants = graph_initializer_constants(
-                                        nested_graph, subgraph_constants, attribute_bindings=attribute_bindings
+                                        nested_graph,
+                                        subgraph_constants,
+                                        attribute_bindings=attribute_bindings,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
                                     )
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
                                     for captured_name in reference_names & tainted_shape_names:
                                         captured_shape = tainted_shapes[captured_name]
                                         if captured_shape is None:
@@ -10410,7 +11162,10 @@ def _build_onnx_weight_analysis_plan(
                                     function_actuals,
                                     subgraph_constants,
                                     attribute_bindings=function_attributes,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
                                 )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
                                 function_constants.update(function_bound_input_constants)
                                 function_context_shapes: dict[str, tuple[int, ...]] = {}
                                 function_context_data_types: dict[str, int | None] = {}
@@ -10419,7 +11174,11 @@ def _build_onnx_weight_analysis_plan(
                                 for input_index, input_name in enumerate(function_actuals):
                                     if input_index >= len(getattr(function, "input", ())):
                                         continue
-                                    function_input_name = _onnx_value_name(function.input[input_index])
+                                    function_input_name = admitted_replay_value_name(
+                                        function.input[input_index], reserve_exact_loop_replay_name_work
+                                    )
+                                    if function_input_name is None:
+                                        return None
                                     input_shape = known_input_shape(input_name)
                                     if function_input_name and input_shape is not None:
                                         function_context_shapes[function_input_name] = input_shape
@@ -10443,7 +11202,11 @@ def _build_onnx_weight_analysis_plan(
                                         getattr(function, "input", ())
                                     ):
                                         continue
-                                    function_input_name = _onnx_value_name(function.input[input_index])
+                                    function_input_name = admitted_replay_value_name(
+                                        function.input[input_index], reserve_exact_loop_replay_name_work
+                                    )
+                                    if function_input_name is None:
+                                        return None
                                     if not function_input_name or (
                                         not node_is_live_for_output
                                         and not subgraph_state_input_can_reach_weight_consumer(
@@ -10452,9 +11215,14 @@ def _build_onnx_weight_analysis_plan(
                                             function_versions,
                                             attribute_bindings=function_attributes,
                                             inherited_constants=constants,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
                                         )
                                     ):
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
                                         continue
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
                                     tainted_shape = tainted_shapes.get(input_name)
                                     if tainted_shape is None:
                                         return None
@@ -10481,7 +11249,11 @@ def _build_onnx_weight_analysis_plan(
                                         output_name = body_node.output[output_index]
                                         if output_index >= len(getattr(function, "output", ())):
                                             return None
-                                        function_output_name = _onnx_value_name(function.output[output_index])
+                                        function_output_name = admitted_replay_value_name(
+                                            function.output[output_index], reserve_exact_loop_replay_name_work
+                                        )
+                                        if function_output_name is None:
+                                            return None
                                         known_output_shape = function_output_shapes.get(function_output_name)
                                         if known_output_shape is None:
                                             return None
@@ -10507,8 +11279,11 @@ def _build_onnx_weight_analysis_plan(
                                         set(tainted_inputs),
                                         opset_versions,
                                         identifier=function_key,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
                                     )
                                 )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
                                 nested_outputs, recurrent_names = control_flow_tainted_outputs(
                                     body_node,
                                     nested_graph,
@@ -10517,7 +11292,10 @@ def _build_onnx_weight_analysis_plan(
                                     subgraph_constants,
                                     attribute_bindings,
                                     depth=1,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
                                 )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
                                 if graph_taint_work_is_exhausted():
                                     return None
                                 for input_name in recurrent_names:
@@ -10527,15 +11305,25 @@ def _build_onnx_weight_analysis_plan(
                                         opset_versions,
                                         attribute_bindings=attribute_bindings,
                                         inherited_constants=subgraph_constants,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
                                     ):
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
+                                        return None
+                                    if not reserve_exact_loop_replay_name_work():
                                         return None
                                 input_slots = node_input_slots(body_node)
                                 state_count = max(len(input_slots) - 2, 0)
-                                nested_state_outputs = {
-                                    _onnx_value_name(value): index - 1
-                                    for index, value in enumerate(getattr(nested_graph, "input", ()))
-                                    if 2 <= index < state_count + 2
-                                }
+                                nested_state_outputs: dict[str, int] = {}
+                                for index, value in enumerate(getattr(nested_graph, "input", ())):
+                                    if not 2 <= index < state_count + 2:
+                                        continue
+                                    nested_formal_name = admitted_replay_value_name(
+                                        value, reserve_exact_loop_replay_name_work
+                                    )
+                                    if nested_formal_name is None:
+                                        return None
+                                    nested_state_outputs[nested_formal_name] = index - 1
                                 live_names = output_dependency_names | potential_weight_dependency_names
                                 relevant_outputs = {
                                     index
@@ -10549,8 +11337,13 @@ def _build_onnx_weight_analysis_plan(
                                 pending_outputs = list(relevant_outputs)
                                 while pending_outputs:
                                     dependencies = graph_output_dependency_names(
-                                        nested_graph, (pending_outputs.pop(),), attribute_bindings=attribute_bindings
+                                        nested_graph,
+                                        (pending_outputs.pop(),),
+                                        attribute_bindings=attribute_bindings,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
                                     )
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
                                     work = max(len(dependencies), 1)
                                     if (
                                         dependency_names_exceeded_limit(dependencies)
@@ -10596,13 +11389,20 @@ def _build_onnx_weight_analysis_plan(
                                         related_graph_input_shapes=dict(nested_shapes),
                                         output_shapes_out=output_shapes,
                                         depth=1,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
                                     )
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
                                     if promoted or output_shapes.get(output_index) != shape:
                                         return None
                                 for output_index in used_outputs:
                                     output_name = str(body_node.output[output_index - 1])
-                                    input_name = _onnx_value_name(nested_graph.input[output_index + 1])
-                                    tainted_shapes[output_name] = nested_shapes[input_name]
+                                    nested_input_name = admitted_replay_value_name(
+                                        nested_graph.input[output_index + 1], reserve_exact_loop_replay_name_work
+                                    )
+                                    if nested_input_name is None:
+                                        return None
+                                    tainted_shapes[output_name] = nested_shapes[nested_input_name]
                                     tainted_data_types[output_name] = None
                                 continue
                             for input_index, input_name in enumerate(body_inputs):
@@ -10716,7 +11516,10 @@ def _build_onnx_weight_analysis_plan(
                                     output_shapes_out=output_shapes,
                                     related_graph_input_shapes=current_related_shapes,
                                     attribute_bindings=attribute_bindings,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
                                 )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
                                 next_shape = output_shapes.get(graph_output_index)
                                 if next_shape is None:
                                     return None
@@ -10733,7 +11536,12 @@ def _build_onnx_weight_analysis_plan(
                                     current_input_pairs,
                                     start=current_input_pair_index_start,
                                 ):
-                                    if _onnx_value_name(related_graph_input) == related_input_name:
+                                    related_formal_name = admitted_replay_value_name(
+                                        related_graph_input, reserve_exact_loop_replay_name_work
+                                    )
+                                    if related_formal_name is None:
+                                        return None
+                                    if related_formal_name == related_input_name:
                                         related_output_index = control_flow_subgraph_state_output_index(
                                             current_node,
                                             related_pair_index,
@@ -10751,7 +11559,7 @@ def _build_onnx_weight_analysis_plan(
                                     related_output_index,
                                     {**current_related_shapes, graph_input_name: current_shape},
                                 )
-                                if exact_loop_replay_work_exhausted:
+                                if not reserve_exact_loop_replay_name_work():
                                     return None
                                 if related_analysis is None:
                                     next_related_shapes[related_input_name] = None
@@ -10783,7 +11591,10 @@ def _build_onnx_weight_analysis_plan(
                                                 graph_input_name: current_shape,
                                             },
                                             attribute_bindings=attribute_bindings,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
                                         )
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
                                         related_next_shape = related_output_shapes.get(related_output_index)
                                     next_related_shapes[related_input_name] = related_next_shape
                             current_related_shapes = next_related_shapes
@@ -10939,10 +11750,11 @@ def _build_onnx_weight_analysis_plan(
                             )
                             if function is not None:
                                 return None
+                            body_attributes = getattr(body_node, "attribute", ())
+                            if body_attributes and not reserve_cross_state_work(len(body_attributes)):
+                                return None
                             has_nested_attribute_graph = any(
-                                True
-                                for attribute in getattr(body_node, "attribute", ())
-                                for _graph in _iter_attribute_graphs(attribute)
+                                True for attribute in body_attributes for _graph in _iter_attribute_graphs(attribute)
                             )
                             if has_nested_attribute_graph:
                                 return None
