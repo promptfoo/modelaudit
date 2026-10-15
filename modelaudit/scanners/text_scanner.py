@@ -10,6 +10,7 @@ import token
 import tokenize
 from array import array
 from bisect import bisect_right
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -173,6 +174,18 @@ MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_TEXT_FENCE_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_TEXT_FENCE_MARKERS = 128
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
+MAX_DOCUMENTATION_CALL_PARSE_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
+MAX_DOCUMENTATION_CALL_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 4
+MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES = 8 * 1024 * 1024
+
+
+class _DocumentationCallBudgetExceeded(Exception):
+    pass
+
+
+_DOCUMENTATION_CALL_BUDGET: ContextVar[int | None] = ContextVar("documentation_call_budget", default=None)
+
+
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
@@ -2182,35 +2195,66 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
+        return cls._documentation_open_call_context_status(payload, position) is not False
+
+    @classmethod
+    def _documentation_open_call_context_status(cls, payload: bytes, position: int) -> bool | None:
         line_start = payload.rfind(b"\n", 0, position) + 1
+        if line_start == 0:
+            return False
         current_line_prefix = payload[line_start:position]
         if cls._documentation_prefix_is_markdown_table_row(current_line_prefix):
             return False
         if cls._documentation_shell_comment_before_position(current_line_prefix, len(current_line_prefix)):
             return False
-        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
-
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
         context_start = cls._documentation_last_closed_fence_end(payload, context_start, line_start)
+        if context_start == line_start:
+            return False
+        markdown_link = cls._documentation_markdown_link_context(payload, position)
+        if (
+            markdown_link is not None
+            and cls._documentation_markdown_link_leading_prefix_is_passive(payload[line_start : markdown_link[1]])
+            and b"(" not in payload[context_start:line_start]
+        ):
+            return False
+        # Cache only bounded prefixes; one parser retry can inspect every byte again.
+        if position - context_start > MAX_DOCUMENTATION_CALL_CONTEXT_BYTES:
+            return None
+        try:
+            return cls._documentation_open_call_prefix_status(payload[context_start:position])
+        except _DocumentationCallBudgetExceeded:
+            return None
+
+    @classmethod
+    @lru_cache(maxsize=128)
+    def _documentation_open_call_prefix_status(cls, context: bytes) -> bool | None:
+        line_start = context.rfind(b"\n") + 1
+        current_line_prefix = context[line_start:]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        remaining_bytes = MAX_DOCUMENTATION_CALL_PARSE_BYTES
         previous_line_end = line_start - 1
-        while previous_line_end >= context_start:
-            previous_line_start = max(
-                payload.rfind(b"\n", context_start, previous_line_end) + 1,
-                context_start,
-            )
-            previous_line = payload[previous_line_start:previous_line_end]
+        while previous_line_end >= 0:
+            previous_line_start = context.rfind(b"\n", 0, previous_line_end) + 1
+            previous_line = context[previous_line_start:previous_line_end]
             stripped = previous_line.strip()
             if stripped and not stripped.startswith(b"#"):
                 previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
-                if current_indent == 0 and previous_indent == 0:
-                    if cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:position]):
-                        return True
-                    previous_line_end = previous_line_start - 1
-                    continue
-                if previous_indent < current_indent:
-                    return cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:position])
-            if previous_line_start == context_start:
-                break
+                if (current_indent == 0 and previous_indent == 0) or previous_indent < current_indent:
+                    prefix = context[previous_line_start:]
+                    is_call = False
+                    if b"(" in prefix and not cls._documentation_prefix_is_markdown_table_row(prefix):
+                        remaining_bytes -= 2 * len(prefix)
+                        if remaining_bytes < 0:
+                            return None
+                        budget = _DOCUMENTATION_CALL_BUDGET.get()
+                        if budget is not None:
+                            if budget < 2 * len(prefix):
+                                raise _DocumentationCallBudgetExceeded
+                            _DOCUMENTATION_CALL_BUDGET.set(budget - 2 * len(prefix))
+                        is_call = cls._documentation_prefix_has_enclosing_call(prefix)
+                    if is_call or previous_indent < current_indent:
+                        return is_call
             previous_line_end = previous_line_start - 1
         return False
 
@@ -2258,6 +2302,10 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        return cls._documentation_finding_actionability(payload, finding) is not False
+
+    @classmethod
+    def _documentation_finding_actionability(cls, payload: bytes, finding: dict[str, Any]) -> bool | None:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return False
@@ -2273,8 +2321,13 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
-        if cls._documentation_open_call_contains_position(payload, position):
-            return True
+        call_context = cls._documentation_open_call_context_status(payload, position)
+        if call_context is not False:
+            if call_context is None:
+                line_parts = cls._finding_line_parts(payload, finding)
+                if line_parts is not None and cls._documentation_line_is_code_shaped(*line_parts):
+                    return True
+            return call_context
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         line_start, line_end, _ = cls._documentation_line_bounds(payload, position)
         url_span = cls._documentation_bare_url_span_at_position(payload, position, line_start, line_end)
@@ -3603,6 +3656,9 @@ class TextScanner(BaseScanner):
                 documentation_image_example_spans=documentation_image_example_spans,
             ):
                 finding = {**finding, "severity": "INFO"}
+            elif documentation_sidecar and cls._documentation_finding_actionability(payload, finding) is None:
+                classification_incomplete = True
+                classification_limit_sources.add("documentation_call_context")
             classified_findings.append(finding)
         return classified_findings, classification_incomplete, classification_limit_sources
 
@@ -3682,6 +3738,13 @@ class TextScanner(BaseScanner):
         )
 
     def _run_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
+        budget_token = _DOCUMENTATION_CALL_BUDGET.set(MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES)
+        try:
+            return self._run_bounded_content_security_checks(path, result, file_size)
+        finally:
+            _DOCUMENTATION_CALL_BUDGET.reset(budget_token)
+
+    def _run_bounded_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
         check_secrets = self._get_bool_config("check_secrets", True)
         check_network = self._get_bool_config("check_network_comm", True)
         if not check_secrets:
@@ -3812,6 +3875,13 @@ class TextScanner(BaseScanner):
                     if "tokenizer_vocabulary" in classification_limit_sources:
                         classification_details["max_tokenizer_vocabulary_cc_retarget_occurrences"] = (
                             MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+                        )
+                    if "documentation_call_context" in classification_limit_sources:
+                        classification_details["max_documentation_call_parse_bytes"] = (
+                            MAX_DOCUMENTATION_CALL_PARSE_BYTES
+                        )
+                        classification_details["max_documentation_total_call_parse_bytes"] = (
+                            MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES
                         )
                     self._mark_content_security_scan_incomplete(
                         result,
