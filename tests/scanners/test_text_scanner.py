@@ -2437,24 +2437,42 @@ def test_documentation_quote_index_skips_tokenization_without_assignments(monkey
         TextScanner._documentation_quoted_assignment_index.cache_clear()
 
 
-def test_documentation_quote_index_bounds_repeated_tokenizer_line_work(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("simulate_error_tokens", [False, True])
+def test_documentation_quote_index_bounds_repeated_tokenizer_line_work(
+    monkeypatch: pytest.MonkeyPatch, simulate_error_tokens: bool
+) -> None:
     source = b"Z " + b" " * 2048 + b"` ;b='text'"
     original = text_scanner_module.tokenize.generate_tokens
     emitted = 0
 
     def counted(readline: Callable[[], str]) -> Iterator[text_scanner_module.tokenize.TokenInfo]:
         nonlocal emitted
-        for item in original(readline):
+        if simulate_error_tokens:
+            line = readline()
+            items = (
+                text_scanner_module.tokenize.TokenInfo(
+                    text_scanner_module.token.ERRORTOKEN, character, (1, index), (1, index + 1), line
+                )
+                for index, character in enumerate(line)
+            )
+        else:
+            items = original(readline)
+        for item in items:
             emitted += 1
             yield item
 
     monkeypatch.setattr(text_scanner_module.tokenize, "generate_tokens", counted)
     monkeypatch.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 3 * len(source))
     TextScanner._documentation_quoted_assignment_index.cache_clear()
-    with pytest.raises(text_scanner_module._DocumentationQuoteBudgetExceeded):
-        TextScanner._documentation_quoted_assignment_index(source)
+    try:
+        assert TextScanner._documentation_has_open_quoted_assignment(source, 0, source.index(b"text"))
+    except text_scanner_module._DocumentationQuoteBudgetExceeded:
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 0
+    else:
+        # Newer Python tokenizers can skip the whitespace and finish within the allowance.
+        assert not simulate_error_tokens
     assert 0 < emitted <= 3
-    assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 0
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
 
 
 def test_documentation_quote_budget_is_shared_and_does_not_cache_failures() -> None:
@@ -4220,6 +4238,57 @@ def test_text_scanner_possible_misuse_keeps_paragraph_continuations_actionable(
 ) -> None:
     _assert_documentation_network_actionable(
         tmp_path, "Malware production may be possible." + newline + continuation + newline, "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize("separator", [" ", "\n", "\r\n"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model steals user data.",
+        "User data leaves the host without consent.",
+        "* **Misuse:** This model steals user data.",
+        "Review generated outputs. This model steals user data.",
+    ],
+)
+def test_text_scanner_misuse_exemption_rejects_hostile_paragraph_prefixes(
+    tmp_path: Path, prefix: str, separator: str
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes((prefix + separator + "Malware production may be possible.\n").encode())
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert any(
+        check.details.get("pattern") == "malware" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "",
+        "* ",
+        "* **Misuse:** ",
+        "**Misuse**: ",
+        "Other forms of misuse such as fraud, spam, or ",
+        "## Misuse\n",
+        "## Safety\n",
+        "## Limitations\n",
+        "This is a language model.\n\n",
+    ],
+)
+def test_text_scanner_misuse_exemption_accepts_recognized_paragraph_prefixes(tmp_path: Path, prefix: str) -> None:
+    _assert_documentation_informational(tmp_path, prefix + "Malware production may be possible.\n")
+
+
+def test_text_scanner_misuse_exemption_rejects_truncated_paragraph_prefix(tmp_path: Path) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path,
+        "This model steals user data. "
+        + "x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 1)
+        + "\nMalware production may be possible.\n",
+        "cc_pattern",
     )
 
 

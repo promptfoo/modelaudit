@@ -778,7 +778,9 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
-    rb"\b"
+    rb"^\s*(?:\#{1,6}[ \t]+(?:misuse|safety|limitations)[ \t]*\#*[ \t]*\r?\n\s*)?"
+    rb"(?:[-*+]\s+)?(?:(?:\*\*)?misuse(?::(?:\*\*)?|(?:\*\*)?:)\s*)?"
+    rb"(?:other\s+forms\s+of\s+misuse\s+such\s+as\s+fraud,\s+spam,\s+or\s+)?\b"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\s+(?:production|generation|creation)\s+(?:may|might|could)\s+be\s+possible\b"
     rb"(?=[.;]?\s*$|[.;]\s*review\s+generated\s+outputs\.?\s*$"
@@ -2686,9 +2688,16 @@ class TextScanner(BaseScanner):
             return True
         absolute_position = finding["position"]
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
-        context = payload[absolute_position - position : context_end]
         if context_end < len(payload):
             return False
+        lookback = max(0, absolute_position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context_start: int | None = 0 if lookback == 0 else None
+        for separator in re.finditer(rb"\r?\n[ \t]*\r?\n", payload[lookback:absolute_position]):
+            context_start = lookback + separator.end()
+        if context_start is None:
+            return False
+        context = payload[context_start:context_end]
+        paragraph_position = absolute_position - context_start
         paragraphs = re.split(rb"\r?\n[ \t]*\r?\n", context)
         if any(
             paragraph.strip() and BENIGN_DOCUMENTATION_MISUSE_CONTINUATION_PATTERN.fullmatch(paragraph.strip()) is None
@@ -2696,7 +2705,7 @@ class TextScanner(BaseScanner):
         ):
             return False
         return any(
-            match.start() <= position < match.end()
+            match.start() <= paragraph_position < match.end()
             for match in BENIGN_DOCUMENTATION_MISUSE_PATTERN.finditer(paragraphs[0])
         )
 
