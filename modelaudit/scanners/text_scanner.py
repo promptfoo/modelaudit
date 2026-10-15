@@ -1458,21 +1458,34 @@ class TextScanner(BaseScanner):
 
     @staticmethod
     def _documentation_closed_inline_code_spans(context: bytes) -> Iterator[tuple[int, int]]:
-        markers = re.finditer(rb"`+", context)
-        for opening in markers:
-            if opening.start() > 0 and context[opening.start() - 1] == ord("\\"):
+        # Index matching runs once so unmatched delimiters cannot consume later examples
+        # or cause repeated searches through the rest of a large line.
+        markers = array("i")
+        previous: dict[int, int] = {}
+        for match in re.finditer(rb"`+|[\r\n]", context):
+            start, end = match.span()
+            if context[start] in b"\r\n":
+                previous.clear()
                 continue
-            previous_end = opening.end()
-            for closing in markers:
-                if (
-                    context.find(b"\n", previous_end, closing.start()) >= 0
-                    or context.find(b"\r", previous_end, closing.start()) >= 0
-                ):
-                    break
-                if closing.end() - closing.start() == opening.end() - opening.start():
-                    yield opening.start(), closing.end()
-                    break
-                previous_end = closing.end()
+            width = end - start
+            index = len(markers)
+            markers.extend((start, end, -1))
+            if width in previous:
+                markers[previous[width] + 2] = index
+            previous[width] = index
+
+        index = 0
+        while index < len(markers):
+            start = markers[index]
+            closing = markers[index + 2]
+            escaped_start = start
+            while escaped_start > 0 and context[escaped_start - 1] == ord("\\"):
+                escaped_start -= 1
+            if closing >= 0 and (start - escaped_start) % 2 == 0:
+                yield start, markers[closing + 1]
+                index = closing + 3
+            else:
+                index += 3
 
     @staticmethod
     @lru_cache(maxsize=4)

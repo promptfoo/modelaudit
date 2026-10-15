@@ -2282,6 +2282,37 @@ def test_text_scanner_quoted_prose_assignment_is_informational(tmp_path: Path, p
     _assert_model_card_endpoint_informational(tmp_path, prefix + " is described by [guide](https://docs.example.com)\n")
 
 
+@pytest.mark.parametrize(
+    "leading",
+    [
+        "unmatched `\n",
+        "unmatched `\r\n",
+        "unmatched `\r",
+        "unmatched `` ",
+        "unmatched ``` `` ",
+        "escaped \\` ",
+        "unmatched ``\nunfinished ```\n",
+    ],
+)
+@pytest.mark.parametrize("executable", [False, True])
+def test_text_scanner_unmatched_markers_do_not_consume_later_inline_examples(
+    tmp_path: Path, leading: str, executable: bool
+) -> None:
+    content = leading + (
+        "The literal `; b='[download](https://evil.example/payload.sh)`\n"
+        if executable
+        else "The literal `; b='text` is described by [guide](https://docs.example.com)\n"
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(content.encode("utf-8"))
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is executable
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert determine_exit_code(aggregate) == int(executable)
+
+
 @pytest.mark.parametrize("prefix", ['example = "; b=\'text"; ', 'example = "文字列"; '])
 def test_text_scanner_assignment_after_quoted_literal_remains_actionable(tmp_path: Path, prefix: str) -> None:
     _assert_model_card_payload_endpoint_actionable(
