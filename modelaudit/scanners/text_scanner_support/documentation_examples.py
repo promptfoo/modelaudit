@@ -5,6 +5,7 @@ or of code downloaded by a reader. Other findings in each example stay intact.
 """
 
 import ast
+import json
 import re
 import shlex
 from bisect import bisect_right
@@ -33,6 +34,7 @@ PYTHON_EXECUTION_NAMES = frozenset(
     | {"posix_spawn", "posix_spawnp", "startfile"}
     | {"CDLL", "PyDLL", "WinDLL", "OleDLL", "cdll", "pydll", "windll", "oledll", "LoadLibrary", "dlopen"}
     | {"Unpickler", "_Unpickler"}
+    | {"import_module", "spec_from_file_location", "module_from_spec", "exec_module"}
 )
 URL_RISK_TERMS = (
     NetworkCommDetector.INFORMATIONAL_URL_RISK_TERMS
@@ -230,6 +232,8 @@ def _shell_url_spans(source: bytes) -> list[tuple[int, int]]:
     offset = 0
     for line in joined.splitlines(keepends=True):
         command = line.lstrip()
+        if command.startswith(b"$ "):
+            command = command[2:].lstrip()
         if command.startswith(b"#"):
             command = command[1:].lstrip()
             if not command.startswith(b"git clone "):
@@ -484,70 +488,27 @@ def _command_executes_script(words: list[str]) -> bool:
             break
     if not words or _setup_command_urls(words) is not None:
         return False
-    command = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if (
-        not wrapped
-        and words[0].lower() == command
-        and re.fullmatch(r"(?:python[23]?|pypy3?)(?:\.\d+)?\.exe", command) is not None
-        and words[1:] in (["--version"], ["-V"], ["--help"], ["-h"])
-    ):
+    command = words[0]
+    if not wrapped and command in {"echo", "printf", "pwd", "true", "false", ":", "ls", "cat", "fi", "done", "}"}:
         return False
-    if (
-        "$" in words[0]
-        or "/" in words[0]
-        or "\\" in words[0]
-        or (wrapped and command.startswith("-"))
-        or command.endswith(
-            (
-                ".py",
-                ".pyw",
-                ".sh",
-                ".bash",
-                ".zsh",
-                ".js",
-                ".mjs",
-                ".cjs",
-                ".rb",
-                ".pl",
-                ".php",
-                ".ps1",
-                ".bat",
-                ".cmd",
-                ".exe",
-                ".com",
-            )
-        )
-    ):
-        return True
-    python_command = re.fullmatch(r"(?:python[23]?|pypy3?)(?:\.\d+)?", command) is not None
-    if not wrapped and (words[1:] in (["--version"], ["-V"], ["--help"]) or (python_command and words[1:] == ["-h"])):
-        return False
-    return (
-        python_command
-        or command
-        in {
-            "sh",
-            "bash",
-            "zsh",
-            "dash",
-            "ksh",
-            "source",
-            "eval",
-            ".",
-            "node",
-            "nodejs",
-            "ruby",
-            "perl",
-            "php",
-            "pwsh",
-            "powershell",
-            "sudo",
-            "npx",
-            "vllm",
-        }
-        or (command in {"uv", "pipx", "npm"} and words[1:2] in (["run"], ["exec"]))
-        or (command == "cmake" and _cmake_script_options(words[1:]))
-    )
+    python_command = re.fullmatch(r"(?:python[23]?|pypy3?|py)(?:\.\d+)?(?:\.exe)?", command, re.IGNORECASE) is not None
+    version_command = python_command or command in {
+        "git",
+        "pip",
+        "pip3",
+        "uv",
+        "cmake",
+        "conda",
+        "vllm",
+        "node",
+        "nodejs",
+        "npm",
+        "bash",
+        "sh",
+    }
+    # Unknown commands, wrappers, and direct program paths cannot prove a clone
+    # is routine setup. Keep their clone findings rather than enumerating launchers.
+    return not (not wrapped and version_command and words[1:] in (["--version"], ["-V"], ["--help"], ["-h"]))
 
 
 def _without_literal_cat_heredocs(source: bytes) -> bytes | None:
@@ -578,6 +539,18 @@ def _without_literal_cat_heredocs(source: bytes) -> bytes | None:
 
 
 def _example_executes_script(source: bytes, language: bytes) -> bool:
+    if language == b"json":
+        try:
+            json.loads(source)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            return True
+        return False
+    if language == b"bibtex" and re.fullmatch(
+        rb"\s*@[A-Za-z]+\{\s*[\w:.-]+\s*,\s*"
+        rb'(?:[A-Za-z]+\s*=\s*(?:\{[^{}]*\}|"[^"\\\r\n]*"|\d+)\s*,?\s*)+\}\s*',
+        source,
+    ):
+        return False
     if language in {b"bibtex", b"json", b"text", b"plaintext"}:
         language = b""
     elif language not in PARSED_FENCE_LANGUAGES:
@@ -705,6 +678,14 @@ def _prose_executes_script(text: str) -> bool:
         for command in commands:
             if len(command) > MAX_EXAMPLE_BYTES:
                 return True
+            if re.match(
+                r"(?:the|an?|this|that|your|our)\s+(?:example|model|command|script|following|code|application|server|steps?|instructions|setup|tests?)\b",
+                command,
+                re.IGNORECASE,
+            ):
+                continue
+            if re.match(r"(?:code\s+(?:is|can|contains)\b|subprocesses[.!]?$)", command, re.IGNORECASE):
+                continue
             call = re.match(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(", command)
             if call and any(name in PYTHON_EXECUTION_NAMES for name in call.group(1).split(".")):
                 return True
@@ -843,7 +824,7 @@ def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], .
             executes_script |= _example_executes_script(source, language)
             examples = (
                 _shell_url_spans(source)
-                if language in {b"sh", b"bash", b"shell"}
+                if language in {b"sh", b"bash", b"shell", b"console", b"terminal"}
                 else _python_url_spans(source)
                 if language in {b"py", b"python"}
                 else []
