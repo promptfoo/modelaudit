@@ -5,6 +5,7 @@ import os
 import pickle
 import pickletools
 import struct
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -123,6 +124,35 @@ def test_cli_metadata_table_limit_preserves_structured_output(tmp_path: Path, ou
         metadata = yaml.safe_load(result.stdout)
     assert len(metadata["files"]) == 3
     assert metadata["summary"]["total_files"] == 3
+
+
+@pytest.mark.parametrize("output_file", [False, True])
+def test_cli_metadata_yaml_fallback_keeps_json_output_parseable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_file: bool,
+) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    target = tmp_path / "empty.safetensors"
+    target.write_bytes(struct.pack("<Q", 2) + b"{}")
+    # Exercise the command-level fallback; PyYAML is required for normal CLI startup.
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    arguments = ["metadata", str(target), "--format", "yaml"]
+    output_path = tmp_path / "metadata.json"
+    if output_file:
+        arguments.extend(["--output", str(output_path)])
+
+    result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert "PyYAML not installed, falling back to JSON" in result.stderr
+    assert "Warning:" not in result.stdout
+    metadata = json.loads(output_path.read_text() if output_file else result.stdout)
+    assert metadata["file"] == target.name
+    assert metadata["format"] == "safetensors"
 
 
 class TestModelMetadataExtractor:

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Send metadata YAML fallback warnings to stderr so they do not contaminate JSON output.
 - Preserve metadata extraction errors with `--security-only` and display them in directory table output.
 - Avoid treating ordinary license text such as `Microsoft.` as a pickle stream when its apparent opcodes have an invalid stack. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and completed executable prefixes with malformed trailing data.
 - Recognize the remaining GGUF tensor types that ggml defines (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ4_NL, I8, I16, I32, I64, F64, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0, and Q2_0) and the retired Q4_0_4_4, Q4_0_4_8, and Q4_0_8_8 layouts that published files still use, so GGUF files that use them get tensor bounds validation instead of an inconclusive scan. Other retired and unknown type IDs remain inconclusive.
