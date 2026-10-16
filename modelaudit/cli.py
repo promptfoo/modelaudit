@@ -2128,23 +2128,11 @@ def _configure_unicode_safe_cli_streams() -> None:
 def _escape_terminal_text(value: Any) -> str:
     """Render control characters visibly before writing model-controlled text to terminals."""
     text = "" if value is None else str(value)
-
-    def replace_control(char: str) -> str:
-        if char == "\n":
-            return "\\n"
-        if char == "\r":
-            return "\\r"
-        if char == "\t":
-            return "\\t"
-        codepoint = ord(char)
-        if codepoint <= 0xFF:
-            return f"\\x{codepoint:02x}"
-        if codepoint <= 0xFFFF:
-            return f"\\u{codepoint:04x}"
-        return f"\\U{codepoint:08x}"
-
     return "".join(
-        replace_control(char) if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"} else char for char in text
+        char.encode("unicode_escape").decode("ascii")
+        if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        else char
+        for char in text
     )
 
 
