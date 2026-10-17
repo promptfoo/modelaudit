@@ -7,8 +7,19 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Support standard CPython 3.14 with standalone package tests and installed-wheel API checks, preserving Python 3.10 compatibility.
+
 ### Fixed
 
+- Preserve backslash pairs in protocol 0 Unicode operands so Template callbacks remain detectable.
+- Report incomplete coverage for unmodeled string-template mapping callbacks and unavailable frozen callable bodies, including Python class constructors and metaclass calls, preserving known dangerous callback findings.
+- Keep speculative ZIP directory metadata private so a rejected importer check cannot leave stale shared cache state.
+
+- Preserve call-graph detection after Python invalidates ZIP import caches, including Windows console-script launchers, while rejecting forged cache state.
+- Follow Python 3.14's lazy annotation helpers to retain detection of annotation evaluation and imports triggered by proxy attribute reads.
+- Distinguish cached, benign string-template calls from deferred pattern imports, without treating an unreachable keyword-only import as executed; fail closed for customized patterns and unproven receiver state.
 - Avoid discovering ordinary license text as pickle data in archives. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and completed executable prefixes with malformed trailing data.
 - Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
 - Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit.
