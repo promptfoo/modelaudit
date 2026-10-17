@@ -52486,3 +52486,401 @@ class TestOnnxFixedCarriedReshape:
         TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
             model, tmp_path, True, prior, coverage_reason="unresolved_initializer_lineage"
         )
+
+
+class TestOnnxDirectLoopBoundAxes:
+    @staticmethod
+    def _model(
+        case: dict[str, Any],
+    ) -> tuple[Any, np.ndarray[Any, Any], list[np.ndarray[Any, Any]], np.ndarray[Any, Any]]:
+        from copy import deepcopy
+
+        h, T = helper, TensorProto
+
+        def value(name: str, shape: Any, dtype: int = T.FLOAT) -> Any:
+            return h.make_tensor_value_info(name, dtype, shape)
+
+        def tensor(name: str, array: Any) -> Any:
+            return onnx.numpy_helper.from_array(np.asarray(array), name=name)
+
+        operation = case.get("operation", "unsqueeze")
+        mode = case.get("binding", "bound")
+        matrix = case.get("matrix", False)
+        initial: np.ndarray[Any, Any] = np.arange(1, 5, dtype=np.float32)
+        if operation == "onehot":
+            initial = np.zeros((4,), np.float32)
+        elif operation == "squeeze":
+            initial = np.ones((1,), np.float32)
+        elif case.get("later_matrix"):
+            initial = initial.reshape(1, 4)
+        if matrix:
+            initial = np.zeros((64, 64), np.float32)
+            if case.get("anomalous"):
+                initial[:5, 0] = 10
+        target = np.asarray([64, 64] if matrix else [1, 4], np.int64)
+        opset = case.get("opset", 14 if operation == "reshape" else 12 if operation in {"gathernd", "einsum"} else 11)
+        attr_name, attr_value = {
+            "unsqueeze": ("axes", case.get("axes", [0])),
+            "squeeze": ("axes", case.get("axes", [0])),
+            "reshape": ("allowzero", case.get("allowzero", 0)),
+            "concat": ("axis", 1),
+            "gathernd": ("batch_dims", case.get("batch_dims", 0)),
+            "flatten": ("axis", 0),
+            "transpose": ("perm", [1, 0]),
+            "einsum": ("equation", "ij->ij"),
+            "onehot": ("axis", 0),
+        }[operation]
+        actual = h.make_attribute(
+            "binding", attr_value, attr_type=onnx.AttributeProto.INTS if isinstance(attr_value, list) else None
+        )
+        reference = onnx.AttributeProto(name=attr_name, ref_attr_name="binding", type=actual.type)
+        if mode == "wrong_ref_type":
+            reference.type = onnx.AttributeProto.INT
+
+        def attribute(node: Any) -> Any:
+            node.attribute.append(
+                h.make_attribute(attr_name, attr_value, attr_type=actual.type) if mode == "literal" else reference
+            )
+            if case.get("duplicate_attribute"):
+                node.attribute.append(reference)
+            return node
+
+        squeeze = h.make_node("Squeeze", ["state"], ["vector"])
+        if operation == "squeeze":
+            attribute(squeeze)
+        elif case.get("later_matrix"):
+            squeeze.attribute.append(h.make_attribute("axes", [0]))
+        nodes = [
+            h.make_node("Identity", ["condition"], ["next_condition"]),
+            squeeze,
+            h.make_node(
+                "PRelu", ["X", "state" if case.get("state_consumer") else "vector"], ["used"], name="body_prelu"
+            ),
+        ]
+        names = ["two", "start", "initial", "X"]
+        initializers = [tensor("two", np.int64(2)), tensor("start", np.bool_(True)), tensor("initial", initial)]
+        if operation == "unsqueeze":
+            nodes.append(attribute(h.make_node("Unsqueeze", ["vector"], ["next"])))
+        elif operation == "squeeze":
+            nodes.append(h.make_node("Unsqueeze", ["vector"], ["next"], axes=[0, 1]))
+        elif operation == "reshape":
+            names.append("target")
+            initializers.append(tensor("target", target))
+            nodes.append(attribute(h.make_node("Reshape", ["vector", "target"], ["next"])))
+        elif operation in {"concat", "gathernd", "einsum"}:
+            nodes.append(h.make_node("Unsqueeze", ["vector"], ["matrix"], axes=[0]))
+            if operation == "concat":
+                names.append("empty")
+                initializers.append(tensor("empty", np.empty((1, 0), np.float32)))
+                node = h.make_node("Concat", ["matrix", "empty"], ["next"])
+            elif operation == "gathernd":
+                names.append("indices")
+                indices = (
+                    np.array([[0]], np.int64) if attr_value == 0 else np.arange(4, dtype=np.int64).reshape(1, 4, 1)
+                )
+                initializers.append(tensor("indices", indices))
+                node = h.make_node("GatherND", ["matrix", "indices"], ["next"])
+            else:
+                node = h.make_node("Einsum", ["matrix"], ["next"])
+            nodes.append(attribute(node))
+        elif operation == "flatten":
+            nodes.append(attribute(h.make_node("Flatten", ["vector"], ["next"])))
+        elif operation == "transpose":
+            nodes.append(h.make_node("Unsqueeze", ["vector"], ["matrix"], axes=[1]))
+            nodes.append(attribute(h.make_node("Transpose", ["matrix"], ["next"])))
+        elif operation == "onehot":
+            names.extend(["depth", "values"])
+            initializers.extend([tensor("depth", np.int64(1)), tensor("values", np.array([0, 0.5], np.float32))])
+            nodes.append(h.make_node("Cast", ["vector"], ["indices"], to=T.INT64))
+            nodes.append(attribute(h.make_node("OneHot", ["indices", "depth", "values"], ["next"])))
+        if case.get("dead_reference"):
+            names.append("dead_source")
+            initializers.append(tensor("dead_source", np.ones((1,), np.float32)))
+            dead = h.make_node("Unsqueeze", ["dead_source"], ["dead"])
+            dead.attribute.append(
+                onnx.AttributeProto(name="axes", ref_attr_name="dead_binding", type=onnx.AttributeProto.INTS)
+            )
+            nodes.append(dead)
+        body = h.make_graph(
+            nodes,
+            "direct_body",
+            [value("iteration", [], T.INT64), value("condition", [], T.BOOL), value("state", None)],
+            [value("next_condition", [], T.BOOL), value("next", None)],
+        )
+        attributes = ["binding"] if mode not in {"literal", "default", "failed_override"} else []
+        if case.get("dead_reference") == "wrong_type":
+            attributes.append("dead_binding")
+        function = h.make_function(
+            "local",
+            "Run",
+            names,
+            ["final"],
+            [h.make_node("Loop", ["two", "start", "initial"], ["final"], body=body)],
+            [h.make_opsetid("", opset)],
+            attributes=attributes,
+        )
+        if mode in {"default", "failed_override"}:
+            function.attribute_proto.append(actual)
+        call = h.make_node("Run", names, ["final"], domain="local")
+        if mode in {"bound", "wrong_ref_type"}:
+            call.attribute.append(actual)
+        elif mode == "wrong_type":
+            call.attribute.append(h.make_attribute("binding", 0.5 if actual.type == onnx.AttributeProto.INT else 0))
+        elif mode in {"chain", "failed_override"}:
+            call.attribute.append(onnx.AttributeProto(name="binding", ref_attr_name="missing_outer", type=actual.type))
+        functions = [function]
+        if mode == "forwarded":
+            inner = h.make_node("Run", names, ["final"], domain="local")
+            inner.attribute.append(onnx.AttributeProto(name="binding", ref_attr_name="outer_binding", type=actual.type))
+            wrapper = h.make_function(
+                "local",
+                "Outer",
+                names,
+                ["final"],
+                [inner],
+                [h.make_opsetid("", opset), h.make_opsetid("local", 1)],
+                attributes=["outer_binding"],
+            )
+            functions.append(wrapper)
+            call = h.make_node("Outer", names, ["final"], domain="local")
+            forwarded = deepcopy(actual)
+            forwarded.name = "outer_binding"
+            call.attribute.append(forwarded)
+        if case.get("dead_reference") == "wrong_type":
+            call.attribute.append(h.make_attribute("dead_binding", 0))
+        feed = -np.ones((64, 64) if matrix else (1, 4), np.float32)
+        shape = [64, 64] if matrix else [1, 4]
+        if operation == "squeeze":
+            shape = [1, 1] if attr_value == [] else [1, 1, 1]
+        elif case.get("later_matrix"):
+            shape = [1, 1, 1, 4]
+        elif operation == "unsqueeze" and attr_value == [1]:
+            shape = [4, 1]
+        model = h.make_model(
+            h.make_graph(
+                [call],
+                "direct_loop_bound_attribute",
+                [value("X", list(feed.shape))],
+                [value("final", shape)],
+                initializer=initializers,
+            ),
+            functions=functions,
+            opset_imports=[h.make_opsetid("", opset), h.make_opsetid("local", 1)],
+            ir_version=9,
+        )
+        if case.get("two_calls"):
+            second = deepcopy(call)
+            second.output[0] = "second_final"
+            second.attribute[0].CopyFrom(h.make_attribute("binding", [-2]))
+            model.graph.node.append(second)
+            model.graph.output.append(value("second_final", shape))
+        state = initial.copy()
+        slopes: list[Any] = []
+        for _ in range(2):
+            vector = (
+                np.squeeze(state, axis=0)
+                if case.get("later_matrix") or (operation == "squeeze" and attr_value != [])
+                else np.squeeze(state)
+            )
+            slopes.append((state if case.get("state_consumer") else vector).copy())
+            if case.get("later_matrix") or operation == "squeeze":
+                state = np.expand_dims(vector, axis=(0, 1))
+            elif operation == "onehot":
+                state = ((vector.astype(np.int64) == 0).astype(np.float32) * np.float32(0.5)).reshape(1, 4)
+            elif matrix:
+                state = vector.reshape(64, 64)
+            elif operation == "unsqueeze" and attr_value == [1]:
+                state = vector.reshape(4, 1)
+            else:
+                state = vector.reshape(1, 4)
+        return model, state, slopes * (2 if case.get("two_calls") else 1), feed
+
+    @staticmethod
+    def _prior_weights() -> Any:
+        weights = np.zeros((64, 64), dtype=np.float32)
+        weights[:5, 0] = 10
+        return weights
+
+    @classmethod
+    def _with_prior(cls, model: Any) -> Any:
+        model.graph.initializer.append(onnx.numpy_helper.from_array(cls._prior_weights(), name="prior"))
+        model.graph.node.insert(0, helper.make_node("MatMul", ["A", "prior"], ["known_prior"]))
+        model.graph.input.append(helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 64]))
+        model.graph.output.append(helper.make_tensor_value_info("known_prior", TensorProto.FLOAT, [1, 64]))
+        return model
+
+    @classmethod
+    def _assert_runtime(cls, model: Any, expected: Any, slopes: list[Any], feed: Any) -> Any:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+        from onnx.reference.ops.op_prelu import PRelu as ReferencePRelu
+
+        original_run = ReferencePRelu._run
+        observed: list[Any] = []
+
+        def observe(instance: Any, x: Any, slope: Any) -> Any:
+            observed.append(slope.copy())
+            return original_run(instance, x, slope)
+
+        scanned_bytes = model.SerializeToString()
+        oracle = deepcopy(model)
+        functions = {(function.domain, function.name): function for function in oracle.functions}
+        # ONNX 1.23 does not carry function defaults into every nested graph.
+        # Materialize them only on the runtime copy; scan the original defaults.
+        for node in oracle.graph.node:
+            function = functions.get((node.domain, node.op_type))
+            if function is None:
+                continue
+            explicit = {attribute.name for attribute in node.attribute}
+            for default in function.attribute_proto:
+                if default.name not in explicit:
+                    node.attribute.append(deepcopy(default))
+        inlined = inline_local_functions(deepcopy(oracle))
+        onnx.checker.check_model(oracle, full_check=True)
+        onnx.checker.check_model(inlined, full_check=True)
+        feeds = {"X": feed, "A": np.ones((1, 64), dtype=np.float32)}
+        with pytest.MonkeyPatch.context() as patcher:
+            patcher.setattr(ReferencePRelu, "_run", observe)
+            for runtime_model in (oracle, inlined):
+                observed.clear()
+                actual = ReferenceEvaluator(runtime_model).run(None, feeds)
+                assert isinstance(actual, list)
+                for output in actual[:-1]:
+                    np.testing.assert_array_equal(output, expected)
+                np.testing.assert_array_equal(actual[-1], feeds["A"] @ cls._prior_weights())
+                assert len(observed) == len(slopes)
+                for actual_slope, expected_slope in zip(observed, slopes, strict=True):
+                    np.testing.assert_array_equal(actual_slope, expected_slope)
+        assert model.SerializeToString() == scanned_bytes
+        return inlined
+
+    @classmethod
+    def _assert_public(
+        cls,
+        model: Any,
+        tmp_path: Path,
+        *,
+        incomplete: bool,
+        own_anomaly: bool = False,
+    ) -> Any:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        if incomplete:
+            assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
+        else:
+            assert plan.coverage_gaps == {}
+        assert any(
+            spec.context["initializer"] == "prior" and np.array_equal(spec.weights, cls._prior_weights())
+            for spec in plan.specs
+        )
+        path = _save_onnx_model(model, tmp_path / "direct-loop-bound-axes.onnx")
+        for scanner in (OnnxScanner(), WeightDistributionScanner()):
+            result = scanner.scan(str(path))
+            assert result.success is not incomplete
+            assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+            semantics = result.metadata["onnx_weight_distribution_semantics"]
+            assert bool(semantics["coverage_gaps"]) is incomplete
+            checks = TestWeightDistributionSemantics._extreme_checks(result)
+            assert all(check.status == CheckStatus.FAILED and check.severity == IssueSeverity.INFO for check in checks)
+            assert sum(check.details.get("initializer") == "prior" for check in checks) == 1
+            assert any(check.details.get("initializer") == "initial" for check in checks) is own_anomaly
+            coverage_checks = TestWeightDistributionCoverage._coverage_checks(
+                result, standalone=isinstance(scanner, WeightDistributionScanner)
+            )
+            assert bool(coverage_checks) is incomplete
+            assert all(check.status == CheckStatus.FAILED and check.message for check in coverage_checks)
+        if incomplete:
+            reset_cache_manager()
+            cache_dir = str(tmp_path / "cache")
+            try:
+                for _ in range(2):
+                    aggregate = scan_model_directory_or_file(
+                        str(path), cache_enabled=True, cache_dir=cache_dir, min_cache_file_size=0
+                    )
+                    assert aggregate.success is False
+                    assert determine_exit_code(aggregate) == 2
+                    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                stats = get_cache_manager(cache_dir, enabled=True).get_stats()
+                assert stats["total_entries"] == stats["cache_hits"] == 0
+            finally:
+                reset_cache_manager()
+        return plan
+
+    @pytest.mark.parametrize("operation", ["squeeze", "unsqueeze"])
+    @pytest.mark.parametrize("binding", ["literal", "bound", "default", "forwarded"])
+    def test_resolved_axes_match_native_vectors(self, tmp_path: Path, operation: str, binding: str) -> None:
+        model, expected, slopes, feed = self._model({"operation": operation, "binding": binding})
+        model = self._with_prior(model)
+        inlined = self._assert_runtime(model, expected, slopes, feed)
+        assert [slope.ndim for slope in slopes] == ([0, 1] if operation == "squeeze" else [1, 1])
+        self._assert_public(model, tmp_path / "wrapped", incomplete=False)
+        self._assert_public(inlined, tmp_path / "inlined", incomplete=False)
+
+    def test_negative_bound_axis_matches_native(self, tmp_path: Path) -> None:
+        model, expected, slopes, feed = self._model({"axes": [-2]})
+        model = self._with_prior(model)
+        inlined = self._assert_runtime(model, expected, slopes, feed)
+        self._assert_public(model, tmp_path / "wrapped", incomplete=False)
+        self._assert_public(inlined, tmp_path / "inlined", incomplete=False)
+
+    @pytest.mark.parametrize("operation", ["squeeze", "unsqueeze"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            pytest.param({"binding": "missing"}, id="missing"),
+            pytest.param({"binding": "wrong_type"}, id="wrong-bound-type"),
+            pytest.param({"binding": "wrong_ref_type"}, id="wrong-declared-type"),
+            pytest.param({"binding": "failed_override"}, id="failed-override-keeps-default-invalid"),
+            pytest.param({"binding": "chain"}, id="reference-chain"),
+            pytest.param({"duplicate_attribute": True}, id="duplicate-attribute"),
+            pytest.param({"axes": [0, 0]}, id="duplicate-axis-values"),
+            pytest.param({"axes": list(range(65))}, id="axis-rank-limit"),
+            pytest.param({"opset": 13}, id="opset13-attribute"),
+        ],
+    )
+    def test_invalid_live_axes_fail_closed(self, tmp_path: Path, operation: str, options: dict[str, Any]) -> None:
+        model, _expected, _slopes, _feed = self._model({"operation": operation, **options})
+        self._assert_public(self._with_prior(model), tmp_path, incomplete=True)
+
+    @pytest.mark.parametrize("operation", ["reshape", "concat", "gathernd", "einsum", "onehot"])
+    def test_other_live_references_remain_refused(self, tmp_path: Path, operation: str) -> None:
+        for binding in ("literal", "bound"):
+            model, expected, slopes, feed = self._model({"operation": operation, "binding": binding})
+            model = self._with_prior(model)
+            self._assert_runtime(model, expected, slopes, feed)
+            self._assert_public(model, tmp_path / binding, incomplete=binding == "bound" or operation == "einsum")
+
+    @pytest.mark.parametrize("binding", ["literal", "bound"])
+    def test_later_matrix_consumer_keeps_coverage_gap(self, tmp_path: Path, binding: str) -> None:
+        model, expected, slopes, feed = self._model({"binding": binding, "state_consumer": True})
+        model = self._with_prior(model)
+        self._assert_runtime(model, expected, slopes, feed)
+        assert [slope.ndim for slope in slopes] == [1, 2]
+        self._assert_public(model, tmp_path, incomplete=True)
+
+    def test_shared_replay_exhaustion_keeps_later_call_incomplete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model, expected, slopes, feed = self._model({"two_calls": True})
+        model = self._with_prior(model)
+        self._assert_runtime(model, expected, slopes, feed)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 64)
+        self._assert_public(model, tmp_path, incomplete=True)
+
+    @pytest.mark.parametrize("binding", ["literal", "bound"])
+    @pytest.mark.parametrize("anomalous", [False, True])
+    def test_existing_matrix_finding_survives_bound_attributes(
+        self, tmp_path: Path, binding: str, anomalous: bool
+    ) -> None:
+        model, expected, slopes, feed = self._model(
+            {"operation": "reshape", "binding": binding, "matrix": True, "anomalous": anomalous}
+        )
+        model = self._with_prior(model)
+        self._assert_runtime(model, expected, slopes, feed)
+        assert [slope.ndim for slope in slopes] == [2, 2]
+        plan = self._assert_public(model, tmp_path, incomplete=False, own_anomaly=anomalous)
+        assert any(
+            spec.context["initializer"] == "initial" and np.array_equal(spec.weights, slopes[0]) for spec in plan.specs
+        )

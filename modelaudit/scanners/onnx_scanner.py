@@ -10915,19 +10915,25 @@ def _build_onnx_weight_analysis_plan(
                                     resolve_int64_vector=constant_int64_vector_values,
                                 )
                             if identifier[1] == "Unsqueeze" and data_input_shape is not None:
-                                axes = resolve_axes(body_node, subgraph_constants, onnx=onnx)
+                                axes = resolve_axes(
+                                    body_node, subgraph_constants, onnx=onnx, resolve_attribute=resolve_attribute
+                                )
                                 if axes is None:
                                     return None
                                 return unsqueezed_shape(data_input_shape, axes)
                             if identifier[1] == "Squeeze" and data_input_shape is not None:
-                                axes = resolve_axes(body_node, subgraph_constants, onnx=onnx)
+                                axes = resolve_axes(
+                                    body_node, subgraph_constants, onnx=onnx, resolve_attribute=resolve_attribute
+                                )
                                 if axes is None:
                                     return None
                                 normalized_axes = tuple(
                                     axis if axis >= 0 else len(data_input_shape) + axis for axis in axes
                                 )
                                 if not normalized_axes:
-                                    return implicit_squeeze_shape(body_node, data_input_shape, identifier=identifier)
+                                    return implicit_squeeze_shape(
+                                        body_node, data_input_shape, resolve_attribute, identifier=identifier
+                                    )
                                 if (
                                     len(set(normalized_axes)) != len(normalized_axes)
                                     or any(axis < 0 or axis >= len(data_input_shape) for axis in normalized_axes)
@@ -11476,12 +11482,28 @@ def _build_onnx_weight_analysis_plan(
                                 and not has_tainted_nested_capture
                             ):
                                 continue
-                            if any(
-                                getattr(attribute, "ref_attr_name", "")
-                                and not (function_key[1] == "Cast" and attribute.name == "to")
-                                for attribute in getattr(body_node, "attribute", ())
-                            ):
-                                return None
+                            for attribute in getattr(body_node, "attribute", ()):
+                                if not getattr(attribute, "ref_attr_name", ""):
+                                    continue
+                                if function_key[1] == "Cast" and attribute.name == "to":
+                                    continue
+                                if (
+                                    not standard_operator
+                                    or function_key[1] not in {"Squeeze", "Unsqueeze"}
+                                    or attribute.name != "axes"
+                                    or int(attribute.type) != int(onnx.AttributeProto.INTS)
+                                    or len(body_node.attribute) != 1
+                                    or len(body_node.input) != 1
+                                    or len(body_node.output) != 1
+                                    or resolved_weight_transform_attribute(body_node, attribute, resolve_attribute)
+                                    is None
+                                ):
+                                    return None
+                                version = opset_versions.get(function_key[0])
+                                if version is None and function_key[0] in {"", "ai.onnx"}:
+                                    version = opset_versions.get("ai.onnx" if function_key[0] == "" else "")
+                                if version is None or version >= 13:
+                                    return None
                             input_walk_work = max(
                                 len(node_input_slots(body_node)) if function is not None else len(body_inputs), 1
                             )
