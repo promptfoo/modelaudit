@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Validate retired interleaved GGUF row groups within each matrix, so incomplete groups cannot pass by combining rows across higher dimensions.
 - Send metadata YAML fallback warnings to stderr so they do not contaminate JSON output.
 - Preserve metadata extraction errors with `--security-only` and display them in directory table output.
 - Avoid treating ordinary license text such as `Microsoft.` as a pickle stream when its apparent opcodes have an invalid stack. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and completed executable prefixes with malformed trailing data.
