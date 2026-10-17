@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.55](https://github.com/promptfoo/modelaudit/compare/v0.2.54...v0.2.55) (2026-10-17)
+
+
+### Features
+
+* **metadata:** make directory table display limits configurable ([#1896](https://github.com/promptfoo/modelaudit/issues/1896)) ([df49ca9](https://github.com/promptfoo/modelaudit/commit/df49ca90c5a10095ea405e4d769f0a18eb09210a))
+
+
+### Bug Fixes
+
+* **ci:** restore Click 8.5 scanning and Windows fixtures ([#1906](https://github.com/promptfoo/modelaudit/issues/1906)) ([f996f12](https://github.com/promptfoo/modelaudit/commit/f996f12c7f3b3f338844a4380639cadc095a9c1f))
+* **gguf:** recognize the remaining ggml tensor types ([#1909](https://github.com/promptfoo/modelaudit/issues/1909)) ([a5cbeca](https://github.com/promptfoo/modelaudit/commit/a5cbeca11d6ad3e2c9a93dd7501eddf339a36dbf))
+* **gguf:** validate interleaved row groups per matrix ([#1920](https://github.com/promptfoo/modelaudit/issues/1920)) ([6a6bdba](https://github.com/promptfoo/modelaudit/commit/6a6bdba5c13def3b3368a1198bbbfde0d6d4b666))
+* **metadata:** keep YAML fallback warnings out of JSON stdout ([#1895](https://github.com/promptfoo/modelaudit/issues/1895)) ([c25b6ee](https://github.com/promptfoo/modelaudit/commit/c25b6ee3b3640f7707469e930a2b319ee0f61e76))
+* **metadata:** preserve extraction errors in filtered and directory output ([#1888](https://github.com/promptfoo/modelaudit/issues/1888)) ([3873627](https://github.com/promptfoo/modelaudit/commit/3873627dc8644797eb39127e3a859e5f23d6d2e7))
+* **picklescan:** restore Click 8.5 detection and Windows test portability ([#1864](https://github.com/promptfoo/modelaudit/issues/1864)) ([2838c99](https://github.com/promptfoo/modelaudit/commit/2838c9978c2254ae699c63712b311b2491d047a7))
+* **routing:** avoid pickle false positives on license text ([#1911](https://github.com/promptfoo/modelaudit/issues/1911)) ([6128247](https://github.com/promptfoo/modelaudit/commit/6128247b084f3bb64724706ab037c7de8ab242f5))
+
 ## [Unreleased]
 
 ### Added
