@@ -29,6 +29,16 @@ modelaudit metadata model.onnx --security-only
 
 ## Directory limits
 
+Directory tables show the first 10 file entries by default. Use `--table-limit` to show fewer
+or more entries, up to 10,000:
+
+```bash
+modelaudit metadata ./models --table-limit 50
+```
+
+This option changes only the directory table display. It does not reduce metadata extraction
+or truncate JSON/YAML output. Single-file tables are unaffected.
+
 Directory metadata extraction stops after 10,000 file entries, 20,000 total filesystem entries,
 1 GiB of aggregate file size, or 64 directory levels. When a limit is reached, table output shows
 an incomplete-extraction warning. JSON and YAML output include `analysis_incomplete: true`,

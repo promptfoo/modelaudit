@@ -162,6 +162,7 @@ _ONNX_STRUCTURE_MAX_STRING_DATA_FIELDS = 100_000
 _ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES = 100_000
 _ONNX_STRUCTURE_MAX_FIELD_NUMBER = (1 << 29) - 1
 _ONNX_STRUCTURE_MAX_PARSE_STEPS = 5_000_000
+_ONNX_PREFLIGHT_MAX_DUPLICATE_SINGULAR_FIELDS = 4096
 _ONNX_STRUCTURE_MAX_UNKNOWN_FIELD_SAMPLES = 20
 _ONNX_STRUCTURE_MAX_RETAINED_OBJECTS = 1_000_000
 _ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES = 1_000_000
@@ -172,6 +173,7 @@ _ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
 _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
+_ONNX_NESTED_PROMOTION_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_PRODUCER_INDEX_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -4882,7 +4884,9 @@ def _build_onnx_weight_analysis_plan(
                             identifier=function_key,
                         ):
                             nested_promoted_output_indexes.add(output_index)
-                    nested_promotion_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                    nested_promotion_work_remaining = min(
+                        _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK, _ONNX_NESTED_PROMOTION_WORK_LIMIT
+                    )
                     nested_promotion_call_work = max(len(getattr(nested_graph, "node", ())), 1)
                     for captured_name, captured_shape in nested_tainted_shapes.items():
                         if nested_promotion_work_remaining <= 0:
@@ -8324,6 +8328,102 @@ def _build_onnx_weight_analysis_plan(
                 pending.append(next_index)
         return True
 
+    def fixed_loop_carried_reshape_shape(
+        node: Any,
+        subgraph: Any,
+        initial_lineages: dict[int, _OnnxWeightLineage],
+        updated_lineages: dict[int, _OnnxWeightLineage],
+        constants: dict[str, Any],
+        opset_versions: dict[str, int],
+        attribute_bindings: dict[str, Any],
+    ) -> tuple[int, ...] | None:
+        nonlocal stack_invariance_work_remaining
+        # This proof covers only a final carried value after a direct fixed
+        # Reshape. Body consumers and stacked outputs retain their own proofs.
+        if len(node.input) != 3 or len(node.output) != 1 or len(subgraph.input) != 3 or len(subgraph.output) != 2:
+            return None
+        work = len(initial_lineages) + len(updated_lineages) + len(subgraph.input) + len(subgraph.output)
+        if work > stack_invariance_work_remaining:
+            return None
+        stack_invariance_work_remaining -= work
+        state_name = _onnx_value_name(subgraph.input[2])
+        output_name = _onnx_value_name(subgraph.output[1])
+        producers = graph_output_producer_nodes_by_name(subgraph)
+        if producers is None or state_name in producers or len(producers.get(output_name, ())) != 1:
+            return None
+        reshape = producers[output_name][0]
+        identifier = bounded_operator_identifier(reshape)
+        if (
+            identifier is None
+            or identifier[0] not in _STANDARD_NEURAL_NETWORK_DOMAINS
+            or identifier[1] != "Reshape"
+            or identifier in functions
+            or not has_registered_standard_operator(reshape, opset_versions, identifier=identifier)
+        ):
+            return None
+        version = opset_versions.get(identifier[0])
+        if version is None and identifier[0] in {"", "ai.onnx"}:
+            version = opset_versions.get("ai.onnx" if identifier[0] == "" else "")
+        if version is None or version < 5:
+            return None
+        work = len(reshape.input) + len(reshape.output) + len(reshape.attribute)
+        if work > stack_invariance_work_remaining:
+            return None
+        stack_invariance_work_remaining -= work
+        if (
+            len(reshape.input) != 2
+            or len(reshape.output) != 1
+            or str(reshape.input[0]) != state_name
+            or len(reshape.attribute) > 1
+            or (version < 14 and bool(reshape.attribute))
+            or any(attribute.name != "allowzero" for attribute in reshape.attribute)
+        ):
+            return None
+
+        def resolve_attribute(attribute: Any) -> Any | None:
+            return attribute_bindings.get(str(attribute.ref_attr_name)) if attribute.ref_attr_name else attribute
+
+        if weight_transform_proof_error(reshape, resolve_attribute=resolve_attribute) is not None:
+            return None
+        body_constants = graph_initializer_constants(subgraph, constants, attribute_bindings)
+        target = constant_int64_vector_values(body_constants.get(str(reshape.input[1])))
+        if not target or any(dimension <= 0 for dimension in target):
+            return None
+        initial = {
+            index: lineage
+            for index, lineage in initial_lineages.items()
+            if lineage.unresolved_reason != "shape_control_lineage"
+        }
+        updated = {
+            index: lineage
+            for index, lineage in updated_lineages.items()
+            if lineage.unresolved_reason != "shape_control_lineage"
+        }
+        if not initial or initial.keys() != updated.keys():
+            return None
+        for index, lineage in initial.items():
+            if lineage.unresolved_reason is not None or updated[index].unresolved_reason is not None:
+                return None
+            expected = transformed_lineage(
+                lineage,
+                reshape,
+                body_constants,
+                resolve_value_shape=lambda _name: None,
+                resolve_attribute=resolve_attribute,
+            )
+            if expected != updated[index] or expected.shape != target:
+                return None
+            repeated = transformed_lineage(
+                expected,
+                reshape,
+                body_constants,
+                resolve_value_shape=lambda _name: None,
+                resolve_attribute=resolve_attribute,
+            )
+            if repeated != expected:
+                return None
+        return target
+
     def lineages_after_control_flow_rank_increase(
         lineages: dict[int, _OnnxWeightLineage],
         *,
@@ -9872,6 +9972,70 @@ def _build_onnx_weight_analysis_plan(
                     num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
                 )
             )
+            standard_control_flow_operator = is_builtin_neural_operator
+            scan_output_axes = (
+                resolved_int_sequence_attribute(node, "scan_output_axes") or ()
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else ()
+            )
+            resolved_scan_input_axes = (
+                resolved_int_sequence_attribute(node, "scan_input_axes") or ()
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else ()
+            )
+            resolved_scan_input_offset = (
+                scan_sequence_lens_input_offset(node, opset_versions, identifier=function_key)
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else 0
+            )
+            resolved_scan_input_count = (
+                resolved_int_attribute(node, "num_scan_inputs", 1)
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else 0
+            )
+            trusted_scan_shape_names = proven_value_ranks
+            untrusted_scan_shape_names = (
+                {name for name in graph_input_names & value_lineages.keys() if name not in proven_value_ranks}
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else set()
+            )
+
+            scan_has_concrete_input_shape = False
+
+            def trusted_scan_input_shape(
+                scan_name: str,
+                trusted: set[str] = trusted_scan_shape_names,
+                untrusted: set[str] = untrusted_scan_shape_names,
+            ) -> tuple[int, ...] | None:
+                nonlocal scan_has_concrete_input_shape
+                shape = scan_input_shape(constants, known_value_shapes, scan_name, trusted, untrusted)
+                scan_has_concrete_input_shape |= shape is not None and (
+                    all(dimension >= 0 for dimension in shape)
+                    or not value_lineages.get(scan_name)
+                    or (
+                        (lineage_shape := resolved_lineage_shape(value_lineages[scan_name].values())) is not None
+                        and _onnx_shape_extent_product(lineage_shape) == 0
+                        and len(lineage_shape) == len(shape)
+                        and all(
+                            known < 0 or known == actual for known, actual in zip(shape, lineage_shape, strict=True)
+                        )
+                    )
+                )
+                return shape
+
+            common_scan_extent = None
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and not resolved_scan_input_offset
+                and 0 < resolved_scan_input_count <= len(node.input)
+            ):
+                common_scan_extent = scan_common_sequence_extent(
+                    node.input[-resolved_scan_input_count:],
+                    resolved_scan_input_axes,
+                    trusted_scan_input_shape,
+                )
+
             node_scan8_skips_body = False
             if (
                 is_builtin_neural_operator
@@ -9898,6 +10062,92 @@ def _build_onnx_weight_analysis_plan(
                             for name in scan_names
                         )
                     )
+            scan_body_controls_resolved = True
+            if standard_control_flow_operator and node.op_type == "Scan":
+                seen_scan_controls: set[str] = set()
+                for scan_attribute in getattr(node, "attribute", ()):
+                    if scan_attribute.name not in {"num_scan_inputs", "scan_input_axes"}:
+                        continue
+                    bound_scan_attribute = resolve_attribute(scan_attribute)
+                    expected_attribute_type = 2 if scan_attribute.name == "num_scan_inputs" else 7
+                    if (
+                        scan_attribute.name in seen_scan_controls
+                        or bound_scan_attribute is None
+                        or bool(getattr(bound_scan_attribute, "ref_attr_name", ""))
+                        or int(getattr(bound_scan_attribute, "type", 0)) != expected_attribute_type
+                        or (scan_attribute.name == "num_scan_inputs" and not bound_scan_attribute.HasField("i"))
+                        or (
+                            scan_attribute.name == "scan_input_axes"
+                            and len(resolved_scan_input_axes) != resolved_scan_input_count
+                        )
+                    ):
+                        scan_body_controls_resolved = False
+                    seen_scan_controls.add(scan_attribute.name)
+            scan8_zero_batch_proven = False
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and resolved_scan_input_offset
+                and scan_body_controls_resolved
+                and "num_scan_inputs" in seen_scan_controls
+                and 0 < resolved_scan_input_count < len(node.input)
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and constant_int64_vector_values(constants.get(str(node.input[0]))) == ()
+            ):
+                # Scan-8 state and sequence inputs share their leading batch.
+                # One trusted zero suffices unless another declaration conflicts.
+                scan_input_start = len(node.input) - resolved_scan_input_count
+                for input_index, parent_input in enumerate(node.input[1:], 1):
+                    parent_name = str(parent_input)
+                    batch_shape = proven_value_shape(parent_name)
+                    if batch_shape is None:
+                        batch_shape = constant_initializer_shape(constants, parent_name)
+                    minimum_rank = 2 if input_index >= scan_input_start else 1
+                    if batch_shape is None or len(batch_shape) < minimum_rank or batch_shape[0] > 0:
+                        scan8_zero_batch_proven = False
+                        break
+                    scan8_zero_batch_proven |= batch_shape[0] == 0
+                node_scan8_skips_body |= scan8_zero_batch_proven
+            scan8_single_invocation_proven = False
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and resolved_scan_input_offset
+                and scan_body_controls_resolved
+                and "num_scan_inputs" in seen_scan_controls
+                and 0 < resolved_scan_input_count < len(node.input)
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and constant_int64_vector_values(constants.get(str(node.input[0]))) == (1,)
+            ):
+                # A single batch and step has exactly the visited body value,
+                # with no padded elements or additional iteration state.
+                single_batch_witness = False
+                single_sequence_witness = False
+                scan_input_start = len(node.input) - resolved_scan_input_count
+                for input_index, parent_input in enumerate(node.input[1:], 1):
+                    parent_name = str(parent_input)
+                    input_shape = proven_value_shape(parent_name)
+                    if input_shape is None:
+                        input_shape = constant_initializer_shape(constants, parent_name)
+                    minimum_rank = 2 if input_index >= scan_input_start else 1
+                    if input_shape is None or len(input_shape) < minimum_rank or input_shape[0] not in {-1, 1}:
+                        break
+                    single_batch_witness |= input_shape[0] == 1
+                    if input_index >= scan_input_start:
+                        if input_shape[1] not in {-1, 1}:
+                            break
+                        single_sequence_witness |= input_shape[1] == 1
+                else:
+                    scan8_single_invocation_proven = single_batch_witness and single_sequence_witness
+            node_body_proven_skipped = (
+                node_scan8_skips_body
+                or (
+                    is_builtin_neural_operator
+                    and node.op_type == "Loop"
+                    and loop_body_is_proven_skipped(node, constants, graph_input_names)
+                )
+                or (common_scan_extent == 0 and scan_has_concrete_input_shape and scan_body_controls_resolved)
+            )
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
                 if is_model_local_function:
                     # Graph attributes are evaluated where the function body uses them.
@@ -10749,30 +10999,63 @@ def _build_onnx_weight_analysis_plan(
                             live_node_ids = graph_nodes_producing_names(function_graph, weight_dependency_names)
                             if live_node_ids is None:
                                 return None
-                            # Cast preserves shape for every valid target dtype.
-                            # Other referenced attributes can change shape, so the
-                            # literal-attribute helpers cannot prove their replay.
+
+                            def function_attribute(attribute: Any) -> Any | None:
+                                reference = str(getattr(attribute, "ref_attr_name", ""))
+                                return function_attributes.get(reference) if reference else attribute
+
+                            replay_function_node_ids: set[int] = set()
                             for function_node in getattr(function_graph, "node", ()):
                                 function_key = bounded_operator_identifier(function_node)
                                 if function_key is None:
                                     return None
-                                # Match the dead-Constant skip in replay; retain all consumer checks.
+                                function_is_registered = has_registered_standard_operator(
+                                    function_node, function_versions, identifier=function_key
+                                )
+                                # Unused results do not make weight consumers or nested
+                                # graph captures irrelevant to coverage.
                                 if (
-                                    builtin_operator(function_node, "Constant", identifier=function_key)
-                                    and id(function_node) not in live_node_ids
+                                    id(function_node) not in live_node_ids
+                                    and function_key not in functions
+                                    and not any(
+                                        int(getattr(attribute, "type", 0))
+                                        in {int(onnx.AttributeProto.GRAPH), int(onnx.AttributeProto.GRAPHS)}
+                                        or any(True for _graph in _iter_attribute_graphs(attribute))
+                                        for attribute in getattr(function_node, "attribute", ())
+                                    )
+                                    and not any(
+                                        input_name
+                                        and _onnx_potential_weight_input(
+                                            function_node,
+                                            input_index,
+                                            is_registered_standard_operator=function_is_registered,
+                                            identifier=function_key,
+                                        )
+                                        for input_index, input_name in enumerate(getattr(function_node, "input", ()))
+                                    )
                                 ):
                                     continue
+                                replay_function_node_ids.add(id(function_node))
                                 for attribute in getattr(function_node, "attribute", ()):
                                     reference = str(getattr(attribute, "ref_attr_name", ""))
                                     if not reference:
                                         continue
-                                    bound_attribute = function_attributes.get(reference)
-                                    if not (
-                                        function_key[0] in _STANDARD_NEURAL_NETWORK_DOMAINS
-                                        and function_key[1] == "Cast"
-                                        and attribute.name == "to"
-                                        and bound_attribute is not None
-                                        and int(getattr(bound_attribute, "type", 0)) == 2
+                                    if function_key[0] not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+                                        return None
+                                    if function_key[1] == "Concat" and attribute.name == "axis":
+                                        bound_attribute = function_attribute(attribute)
+                                        if (
+                                            bound_attribute is None
+                                            or bool(getattr(bound_attribute, "ref_attr_name", ""))
+                                            or int(getattr(bound_attribute, "type", 0)) != int(onnx.AttributeProto.INT)
+                                            or not _onnx_has_singular_field(bound_attribute, "i")
+                                        ):
+                                            return None
+                                    elif (
+                                        resolved_weight_transform_attribute(
+                                            function_node, attribute, function_attribute
+                                        )
+                                        is None
                                     ):
                                         return None
                             function_producers = graph_output_producer_nodes_by_name(function_graph)
@@ -10788,10 +11071,6 @@ def _build_onnx_weight_analysis_plan(
                                     return None
                                 return function_context_data_types.get(input_name)
 
-                            def function_attribute(attribute: Any) -> Any | None:
-                                reference = str(getattr(attribute, "ref_attr_name", ""))
-                                return function_attributes.get(reference) if reference else attribute
-
                             def local_known_input_shape(input_name: str) -> tuple[int, ...] | None:
                                 if input_name in local_tainted_shapes:
                                     return local_tainted_shapes[input_name]
@@ -10805,6 +11084,15 @@ def _build_onnx_weight_analysis_plan(
                                 *,
                                 identifier: tuple[str, str, str],
                             ) -> tuple[int, ...] | None:
+                                if identifier[1] in _RANK_PRESERVING_VARIADIC_OPERATORS:
+                                    axis = resolved_onnx_int_attribute(function_node, "axis", 0, function_attribute)
+                                    if axis is None:
+                                        return None
+                                    return concat_shape(
+                                        function_node,
+                                        (local_known_input_shape(input_name) for input_name in function_inputs),
+                                        axis=axis,
+                                    )
                                 if (
                                     weight_transform_proof_error(function_node, resolve_attribute=function_attribute)
                                     is not None
@@ -10842,12 +11130,6 @@ def _build_onnx_weight_analysis_plan(
                                         if permutation is not None
                                         else None
                                     )
-                                if identifier[1] in _RANK_PRESERVING_VARIADIC_OPERATORS:
-                                    return concat_shape(
-                                        function_node,
-                                        (local_known_input_shape(input_name) for input_name in function_inputs),
-                                        axis=_onnx_int_attribute(function_node, "axis"),
-                                    )
                                 if identifier[1] == "MatMul":
                                     return matmul_output_shape(
                                         local_known_input_shape(function_inputs[0]) if function_inputs else None,
@@ -10882,20 +11164,35 @@ def _build_onnx_weight_analysis_plan(
                                     shape_initializer = function_constants.get(shape_name)
                                     if shape_initializer is None:
                                         return None
+                                    allowzero = resolved_onnx_int_attribute(
+                                        function_node, "allowzero", 0, function_attribute
+                                    )
+                                    if allowzero is None:
+                                        return None
                                     return _resolve_onnx_reshape_shape(
                                         data_input_shape,
                                         shape_initializer,
-                                        allowzero=bool(_onnx_int_attribute(function_node, "allowzero")),
+                                        allowzero=bool(allowzero),
                                         onnx=onnx,
                                         resolve_int64_vector=constant_int64_vector_values,
                                     )
                                 if identifier[1] == "Unsqueeze" and data_input_shape is not None:
-                                    axes = resolve_axes(function_node, function_constants, onnx=onnx)
+                                    axes = resolve_axes(
+                                        function_node,
+                                        function_constants,
+                                        onnx=onnx,
+                                        resolve_attribute=function_attribute,
+                                    )
                                     if axes is None:
                                         return None
                                     return unsqueezed_shape(data_input_shape, axes)
                                 if identifier[1] == "Squeeze" and data_input_shape is not None:
-                                    axes = resolve_axes(function_node, function_constants, onnx=onnx)
+                                    axes = resolve_axes(
+                                        function_node,
+                                        function_constants,
+                                        onnx=onnx,
+                                        resolve_attribute=function_attribute,
+                                    )
                                     if axes is None:
                                         return None
                                     normalized_axes = tuple(
@@ -10903,7 +11200,7 @@ def _build_onnx_weight_analysis_plan(
                                     )
                                     if not normalized_axes:
                                         return implicit_squeeze_shape(
-                                            function_node, data_input_shape, identifier=identifier
+                                            function_node, data_input_shape, function_attribute, identifier=identifier
                                         )
                                     if (
                                         len(set(normalized_axes)) != len(normalized_axes)
@@ -10920,6 +11217,8 @@ def _build_onnx_weight_analysis_plan(
                                 return None
 
                             for function_node in getattr(function_graph, "node", ()):
+                                if id(function_node) not in replay_function_node_ids:
+                                    continue
                                 function_inputs = node_input_names(function_node)
                                 function_outputs = node_output_names(function_node)
                                 function_key = bounded_operator_identifier(function_node)
@@ -11190,6 +11489,44 @@ def _build_onnx_weight_analysis_plan(
                                 exact_loop_replay_work_exhausted = True
                                 return None
                             exact_loop_replay_work_remaining -= input_walk_work
+                            if (
+                                has_tainted_nested_capture
+                                and standard_operator
+                                and function_key[1] == "If"
+                                and len(nested_attribute_references) == 2
+                            ):
+                                for nested_graph, reference_names in nested_attribute_references:
+                                    if reference_names is None or not reserve_exact_loop_replay_traversal(
+                                        nested_graph, 0, len(reference_names)
+                                    ):
+                                        return None
+                                    for opaque_node in getattr(nested_graph, "node", ()):
+                                        opaque_key = bounded_operator_identifier(opaque_node)
+                                        if (
+                                            opaque_key is None
+                                            or opaque_key in functions
+                                            or any(
+                                                getattr(attribute, "ref_attr_name", "")
+                                                or int(getattr(attribute, "type", 0))
+                                                in {int(onnx.AttributeProto.GRAPH), int(onnx.AttributeProto.GRAPHS)}
+                                                for attribute in getattr(opaque_node, "attribute", ())
+                                            )
+                                        ):
+                                            return None
+                                    if (
+                                        subgraph_has_potential_weight_consumer(
+                                            nested_graph,
+                                            opset_versions,
+                                            attribute_bindings=attribute_bindings,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
+                                        )
+                                        or not reserve_exact_loop_replay_name_work()
+                                    ):
+                                        return None
+                                for output_name in body_outputs:
+                                    tainted_shapes[output_name] = None
+                                    tainted_data_types[output_name] = None
+                                continue
                             if has_tainted_nested_capture:
                                 # A Loop without carried inputs cannot change captured
                                 # values. Its unused outputs need no shape replay, but
@@ -11303,6 +11640,7 @@ def _build_onnx_weight_analysis_plan(
                                     for output_index, output_name in enumerate(getattr(body_node, "output", ()))
                                     if output_name and output_name in output_dependency_names
                                 )
+                                function_output_is_opaque = False
                                 for input_index, input_name in enumerate(function_actuals):
                                     if input_name not in tainted_shapes or input_index >= len(
                                         getattr(function, "input", ())
@@ -11347,9 +11685,49 @@ def _build_onnx_weight_analysis_plan(
                                         requested_function_output_indexes,
                                     )
                                     if function_consumes_weight_rank is None:
-                                        return None
+                                        if (
+                                            function_has_weight_consumer
+                                            or exact_loop_replay_work_exhausted
+                                            or not reserve_exact_loop_replay_name_work()
+                                        ):
+                                            return None
+                                        resolved_function = resolved_replay_function_reference(
+                                            body_node, reserve_exact_loop_replay_name_work
+                                        )
+                                        if (
+                                            resolved_function is None
+                                            or resolved_function[0] is not function
+                                            or resolved_function[1] is None
+                                            or not reserve_exact_loop_replay_name_work()
+                                        ):
+                                            return None
+                                        function_tainted_outputs = graph_tainted_output_indexes(
+                                            function,
+                                            {function_input_name},
+                                            function_versions,
+                                            attribute_bindings=function_attributes,
+                                            inherited_constants=function_constants,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
+                                        )
+                                        if (
+                                            graph_taint_work_is_exhausted()
+                                            or not reserve_exact_loop_replay_name_work()
+                                            or any(
+                                                output_index not in function_tainted_outputs
+                                                for output_index, output_name in enumerate(body_node.output)
+                                                if output_name
+                                            )
+                                        ):
+                                            return None
+                                        function_output_is_opaque = True
+                                        break
                                     if function_consumes_weight_rank:
                                         return True, None
+                                if function_output_is_opaque:
+                                    for output_name in body_outputs:
+                                        tainted_shapes[output_name] = None
+                                        tainted_data_types[output_name] = None
+                                    continue
                                 if node_is_live_for_output:
                                     for output_index in requested_function_output_indexes:
                                         output_name = body_node.output[output_index]
@@ -12321,7 +12699,8 @@ def _build_onnx_weight_analysis_plan(
                                 ):
                                     record_weight_lineage_limit_gap(
                                         value_lineage_limit_gap_counts[parent_name],
-                                        collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
+                                        collect_weight_consumers=collect_weight_consumers
+                                        and not node_body_proven_skipped,
                                     )
                         sibling_state_rank_promotion_may_affect_weight = False
                         if (
@@ -12355,19 +12734,19 @@ def _build_onnx_weight_analysis_plan(
                                     break
                                 if sibling_graph_output_index == graph_output_index or not sibling_parent_name:
                                     continue
+                                if (
+                                    current_update_dependency_names is not None
+                                    and sibling_graph_input_name not in current_update_dependency_names
+                                    and current_weight_consumer_dependency_names is not None
+                                    and sibling_graph_input_name not in current_weight_consumer_dependency_names
+                                ):
+                                    continue
                                 if not subgraph_state_input_can_reach_weight_consumer(
                                     subgraph,
                                     sibling_graph_input_name,
                                     opset_versions,
                                     inherited_constants=constants,
                                     attribute_bindings=attribute_bindings,
-                                ):
-                                    continue
-                                if (
-                                    current_update_dependency_names is not None
-                                    and sibling_graph_input_name not in current_update_dependency_names
-                                    and current_weight_consumer_dependency_names is not None
-                                    and sibling_graph_input_name not in current_weight_consumer_dependency_names
                                 ):
                                     continue
                                 sibling_parent_shape = proven_value_shape(sibling_parent_name)
@@ -12761,7 +13140,7 @@ def _build_onnx_weight_analysis_plan(
                             proven_weight_inputs_out=subgraph_proven_weight_inputs,
                             proven_weight_inputs_path=subgraph_proof_path,
                             collect_weight_consumers=collect_weight_consumers
-                            and not (node_scan8_skips_body and attribute.name == "body"),
+                            and not (node_body_proven_skipped and attribute.name == "body"),
                         ),
                     )
                     if is_builtin_neural_operator and node.op_type in {"Loop", "Scan"}:
@@ -12918,7 +13297,7 @@ def _build_onnx_weight_analysis_plan(
                                     node,
                                     current_node_index,
                                     pair_index,
-                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
+                                    collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
                                 )
 
             function = functions.get(function_key)
@@ -12946,7 +13325,7 @@ def _build_onnx_weight_analysis_plan(
                             node,
                             current_node_index,
                             input_index,
-                            collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
+                            collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
                         )
                 function = None
             if function is not None and function_versions is not None:
@@ -13137,6 +13516,34 @@ def _build_onnx_weight_analysis_plan(
                 elementwise_output_rank_proven = all(
                     value_rank_is_proven_or_unknown(input_name) for input_name in input_names
                 )
+            elif is_builtin_neural_operator and node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS and input_names:
+                elementwise_output_shape = concat_shape(
+                    node,
+                    (known_value_shapes.get(input_name) for input_name in input_names),
+                    axis=resolved_int_attribute(node, "axis", 0),
+                )
+                elementwise_output_rank_proven = all(
+                    value_rank_is_proven_or_unknown(input_name) for input_name in input_names
+                )
+                if elementwise_output_shape is not None:
+                    elementwise_output_rank = len(elementwise_output_shape)
+                else:
+                    input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
+                    known_ranks = {rank for rank in input_ranks if rank is not None}
+                    if len(known_ranks) == 1 and all(rank is not None for rank in input_ranks):
+                        elementwise_output_rank = next(iter(known_ranks))
+            elif is_builtin_neural_operator and node.op_type == "MatMul" and len(input_names) == 2:
+                matmul_left_shape = proven_value_shape(input_names[0])
+                matmul_right_shape = proven_value_shape(input_names[1])
+                if matmul_left_shape and matmul_right_shape:
+                    matmul_left_extent = matmul_left_shape[-1]
+                    matmul_right_extent = (
+                        matmul_right_shape[-2] if len(matmul_right_shape) >= 2 else matmul_right_shape[-1]
+                    )
+                    if matmul_left_extent < 0 or matmul_right_extent < 0 or matmul_left_extent == matmul_right_extent:
+                        elementwise_output_shape = matmul_output_shape(matmul_left_shape, matmul_right_shape)
+                if elementwise_output_shape is not None:
+                    elementwise_output_rank = len(elementwise_output_shape)
             elif (clip_operator or batch_normalization_operator) and input_names:
                 elementwise_output_shape = known_value_shapes.get(input_names[0])
                 elementwise_output_rank = (
@@ -13945,70 +14352,6 @@ def _build_onnx_weight_analysis_plan(
                 state_input_name = control_flow_state_input_name(output_index)
                 return proven_value_rank(state_input_name)
 
-            standard_control_flow_operator = is_builtin_neural_operator
-            scan_output_axes = (
-                resolved_int_sequence_attribute(node, "scan_output_axes") or ()
-                if standard_control_flow_operator and node.op_type == "Scan"
-                else ()
-            )
-            resolved_scan_input_axes = (
-                resolved_int_sequence_attribute(node, "scan_input_axes") or ()
-                if standard_control_flow_operator and node.op_type == "Scan"
-                else ()
-            )
-            resolved_scan_input_offset = (
-                scan_sequence_lens_input_offset(node, opset_versions, identifier=function_key)
-                if standard_control_flow_operator and node.op_type == "Scan"
-                else 0
-            )
-            resolved_scan_input_count = (
-                resolved_int_attribute(node, "num_scan_inputs", 1)
-                if standard_control_flow_operator and node.op_type == "Scan"
-                else 0
-            )
-            trusted_scan_shape_names = proven_value_ranks
-            untrusted_scan_shape_names = (
-                {name for name in graph_input_names & value_lineages.keys() if name not in proven_value_ranks}
-                if standard_control_flow_operator and node.op_type == "Scan"
-                else set()
-            )
-
-            scan_has_concrete_input_shape = False
-
-            def trusted_scan_input_shape(
-                scan_name: str,
-                trusted: set[str] = trusted_scan_shape_names,
-                untrusted: set[str] = untrusted_scan_shape_names,
-            ) -> tuple[int, ...] | None:
-                nonlocal scan_has_concrete_input_shape
-                shape = scan_input_shape(constants, known_value_shapes, scan_name, trusted, untrusted)
-                scan_has_concrete_input_shape |= shape is not None and (
-                    all(dimension >= 0 for dimension in shape)
-                    or not value_lineages.get(scan_name)
-                    or (
-                        (lineage_shape := resolved_lineage_shape(value_lineages[scan_name].values())) is not None
-                        and _onnx_shape_extent_product(lineage_shape) == 0
-                        and len(lineage_shape) == len(shape)
-                        and all(
-                            known < 0 or known == actual for known, actual in zip(shape, lineage_shape, strict=True)
-                        )
-                    )
-                )
-                return shape
-
-            common_scan_extent = None
-            if (
-                standard_control_flow_operator
-                and node.op_type == "Scan"
-                and not resolved_scan_input_offset
-                and 0 < resolved_scan_input_count <= len(node.input)
-            ):
-                common_scan_extent = scan_common_sequence_extent(
-                    node.input[-resolved_scan_input_count:],
-                    resolved_scan_input_axes,
-                    trusted_scan_input_shape,
-                )
-
             def scan8_batch_extent(
                 output_index: int,
                 *,
@@ -14331,7 +14674,7 @@ def _build_onnx_weight_analysis_plan(
                                     node,
                                     current_node_index,
                                     output_index,
-                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
+                                    collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
                                 )
                     if (
                         graph_output_parent_lineages
@@ -14352,26 +14695,56 @@ def _build_onnx_weight_analysis_plan(
                             input_shape=proven_value_shape,
                         )
                     ):
-                        # Shape invariance does not imply value invariance. A
-                        # later iteration can carry a different initializer.
-                        graph_output_parent_lineages = {
-                            initializer_index: _OnnxWeightLineage(
-                                initializer_index=lineage.initializer_index,
-                                shape=(
-                                    graph_output_shape
-                                    if graph_output_shape is not None and graph_output_rank_proven
-                                    else tuple(-1 for _ in range(graph_output_rank))
-                                    if graph_output_rank is not None and graph_output_rank_proven
-                                    else None
-                                )
-                                if repeated_carried_state
-                                else lineage.shape,
-                                data_type=lineage.data_type,
-                                transforms=lineage.transforms,
-                                unresolved_reason=lineage.unresolved_reason or "unresolved_control_flow_stack_lineage",
+                        fixed_reshape_shape = (
+                            fixed_loop_carried_reshape_shape(
+                                node,
+                                subgraph,
+                                value_lineages.get(str(node.input[2]), {}),
+                                graph_output_parent_lineages,
+                                constants,
+                                opset_versions,
+                                attribute_bindings,
                             )
-                            for initializer_index, lineage in graph_output_parent_lineages.items()
-                        }
+                            if repeated_carried_state
+                            and node.op_type == "Loop"
+                            and len(node.input) == 3
+                            and len(subgraph_results) == 1
+                            and (
+                                iterations := loop_exact_iteration_count(
+                                    max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                                    require_bounded_trip_count=True,
+                                )
+                            )
+                            is not None
+                            and iterations > 1
+                            else None
+                        )
+                        if fixed_reshape_shape is not None:
+                            graph_output_shape = fixed_reshape_shape
+                            graph_output_rank = len(fixed_reshape_shape)
+                            graph_output_rank_proven = True
+                        else:
+                            # Shape invariance does not imply value invariance. A
+                            # later iteration can carry a different initializer.
+                            graph_output_parent_lineages = {
+                                initializer_index: _OnnxWeightLineage(
+                                    initializer_index=lineage.initializer_index,
+                                    shape=(
+                                        graph_output_shape
+                                        if graph_output_shape is not None and graph_output_rank_proven
+                                        else tuple(-1 for _ in range(graph_output_rank))
+                                        if graph_output_rank is not None and graph_output_rank_proven
+                                        else None
+                                    )
+                                    if repeated_carried_state
+                                    else lineage.shape,
+                                    data_type=lineage.data_type,
+                                    transforms=lineage.transforms,
+                                    unresolved_reason=lineage.unresolved_reason
+                                    or "unresolved_control_flow_stack_lineage",
+                                )
+                                for initializer_index, lineage in graph_output_parent_lineages.items()
+                            }
                     if graph_output_parent_lineages and (
                         stacked_scan_output
                         or (
@@ -14396,6 +14769,13 @@ def _build_onnx_weight_analysis_plan(
                                 and (
                                     node.op_type == "Loop"
                                     or (node.op_type == "Scan" and not resolved_scan_input_offset)
+                                    or (
+                                        node.op_type == "Scan"
+                                        and scan8_single_invocation_proven
+                                        and graph_output_rank_proven
+                                        and graph_output_shape is not None
+                                        and all(dimension >= 0 for dimension in graph_output_shape)
+                                    )
                                 )
                             )
                             or (
@@ -14517,7 +14897,7 @@ def _build_onnx_weight_analysis_plan(
                     ):
                         record_weight_lineage_limit_gap(
                             graph_output_weight_lineage_gap_counts[graph_output_index],
-                            collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
+                            collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
                         )
                         recorded_future_body_gap = True
                     if stacked_scan_output and graph_output_weight_lineage_gap_counts[graph_output_index]:
@@ -14649,7 +15029,7 @@ def _build_onnx_weight_analysis_plan(
                             if finite_loop_body_consumes_weight_rank:
                                 record_weight_lineage_limit_gap(
                                     graph_output_rank_promotable_gap_count,
-                                    collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
+                                    collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
                                 )
                                 recorded_future_body_gap = True
                             subgraph_output_weight_lineage_gap_counts[output_index] = (
@@ -14758,7 +15138,7 @@ def _build_onnx_weight_analysis_plan(
                         if future_body_may_consume_gap:
                             record_weight_lineage_limit_gap(
                                 graph_output_non_shape_lineage_gap_counts[graph_output_index],
-                                collect_weight_consumers=collect_weight_consumers and not node_scan8_skips_body,
+                                collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
                             )
                     if (
                         standard_control_flow_operator
@@ -14918,9 +15298,6 @@ def _build_onnx_weight_analysis_plan(
                     and (node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS or node.op_type == "Slice")
                     and (len(input_names) == 1 or node.op_type in {"Clip", "Dropout", "Slice"})
                 )
-                rank_preserving_variadic_operator = (
-                    is_builtin_neural_operator and node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS
-                )
                 if common_output_rank_operator:
                     if value_has_unknown_dynamic_rank(input_names[0]):
                         elementwise_has_unknown_dynamic_rank = True
@@ -14935,22 +15312,6 @@ def _build_onnx_weight_analysis_plan(
                             else known_value_ranks.get(input_names[0])
                         )
                         elementwise_output_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
-                elif rank_preserving_variadic_operator:
-                    elementwise_output_shape = concat_shape(
-                        node,
-                        (known_value_shapes.get(input_name) for input_name in input_names),
-                        axis=resolved_int_attribute(node, "axis", 0),
-                    )
-                    elementwise_output_rank_proven = all(
-                        value_rank_is_proven_or_unknown(input_name) for input_name in input_names
-                    )
-                    if elementwise_output_shape is not None:
-                        elementwise_output_rank = len(elementwise_output_shape)
-                    else:
-                        input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
-                        known_ranks = {rank for rank in input_ranks if rank is not None}
-                        if len(known_ranks) == 1 and all(rank is not None for rank in input_ranks):
-                            elementwise_output_rank = next(iter(known_ranks))
 
             transform_output_shape: tuple[int, ...] | None = None
             transform_output_rank: int | None = None
@@ -15228,7 +15589,25 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_output_lineages[output_index],
                     ambiguous_reason="ambiguous_subgraph_output_lineage",
                 )
-                if subgraph_output_dynamic[output_index] and per_output_lineages:
+                # A runtime value with a proven empty batch has no weight data,
+                # even though its dynamic provenance must still propagate.
+                empty_scan8_state_shape = subgraph_output_shapes[output_index]
+                preserve_empty_scan8_state = (
+                    scan8_zero_batch_proven
+                    and output_index < len(node.input) - resolved_scan_input_count - resolved_scan_input_offset
+                    and subgraph_output_proven_ranks[output_index]
+                    and empty_scan8_state_shape is not None
+                    and len(empty_scan8_state_shape) > 0
+                    and empty_scan8_state_shape[0] == 0
+                    and all(
+                        lineage.unresolved_reason is None
+                        and lineage.shape is not None
+                        and len(lineage.shape) > 0
+                        and lineage.shape[0] == 0
+                        for lineage in per_output_lineages.values()
+                    )
+                )
+                if subgraph_output_dynamic[output_index] and per_output_lineages and not preserve_empty_scan8_state:
                     per_output_lineages = {
                         initializer_index: _OnnxWeightLineage(
                             initializer_index=initializer_index,
@@ -16311,6 +16690,9 @@ class _OnnxStructureParseState:
     interrupt_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     # Strict duplicate rejection remains the structural scanner default.
     merge_singular_messages: bool = False
+    preflight_singular_fields: dict[str, frozenset[int]] | None = field(default=None, repr=False)
+    preflight_seen_singular_fields: set[int] = field(default_factory=set, repr=False)
+    preflight_duplicate_singular_fields: int = 0
     raw_control_tensors: list[_OnnxLiteTensor] = field(default_factory=list, repr=False)
     omitted_raw_data_fields: int = 0
     omitted_raw_data_bytes: int = 0
@@ -16491,6 +16873,23 @@ def _read_onnx_message_key(
     field_number, wire_type = _read_onnx_key(handle, end, state)
     if field_number not in _onnx_known_field_numbers(message_name):
         state.record_unknown_field(message_name, field_number, wire_type)
+        if state.preflight_singular_fields is not None:
+            raise _OnnxStructureParseError("unknown_protobuf_fields", "ONNX preflight encountered an unknown field")
+    if state.preflight_singular_fields is not None and field_number in state.preflight_singular_fields.get(
+        message_name, ()
+    ):
+        # Duplicate singular messages count too, so splitting a scalar flood
+        # into merged fragments cannot reset the aggregate preflight budget.
+        if field_number in state.preflight_seen_singular_fields:
+            if state.preflight_duplicate_singular_fields >= _ONNX_PREFLIGHT_MAX_DUPLICATE_SINGULAR_FIELDS:
+                raise _OnnxStructureParseError(
+                    "raw_control_duplicate_singular_limit",
+                    "ONNX control preflight duplicate singular field work exceeds limit "
+                    f"({_ONNX_PREFLIGHT_MAX_DUPLICATE_SINGULAR_FIELDS})",
+                )
+            state.preflight_duplicate_singular_fields += 1
+        else:
+            state.preflight_seen_singular_fields.add(field_number)
     return field_number, wire_type
 
 
@@ -16650,10 +17049,16 @@ def _read_onnx_submessage(
 ) -> Any:
     _ensure_onnx_parse_depth(depth + 1)
     _length, payload_end = _read_onnx_length_bounds(handle, end)
-    if existing is None:
-        value = parser(handle, payload_end, state, depth + 1)
-    else:
-        value = parser(handle, payload_end, state, depth + 1, existing=existing)
+    parent_singular_fields = state.preflight_seen_singular_fields
+    if state.preflight_singular_fields is not None:
+        state.preflight_seen_singular_fields = set()
+    try:
+        if existing is None:
+            value = parser(handle, payload_end, state, depth + 1)
+        else:
+            value = parser(handle, payload_end, state, depth + 1, existing=existing)
+    finally:
+        state.preflight_seen_singular_fields = parent_singular_fields
     handle.seek(payload_end)
     return value
 
@@ -17407,7 +17812,7 @@ class _OnnxSerializedInput:
         return value
 
 
-def _onnx_raw_control_schema_supported() -> bool:
+def _onnx_raw_control_schema_supported(*, singular_fields: dict[str, frozenset[int]] | None = None) -> bool:
     """Refuse a schema with tensor-bearing edges the wire parser cannot visit."""
     traversed_fields = {
         "onnx.ModelProto": {
@@ -17478,6 +17883,18 @@ def _onnx_raw_control_schema_supported() -> bool:
                     edge = (child.full_name, _onnx_proto_field_is_repeated(proto_field))
                     if traversed_fields.get(name, {}).get(proto_field.number) != edge:
                         return False
+        if singular_fields is not None:
+            singular_fields.update(
+                (
+                    name,
+                    frozenset(
+                        proto_field.number
+                        for proto_field in descriptor.fields
+                        if not _onnx_proto_field_is_repeated(proto_field)
+                    ),
+                )
+                for name, descriptor in descriptors.items()
+            )
         return True
     except Exception:
         return False
@@ -17612,11 +18029,13 @@ def _preflight_onnx_raw_controls(
         training_state.positions = None
     if type(data) is not bytes:
         return False, False, "raw_control_preflight_failed"
-    if not _onnx_raw_control_schema_supported():
+    singular_fields: dict[str, frozenset[int]] = {}
+    if not _onnx_raw_control_schema_supported(singular_fields=singular_fields):
         return False, False, "raw_control_schema_unsupported"
     state = _OnnxStructureParseState(
         interrupt_check=interrupt_check,
         merge_singular_messages=True,
+        preflight_singular_fields=singular_fields,
     )
     handle = _OnnxSerializedInput(data)
     try:
@@ -17673,6 +18092,9 @@ def _preflight_onnx_raw_controls(
         if training_state is not None:
             training_state.positions = training_positions
         return vectors_bounded, scalars_bounded, None
+    except _OnnxStructureParseError as exc:
+        reason = exc.reason if exc.reason == "raw_control_duplicate_singular_limit" else "raw_control_preflight_failed"
+        return False, False, reason
     except Exception:
         return False, False, "raw_control_preflight_failed"
 
