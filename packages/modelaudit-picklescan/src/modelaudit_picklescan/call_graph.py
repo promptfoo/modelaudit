@@ -2440,12 +2440,12 @@ def find_unanalyzed_callable_call_graph_references(
             continue
         if (module, name) in seen:
             continue
-        seen.add((module, name))
         if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
             module, name
         ):
             continue
         if (module, name) in incomplete_newobj_ex_references:
+            seen.add((module, name))
             references.append(
                 UnanalyzedCallGraphReference(
                     module=module,
@@ -2463,11 +2463,12 @@ def find_unanalyzed_callable_call_graph_references(
         if reason is None and _interpreter_module_origin_without_import_hooks(module) == "frozen":
             state = _current_loaded_interpreter_reference_state(module, name)
             _track_loaded_interpreter_reference_state(module, name, state)
-            if not state[0] or type(state[1]) is FunctionType:
+            if not state[0] or not _frozen_reference_body_is_native(state[1], reference):
                 # Frozen origin authenticates the module, not coverage of its Python body.
                 reason = "source_unavailable"
         if reason is None:
             continue
+        seen.add((module, name))
         references.append(
             UnanalyzedCallGraphReference(
                 module=module,
@@ -2479,6 +2480,42 @@ def find_unanalyzed_callable_call_graph_references(
         if len(references) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(references)
+
+
+def _frozen_reference_body_is_native(value: object, reference: Mapping[str, object]) -> bool:
+    if type(value) is FunctionType:
+        return False
+    mro_descriptor = type.__dict__["__mro__"]
+    namespace_descriptor = type.__dict__["__dict__"]
+    if type(value) is not type:
+        # Custom metaclasses need source coverage; even introspection can run descriptors.
+        return not any(base is type for base in mro_descriptor.__get__(type(value)))
+    class_ = cast(type[object], value)
+    methods, _ = _pickle_owner_proof_for_reference(reference)
+    entrypoints = _class_pickle_entrypoint_methods(methods)
+    for base in mro_descriptor.__get__(class_):
+        namespace = namespace_descriptor.__get__(base)
+        if any(type(name) is not str for name in namespace):
+            return False
+        for name in entrypoints:
+            if name in namespace and (
+                type(base) is not type
+                or not _trusted_owner_bound_builtin_descriptor_matches(base, name, namespace[name])
+            ):
+                return False
+        if "__setattr__" in entrypoints:
+            for name, member in namespace.items():
+                is_data_descriptor = False
+                for member_base in mro_descriptor.__get__(type(member)):
+                    member_namespace = namespace_descriptor.__get__(member_base)
+                    if any(type(member_name) is not str for member_name in member_namespace):
+                        return False
+                    is_data_descriptor |= "__set__" in member_namespace or "__delete__" in member_namespace
+                if is_data_descriptor and (
+                    type(base) is not type or not _trusted_owner_bound_builtin_descriptor_matches(base, name, member)
+                ):
+                    return False
+    return True
 
 
 def find_analyzed_callable_call_graph_global_positions(
@@ -6405,11 +6442,57 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
             and not _template_has_trusted_compiled_pattern()
         ):
             calls = (*calls, "string.Template._compile_pattern")
+        if module_name == "typing" and analysis.aliases.get("_lazy_annotationlib") == "annotationlib":
+            context = _module_source_context(module_name)
+            if context is not None and _typing_uses_reviewed_annotationlib_proxy(context):
+                function = _find_qualified_function_def(context.module_statements, qualified_name)
+                proxy = _find_qualified_function_def(context.module_statements, "_LazyAnnotationLib.__getattr__")
+                if function is not None and proxy is not None and _function_reads_lazy_annotationlib(function):
+                    calls = (*calls, *_direct_import_execution_calls(proxy, module_name, context.is_package))
     except _CallGraphAnalysisLimitError as error:
         raise _CallGraphAnalysisLimitError(
             str(error), partial_calls=calls, stability_reason=error.stability_reason
         ) from error
     return calls
+
+
+def _function_reads_lazy_annotationlib(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    class _ProxyReadVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if (
+                isinstance(node.ctx, ast.Load)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "_lazy_annotationlib"
+            ):
+                self.found = True
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            self._visit_defaults(node.args)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self._visit_defaults(node.args)
+
+        def _visit_defaults(self, args: ast.arguments) -> None:
+            for default in (*args.defaults, *args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Lambda):
+                self.visit(node.func.body)
+
+    visitor = _ProxyReadVisitor()
+    for statement in function.body:
+        visitor.visit(statement)
+    return visitor.found
 
 
 def _template_import_requires_keywords(function_name: str, keyword_arg_names: tuple[str, ...] | None) -> bool:
