@@ -18,7 +18,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep speculative ZIP directory metadata private so a rejected importer check cannot leave stale shared cache state.
 
 - Preserve call-graph detection after Python invalidates ZIP import caches, including Windows console-script launchers, while rejecting forged cache state.
-- Follow Python 3.14's lazy annotation helpers to retain detection of annotation evaluation.
+- Follow Python 3.14's lazy annotation helpers to retain detection of annotation evaluation and imports triggered by proxy attribute reads.
 - Distinguish cached, benign string-template calls from deferred pattern imports, without treating an unreachable keyword-only import as executed; fail closed for customized patterns and unproven receiver state.
 - Avoid discovering ordinary license text as pickle data in archives. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and completed executable prefixes with malformed trailing data.
 - Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.

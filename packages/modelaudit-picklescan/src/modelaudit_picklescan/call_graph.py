@@ -6442,11 +6442,57 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
             and not _template_has_trusted_compiled_pattern()
         ):
             calls = (*calls, "string.Template._compile_pattern")
+        if module_name == "typing" and analysis.aliases.get("_lazy_annotationlib") == "annotationlib":
+            context = _module_source_context(module_name)
+            if context is not None and _typing_uses_reviewed_annotationlib_proxy(context):
+                function = _find_qualified_function_def(context.module_statements, qualified_name)
+                proxy = _find_qualified_function_def(context.module_statements, "_LazyAnnotationLib.__getattr__")
+                if function is not None and proxy is not None and _function_reads_lazy_annotationlib(function):
+                    calls = (*calls, *_direct_import_execution_calls(proxy, module_name, context.is_package))
     except _CallGraphAnalysisLimitError as error:
         raise _CallGraphAnalysisLimitError(
             str(error), partial_calls=calls, stability_reason=error.stability_reason
         ) from error
     return calls
+
+
+def _function_reads_lazy_annotationlib(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    class _ProxyReadVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if (
+                isinstance(node.ctx, ast.Load)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "_lazy_annotationlib"
+            ):
+                self.found = True
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            self._visit_defaults(node.args)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self._visit_defaults(node.args)
+
+        def _visit_defaults(self, args: ast.arguments) -> None:
+            for default in (*args.defaults, *args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Lambda):
+                self.visit(node.func.body)
+
+    visitor = _ProxyReadVisitor()
+    for statement in function.body:
+        visitor.visit(statement)
+    return visitor.found
 
 
 def _template_import_requires_keywords(function_name: str, keyword_arg_names: tuple[str, ...] | None) -> bool:

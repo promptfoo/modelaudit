@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import _imp
+import ast
 import importlib
 import os
 import pickle
@@ -39,7 +40,111 @@ from pickle_test_helpers import _clear_call_graph_caches
 
 import modelaudit_picklescan.api as package_api
 import modelaudit_picklescan.call_graph as call_graph
-from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanStatus
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanStatus, Severity
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("return _lazy_annotationlib.Format.STRING", True),
+        ("return _lazy_annotationlib.type_repr(value)", True),
+        ("_lazy_annotationlib.Format = value", False),
+        ("def deferred():\n        return _lazy_annotationlib.Format.STRING\n    return deferred", False),
+        ("return lambda: _lazy_annotationlib.Format.STRING", False),
+        ("return (lambda: _lazy_annotationlib.Format.STRING)()", True),
+        ("def deferred(value=_lazy_annotationlib.Format.STRING):\n        return value", True),
+        ("return annotationlib.Format.STRING", False),
+    ],
+)
+def test_lazy_annotation_proxy_reads_follow_executed_scope(body: str, expected: bool) -> None:
+    function = ast.parse(f"def entry(value=None):\n    {body}\n").body[0]
+    assert isinstance(function, ast.FunctionDef)
+    assert call_graph._function_reads_lazy_annotationlib(function) is expected
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="typing lazy annotation proxy requires Python 3.14")
+def test_typing_lazy_annotation_import_preserves_members_and_invocation_boundaries() -> None:
+    reference = {
+        "module": "typing",
+        "name": "evaluate_forward_ref",
+        "opcode": "REDUCE",
+        "positional_arg_count": 1,
+        "global_position": 2,
+        "position": 33,
+    }
+    with _isolated_call_graph_caches():
+        analysis = call_graph._analyze_module("typing")
+        assert analysis is not None
+        assert analysis.aliases["_lazy_annotationlib"] == "annotationlib"
+        findings = call_graph.find_dangerous_call_graphs([reference], [reference])
+        assert any(
+            finding.sink == "builtins.__import__"
+            and finding.call_path == ("typing.evaluate_forward_ref", "builtins.__import__")
+            for finding in findings
+        )
+        assert call_graph.find_dangerous_call_graphs([reference], []) == ()
+        missing_arg = {**reference, "positional_arg_count": 0}
+        assert call_graph.find_dangerous_call_graphs([missing_arg], [missing_arg]) == ()
+        benign = {**reference, "name": "cast", "positional_arg_count": 2}
+        assert call_graph.find_dangerous_call_graphs([benign], [benign]) == ()
+        assert "annotationlib.type_repr" in (call_graph._calls_for_function("typing._type_repr") or ())
+        member_path = call_graph._find_sink_path("typing._type_repr")
+        assert member_path is not None and member_path[-1] == "builtins.compile"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="typing lazy annotation proxy requires Python 3.14")
+@pytest.mark.parametrize("has_side_effect", [False, True])
+def test_typing_lazy_annotation_import_is_not_executed_during_analysis(tmp_path: Path, has_side_effect: bool) -> None:
+    marker = tmp_path / "annotation-imported.txt"
+    companion = tmp_path / "annotationlib.py"
+    companion.write_text(
+        (f"with open({str(marker)!r}, 'w') as output:\n    output.write('imported')\n" if has_side_effect else "")
+        + "class Format:\n    STRING = 3\n    VALUE = 1\n    FORWARDREF = 2\n",
+        encoding="utf-8",
+    )
+    reference = {
+        "module": "typing",
+        "name": "evaluate_forward_ref",
+        "opcode": "REDUCE",
+        "positional_arg_count": 1,
+        "global_position": 2,
+    }
+    with _isolated_call_graph_caches():
+        findings = call_graph.find_dangerous_call_graphs([reference], [reference])
+    assert any(finding.sink == "builtins.__import__" for finding in findings)
+    assert not marker.exists()
+    # The consumer starts cold, without deleting scanner caches or installing import hooks.
+    consumer = (
+        "import sys, pickle\n"
+        "assert 'typing' not in sys.modules and 'annotationlib' not in sys.modules\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "try:\n"
+        "    pickle.loads(b'\\x80\\x04ctyping\\nevaluate_forward_ref\\nN\\x85R.')\n"
+        "except AttributeError:\n"
+        "    pass\n"
+        "assert vars(sys.modules['annotationlib'])['__file__'] == sys.argv[2]\n"
+    )
+    subprocess.run(
+        [sys.executable, "-I", "-S", "-c", consumer, str(tmp_path), str(companion)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert marker.exists() is has_side_effect
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="typing lazy annotation proxy requires Python 3.14")
+def test_typing_lazy_annotation_import_public_scan_retains_critical_finding() -> None:
+    report = package_api.scan_bytes(b"\x80\x04ctyping\nevaluate_forward_ref\nN\x85R.")
+    assert report.status == ScanStatus.COMPLETE, report
+    assert report.verdict == SafetyVerdict.MALICIOUS, report
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("sink") == "builtins.__import__"
+        for finding in report.findings
+    ), report
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows ctime differs across stat views")
@@ -4231,7 +4336,13 @@ def test_sourceless_frozen_class_scan_preserves_incomplete_coverage(
     report = package_api.scan_bytes(payload + b".")
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == (SafetyVerdict.MALICIOUS if include_critical else SafetyVerdict.UNKNOWN)
+    assert report.verdict == (SafetyVerdict.MALICIOUS if include_critical else SafetyVerdict.SUSPICIOUS), report
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.severity == Severity.WARNING
+        and finding.details.get("import_reference") == "_frozen_importlib.ModuleSpec"
+        for finding in report.findings
+    ), report
     assert report.metadata["analysis_incomplete"] is True
     notices = [notice for notice in report.notices if notice.code == "call_graph_source_unavailable"]
     assert any(notice.details.get("import_reference") == "_frozen_importlib.ModuleSpec" for notice in notices)
@@ -4257,7 +4368,14 @@ def test_sourceless_frozen_class_slot_state_requires_descriptor_coverage(monkeyp
     payload = b"\x80\x04c_frozen_importlib\nModuleSpec\n)\x81N}\x8c\x0chas_location\x88s\x86b."
     report = package_api.scan_bytes(payload)
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS, report
+    assert report.metadata["analysis_incomplete"] is True
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.severity == Severity.WARNING
+        and finding.details.get("import_reference") == "_frozen_importlib.ModuleSpec"
+        for finding in report.findings
+    ), report
     assert any(
         notice.code == "call_graph_source_unavailable"
         and notice.details.get("import_reference") == "_frozen_importlib.ModuleSpec"
