@@ -24,7 +24,9 @@ Pickle deserialization is the most common supply-chain attack vector in ML check
 pip install modelaudit-picklescan
 ```
 
-Pre-built `abi3` wheels ship for Python 3.10–3.13 on five targets: Linux `x86_64`, Linux `aarch64`, macOS `arm64`, macOS `x86_64`, and Windows `x64`. Other platforms install from the sdist and require a Rust toolchain (see [Building from source](#building-from-source)).
+Pre-built `abi3` wheels ship for standard CPython 3.10–3.14 on five targets: Linux `x86_64`, Linux `aarch64`, macOS `arm64`, macOS `x86_64`, and Windows `x64`. Free-threaded CPython is not supported by these wheels. Other platforms install from the sdist and require a Rust toolchain (see [Building from source](#building-from-source)).
+
+On CPython 3.14, string-template calls with customized runtime methods, defaults or patterns, or with earlier operations that could change receiver state, produce incomplete coverage rather than a clean verdict.
 
 ## Quickstart
 

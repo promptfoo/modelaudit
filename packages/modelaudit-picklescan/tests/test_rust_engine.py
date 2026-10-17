@@ -74,7 +74,7 @@ pytestmark = pytest.mark.skipif(
 
 def _rust_source_text() -> str:
     rust_src = Path(__file__).resolve().parents[1] / "rust" / "src"
-    return "\n".join(path.read_text() for path in sorted(rust_src.glob("*.rs")))
+    return "\n".join(path.read_text(encoding="utf-8") for path in sorted(rust_src.glob("*.rs")))
 
 
 def _binary_opcode_os_system_reduce_payload() -> bytes:
