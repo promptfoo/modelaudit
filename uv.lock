@@ -2033,7 +2033,7 @@ wheels = [
 
 [[package]]
 name = "modelaudit"
-version = "0.2.54"
+version = "0.2.55"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -2330,7 +2330,7 @@ dev = [
 
 [[package]]
 name = "modelaudit-picklescan"
-version = "0.1.12"
+version = "0.1.13"
 source = { editable = "packages/modelaudit-picklescan" }
 
 [[package]]

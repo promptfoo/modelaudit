@@ -5,6 +5,14 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.12...modelaudit-picklescan-v0.1.13) (2026-10-17)
+
+### Bug Fixes
+
+- **ci:** restore Click 8.5 scanning and Windows fixtures ([#1906](https://github.com/promptfoo/modelaudit/issues/1906)) ([f996f12](https://github.com/promptfoo/modelaudit/commit/f996f12c7f3b3f338844a4380639cadc095a9c1f))
+- **picklescan:** restore Click 8.5 detection and Windows test portability ([#1864](https://github.com/promptfoo/modelaudit/issues/1864)) ([2838c99](https://github.com/promptfoo/modelaudit/commit/2838c9978c2254ae699c63712b311b2491d047a7))
+- **routing:** avoid pickle false positives on license text ([#1911](https://github.com/promptfoo/modelaudit/issues/1911)) ([6128247](https://github.com/promptfoo/modelaudit/commit/6128247b084f3bb64724706ab037c7de8ab242f5))
+
 ## [Unreleased]
 
 ### Fixed
