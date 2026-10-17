@@ -15,6 +15,7 @@ import zipfile
 import zipimport
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from importlib.abc import Loader
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
@@ -4070,16 +4071,32 @@ def _poison_zipimport_unpack(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
 
 
 @pytest.mark.parametrize("source_available", [False, True])
-@pytest.mark.parametrize("reference_kind", ["unavailable", "python", "native"])
+@pytest.mark.parametrize(
+    "reference_kind", ["unavailable", "python", "python_class", "metaclass", "native_class", "native"]
+)
 def test_frozen_invoked_reference_requires_callable_body_coverage(
     monkeypatch: pytest.MonkeyPatch, source_available: bool, reference_kind: str
 ) -> None:
     def python_callable() -> None:
         pass
 
+    class PythonClass:
+        def __init__(self) -> None:
+            raise AssertionError("scanner executed a constructor")
+
+    class PythonMetaclass(type):
+        def __call__(cls) -> object:
+            raise AssertionError("scanner executed a metaclass")
+
+    class MetaclassInstance(metaclass=PythonMetaclass):
+        pass
+
     states: dict[str, tuple[bool, object | None]] = {
         "unavailable": (False, None),
         "python": (True, python_callable),
+        "python_class": (True, PythonClass),
+        "metaclass": (True, MetaclassInstance),
+        "native_class": (True, object),
         "native": (True, len),
     }
     monkeypatch.setattr(
@@ -4094,7 +4111,7 @@ def test_frozen_invoked_reference_requires_callable_body_coverage(
     )
     invocation = {"module": "ntpath", "name": "abspath", "opcode": "REDUCE", "positional_arg_count": 1}
     references = call_graph.find_unanalyzed_callable_call_graph_references([invocation])
-    if source_available or reference_kind == "native":
+    if source_available or reference_kind in {"native", "native_class"}:
         assert references == ()
     else:
         assert references == (
@@ -4114,6 +4131,180 @@ def test_frozen_invoked_reference_requires_callable_body_coverage(
             assert report.metadata["analysis_incomplete"] is True
             assert report.notices[-1].code == "call_graph_source_unavailable"
             assert report.notices[-1].details["reason"] == "source_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("member", "opcode", "source_required"),
+    [
+        ("__init__", "REDUCE", True),
+        ("__init__", "NEWOBJ", False),
+        ("__init__", "NEWOBJ_EX", False),
+        ("__new__", "NEWOBJ", True),
+        ("__new__", "NEWOBJ_EX", True),
+        ("__setstate__", "BUILD", True),
+        ("__setattr__", "BUILD", True),
+        ("__call__", "REDUCE", True),
+        ("__call__", "NEWOBJ", True),
+        ("__call__", "NEWOBJ_EX", True),
+    ],
+)
+def test_frozen_class_body_coverage_follows_pickle_entrypoints(
+    monkeypatch: pytest.MonkeyPatch, member: str, opcode: str, source_required: bool
+) -> None:
+    calls: list[str] = []
+
+    def python_method(*_args: object, **_kwargs: object) -> None:
+        calls.append(member)
+
+    class Metaclass(type):
+        pass
+
+    class FrozenClass:
+        pass
+
+    class MetaclassInstance(metaclass=Metaclass):
+        pass
+
+    target = MetaclassInstance if member == "__call__" else FrozenClass
+    monkeypatch.setattr(Metaclass if member == "__call__" else FrozenClass, member, python_method, raising=False)
+    invocation = {
+        "module": "_frozen_importlib",
+        "name": "FrozenClass",
+        "opcode": opcode,
+        "positional_arg_count": 0,
+        "keyword_arg_names": [],
+    }
+    assert call_graph._frozen_reference_body_is_native(target, invocation) is not source_required
+    assert calls == []
+
+
+def test_frozen_class_body_coverage_does_not_execute_custom_descriptors() -> None:
+    calls: list[str] = []
+
+    class HostileDescriptor:
+        def __get__(self, _instance: object, _owner: type[object]) -> object:
+            calls.append("descriptor")
+            raise AssertionError("scanner executed a descriptor")
+
+    class FrozenClass:
+        __init__ = cast(Any, HostileDescriptor())
+
+    assert not call_graph._frozen_reference_body_is_native(FrozenClass, {"opcode": "REDUCE"})
+    assert calls == []
+
+
+def test_frozen_class_later_constructor_still_requires_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    invocation = {"module": "_frozen_importlib", "name": "ModuleSpec", "positional_arg_count": 2}
+    monkeypatch.setattr(call_graph, "_call_graph_entrypoints_for_reference", lambda *_args: ())
+    references = call_graph.find_unanalyzed_callable_call_graph_references(
+        [{**invocation, "opcode": "NEWOBJ"}, {**invocation, "opcode": "REDUCE"}]
+    )
+    assert references == (
+        call_graph.UnanalyzedCallGraphReference(
+            module="_frozen_importlib",
+            name="ModuleSpec",
+            import_reference="_frozen_importlib.ModuleSpec",
+            reason="source_unavailable",
+        ),
+    )
+
+
+@pytest.mark.parametrize("mutate_constructor", [False, True])
+@pytest.mark.parametrize("include_critical", [False, True])
+def test_sourceless_frozen_class_scan_preserves_incomplete_coverage(
+    monkeypatch: pytest.MonkeyPatch, mutate_constructor: bool, include_critical: bool
+) -> None:
+    calls: list[str] = []
+    original_init = ModuleSpec.__init__
+
+    def marked_init(self: ModuleSpec, name: str, loader: Loader | None) -> None:
+        calls.append("constructor")
+        original_init(self, name, loader)
+
+    if mutate_constructor:
+        monkeypatch.setattr(ModuleSpec, "__init__", marked_init)
+    assert call_graph._interpreter_module_origin_without_import_hooks("_frozen_importlib") == "frozen"
+    assert call_graph._resolve_module_source("_frozen_importlib") is None
+    payload = b"\x80\x04c_frozen_importlib\nModuleSpec\n\x8c\x01xN\x86R"
+    if include_critical:
+        payload += b"0cbuiltins\neval\n\x8c\x011\x85R"
+    report = package_api.scan_bytes(payload + b".")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == (SafetyVerdict.MALICIOUS if include_critical else SafetyVerdict.UNKNOWN)
+    assert report.metadata["analysis_incomplete"] is True
+    notices = [notice for notice in report.notices if notice.code == "call_graph_source_unavailable"]
+    assert any(notice.details.get("import_reference") == "_frozen_importlib.ModuleSpec" for notice in notices)
+    assert calls == []
+    if mutate_constructor:
+        restored = pickle.loads(b"\x80\x04c_frozen_importlib\nModuleSpec\n\x8c\x01xN\x86R.")
+        assert type(restored) is ModuleSpec
+        assert calls == ["constructor"]
+
+
+def test_sourceless_frozen_class_slot_state_requires_descriptor_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    original = type.__getattribute__(ModuleSpec, "__dict__")["has_location"]
+    assert isinstance(original, property)
+    original_setter = original.fset
+    assert original_setter is not None
+
+    def marked_setter(self: ModuleSpec, value: bool) -> None:
+        calls.append("setter")
+        original_setter(self, value)
+
+    monkeypatch.setattr(ModuleSpec, "has_location", property(original.fget, marked_setter))
+    payload = b"\x80\x04c_frozen_importlib\nModuleSpec\n)\x81N}\x8c\x0chas_location\x88s\x86b."
+    report = package_api.scan_bytes(payload)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert any(
+        notice.code == "call_graph_source_unavailable"
+        and notice.details.get("import_reference") == "_frozen_importlib.ModuleSpec"
+        for notice in report.notices
+    )
+    assert calls == []
+    restored = pickle.loads(payload)
+    assert type(restored) is ModuleSpec
+    assert calls == ["setter"]
+
+
+@pytest.mark.parametrize("attribute", ["__mro__", "__dict__"])
+def test_frozen_class_body_coverage_bypasses_metaclass_data_descriptors(attribute: str) -> None:
+    calls: list[str] = []
+
+    def descriptor(_cls: type[object]) -> object:
+        calls.append(attribute)
+        raise AssertionError("scanner executed a metaclass descriptor")
+
+    metaclass = type("Metaclass", (type,), {attribute: property(descriptor)})
+    frozen_class = metaclass("FrozenClass", (), {})
+    assert not call_graph._frozen_reference_body_is_native(frozen_class, {"opcode": "REDUCE"})
+    assert calls == []
+
+
+@pytest.mark.parametrize("descriptor_namespace", [False, True])
+def test_frozen_class_body_coverage_does_not_compare_arbitrary_namespace_keys(descriptor_namespace: bool) -> None:
+    calls: list[str] = []
+    target = "__set__" if descriptor_namespace else "__new__"
+
+    class HostileKey:
+        def __hash__(self) -> int:
+            return hash(target)
+
+        def __eq__(self, _other: object) -> bool:
+            calls.append("equality")
+            return False
+
+    namespace = cast(dict[str, object], {HostileKey(): None})
+    if descriptor_namespace:
+        descriptor_class = type("Descriptor", (), namespace)
+        namespace = {"slot": descriptor_class()}
+    frozen_class = type("FrozenClass", (), namespace)
+    calls.clear()
+    invocation = {"opcode": "BUILD" if descriptor_namespace else "REDUCE"}
+    assert not call_graph._frozen_reference_body_is_native(frozen_class, invocation)
+    assert calls == []
 
 
 @pytest.mark.parametrize("mutation", ["replace-archive", "remove-archive", "finder-state"])
