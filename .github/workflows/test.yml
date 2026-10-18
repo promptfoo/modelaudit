@@ -485,11 +485,22 @@ jobs:
 
       - *install-uv
 
-      - *pin-python-312
+      # Python 3.12 traces large functions slowly: python/cpython#127953.
+      # The fast-test matrix retains Python 3.12 without coverage.
+      - name: Pin Python version
+        run: |
+          uv python pin 3.11
 
       - *install-rust-toolchain
 
-      - *cache-python-312-dependencies
+      - name: Cache Python dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: *python-cache-paths
+          key: ${{ runner.os }}-uv-py3.11-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-py3.11-
+            ${{ runner.os }}-uv-
 
       - *sync-all-ci-dependencies
 
