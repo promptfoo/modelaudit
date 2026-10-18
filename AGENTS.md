@@ -18,7 +18,7 @@ This repo publishes **two PyPI packages with independent versions**:
 | `modelaudit`            | `./` (root)                       | `pyproject.toml` + `uv.lock`    | `CHANGELOG.md`                                |
 | `modelaudit-picklescan` | `packages/modelaudit-picklescan/` | `pyproject.toml` + `Cargo.toml` | `packages/modelaudit-picklescan/CHANGELOG.md` |
 
-Root `modelaudit` hard-requires `modelaudit-picklescan>=0.1.11,<0.2.0` — when the sibling crosses `0.2.0`, bump the constraint in the same PR or the next `modelaudit` release is uninstallable. Both packages are driven by a single `release-please` workflow (`.github/workflows/release-please.yml`) with components defined in `release-please-config.json` and current versions in `.release-please-manifest.json`. Full publishing details — trusted publishing, manual `workflow_dispatch` recovery (`root_version` / `picklescan_version`), and yank procedure — are in [`docs/agents/release-process.md`](docs/agents/release-process.md). For work inside the picklescan package, start from [`packages/modelaudit-picklescan/AGENTS.md`](packages/modelaudit-picklescan/AGENTS.md).
+Root `modelaudit` hard-requires `modelaudit-picklescan>=0.1.13,<0.2.0` — when the sibling crosses `0.2.0`, bump the constraint in the same PR or the next `modelaudit` release is uninstallable. Both packages are driven by a single `release-please` workflow (`.github/workflows/release-please.yml`) with components defined in `release-please-config.json` and current versions in `.release-please-manifest.json`. Full publishing details — trusted publishing, manual `workflow_dispatch` recovery (`root_version` / `picklescan_version`), and yank procedure — are in [`docs/agents/release-process.md`](docs/agents/release-process.md). For work inside the picklescan package, start from [`packages/modelaudit-picklescan/AGENTS.md`](packages/modelaudit-picklescan/AGENTS.md).
 
 ## Mission & Principles
 
@@ -106,7 +106,7 @@ PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integra
 
 ## Coding & Style Guardrails
 
-- **Python:** 3.10–3.13 supported. Classes PascalCase, functions/vars snake_case, constants UPPER_SNAKE_CASE, always type hints.
+- **Python:** 3.10–3.14 supported. Classes PascalCase, functions/vars snake_case, constants UPPER_SNAKE_CASE, always type hints.
 - **Comments:** Use sparingly to explain intent, not mechanics.
 - **Docs/Markdown:** Keep concise; when formatting markdown/json/yaml, use `npm ci --ignore-scripts && npx prettier --write "**/*.{md,yaml,yml,json}"` if instructed or if formatting drifts.
 - **Dependencies:** Do not add new packages without explicit approval and updating `pyproject.toml`/locks.
@@ -117,7 +117,7 @@ PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integra
 - Preserve or strengthen detections; test both benign and malicious samples.
 - Follow existing scanner patterns and update registries, CLI wiring, and docs as needed.
 - Add comprehensive tests, including edge cases and regression coverage.
-- Ensure compatibility across Python 3.10–3.13 and handle missing optional deps gracefully.
+- Ensure compatibility across Python 3.10–3.14 and handle missing optional deps gracefully.
 
 ## Testing & Routing Guardrails
 

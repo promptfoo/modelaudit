@@ -398,7 +398,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.12","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
+        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.12","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.14","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.14","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.14","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
     steps:
       - *checkout-repo
 
@@ -439,6 +439,34 @@ jobs:
             --modelaudit-shard-count ${{ matrix.shard-count }} \
             --modelaudit-shard-index ${{ matrix.shard-index }} \
             --tb=short --durations=15
+
+  python314-platform-smoke:
+    name: Python 3.14 Smoke (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      PROMPTFOO_DISABLE_TELEMETRY: "1"
+    steps:
+      - *checkout-repo
+
+      - *install-uv
+
+      - *install-rust-toolchain
+
+      - name: Sync Python 3.14 smoke dependencies
+        run: uv sync --locked --python 3.14 --extra all-ci-windows --extra h5
+
+      - name: Verify Python 3.14 native and H5 imports
+        run: uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"
+
+      - name: Test Python 3.14 native pickle and H5 scanning
+        run: uv run --locked --python 3.14 pytest tests/test_python_compatibility.py -n 0 --tb=short
 
   slow-tests:
     name: Slow/Integration Tests (Python 3.12)
@@ -1078,6 +1106,7 @@ jobs:
         uv-lock-check,
         type-check,
         windows-tests,
+        python314-platform-smoke,
         test,
         slow-tests,
         coverage,
@@ -1110,6 +1139,7 @@ jobs:
           LICENSE_RESULT="${{ needs.license-check.result }}"
           UV_LOCK_RESULT="${{ needs.uv-lock-check.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
+          PYTHON314_SMOKE_RESULT="${{ needs.python314-platform-smoke.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
           SLOW_RESULT="${{ needs.slow-tests.result }}"
@@ -1140,6 +1170,7 @@ jobs:
           echo "  license-check: $LICENSE_RESULT"
           echo "  uv-lock-check: $UV_LOCK_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
+          echo "  python314-platform-smoke: $PYTHON314_SMOKE_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
           echo "  slow-tests: $SLOW_RESULT"
@@ -1173,6 +1204,7 @@ jobs:
           require_success "$EXPECT_DEPENDENCY_SURFACE" "$UV_LOCK_RESULT" "uv-lock-check"
           require_success "$EXPECT_CORE_FAST" "$TYPE_CHECK_RESULT" "type-check"
           require_success "$EXPECT_CORE_FAST" "$WINDOWS_RESULT" "windows-tests"
+          require_success "$EXPECT_CORE_FAST" "$PYTHON314_SMOKE_RESULT" "python314-platform-smoke"
           require_success "$EXPECT_TEST" "$TEST_RESULT" "test"
           require_success "$EXPECT_SLOW" "$SLOW_RESULT" "slow-tests"
           require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"

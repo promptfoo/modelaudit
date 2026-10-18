@@ -2358,11 +2358,15 @@ class TestTarScanner:
             archive.fileobj = cast(Any, fileobj)
             tail_end = archive_path.stat().st_size
 
-            def dense_lseek(_fd: int, offset: int, whence: int) -> int:
+            original_lseek = os.lseek
+
+            def dense_lseek(fd: int, offset: int, whence: int) -> int:
+                if whence in {os.SEEK_CUR, os.SEEK_SET}:
+                    return original_lseek(fd, offset, whence)
                 if whence == os.SEEK_DATA:
-                    return offset
+                    return original_lseek(fd, offset, os.SEEK_SET)
                 assert whence == os.SEEK_HOLE
-                return tail_end
+                return original_lseek(fd, tail_end, os.SEEK_SET)
 
             monkeypatch.setattr(os, "lseek", dense_lseek)
 
@@ -2370,6 +2374,7 @@ class TestTarScanner:
 
             assert scanner._raw_tar_has_complete_end_marker(archive) is False
             assert fileobj.bytes_read == 2 * tarfile.BLOCKSIZE
+            assert fileobj.tell() == archive.offset + 2 * tarfile.BLOCKSIZE
 
     def test_sparse_large_raw_tar_complete_end_marker_remains_successful(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "complete-end-marker.tar"
@@ -2511,16 +2516,21 @@ class TestTarScanner:
             tail_end = os.fstat(raw_file.fileno()).st_size
             seek_data_calls = 0
 
-            def seek_to_tail_end(_fd: int, _offset: int, whence: int) -> int:
+            original_lseek = os.lseek
+
+            def seek_to_tail_end(fd: int, offset: int, whence: int) -> int:
                 nonlocal seek_data_calls
+                if whence in {os.SEEK_CUR, os.SEEK_SET}:
+                    return original_lseek(fd, offset, whence)
                 assert whence == os.SEEK_DATA
                 seek_data_calls += 1
-                return tail_end
+                return original_lseek(fd, tail_end, os.SEEK_SET)
 
             monkeypatch.setattr(os, "lseek", seek_to_tail_end)
 
             assert TarScanner()._raw_tar_has_complete_end_marker(archive) is True
             assert seek_data_calls == 1
+            assert raw_file.tell() == archive.offset + 2 * tarfile.BLOCKSIZE
 
     @pytest.mark.parametrize(
         ("member_type", "expected_kind"),
