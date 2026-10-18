@@ -150,8 +150,7 @@ def test_call_graph_resolves_super_forwarded_constructor_default_instance_aliase
     assert path[-1] == "asyncio.create_subprocess_exec"
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
-def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None:
+def _assert_botocore_process_provider_rce(tmp_path: Path) -> None:
     marker = tmp_path / "botocore_process_provider_rce_marker"
     control_payload = b"\x80\x04" + _botocore_process_provider_operand() + b"."
     payload, marker_content = _botocore_process_provider_rce_payload(marker)
@@ -182,6 +181,48 @@ def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None
         "account_id": "1",
     }
     assert marker.read_text() == marker_content
+
+
+def _run_botocore_process_provider_check(tmp_path: Path, *, warm_parent: bool = False) -> None:
+    test_file = Path(__file__).resolve()
+    package = test_file.parents[1]
+    script = (
+        "import runpy, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path[:0] = {[str(package / 'src'), str(test_file.parent)]!r}\n"
+        f"namespace = runpy.run_path({str(test_file)!r})\n"
+    )
+    if warm_parent:
+        script += (
+            "import botocore.credentials\n"
+            "assert 'botocore.credentials' in sys.modules\n"
+            "namespace['test_scan_bytes_blocks_botocore_process_provider_rce'](Path(sys.argv[1]))\n"
+        )
+    else:
+        script += (
+            "assert 'botocore.credentials' not in sys.modules\n"
+            "namespace['_assert_botocore_process_provider_rce'](Path(sys.argv[1]))\n"
+        )
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(tmp_path)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120 if warm_parent else 90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None:
+    # The CLEAN control needs cold import state; loaded callable defaults remain conservative.
+    _run_botocore_process_provider_check(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_botocore_process_provider_check_isolates_warm_parent(tmp_path: Path) -> None:
+    _run_botocore_process_provider_check(tmp_path, warm_parent=True)
 
 
 @pytest.mark.skipif(find_spec("aiobotocore") is None, reason="aiobotocore is unavailable")
