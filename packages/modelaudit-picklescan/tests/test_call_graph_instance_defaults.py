@@ -157,7 +157,28 @@ def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None
     payload, marker_content = _botocore_process_provider_rce_payload(marker)
 
     control_report = scan_bytes(control_payload, source="botocore-process-provider-control.pkl")
-    assert control_report.verdict == SafetyVerdict.CLEAN
+    assert control_report.verdict == SafetyVerdict.CLEAN, str(
+        {
+            "report": control_report.to_dict(),
+            "runtime": sys.version,
+            "executable": sys.executable,
+            "modules": {
+                name: {
+                    "loaded": name in sys.modules,
+                    "origin": (
+                        vars(sys.modules[name]).get("__file__") if type(sys.modules.get(name)) is type(sys) else None
+                    ),
+                }
+                for name in (
+                    "modelaudit_picklescan",
+                    "modelaudit_picklescan.api",
+                    _RUST_EXTENSION_MODULE,
+                    "botocore",
+                    "botocore.credentials",
+                )
+            },
+        }
+    )
 
     assert not marker.exists()
     pickle.loads(control_payload)

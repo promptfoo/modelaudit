@@ -47,12 +47,72 @@ jobs:
           rustup default stable
 
       - name: Sync dependencies
+        id: sync
         run: |
           uv sync --extra ${{ matrix.os == 'windows-latest' && 'all-ci-windows' || 'all-ci' }}
 
       - name: Run correctness shard (fast + slow + integration)
         run: |
           uv run pytest -n auto -m "not performance" --modelaudit-shard-count 3 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
+
+      - name: Capture ProcessProvider native diagnostic
+        if: ${{ always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && matrix.shard == 0 && steps.sync.outcome == 'success' }}
+        shell: bash
+        run: |
+          .venv/bin/python - <<'PY'
+          import hashlib
+          import importlib.metadata
+          import importlib.util
+          import json
+          import platform
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          output = Path("picklescan-process-provider-diagnostic")
+          output.mkdir(exist_ok=True)
+          package = importlib.util.find_spec("modelaudit_picklescan")
+          native = importlib.util.find_spec("modelaudit_picklescan._rust")
+          assert package is not None and package.origin is not None
+          assert native is not None and native.origin is not None
+          binary = Path(native.origin).resolve(strict=True)
+          assert binary.suffix == ".so"
+          shutil.copy2(binary, output / binary.name)
+          paths = subprocess.check_output(
+              ["git", "ls-files", "packages/modelaudit-picklescan", "pyproject.toml", "uv.lock",
+               "tests/conftest.py", ".github/workflows/nightly.yml"], text=True
+          ).splitlines()
+          manifest = {
+              "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "tracked_status": subprocess.check_output(
+                  ["git", "status", "--porcelain", "--untracked-files=no"], text=True
+              ),
+              "runtime": sys.version,
+              "executable": sys.executable,
+              "platform": platform.platform(),
+              "package_origin": package.origin,
+              "native_origin": str(binary),
+              "native_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "tracked_input_sha256": {
+                  path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in paths
+              },
+              "installed_versions": sorted(
+                  (distribution.metadata["Name"], distribution.version)
+                  for distribution in importlib.metadata.distributions()
+              ),
+          }
+          (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+
+      - name: Upload ProcessProvider native diagnostic
+        if: ${{ always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && matrix.shard == 0 && steps.sync.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: picklescan-process-provider-native-${{ github.sha }}
+          path: picklescan-process-provider-diagnostic/
+          if-no-files-found: error
+          retention-days: 7
 
   performance:
     name: Performance Tests (Python 3.11, single process)
