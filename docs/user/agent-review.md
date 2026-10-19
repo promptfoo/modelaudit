@@ -35,7 +35,10 @@ One request considers at most 20 eligible findings and 256 KiB of evidence.
 Complete UTF-8 documents up to 32 KiB are included when they remain available as
 regular local files. Symlinks and platforms without no-follow directory reads
 provide findings only; so do documents already removed by streaming/acquisition
-cleanup. Missing context or incomplete scan coverage prevents `likely_benign`
+cleanup. Text scans record `text_content_sha256` from the bytes inspected; triage
+includes a document only when it matches that hash. Changed documents and older
+reports without this hash provide findings only.
+Missing context or incomplete scan coverage prevents `likely_benign`
 advice. Output says how many eligible findings were submitted. Network connect/read
 timeouts are 5/30 seconds, with no retries and at most 4,096 output tokens.
 

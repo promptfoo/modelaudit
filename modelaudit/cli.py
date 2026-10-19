@@ -3031,11 +3031,17 @@ def _emit_triage(audit_result: ModelAuditResultModel) -> None:
         from .triage import triage_findings
 
         lines = triage_findings(audit_result)
-    except (Exception, KeyboardInterrupt) as exc:
+    except BaseException as exc:
+        # The module entrypoint uses a BaseException subclass for SIGINT.
         lines = [f"AI triage unavailable ({type(exc).__name__}: {exc}); scanner result unchanged."]
     if lines:
-        with contextlib.suppress(OSError, KeyboardInterrupt):
-            click.echo("\n".join(_escape_terminal_text(line) for line in lines), err=True)
+        with contextlib.suppress(BaseException):
+            try:
+                click.echo("\n".join(_escape_terminal_text(line) for line in lines), err=True)
+            except OSError:
+                # Prevent Python's shutdown flush from replacing the scan exit code with 120.
+                with open(os.devnull, "w") as sink:
+                    os.dup2(sink.fileno(), sys.stderr.fileno())
 
 
 def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, verbose: bool) -> bool:

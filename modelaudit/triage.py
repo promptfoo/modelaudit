@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -64,11 +65,13 @@ class _NoNetrcAuth(AuthBase):
         return request
 
 
-def _read_document(location: str) -> str | None:
+def _read_document(location: str, expected_sha256: str | None) -> str | None:
     """Read bounded regular text without following mutable source/ancestor symlinks."""
-    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+    if not expected_sha256 or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         return None
-    path = Path(os.path.abspath(location))
+    path = Path(location)
+    if not path.is_absolute():
+        path = Path.cwd() / path
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
         parent = os.open(path.anchor, directory_flags)
@@ -89,6 +92,8 @@ def _read_document(location: str) -> str | None:
             if len(data) > MAX_DOCUMENT_BYTES or any(
                 getattr(before, field) != getattr(after, field) for field in ("st_size", "st_mtime_ns", "st_ctime_ns")
             ):
+                return None
+            if hashlib.sha256(data).hexdigest() != expected_sha256:
                 return None
             return data.decode("utf-8")
     except (OSError, UnicodeError, ValueError):
@@ -119,7 +124,7 @@ def prepare_findings(result: ModelAuditResultModel) -> tuple[list[dict[str, Any]
         if eligible > MAX_FINDINGS:
             continue
         if location not in documents:
-            documents[location] = _read_document(location)
+            documents[location] = _read_document(location, metadata.get("text_content_sha256"))
         finding = {
             "finding_id": f"/issues/{index}",
             "finding": issue.model_dump(mode="json", exclude_none=True),
