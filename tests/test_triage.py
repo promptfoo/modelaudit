@@ -359,7 +359,9 @@ def test_malformed_assessments_are_rejected(
 
 
 @pytest.mark.parametrize(
-    "body", [b"{}", b"not json", b'{"status":"incomplete"}', b"x" * (triage.MAX_RESPONSE_BYTES + 1)]
+    "body",
+    [b"{}", b"not json", b'{"status":"incomplete"}', b"x" * (triage.MAX_RESPONSE_BYTES + 1)],
+    ids=["empty", "invalid_json", "incomplete", "oversized"],
 )
 def test_invalid_or_incomplete_api_responses(body: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     post = mock_api(monkeypatch, [])
