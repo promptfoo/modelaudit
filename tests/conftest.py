@@ -135,6 +135,7 @@ def pytest_runtest_setup(item):
 
         # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
         allowed_test_files = [
+            "test_agent_review.py",  # Optional advisory review preserves scanner evidence and exits
             "test_python_compatibility.py",
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an experimental, opt-in Codex review command for README and model-card network findings. It produces a separate, evidence-linked advisory report without changing scanner findings, verdicts, or exit codes, and includes evaluation cases based on #1913.
 - Support standard CPython 3.14 with native pickle and H5 scanner validation across Linux, macOS, and Windows.
 - Add `metadata --table-limit` to control the number of file entries displayed in directory tables.
 
