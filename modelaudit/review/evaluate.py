@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
+import sys
 from pathlib import Path
 from typing import Any
 
 from .bundle import digest, write_json
 from .codex import DockerReviewer
 from .models import Artifact
+from .process import terminate
 from .render import render_markdown
 from .runner import Reviewer, review_findings
 
@@ -18,6 +21,7 @@ def replay(case: dict[str, Any], output: Path, reviewer: Reviewer | None) -> dic
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     artifacts = output / "artifacts"
     artifacts.mkdir(mode=0o755)
+    artifacts.chmod(0o755)
     content = case["document"].encode("utf-8")
     if digest(content) != case["document_sha256"]:
         raise ValueError("Evaluation document digest mismatch")
@@ -110,4 +114,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Evaluation interrupted; completed bundles remain in the output directory", file=sys.stderr)
+        raise SystemExit(2) from None

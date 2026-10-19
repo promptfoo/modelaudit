@@ -150,6 +150,7 @@ class DockerReviewer:
         self.validate(output)
         request = output / "request"
         request.mkdir(mode=0o755)
+        request.chmod(0o755)
         write_json(request / "schema.json", AgentResponse.model_json_schema())
         write_json(
             request / "evidence.json",

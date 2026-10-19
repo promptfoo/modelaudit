@@ -31,6 +31,7 @@ from .models import (
     ReviewStatus,
 )
 from .policy import POLICY
+from .process import kill_process_group
 from .render import render_markdown
 
 
@@ -215,8 +216,15 @@ def run_scan(command: list[str], output: Path) -> int:
     environment.update(
         PYTHONPATH=str(Path(__file__).resolve().parents[2]), PROMPTFOO_DISABLE_TELEMETRY="1", NO_ANALYTICS="1"
     )
-    with (output / "scan.stdout.txt").open("xb") as stdout, (output / "scan.stderr.txt").open("xb") as stderr:
-        return subprocess.run(command, stdout=stdout, stderr=stderr, env=environment, check=False).returncode
+    with (
+        (output / "scan.stdout.txt").open("xb") as stdout,
+        (output / "scan.stderr.txt").open("xb") as stderr,
+        subprocess.Popen(command, stdout=stdout, stderr=stderr, env=environment, start_new_session=True) as process,
+    ):
+        try:
+            return process.wait()
+        finally:
+            kill_process_group(process)
 
 
 def run(
@@ -271,7 +279,7 @@ def run(
         for path in root.rglob("*"):
             if path.is_dir():
                 path.chmod(0o755)
-        command = scan_command(root / source.name, output / "scan.json", scan_timeout)
+        command = scan_command(root / resolved.name, output / "scan.json", scan_timeout)
         manifest["scan_argv"] = command
         exit_code = run_scan(command, output)
         manifest.update(scan_status="finished", scan_exit_code=exit_code)
@@ -291,7 +299,7 @@ def run(
         review = review_findings(
             report, raw, exit_code, artifacts, root, output, reviewer, max_groups=max_review_groups
         )
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         review = ReviewReport(
             scan_sha256=digest(raw) if raw else "",
             scan_exit_code=exit_code,
@@ -299,7 +307,11 @@ def run(
             selected_count=0,
             reviewed_count=0,
             entries=[],
-            errors=[f"{type(exc).__name__}: {exc}"],
+            errors=[
+                "Review interrupted; scanner result unchanged"
+                if isinstance(exc, KeyboardInterrupt)
+                else f"{type(exc).__name__}: {exc}"
+            ],
         )
     try:
         write_json(output / "manifest.json", manifest)

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import socket
+import subprocess
 import sys
+import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -172,7 +177,7 @@ def test_prepare_only_never_calls_agent(tmp_path: Path, monkeypatch: pytest.Monk
     assert all(item["display_action"] == "retain" for item in report["entries"])
 
 
-@pytest.mark.parametrize("filename", ["README.md", "readme", "model-card.md", "MODEL_CARD.txt"])
+@pytest.mark.parametrize("filename", ["README.md", "readme", "model-card.md", "MODEL_CARD.txt", "modelcard.md"])
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
 def test_full_document_preserves_later_fences_and_raw_byte_citations(
     tmp_path: Path, filename: str, newline: bytes
@@ -303,8 +308,9 @@ def test_process_bounds(tmp_path: Path, program: str, limit: int, error: type[Ex
     assert isinstance(failure.value.__cause__, error)
 
 
+@pytest.mark.parametrize("umask", [0o022, 0o077])
 def test_docker_worker_has_no_host_fallback_and_always_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, umask: int
 ) -> None:
     calls: list[list[str]] = []
 
@@ -318,8 +324,14 @@ def test_docker_worker_has_no_host_fallback_and_always_cleans_up(
 
     monkeypatch.setattr("modelaudit.review.codex.run_bounded", execute)
     reviewer = DockerReviewer("sha256:" + "a" * 64, "review-private", "http://gateway:8080/v1", "test-model")
-    with pytest.raises(TimeoutError):
-        reviewer.review([], [], tmp_path, tmp_path)
+    previous_umask = os.umask(umask)
+    try:
+        with pytest.raises(TimeoutError):
+            reviewer.review([], [], tmp_path, tmp_path)
+    finally:
+        os.umask(previous_umask)
+    assert (tmp_path / "request").stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / "request/schema.json").stat().st_mode & 0o777 == 0o444
     command = next(c for c in calls if c[1] == "run")
     assert "--read-only" in command and "--cap-drop=ALL" in command
     assert "--user" in command and "10001:10001" in command
@@ -353,6 +365,32 @@ def test_gateway_is_model_and_tool_scoped() -> None:
             request_body(json.dumps(body).encode(), "test-model")
 
 
+@pytest.mark.parametrize("kind", ["function", "custom"])
+@pytest.mark.parametrize("in_input", [False, True])
+def test_gateway_accepts_codex_client_tool_namespaces(kind: str, in_input: bool) -> None:
+    tool = {"type": "namespace", "name": "clock", "tools": [{"type": kind, "name": "sleep"}]}
+    body: dict[str, Any] = {"model": "test-model"}
+    if in_input:
+        body["input"] = [{"type": "additional_tools", "role": "developer", "tools": [tool]}]
+    else:
+        body["tools"] = [tool]
+    result = json.loads(request_body(json.dumps(body).encode(), "test-model"))
+    assert (result["input"][0]["tools"] if in_input else result["tools"]) == [tool]
+
+
+@pytest.mark.parametrize("kind", ["web_search", "computer", "mcp", "namespace"])
+@pytest.mark.parametrize("in_input", [False, True])
+def test_gateway_rejects_hosted_tools_inside_namespace(kind: str, in_input: bool) -> None:
+    tool = {"type": "namespace", "name": "hidden", "tools": [{"type": kind, "name": "remote"}]}
+    body: dict[str, Any] = {"model": "test-model"}
+    if in_input:
+        body["input"] = [{"type": "additional_tools", "role": "developer", "tools": [tool]}]
+    else:
+        body["tools"] = [tool]
+    with pytest.raises(ValueError, match="client-side"):
+        request_body(json.dumps(body).encode(), "test-model")
+
+
 def test_render_does_not_activate_artifact_markup_or_controls() -> None:
     output = escaped('<img src="https://example.com"> ![x](https://example.com)\x1b[2J')
     assert "<img" not in output and "![" not in output and "\x1b" not in output
@@ -373,13 +411,18 @@ def test_pr1913_recorded_cases_remain_blind_and_preserve_baseline(tmp_path: Path
             assert "expected_display" not in request
             assert "requires_execution_warning" not in request
             assert "case_id" not in request
+            assert artifacts.stat().st_mode & 0o777 == 0o755
             return super().review(findings, evidence, artifacts, output)
 
     # Deliberately always returns favorable advice, proving malicious cases count as unsafe.
-    for index, case in enumerate(fixture["cases"]):
-        result = replay(case, tmp_path / f"{index:03d}", BlindReviewer())
-        assert result["scan_exit_code"] == case["scan_exit_code"]
-        results.append(result)
+    previous_umask = os.umask(0o077)
+    try:
+        for index, case in enumerate(fixture["cases"]):
+            result = replay(case, tmp_path / f"{index:03d}", BlindReviewer())
+            assert result["scan_exit_code"] == case["scan_exit_code"]
+            results.append(result)
+    finally:
+        os.umask(previous_umask)
     summary = score(results)
     assert summary["cases"] == 18
     assert summary["alert_cases"] == 17
@@ -400,6 +443,186 @@ def test_real_scanner_still_exits_one_after_favorable_advice(tmp_path: Path) -> 
     assert report["review_status"] == "complete"
     assert report["scan_exit_code"] == 1
     assert report["scanner_issue_count"] == len(scan["issues"])
+
+
+def test_actual_ip_and_domain_issues_and_checks_are_selected(tmp_path: Path) -> None:
+    from modelaudit.scanners.text_scanner import TextScanner
+
+    source = tmp_path / "modelcard.md"
+    source.write_text(
+        'HOST = "192.168.1.100"\nHOST6 = "2001:db8:1234:5678:abcd:1234:5678:9abc"\nHOSTNAME = "payload.example"\n'
+    )
+    root = tmp_path / "snapshot"
+    artifacts = snapshot(source, root, max_bytes=10000)
+    report = TextScanner().scan(str(root / source.name)).to_dict()
+    findings, _ = index_findings(report, "report-digest", root, artifacts)
+    for kind in ("ipv4_address", "ipv6_address", "domain_name"):
+        matches = [finding for finding in findings if finding.record.get("details", {}).get("type") == kind]
+        assert any(f.pointer.startswith("/issues/") for f in matches), kind
+        assert any(f.pointer.startswith("/checks/") for f in matches), kind
+        assert all(f.selected for f in matches), kind
+
+
+def test_parent_directory_input_scans_only_its_resolved_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "input"
+    (source / "child").mkdir(parents=True)
+    (source / "README.md").write_text("model card")
+    captured: list[str] = []
+
+    def scan(command: list[str], output: Path) -> int:
+        captured.append(command[4])
+        (output / "scan.json").write_text('{"issues": [], "checks": []}')
+        return 0
+
+    monkeypatch.setattr(runner, "run_scan", scan)
+    output = tmp_path / "bundle"
+    assert runner.run(source / "child/..", output, None) == 0
+    assert captured == [str(output / "artifacts/input")]
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 2])
+def test_review_interruption_preserves_completed_scanner_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    class InterruptedReviewer(FakeReviewer):
+        def review(
+            self, findings: list[Finding], evidence: list[Evidence], artifacts: Path, output: Path
+        ) -> AgentResponse:
+            raise KeyboardInterrupt
+
+    source = tmp_path / "README.md"
+    source.write_text("model card")
+    captured = fake_scan(monkeypatch, exit_code)
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, InterruptedReviewer()) == exit_code
+    assert (output / "scan.json").read_bytes() == captured[0]
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    review = json.loads((output / "review.json").read_bytes())
+    assert manifest["scan_exit_code"] == review["scan_exit_code"] == exit_code
+    assert manifest["scan_sha256"] == review["scan_sha256"] == digest(captured[0])
+    assert review["review_status"] == "failed"
+    assert "interrupted" in review["errors"][0]
+
+
+def test_scanner_cancellation_kills_descendants(tmp_path: Path) -> None:
+    group_path = tmp_path / "scanner-group.txt"
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        listener.settimeout(10)
+        child = (
+            "import socket,time; "
+            f"connection=socket.create_connection({listener.getsockname()!r}); "
+            "connection.sendall(b'ready'); time.sleep(60)"
+        )
+        scanner = (
+            "import os,subprocess,sys; from pathlib import Path; "
+            f"Path({str(group_path)!r}).write_text(str(os.getpgrp())); "
+            f"subprocess.run([sys.executable,'-c',{child!r}],check=True)"
+        )
+        driver = (
+            "import signal,sys; from pathlib import Path\n"
+            "from modelaudit.review.runner import run_scan\n"
+            "from modelaudit.review.process import terminate\n"
+            "signal.signal(signal.SIGTERM,terminate)\n"
+            "try:\n"
+            f"    run_scan([sys.executable,'-c',{scanner!r}],Path({str(tmp_path)!r}))\n"
+            "except KeyboardInterrupt:\n"
+            "    sys.exit(2)\n"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", driver],
+            env={"PYTHONPATH": str(Path(runner.__file__).resolve().parents[2])},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        ) as process:
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(10)
+                    assert connection.recv(5, socket.MSG_WAITALL) == b"ready"
+                    process.send_signal(signal.SIGTERM)
+                    assert process.wait(timeout=10) == 2
+                    assert connection.recv(1) == b""
+            finally:
+                if group_path.exists():
+                    with suppress(ProcessLookupError):
+                        os.killpg(int(group_path.read_text()), signal.SIGKILL)
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+
+
+def test_evaluator_sigterm_removes_daemon_owned_worker(tmp_path: Path) -> None:
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    active = tmp_path / "worker.json"
+    removed = tmp_path / "removed.txt"
+    docker = binary / "docker"
+    docker.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,sys,time\nfrom pathlib import Path\n"
+        "if sys.argv[1:3] == ['network','inspect']:\n"
+        '    print(\'[{"Internal":true,"Driver":"bridge"}]\')\n'
+        "elif sys.argv[1] == 'run':\n"
+        f"    pending=Path({str(active.with_suffix('.pending'))!r})\n"
+        "    pending.write_text(json.dumps({'group':os.getpgrp()}))\n"
+        f"    pending.rename({str(active)!r})\n"
+        "    time.sleep(60)\n"
+        "elif sys.argv[1:3] == ['rm','--force']:\n"
+        f"    Path({str(removed)!r}).write_text(sys.argv[3])\n"
+        f"    Path({str(active)!r}).unlink(missing_ok=True)\n"
+    )
+    docker.chmod(0o755)
+    fixture = Path(__file__).parent / "assets/agent_review_pr1913.json"
+    command = [
+        sys.executable,
+        "-m",
+        "modelaudit.review.evaluate",
+        "--cases",
+        str(fixture),
+        "--output-dir",
+        str(tmp_path / "evaluation"),
+        "--runs",
+        "1",
+        "--worker-image",
+        "sha256:" + "a" * 64,
+        "--worker-network",
+        "review",
+        "--proxy-url",
+        "http://gateway:8080/v1",
+        "--codex-model",
+        "test-model",
+    ]
+    worker_group: int | None = None
+    with subprocess.Popen(
+        command,
+        env={
+            "PATH": str(binary) + os.pathsep + os.defpath,
+            "PYTHONPATH": str(Path(runner.__file__).resolve().parents[2]),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        try:
+            deadline = time.monotonic() + 10
+            while not active.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert active.exists(), "Evaluator did not start the worker"
+            worker_group = json.loads(active.read_bytes())["group"]
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=10) == 2
+            assert removed.read_text().startswith("modelaudit-review-")
+            assert not active.exists()
+        finally:
+            if worker_group is not None:
+                with suppress(ProcessLookupError):
+                    os.killpg(worker_group, signal.SIGKILL)
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
 
 
 @pytest.mark.parametrize("max_groups", [1, 8])

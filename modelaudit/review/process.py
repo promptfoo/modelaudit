@@ -10,6 +10,18 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
+
+
+def terminate(signum: int, frame: FrameType | None) -> None:
+    raise KeyboardInterrupt
+
+
+def kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    # The leader can exit while descendants are still running.
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
 
 
 @dataclass(frozen=True)
@@ -86,7 +98,4 @@ def run_bounded(
         except (TimeoutError, ValueError, subprocess.TimeoutExpired) as exc:
             raise ProcessLimitError(str(exc), bytes(outputs["stdout"]), bytes(outputs["stderr"])) from exc
         finally:
-            # The leader can exit while descendants are still running.
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            kill_process_group(process)

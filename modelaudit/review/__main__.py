@@ -6,9 +6,9 @@ import argparse
 import signal
 import sys
 from pathlib import Path
-from types import FrameType
 
 from .codex import DockerReviewer
+from .process import terminate
 from .runner import run
 
 
@@ -54,10 +54,6 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         print(f"Review could not start: {str(exc)!a}", file=sys.stderr)
         return 2
-
-
-def terminate(signum: int, frame: FrameType | None) -> None:
-    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":

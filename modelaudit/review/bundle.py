@@ -25,7 +25,7 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def is_document(path: str) -> bool:
-    return bool(re.fullmatch(r"(?:readme|model[-_]card)(?:\.(?:md|markdown|rst|txt))?", Path(path).name, re.I))
+    return bool(re.fullmatch(r"(?:readme|model[-_]?card)(?:\.(?:md|markdown|rst|txt))?", Path(path).name, re.I))
 
 
 def snapshot(source: Path, destination: Path, *, max_bytes: int, max_files: int = 10000) -> list[Artifact]:
@@ -140,7 +140,21 @@ def index_findings(
             network = record.get("name") == "Network Communication Detection" or (
                 isinstance(details, dict)
                 and details.get("type")
-                in {"url_detected", "network_function", "network_library", "network_command", "ip_address"}
+                in {
+                    "url_detected",
+                    "cloud_storage_url",
+                    "domain",
+                    "domain_name",
+                    "ipv4_address",
+                    "ipv6_address",
+                    "network_function",
+                    "network_library",
+                    "network_command",
+                    "cc_pattern",
+                    "suspicious_port",
+                    "explicit_network_pattern",
+                    "blacklisted_domain",
+                }
             )
             selected = bool(
                 artifact

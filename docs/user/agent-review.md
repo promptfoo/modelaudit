@@ -27,7 +27,8 @@ stdout are saved. Host API-key environment variables are not passed to the scann
 
 Once scanning finishes, the command returns **that scanner process's exit code**, including when
 review fails. `0`, `1`, and `2` retain their scanner meanings. Preparation errors before the scan
-return `2`. Cancellation returns `2` and stops the worker. An exit of `0` does **not** establish that
+return `2`. Handled interruption stops the worker and preserves a captured scanner exit; interruption
+before a scanner exit is captured returns `2`. An exit of `0` does **not** establish that
 review completed: consumers that require review must also inspect `review_status` in `review.json`.
 
 ## Evidence and output

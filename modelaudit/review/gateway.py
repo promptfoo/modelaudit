@@ -15,6 +15,21 @@ from typing import Any
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
 
+def client_tool(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    if tool.get("type") in ("function", "custom"):
+        return True
+    if tool.get("type") == "namespace":
+        nested = tool.get("tools")
+        return (
+            isinstance(nested, list)
+            and bool(nested)
+            and all(isinstance(item, dict) and item.get("type") in ("function", "custom") for item in nested)
+        )
+    return False
+
+
 def request_body(raw: bytes, model: str) -> bytes:
     if len(raw) > MAX_REQUEST_BYTES:
         raise ValueError("Request body exceeds gateway limit")
@@ -27,7 +42,16 @@ def request_body(raw: bytes, model: str) -> bytes:
     body["max_output_tokens"] = min(limit, 4096)
     body["store"] = False
     # Do not permit provider-hosted tools or background work through this relay.
-    if body.get("background") or any(tool.get("type") not in {"function", "custom"} for tool in body.get("tools", [])):
+    tool_lists = [body.get("tools", [])]
+    if isinstance(body.get("input"), list):
+        tool_lists.extend(
+            item.get("tools")
+            for item in body["input"]
+            if isinstance(item, dict) and item.get("type") == "additional_tools"
+        )
+    if body.get("background") or any(
+        not isinstance(items, list) or not all(client_tool(tool) for tool in items) for items in tool_lists
+    ):
         raise ValueError("Only client-side Codex tools are allowed")
     return json.dumps(body, allow_nan=False).encode()
 
