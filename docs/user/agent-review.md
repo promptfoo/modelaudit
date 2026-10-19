@@ -22,6 +22,10 @@ This prototype accepts local model directories or individual README/model-card d
 hosts. For model artifacts, supply a directory containing all required companion files; individual
 model files are rejected before scanning. Acquire remote models separately and retain their immutable
 upstream revision.
+Recognized model formats are rejected as individual inputs even when renamed to a document filename.
+Supported document names are `README` and `model_card`, with an optional `.md`, `.markdown`, `.rst`,
+or `.txt` extension, plus `modelcard` with one of those extensions (case-insensitive).
+Other names, including `model-card.md`, are outside this prototype's review scope.
 It copies regular files into a bounded snapshot (2 GiB and 10,000 entries by default), rejects
 symlinks/special files, and scans the copy with the installed ModelAudit CLI. Use
 `--max-snapshot-bytes` to set a larger explicit budget for weights. No model is loaded for inference.
@@ -52,6 +56,9 @@ review completed: consumers that require review must also inspect `review_status
 Issue/check duplicates retain separate identities. All original issues and failed checks remain
 visible; unrelated findings and existing INFO/DEBUG records receive `not_reviewed`. The complete
 scanner report also retains passed/skipped checks and coverage information.
+Snapshot roles are filename hints. Review additionally requires per-file scanner evidence of a
+text-only format; executable formats disguised as documents, mixed formats, and missing format
+provenance remain outside the review scope.
 
 Review uses the entire relevant UTF-8 document, up to 256 KiB per document and 2 MiB across documents.
 This preserves cross-fence and prose context. Oversized/undecodable documents, changed hashes,

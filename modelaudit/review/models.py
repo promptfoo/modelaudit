@@ -22,7 +22,7 @@ class Artifact(Contract):
     path: str
     sha256: str
     size: int
-    role: Literal["documentation", "artifact"]
+    role: Literal["documentation", "artifact"] = Field(description="Filename hint, not a verified file format")
 
 
 class Evidence(Contract):

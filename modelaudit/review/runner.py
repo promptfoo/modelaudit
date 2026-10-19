@@ -253,8 +253,8 @@ def run(
     resolved = source.resolve(strict=True)
     if resolved.is_file() and not is_document(resolved.name):
         raise ValueError(
-            "Individual inputs must be README/model-card documents; "
-            "for model artifacts, pass a directory containing the model and all required companion files"
+            "Individual inputs must use a supported README/model-card filename; "
+            "for other inputs, pass a directory containing the model and all required companion files"
         )
     if output == resolved or resolved in output.parents or output in resolved.parents:
         raise ValueError("Output must be outside the input tree")
@@ -296,7 +296,17 @@ def run(
         for path in root.rglob("*"):
             if path.is_dir():
                 path.chmod(0o755)
-        command = scan_command(root / resolved.name, output / "scan.json", scan_timeout)
+        input_path = root / resolved.name
+        if input_path.is_file():
+            from modelaudit.utils.file.detection import detect_file_format_from_magic
+
+            detected = detect_file_format_from_magic(str(input_path))
+            if detected not in {"unknown", "text"}:
+                raise ValueError(
+                    f"Individual document input has non-text format {detected!r}; "
+                    "pass a directory containing the model and all required companion files"
+                )
+        command = scan_command(input_path, output / "scan.json", scan_timeout)
         manifest["scan_argv"] = command
         exit_code = run_scan(command, output)
         manifest.update(scan_status="finished", scan_exit_code=exit_code)

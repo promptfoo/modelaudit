@@ -25,7 +25,32 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def is_document(path: str) -> bool:
-    return bool(re.fullmatch(r"(?:readme|model[-_]?card)(?:\.(?:md|markdown|rst|txt))?", Path(path).name, re.I))
+    return bool(
+        re.fullmatch(
+            r"(?:(?:readme|model_card)(?:\.(?:md|markdown|rst|txt))?|modelcard\.(?:md|markdown|rst|txt))",
+            Path(path).name,
+            re.I,
+        )
+    )
+
+
+def text_locations(report: dict[str, Any]) -> set[str]:
+    """Require per-file scanner provenance, including supplemental format scans."""
+    assets = report.get("assets", [])
+    metadata = report.get("file_metadata", {})
+    if not isinstance(assets, list) or not isinstance(metadata, dict):
+        return set()
+    types: dict[str, set[str]] = {}
+    for asset in assets:
+        if isinstance(asset, dict) and isinstance(asset.get("path"), str):
+            types.setdefault(asset["path"], set()).add(str(asset.get("type")))
+    return {
+        path
+        for path, formats in types.items()
+        if formats == {"text"}
+        and isinstance(metadata.get(path), dict)
+        and metadata[path].get("scanner_dependency_ids") == ["text"]
+    }
 
 
 def snapshot(source: Path, destination: Path, *, max_bytes: int, max_files: int = 10000) -> list[Artifact]:
@@ -121,6 +146,7 @@ def index_findings(
     report: dict[str, Any], scan_sha256: str, root: Path, artifacts: list[Artifact]
 ) -> tuple[list[Finding], list[Evidence]]:
     by_location = {str(root / item.path): item for item in artifacts}
+    confirmed_text = text_locations(report)
     evidence_by_path: dict[str, Evidence] = {}
     findings: list[Finding] = []
     evidence_bytes = 0
@@ -159,10 +185,11 @@ def index_findings(
             selected = bool(
                 artifact
                 and artifact.role == "documentation"
+                and str(record.get("location", "")) in confirmed_text
                 and network
                 and record.get("severity") in {"warning", "critical"}
             )
-            reason = "documentation network finding" if selected else "outside documentation network scope"
+            reason = "documentation network finding" if selected else "outside verified text-document network scope"
             ids: list[str] = []
             if selected and artifact:
                 if artifact.path not in evidence_by_path:
