@@ -27,7 +27,9 @@ Supported document names are `README` and `model_card`, with an optional `.md`, 
 or `.txt` extension, plus `modelcard` with one of those extensions (case-insensitive).
 Other names, including `model-card.md`, are outside this prototype's review scope.
 It copies regular files into a bounded snapshot (2 GiB and 10,000 entries by default), rejects
-symlinks/special files, and scans the copy with the installed ModelAudit CLI. Use
+symlinks/special files, and scans the copy with the installed ModelAudit CLI. Input paths, including
+parent directories, must not contain symlink aliases; use physical paths such as `/private/tmp`
+in place of macOS `/tmp`. The snapshot opens each path component without following symlinks. Use
 `--max-snapshot-bytes` to set a larger explicit budget for weights. No model is loaded for inference.
 The initial scanner runs locally with `--verbose --quiet --no-cache --format json`; its exact
 arguments, timeout, versions, source path, and coverage metadata are recorded. Scanner stderr and

@@ -57,9 +57,8 @@ def snapshot(source: Path, destination: Path, *, max_bytes: int, max_files: int 
     """Copy regular files through anchored directory descriptors (POSIX prototype)."""
     if os.name != "posix":
         raise ValueError("The review prototype requires a POSIX host")
-    if source.is_symlink():
-        raise ValueError("Snapshot source must not be a symlink")
-    source = source.resolve(strict=True)
+    # Normalize dot segments without following a mutable source or ancestor symlink.
+    source = Path(os.path.abspath(source))
     destination.mkdir(mode=0o700)
     artifacts: list[Artifact] = []
     total = 0
@@ -76,6 +75,9 @@ def snapshot(source: Path, destination: Path, *, max_bytes: int, max_files: int 
             target.mkdir(mode=0o700)
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
             try:
+                opened = os.fstat(child)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise ValueError("Snapshot source changed while opening")
                 names: list[str] = []
                 with os.scandir(child) as listing:
                     for entry in listing:
@@ -123,8 +125,13 @@ def snapshot(source: Path, destination: Path, *, max_bytes: int, max_files: int 
             )
         )
 
-    parent_fd = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = os.open(source.anchor, flags)
     try:
+        for part in source.parts[1:-1]:
+            child_fd = os.open(part, flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
         copy_entry(parent_fd, source.name, Path(source.name))
     finally:
         os.close(parent_fd)

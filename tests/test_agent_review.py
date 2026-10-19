@@ -27,6 +27,7 @@ from modelaudit.review.models import (
     MAX_DOCUMENT_BYTES,
     MAX_GROUP_FINDINGS,
     AgentResponse,
+    Artifact,
     Assessment,
     Evidence,
     Finding,
@@ -1056,3 +1057,122 @@ def test_single_model_disguised_as_document_requires_a_companion_directory(
     review = json.loads((output / "review.json").read_bytes())
     assert manifest["scan_status"] == "not_run"
     assert "non-text format 'pickle'" in review["errors"][0]
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+@pytest.mark.parametrize("entrypoint", ["snapshot", "runner"])
+def test_snapshot_root_symlink_substitution_cannot_copy_private_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, entrypoint: str
+) -> None:
+    source = tmp_path / ("README.md" if kind == "file" else "model")
+    private = tmp_path / "private" / source.name
+    private.parent.mkdir()
+    if kind == "directory":
+        source.mkdir()
+        private.mkdir()
+    (source if kind == "file" else source / "README.md").write_text("public input")
+    (private if kind == "file" else private / "README.md").write_text("PRIVATE_SENTINEL")
+    original_stat = os.stat
+    swapped = False
+
+    def swap_after_lstat(path: Any, *, dir_fd: int | None = None, follow_symlinks: bool = True) -> os.stat_result:
+        nonlocal swapped
+        info = original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        is_root = (dir_fd is None and path == source) or (dir_fd is not None and path == source.name)
+        if not swapped and not follow_symlinks and is_root:
+            source.rename(tmp_path / "original-input")
+            source.symlink_to(private, target_is_directory=kind == "directory")
+            swapped = True
+        return info
+
+    monkeypatch.setattr(os, "stat", swap_after_lstat)
+    output = tmp_path / "bundle"
+    if entrypoint == "snapshot":
+        with pytest.raises((OSError, ValueError)):
+            snapshot(source, output, max_bytes=10000)
+    else:
+        calls = fake_scan(monkeypatch, 1)
+        assert runner.run(source, output, None) == 2
+        assert not calls
+        assert json.loads((output / "manifest.json").read_text())["scan_status"] == "not_run"
+    assert swapped
+    assert not any(b"PRIVATE_SENTINEL" in path.read_bytes() for path in output.rglob("*") if path.is_file())
+
+
+@pytest.mark.parametrize("when", ["before_open", "after_open"])
+def test_snapshot_anchors_ancestor_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str) -> None:
+    shared = tmp_path / "shared"
+    source = shared / "nested" / "README.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("public input")
+    private = tmp_path / "private"
+    (private / "nested").mkdir(parents=True)
+    (private / "nested" / "README.md").write_text("PRIVATE_SENTINEL")
+    original_open = os.open
+    swapped = False
+
+    def substitute() -> None:
+        nonlocal swapped
+        shared.rename(tmp_path / "original-shared")
+        shared.symlink_to(private, target_is_directory=True)
+        swapped = True
+
+    def swap_after_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if not swapped and path == "shared" and dir_fd is not None:
+            substitute()
+        return descriptor
+
+    output = tmp_path / "snapshot"
+    if when == "before_open":
+        substitute()
+        with pytest.raises(OSError):
+            snapshot(source, output, max_bytes=10000)
+        assert not list(output.rglob("README.md"))
+    else:
+        monkeypatch.setattr(os, "open", swap_after_open)
+        artifacts = snapshot(source, output, max_bytes=10000)
+        assert len(artifacts) == 1
+        assert (output / "README.md").read_text() == "public input"
+    assert swapped
+
+
+def test_snapshot_rejects_directory_identity_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "model"
+    source.mkdir()
+    (source / "README.md").write_text("original")
+    original_open = os.open
+    swapped = False
+
+    def replace_before_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        nonlocal swapped
+        if not swapped and path == "model" and dir_fd is not None:
+            source.rename(tmp_path / "original-model")
+            source.mkdir()
+            (source / "README.md").write_text("replacement")
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replace_before_open)
+    with pytest.raises(ValueError, match="changed while opening"):
+        snapshot(source, tmp_path / "snapshot", max_bytes=10000)
+    assert swapped
+
+
+def test_changed_input_kind_cannot_bypass_individual_document_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "model"
+    source.mkdir()
+    calls = fake_scan(monkeypatch, 0)
+
+    def substitute_before_snapshot(source: Path, destination: Path, *, max_bytes: int) -> list[Artifact]:
+        source.rmdir()
+        source.write_text("unrecognized model artifact")
+        return snapshot(source, destination, max_bytes=max_bytes)
+
+    monkeypatch.setattr(runner, "snapshot", substitute_before_snapshot)
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, None) == 2
+    assert not calls
+    assert json.loads((output / "manifest.json").read_text())["scan_status"] == "not_run"

@@ -248,15 +248,14 @@ def run(
     scan_timeout: int = 300,
     max_review_groups: int = 8,
 ) -> int:
-    source = source.absolute()
+    source = Path(os.path.abspath(source))
     output = output.resolve()
-    resolved = source.resolve(strict=True)
-    if resolved.is_file() and not is_document(resolved.name):
+    if source.is_file() and not is_document(source.name):
         raise ValueError(
             "Individual inputs must use a supported README/model-card filename; "
             "for other inputs, pass a directory containing the model and all required companion files"
         )
-    if output == resolved or resolved in output.parents or output in resolved.parents:
+    if output == source or source in output.parents or output in source.parents:
         raise ValueError("Output must be outside the input tree")
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     manifest: dict[str, Any] = {
@@ -265,7 +264,7 @@ def run(
         "prompt_sha256": digest(POLICY.encode()),
         "response_schema_sha256": digest(json.dumps(AgentResponse.model_json_schema(), sort_keys=True).encode()),
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "source": str(resolved),
+        "source": str(source),
         "modelaudit_version": installed_version("modelaudit"),
         "picklescan_version": installed_version("modelaudit-picklescan"),
         "picklescan_source": getattr(importlib.util.find_spec("modelaudit_picklescan"), "origin", None),
@@ -296,8 +295,10 @@ def run(
         for path in root.rglob("*"):
             if path.is_dir():
                 path.chmod(0o755)
-        input_path = root / resolved.name
+        input_path = root / source.name
         if input_path.is_file():
+            if not is_document(input_path.name):
+                raise ValueError("Individual inputs must use a supported README/model-card filename")
             from modelaudit.utils.file.detection import detect_file_format_from_magic
 
             detected = detect_file_format_from_magic(str(input_path))
