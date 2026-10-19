@@ -1,4 +1,4 @@
-# Supply the immutable image ID of the ordinary ModelAudit image built from this branch.
+# Supply a trusted ModelAudit image built from this branch: a local tag or repository manifest digest.
 ARG MODELAUDIT_IMAGE
 FROM ${MODELAUDIT_IMAGE}
 

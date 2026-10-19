@@ -10,6 +10,7 @@ import platform
 import subprocess
 import sys
 from collections import defaultdict
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -182,7 +183,7 @@ def review_findings(
         scan_sha256=digest(raw),
         scan_exit_code=exit_code,
         scanner_issue_count=len(report.get("issues", [])),
-        scanner_failed_check_count=sum(c.get("status") == "failed" for c in report.get("checks", [])),
+        scanner_failed_check_count=report.get("failed_checks"),
         review_status=status,
         selected_count=len(selected),
         reviewed_count=reviewed,
@@ -317,14 +318,15 @@ def run(
         write_json(output / "manifest.json", manifest)
         write_json(output / "review.json", review.model_dump())
         (output / "review.md").write_text(render_markdown(review), encoding="utf-8")
-    except Exception as exc:
-        # Even disk exhaustion while writing advisory output must not replace a completed scan's exit.
-        print(f"Review output failed: {str(exc)!a}; scanner exit: {exit_code}", file=sys.stderr)
-        return exit_code
-    # Escape controls in paths/errors; raw diagnostics remain in the private bundle.
-    print(
-        f"Advisory review: {review.review_status}; scanner exit: {exit_code}; bundle: {str(output)!a}", file=sys.stderr
-    )
-    for error in review.errors:
-        print(ascii(error), file=sys.stderr)
+        # Escape controls in paths/errors; raw diagnostics remain in the private bundle.
+        print(
+            f"Advisory review: {review.review_status}; scanner exit: {exit_code}; bundle: {str(output)!a}",
+            file=sys.stderr,
+        )
+        for error in review.errors:
+            print(ascii(error), file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as exc:
+        # Failed or interrupted advisory output, including diagnostics, cannot replace the scanner exit.
+        with suppress(Exception, KeyboardInterrupt):
+            print(f"Review output incomplete: {str(exc)!a}; scanner exit: {exit_code}", file=sys.stderr)
     return exit_code

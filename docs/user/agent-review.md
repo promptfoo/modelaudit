@@ -87,13 +87,18 @@ Preserve the package layout, including `bin/`, `codex-resources/`, `codex-path/`
 `codex-package.json`; the standalone executable omits required sandbox resources. Then build:
 
 ```sh
-docker build -t modelaudit-review-scanner .
-docker image inspect --format '{{.Id}}' modelaudit-review-scanner
-# Substitute the returned immutable image ID below.
-docker build --build-arg MODELAUDIT_IMAGE=sha256:<scanner-image-id> \
+docker build -t modelaudit-review-scanner:prototype .
+docker image inspect --format '{{.Id}}' modelaudit-review-scanner:prototype
+docker build --build-arg MODELAUDIT_IMAGE=modelaudit-review-scanner:prototype \
   -f modelaudit/review/Dockerfile -t modelaudit-review-worker /path/to/codex-build-context
 docker image inspect --format '{{.Id}}' modelaudit-review-worker
 ```
+
+This recipe uses the default local Docker builder and a dedicated scanner tag. Record the scanner
+image ID and keep that tag unchanged during the worker build. For a remote/container builder,
+publish the scanner image to a trusted registry and use its repository-qualified manifest digest
+(`registry.example/modelaudit@sha256:...`). BuildKit does not accept a bare local image ID in `FROM`.
+Run reviewers only with the resulting immutable worker image ID/digest.
 
 Each document starts a fresh container with an unprivileged UID, read-only root and input mounts,
 all capabilities dropped, no new privileges, 2 CPUs, 4 GiB RAM, no swap, 128 processes, and 512 MiB
@@ -101,6 +106,7 @@ of temporary storage across work/home/tmp. The supervisor imposes a five-minute 
 4 MiB combined output limit, kills subprocess groups, and explicitly removes daemon-owned containers.
 Only the request and artifact snapshot are mounted. The original report and supervisor output
 directory, host home, credentials, and Docker socket are not mounted.
+Docker-injected proxy variables are cleared so the harness connects directly to the private gateway.
 
 The supervisor reviews at most eight documents per run by default (`--max-review-groups`).
 Remaining findings stay visible as `not_reviewed`, with a partial/failed review status. This bounds

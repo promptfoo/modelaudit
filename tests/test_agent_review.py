@@ -166,6 +166,34 @@ def test_advisory_write_failure_keeps_exit(tmp_path: Path, monkeypatch: pytest.M
     assert runner.run(source, tmp_path / "bundle", FakeReviewer()) == 1
 
 
+@pytest.mark.parametrize("exit_code", [0, 1, 2])
+@pytest.mark.parametrize("stage", ["manifest.json", "review.json", "review.md", "diagnostic"])
+@pytest.mark.parametrize("failure", [KeyboardInterrupt, OSError])
+def test_final_output_failures_preserve_captured_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, stage: str, failure: type[BaseException]
+) -> None:
+    source = tmp_path / "README.md"
+    source.write_text("model card")
+    captured = fake_scan(monkeypatch, exit_code)
+    original_write = Path.write_text
+
+    def write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if path.name == stage:
+            raise failure("final output failed")
+        return original_write(path, data, *args, **kwargs)
+
+    def diagnostic(*args: Any, **kwargs: Any) -> None:
+        raise failure("diagnostic output failed")
+
+    if stage == "diagnostic":
+        monkeypatch.setattr(runner, "print", diagnostic, raising=False)
+    else:
+        monkeypatch.setattr(Path, "write_text", write)
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, FakeReviewer()) == exit_code
+    assert (output / "scan.json").read_bytes() == captured[0]
+
+
 def test_prepare_only_never_calls_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source = tmp_path / "README.md"
     source.write_text("# Setup\ngit clone https://github.com/example/model")
@@ -338,6 +366,9 @@ def test_docker_worker_has_no_host_fallback_and_always_cleans_up(
     assert "--security-opt=no-new-privileges" in command
     assert all("readonly" in command[i + 1] for i, token in enumerate(command) if token == "--mount")
     assert not any("OPENAI_API_KEY" in arg or "docker.sock" in arg for arg in command)
+    environment = [command[index + 1] for index, token in enumerate(command) if token == "--env"]
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY", "NO_PROXY"):
+        assert f"{key}=" in environment and f"{key.lower()}=" in environment
     assert calls[-1][1:3] == ["rm", "--force"]
 
 
@@ -418,8 +449,11 @@ def test_pr1913_recorded_cases_remain_blind_and_preserve_baseline(tmp_path: Path
     previous_umask = os.umask(0o077)
     try:
         for index, case in enumerate(fixture["cases"]):
-            result = replay(case, tmp_path / f"{index:03d}", BlindReviewer())
+            output = tmp_path / f"{index:03d}"
+            result = replay(case, output, BlindReviewer())
             assert result["scan_exit_code"] == case["scan_exit_code"]
+            report = json.loads((output / "review.json").read_bytes())
+            assert report["scanner_failed_check_count"] == case["report"]["failed_checks"]
             results.append(result)
     finally:
         os.umask(previous_umask)

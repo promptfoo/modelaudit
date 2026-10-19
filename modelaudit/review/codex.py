@@ -165,6 +165,13 @@ class DockerReviewer:
             if any(character in str(path) for character in (",", "\n", "\r")):
                 raise ValueError("Docker bind paths cannot contain commas or newlines")
         name = f"modelaudit-review-{uuid.uuid4().hex}"
+        # Docker client proxy configuration can inject credentials and redirect gateway requests.
+        proxy_environment = [
+            argument
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY")
+            for key in (name, name.lower())
+            for argument in ("--env", f"{key}=")
+        ]
         command = [
             "docker",
             "run",
@@ -184,6 +191,7 @@ class DockerReviewer:
             "--pids-limit=128",
             "--network",
             self.network,
+            *proxy_environment,
             "--tmpfs",
             "/work:rw,nosuid,nodev,size=268435456,uid=10001,gid=10001,mode=700",
             "--tmpfs",
