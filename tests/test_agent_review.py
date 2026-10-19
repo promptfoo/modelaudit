@@ -85,7 +85,7 @@ def fake_scan(monkeypatch: pytest.MonkeyPatch, exit_code: int, *, malformed: boo
             "success": exit_code != 2,
             "files_scanned": 1,
             "bytes_scanned": 100,
-            "has_errors": exit_code != 0,
+            "has_errors": exit_code == 2,
             "start_time": 0,
             "duration": 0,
             "total_checks": 1,
@@ -176,21 +176,34 @@ def test_final_output_failures_preserve_captured_exit(
     source.write_text("model card")
     captured = fake_scan(monkeypatch, exit_code)
     original_write = Path.write_text
+    original_json = runner.write_json
+    injected: list[str] = []
+
+    def write_json(path: Path, value: Any) -> None:
+        if path.name == stage:
+            injected.append(stage)
+            raise failure("JSON output failed")
+        original_json(path, value)
 
     def write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
         if path.name == stage:
+            injected.append(stage)
             raise failure("final output failed")
         return original_write(path, data, *args, **kwargs)
 
     def diagnostic(*args: Any, **kwargs: Any) -> None:
+        injected.append(stage)
         raise failure("diagnostic output failed")
 
-    if stage == "diagnostic":
+    if stage.endswith(".json"):
+        monkeypatch.setattr(runner, "write_json", write_json)
+    elif stage == "diagnostic":
         monkeypatch.setattr(runner, "print", diagnostic, raising=False)
     else:
         monkeypatch.setattr(Path, "write_text", write)
     output = tmp_path / "bundle"
     assert runner.run(source, output, FakeReviewer()) == exit_code
+    assert injected, "The final-output fault was not exercised"
     assert (output / "scan.json").read_bytes() == captured[0]
 
 
@@ -477,6 +490,86 @@ def test_real_scanner_still_exits_one_after_favorable_advice(tmp_path: Path) -> 
     assert report["review_status"] == "complete"
     assert report["scan_exit_code"] == 1
     assert report["scanner_issue_count"] == len(scan["issues"])
+
+
+def test_completed_warning_only_scan_can_receive_advice(tmp_path: Path) -> None:
+    source = tmp_path / "model"
+    source.mkdir()
+    (source / "README.md").write_text('HOST = "192.168.1.100"\n')
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, FakeReviewer()) == 1
+    scan = json.loads((output / "scan.json").read_bytes())
+    assert scan["has_errors"] is False and scan["files_scanned"] == 1
+    assert any(issue["severity"] == "warning" for issue in scan["issues"])
+    report = json.loads((output / "review.json").read_bytes())
+    reviewed = [entry for entry in report["entries"] if entry["status"] == "reviewed"]
+    assert report["review_status"] == "complete" and reviewed
+    assert all(entry["display_action"] == "de_emphasize" for entry in reviewed)
+    assert report["scan_exit_code"] == 1
+
+
+def test_core_warning_failure_is_not_incomplete_coverage(tmp_path: Path) -> None:
+    from modelaudit.core import scan_model_directory_or_file
+    from modelaudit.core_results import determine_exit_code
+
+    source = tmp_path / "README.md"
+    source.write_text('HOST = "192.168.1.100"\n')
+    output = tmp_path / "bundle"
+    output.mkdir()
+    root = output / "artifacts"
+    artifacts = snapshot(source, root, max_bytes=10000)
+    result = scan_model_directory_or_file(str(root / source.name), cache_enabled=False)
+    # Core and older reports retain this legacy flag; the current CLI normalizes it during aggregation.
+    assert result.success is False and determine_exit_code(result) == 1
+    raw = result.model_dump_json(indent=2).encode()
+    (output / "scan.json").write_bytes(raw)
+    review = runner.review_findings(json.loads(raw), raw, 1, artifacts, root, output, FakeReviewer())
+    reviewed = [entry for entry in review.entries if entry.status == "reviewed"]
+    assert review.review_status == "complete" and reviewed
+    assert all(entry.display_action == "de_emphasize" for entry in reviewed)
+    assert (output / "scan.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("indicator", ["operational_error", "inconclusive", "has_errors", "no_files"])
+def test_explicit_coverage_and_operational_failures_prevent_deemphasis(tmp_path: Path, indicator: str) -> None:
+    fixture = json.loads((Path(__file__).parent / "assets/agent_review_pr1913.json").read_bytes())
+    case = fixture["cases"][0]
+    if indicator == "operational_error":
+        case["report"]["file_metadata"] = {"/artifacts/README.md": {"operational_error": True}}
+    elif indicator == "inconclusive":
+        case["report"]["file_metadata"] = {"/artifacts/README.md": {"scan_outcome": "inconclusive"}}
+    elif indicator == "has_errors":
+        case["report"]["has_errors"] = True
+    else:
+        case["report"]["files_scanned"] = 0
+    result = replay(case, tmp_path / "bundle", FakeReviewer())
+    assert result["reviewed"] > 0 and result["de_emphasized"] == 0
+    report = json.loads((tmp_path / "bundle/review.json").read_bytes())
+    assert all(
+        entry["reason"] == "Scanner coverage is incomplete" for entry in report["entries"] if entry["assessment"]
+    )
+
+
+@pytest.mark.parametrize("shadow", ["modelaudit.py", "json.py"])
+def test_scanner_never_imports_from_artifact_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shadow: str
+) -> None:
+    untrusted = tmp_path / "untrusted"
+    untrusted.mkdir()
+    marker = tmp_path / "executed.txt"
+    (untrusted / shadow).write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\nraise SystemExit(99)\n"
+    )
+    source = untrusted / "README.md"
+    source.write_text('HOST = "192.168.1.100"\n')
+    # The parent has already imported the trusted package, as with an installed `python -I` entrypoint.
+    monkeypatch.chdir(untrusted)
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, None) == 1
+    assert not marker.exists()
+    scan = json.loads((output / "scan.json").read_bytes())
+    assert scan["files_scanned"] == 1
+    assert any(issue["details"].get("type") == "ipv4_address" for issue in scan["issues"])
 
 
 def test_actual_ip_and_domain_issues_and_checks_are_selected(tmp_path: Path) -> None:

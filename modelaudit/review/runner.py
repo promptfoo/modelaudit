@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from modelaudit.core_results import results_have_inconclusive_outcome
+from modelaudit.core_results import results_have_inconclusive_outcome, results_have_operational_error
 from modelaudit.models import ModelAuditResultModel
 
 from .bundle import digest, index_findings, snapshot, verify_artifact, write_json
@@ -128,8 +128,8 @@ def review_findings(
         model = ModelAuditResultModel.model_validate(report)
         coverage_complete = (
             exit_code in {0, 1}
-            and model.success is True
             and model.files_scanned > 0
+            and not results_have_operational_error(model)
             and not results_have_inconclusive_outcome(model)
         )
         for number, (artifact_path, group) in enumerate(groups.items()):
@@ -220,7 +220,9 @@ def run_scan(command: list[str], output: Path) -> int:
     with (
         (output / "scan.stdout.txt").open("xb") as stdout,
         (output / "scan.stderr.txt").open("xb") as stderr,
-        subprocess.Popen(command, stdout=stdout, stderr=stderr, env=environment, start_new_session=True) as process,
+        subprocess.Popen(
+            command, cwd=output, stdout=stdout, stderr=stderr, env=environment, start_new_session=True
+        ) as process,
     ):
         try:
             return process.wait()
