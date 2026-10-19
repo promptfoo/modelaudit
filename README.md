@@ -323,7 +323,7 @@ modelaudit model.pkl --format sarif --output results.sarif
 - **[Compatibility matrix](https://github.com/promptfoo/modelaudit/blob/main/docs/user/compatibility-matrix.md)** — file formats vs optional dependencies
 - **[Scanner selection](https://github.com/promptfoo/modelaudit/blob/main/docs/user/scanner-selection.md)** — targeted scanner allowlists and exclusions
 - **[Metadata extraction guide](https://github.com/promptfoo/modelaudit/blob/main/docs/user/metadata-extraction.md)** — safe metadata workflows and `--trust-loaders` guidance
-- **[Optional Codex review prototype](https://github.com/promptfoo/modelaudit/blob/main/docs/user/agent-review.md)** — advisory triage of README/model-card findings with unchanged scanner verdicts and exit codes
+- **[Optional AI triage](https://github.com/promptfoo/modelaudit/blob/main/docs/user/agent-review.md)** — setting `OPENAI_API_KEY` enables advisory README/model-card triage; use `--no-triage` to keep scans local
 - **[Offline/air-gapped guide](https://github.com/promptfoo/modelaudit/blob/main/docs/user/offline-air-gapped.md)** — secure operation without internet access
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability
 

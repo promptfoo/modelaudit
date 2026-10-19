@@ -3025,6 +3025,19 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
     sys.exit(determine_exit_code(audit_result))
 
 
+def _emit_triage(audit_result: ModelAuditResultModel) -> None:
+    """Keep optional triage failures and output separate from scanner results."""
+    try:
+        from .triage import triage_findings
+
+        message = triage_findings(audit_result)
+    except (Exception, KeyboardInterrupt) as exc:
+        message = f"AI triage unavailable ({type(exc).__name__}); scanner result unchanged."
+    if message:
+        with contextlib.suppress(OSError, KeyboardInterrupt):
+            click.echo("\n".join(_escape_terminal_text(line) for line in message.splitlines()), err=True)
+
+
 def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, verbose: bool) -> bool:
     """Return True when the local scan prefilter should skip a non-model file."""
     if _local_path_will_be_scanned(scan_path, skip_non_model_files=runtime.skip_non_model_files):
@@ -4489,6 +4502,11 @@ def delegate_info() -> None:
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option("--quiet", "-q", is_flag=True, help="Silence detection messages")
+@click.option(
+    "--no-triage",
+    is_flag=True,
+    help="Skip advisory AI triage (enabled when OPENAI_API_KEY is set; sends documentation findings to OpenAI)",
+)
 # Security behavior (2 flags)
 @click.option(
     "--blacklist",
@@ -4589,6 +4607,7 @@ def scan_command(
     output: str | None,
     verbose: bool,
     quiet: bool,
+    no_triage: bool,
     blacklist: tuple[str, ...],
     strict: bool,
     no_whitelist: bool,
@@ -4904,6 +4923,8 @@ def scan_command(
         flush_telemetry()
         raise
 
+    if not no_triage and not dry_run and os.environ.get("OPENAI_API_KEY", "").strip():
+        _emit_triage(audit_result)
     _record_scan_end_and_exit(audit_result, scan_start_time)
 
 
