@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,7 +17,8 @@ from modelaudit import cli as cli_module
 from modelaudit import triage
 from modelaudit.core_results import determine_exit_code
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanner_results import IssueSeverity
+from modelaudit.scanner_results import Check, CheckStatus, IssueSeverity
+from modelaudit.scanner_selection import SCANNER_SELECTION_CHECK_NAME, SCANNER_SELECTION_PREFERRED_KIND
 
 CORPUS = json.loads((Path(__file__).parent / "assets" / "agent_review_pr1913.json").read_text())
 
@@ -38,6 +41,7 @@ def report_for_case(tmp_path: Path, index: int = 0) -> ModelAuditResultModel:
 def mock_api(monkeypatch: pytest.MonkeyPatch, assessments: list[dict[str, str]]) -> MagicMock:
     response = MagicMock()
     response.__enter__.return_value = response
+    response.status_code = 200
     response.iter_content.return_value = [
         json.dumps(
             {
@@ -88,7 +92,7 @@ def test_pr1913_context_and_original_findings_preserved(
         assert output is None
         post.assert_not_called()
         return
-    assert output and "needs_attention" in output
+    assert output and "needs_attention" in "\n".join(output)
     body = post.call_args.kwargs["json"]
     evidence = json.loads(body["input"])
     assert "case_id" not in body["input"]
@@ -116,6 +120,58 @@ def test_request_contract_and_model_override(tmp_path: Path, monkeypatch: pytest
     assert body["max_output_tokens"] == 4096
     assert body["text"]["format"]["strict"] is True
     assert "test-key" not in json.dumps(body)
+
+
+@pytest.mark.parametrize("machine", ["machine api.openai.com", "default"])
+def test_prepared_request_does_not_use_netrc(machine: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    netrc = tmp_path / "netrc"
+    netrc.write_text(f"{machine} login unrelated-user password unrelated-password\n")
+    netrc.chmod(0o600)
+    monkeypatch.setenv("NETRC", str(netrc))
+    findings, _ = triage.prepare_findings(report_for_case(tmp_path))
+    captured: list[requests.PreparedRequest] = []
+
+    def send(session: requests.Session, request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:
+        captured.append(request)
+        raise requests.ConnectionError("intercepted request")
+
+    monkeypatch.setattr(requests.Session, "send", send)
+    with pytest.raises(requests.ConnectionError, match="intercepted request"):
+        triage.request_triage(findings, api_key="test-key", coverage_complete=True)
+    assert len(captured) == 1
+    assert captured[0].headers["Authorization"] == "Bearer test-key"
+
+
+def test_invalid_key_is_not_in_diagnostics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    post = mock_api(monkeypatch, [])
+    monkeypatch.setenv("OPENAI_API_KEY", "private-key\ninvalid-header")
+    echo = MagicMock()
+    monkeypatch.setattr(cli_module.click, "echo", echo)
+    cli_module._emit_triage(report_for_case(tmp_path))
+    assert "printable ASCII" in echo.call_args.args[0]
+    assert "private-key" not in echo.call_args.args[0]
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "status,detail", [(401, "Invalid API key"), (404, "Model not found"), (429, "Quota exhausted")]
+)
+def test_api_error_diagnostics_preserve_status_and_body(
+    status: int, detail: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    post = mock_api(monkeypatch, [])
+    post.return_value.status_code = status
+    post.return_value.iter_content.return_value = [f"{detail}\nprovider detail\x1b[2J".encode()]
+    echo = MagicMock()
+    monkeypatch.setattr(cli_module.click, "echo", echo)
+    scanned = report_for_case(tmp_path)
+    before = scanned.model_dump_json()
+    cli_module._emit_triage(scanned)
+    text = echo.call_args.args[0]
+    assert f"OpenAI HTTP {status}: {detail}" in text
+    assert r"\nprovider detail\x1b[2J" in text
+    assert "\n" not in text
+    assert scanned.model_dump_json() == before
 
 
 @pytest.mark.parametrize("kind", ["non_text", "mixed", "missing_provenance", "other_name", "info"])
@@ -152,7 +208,26 @@ def test_missing_context_or_coverage_cannot_get_benign_advice(
         result.has_errors = True
     mock_api(monkeypatch, [assessment()])
     output = triage.triage_findings(result)
-    assert output and "inconclusive" in output and "likely_benign" not in output
+    assert output and "inconclusive" in "\n".join(output) and "likely_benign" not in "\n".join(output)
+
+
+def test_suppressed_preferred_scanner_prevents_benign_advice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    result = report_for_case(tmp_path)
+    result.checks.append(
+        Check(
+            name=SCANNER_SELECTION_CHECK_NAME,
+            status=CheckStatus.SKIPPED,
+            message="Preferred scanner excluded by selection",
+            location=str(tmp_path / "model.pkl"),
+            details={"kind": SCANNER_SELECTION_PREFERRED_KIND, "skipped_scanner_id": "pickle"},
+        )
+    )
+    before = result.model_dump_json()
+    post = mock_api(monkeypatch, [assessment()])
+    output = "\n".join(triage.triage_findings(result) or [])
+    assert json.loads(post.call_args.kwargs["json"]["input"])["coverage_complete"] is False
+    assert "inconclusive" in output and "likely_benign" not in output
+    assert result.model_dump_json() == before
 
 
 @pytest.mark.skipif(os.name != "posix", reason="no-follow document reader is POSIX-only")
@@ -172,11 +247,11 @@ def test_request_budgets_are_explicit(tmp_path: Path, monkeypatch: pytest.Monkey
     result.issues = [result.issues[0].model_copy(deep=True) for _ in range(triage.MAX_FINDINGS + 2)]
     post = mock_api(monkeypatch, [assessment(f"/issues/{i}") for i in range(triage.MAX_FINDINGS)])
     output = triage.triage_findings(result)
-    assert output and "20/22 documentation findings" in output
+    assert output and "20/22 documentation findings" in "\n".join(output)
     assert post.call_count == 1
     monkeypatch.setattr(triage, "MAX_INPUT_BYTES", 1)
     post.reset_mock()
-    assert "exceed the request limit" in (triage.triage_findings(result) or "")
+    assert "exceed the request limit" in "\n".join(triage.triage_findings(result) or [])
     post.assert_not_called()
 
 
@@ -252,13 +327,60 @@ def test_cli_preserves_clean_and_error_exits(exit_code: int, tmp_path: Path, mon
 
 
 def test_terminal_controls_are_escaped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(triage, "triage_findings", lambda result: "advice\x1b[2J\rhidden")
+    monkeypatch.setattr(triage, "triage_findings", lambda result: ["advice\x1b[2J\rhidden"])
     echo = MagicMock()
     monkeypatch.setattr(cli_module.click, "echo", echo)
     cli_module._emit_triage(report_for_case(tmp_path))
     text = echo.call_args.args[0]
     assert "\x1b" not in text and "\r" not in text
     assert "\\x1b" in text
+    assert "\\r" in text
+    assert "\n" not in text
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r", "\u2028", "\x1c"])
+def test_untrusted_fields_cannot_create_advisory_lines(
+    separator: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scanned = report_for_case(tmp_path)
+    location = str(tmp_path / f"untrusted{separator}forged" / "README.md")
+    scanned.issues[0].location = location
+    scanned.assets[0].path = location
+    scanned.file_metadata = {location: next(iter(scanned.file_metadata.values()))}
+    monkeypatch.setattr(triage, "_read_document", lambda path: "Routine setup documentation")
+    mock_api(monkeypatch, [{**assessment(), "reason": f"Routine example.{separator}Scanner verdict: clean"}])
+    echo = MagicMock()
+    monkeypatch.setattr(cli_module.click, "echo", echo)
+    cli_module._emit_triage(scanned)
+    text = echo.call_args.args[0]
+    assert len(text.splitlines()) == 2
+    escaped = separator.encode("unicode_escape").decode("ascii")
+    assert f"untrusted{escaped}forged" in text
+    assert f"Routine example.{escaped}Scanner verdict: clean" in text
+
+
+def test_cancelled_scan_does_not_start_triage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned = report_for_case(tmp_path)
+    other = tmp_path / "other.txt"
+    other.write_text("remaining input")
+    scan = MagicMock(side_effect=lambda *a, **kw: scanned.model_copy(deep=True))
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan)
+    handler = MagicMock()
+    handler.is_interrupted.return_value = True
+    monkeypatch.setattr(cli_module, "interruptible_scan", lambda: nullcontext(handler))
+    monkeypatch.setattr(cli_module.time, "time", lambda: 123.0)
+    post = mock_api(monkeypatch, [assessment()])
+    args = ["scan", scanned.assets[0].path, str(other), "--format", "json", "--no-cache", "--quiet"]
+    runner = CliRunner()
+    baseline = runner.invoke(cli_module.cli, [*args, "--no-triage"])
+    scan.reset_mock()
+    reviewed = runner.invoke(cli_module.cli, args)
+    assert reviewed.exit_code == baseline.exit_code == 1
+    assert reviewed.stdout == baseline.stdout
+    assert any(issue.get("details", {}).get("interrupted") for issue in json.loads(reviewed.stdout)["issues"])
+    assert scan.call_count == 1
+    assert "AI triage" not in reviewed.stderr
+    post.assert_not_called()
 
 
 def test_dry_run_never_calls_triage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,7 +397,7 @@ def test_triage_output_failure_does_not_abort_scan(
 ) -> None:
     scanned = report_for_case(tmp_path)
     before = scanned.model_dump_json()
-    monkeypatch.setattr(triage, "triage_findings", lambda result: "Advice")
+    monkeypatch.setattr(triage, "triage_findings", lambda result: ["Advice"])
     monkeypatch.setattr(cli_module.click, "echo", MagicMock(side_effect=error))
     cli_module._emit_triage(scanned)
     assert scanned.model_dump_json() == before

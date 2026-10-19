@@ -11,10 +11,12 @@ from typing import Any, Literal
 
 import requests
 from pydantic import BaseModel, ConfigDict, Field
+from requests.auth import AuthBase
 
 from modelaudit.core_results import results_have_inconclusive_outcome, results_have_operational_error
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
+from modelaudit.scanner_selection import collect_suppressed_preferred_scanners
 
 MAX_FINDINGS = 20
 MAX_DOCUMENT_BYTES = 32 * 1024
@@ -53,6 +55,13 @@ class TriageResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     assessments: list[Assessment]
+
+
+class _NoNetrcAuth(AuthBase):
+    """Keep ambient netrc credentials from replacing the configured API key."""
+
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
+        return request
 
 
 def _read_document(location: str) -> str | None:
@@ -124,6 +133,8 @@ def prepare_findings(result: ModelAuditResultModel) -> tuple[list[dict[str, Any]
 
 
 def request_triage(findings: list[dict[str, Any]], *, api_key: str, coverage_complete: bool) -> TriageResponse:
+    if not api_key or any(not 33 <= ord(char) <= 126 for char in api_key):
+        raise ValueError("OPENAI_API_KEY must contain only printable ASCII without whitespace")
     payload = {
         "model": os.environ.get("MODELAUDIT_TRIAGE_MODEL") or DEFAULT_MODEL,
         "instructions": INSTRUCTIONS,
@@ -143,17 +154,22 @@ def request_triage(findings: list[dict[str, Any]], *, api_key: str, coverage_com
     with requests.post(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {api_key}"},
+        auth=_NoNetrcAuth(),
         json=payload,
         timeout=(5, 30),
         allow_redirects=False,
         stream=True,
     ) as response:
-        response.raise_for_status()
         raw = bytearray()
         for chunk in response.iter_content(8192):
             raw.extend(chunk)
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise ValueError("Triage response exceeded its size limit")
+        if not 200 <= response.status_code < 300:
+            raise requests.HTTPError(
+                f"OpenAI HTTP {response.status_code}: {raw.decode('utf-8', errors='backslashreplace')}",
+                response=response,
+            )
         body = json.loads(raw)
     if body.get("status") != "completed":
         raise ValueError("Triage response was not completed")
@@ -178,8 +194,8 @@ def request_triage(findings: list[dict[str, Any]], *, api_key: str, coverage_com
     return advice
 
 
-def triage_findings(result: ModelAuditResultModel) -> str | None:
-    """Return advisory text, or nothing when no key or eligible findings exist."""
+def triage_findings(result: ModelAuditResultModel) -> list[str] | None:
+    """Return advisory lines for the CLI to escape, or nothing when triage is unnecessary."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         return None
@@ -187,12 +203,16 @@ def triage_findings(result: ModelAuditResultModel) -> str | None:
     if not eligible:
         return None
     if not findings:
-        return "AI triage skipped: documentation findings exceed the request limit. Scanner result unchanged."
-    coverage_complete = not (results_have_operational_error(result) or results_have_inconclusive_outcome(result))
+        return ["AI triage skipped: documentation findings exceed the request limit. Scanner result unchanged."]
+    coverage_complete = not (
+        results_have_operational_error(result)
+        or results_have_inconclusive_outcome(result)
+        or collect_suppressed_preferred_scanners(result.checks)
+    )
     advice = request_triage(findings, api_key=api_key, coverage_complete=coverage_complete)
     by_id = {finding["finding_id"]: finding["finding"] for finding in findings}
     lines = [f"AI triage (advisory; {len(findings)}/{eligible} documentation findings; scanner result unchanged):"]
     for assessment in advice.assessments:
         location = by_id[assessment.finding_id]["location"]
         lines.append(f"  {assessment.finding_id} {location}: {assessment.classification} — {assessment.reason}")
-    return "\n".join(lines)
+    return lines

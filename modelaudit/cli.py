@@ -3030,12 +3030,12 @@ def _emit_triage(audit_result: ModelAuditResultModel) -> None:
     try:
         from .triage import triage_findings
 
-        message = triage_findings(audit_result)
+        lines = triage_findings(audit_result)
     except (Exception, KeyboardInterrupt) as exc:
-        message = f"AI triage unavailable ({type(exc).__name__}); scanner result unchanged."
-    if message:
+        lines = [f"AI triage unavailable ({type(exc).__name__}: {exc}); scanner result unchanged."]
+    if lines:
         with contextlib.suppress(OSError, KeyboardInterrupt):
-            click.echo("\n".join(_escape_terminal_text(line) for line in message.splitlines()), err=True)
+            click.echo("\n".join(_escape_terminal_text(line) for line in lines), err=True)
 
 
 def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, verbose: bool) -> bool:
@@ -4923,7 +4923,12 @@ def scan_command(
         flush_telemetry()
         raise
 
-    if not no_triage and not dry_run and os.environ.get("OPENAI_API_KEY", "").strip():
+    if (
+        not no_triage
+        and not dry_run
+        and not interrupt_handler.is_interrupted()
+        and os.environ.get("OPENAI_API_KEY", "").strip()
+    ):
         _emit_triage(audit_result)
     _record_scan_end_and_exit(audit_result, scan_start_time)
 

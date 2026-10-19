@@ -28,6 +28,8 @@ with the issue's JSON pointer, location, and explanation. Nothing is filtered or
 downgraded: scan output, JSON/SARIF reports, caches, verdicts, and exit codes remain
 the scanner's. API errors, malformed replies, and interrupted requests do not
 replace a completed scan's exit code.
+Cancelled scans skip triage. Local API error diagnostics retain the HTTP status and
+bounded response body, with terminal control characters escaped.
 
 One request considers at most 20 eligible findings and 256 KiB of evidence.
 Complete UTF-8 documents up to 32 KiB are included when they remain available as
