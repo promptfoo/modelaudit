@@ -7,7 +7,8 @@ import selectors
 import signal
 import subprocess
 import time
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -15,6 +16,16 @@ from types import FrameType
 
 def terminate(signum: int, frame: FrameType | None) -> None:
     raise KeyboardInterrupt
+
+
+@contextmanager
+def defer_termination() -> Iterator[None]:
+    """Let bounded daemon cleanup finish before delivering a pending cancellation."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def kill_process_group(process: subprocess.Popen[bytes]) -> None:

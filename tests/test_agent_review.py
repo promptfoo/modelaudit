@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import signal
@@ -12,6 +13,7 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -21,7 +23,14 @@ from modelaudit.review.bundle import digest, index_findings, snapshot
 from modelaudit.review.codex import DockerReviewer, extract_response
 from modelaudit.review.evaluate import replay, score
 from modelaudit.review.gateway import request_body
-from modelaudit.review.models import MAX_DOCUMENT_BYTES, AgentResponse, Assessment, Evidence, Finding
+from modelaudit.review.models import (
+    MAX_DOCUMENT_BYTES,
+    MAX_GROUP_FINDINGS,
+    AgentResponse,
+    Assessment,
+    Evidence,
+    Finding,
+)
 from modelaudit.review.process import ProcessLimitError, ProcessResult, run_bounded
 from modelaudit.review.render import escaped
 
@@ -67,7 +76,9 @@ class FakeReviewer:
         return AgentResponse(assessments=assessments)
 
 
-def fake_scan(monkeypatch: pytest.MonkeyPatch, exit_code: int, *, malformed: bool = False) -> list[bytes]:
+def fake_scan(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, *, malformed: bool = False, network_count: int = 1
+) -> list[bytes]:
     captured: list[bytes] = []
 
     def scan(command: list[str], output: Path) -> int:
@@ -80,17 +91,18 @@ def fake_scan(monkeypatch: pytest.MonkeyPatch, exit_code: int, *, malformed: boo
             "rule_code": "S402",
         }
         report = {
-            "issues": [record, {"severity": "critical", "message": "Pickle execution", "location": "model.pkl"}],
-            "checks": [{**record, "name": "Network Communication Detection", "status": "failed"}],
+            "issues": [record] * network_count
+            + [{"severity": "critical", "message": "Pickle execution", "location": "model.pkl"}],
+            "checks": [{**record, "name": "Network Communication Detection", "status": "failed"}] * network_count,
             "success": exit_code != 2,
             "files_scanned": 1,
             "bytes_scanned": 100,
             "has_errors": exit_code == 2,
             "start_time": 0,
             "duration": 0,
-            "total_checks": 1,
+            "total_checks": network_count,
             "passed_checks": 0,
-            "failed_checks": 1,
+            "failed_checks": network_count,
         }
         raw = b"not JSON" if malformed else json.dumps(report, indent=3).encode() + b"\n\n"
         (output / "scan.json").write_bytes(raw)
@@ -551,9 +563,7 @@ def test_explicit_coverage_and_operational_failures_prevent_deemphasis(tmp_path:
 
 
 @pytest.mark.parametrize("shadow", ["modelaudit.py", "json.py"])
-def test_scanner_never_imports_from_artifact_working_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shadow: str
-) -> None:
+def test_documented_entrypoint_and_scanner_never_import_from_artifact_directory(tmp_path: Path, shadow: str) -> None:
     untrusted = tmp_path / "untrusted"
     untrusted.mkdir()
     marker = tmp_path / "executed.txt"
@@ -562,10 +572,15 @@ def test_scanner_never_imports_from_artifact_working_directory(
     )
     source = untrusted / "README.md"
     source.write_text('HOST = "192.168.1.100"\n')
-    # The parent has already imported the trusted package, as with an installed `python -I` entrypoint.
-    monkeypatch.chdir(untrusted)
     output = tmp_path / "bundle"
-    assert runner.run(source, output, None) == 1
+    process = subprocess.run(
+        [sys.executable, "-I", "-m", "modelaudit.review", str(source), "--output-dir", str(output), "--prepare-only"],
+        cwd=untrusted,
+        env={"PATH": os.defpath, "PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        capture_output=True,
+        timeout=30,
+    )
+    assert process.returncode == 1, process.stderr.decode()
     assert not marker.exists()
     scan = json.loads((output / "scan.json").read_bytes())
     assert scan["files_scanned"] == 1
@@ -681,11 +696,16 @@ def test_scanner_cancellation_kills_descendants(tmp_path: Path) -> None:
                 process.wait(timeout=10)
 
 
-def test_evaluator_sigterm_removes_daemon_owned_worker(tmp_path: Path) -> None:
+@pytest.mark.parametrize("interrupt_cleanup", [None, signal.SIGINT, signal.SIGTERM])
+def test_evaluator_sigterm_removes_daemon_owned_worker(
+    tmp_path: Path, interrupt_cleanup: signal.Signals | None
+) -> None:
     binary = tmp_path / "bin"
     binary.mkdir()
     active = tmp_path / "worker.json"
     removed = tmp_path / "removed.txt"
+    cleanup_started = tmp_path / "cleanup-started.txt"
+    cleanup_continue = tmp_path / "cleanup-continue.txt"
     docker = binary / "docker"
     docker.write_text(
         f"#!{sys.executable}\n"
@@ -698,6 +718,9 @@ def test_evaluator_sigterm_removes_daemon_owned_worker(tmp_path: Path) -> None:
         f"    pending.rename({str(active)!r})\n"
         "    time.sleep(60)\n"
         "elif sys.argv[1:3] == ['rm','--force']:\n"
+        f"    Path({str(cleanup_started)!r}).write_text('started')\n"
+        f"    while {bool(interrupt_cleanup)!r} and not Path({str(cleanup_continue)!r}).exists():\n"
+        "        time.sleep(0.02)\n"
         f"    Path({str(removed)!r}).write_text(sys.argv[3])\n"
         f"    Path({str(active)!r}).unlink(missing_ok=True)\n"
     )
@@ -740,10 +763,20 @@ def test_evaluator_sigterm_removes_daemon_owned_worker(tmp_path: Path) -> None:
             assert active.exists(), "Evaluator did not start the worker"
             worker_group = json.loads(active.read_bytes())["group"]
             process.send_signal(signal.SIGTERM)
+            if interrupt_cleanup:
+                deadline = time.monotonic() + 10
+                while not cleanup_started.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert cleanup_started.exists(), "Worker removal did not start"
+                process.send_signal(interrupt_cleanup)
+                with pytest.raises(subprocess.TimeoutExpired):
+                    process.wait(timeout=0.2)
+                cleanup_continue.write_text("continue")
             assert process.wait(timeout=10) == 2
             assert removed.read_text().startswith("modelaudit-review-")
             assert not active.exists()
         finally:
+            cleanup_continue.touch()
             if worker_group is not None:
                 with suppress(ProcessLookupError):
                     os.killpg(worker_group, signal.SIGKILL)
@@ -785,3 +818,101 @@ def test_failed_or_budget_blocked_group_does_not_discard_completed_group(tmp_pat
     assert [item.display_action for item in result.entries] == ["de_emphasize", "retain"]
     assert result.entries[1].status == ("not_reviewed" if max_groups == 1 else "failed")
     assert (tmp_path / "scan.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("max_groups,reviewed,status", [(8, 20, "complete"), (2, 16, "partial")])
+def test_document_findings_are_batched_with_full_context_and_a_session_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, max_groups: int, reviewed: int, status: str
+) -> None:
+    source = tmp_path / "README.md"
+    source.write_text("# Setup\ngit clone https://github.com/example/model\nLater context must stay visible.\n")
+    captured = fake_scan(monkeypatch, 1, network_count=10)
+    seen: list[str] = []
+
+    class BoundedReviewer(FakeReviewer):
+        def review(
+            self, findings: list[Finding], evidence: list[Evidence], artifacts: Path, output: Path
+        ) -> AgentResponse:
+            assert 0 < len(findings) <= MAX_GROUP_FINDINGS
+            assert all(item.text == source.read_text() and item.complete for item in evidence)
+            seen.extend(item.finding_id for item in findings)
+            return super().review(findings, evidence, artifacts, output)
+
+    reviewer = BoundedReviewer()
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, reviewer, max_review_groups=max_groups) == 1
+    report = json.loads((output / "review.json").read_bytes())
+    assert report["selected_count"] == 20 and report["reviewed_count"] == reviewed
+    assert report["review_status"] == status
+    assert len(seen) == len(set(seen)) == reviewed
+    assert reviewer.calls == (3 if max_groups == 8 else 2)
+    assert all(entry["display_action"] == "retain" for entry in report["entries"] if entry["status"] != "reviewed")
+    assert (output / "scan.json").read_bytes() == captured[0]
+
+
+def test_model_file_requires_an_explicit_companion_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "model"
+    source.mkdir()
+    artifact = source / "model.onnx"
+    artifact.write_bytes(b"model fixture")
+    companion = source / "weights.bin"
+    companion.write_bytes(b"companion fixture")
+    captured = fake_scan(monkeypatch, 0)
+    output = tmp_path / "bundle"
+    with pytest.raises(ValueError, match="directory containing the model and all required companion files"):
+        runner.run(artifact, output, None)
+    assert not captured and not output.exists()
+    assert runner.run(source, output, None) == 0
+    assert (output / "artifacts/model/model.onnx").read_bytes() == artifact.read_bytes()
+    assert (output / "artifacts/model/weights.bin").read_bytes() == companion.read_bytes()
+
+
+def test_signal_terminated_scanner_is_reported_as_a_scan_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def command(input_path: Path, report_path: Path, timeout: int) -> list[str]:
+        return [sys.executable, "-c", "import os,signal; os.kill(os.getpid(),signal.SIGKILL)"]
+
+    monkeypatch.setattr(runner, "scan_command", command)
+    source = tmp_path / "README.md"
+    source.write_text("model card")
+    output = tmp_path / "bundle"
+    assert runner.run(source, output, None) == 2
+    assert json.loads((output / "manifest.json").read_bytes())["scan_exit_code"] == 2
+    assert "terminated by signal 9" in (output / "scan.stderr.txt").read_text()
+
+
+@pytest.mark.parametrize(
+    "peer,expected",
+    [
+        (("192.0.2.1", 8080), ("192.0.2.1", 8080)),
+        (("2001:db8::1", 8080, 0, 0), ("2001:db8::1", 8080)),
+        (("fe80::1", 8080, 0, 3), ("fe80::1%3", 8080)),
+    ],
+)
+def test_preflight_probes_normalized_gateway_endpoints(
+    monkeypatch: pytest.MonkeyPatch, peer: tuple[Any, ...], expected: tuple[str, int]
+) -> None:
+    from modelaudit.review import worker
+    from modelaudit.review.codex import CODEX_VERSION
+
+    monkeypatch.setattr(worker.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(worker.os, "getuid", lambda: 10001)
+    for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    connection = MagicMock()
+    connection.__enter__.return_value.getpeername.return_value = peer
+    monkeypatch.setattr(worker.socket, "create_connection", lambda *args, **kwargs: connection)
+    listener = MagicMock()
+    listener.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 12345)
+    monkeypatch.setattr(worker.socket, "socket", lambda *args, **kwargs: listener)
+    probes: list[str] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if command[1] == "--version":
+            return subprocess.CompletedProcess(command, 0, stdout=f"codex-cli {CODEX_VERSION}\n")
+        probes.append(command[-1])
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    monkeypatch.setattr(worker.subprocess, "run", run)
+    worker.preflight("http://gateway:8080/v1")
+    loop = next(node for node in ast.parse(probes[0]).body if isinstance(node, ast.For))
+    assert ast.literal_eval(loop.iter) == [("127.0.0.1", 12345), expected]

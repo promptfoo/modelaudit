@@ -6,18 +6,22 @@ JSON/SARIF reports, severity, suppressions, caching, and exit-code logic are unc
 
 ```sh
 # Local scan and evidence bundle only; no Codex or API call.
-python -m modelaudit.review ./model --output-dir ./review-run --prepare-only
+python -I -m modelaudit.review ./model --output-dir ./review-run --prepare-only
 
 # Advisory review using the isolated worker described below.
-python -m modelaudit.review ./model --output-dir ./review-run-with-agent \
+python -I -m modelaudit.review ./model --output-dir ./review-run-with-agent \
   --worker-image sha256:<local-worker-image-id> \
   --worker-network modelaudit-review \
   --proxy-url http://172.30.0.2:8080/v1 \
   --codex-model <explicit-model-id>
 ```
 
-The output directory must be new and outside the input tree. This prototype accepts local input
-on POSIX hosts. Acquire remote models separately and retain their immutable upstream revision.
+Use the installed package with Python's `-I` flag so files in an untrusted working directory cannot
+shadow imports before isolation starts. The output directory must be new and outside the input tree.
+This prototype accepts local model directories or individual README/model-card documents on POSIX
+hosts. For model artifacts, supply a directory containing all required companion files; individual
+model files are rejected before scanning. Acquire remote models separately and retain their immutable
+upstream revision.
 It copies regular files into a bounded snapshot (2 GiB and 10,000 entries by default), rejects
 symlinks/special files, and scans the copy with the installed ModelAudit CLI. Use
 `--max-snapshot-bytes` to set a larger explicit budget for weights. No model is loaded for inference.
@@ -27,7 +31,8 @@ stdout are saved. Host API-key environment variables are not passed to the scann
 
 Once scanning finishes, the command returns **that scanner process's exit code**, including when
 review fails. `0`, `1`, and `2` retain their scanner meanings. Preparation errors before the scan
-return `2`. Handled interruption stops the worker and preserves a captured scanner exit; interruption
+return `2`. Signal-terminated scanners also return `2`, with the signal recorded in scanner stderr.
+Handled interruption stops the worker and preserves a captured scanner exit; interruption
 before a scanner exit is captured returns `2`. An exit of `0` does **not** establish that
 review completed: consumers that require review must also inspect `review_status` in `review.json`.
 
@@ -41,7 +46,7 @@ review completed: consumers that require review must also inspect `review_status
 | `artifacts/`                            | Copied input files, including weights; mounted read-only to the worker                                   |
 | `findings.json`                         | Original issue and failed-check records with IDs derived from report digest + JSON pointer               |
 | `evidence/index.json`, `evidence/*.bin` | Byte ranges, SHA-256 digests, derived line ranges, decoding/completeness flags, raw excerpts             |
-| `group-NNNN/`                           | One document's request, exact invocation, bounded Codex JSONL trace and stderr                           |
+| `group-NNNN/`                           | One finding batch's request, exact invocation, bounded Codex JSONL trace and stderr                      |
 | `review.json`, `review.md`              | Separate validated advisory output, retained findings, errors, original exit/counts                      |
 
 Issue/check duplicates retain separate identities. All original issues and failed checks remain
@@ -49,8 +54,8 @@ visible; unrelated findings and existing INFO/DEBUG records receive `not_reviewe
 scanner report also retains passed/skipped checks and coverage information.
 
 Review uses the entire relevant UTF-8 document, up to 256 KiB per document and 2 MiB across documents.
-This preserves cross-fence and prose context. Oversized/undecodable documents, excessive findings,
-changed hashes, malformed responses, unknown/duplicate/missing finding IDs, and invalid citations
+This preserves cross-fence and prose context. Oversized/undecodable documents, changed hashes,
+malformed responses, unknown/duplicate/missing finding IDs, and invalid citations
 fail closed: retain the findings and report a review failure. Incomplete scanner coverage also
 prevents de-emphasis. Review status is `complete`, `partial`, `failed`, `not_needed`, or
 `not_requested`; complete may include `inconclusive` assessments.
@@ -100,7 +105,7 @@ publish the scanner image to a trusted registry and use its repository-qualified
 (`registry.example/modelaudit@sha256:...`). BuildKit does not accept a bare local image ID in `FROM`.
 Run reviewers only with the resulting immutable worker image ID/digest.
 
-Each document starts a fresh container with an unprivileged UID, read-only root and input mounts,
+Each batch starts a fresh container with an unprivileged UID, read-only root and input mounts,
 all capabilities dropped, no new privileges, 2 CPUs, 4 GiB RAM, no swap, 128 processes, and 512 MiB
 of temporary storage across work/home/tmp. The supervisor imposes a five-minute deadline and a
 4 MiB combined output limit, kills subprocess groups, and explicitly removes daemon-owned containers.
@@ -108,9 +113,11 @@ Only the request and artifact snapshot are mounted. The original report and supe
 directory, host home, credentials, and Docker socket are not mounted.
 Docker-injected proxy variables are cleared so the harness connects directly to the private gateway.
 
-The supervisor reviews at most eight documents per run by default (`--max-review-groups`).
+Each batch contains at most eight findings from one document, with the full document context,
+leaving room for concise explanations within the output allowance. The supervisor starts at most
+eight sessions per run by default (`--max-review-groups`); a document can use multiple sessions.
 Remaining findings stay visible as `not_reviewed`, with a partial/failed review status. This bounds
-the number of agent sessions separately from the per-document deadline and gateway request budget.
+agent sessions separately from the per-session deadline and gateway request budget.
 
 Codex runs with approvals disabled, workspace writes limited to scratch, command networking
 disabled, a fresh home, ephemeral state, user config/rules ignored, project instructions disabled,
@@ -170,7 +177,7 @@ localhost clients, package indexes, user-data URLs, builds, and adversarial exec
 from the [#1913 discussion](https://github.com/promptfoo/modelaudit/pull/1913).
 
 ```sh
-python -m modelaudit.review.evaluate \
+python -I -m modelaudit.review.evaluate \
   --cases tests/assets/agent_review_pr1913.json --output-dir ./review-evaluation --runs 3 \
   --worker-image sha256:<worker-image-id> --worker-network modelaudit-review \
   --proxy-url http://172.30.0.2:8080/v1 --codex-model <explicit-model-id>

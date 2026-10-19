@@ -25,7 +25,7 @@ def main() -> int:
     parser.add_argument("--codex-model", help="Explicit model routed by the gateway")
     parser.add_argument("--review-timeout", type=int, default=300)
     parser.add_argument(
-        "--max-review-groups", type=int, default=8, help="Maximum documents sent to fresh Codex workers"
+        "--max-review-groups", type=int, default=8, help="Maximum finding batches sent to fresh Codex workers"
     )
     parser.add_argument("--scan-timeout", type=int, default=300)
     parser.add_argument("--max-snapshot-bytes", type=int, default=2 * 1024**3)

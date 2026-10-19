@@ -23,7 +23,11 @@ def preflight(proxy_url: str) -> None:
         raise ValueError("Unexpected Codex CLI version")
     proxy = urlsplit(proxy_url)
     with socket.create_connection((str(proxy.hostname), proxy.port or 80), timeout=5) as connection:
-        gateway = connection.getpeername()
+        peer = connection.getpeername()
+        host = peer[0]
+        if len(peer) == 4 and peer[3] and "%" not in host:
+            host = f"{host}%{peer[3]}"
+        gateway = (host, peer[1])
     # A listening parent socket proves a command cannot reach the harness network namespace.
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))

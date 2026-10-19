@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from .bundle import write_json
 from .models import AgentResponse, Evidence, Finding
 from .policy import POLICY
-from .process import ProcessLimitError, run_bounded
+from .process import ProcessLimitError, defer_termination, run_bounded
 
 CODEX_VERSION = "0.163.0"
 
@@ -243,13 +243,13 @@ class DockerReviewer:
         finally:
             # Killing the docker client alone does not stop a daemon-owned container.
             interrupted = isinstance(sys.exc_info()[1], (KeyboardInterrupt, SystemExit))
-            try:
-                cleanup = run_bounded(["docker", "rm", "--force", name], cwd=output, timeout=15)
-                if cleanup.returncode and b"No such container" not in cleanup.stderr:
-                    raise ValueError("Docker could not remove the worker")
-            except Exception as exc:
-                message = f"Worker cleanup failed; remove {name} (see invocation.json)"
-                if interrupted:
+            with defer_termination():
+                try:
+                    cleanup = run_bounded(["docker", "rm", "--force", name], cwd=output, timeout=15)
+                    if cleanup.returncode and b"No such container" not in cleanup.stderr:
+                        raise ValueError("Docker could not remove the worker")
+                except Exception as exc:
+                    message = f"Worker cleanup failed; remove {name} (see invocation.json)"
                     print(message, file=sys.stderr)
-                else:
-                    raise ValueError(message) from exc
+                    if not interrupted:
+                        raise ValueError(message) from exc

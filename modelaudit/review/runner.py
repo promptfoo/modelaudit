@@ -18,7 +18,7 @@ from typing import Any, Protocol
 from modelaudit.core_results import results_have_inconclusive_outcome, results_have_operational_error
 from modelaudit.models import ModelAuditResultModel
 
-from .bundle import digest, index_findings, snapshot, verify_artifact, write_json
+from .bundle import digest, index_findings, is_document, snapshot, verify_artifact, write_json
 from .models import (
     MAX_GROUP_FINDINGS,
     POLICY_VERSION,
@@ -132,21 +132,26 @@ def review_findings(
             and not results_have_operational_error(model)
             and not results_have_inconclusive_outcome(model)
         )
-        for number, (artifact_path, group) in enumerate(groups.items()):
+        batches = (
+            (path, findings[start : start + MAX_GROUP_FINDINGS])
+            for path, findings in groups.items()
+            for start in range(0, len(findings), MAX_GROUP_FINDINGS)
+        )
+        for number, (artifact_path, group) in enumerate(batches):
             if number >= max_groups:
                 if number == max_groups:
-                    errors.append("Review document budget exhausted; remaining findings retained")
+                    errors.append("Review session budget exhausted; remaining findings retained")
                 for finding in group:
                     entries[finding.finding_id] = entries[finding.finding_id].model_copy(
-                        update={"reason": "Review document budget exhausted"}
+                        update={"reason": "Review session budget exhausted"}
                     )
                 continue
             group_evidence = [e for e in evidence if e.artifact_path == artifact_path]
             group_dir = output / f"group-{number:04d}"
             group_dir.mkdir(mode=0o700)
             try:
-                if len(group) > MAX_GROUP_FINDINGS or not all(e.complete for e in group_evidence):
-                    raise ValueError("Document context or finding count exceeds the bounded review scope")
+                if not all(e.complete for e in group_evidence):
+                    raise ValueError("Document context exceeds the bounded review scope")
                 artifact = next(a for a in artifacts if a.path == artifact_path)
                 verify_artifact(root, artifact)
                 response = reviewer.review(group, group_evidence, root, group_dir)
@@ -225,7 +230,11 @@ def run_scan(command: list[str], output: Path) -> int:
         ) as process,
     ):
         try:
-            return process.wait()
+            returncode = process.wait()
+            if returncode < 0:
+                stderr.write(f"\nScanner terminated by signal {-returncode}; returning scan error 2.\n".encode())
+                return 2
+            return returncode
         finally:
             kill_process_group(process)
 
@@ -242,6 +251,11 @@ def run(
     source = source.absolute()
     output = output.resolve()
     resolved = source.resolve(strict=True)
+    if resolved.is_file() and not is_document(resolved.name):
+        raise ValueError(
+            "Individual inputs must be README/model-card documents; "
+            "for model artifacts, pass a directory containing the model and all required companion files"
+        )
     if output == resolved or resolved in output.parents or output in resolved.parents:
         raise ValueError("Output must be outside the input tree")
     output.mkdir(mode=0o700, parents=True, exist_ok=False)

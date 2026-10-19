@@ -10,7 +10,7 @@ SCHEMA_VERSION = "modelaudit-review-v1"
 POLICY_VERSION = "documentation-v1"
 MAX_DOCUMENT_BYTES = 256 * 1024
 MAX_EVIDENCE_BYTES = 2 * 1024 * 1024
-MAX_GROUP_FINDINGS = 64
+MAX_GROUP_FINDINGS = 8
 ReviewStatus = Literal["complete", "partial", "failed", "not_needed", "not_requested"]
 
 
