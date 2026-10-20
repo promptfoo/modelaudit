@@ -5,6 +5,7 @@ import os
 import pickle
 import pickletools
 import struct
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -55,6 +56,103 @@ def test_has_tensorflow_protobuf_stubs_fails_closed_on_probe_error(monkeypatch: 
 
     assert tensorflow_compat.has_tensorflow_protobuf_stubs() is False
     assert tensorflow_compat._HAS_PROTOBUF_STUBS is False
+
+
+@pytest.mark.parametrize("table_limit", [1, 10, 12])
+def test_cli_metadata_directory_table_limit(tmp_path: Path, table_limit: int) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    for index in range(12):
+        (tmp_path / f"model-{index}.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+
+    result = CliRunner().invoke(cli, ["metadata", str(tmp_path), "--table-limit", str(table_limit)])
+
+    assert result.exit_code == 0, result.output
+    assert "Total Files: 12" in result.stdout
+    assert result.stdout.count("(safetensors)") == table_limit
+    if table_limit < 12:
+        assert f"... and {12 - table_limit} more" in result.stdout
+    else:
+        assert "... and" not in result.stdout
+
+
+def test_cli_metadata_directory_table_default_limit(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    for index in range(12):
+        (tmp_path / f"model-{index}.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+
+    result = CliRunner().invoke(cli, ["metadata", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.count("(safetensors)") == 10
+    assert "... and 2 more" in result.stdout
+
+
+@pytest.mark.parametrize("table_limit", ["0", "-1", "10001"])
+def test_cli_metadata_rejects_invalid_table_limit(tmp_path: Path, table_limit: str) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    result = CliRunner().invoke(cli, ["metadata", str(tmp_path), "--table-limit", table_limit])
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--table-limit'" in result.output
+
+
+@pytest.mark.parametrize("output_format", ["json", "yaml"])
+def test_cli_metadata_table_limit_preserves_structured_output(tmp_path: Path, output_format: str) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    for index in range(3):
+        (tmp_path / f"model-{index}.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+
+    result = CliRunner().invoke(cli, ["metadata", str(tmp_path), "--format", output_format, "--table-limit", "1"])
+
+    assert result.exit_code == 0, result.output
+    if output_format == "json":
+        metadata = json.loads(result.stdout)
+    else:
+        yaml = pytest.importorskip("yaml")
+        metadata = yaml.safe_load(result.stdout)
+    assert len(metadata["files"]) == 3
+    assert metadata["summary"]["total_files"] == 3
+
+
+@pytest.mark.parametrize("output_file", [False, True])
+def test_cli_metadata_yaml_fallback_keeps_json_output_parseable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_file: bool,
+) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    target = tmp_path / "empty.safetensors"
+    target.write_bytes(struct.pack("<Q", 2) + b"{}")
+    # Exercise the command-level fallback; PyYAML is required for normal CLI startup.
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    arguments = ["metadata", str(target), "--format", "yaml"]
+    output_path = tmp_path / "metadata.json"
+    if output_file:
+        arguments.extend(["--output", str(output_path)])
+
+    result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert "PyYAML not installed, falling back to JSON" in result.stderr
+    assert "Warning:" not in result.stdout
+    metadata = json.loads(output_path.read_text() if output_file else result.stdout)
+    assert metadata["file"] == target.name
+    assert metadata["format"] == "safetensors"
 
 
 class TestModelMetadataExtractor:
@@ -1194,3 +1292,91 @@ class TestCLIMetadataCommand:
 
         assert result.exit_code == 0
         assert "Format: safetensors" in result.output
+
+
+@pytest.mark.parametrize("security_only", [False, True])
+@pytest.mark.parametrize("directory", [False, True])
+def test_metadata_extraction_errors_survive_security_filter(
+    tmp_path: Path,
+    security_only: bool,
+    directory: bool,
+) -> None:
+    target = tmp_path / "truncated.safetensors"
+    target.write_bytes(struct.pack("<Q", 64) + b"{}")
+    extractor = metadata_extractor_module.ModelMetadataExtractor()
+    result = extractor.extract(str(tmp_path if directory else target), security_only=security_only)
+    metadata = result["files"][0] if directory else result
+
+    assert metadata["format"] == "safetensors"
+    assert metadata["file"] == target.name
+    assert metadata["path"] == str(target)
+    assert metadata["extraction_error"] == "Invalid SafeTensors header length: 64"
+
+
+@pytest.mark.parametrize("security_only", [False, True])
+@pytest.mark.parametrize("directory", [False, True])
+@pytest.mark.parametrize("output_format", ["json", "table"])
+def test_cli_metadata_displays_extraction_errors(
+    tmp_path: Path,
+    security_only: bool,
+    directory: bool,
+    output_format: str,
+) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    target = tmp_path / "truncated.safetensors"
+    target.write_bytes(struct.pack("<Q", 64) + b"{}")
+    arguments = ["metadata", str(tmp_path if directory else target), "--format", output_format]
+    if security_only:
+        arguments.append("--security-only")
+
+    result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert "Invalid SafeTensors header length: 64" in result.output
+    if output_format == "json":
+        metadata = json.loads(result.output)
+        if directory:
+            metadata = metadata["files"][0]
+        assert metadata["extraction_error"] == "Invalid SafeTensors header length: 64"
+    elif directory:
+        assert "truncated.safetensors (error: Invalid SafeTensors header length: 64)" in result.output
+
+
+@pytest.mark.parametrize("security_only", [False, True])
+@pytest.mark.parametrize("directory", [False, True])
+@pytest.mark.parametrize("output_format", ["json", "table"])
+def test_cli_metadata_displays_gguf_read_errors(
+    tmp_path: Path,
+    security_only: bool,
+    directory: bool,
+    output_format: str,
+) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+    from tests.helpers import create_mock_gguf
+
+    target = create_mock_gguf(tmp_path / "bounded.gguf")
+    payload = bytearray(target.read_bytes())
+    struct.pack_into("<Q", payload, 16, 100_001)
+    target.write_bytes(payload)
+    message = "File declares 100001 metadata keys, exceeding limit 100000"
+    arguments = ["metadata", str(tmp_path if directory else target), "--format", output_format]
+    if security_only:
+        arguments.append("--security-only")
+
+    result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert message in result.output
+    if output_format == "json":
+        metadata = json.loads(result.output)
+        if directory:
+            metadata = metadata["files"][0]
+        assert metadata["error_reading_metadata"] == message
+        assert metadata["format"] == "gguf"
+    elif directory:
+        assert f"bounded.gguf (error: {message})" in result.output

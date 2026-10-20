@@ -11,7 +11,7 @@ Both packages are driven by a single [release-please](https://github.com/googlea
 
 The root release intentionally omits `package-name` and `component`. Release-please reads `project.name` from `pyproject.toml` for Python updates, while the empty branch component lets a root-only grouped Release PR match `release-please--branches--main` and keeps the existing `v{X.Y.Z}` tags. Restoring a non-empty `package-name` or `component` makes root-only releases look like a different component and silently skips publication after merge.
 
-The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.11,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
+The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.13,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
 
 ## Normal flow
 
@@ -103,7 +103,7 @@ fix(modelaudit-picklescan): bound nested pickle expansion
 Before merging a Release PR:
 
 1. Release PR version and changelog content look correct for every component bumped.
-2. Required checks green: `CI Success`, `Docker CI Success`, docs checks, CodeQL, and — for picklescan bumps — `Standalone Pickle Package (3.10/3.11/3.12/3.13)`.
+2. Required checks green: `CI Success`, `Docker CI Success`, docs checks, CodeQL, and — for picklescan bumps — `Standalone Pickle Package (3.10/3.11/3.12/3.13/3.14)`.
 3. Release-build validation green:
    - `twine check dist/*`
    - exactly one wheel + one sdist for `modelaudit`

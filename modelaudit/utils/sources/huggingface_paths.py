@@ -282,6 +282,12 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
         except ValueError:
             pass
 
+    # Remote source labels do not name local metadata directories. Older Python
+    # versions raise for oversized URL paths where Python 3.14 returns False.
+    # Require a multi-character scheme so Windows drive paths remain local.
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]+://", path):
+        return None, None
+
     path_obj = Path(path)
     if is_huggingface_cache_path(path_obj):
         cache_root = _find_hf_cache_root(path_obj)

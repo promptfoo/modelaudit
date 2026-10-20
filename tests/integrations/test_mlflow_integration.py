@@ -124,6 +124,17 @@ def _configure_trusted_remote_repository(
     return artifact_repository
 
 
+def _new_trusted_remote_mlflow(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    mock_mlflow = MagicMock()
+    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    return mock_mlflow
+
+
+def _scan_with_mock_mlflow(mock_mlflow: MagicMock, **kwargs: Any) -> Any:
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        return scan_mlflow_model("models:/TestModel/1", **kwargs)
+
+
 def _download_trusted_plan_for_test(plan: _MlflowDelegatedDownloadPlan, download_dir: Path) -> Any:
     captured_root = _capture_mlflow_download_root("models:/TestModel/1", str(download_dir))
     assert isinstance(captured_root, _MlflowDownloadRoot)
@@ -1143,8 +1154,7 @@ def test_scan_mlflow_model_accepts_empty_local_artifact_directory(
 
     mock_repo = local_artifact_repository(source_root)
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_file_size=10)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_file_size=10)
 
     assert result == mock_scan.return_value
     mock_scan.assert_called_once_with(
@@ -1172,8 +1182,7 @@ def test_scan_mlflow_model_rejects_unknown_size_before_download(
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.side_effect = RuntimeError("size unavailable")
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_file_size=1000)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_file_size=1000)
 
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_mkdtemp.assert_not_called()
@@ -1195,8 +1204,7 @@ def test_scan_mlflow_model_preserves_size_lookup_error_before_reporting(
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.side_effect = RuntimeError(f"size unavailable for {secret_url}")
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_file_size=1000)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_file_size=1000)
 
     mock_mkdtemp.assert_not_called()
     mock_scan.assert_not_called()
@@ -1220,8 +1228,7 @@ def test_scan_mlflow_model_preserves_header_credentials_from_size_errors(
         "request failed; headers={'Authorization': 'Bearer very-secret-token', \"api_key\": \"another secret\"}"
     )
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_file_size=1000)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_file_size=1000)
 
     mock_mkdtemp.assert_not_called()
     mock_scan.assert_not_called()
@@ -1348,8 +1355,7 @@ def test_scan_mlflow_model_rejects_unallowlisted_artifact_uri_before_download(
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.return_value = SimpleNamespace(artifact_uri=artifact_uri)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_mkdtemp.assert_not_called()
@@ -1811,8 +1817,7 @@ def test_scan_mlflow_model_rejects_unsafe_remote_listing_before_download(
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     assert determine_exit_code(result) == 2
     assert result.checks[0].details["reason"] == "artifact_listing_unsafe"
@@ -1844,8 +1849,7 @@ def test_scan_mlflow_model_allows_explicitly_allowlisted_remote_artifact_uri(
     artifact_repository.download_artifacts.return_value = str(download_dir)
     mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     assert result == scan_result
     mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/1")
@@ -2179,8 +2183,7 @@ def test_scan_mlflow_model_rejects_file_added_after_preflight(
 
     mock_repo = local_artifact_repository(source_root)
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_file_size=10)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_file_size=10)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2204,8 +2207,7 @@ def test_scan_mlflow_model_rejects_oversized_artifact_before_download(
 
     mock_repo = local_artifact_repository(source_root)
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_file_size=1024)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_file_size=1024)
 
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_mkdtemp.assert_not_called()
@@ -2274,8 +2276,7 @@ def test_scan_mlflow_model_rejects_artifact_size_change_after_preflight(
 
     mock_repo = local_artifact_repository(source_root)
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_file_size=10)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_file_size=10)
 
     mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
@@ -2306,8 +2307,7 @@ def test_scan_mlflow_model_rejects_unsafe_artifact_metadata_path(
     download_dir.mkdir()
     mock_mkdtemp.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_repo.list_artifacts.assert_called_once_with(None)
     mock_repo._download_file.assert_not_called()
@@ -2343,12 +2343,11 @@ def test_scan_mlflow_model_accepts_exact_download_size_boundaries(
 
     mock_repo = local_artifact_repository(source_root)
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model(
-            "models:/TestModel/1",
-            max_file_size=4,
-            max_total_size=7,
-        )
+    result = _scan_with_mock_mlflow(
+        mock_mlflow,
+        max_file_size=4,
+        max_total_size=7,
+    )
 
     assert result == mock_scan.return_value
     mock_repo._download_file.assert_not_called()
@@ -2382,12 +2381,11 @@ def test_scan_mlflow_model_rejects_listing_budget_before_download(
 
     mock_repo = local_artifact_repository(source_root)
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model(
-            "models:/TestModel/1",
-            max_file_size=1024,
-            max_mlflow_artifact_entries=2,
-        )
+    result = _scan_with_mock_mlflow(
+        mock_mlflow,
+        max_file_size=1024,
+        max_mlflow_artifact_entries=2,
+    )
 
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
@@ -2419,12 +2417,11 @@ def test_scan_mlflow_model_bounds_real_local_repository_listing(
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.return_value = repository
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model(
-            "models:/TestModel/1",
-            max_file_size=1024,
-            max_mlflow_artifact_entries=2,
-        )
+    result = _scan_with_mock_mlflow(
+        mock_mlflow,
+        max_file_size=1024,
+        max_mlflow_artifact_entries=2,
+    )
 
     repository.list_artifacts.assert_not_called()  # type: ignore[attr-defined]
     mock_mkdtemp.assert_not_called()
@@ -2511,8 +2508,7 @@ def test_scan_mlflow_model_bounds_generator_listing_before_download(
     download_dir.mkdir()
     mock_mkdtemp.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_mlflow_artifact_entries=2)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_mlflow_artifact_entries=2)
 
     mock_repo.list_artifacts.assert_called_once_with(None)
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
@@ -2619,8 +2615,7 @@ def test_scan_mlflow_model_rejects_download_return_outside_staging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """MLflow backends must not redirect scanning outside ModelAudit's staging directory."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "modelaudit_mlflow_test"
     download_dir.mkdir()
     outside_model = tmp_path / "outside" / "model.pkl"
@@ -2629,8 +2624,7 @@ def test_scan_mlflow_model_rejects_download_return_outside_staging(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(outside_model)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2651,8 +2645,7 @@ def test_scan_mlflow_model_rejects_staging_root_symlink_swap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A backend must not replace the private staging root with an outside link."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     outside_dir = tmp_path / "outside"
@@ -2670,8 +2663,7 @@ def test_scan_mlflow_model_rejects_staging_root_symlink_swap(
 
     mock_mlflow.artifacts.download_artifacts.side_effect = replace_staging_root
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2688,8 +2680,7 @@ def test_scan_mlflow_model_rejects_staging_root_directory_swap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A new directory at the same path is not the private staging root ModelAudit created."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     mock_mkdtemp.return_value = str(download_dir)
@@ -2705,8 +2696,7 @@ def test_scan_mlflow_model_rejects_staging_root_directory_swap(
 
     mock_mlflow.artifacts.download_artifacts.side_effect = replace_staging_root
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2724,8 +2714,7 @@ def test_scan_mlflow_model_rejects_staged_symlink_to_outside_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A staged symlink must not redirect scanning to an outside file."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     outside_model = tmp_path / "outside" / "model.pkl"
@@ -2736,8 +2725,7 @@ def test_scan_mlflow_model_rejects_staged_symlink_to_outside_file(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(returned_link)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2755,8 +2743,7 @@ def test_scan_mlflow_model_accepts_staged_symlink_to_staged_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An in-staging symlink to an in-staging regular file remains scannable."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     target_dir = download_dir / "artifacts"
     target_dir.mkdir(parents=True)
@@ -2768,8 +2755,7 @@ def test_scan_mlflow_model_accepts_staged_symlink_to_staged_file(
     mock_mlflow.artifacts.download_artifacts.return_value = str(returned_link)
     mock_scan.return_value = {"bytes_scanned": 5, "issues": []}
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     assert result == mock_scan.return_value
     mock_scan.assert_called_once()
@@ -2787,8 +2773,7 @@ def test_scan_mlflow_model_rejects_fifo_without_blocking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A returned FIFO is rejected by metadata without opening the pipe."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     fifo_path = download_dir / "model.pkl"
@@ -2796,8 +2781,7 @@ def test_scan_mlflow_model_rejects_fifo_without_blocking(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(fifo_path)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2815,8 +2799,7 @@ def test_scan_mlflow_model_rejects_symlink_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A returned symlink loop fails closed instead of escaping the CLI error contract."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     first_link = download_dir / "first.pkl"
@@ -2826,8 +2809,7 @@ def test_scan_mlflow_model_rejects_symlink_loop(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(first_link)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2845,8 +2827,7 @@ def test_scan_mlflow_model_rejects_nested_fifo_without_blocking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A special file nested below an accepted directory must be rejected before core hashing."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     model_dir = download_dir / "model"
     model_dir.mkdir(parents=True)
@@ -2854,8 +2835,7 @@ def test_scan_mlflow_model_rejects_nested_fifo_without_blocking(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2874,8 +2854,7 @@ def test_scan_mlflow_model_rejects_nested_file_symlink_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A nested file symlink must not redirect core to a target outside staging."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     model_dir = download_dir / "model"
     model_dir.mkdir(parents=True)
@@ -2885,8 +2864,7 @@ def test_scan_mlflow_model_rejects_nested_file_symlink_escape(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2905,8 +2883,7 @@ def test_scan_mlflow_model_rejects_nested_directory_symlink(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Directory links are rejected because core's non-following walk would omit their contents."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     model_dir = download_dir / "model"
     target_dir = download_dir / "target"
@@ -2917,8 +2894,7 @@ def test_scan_mlflow_model_rejects_nested_directory_symlink(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2936,8 +2912,7 @@ def test_scan_mlflow_model_rejects_nested_directory_junction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Windows junctions are rejected even when pathlib does not classify them as symlinks."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     model_dir = download_dir / "model"
     junction_dir = model_dir / "junction"
@@ -2947,8 +2922,7 @@ def test_scan_mlflow_model_rejects_nested_directory_junction(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2966,8 +2940,7 @@ def test_scan_mlflow_model_rejects_regular_file_reparse_point(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A file reparse point must not be treated as an ordinary staged regular file."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     reparse_file = download_dir / "model.pkl"
@@ -2979,8 +2952,7 @@ def test_scan_mlflow_model_rejects_regular_file_reparse_point(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -2998,8 +2970,7 @@ def test_scan_mlflow_model_rejects_hardlink_alias_outside_staging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A staged file with an alias outside the private directory remains replaceable by that alias."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     staged_file = download_dir / "model.pkl"
@@ -3011,8 +2982,7 @@ def test_scan_mlflow_model_rejects_hardlink_alias_outside_staging(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -3029,8 +2999,7 @@ def test_scan_mlflow_model_accepts_hardlinks_contained_in_staging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Hardlinks are safe when every alias remains inside the private staging directory."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     staged_file = download_dir / "model.pkl"
@@ -3043,8 +3012,7 @@ def test_scan_mlflow_model_accepts_hardlinks_contained_in_staging(
     mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
     mock_scan.return_value = {"bytes_scanned": 5, "issues": []}
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1")
+    result = _scan_with_mock_mlflow(mock_mlflow)
 
     assert result == mock_scan.return_value
     mock_scan.assert_called_once()
@@ -3061,8 +3029,7 @@ def test_scan_mlflow_model_bounds_staging_tree_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Recursive validation uses the same configurable artifact-entry budget as preflight."""
-    mock_mlflow = MagicMock()
-    _configure_trusted_remote_repository(mock_mlflow, monkeypatch)
+    mock_mlflow = _new_trusted_remote_mlflow(monkeypatch)
     download_dir = tmp_path / "staging"
     download_dir.mkdir()
     (download_dir / "first.pkl").write_bytes(b"one")
@@ -3070,8 +3037,7 @@ def test_scan_mlflow_model_bounds_staging_tree_validation(
     mock_mkdtemp.return_value = str(download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-        result = scan_mlflow_model("models:/TestModel/1", max_mlflow_artifact_entries=1)
+    result = _scan_with_mock_mlflow(mock_mlflow, max_mlflow_artifact_entries=1)
 
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
