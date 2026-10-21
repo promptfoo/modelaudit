@@ -76,6 +76,7 @@ EXPECTED_SENTENCEPIECE_FIXTURES = {
 
 LARGE_ASSET_BYTES = 100 * 1024
 LARGE_ASSET_ALLOWLIST = {
+    "tests/assets/agent_review_pr1913.json": "18 triage regression cases with original scanner reports from PR #1913",
     "tests/assets/samples/pickles/safe_large_model.pkl": "safe pickle regression corpus large-file fixture",
     "tests/assets/scenarios/license_scenarios/agpl_component/agpl_model.pkl": "license scenario model fixture",
     "tests/assets/scenarios/license_scenarios/unlicensed_dataset/embeddings.npy": "license scenario dataset fixture",

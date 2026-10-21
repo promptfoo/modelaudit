@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add advisory API triage for README/model-card findings when `OPENAI_API_KEY` is set, with `--no-triage` to disable it. Advice goes to stderr without changing scanner reports, verdicts, or exit codes.
 - Support standard CPython 3.14 with native pickle and H5 scanner validation across Linux, macOS, and Windows.
 - Add `metadata --table-limit` to control the number of file entries displayed in directory tables.
 

@@ -3025,6 +3025,25 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
     sys.exit(determine_exit_code(audit_result))
 
 
+def _emit_triage(audit_result: ModelAuditResultModel) -> None:
+    """Keep optional triage failures and output separate from scanner results."""
+    try:
+        from .triage import triage_findings
+
+        lines = triage_findings(audit_result)
+    except BaseException as exc:
+        # The module entrypoint uses a BaseException subclass for SIGINT.
+        lines = [f"AI triage unavailable ({type(exc).__name__}: {exc}); scanner result unchanged."]
+    if lines:
+        with contextlib.suppress(BaseException):
+            try:
+                click.echo("\n".join(_escape_terminal_text(line) for line in lines), err=True)
+            except OSError:
+                # Prevent Python's shutdown flush from replacing the scan exit code with 120.
+                with open(os.devnull, "w") as sink:
+                    os.dup2(sink.fileno(), sys.stderr.fileno())
+
+
 def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, verbose: bool) -> bool:
     """Return True when the local scan prefilter should skip a non-model file."""
     if _local_path_will_be_scanned(scan_path, skip_non_model_files=runtime.skip_non_model_files):
@@ -4489,6 +4508,11 @@ def delegate_info() -> None:
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option("--quiet", "-q", is_flag=True, help="Silence detection messages")
+@click.option(
+    "--no-triage",
+    is_flag=True,
+    help="Skip advisory AI triage (enabled when OPENAI_API_KEY is set; sends documentation findings to OpenAI)",
+)
 # Security behavior (2 flags)
 @click.option(
     "--blacklist",
@@ -4589,6 +4613,7 @@ def scan_command(
     output: str | None,
     verbose: bool,
     quiet: bool,
+    no_triage: bool,
     blacklist: tuple[str, ...],
     strict: bool,
     no_whitelist: bool,
@@ -4904,6 +4929,13 @@ def scan_command(
         flush_telemetry()
         raise
 
+    if (
+        not no_triage
+        and not dry_run
+        and not interrupt_handler.is_interrupted()
+        and os.environ.get("OPENAI_API_KEY", "").strip()
+    ):
+        _emit_triage(audit_result)
     _record_scan_end_and_exit(audit_result, scan_start_time)
 
 
