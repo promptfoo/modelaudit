@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support standard CPython 3.14 with native pickle and H5 scanner validation across Linux, macOS, and Windows.
 - Add `metadata --table-limit` to control the number of file entries displayed in directory tables.
 
+### Changed
+
+- Require Rust 1.85 or newer for source builds of the native pickle scanner and use Rust 1.85 in Docker builds for PyO3 0.30 compatibility.
+
 ### Fixed
 
 - Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.

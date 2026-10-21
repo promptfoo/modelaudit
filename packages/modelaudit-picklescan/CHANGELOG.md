@@ -11,6 +11,10 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Support standard CPython 3.14 with standalone package tests and installed-wheel API checks, preserving Python 3.10 compatibility.
 
+### Changed
+
+- Require Rust 1.85 or newer when building from source to support PyO3 0.30. Prebuilt wheels do not require a Rust toolchain.
+
 ### Fixed
 
 - Preserve backslash pairs in protocol 0 Unicode operands so Template callbacks remain detectable.

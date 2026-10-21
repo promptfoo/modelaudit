@@ -9,7 +9,7 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 - Python 3.10-3.14
 - uv (recommended) or pip
 - Git
-- Rust 1.83+ toolchain with `cargo`, `rustfmt`, and `clippy`; editable installs build the native pickle scanner extension
+- Rust 1.85+ toolchain with `cargo`, `rustfmt`, and `clippy`; editable installs build the native pickle scanner extension
 
 ### Setup
 

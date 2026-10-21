@@ -939,7 +939,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.83.0 --profile minimal
+          rustup toolchain install 1.85.0 --profile minimal
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
 
@@ -967,7 +967,7 @@ jobs:
 
       - name: Check Rust scanner MSRV
         run: |
-          cargo +1.83.0 check --manifest-path Cargo.toml --locked
+          cargo +1.85.0 check --manifest-path Cargo.toml --locked
 
       - name: Lint Rust scanner crate
         run: |

@@ -161,7 +161,7 @@ Reports and all nested models are frozen — call `to_dict()` if you need a muta
 Wheels cover five targets; any other platform or a custom Python ABI requires building from source:
 
 ```bash
-# Requires Rust 1.83+ and a working C toolchain
+# Requires Rust 1.85+ and a working C toolchain
 pip install modelaudit-picklescan --no-binary modelaudit-picklescan
 ```
 
