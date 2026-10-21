@@ -5,6 +5,22 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.12...modelaudit-picklescan-v0.1.13) (2026-10-21)
+
+
+### Features
+
+* **python:** support standard CPython 3.14 in ModelAudit ([#1908](https://github.com/promptfoo/modelaudit/issues/1908)) ([58a6784](https://github.com/promptfoo/modelaudit/commit/58a67841beb8eab124dcfad457bb281597d50e75))
+
+
+### Bug Fixes
+
+* **ci:** restore Click 8.5 scanning and Windows fixtures ([#1906](https://github.com/promptfoo/modelaudit/issues/1906)) ([f996f12](https://github.com/promptfoo/modelaudit/commit/f996f12c7f3b3f338844a4380639cadc095a9c1f))
+* **deps:** update rust crate pyo3 to 0.30.0 ([#1914](https://github.com/promptfoo/modelaudit/issues/1914)) ([415819f](https://github.com/promptfoo/modelaudit/commit/415819fa0b58d097dd201c0fa3f41eba33431c78))
+* **picklescan:** restore Click 8.5 detection and Windows test portability ([#1864](https://github.com/promptfoo/modelaudit/issues/1864)) ([2838c99](https://github.com/promptfoo/modelaudit/commit/2838c9978c2254ae699c63712b311b2491d047a7))
+* **picklescan:** support standard CPython 3.14 ([#1907](https://github.com/promptfoo/modelaudit/issues/1907)) ([5cda52b](https://github.com/promptfoo/modelaudit/commit/5cda52b0698109e479d10394579cf2128bf3d577))
+* **routing:** avoid pickle false positives on license text ([#1911](https://github.com/promptfoo/modelaudit/issues/1911)) ([6128247](https://github.com/promptfoo/modelaudit/commit/6128247b084f3bb64724706ab037c7de8ab242f5))
+
 ## [Unreleased]
 
 ### Added
