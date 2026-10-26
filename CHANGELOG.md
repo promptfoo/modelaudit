@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Constrain Filelock to 3.20.3 on Python 3.10 and patched 4.2.1+ on Python 3.11-3.14 in published dependencies and the lockfile.
+
 ### Added
 
 - Support standard CPython 3.14 with native pickle and H5 scanner validation across Linux, macOS, and Windows.

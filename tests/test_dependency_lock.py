@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import pytest
+from packaging.markers import Marker
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
@@ -119,6 +120,58 @@ def test_base_install_requires_patched_anyio() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
 
     assert PATCHED_ANYIO_REQUIREMENT in root_config["project"]["dependencies"]
+
+
+@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14"])
+def test_filelock_requirements_exclude_vulnerable_releases(python_version: str) -> None:
+    project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    environment = {"python_version": python_version, "python_full_version": f"{python_version}.0"}
+    requirements = [
+        requirement
+        for entry in project["dependencies"]
+        if (requirement := Requirement(entry)).name == "filelock"
+        and (requirement.marker is None or requirement.marker.evaluate(environment))
+    ]
+
+    assert len(requirements) == 1
+    specifier = requirements[0].specifier
+    for vulnerable_version in ("3.20.0", "3.20.1", "3.20.2", "3.20.4", "3.22.0", "4.1.0", "4.2.0", "4.2.1rc1"):
+        assert not specifier.contains(vulnerable_version, prereleases=True)
+    if python_version == "3.10":
+        assert specifier == SpecifierSet("==3.20.3")
+    else:
+        assert not specifier.contains("3.20.3")
+        for patched_version in ("4.2.1", "4.2.4", "4.3.0"):
+            assert specifier.contains(patched_version)
+
+
+@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14"])
+def test_filelock_lock_preserves_secure_python_cohorts(python_version: str) -> None:
+    lock = tomllib.loads(LOCKFILE.read_text(encoding="utf-8"))
+    environment = {"python_version": python_version, "python_full_version": f"{python_version}.0"}
+    packages = [
+        package
+        for package in lock["package"]
+        if package["name"] == "filelock"
+        and (
+            "resolution-markers" not in package
+            or any(Marker(marker).evaluate(environment) for marker in package["resolution-markers"])
+        )
+    ]
+
+    assert len(packages) == 1
+    locked_version = Version(packages[0]["version"])
+    if python_version == "3.10":
+        assert locked_version == Version("3.20.3")
+    else:
+        assert locked_version >= Version("4.2.1")
+    project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    assert any(
+        requirement.specifier.contains(locked_version)
+        for entry in project["dependencies"]
+        if (requirement := Requirement(entry)).name == "filelock"
+        and (requirement.marker is None or requirement.marker.evaluate(environment))
+    )
 
 
 @pytest.mark.parametrize("extra", MLFLOW_EXTRAS)

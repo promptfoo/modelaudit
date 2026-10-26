@@ -32,6 +32,8 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 XGBoost 3.4 requires Python 3.12+, so Python 3.10-3.11 use XGBoost 3.2 while Python 3.12-3.14 use XGBoost 3.4.
 
+Filelock is already required by Hugging Face Hub. Published dependencies pin it to 3.20.3 on Python 3.10 and require 4.2.1+ on Python 3.11-3.14. The 4.2.1 security fixes require Python 3.11; 3.20.3 includes the [earlier security fix](https://github.com/advisories/GHSA-qmgc-5h2g-mvrw) and precedes the [affected 3.20.4-4.2.0 releases](https://github.com/advisories/GHSA-9vhv-jxww-xfm5). Keep these interpreter-specific constraints in package metadata as well as the lockfile.
+
 Standard CPython 3.14 uses the broad root test profile alongside Python 3.11; it is not added to the reduced-lane allowlist. PR CI also smoke-tests native pickle and H5 scanning on macOS and Windows. Python 3.10, 3.12, and 3.13 retain their existing reduced profiles.
 
 The H5 extras require h5py 3.15+ on Python 3.14 for upstream wheel support; older Python versions keep their existing h5py floor and locked h5py 3.14.0. The Python 3.14 lock selects h5py 3.16.0 with bundled HDF5 2.0; regression tests cover benign and malicious Keras metadata with both earliest and latest HDF5 format bounds. TensorFlow and ONNX retain the version markers above. Free-threaded Python is not supported.
