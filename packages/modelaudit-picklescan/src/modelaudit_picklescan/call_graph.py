@@ -1785,7 +1785,6 @@ class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
     resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
     import_runtime_trusted: bool
-    report_started: bool = False
     resolution_fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
@@ -5421,13 +5420,11 @@ def _begin_shared_source_report() -> int | None:
     if snapshot is None:
         return None
     with snapshot.lock:
-        # Context creation already validated the runtime immediately before the first report.
-        if snapshot.report_started and (not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot)):
+        if not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot):
             _clear_source_sensitive_caches_now()
             _reset_shared_source_snapshot(snapshot)
         snapshot.active_report_generation = snapshot.generation
         snapshot.active_report_stability_reason = snapshot.stability_reason if not snapshot.stable else None
-        snapshot.report_started = True
         return snapshot.generation
 
 

@@ -613,7 +613,8 @@ def test_shared_source_snapshot_bounds_full_import_runtime_validation(
         assert call_graph._interpreter_import_runtime_is_trusted() is True
         call_graph._ensure_shared_source_snapshot_stable(report_generation)
 
-    assert validation_count == 2
+    # A shared scope can change before its first report, so that boundary needs its own validation.
+    assert validation_count == 3
 
 
 def test_shared_snapshot_revalidates_file_finder_constructor_without_execution(
@@ -2817,6 +2818,38 @@ def test_file_finder_resolution_retries_one_stale_directory_snapshot(
         assert finder_state["_relaxed_path_cache"] is relaxed_path_cache
     finally:
         call_graph._cached_file_finder_resolution_summary.cache_clear()
+
+
+def test_scan_bytes_refreshes_file_finder_state_before_first_shared_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = pickle.dumps(complex(1, 2), protocol=4)
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec("unrelated_module") is None
+
+    with (
+        _standard_import_runtime(
+            monkeypatch,
+            module="unrelated_module",
+            importer_cache={**sys.path_importer_cache, path_entry: finder},
+            search_path=[path_entry, *sys.path],
+        ),
+        call_graph.shared_source_sensitive_caches(),
+    ):
+        (tmp_path / "unrelated.txt").write_text("not Python source", encoding="utf-8")
+        directory_stat = tmp_path.stat()
+        os.utime(tmp_path, ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns + 2_000_000_000))
+        assert finder.find_spec("unrelated_module") is None
+
+        report = package_api.scan_bytes(payload)
+
+    assert report.status == ScanStatus.COMPLETE, report.to_dict()
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.coverage.raw_scan_complete is True
+    assert report.coverage.opcode_scan_complete is True
+    assert not report.errors
 
 
 @pytest.mark.parametrize("change_during_scan", [False, True], ids=["before-scan", "during-scan"])
