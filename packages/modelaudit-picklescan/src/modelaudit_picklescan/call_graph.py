@@ -1765,6 +1765,7 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         partial_entrypoints: tuple[str, ...] = (),
         partial_calls: tuple[str, ...] = (),
         stability_reason: str | None = None,
+        stability_details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.partial_findings = partial_findings
@@ -1774,6 +1775,7 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         self.partial_calls = partial_calls
         # Which snapshot gate invalidated the run, reported without changing the message text.
         self.stability_reason = stability_reason
+        self.stability_details = stability_details
 
 
 class _SourceReadTooLargeError(OSError):
@@ -1785,7 +1787,6 @@ class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
     resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
     import_runtime_trusted: bool
-    report_started: bool = False
     resolution_fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
@@ -1801,6 +1802,8 @@ class _SharedSourceSnapshot:
     generation: int = 0
     active_report_generation: int | None = None
     active_report_stability_reason: str | None = None
+    stability_details: tuple[str, dict[str, Any]] | None = None
+    active_report_stability_details: dict[str, Any] | None = None
     stable: bool = True
     stability_reason: str | None = None
     reusable: bool = True
@@ -3400,6 +3403,114 @@ def _mark_shared_source_snapshot_unreusable() -> None:
             snapshot.reusable = False
 
 
+_MAX_STABILITY_DETAIL_ENTRIES = 8
+_MAX_STABILITY_DETAIL_TEXT = 2048
+
+
+def _bounded_stability_text(value: str) -> dict[str, Any]:
+    details: dict[str, Any] = {"value": value[:_MAX_STABILITY_DETAIL_TEXT]}
+    if len(value) > _MAX_STABILITY_DETAIL_TEXT:
+        details.update(
+            length=len(value),
+            truncated=True,
+            sha256=hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest(),
+        )
+    return details
+
+
+def _record_source_stability_details(snapshot: _SharedSourceSnapshot, reason: str, details: dict[str, Any]) -> None:
+    if snapshot.stability_details is None and snapshot.stability_reason in {None, reason}:
+        snapshot.stability_details = (
+            reason,
+            {
+                "generation": snapshot.generation,
+                "active_report_generation": snapshot.active_report_generation,
+                **details,
+            },
+        )
+
+
+def _matching_source_stability_details(snapshot: _SharedSourceSnapshot, reason: str | None) -> dict[str, Any] | None:
+    observation = snapshot.stability_details
+    return observation[1] if observation is not None and observation[0] == reason else None
+
+
+def _resolution_context_change_details(
+    before: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    after: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> dict[str, Any]:
+    components: list[dict[str, Any]] = []
+    for name, previous, current in zip(("meta_path", "path_hooks", "path_importers"), before, after, strict=True):
+        if previous == current:
+            continue
+        changes: list[dict[str, Any]] = []
+        omitted = 0
+        for index in range(max(len(previous), len(current))):
+            old = previous[index] if index < len(previous) else None
+            new = current[index] if index < len(current) else None
+            if old == new:
+                continue
+            if len(changes) >= _MAX_STABILITY_DETAIL_ENTRIES:
+                omitted += 1
+                continue
+            change: dict[str, Any] = {
+                "index": index,
+                "before": _bounded_stability_text(old) if old is not None else None,
+                "after": _bounded_stability_text(new) if new is not None else None,
+            }
+            if name == "path_importers":
+                change["before_path"] = _bounded_stability_text(old.rpartition("=")[0]) if old is not None else None
+                change["after_path"] = _bounded_stability_text(new.rpartition("=")[0]) if new is not None else None
+            changes.append(change)
+        components.append(
+            {
+                "component": name,
+                "before_count": len(previous),
+                "after_count": len(current),
+                "changes": changes,
+                "omitted_changes": omitted,
+            }
+        )
+    return {"phase": "resolution_context", "components": components}
+
+
+def _stability_fingerprint_details(fingerprint: bytes | str | None) -> dict[str, Any]:
+    if fingerprint is None:
+        return {"kind": "missing"}
+    if isinstance(fingerprint, bytes):
+        return {"kind": "content_sha256", "value": fingerprint.hex()}
+    return {"kind": "file_identity", **_bounded_stability_text(fingerprint)}
+
+
+def _record_resolution_fingerprint_change(
+    snapshot: _SharedSourceSnapshot,
+    *,
+    phase: str,
+    path: str,
+    reusable: bool,
+    fingerprint: bytes | str | None,
+    module_name: str | None = None,
+    loaded: bool | None = None,
+) -> None:
+    expected_recorded = path in snapshot.resolution_fingerprints
+    details: dict[str, Any] = {
+        "phase": phase,
+        "path": _bounded_stability_text(path),
+        "reusable": reusable,
+        "expected_recorded": expected_recorded,
+        "expected": (
+            _stability_fingerprint_details(snapshot.resolution_fingerprints[path])
+            if expected_recorded
+            else {"kind": "untracked"}
+        ),
+        "observed": _stability_fingerprint_details(fingerprint) if reusable else {"kind": "unreadable"},
+    }
+    if module_name is not None:
+        details["module"] = _bounded_stability_text(module_name)
+        details["loaded"] = loaded
+    _record_source_stability_details(snapshot, "resolution_fingerprint_changed", details)
+
+
 def _mark_shared_source_snapshot_unstable(snapshot: _SharedSourceSnapshot, reason: str) -> None:
     """Record the first specific reason that invalidated the current report."""
     with snapshot.lock:
@@ -3407,6 +3518,7 @@ def _mark_shared_source_snapshot_unstable(snapshot: _SharedSourceSnapshot, reaso
             snapshot.stability_reason = reason
         if snapshot.active_report_generation is not None and snapshot.active_report_stability_reason is None:
             snapshot.active_report_stability_reason = reason
+            snapshot.active_report_stability_details = _matching_source_stability_details(snapshot, reason)
         snapshot.stable = False
         snapshot.reusable = False
 
@@ -5272,6 +5384,7 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.loaded_interpreter_references.clear()
     snapshot.generation += 1
     snapshot.stability_reason = None
+    snapshot.stability_details = None
     snapshot.stable = True
     snapshot.reusable = snapshot.import_runtime_trusted and all(
         ":unreusable:" not in identity for identities in snapshot.resolution_context for identity in identities
@@ -5326,6 +5439,11 @@ def _snapshot_resolution_context_is_current(snapshot: _SharedSourceSnapshot) -> 
     if snapshot.resolution_context == current:
         return True
     if not _resolution_context_allows_trusted_cache_population(snapshot.resolution_context, current):
+        _record_source_stability_details(
+            snapshot,
+            "resolution_context_changed",
+            _resolution_context_change_details(snapshot.resolution_context, current),
+        )
         return False
     snapshot.resolution_context = current
     snapshot.reusable = snapshot.reusable and all(
@@ -5365,6 +5483,13 @@ def _shared_source_snapshot_staleness_reason(snapshot: _SharedSourceSnapshot) ->
     for path, expected_resolution_fingerprint in snapshot.resolution_fingerprints.items():
         reusable, resolution_fingerprint = _resolution_candidate_fingerprint(Path(path))
         if not reusable or resolution_fingerprint != expected_resolution_fingerprint:
+            _record_resolution_fingerprint_change(
+                snapshot,
+                phase="resolution_revalidation",
+                path=path,
+                reusable=reusable,
+                fingerprint=resolution_fingerprint,
+            )
             return "resolution_fingerprint_changed"
     for module_name, expected_source in snapshot.module_sources.items():
         if _current_module_source_path(module_name) != expected_source:
@@ -5421,13 +5546,14 @@ def _begin_shared_source_report() -> int | None:
     if snapshot is None:
         return None
     with snapshot.lock:
-        # Context creation already validated the runtime immediately before the first report.
-        if snapshot.report_started and (not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot)):
+        if not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot):
             _clear_source_sensitive_caches_now()
             _reset_shared_source_snapshot(snapshot)
         snapshot.active_report_generation = snapshot.generation
         snapshot.active_report_stability_reason = snapshot.stability_reason if not snapshot.stable else None
-        snapshot.report_started = True
+        snapshot.active_report_stability_details = _matching_source_stability_details(
+            snapshot, snapshot.active_report_stability_reason
+        )
         return snapshot.generation
 
 
@@ -5445,17 +5571,24 @@ def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None
             raise _CallGraphAnalysisLimitError(
                 "source changed during shared call-graph analysis",
                 stability_reason=reason or "report_generation_advanced",
+                stability_details=(
+                    snapshot.active_report_stability_details
+                    if snapshot.active_report_generation == report_generation
+                    else None
+                ),
             )
         reason = _shared_source_snapshot_staleness_reason(snapshot)
         if reason is None:
             return
         _mark_shared_source_snapshot_unstable(snapshot, reason)
         reason = snapshot.active_report_stability_reason or reason
+        details = snapshot.active_report_stability_details or _matching_source_stability_details(snapshot, reason)
         _clear_source_sensitive_caches_now()
         _reset_shared_source_snapshot(snapshot)
     raise _CallGraphAnalysisLimitError(
         "source changed during shared call-graph analysis",
         stability_reason=reason,
+        stability_details=details,
     )
 
 
@@ -5785,6 +5918,15 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
             return
         reusable, fingerprint = _resolution_candidate_fingerprint(candidate)
         if not reusable:
+            _record_resolution_fingerprint_change(
+                snapshot,
+                phase="selected_source_read",
+                path=str(candidate),
+                reusable=reusable,
+                fingerprint=fingerprint,
+                module_name=module_name,
+                loaded=loaded,
+            )
             _mark_shared_source_snapshot_unstable(snapshot, "resolution_fingerprint_changed")
             return
         existing_source = snapshot.module_sources.get(module_name)
@@ -6451,7 +6593,10 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
                     calls = (*calls, *_direct_import_execution_calls(proxy, module_name, context.is_package))
     except _CallGraphAnalysisLimitError as error:
         raise _CallGraphAnalysisLimitError(
-            str(error), partial_calls=calls, stability_reason=error.stability_reason
+            str(error),
+            partial_calls=calls,
+            stability_reason=error.stability_reason,
+            stability_details=error.stability_details,
         ) from error
     return calls
 

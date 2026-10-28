@@ -156,7 +156,7 @@ def _assert_botocore_process_provider_rce(tmp_path: Path) -> None:
     payload, marker_content = _botocore_process_provider_rce_payload(marker)
 
     control_report = scan_bytes(control_payload, source="botocore-process-provider-control.pkl")
-    assert control_report.verdict == SafetyVerdict.CLEAN
+    assert control_report.verdict == SafetyVerdict.CLEAN, control_report.to_dict()
 
     assert not marker.exists()
     pickle.loads(control_payload)
