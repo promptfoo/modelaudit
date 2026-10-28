@@ -3989,6 +3989,7 @@ def test_scan_huggingface_file_encoded_revision_source_key_is_not_double_suffixe
 def test_scan_huggingface_streaming_gated_json_reports_acquisition_error(
     mock_download_streaming: MagicMock,
     mock_scan_streaming: MagicMock,
+    tmp_path: Path,
 ) -> None:
     """Streaming acquisition failures must not claim a completed stream scan."""
 
@@ -4003,7 +4004,9 @@ def test_scan_huggingface_streaming_gated_json_reports_acquisition_error(
     url = f"https://huggingface.co/test/gated?revision={_HF_TEST_REVISION}"
     mock_download_streaming.side_effect = error
 
-    result = CliRunner().invoke(cli, ["scan", "--quiet", "--stream", "--format", "json", url])
+    result = CliRunner().invoke(
+        cli, ["scan", "--cache-dir", str(tmp_path / "cache"), "--quiet", "--stream", "--format", "json", url]
+    )
 
     parsed = parse_click_json_output(result.output)
     source_key = f"{url}@{_HF_TEST_REVISION}"
@@ -4044,7 +4047,16 @@ def test_scan_huggingface_streaming_late_failure_is_not_acquisition_error(
 
     result = CliRunner().invoke(
         cli,
-        ["scan", "--quiet", "--stream", "--format", "json", "https://huggingface.co/test/gated"],
+        [
+            "scan",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--quiet",
+            "--stream",
+            "--format",
+            "json",
+            "https://huggingface.co/test/gated",
+        ],
     )
 
     parsed = parse_click_json_output(result.output)
@@ -5063,7 +5075,18 @@ def test_scan_huggingface_streaming_success(
     mock_scan_streaming.return_value = mock_result
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "--format", "json", "https://huggingface.co/test/streaming-model"])
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--stream",
+            "--format",
+            "json",
+            "https://huggingface.co/test/streaming-model",
+        ],
+    )
 
     # Should succeed
     assert result.exit_code == 0
@@ -6413,6 +6436,7 @@ def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
+    tmp_path: Path,
 ) -> None:
     """Selected scanners should constrain HuggingFace streaming prefilters."""
     mock_is_hf_url.return_value = True
@@ -6420,7 +6444,19 @@ def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
     mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "--scanners", "llamafile", "--quiet", "hf://test/model"])
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--stream",
+            "--scanners",
+            "llamafile",
+            "--quiet",
+            "hf://test/model",
+        ],
+    )
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({"", ".exe", ".llamafile"})
@@ -6437,6 +6473,7 @@ def test_scan_huggingface_streaming_preserves_header_routed_unknown_suffixes(
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
     scanner_args: list[str],
+    tmp_path: Path,
 ) -> None:
     """Default and header-routed scans should request bounded unknown-suffix coverage."""
     mock_is_hf_url.return_value = True
@@ -6444,7 +6481,9 @@ def test_scan_huggingface_streaming_preserves_header_routed_unknown_suffixes(
     mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", *scanner_args, "--quiet", "hf://test/model"])
+    result = runner.invoke(
+        cli, ["scan", "--cache-dir", str(tmp_path / "cache"), "--stream", *scanner_args, "--quiet", "hf://test/model"]
+    )
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["include_all_files"] is True
@@ -6459,6 +6498,7 @@ def test_scan_huggingface_streaming_preserves_selected_extensionless_filenames(
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
+    tmp_path: Path,
 ) -> None:
     """Selected filename-routed scanners should keep extensionless remote candidates."""
     mock_is_hf_url.return_value = True
@@ -6466,7 +6506,19 @@ def test_scan_huggingface_streaming_preserves_selected_extensionless_filenames(
     mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "--scanners", "metadata", "--quiet", "hf://test/model"])
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--stream",
+            "--scanners",
+            "metadata",
+            "--quiet",
+            "hf://test/model",
+        ],
+    )
 
     assert result.exit_code == 0
     assert "" not in mock_download_streaming.call_args.kwargs["scannable_extensions"]
@@ -6482,6 +6534,7 @@ def test_scan_huggingface_streaming_preview_uses_selected_stream_policy(
     mock_download_streaming: MagicMock,
     mock_get_model_info: MagicMock,
     mock_is_hf_url: MagicMock,
+    tmp_path: Path,
 ) -> None:
     """Streaming preview should use the same selected scanner policy as acquisition."""
     mock_is_hf_url.return_value = True
@@ -6498,7 +6551,19 @@ def test_scan_huggingface_streaming_preview_uses_selected_stream_policy(
 
     result = CliRunner().invoke(
         cli,
-        ["scan", "--stream", "--timeout", "7", "--scanners", "metadata", "--format", "text", "hf://test/model"],
+        [
+            "scan",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--stream",
+            "--timeout",
+            "7",
+            "--scanners",
+            "metadata",
+            "--format",
+            "text",
+            "hf://test/model",
+        ],
     )
 
     output = strip_ansi(result.output)
@@ -6526,6 +6591,7 @@ def test_scan_huggingface_streaming_preview_preserves_include_all_files_policy(
     mock_download_streaming: MagicMock,
     mock_get_model_info: MagicMock,
     mock_is_hf_url: MagicMock,
+    tmp_path: Path,
 ) -> None:
     """Default streaming preview should include the bounded unfiltered inventory."""
     mock_is_hf_url.return_value = True
@@ -6540,7 +6606,9 @@ def test_scan_huggingface_streaming_preview_preserves_include_all_files_policy(
         "unknown_size_count": 0,
     }
 
-    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/model"])
+    result = CliRunner().invoke(
+        cli, ["scan", "--cache-dir", str(tmp_path / "cache"), "--stream", "--format", "text", "hf://test/model"]
+    )
 
     output = strip_ansi(result.output)
     assert result.exit_code == 0, output
@@ -6785,9 +6853,21 @@ def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
     sbom_file = tmp_path / "streamed.sbom.json"
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "--quiet", "--sbom", str(sbom_file), "hf://test/model"])
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--sbom",
+            str(sbom_file),
+            "hf://test/model",
+        ],
+    )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert sbom_file.exists()
     sbom_data = json.loads(sbom_file.read_text())
     components = {component["name"]: component for component in sbom_data["components"]}
@@ -6924,7 +7004,9 @@ def test_scan_huggingface_streaming_incomplete_result_reports_failed_progress(
         success=False,
     )
 
-    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/model"])
+    result = CliRunner().invoke(
+        cli, ["scan", "--cache-dir", str(tmp_path / "cache"), "--stream", "--format", "text", "hf://test/model"]
+    )
     clean_output = strip_ansi(result.output)
 
     assert result.exit_code == 2
@@ -7065,7 +7147,10 @@ def test_scan_huggingface_streaming_security_findings_keep_complete_progress(
         success=True,
     )
 
-    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/malicious-model"])
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--cache-dir", str(tmp_path / "cache"), "--stream", "--format", "text", "hf://test/malicious-model"],
+    )
     clean_output = strip_ansi(result.output)
 
     assert result.exit_code == 1
@@ -7109,7 +7194,9 @@ def test_scan_huggingface_streaming_with_issues(
     mock_scan_streaming.return_value = mock_result
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "hf://test/malicious-model"])
+    result = runner.invoke(
+        cli, ["scan", "--cache-dir", str(tmp_path / "cache"), "--stream", "hf://test/malicious-model"]
+    )
 
     # Should exit with code 1 (security issues found)
     assert result.exit_code == 1
@@ -7121,17 +7208,25 @@ def test_scan_huggingface_streaming_with_issues(
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
-def test_scan_huggingface_streaming_download_failure(mock_download_streaming, mock_is_hf_url):
+def test_scan_huggingface_streaming_download_failure(
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test handling of download failure in streaming mode."""
     mock_is_hf_url.return_value = True
     mock_download_streaming.side_effect = Exception("Streaming download failed")
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "https://huggingface.co/test/model"])
+    result = runner.invoke(
+        cli, ["scan", "--cache-dir", str(tmp_path / "cache"), "--stream", "https://huggingface.co/test/model"]
+    )
 
     # Should fail with error code 2
     assert result.exit_code == 2
     assert "Error" in result.output
+    assert "Streaming download failed" in result.output
+    mock_download_streaming.assert_called_once()
 
 
 @pytest.mark.parametrize(("malicious", "expected_exit_code"), [(False, 0), (True, 1)])
@@ -7254,7 +7349,7 @@ def test_scan_huggingface_streaming_scan_errors(
     mock_scan_streaming.return_value = mock_result
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "hf://test/model"])
+    result = runner.invoke(cli, ["scan", "--cache-dir", str(tmp_path / "cache"), "--stream", "hf://test/model"])
 
     # Should exit with code 2 (scan errors)
     assert result.exit_code == 2
