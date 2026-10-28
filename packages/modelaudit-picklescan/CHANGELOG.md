@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Include bounded changed-context and source-fingerprint details when call-graph analysis fails closed because its source snapshot becomes unstable.
 - Support standard CPython 3.14 with standalone package tests and installed-wheel API checks, preserving Python 3.10 compatibility.
 
 ### Changed

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import _imp
 import ast
+import hashlib
 import importlib
 import os
 import pickle
@@ -4606,3 +4607,240 @@ def test_private_zip_validation_rechecks_constructor_without_executing_it(
     monkeypatch.setattr(call_graph, "_zipimport_read_bounded_archive_files", change_constructor_after_read)
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
     assert entry not in directory_cache
+
+
+@pytest.fixture
+def source_stability_snapshot(monkeypatch: pytest.MonkeyPatch) -> Iterator[call_graph._SharedSourceSnapshot]:
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: ())
+    monkeypatch.setattr(call_graph, "_source_resolution_context", lambda: ((), (), ()))
+    with call_graph.shared_source_sensitive_caches():
+        call_graph._begin_shared_source_report()
+        snapshot = call_graph._SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        assert snapshot is not None
+        yield snapshot
+
+
+@pytest.mark.parametrize("component", [0, 1, 2])
+def test_source_stability_diagnostics_preserve_rejection_and_first_reason(
+    source_stability_snapshot: call_graph._SharedSourceSnapshot,
+    monkeypatch: pytest.MonkeyPatch,
+    component: int,
+) -> None:
+    snapshot = source_stability_snapshot
+    previous = [("meta",), ("hook",), ("/root=trusted:importlib.machinery.FileFinder:old",)]
+    current = list(previous)
+    current[component] = ("/root=trusted:importlib.machinery.FileFinder:new",)
+    snapshot.resolution_context = (previous[0], previous[1], previous[2])
+    monkeypatch.setattr(call_graph, "_source_resolution_context", lambda: (current[0], current[1], current[2]))
+
+    assert call_graph._snapshot_resolution_context_is_current(snapshot) is False
+    call_graph._mark_shared_source_snapshot_unstable(snapshot, "resolution_context_changed")
+    first_details = snapshot.active_report_stability_details
+    first_generation = snapshot.active_report_generation
+    call_graph._record_source_stability_details(snapshot, "resolution_context_changed", {"later": True})
+    call_graph._record_source_stability_details(snapshot, "resolution_fingerprint_changed", {"later": True})
+    call_graph._mark_shared_source_snapshot_unstable(snapshot, "resolution_fingerprint_changed")
+
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError) as error:
+        call_graph._ensure_shared_source_snapshot_stable(snapshot.active_report_generation)
+    assert error.value.stability_reason == "resolution_context_changed"
+    assert error.value.stability_details is first_details
+    assert first_details is not None
+    assert first_details["generation"] == first_generation
+    assert first_details["active_report_generation"] == first_generation
+    changed_component = first_details["components"][0]
+    assert changed_component["component"] == ("meta_path", "path_hooks", "path_importers")[component]
+    assert changed_component["changes"][0]["before"]["value"] == previous[component][0]
+    assert changed_component["changes"][0]["after"]["value"] == current[component][0]
+    assert changed_component["omitted_changes"] == 0
+    if component == 2:
+        assert changed_component["changes"][0]["before_path"]["value"] == "/root"
+    assert snapshot.stability_details is None
+    next_generation = call_graph._begin_shared_source_report()
+    assert snapshot.active_report_stability_details is None
+    call_graph._ensure_shared_source_snapshot_stable(next_generation)
+
+
+@pytest.mark.parametrize("populate", [False, True])
+def test_source_stability_diagnostics_keep_unchanged_and_trusted_population_clean(
+    source_stability_snapshot: call_graph._SharedSourceSnapshot,
+    monkeypatch: pytest.MonkeyPatch,
+    populate: bool,
+) -> None:
+    snapshot = source_stability_snapshot
+    before = (("meta",), ("hook",), ("/old=trusted:importlib.machinery.FileFinder:old",))
+    after = (
+        (before[0], before[1], (*before[2], "/new=trusted:importlib.machinery.FileFinder:new")) if populate else before
+    )
+    snapshot.resolution_context = before
+    monkeypatch.setattr(call_graph, "_source_resolution_context", lambda: after)
+    assert call_graph._snapshot_resolution_context_is_current(snapshot) is True
+    assert snapshot.resolution_context == after
+    assert snapshot.stability_details is None
+    assert snapshot.active_report_stability_details is None
+
+
+@pytest.mark.parametrize(
+    ("expected", "observed", "reusable", "expected_kind", "observed_kind"),
+    [
+        (None, b"x" * 32, True, "missing", "content_sha256"),
+        (b"x" * 32, None, True, "content_sha256", "missing"),
+        (b"x" * 32, b"y" * 32, True, "content_sha256", "content_sha256"),
+        ("regular_file:old", "regular_file:new", True, "file_identity", "file_identity"),
+        (b"x" * 32, None, False, "content_sha256", "unreadable"),
+    ],
+)
+def test_source_stability_diagnostics_identify_resolution_revalidation(
+    source_stability_snapshot: call_graph._SharedSourceSnapshot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    expected: bytes | str | None,
+    observed: bytes | str | None,
+    reusable: bool,
+    expected_kind: str,
+    observed_kind: str,
+) -> None:
+    snapshot = source_stability_snapshot
+    path = str(tmp_path / "module.pyc")
+    snapshot.resolution_fingerprints[path] = expected
+    calls: list[Path] = []
+
+    def fingerprint(candidate: Path) -> tuple[bool, bytes | str | None]:
+        calls.append(candidate)
+        return reusable, observed
+
+    monkeypatch.setattr(call_graph, "_resolution_candidate_fingerprint", fingerprint)
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError) as error:
+        call_graph._ensure_shared_source_snapshot_stable(snapshot.active_report_generation)
+    assert calls == [Path(path)]
+    details = error.value.stability_details
+    assert details is not None
+    assert details["phase"] == "resolution_revalidation"
+    assert details["path"] == {"value": path}
+    assert details["expected_recorded"] is True
+    assert details["expected"]["kind"] == expected_kind
+    assert details["observed"]["kind"] == observed_kind
+    assert details["reusable"] is reusable
+    if isinstance(observed, bytes):
+        assert details["observed"]["value"] == observed.hex()
+    assert error.value.stability_reason == "resolution_fingerprint_changed"
+
+
+def test_source_stability_diagnostics_distinguish_untracked_selected_source(
+    source_stability_snapshot: call_graph._SharedSourceSnapshot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = source_stability_snapshot
+    path = tmp_path / "module.py"
+    monkeypatch.setattr(call_graph, "_resolution_candidate_fingerprint", lambda _path: (False, None))
+    call_graph._track_shared_source_path("module", path, loaded=False)
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError) as error:
+        call_graph._ensure_shared_source_snapshot_stable(snapshot.active_report_generation)
+    details = error.value.stability_details
+    assert details is not None
+    assert details["phase"] == "selected_source_read"
+    assert details["path"] == {"value": str(path)}
+    assert details["expected_recorded"] is False
+    assert details["expected"] == {"kind": "untracked"}
+    assert details["observed"] == {"kind": "unreadable"}
+    assert details["reusable"] is False
+    assert details["module"] == {"value": "module"}
+    assert details["loaded"] is False
+
+
+def test_source_stability_diagnostics_do_not_relabel_earlier_reason(
+    source_stability_snapshot: call_graph._SharedSourceSnapshot,
+) -> None:
+    snapshot = source_stability_snapshot
+    call_graph._mark_shared_source_snapshot_unstable(snapshot, "source_search_context_changed")
+    call_graph._record_source_stability_details(snapshot, "resolution_context_changed", {"later": True})
+    call_graph._mark_shared_source_snapshot_unstable(snapshot, "resolution_context_changed")
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError) as error:
+        call_graph._ensure_shared_source_snapshot_stable(snapshot.active_report_generation)
+    assert error.value.stability_reason == "source_search_context_changed"
+    assert error.value.stability_details is None
+
+
+def test_source_stability_diagnostics_never_cross_report_generations(
+    source_stability_snapshot: call_graph._SharedSourceSnapshot,
+) -> None:
+    snapshot = source_stability_snapshot
+    snapshot.generation = 3
+    snapshot.active_report_generation = 2
+    snapshot.active_report_stability_reason = "resolution_context_changed"
+    snapshot.active_report_stability_details = {"generation": 2}
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError) as error:
+        call_graph._ensure_shared_source_snapshot_stable(1)
+    assert error.value.stability_reason == "report_generation_advanced"
+    assert error.value.stability_details is None
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError) as same_report_error:
+        call_graph._ensure_shared_source_snapshot_stable(2)
+    assert same_report_error.value.stability_reason == "resolution_context_changed"
+    assert same_report_error.value.stability_details == {"generation": 2}
+
+
+def test_source_stability_diagnostics_bound_entries_and_mark_text_truncation() -> None:
+    limit = call_graph._MAX_STABILITY_DETAIL_ENTRIES
+    text_limit = call_graph._MAX_STABILITY_DETAIL_TEXT
+    long_identity = "/" + "a" * (text_limit + 20)
+    before = (tuple(f"{index}:{long_identity}" for index in range(limit + 3)), (), ())
+    after = (tuple(f"changed:{index}" for index in range(limit + 3)), (), ())
+    component = call_graph._resolution_context_change_details(before, after)["components"][0]
+    assert len(component["changes"]) == limit
+    assert component["omitted_changes"] == 3
+    assert component["before_count"] == component["after_count"] == limit + 3
+    value = component["changes"][0]["before"]
+    original = before[0][0]
+    assert value["value"] == original[:text_limit]
+    assert value["length"] == len(original)
+    assert value["truncated"] is True
+    assert value["sha256"] == hashlib.sha256(original.encode()).hexdigest()
+
+
+def test_source_stability_diagnostics_survive_partial_call_rethrow(monkeypatch: pytest.MonkeyPatch) -> None:
+    details = {"phase": "resolution_revalidation", "generation": 2}
+    error = call_graph._CallGraphAnalysisLimitError(
+        "source changed during shared call-graph analysis",
+        stability_reason="resolution_fingerprint_changed",
+        stability_details=details,
+    )
+
+    def fail_context(_module: str) -> None:
+        raise error
+
+    monkeypatch.setattr(call_graph, "_resolve_function_target", lambda _name: "typing.function")
+    monkeypatch.setattr(
+        call_graph,
+        "_analyze_module",
+        lambda _name: SimpleNamespace(
+            calls_by_function={"typing.function": ("safe.call",)},
+            aliases={"_lazy_annotationlib": "annotationlib"},
+        ),
+    )
+    monkeypatch.setattr(call_graph, "_module_source_context", fail_context)
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError) as caught:
+        call_graph._calls_for_function("typing.function")
+    assert caught.value.partial_calls == ("safe.call",)
+    assert caught.value.stability_details is details
+    assert caught.value.stability_reason == error.stability_reason
+
+
+def test_source_stability_diagnostics_preserve_public_fail_closed_report() -> None:
+    details = {"phase": "selected_source_read", "generation": 0}
+    error = call_graph._CallGraphAnalysisLimitError(
+        "source changed during shared call-graph analysis",
+        stability_reason="resolution_fingerprint_changed",
+        stability_details=details,
+    )
+    report = package_api._with_call_graph_enrichment_errors(
+        package_api.scan_bytes(pickle.dumps(None), source="inert-diagnostic-control.pkl"),
+        (("python_call_graph_source_stability", error),),
+    )
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.errors[-1].category == "call_graph_analysis_error"
+    assert report.errors[-1].details["analysis_incomplete"] is True
+    assert report.errors[-1].details["source_stability_reason"] == "resolution_fingerprint_changed"
+    assert report.errors[-1].details["source_stability_details"] == details
