@@ -87,8 +87,11 @@ def test_gitpython_lock_stays_on_patched_release_floor() -> None:
     [
         ("aiohttp", (3, 14, 3)),
         ("anyio", PATCHED_ANYIO_FLOOR),
+        ("brotli", (1, 2, 1)),
+        ("certifi", (2026, 10, 19)),
         ("cryptography", (50, 0, 0)),
         ("keras", (3, 15, 0)),
+        ("setuptools", (84, 1, 0)),
         ("sqlparse", (0, 6, 0)),
     ],
 )

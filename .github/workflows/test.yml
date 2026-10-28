@@ -373,6 +373,7 @@ jobs:
       - *install-rust-toolchain
 
       - name: Sync dependencies
+        id: windows-dependencies
         run: |
           uv sync --extra all-ci-windows
 
@@ -385,6 +386,13 @@ jobs:
         if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
         run: |
           uv run pytest tests -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
+
+      - name: Capture benign pickle scanner diagnostics
+        if: ${{ !cancelled() && steps.windows-dependencies.outcome == 'success' }}
+        env:
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+        run: |
+          uv run pytest tests/test_pickle_context_filtering.py::test_rust_pickle_scanner_keeps_common_ml_serialization_clean -n 0 -s --tb=short
 
   test:
     name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
