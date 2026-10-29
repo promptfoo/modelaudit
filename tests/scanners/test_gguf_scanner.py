@@ -9,6 +9,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,6 +20,7 @@ from modelaudit.cli import cli
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
+from modelaudit.scanners import gguf_scanner as gguf_scanner_module
 from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
@@ -2956,6 +2958,95 @@ def test_gguf_ggml_source_stability_fails_closed(
         tmp_path / "source-stability-cache",
         GGUF_SOURCE_CHANGED_REASON,
     )
+
+
+@pytest.mark.parametrize("format_name", ["ggml", "gguf"])
+@pytest.mark.parametrize(
+    ("platform_name", "stat_source", "change", "expected_success"),
+    [
+        ("nt", "path", "ctime", True),
+        ("nt", "descriptor", "ctime", False),
+        ("posix", "path", "ctime", False),
+        ("posix", "descriptor", "ctime", False),
+        ("nt", "path", "identity", False),
+        ("nt", "path", "mode", False),
+        ("nt", "path", "size", False),
+        ("nt", "path", "mtime", False),
+    ],
+)
+def test_source_stability_distinguishes_windows_cross_view_ctime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
+    platform_name: str,
+    stat_source: str,
+    change: str,
+    expected_success: bool,
+) -> None:
+    path = tmp_path / f"cross-view.{format_name}"
+    if format_name == "gguf":
+        _write_gguf_with_tensor_type(path, 0)
+    else:
+        _write_ggml_file(path)
+    with path.open("rb") as handle:
+        source_stat = os.fstat(handle.fileno())
+    changed_values = list(source_stat)
+    if change == "identity":
+        changed_values[1] += 1
+    elif change == "mode":
+        changed_values[0] = int(changed_values[0]) ^ 0o100
+    elif change == "size":
+        changed_values[6] += 1
+    changed_stat = os.stat_result(
+        changed_values,
+        {
+            "st_atime_ns": source_stat.st_atime_ns,
+            "st_mtime_ns": source_stat.st_mtime_ns + (1 if change == "mtime" else 0),
+            "st_ctime_ns": source_stat.st_ctime_ns + (1 if change == "ctime" else 0),
+        },
+    )
+    original_fstat = os.fstat
+    original_stat = os.stat
+    analysis_complete = False
+    scanner = GgufScanner()
+    original_scan = getattr(scanner, f"_scan_{format_name}")
+
+    def scan_and_mark(*args: Any, **kwargs: Any) -> None:
+        nonlocal analysis_complete
+        original_scan(*args, **kwargs)
+        analysis_complete = True
+
+    def observed_stat(observed: os.stat_result, view: str) -> os.stat_result:
+        if not os.path.samestat(source_stat, observed):
+            return observed
+        # Normalize real host differences; inject only the selected final-view change.
+        return changed_stat if analysis_complete and stat_source == view else source_stat
+
+    def simulated_fstat(fd: int) -> os.stat_result:
+        return observed_stat(original_fstat(fd), "descriptor")
+
+    def simulated_stat(*args: Any, **kwargs: Any) -> os.stat_result:
+        return observed_stat(original_stat(*args, **kwargs), "path")
+
+    simulated_os = SimpleNamespace(**vars(os))
+    simulated_os.name = platform_name
+    simulated_os.fstat = simulated_fstat
+    simulated_os.stat = simulated_stat
+    monkeypatch.setattr(gguf_scanner_module, "os", simulated_os)
+    monkeypatch.setattr(scanner, f"_scan_{format_name}", scan_and_mark)
+
+    result = scanner.scan(str(path))
+
+    assert result.success is expected_success
+    stability_checks = [check for check in result.checks if check.name == "GGUF/GGML Source Stability"]
+    if expected_success:
+        assert stability_checks == []
+        assert GGUF_SOURCE_CHANGED_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    else:
+        assert len(stability_checks) == 1
+        assert stability_checks[0].details["analysis_incomplete"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert GGUF_SOURCE_CHANGED_REASON in result.metadata["scan_outcome_reasons"]
 
 
 def test_ggml_polyglot_with_post_preflight_bad_zip_fails_closed(tmp_path: Path) -> None:

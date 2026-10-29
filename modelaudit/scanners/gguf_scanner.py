@@ -459,8 +459,9 @@ class GgufScanner(BaseScanner):
                     or opened_stat.st_mode != final_stat.st_mode
                     or opened_stat.st_size != final_stat.st_size
                     or opened_stat.st_mtime_ns != final_stat.st_mtime_ns
-                    or opened_stat.st_ctime_ns != final_stat.st_ctime_ns
-                    for final_stat in final_stats
+                    # Windows path and descriptor views can disagree on creation time.
+                    or (opened_stat.st_ctime_ns != final_stat.st_ctime_ns and (os.name != "nt" or stat_index == 0))
+                    for stat_index, final_stat in enumerate(final_stats)
                 ):
                     result.add_check(
                         name="GGUF/GGML Source Stability",

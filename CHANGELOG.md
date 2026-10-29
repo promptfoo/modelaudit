@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Avoid false GGUF/GGML source-change rejections from Windows path/descriptor creation-time differences while retaining descriptor and other file-stability checks.
 - Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.
 - Resolve bound function attributes during finite ONNX replay and ignore unrelated dead transforms without dropping live weight consumers.
 - Bound duplicate singular fields during ONNX control preflight and preserve findings and explicit incomplete coverage when admission stops.
