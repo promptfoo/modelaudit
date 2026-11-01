@@ -246,7 +246,7 @@ jobs:
       - name: Download release metadata
         id: download-metadata
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: modelaudit-release-metadata-${{ github.run_attempt }}
           path: /tmp/modelaudit-release-metadata
@@ -822,7 +822,7 @@ jobs:
     steps:
       - &shared-download-build-artifacts
         name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with: *root-dist-artifact
 
       - name: Verify the root picklescan dependency is available on PyPI
@@ -943,7 +943,7 @@ jobs:
     steps:
       - &shared-download-standalone-pickle-package-artifacts
         name: Download standalone pickle package artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: modelaudit-picklescan-dist-*
           path: dist/
@@ -1473,7 +1473,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download original root build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dist
           path: dist/
