@@ -8238,6 +8238,20 @@ class TestNetworkCommDetector:
         assert 4444 in ports  # Metasploit
         assert 6379 in ports  # Redis
 
+    @pytest.mark.parametrize("data", [b"arxiv:2310.06825", b"port=2300", b"port 2300"])
+    def test_suspicious_ports_do_not_match_decimal_prefixes(self, data: bytes) -> None:
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
+
+    def test_suspicious_port_after_decimal_near_match_keeps_actual_position(self) -> None:
+        data = b"arxiv:2310.06825\nserver:23\n"
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        finding = next(finding for finding in findings if finding["type"] == "suspicious_port")
+        assert finding["port"] == 23
+        assert finding["position"] == data.rindex(b"23")
+
     def test_suspicious_port_findings_do_not_reexpose_url_passwords(self) -> None:
         """A numeric URL password removed from URL evidence must stay removed."""
         findings = NetworkCommDetector().scan(b"https://user:4444@example.com/path", "hook.py")
