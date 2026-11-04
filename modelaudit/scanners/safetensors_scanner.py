@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlparse
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from ..core_results import mark_operational_scan_error
+from ..utils.helpers.json_limits import validate_json_structural_limits as _validate_json_structural_token_limit
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Map SafeTensors dtypes to bit sizes for integrity checking. Sub-byte
@@ -194,28 +195,6 @@ _HTML_EVENT_NAMES = frozenset(
         "wheel",
     }
 )
-
-
-def _validate_json_structural_token_limit(raw: bytes, max_tokens: int, label: str) -> None:
-    """Reject container-heavy JSON before the decoder materializes attacker-controlled graphs."""
-    token_count = 0
-    in_string = False
-    escaped = False
-    for byte in raw:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif byte == ord("\\"):
-                escaped = True
-            elif byte == ord('"'):
-                in_string = False
-            continue
-        if byte == ord('"'):
-            in_string = True
-        elif byte in {ord("{"), ord("["), ord(",")}:
-            token_count += 1
-            if token_count > max_tokens:
-                raise ValueError(f"{label} exceeds JSON object/value limit")
 
 
 def _iter_safetensors_name_utf8_chunks(name: str) -> Iterator[bytes]:

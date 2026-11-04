@@ -1508,6 +1508,7 @@ class WeightDistributionScanner(BaseScanner):
 
             from modelaudit.scanners.onnx_scanner import (
                 _build_onnx_weight_analysis_plan,
+                _load_onnx_model_with_control_admission,
                 _OnnxWeightAnalysisPlan,
             )
         except ImportError as exc:
@@ -1538,7 +1539,31 @@ class WeightDistributionScanner(BaseScanner):
             return plan
 
         try:
-            model = onnx.load(path, load_external_data=False)  # type: ignore[possibly-unresolved-reference]
+            raw_control_admission = None
+            selected_format = (
+                onnx.serialization.registry.get_format_from_file_extension(os.path.splitext(path)[1]) or "protobuf"
+            )
+            # The stat-sized input passed the configured limit above. Bound
+            # this read to that admitted size, not the whole configured budget.
+            snapshot_limit = model_size
+            self.check_interrupted()
+            with open(path, "rb") as handle:
+                model_data = handle.read(snapshot_limit + 1)
+            if len(model_data) > snapshot_limit:
+                raise ValueError("ONNX source exceeds the admitted snapshot byte limit")
+            if selected_format == "protobuf":
+                # Bind preflight and loading to one immutable read, including
+                # private binary calls with .pb or unregistered extensions.
+                model, raw_control_admission = _load_onnx_model_with_control_admission(
+                    model_data, onnx=onnx, interrupt_check=self.check_interrupted
+                )
+            else:
+                # Preserve ONNX's public format selection for private nonbinary
+                # callers. Raw tensor controls and attribute-string proofs lack
+                # binary-wire admission and remain explicitly inconclusive.
+                # Potential training targets also cannot supply constant proofs.
+                model = onnx.load_model_from_string(model_data, format=selected_format)
+            del model_data
 
             def pre_materialization_check(initializer: Any, name: str, estimated_bytes: int) -> bool:
                 inline_storage_nbytes = self._onnx_inline_storage_nbytes(onnx, initializer)
@@ -1559,7 +1584,11 @@ class WeightDistributionScanner(BaseScanner):
                 onnx=onnx,
                 np=np,
                 max_array_size=None,
+                raw_control_admission=raw_control_admission,
                 pre_materialization_check=pre_materialization_check,
+                pre_view_check=lambda name, nbytes: self._tensor_fits_budget(
+                    "onnx_initializer_size_limit", name, tensor_nbytes=nbytes
+                ),
                 retain_array_check=lambda name, nbytes: self._tensor_fits_budget(
                     "onnx_initializer_size_limit",
                     name,

@@ -30,7 +30,13 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 `pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install. Keep ONNX docs aligned with the `python_version < "3.13"` package marker until that gate is removed.
 
-XGBoost 3.4 requires Python 3.12+, so Python 3.10-3.11 use XGBoost 3.2 while Python 3.12-3.13 use XGBoost 3.4.
+XGBoost 3.4 requires Python 3.12+, so Python 3.10-3.11 use XGBoost 3.2 while Python 3.12-3.14 use XGBoost 3.4.
+
+Standard CPython 3.14 uses the broad root test profile alongside Python 3.11; it is not added to the reduced-lane allowlist. PR CI also smoke-tests native pickle and H5 scanning on macOS and Windows. Python 3.10, 3.12, and 3.13 retain their existing reduced profiles.
+
+The H5 extras require h5py 3.15+ on Python 3.14 for upstream wheel support; older Python versions keep their existing h5py floor and locked h5py 3.14.0. The Python 3.14 lock selects h5py 3.16.0 with bundled HDF5 2.0; regression tests cover benign and malicious Keras metadata with both earliest and latest HDF5 format bounds. TensorFlow and ONNX retain the version markers above. Free-threaded Python is not supported.
+
+Python 3.14 Dill function/class bytecode can resemble a truncated embedded pickle. These files retain fail-closed S213 incomplete-analysis findings alongside the normal dynamic-code findings. Do not exempt executable bytecode from nested inspection; the regression test requires this conservative result on 3.14 and completed analysis on older interpreters.
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 

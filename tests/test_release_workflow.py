@@ -117,6 +117,79 @@ def test_root_release_accepts_current_picklescan_version() -> None:
     assert Requirement(picklescan_requirements[0]).specifier.contains(picklescan_project["version"])
 
 
+def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi() -> None:
+    root_dir = Path(__file__).resolve().parents[1]
+    package_dir = root_dir / "packages/modelaudit-picklescan"
+    project = tomllib.loads((package_dir / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    cargo = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+    workflow = yaml.safe_load((root_dir / ".github/workflows/test.yml").read_text(encoding="utf-8"))
+    job = _jobs(workflow)["picklescan-package"]
+    matrix = job["strategy"]["matrix"]
+    versions = matrix["python-version"]
+    lanes = {(os_name, version) for os_name in matrix["os"] for version in versions}
+    lanes.update((lane["os"], lane["python-version"]) for lane in matrix["include"])
+    release_platforms = {
+        lane["os"]
+        for lane in _jobs(_load_release_workflow())["build-picklescan-package"]["strategy"]["matrix"]["include"]
+    }
+
+    assert {"3.10", "3.11", "3.12", "3.13", "3.14"} <= set(versions)
+    assert {(os_name, "3.14") for os_name in release_platforms} <= lanes
+    assert job["timeout-minutes"] == (
+        "${{ matrix.timeout-minutes || ((matrix.os == 'macos-15-intel' || "
+        "matrix.os == 'windows-latest') && 30 || 15) }}"
+    )
+    for version in ("3.12", "3.13", "3.14"):
+        linux = next(
+            lane for lane in matrix["include"] if lane["os"] == "ubuntu-latest" and lane["python-version"] == version
+        )
+        assert linux["timeout-minutes"] == 30
+    intel311 = next(
+        lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.11"
+    )
+    assert intel311["timeout-minutes"] == 45
+    intel314 = next(
+        lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.14"
+    )
+    assert intel314["timeout-minutes"] == 75
+    arm314 = next(lane for lane in matrix["include"] if lane["os"] == "macos-14" and lane["python-version"] == "3.14")
+    assert arm314["timeout-minutes"] == 60
+    ubuntu_arm314 = next(
+        lane for lane in matrix["include"] if lane["os"] == "ubuntu-24.04-arm" and lane["python-version"] == "3.14"
+    )
+    assert ubuntu_arm314["timeout-minutes"] == 30
+    windows314 = next(
+        lane for lane in matrix["include"] if lane["os"] == "windows-latest" and lane["python-version"] == "3.14"
+    )
+    assert windows314["timeout-minutes"] == 90
+    assert project["requires-python"] == ">=3.10"
+    assert cargo["features"]["abi3"] == ["pyo3/abi3-py310"]
+    for version in versions:
+        assert f"Programming Language :: Python :: {version}" in project["classifiers"]
+
+    steps = _job_steps(workflow, "picklescan-package")
+    assert "${{ matrix.python-version }}" in _step_by_name(steps, "Pin Python version")["run"]
+    assert job["defaults"]["run"]["working-directory"] == "packages/modelaudit-picklescan"
+    assert job["defaults"]["run"]["shell"] == "bash"
+    test_run = _step_by_name(steps, "Run standalone package tests")["run"]
+    assert '--junitxml="$RUNNER_TEMP/picklescan-test-results.xml"' in test_run
+    evidence = _step_by_name(steps, "Preserve Windows standalone test evidence")
+    assert evidence["if"] == "always() && runner.os == 'Windows'"
+    assert evidence["uses"].startswith("actions/upload-artifact@")
+    smoke = _step_by_name(steps, "Smoke test standalone package wheel install")["run"]
+    assert 'uv pip install --python "$SMOKE_PYTHON"' in smoke
+    assert "/Scripts/python.exe" in smoke
+    assert 'cd "$smoke_dir"' in smoke
+    assert '"$SMOKE_PYTHON" -I -' in smoke
+    assert "import modelaudit_picklescan._rust as native" in smoke
+    assert "origin.is_relative_to(Path(sys.prefix).resolve())" in smoke
+    assert 'string.Template("warm").substitute({})' in smoke
+    assert 'assert template.status.value == "complete"' in smoke
+    assert 'assert template.verdict.value == "clean"' in smoke
+    assert 'for method in ("Template.is_valid", "Template.get_identifiers")' in smoke
+    assert 'assert helper.verdict.value == "clean"' in smoke
+
+
 def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
     root_dir = Path(__file__).resolve().parents[1]
     root_lock = tomllib.loads((root_dir / "uv.lock").read_text(encoding="utf-8"))

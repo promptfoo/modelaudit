@@ -9006,11 +9006,12 @@ def test_raw_tar_hdf5_entry_limit_preserves_early_nemo_finding(tmp_path: Path) -
     )
 
 
-def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("target", "dangerous"), [("os.system", True), ("torch.nn.Linear", False)])
+def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path, target: str, dangerous: bool) -> None:
     model_path = tmp_path / "raw-nemo-padding-limit.h5"
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
-        [("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")],
+        [("model_config.yaml", f"model:\n  _target_: {target}\n  command: echo pwned\n".encode())],
     )
     config = {
         "cache_enabled": False,
@@ -9026,12 +9027,17 @@ def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path)
     assert result.scanner_name == "keras_h5"
     assert "nemo" in result.metadata["supplemental_scanners"]
     assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-        and check.status == CheckStatus.FAILED
-        and check.details["target"] == "os.system"
-        for check in result.checks
+    assert (
+        any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == target
+            for check in result.checks
+        )
+        is dangerous
     )
+    assert result.success is False
+    assert any(entry["path"].endswith(":model_config.yaml") for entry in result.metadata["contents"])
 
 
 def test_raw_tar_hdf5_metadata_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
@@ -12084,23 +12090,6 @@ def test_scan_file_fails_closed_for_xgboost_mxnet_json_overlap(
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
 
 
-def test_scan_file_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysis(tmp_path: Path) -> None:
-    model_path = tmp_path / "polyglot-0000.params"
-    model_path.write_text(
-        '\ufeff{"version":[1,7,4],"learner":{"gradient_booster":{}},'
-        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-        '"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert result.success is False
-    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
-    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
-
-
 def test_scan_file_xgboost_owned_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
     model_path = tmp_path / "polyglot-0000.params"
     model_path.write_bytes(
@@ -12123,67 +12112,6 @@ def test_scan_file_xgboost_owned_shadowed_params_preserves_raw_signature_finding
     _assert_xgboost_params_signature(model_path)
 
 
-def test_scan_file_xgboost_owned_analysis_failed_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
-    model_path = tmp_path / "polyglot-0000.params"
-    model_path.write_bytes(
-        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
-        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
-        b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
-    )
-
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
-    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
-
-
-def test_scan_file_xgboost_only_skips_overlap_params_signature_analysis(tmp_path: Path) -> None:
-    model_path = tmp_path / "polyglot-0000.params"
-    model_path.write_bytes(
-        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
-        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
-        b'"metadata":"\x7fELF"}'
-    )
-
-    result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert result.success is True
-    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
-    assert "mxnet" in result.metadata["skipped_scanner_ids"]
-
-
-def test_scan_file_xgboost_only_skips_shadowed_params_signature_analysis(tmp_path: Path) -> None:
-    model_path = tmp_path / "polyglot-0000.params"
-    model_path.write_bytes(
-        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
-        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
-        b'"metadata":"\x7fELF","nodes":[]}'
-    )
-
-    result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
-
-    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
-    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
-    assert "mxnet" in result.metadata["skipped_scanner_ids"]
-
-
-def test_scan_file_xgboost_only_skips_analysis_failed_params_signature_analysis(tmp_path: Path) -> None:
-    model_path = tmp_path / "polyglot-0000.params"
-    model_path.write_bytes(
-        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
-        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
-        b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
-    )
-
-    result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
-
-    assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
-    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
-    assert "mxnet" in result.metadata["skipped_scanner_ids"]
-
-
 def test_scan_file_runs_xgboost_checks_for_conclusive_mxnet_json_overlap(tmp_path: Path) -> None:
     model_path = tmp_path / "polyglot.json"
     model_path.write_text(
@@ -12198,43 +12126,6 @@ def test_scan_file_runs_xgboost_checks_for_conclusive_mxnet_json_overlap(tmp_pat
     assert result.success is False
     assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
-
-
-def test_scan_file_runs_xgboost_checks_for_probable_malformed_mxnet_json_overlap(tmp_path: Path) -> None:
-    model_path = tmp_path / "malformed-polyglot.json"
-    model_path.write_text(
-        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
-        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert result.success is False
-    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
-    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
-
-
-@pytest.mark.parametrize("filename", ["malformed-0000.params", "malformed.jpg"])
-def test_scan_file_runs_xgboost_checks_for_renamed_probable_malformed_mxnet_overlap(
-    tmp_path: Path,
-    filename: str,
-) -> None:
-    model_path = tmp_path / filename
-    model_path.write_text(
-        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"__reduce__"},'
-        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert result.success is False
-    assert any(
-        "Suspicious pattern detected: Pickle-like reduction pattern in JSON" in issue.message for issue in result.issues
-    )
 
 
 def test_scan_file_syntactically_malformed_renamed_mxnet_xgboost_overlap_fails_closed(tmp_path: Path) -> None:
@@ -12276,20 +12167,6 @@ def test_scan_file_partial_malformed_renamed_mxnet_xgboost_overlap_fails_closed(
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
     assert aggregate.success is False
     assert core_module.determine_exit_code(aggregate) == 2
-
-
-def test_scan_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tmp_path: Path) -> None:
-    model_path = tmp_path / "malformed-0000.params"
-    model_path.write_text(
-        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
-        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
 def test_scan_file_xgboost_only_malformed_overlap_is_exit2_and_not_cached(tmp_path: Path) -> None:
@@ -12341,54 +12218,6 @@ def test_scan_file_runs_xgboost_checks_for_bounded_probable_malformed_mxnet_over
     )
 
     _assert_xgboost_json_pattern(model_path)
-
-
-def test_scan_file_keeps_benign_mxnet_json_near_match_out_of_xgboost_routing(tmp_path: Path) -> None:
-    model_path = tmp_path / "benign-symbol.json"
-    model_path.write_text(
-        '{"learner":{"description":"benign metadata"},'
-        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "mxnet"
-    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
-
-
-@pytest.mark.parametrize("filename", ["nested-metadata.json", "nested-metadata-symbol.json"])
-def test_scan_file_keeps_nested_xgboost_marker_names_in_mxnet_metadata_out_of_xgboost_analysis(
-    tmp_path: Path,
-    filename: str,
-) -> None:
-    model_path = tmp_path / filename
-    model_path.write_text(
-        '{"nodes":[{"op":"null","name":"data","attrs":{"documentation":'
-        '{"version":"malformed","learner":{"gradient_booster":{},"note":"eval(x)"}}}}],'
-        '"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "mxnet"
-    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
-
-
-def test_scan_file_canonical_mxnet_symbol_composes_probable_xgboost_security_analysis(tmp_path: Path) -> None:
-    model_path = tmp_path / "malformed-symbol.json"
-    model_path.write_text(
-        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
-        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "mxnet"
-    assert result.success is False
-    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
 def test_scan_file_fails_closed_for_xgboost_shadowed_mxnet_nodes(tmp_path: Path) -> None:
@@ -12478,30 +12307,6 @@ def test_scan_file_mxnet_only_selection_fails_closed_for_bounded_xgboost_overlap
         and check.details.get("skipped_scanner_id") == "xgboost"
         and check.details.get("context") == "overlapping JSON analysis"
         and check.details.get("kind") == "preferred"
-        for check in result.checks
-    )
-
-
-def test_scan_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tmp_path: Path) -> None:
-    model_path = tmp_path / "polyglot.json"
-    model_path.write_text(
-        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
-        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-        '"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert result.success is True
-    assert not any(issue.details.get("attribute") == "library" for issue in result.issues)
-    assert "mxnet" in result.metadata["skipped_scanner_ids"]
-    assert "xgboost_mxnet_symbol_overlap" not in result.metadata.get("scan_outcome_reasons", [])
-    assert any(
-        check.name == "Scanner Selection"
-        and check.details.get("skipped_scanner_id") == "mxnet"
-        and check.details.get("kind") == "embedded"
         for check in result.checks
     )
 

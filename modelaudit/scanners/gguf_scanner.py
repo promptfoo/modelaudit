@@ -1085,7 +1085,8 @@ class GgufScanner(BaseScanner):
                 )
 
             row_group = _GGML_INTERLEAVED_ROW_GROUPS.get(tensor.tensor_type)
-            rows = nelements // row_width
+            # Interleaved groups stay within each matrix, including in batched tensors.
+            rows = tensor.dims[1] if len(tensor.dims) > 1 else 1
             if row_group is not None and rows % row_group != 0:
                 result.add_check(
                     name="Tensor Block Alignment Check",

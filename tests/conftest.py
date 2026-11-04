@@ -41,6 +41,7 @@ _FRAMEWORK_AVAILABILITY: dict[str, bool] = {}
 # Reduced CI lanes only install the dependency set needed for this curated test
 # subset. Keep this centralized so adding a supported Python version requires one
 # deliberate update instead of duplicating version checks in hook logic.
+# Python 3.11 and standard 3.14 deliberately exercise the broad test profile.
 RESTRICTED_PYTHON_VERSIONS = frozenset({(3, 10), (3, 12), (3, 13)})
 
 
@@ -134,6 +135,7 @@ def pytest_runtest_setup(item):
 
         # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
         allowed_test_files = [
+            "test_python_compatibility.py",
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
             "test_pickle_binunicode8_setitem.py",

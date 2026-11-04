@@ -271,7 +271,10 @@ fn handle_post_budget_opcode(
                 memo_read: false,
             };
             stack.push(if is_inst {
-                StackValue::Constructed(reference.clone())
+                StackValue::Constructed {
+                    reference: reference.clone(),
+                    defaultdict_without_factory: false,
+                }
             } else {
                 StackValue::Global(reference.clone())
             });
@@ -354,7 +357,8 @@ fn record_post_budget_callable_value(
     tail: &[u8],
     sink: &mut PostBudgetRecordSink<'_>,
 ) {
-    let Some(StackValue::Global(reference) | StackValue::Constructed(reference)) = callable_value
+    let Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. }) =
+        callable_value
     else {
         return;
     };
@@ -440,10 +444,13 @@ fn consume_top_operands(stack: &mut Vec<StackValue>, operand_count: usize) -> Op
 
 fn push_constructed_result(stack: &mut Vec<StackValue>, callable_value: Option<&StackValue>) {
     match callable_value {
-        Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+        Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
             if !reference.malformed =>
         {
-            stack.push(StackValue::Constructed(reference.clone()));
+            stack.push(StackValue::Constructed {
+                reference: reference.clone(),
+                defaultdict_without_factory: false,
+            });
         }
         _ => stack.push(StackValue::Other),
     }

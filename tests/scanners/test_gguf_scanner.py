@@ -2,6 +2,7 @@
 
 import io
 import json
+import math
 import os
 import struct
 import sys
@@ -1830,6 +1831,50 @@ def test_gguf_retired_interleaved_q4_0_layouts_hold_whole_row_groups(
         assert alignment_checks[0].details["rows"] == rows
         assert alignment_checks[0].details["row_group"] == row_group
         assert partial_exit_code == 1
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "row_group"),
+    [(31, 4), (32, 4), (33, 8)],
+    ids=["q4_0_4_4", "q4_0_4_8", "q4_0_8_8"],
+)
+@pytest.mark.parametrize("matrix_dims", [(2,), (2, 2)], ids=["3d", "4d"])
+@pytest.mark.parametrize("aligned", [False, True], ids=["partial_matrix", "whole_matrix"])
+def test_gguf_retired_interleaved_row_groups_cannot_span_matrices(
+    tmp_path: Path,
+    tensor_type: int,
+    row_group: int,
+    matrix_dims: tuple[int, ...],
+    aligned: bool,
+) -> None:
+    rows = row_group if aligned else row_group // 2
+    dims = (32, rows, *matrix_dims)
+    path = tmp_path / "matrices.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        dims=dims,
+        tensor_data_size=18 * math.prod(dims[1:]),
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        alignment_checks = [check for check in result.checks if check.name == "Tensor Block Alignment Check"]
+        assert not any(check.name == "Tensor Data Bounds Check" for check in result.checks)
+        if aligned:
+            assert not alignment_checks
+            _assert_no_warning_or_critical_issues(result)
+        else:
+            assert len(alignment_checks) == 1
+            assert alignment_checks[0].status == CheckStatus.FAILED
+            assert alignment_checks[0].details["rows"] == rows
+            assert alignment_checks[0].details["row_group"] == row_group
+            assert f"not aligned to its {row_group}-row block groups" in alignment_checks[0].message
+    assert direct.success is True
+    assert aggregate.success is aligned
+    assert determine_exit_code(aggregate) == (0 if aligned else 1)
 
 
 @pytest.mark.parametrize("tensor_type", [4, 5, 36, 37, 38, 43, 142])

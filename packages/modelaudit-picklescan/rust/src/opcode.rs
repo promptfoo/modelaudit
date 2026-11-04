@@ -537,6 +537,12 @@ pub(crate) fn decode_raw_unicode_escape(value: &[u8]) -> String {
                         continue;
                     }
                 }
+                other if !matches!(other, b'u' | b'U') => {
+                    decoded.push('\\');
+                    decoded.push(char::from(other));
+                    index += 2;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -623,6 +629,41 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_unicode_escape_preserves_pairs_and_existing_fallbacks() {
+        let cases: &[(&[u8], &str)] = &[
+            (br"\u0024$x", "$$x"),
+            (br"\\u0024$x", r"\\u0024$x"),
+            (br"\\\u0024$x", r"\\$$x"),
+            (br"\\\\u0024$x", r"\\\\u0024$x"),
+            (br"\U00000024$x", "$$x"),
+            (br"\\U00000024$x", r"\\U00000024$x"),
+            (br"\\\U00000024$x", r"\\$$x"),
+            (br"\\\\U00000024$x", r"\\\\U00000024$x"),
+            (br"\q\u0024$x", r"\q$$x"),
+            (br"\n", r"\n"),
+            (br"\", r"\"),
+            (b"\xff", "ÿ"),
+            (br"\u00e9", "é"),
+            (br"\U0001f40d", "🐍"),
+            // Preserve the existing non-scalar/malformed fallback contract.
+            (br"\ud800$x", r"\ud800$x"),
+            (br"\u12", r"\u12"),
+            (br"\u00zz", r"\u00zz"),
+            (br"\U00110000", r"\U00110000"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(decode_raw_unicode_escape(raw), *expected);
+            let mut payload = vec![b'V'];
+            payload.extend_from_slice(raw);
+            payload.push(b'\n');
+            let parsed = parse_opcode(&payload, 0, payload.len()).expect("UNICODE operand");
+            assert_eq!(parsed.name, "UNICODE");
+            assert_eq!(parsed.next, payload.len());
+            assert_eq!(parsed.arg, ArgValue::Text((*expected).to_string()));
+        }
+    }
 
     #[test]
     fn parse_arguments_and_positions_after_operand_reads() {

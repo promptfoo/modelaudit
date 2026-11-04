@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -2267,10 +2267,50 @@ def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionabl
 
 @pytest.mark.parametrize(
     "prefix",
-    ['The literal "; b=\'text"', "The literal '; b=\"text'", '文字列 "; b=\'text"'],
+    [
+        'The literal "; b=\'text"',
+        "The literal '; b=\"text'",
+        '文字列 "; b=\'text"',
+        "The literal `; b='text`",
+        'The literal ``; b="text``',
+        "The literal ```; b='text```",
+        "文字列 `; b='text`",
+        "The literal ``; b='text ` nested``",
+    ],
 )
 def test_text_scanner_quoted_prose_assignment_is_informational(tmp_path: Path, prefix: str) -> None:
     _assert_model_card_endpoint_informational(tmp_path, prefix + " is described by [guide](https://docs.example.com)\n")
+
+
+@pytest.mark.parametrize(
+    "leading",
+    [
+        "unmatched `\n",
+        "unmatched `\r\n",
+        "unmatched `\r",
+        "unmatched `` ",
+        "unmatched ``` `` ",
+        "escaped \\` ",
+        "unmatched ``\nunfinished ```\n",
+    ],
+)
+@pytest.mark.parametrize("executable", [False, True])
+def test_text_scanner_unmatched_markers_do_not_consume_later_inline_examples(
+    tmp_path: Path, leading: str, executable: bool
+) -> None:
+    content = leading + (
+        "The literal `; b='[download](https://evil.example/payload.sh)`\n"
+        if executable
+        else "The literal `; b='text` is described by [guide](https://docs.example.com)\n"
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(content.encode("utf-8"))
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is executable
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert determine_exit_code(aggregate) == int(executable)
 
 
 @pytest.mark.parametrize("prefix", ['example = "; b=\'text"; ', 'example = "文字列"; '])
@@ -2278,6 +2318,82 @@ def test_text_scanner_assignment_after_quoted_literal_remains_actionable(tmp_pat
     _assert_model_card_payload_endpoint_actionable(
         tmp_path, prefix + 'endpoint="' + "x" * 8192 + '[download](https://evil.example/payload.sh)"\n'
     )
+
+
+@pytest.mark.parametrize(
+    "prefix,suffix",
+    [
+        ("The literal `; b='", "`"),
+        ("The literal ``; b='", "``"),
+        ("The literal `; b='", ""),
+        ("The literal ``; b='text` ", ""),
+        ("The literal \\`; b='text` ", ""),
+        ("The literal `; b='text` is shown; endpoint='", "'"),
+        ("endpoint=\"text `; b='text` ", '"'),
+    ],
+)
+def test_text_scanner_inline_code_does_not_hide_real_assignment_values(
+    tmp_path: Path, prefix: str, suffix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + "[download](https://evil.example/payload.sh)" + suffix + "\n"
+    )
+
+
+def test_documentation_quote_windows_reuse_indexes_without_copying_and_preserve_source_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = b"plain\n" * 100_000
+    original = TextScanner._documentation_quoted_assignment_index
+    indexed_sizes: list[int] = []
+
+    def record_index(context: bytes) -> tuple[memoryview, memoryview]:
+        indexed_sizes.append(len(context))
+        return original(context)
+
+    monkeypatch.setattr(TextScanner, "_documentation_quoted_assignment_index", staticmethod(record_index))
+    windows: dict[int, tuple[memoryview, memoryview]] = {}
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set((source, windows))
+    try:
+        for index in range(1024):
+            start = index * 6
+            assert not TextScanner._documentation_has_open_quoted_assignment(source, start, start + 5)
+        assert indexed_sizes == [2 * 256 * 1024]
+        other_source = b'endpoint="[download]'
+        assert TextScanner._documentation_has_open_quoted_assignment(other_source)
+        assert indexed_sizes == [2 * 256 * 1024, len(other_source)]
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
+
+
+def test_documentation_quote_windows_are_bounded() -> None:
+    source = b"plain\n" * 300_000
+    windows: dict[int, tuple[memoryview, memoryview]] = {}
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set((source, windows))
+    try:
+        for index in range(6):
+            start = (index * 256 * 1024) // 6 * 6
+            assert not TextScanner._documentation_has_open_quoted_assignment(source, start, start + 5)
+        assert len(windows) == 4
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
+
+
+@pytest.mark.parametrize("fail_detector", [False, True])
+def test_text_scanner_releases_quote_windows_after_scan(tmp_path: Path, fail_detector: bool) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("See [guide](https://docs.example.com)\n")
+    scanner_type = _FailingNetworkDetectorTextScanner if fail_detector else TextScanner
+    scanner = scanner_type(config={"check_secrets": False})
+    parent_context: tuple[bytes, dict[int, tuple[memoryview, memoryview]]] = (b"parent", {})
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set(parent_context)
+    try:
+        result = scanner.scan(str(path))
+        assert result.success is not fail_detector
+        assert text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.get() is parent_context
+        assert parent_context[1] == {}
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
 
 
 @pytest.mark.parametrize("assigned", [False, True])
@@ -2291,6 +2407,184 @@ def test_text_scanner_reuses_quote_analysis_across_many_links(tmp_path: Path, as
     assert all((check.severity != IssueSeverity.INFO) == assigned for check in checks)
     assert TextScanner._documentation_quoted_assignment_index.cache_info().misses <= 2
     TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_index_retains_compact_read_only_storage() -> None:
+    context = b';a=""\n' * ((2 * 256 * 1024) // 6)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    positions, starts = TextScanner._documentation_quoted_assignment_index(context)
+    assert positions.readonly and starts.readonly
+    assert len(positions) == len(starts)
+    assert positions.nbytes + starts.nbytes <= 4 * len(context) + 32
+    assert TextScanner._documentation_has_open_quoted_assignment(context, 0, 4)
+    assert not TextScanner._documentation_has_open_quoted_assignment(context, 0, 5)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_index_skips_tokenization_without_assignments(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_tokenization(_readline: Callable[[], str]) -> Iterator[text_scanner_module.tokenize.TokenInfo]:
+        raise AssertionError("A window without assignment candidates must not be tokenized")
+
+    monkeypatch.setattr(text_scanner_module.tokenize, "generate_tokens", unexpected_tokenization)
+    source = b"Z " + b" " * (2 * 256 * 1024 - 32) + b"` [guide]"
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(0)
+    try:
+        assert not TextScanner._documentation_has_open_quoted_assignment(source)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.reset(budget_token)
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize("word", ["item", "élément"])
+def test_documentation_quote_index_allows_dense_valid_token_lines(word: str) -> None:
+    source = ("Z; (" + f"{word}, " * 18000 + '); message="literal ; inner=\'text"\n').encode()
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    try:
+        assert not TextScanner._documentation_has_open_quoted_assignment(source, 0, len(source) - 1)
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 1
+    finally:
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_text_scanner_dense_valid_quote_context_keeps_completed_security_verdict(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("Z; (" + "item, " * 18000 + '); value="[guide](https://docs.example.com)"\n')
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("simulate_error_tokens", [False, True])
+def test_documentation_quote_index_bounds_repeated_tokenizer_line_work(
+    monkeypatch: pytest.MonkeyPatch, simulate_error_tokens: bool
+) -> None:
+    source = b"Z " + b" " * 2048 + b"` ;b='text'"
+    original = text_scanner_module.tokenize.generate_tokens
+    emitted = 0
+
+    def counted(readline: Callable[[], str]) -> Iterator[text_scanner_module.tokenize.TokenInfo]:
+        nonlocal emitted
+        if simulate_error_tokens:
+            line = readline()
+            items = (
+                text_scanner_module.tokenize.TokenInfo(
+                    text_scanner_module.token.ERRORTOKEN, character, (1, index), (1, index + 1), line
+                )
+                for index, character in enumerate(line)
+            )
+        else:
+            items = original(readline)
+        for item in items:
+            emitted += 1
+            yield item
+
+    monkeypatch.setattr(text_scanner_module.tokenize, "generate_tokens", counted)
+    monkeypatch.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 3 * len(source))
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    try:
+        assert TextScanner._documentation_has_open_quoted_assignment(source, 0, source.index(b"text"))
+    except text_scanner_module._DocumentationQuoteBudgetExceeded:
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 0
+    else:
+        # Newer Python tokenizers can skip the whitespace and finish within the allowance.
+        assert not simulate_error_tokens
+    assert 0 < emitted <= 3
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_budget_is_shared_and_does_not_cache_failures() -> None:
+    first = b'a="first'
+    second = b'b="second'
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(len(first))
+    try:
+        assert TextScanner._documentation_has_open_quoted_assignment(first)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+        assert TextScanner._documentation_has_open_quoted_assignment(first)
+        with pytest.raises(text_scanner_module._DocumentationQuoteBudgetExceeded):
+            TextScanner._documentation_has_open_quoted_assignment(second)
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 1
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(len(second))
+        assert TextScanner._documentation_has_open_quoted_assignment(second)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.reset(budget_token)
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "content,completed_exit_code",
+    [
+        ('The literal "; b=\'text" is described by [guide](https://docs.example.com)\n', 0),
+        ('endpoint="[download](https://evil.example/payload.sh)"\n', 1),
+    ],
+)
+def test_text_scanner_quote_limit_retains_findings_and_is_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str, completed_exit_code: int
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(content)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    cache_dir = tmp_path / "cache"
+    with monkeypatch.context() as limited, IsolatedCacheManager(reset_cache_manager):
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 0)
+        result = TextScanner(config={"check_secrets": False}).scan(str(path))
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+        assert any(
+            check.name == "Text Content Security Coverage"
+            and check.message == "Text network finding classification exceeded the work limit"
+            and check.details.get("classification_limit_sources") == ["documentation_quote_context"]
+            and check.details.get("max_documentation_quote_parse_work") == 0
+            for check in result.checks
+        )
+        assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() is None
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == completed_exit_code
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize("prefix", ["endpoint = '", 'endpoint: "', 'download("', "endpoint =\n"])
+def test_text_scanner_long_html_assignment_context_remains_actionable(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + " " * 5120 + '<a href="https://evil.example/payload.sh">download</a>\n'
+    )
+
+
+@pytest.mark.parametrize("prefix", [b"endpoint = '", b'endpoint: "', b'download("', b"endpoint =\n"])
+def test_text_scanner_html_context_beyond_lookback_remains_actionable(prefix: bytes) -> None:
+    payload = prefix + b" " * (256 * 1024 + 1) + b'<a href="https://evil.example/payload.sh">download</a>\n'
+    assert TextScanner._documentation_finding_is_actionable(payload, {"position": payload.index(b"https://")})
+
+
+@pytest.mark.parametrize("prefix", ["", 'endpoint = "closed" ', 'endpoint = "closed"\n'])
+def test_text_scanner_long_html_whitespace_without_open_assignment_is_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, prefix + " " * 5120 + '<a href="https://docs.example.com/reference">guide</a>\n'
+    )
 
 
 @pytest.mark.parametrize(
@@ -2613,6 +2907,214 @@ def test_text_scanner_documentation_open_call_ignores_zero_indent_passive_near_m
 )
 def test_text_scanner_documentation_enclosing_call_ignores_markdown_table_call_literals(prefix: bytes) -> None:
     assert not TextScanner._documentation_prefix_has_enclosing_call(prefix)
+
+
+def test_text_scanner_many_contractions_before_passive_links_avoid_reparsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parsed_bytes = 0
+    original = TextScanner._documentation_prefix_has_enclosing_call
+
+    def counted(prefix: bytes) -> bool:
+        nonlocal parsed_bytes
+        parsed_bytes += len(prefix)
+        return original(prefix)
+
+    monkeypatch.setattr(TextScanner, "_documentation_prefix_has_enclosing_call", staticmethod(counted))
+    content = ("''\nIt's\n" * 512 + "[guide](https://docs.example.com/reference)\n") * 16
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    _assert_documentation_informational(tmp_path, content)
+    assert parsed_bytes <= 4 * len(content)
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_documentation_call_context_bounds_reparsing_and_reuses_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    parsed_bytes = 0
+    original = TextScanner._documentation_prefix_has_enclosing_call
+
+    def counted(prefix: bytes) -> bool:
+        nonlocal parsed_bytes
+        parsed_bytes += len(prefix)
+        return original(prefix)
+
+    monkeypatch.setattr(TextScanner, "_documentation_prefix_has_enclosing_call", staticmethod(counted))
+    content = b"''\nIt's (a)\n" * 256 + b"[guide](https://docs.example.com/reference)\n"
+    position = content.index(b"https://")
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    assert TextScanner._documentation_open_call_context_status(content, position) is None
+    assert 0 < parsed_bytes <= text_scanner_module.MAX_DOCUMENTATION_CALL_PARSE_BYTES
+    first_parse_bytes = parsed_bytes
+    assert TextScanner._documentation_open_call_contains_position(content, position)
+    assert parsed_bytes == first_parse_bytes
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_documentation_call_context_does_not_cache_oversized_prefixes() -> None:
+    content = (
+        b"download(\n" + b" " * text_scanner_module.MAX_DOCUMENTATION_CALL_CONTEXT_BYTES + b'"https://example.com"'
+    )
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    assert TextScanner._documentation_open_call_context_status(content, content.index(b"https://")) is None
+    assert TextScanner._documentation_open_call_prefix_status.cache_info().currsize == 0
+
+
+def test_text_scanner_call_context_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("download(\n" + "''\nIt's (a)\n" * 256 + "[payload](https://evil.example/payload.sh)\n")
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.message == "Text network finding classification exceeded the work limit"
+        and check.details.get("classification_limit_sources") == ["documentation_call_context"]
+        and check.details.get("max_documentation_call_parse_bytes")
+        == text_scanner_module.MAX_DOCUMENTATION_CALL_PARSE_BYTES
+        and check.details.get("max_documentation_total_call_parse_bytes")
+        == text_scanner_module.MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES
+        for check in result.checks
+    )
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    cache_dir = tmp_path / "cache"
+    with IsolatedCacheManager(reset_cache_manager):
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_text_scanner_call_context_limit_does_not_reclassify_cc_findings(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("''\nIt's (a)\n" * 256 + "This model installs a backdoor payload.\n")
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.success is False
+    assert not result.metadata.get("analysis_incomplete")
+    assert any(
+        check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "backdoor"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_completed_fence_bounds_dense_call_context(tmp_path: Path) -> None:
+    _assert_documentation_informational(
+        tmp_path,
+        "```python\ndownload(\n" + "'',\n" * 128 + ")\n```\n[guide](https://docs.example.com/reference)\n",
+    )
+
+
+def test_documentation_total_call_budget_does_not_cache_incomplete_results() -> None:
+    content = b"''\nIt's (a)\n[guide](https://docs.example.com/reference)\n"
+    position = content.index(b"https://")
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    token = text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(0)
+    try:
+        assert TextScanner._documentation_open_call_context_status(content, position) is None
+        assert TextScanner._documentation_open_call_prefix_status.cache_info().currsize == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.reset(token)
+    assert TextScanner._documentation_open_call_context_status(content, position) is False
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_text_scanner_total_call_budget_is_scoped_to_each_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("''\nIt's (a)\n[guide](https://docs.example.com/reference)\n")
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    with monkeypatch.context() as limited:
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES", 0)
+        result = TextScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.details.get("classification_limit_sources") == ["documentation_call_context"]
+            and check.details.get("max_documentation_total_call_parse_bytes") == 0
+            for check in result.checks
+        )
+    assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() is None
+    result = TextScanner().scan(str(path))
+    assert result.success is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_documentation_call_parser_caches_results_without_caching_budget_failures() -> None:
+    prefix = b"source (context) "
+    other_prefix = b"another (context) "
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(len(prefix))
+    try:
+        assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+        assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() == 0
+        assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+        with pytest.raises(text_scanner_module._DocumentationCallBudgetExceeded):
+            TextScanner._documentation_prefix_has_enclosing_call(other_prefix)
+        assert TextScanner._documentation_cached_call_prefix.cache_info().currsize == 1
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(len(other_prefix))
+        assert TextScanner._documentation_prefix_has_enclosing_call(other_prefix) is False
+        assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.reset(budget_token)
+        TextScanner._documentation_cached_call_prefix.cache_clear()
+
+
+def test_documentation_call_parser_does_not_cache_oversized_prefixes() -> None:
+    prefix = b"source " + b" " * text_scanner_module.MAX_DOCUMENTATION_CALL_PARSE_BYTES + b"(context)"
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+    assert TextScanner._documentation_cached_call_prefix.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "completed_exit_code"),
+    [
+        ("source (context) [guide](https://docs.example.com/reference)\n", 0),
+        ("source (context) mentions import urllib.\n\nimport urllib\n", 1),
+    ],
+)
+def test_text_scanner_same_line_call_limit_is_inconclusive_and_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str, completed_exit_code: int
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(content)
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    cache_dir = tmp_path / "cache"
+    with monkeypatch.context() as limited, IsolatedCacheManager(reset_cache_manager):
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES", 0)
+        result = TextScanner(config={"check_secrets": False}).scan(str(path))
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "Text Content Security Coverage"
+            and check.details.get("classification_limit_sources") == ["documentation_call_context"]
+            for check in result.checks
+        )
+        assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() is None
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == completed_exit_code
+    TextScanner._documentation_cached_call_prefix.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -3767,6 +4269,99 @@ def test_text_scanner_possible_misuse_keeps_paragraph_continuations_actionable(
     )
 
 
+@pytest.mark.parametrize("separator", [" ", "\n", "\r\n", "\n\n", "\r\n\r\n"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model steals user data.",
+        "User data leaves the host without consent.",
+        "* **Misuse:** This model steals user data.",
+        "Review generated outputs. This model steals user data.",
+    ],
+)
+def test_text_scanner_misuse_exemption_rejects_hostile_paragraph_prefixes(
+    tmp_path: Path, prefix: str, separator: str
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes((prefix + separator + "Malware production may be possible.\n").encode())
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert any(
+        check.details.get("pattern") == "malware" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "",
+        "* ",
+        "* **Misuse:** ",
+        "**Misuse**: ",
+        "Other forms of misuse such as fraud, spam, or ",
+        "## Misuse\n",
+        "## Safety\n",
+        "## Limitations\n",
+        "This is a language model.\n\n",
+    ],
+)
+def test_text_scanner_misuse_exemption_accepts_recognized_paragraph_prefixes(tmp_path: Path, prefix: str) -> None:
+    _assert_documentation_informational(tmp_path, prefix + "Malware production may be possible.\n")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model steals user data.\n\nThis is a language model.",
+        "This model steals user data.\n\n" + "Ordinary context.\n\n" * 300,
+        "This model exfiltrates inputs to a server.",
+        "The model installs it on the scanner host by default.",
+        "This model executes it during loading.",
+        "User data leaves the host without consent.",
+    ],
+)
+def test_text_scanner_misuse_exemption_keeps_surrounding_harmful_claims(tmp_path: Path, prefix: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, prefix + "\n\nMalware production may be possible.\n", "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model does not steal user data.",
+        "The model will not execute code.",
+        "Some models may exfiltrate inputs.",
+        'The phrase "This model steals user data" is a warning example.',
+        "* **Generation of Harmful Content:** Developers should assess outputs for their context and use available "
+        "safety classifiers or custom solutions appropriate for their use case.",
+    ],
+)
+def test_text_scanner_misuse_exemption_keeps_surrounding_safety_guidance_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_documentation_informational(tmp_path, prefix + "\n\nMalware production may be possible.\n")
+
+
+def test_text_scanner_misuse_document_context_limit_retains_alerts(tmp_path: Path) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path,
+        "# Model card\n\n" + "Description.\n\n" * 20000 + "Malware production may be possible.\n",
+        "cc_pattern",
+    )
+
+
+def test_text_scanner_misuse_exemption_rejects_truncated_paragraph_prefix(tmp_path: Path) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path,
+        "This model steals user data. "
+        + "x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 1)
+        + "\nMalware production may be possible.\n",
+        "cc_pattern",
+    )
+
+
 @pytest.mark.parametrize(
     "continuation",
     [
@@ -3891,6 +4486,22 @@ def test_text_scanner_documentation_links_after_prose_or_closed_examples_are_inf
     tmp_path: Path, prefix: str
 ) -> None:
     _assert_model_card_endpoint_informational(tmp_path, prefix + "[guide](https://docs.example.com/reference)\n")
+
+
+@pytest.mark.parametrize("contraction", ["It's", "Don't", "We're", "You've", "They'll", "I'd", "I'm", "Can't"])
+def test_text_scanner_contractions_before_parenthetical_links_are_informational(
+    tmp_path: Path, contraction: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, f"{contraction} (see [guide](https://docs.example.com/reference))\n"
+    )
+
+
+@pytest.mark.parametrize("contraction", ["It's", "Don't", "We're", "You've", "They'll", "I'd", "I'm", "Can't"])
+def test_text_scanner_contractions_inside_enclosing_calls_remain_actionable(tmp_path: Path, contraction: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f'download("{contraction} (see [payload](https://evil.example/payload.sh))")\n'
+    )
 
 
 @pytest.mark.parametrize("tag,attribute", [("img", "src"), ("a", "href")])

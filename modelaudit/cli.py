@@ -2128,23 +2128,11 @@ def _configure_unicode_safe_cli_streams() -> None:
 def _escape_terminal_text(value: Any) -> str:
     """Render control characters visibly before writing model-controlled text to terminals."""
     text = "" if value is None else str(value)
-
-    def replace_control(char: str) -> str:
-        if char == "\n":
-            return "\\n"
-        if char == "\r":
-            return "\\r"
-        if char == "\t":
-            return "\\t"
-        codepoint = ord(char)
-        if codepoint <= 0xFF:
-            return f"\\x{codepoint:02x}"
-        if codepoint <= 0xFFFF:
-            return f"\\u{codepoint:04x}"
-        return f"\\U{codepoint:08x}"
-
     return "".join(
-        replace_control(char) if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"} else char for char in text
+        char.encode("unicode_escape").decode("ascii")
+        if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        else char
+        for char in text
     )
 
 
@@ -5454,11 +5442,25 @@ def _display_failure_details(summary: dict[str, Any]) -> None:
 @click.option("--output", type=click.Path(), help="Output file path")
 @click.option("--security-only", is_flag=True, help="Show only security-relevant metadata")
 @click.option(
+    "--table-limit",
+    type=click.IntRange(1, 10_000),
+    default=10,
+    show_default=True,
+    help="Maximum number of file entries shown in directory tables (does not limit extraction)",
+)
+@click.option(
     "--trust-loaders",
     is_flag=True,
     help="Allow metadata extraction to deserialize models (unsafe on untrusted inputs; defaults to off)",
 )
-def metadata(path: str, output_format: str, output: str | None, security_only: bool, trust_loaders: bool) -> None:
+def metadata(
+    path: str,
+    output_format: str,
+    output: str | None,
+    security_only: bool,
+    trust_loaders: bool,
+    table_limit: int = 10,
+) -> None:
     """Extract and display model metadata."""
     start_time = time.time()
     from .metadata_extractor import ModelMetadataExtractor
@@ -5475,10 +5477,10 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
 
                 output_text = yaml.dump(metadata, default_flow_style=False, sort_keys=False)
             except ImportError:
-                click.secho("Warning: PyYAML not installed, falling back to JSON", fg="yellow")
+                click.secho("Warning: PyYAML not installed, falling back to JSON", fg="yellow", err=True)
                 output_text = json.dumps(metadata, indent=2)
         else:  # table format
-            output_text = _format_metadata_table(metadata)
+            output_text = _format_metadata_table(metadata, table_limit=table_limit)
 
         if output:
             _write_output_text_file(output, output_text)
@@ -5517,7 +5519,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
         sys.exit(1)
 
 
-def _format_metadata_table(metadata: dict[str, Any]) -> str:
+def _format_metadata_table(metadata: dict[str, Any], table_limit: int = 10) -> str:
     """Format metadata as a readable table."""
     output = []
 
@@ -5533,9 +5535,11 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
         for fmt, count in metadata["summary"]["formats"].items():
             output.append(f"  {_escape_terminal_text(fmt)}: {_escape_terminal_text(count)}")
         output.append("\nFiles:")
-        for file_meta in metadata["files"][:10]:  # Show first 10 files
+        for file_meta in metadata["files"][:table_limit]:
             file_name = _escape_terminal_text(file_meta.get("file", "unknown"))
-            if error := file_meta.get("error"):
+            if error := (
+                file_meta.get("error") or file_meta.get("extraction_error") or file_meta.get("error_reading_metadata")
+            ):
                 output.append(f"  {file_name} (error: {_escape_terminal_text(error)})")
             else:
                 file_format = _escape_terminal_text(file_meta.get("format", "unknown"))
@@ -5554,8 +5558,8 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
                     if isinstance(value, list):
                         value = ", ".join(_escape_terminal_text(item) for item in value) if value else "none"
                     output.append(f"    {key.replace('_', ' ').title()}: {_escape_terminal_text(value)}")
-        if len(metadata["files"]) > 10:
-            output.append(f"  ... and {len(metadata['files']) - 10} more")
+        if len(metadata["files"]) > table_limit:
+            output.append(f"  ... and {len(metadata['files']) - table_limit} more")
     else:
         # Single file
         output.append(f"File: {_escape_terminal_text(metadata.get('file', 'unknown'))}")

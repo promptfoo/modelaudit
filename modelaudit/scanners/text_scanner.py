@@ -8,7 +8,10 @@ import os
 import re
 import token
 import tokenize
+from array import array
 from bisect import bisect_right
+from collections.abc import Iterator
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -173,6 +176,27 @@ MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_TEXT_FENCE_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_TEXT_FENCE_MARKERS = 128
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
+MAX_DOCUMENTATION_CALL_PARSE_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
+MAX_DOCUMENTATION_CALL_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 4
+MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES = 8 * 1024 * 1024
+MAX_DOCUMENTATION_QUOTE_PARSE_WORK = 8 * 1024 * 1024
+
+
+class _DocumentationCallBudgetExceeded(Exception):
+    limit_source = "documentation_call_context"
+
+
+class _DocumentationQuoteBudgetExceeded(Exception):
+    limit_source = "documentation_quote_context"
+
+
+_DOCUMENTATION_CALL_BUDGET: ContextVar[int | None] = ContextVar("documentation_call_budget", default=None)
+_DOCUMENTATION_QUOTE_BUDGET: ContextVar[int | None] = ContextVar("documentation_quote_budget", default=None)
+_DOCUMENTATION_QUOTE_WINDOWS: ContextVar[tuple[bytes, dict[int, tuple[memoryview, memoryview]]] | None] = ContextVar(
+    "documentation_quote_windows", default=None
+)
+
+
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
@@ -755,7 +779,9 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
-    rb"\b"
+    rb"^\s*(?:\#{1,6}[ \t]+(?:misuse|safety|limitations)[ \t]*\#*[ \t]*\r?\n\s*)?"
+    rb"(?:[-*+]\s+)?(?:(?:\*\*)?misuse(?::(?:\*\*)?|(?:\*\*)?:)\s*)?"
+    rb"(?:other\s+forms\s+of\s+misuse\s+such\s+as\s+fraud,\s+spam,\s+or\s+)?\b"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\s+(?:production|generation|creation)\s+(?:may|might|could)\s+be\s+possible\b"
     rb"(?=[.;]?\s*$|[.;]\s*review\s+generated\s+outputs\.?\s*$"
@@ -772,6 +798,17 @@ BENIGN_DOCUMENTATION_MISUSE_CONTINUATION_PATTERN = re.compile(
     rb"|\#{1,6}\s+(?:usage|examples?|installation|license|references|limitations|safety|misuse)\s*\#*"
     rb"|(?:[-*+]\s+)?(?:\*\*)?(?:data\s+summary|documentation|references?)\s*(?:\*\*)?:\s*"
     rb"(?:\*\*\s*)?https?://[^\s<>]+)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN = re.compile(
+    rb"(?:^|(?<=[.!?\n]))[ \t]*(?:[-*+]\s+)?"
+    rb"(?:(?:\*\*)?misuse(?::(?:\*\*)?|(?:\*\*)?:)\s*)?(?:"
+    rb"(?:it|(?:the|this)\s+(?:model|code|script|package))\s+(?:automatically\s+)?"
+    rb"(?:(?:steals?|exfiltrates?)\b|(?:installs?|executes?|runs?|launches?|deploys?)\s+"
+    rb"(?:it|code|scripts?|commands?)\b)"
+    rb"|(?:user\s+)?(?:data|inputs?|files?|credentials?|secrets?)\s+"
+    rb"(?:leaves?|is\s+(?:copied|sent|transmitted))\b[^.!?\r\n]{0,128}\bwithout\s+(?:user\s+)?consent\b"
+    rb")",
     re.IGNORECASE,
 )
 GENERIC_CC_PROSE_PATTERNS = frozenset({"backdoor", "botnet", "malware", "trojan", "zombie"})
@@ -1073,6 +1110,24 @@ class TextScanner(BaseScanner):
     @staticmethod
     def _documentation_prefix_has_enclosing_call(prefix: bytes) -> bool:
         """Return whether a bounded Python prefix leaves a function call open at the finding."""
+        if b"(" not in prefix:
+            return False
+        if len(prefix) <= MAX_DOCUMENTATION_CALL_PARSE_BYTES:
+            return TextScanner._documentation_cached_call_prefix(prefix)
+        return TextScanner._documentation_parse_call_prefix(prefix)
+
+    @staticmethod
+    @lru_cache(maxsize=8)
+    def _documentation_cached_call_prefix(prefix: bytes) -> bool:
+        return TextScanner._documentation_parse_call_prefix(prefix)
+
+    @staticmethod
+    def _documentation_parse_call_prefix(prefix: bytes) -> bool:
+        budget = _DOCUMENTATION_CALL_BUDGET.get()
+        if budget is not None:
+            if budget < len(prefix):
+                raise _DocumentationCallBudgetExceeded
+            _DOCUMENTATION_CALL_BUDGET.set(budget - len(prefix))
         source = prefix.strip()
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
@@ -1172,7 +1227,7 @@ class TextScanner(BaseScanner):
                     match.group()
                     if keyword.iskeyword(match[1].decode())
                     or match[1].lower() in {b"r", b"u", b"b", b"f", b"br", b"rb", b"fr", b"rf"}
-                    else match[1] + b"_" + match[2]
+                    else match[1] + b" " + match[2]
                 ),
                 source,
                 flags=re.IGNORECASE,
@@ -1204,11 +1259,11 @@ class TextScanner(BaseScanner):
                 if quoted_assignment is None
                 else quoted_assignment
             )
-            or (not line_prefix.lstrip().startswith(b"|") and cls._documentation_prefix_has_enclosing_call(line_prefix))
             or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
             or cls._documentation_markdown_link_config_is_actionable(code_prefix)
+            or (not line_prefix.lstrip().startswith(b"|") and cls._documentation_prefix_has_enclosing_call(line_prefix))
         )
 
     @classmethod
@@ -1399,7 +1454,19 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _documentation_string_literal_spans(context: bytes) -> tuple[tuple[int, int], ...]:
+    def _documentation_string_literal_spans(context: bytes, last_assignment_start: int) -> tuple[tuple[int, int], ...]:
+        remaining_work = MAX_DOCUMENTATION_QUOTE_PARSE_WORK
+
+        def charge_work(amount: int) -> None:
+            nonlocal remaining_work
+            shared = _DOCUMENTATION_QUOTE_BUDGET.get()
+            if amount > remaining_work or (shared is not None and amount > shared):
+                raise _DocumentationQuoteBudgetExceeded
+            remaining_work -= amount
+            if shared is not None:
+                _DOCUMENTATION_QUOTE_BUDGET.set(shared - amount)
+
+        charge_work(len(context))
         try:
             source = context.decode("utf-8")
         except UnicodeDecodeError:
@@ -1411,20 +1478,71 @@ class TextScanner(BaseScanner):
             for character in source:
                 byte_offsets.append(byte_offsets[-1] + len(character.encode("utf-8")))
         spans: list[tuple[int, int]] = []
+        previous_byte_end = 0
         try:
             for item in tokenize.generate_tokens(io.StringIO(source).readline):
+                if item.type == token.ENDMARKER:
+                    break
+                end = lines[item.end[0] - 1] + item.end[1]
+                byte_end = byte_offsets[end] if byte_offsets is not None else end
                 if item.type == token.STRING:
                     start = lines[item.start[0] - 1] + item.start[1]
-                    end = lines[item.end[0] - 1] + item.end[1]
-                    spans.append((byte_offsets[start], byte_offsets[end]) if byte_offsets is not None else (start, end))
+                    spans.append((byte_offsets[start] if byte_offsets is not None else start, byte_end))
+                if byte_end > last_assignment_start:
+                    break
+                # Error tokens can trigger repeated full-line rescans; ordinary tokens advance linearly.
+                charge_work(
+                    len(item.line.encode("utf-8"))
+                    if item.type == token.ERRORTOKEN
+                    else max(0, byte_end - previous_byte_end)
+                )
+                previous_byte_end = byte_end
         except (IndentationError, SyntaxError, tokenize.TokenError):
             pass  # Only complete literals proved before the tokenizer stopped can suppress nested assignments.
         return tuple(spans)
 
     @staticmethod
+    def _documentation_closed_inline_code_spans(context: bytes) -> Iterator[tuple[int, int]]:
+        # Index matching runs once so unmatched delimiters cannot consume later examples
+        # or cause repeated searches through the rest of a large line.
+        markers = array("i")
+        previous: dict[int, int] = {}
+        for match in re.finditer(rb"`+|[\r\n]", context):
+            start, end = match.span()
+            if context[start] in b"\r\n":
+                previous.clear()
+                continue
+            width = end - start
+            index = len(markers)
+            markers.extend((start, end, -1))
+            if width in previous:
+                markers[previous[width] + 2] = index
+            previous[width] = index
+
+        index = 0
+        while index < len(markers):
+            start = markers[index]
+            closing = markers[index + 2]
+            escaped_start = start
+            while escaped_start > 0 and context[escaped_start - 1] == ord("\\"):
+                escaped_start -= 1
+            if closing >= 0 and (start - escaped_start) % 2 == 0:
+                yield start, markers[closing + 1]
+                index = closing + 3
+            else:
+                index += 3
+
+    @staticmethod
     @lru_cache(maxsize=4)
-    def _documentation_quoted_assignment_index(context: bytes) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        literals = TextScanner._documentation_string_literal_spans(context)
+    def _documentation_quoted_assignment_index(context: bytes) -> tuple[memoryview, memoryview]:
+        positions = array("I", [0])
+        starts = array("i", [-1])
+        last_assignment_start = -1
+        for candidate in DOCUMENTATION_CODE_QUOTED_VALUE_OPEN_PATTERN.finditer(context):
+            last_assignment_start = candidate.start()
+        if last_assignment_start < 0:
+            return memoryview(positions).toreadonly(), memoryview(starts).toreadonly()
+        literals = TextScanner._documentation_string_literal_spans(context, last_assignment_start)
         literal_starts = [start for start, _end in literals]
 
         def nested_in_literal(position: int) -> bool:
@@ -1438,13 +1556,16 @@ class TextScanner(BaseScanner):
         )
         following = next(matches, None)
         if following is None:
-            return (0,), (-1,)
+            return memoryview(positions).toreadonly(), memoryview(starts).toreadonly()
         # Keep the most recent still-open assignment for each quote/escape state.
         # A pending single quote can reopen only when the next quote doubles it.
         states = dict.fromkeys(b"\"'`", (-1, -1))
-        positions = [0]
-        starts = [-1]
+        inline_spans = TextScanner._documentation_closed_inline_code_spans(context)
+        inline_span = next(inline_spans, None)
+        reset_after_inline = False
         for position, value in enumerate(context, 1):
+            if inline_span is not None and position - 1 == inline_span[0]:
+                reset_after_inline = all(opened < 0 and pending < 0 for opened, pending in states.values())
             for quote, (opened, pending) in states.items():
                 if quote == ord("'"):
                     states[quote] = (
@@ -1463,14 +1584,21 @@ class TextScanner(BaseScanner):
                 if context[assignment_start] in b"\r\n{[(,;":
                     assignment_start += 1
                 states[quote] = max(opened, assignment_start), pending
+                if inline_span is not None and assignment_start < inline_span[0]:
+                    reset_after_inline = False
                 following = next(matches, None)
+            if inline_span is not None and position == inline_span[1]:
+                if reset_after_inline:
+                    # An inline example cannot leave a synthetic assignment open in later prose.
+                    states = dict.fromkeys(states, (-1, -1))
+                inline_span = next(inline_spans, None)
             latest = max(
                 max(opened, pending) if quote != ord("'") else opened for quote, (opened, pending) in states.items()
             )
             if latest != starts[-1]:
                 positions.append(position)
                 starts.append(latest)
-        return tuple(positions), tuple(starts)
+        return memoryview(positions).toreadonly(), memoryview(starts).toreadonly()
 
     @classmethod
     def _documentation_has_open_quoted_assignment(cls, source: bytes, start: int = 0, end: int | None = None) -> bool:
@@ -1480,8 +1608,16 @@ class TextScanner(BaseScanner):
         # the existing 256 KiB lookback, including across a window boundary.
         window = MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES
         origin = start // window * window
-        context = source[origin : origin + 2 * window]
-        positions, starts = cls._documentation_quoted_assignment_index(context)
+        shared = _DOCUMENTATION_QUOTE_WINDOWS.get()
+        if shared is not None and shared[0] is source:
+            windows = shared[1]
+            if origin not in windows:
+                windows[origin] = cls._documentation_quoted_assignment_index(source[origin : origin + 2 * window])
+                if len(windows) > 4:
+                    del windows[next(iter(windows))]
+            positions, starts = windows[origin]
+        else:
+            positions, starts = cls._documentation_quoted_assignment_index(source[origin : origin + 2 * window])
         index = bisect_right(positions, end - origin) - 1
         if starts[index] >= start - origin:
             return True
@@ -2182,35 +2318,61 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
+        return cls._documentation_open_call_context_status(payload, position) is not False
+
+    @classmethod
+    def _documentation_open_call_context_status(cls, payload: bytes, position: int) -> bool | None:
         line_start = payload.rfind(b"\n", 0, position) + 1
+        if line_start == 0:
+            return False
         current_line_prefix = payload[line_start:position]
         if cls._documentation_prefix_is_markdown_table_row(current_line_prefix):
             return False
         if cls._documentation_shell_comment_before_position(current_line_prefix, len(current_line_prefix)):
             return False
-        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
-
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
         context_start = cls._documentation_last_closed_fence_end(payload, context_start, line_start)
+        if context_start == line_start:
+            return False
+        markdown_link = cls._documentation_markdown_link_context(payload, position)
+        if (
+            markdown_link is not None
+            and cls._documentation_markdown_link_leading_prefix_is_passive(payload[line_start : markdown_link[1]])
+            and b"(" not in payload[context_start:line_start]
+        ):
+            return False
+        # Cache only bounded prefixes; one parser retry can inspect every byte again.
+        if position - context_start > MAX_DOCUMENTATION_CALL_CONTEXT_BYTES:
+            return None
+        try:
+            return cls._documentation_open_call_prefix_status(payload[context_start:position])
+        except _DocumentationCallBudgetExceeded:
+            return None
+
+    @classmethod
+    @lru_cache(maxsize=128)
+    def _documentation_open_call_prefix_status(cls, context: bytes) -> bool | None:
+        line_start = context.rfind(b"\n") + 1
+        current_line_prefix = context[line_start:]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        remaining_bytes = MAX_DOCUMENTATION_CALL_PARSE_BYTES
         previous_line_end = line_start - 1
-        while previous_line_end >= context_start:
-            previous_line_start = max(
-                payload.rfind(b"\n", context_start, previous_line_end) + 1,
-                context_start,
-            )
-            previous_line = payload[previous_line_start:previous_line_end]
+        while previous_line_end >= 0:
+            previous_line_start = context.rfind(b"\n", 0, previous_line_end) + 1
+            previous_line = context[previous_line_start:previous_line_end]
             stripped = previous_line.strip()
             if stripped and not stripped.startswith(b"#"):
                 previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
-                if current_indent == 0 and previous_indent == 0:
-                    if cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:position]):
-                        return True
-                    previous_line_end = previous_line_start - 1
-                    continue
-                if previous_indent < current_indent:
-                    return cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:position])
-            if previous_line_start == context_start:
-                break
+                if (current_indent == 0 and previous_indent == 0) or previous_indent < current_indent:
+                    prefix = context[previous_line_start:]
+                    is_call = False
+                    if b"(" in prefix and not cls._documentation_prefix_is_markdown_table_row(prefix):
+                        remaining_bytes -= 2 * len(prefix)
+                        if remaining_bytes < 0:
+                            return None
+                        is_call = cls._documentation_prefix_has_enclosing_call(prefix)
+                    if is_call or previous_indent < current_indent:
+                        return is_call
             previous_line_end = previous_line_start - 1
         return False
 
@@ -2258,6 +2420,10 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        return cls._documentation_finding_actionability(payload, finding) is not False
+
+    @classmethod
+    def _documentation_finding_actionability(cls, payload: bytes, finding: dict[str, Any]) -> bool | None:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return False
@@ -2273,18 +2439,32 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
-        if cls._documentation_open_call_contains_position(payload, position):
-            return True
+        call_context = cls._documentation_open_call_context_status(payload, position)
+        if call_context is not False:
+            if call_context is None:
+                line_parts = cls._finding_line_parts(payload, finding)
+                if line_parts is not None and cls._documentation_line_is_code_shaped(*line_parts):
+                    return True
+            return call_context
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         line_start, line_end, _ = cls._documentation_line_bounds(payload, position)
         url_span = cls._documentation_bare_url_span_at_position(payload, position, line_start, line_end)
         html_position = url_span[0] if url_span is not None else position
-        html_prefix = payload[max(0, html_position - MAX_TEXT_FINDING_CONTEXT_BYTES) : html_position]
+        html_prefix_start = max(0, html_position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        html_prefix = payload[html_prefix_start:html_position]
         html_link = DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN.search(html_prefix)
         if html_link is not None:
             tag_line_start = html_prefix.rfind(b"\n", 0, html_link.start()) + 1
             if not html_prefix[tag_line_start : html_link.start()].strip():
                 surrounding_prefix = html_prefix[: html_link.start()].rstrip(b" \t\r\n")
+                tag_start = html_prefix_start + html_link.start()
+                if cls._finding_line_prefix_is_truncated(payload, {"position": tag_start}):
+                    context_start = max(0, tag_start - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+                    if context_start and payload[context_start - 1 : context_start] not in {b"\r", b"\n"}:
+                        return True
+                    surrounding_prefix = payload[context_start:tag_start].rstrip(b" \t\r\n")
+                    if len(surrounding_prefix) > MAX_TEXT_FINDING_CONTEXT_BYTES:
+                        return True
                 return (
                     cls._documentation_assignment_is_actionable(surrounding_prefix)
                     or cls._documentation_markdown_link_config_is_actionable(surrounding_prefix)
@@ -2506,6 +2686,11 @@ class TextScanner(BaseScanner):
             and not cls._documentation_prefix_has_enclosing_call(prefix)
         )
 
+    @staticmethod
+    @lru_cache(maxsize=4)
+    def _bounded_documentation_has_harmful_behavior_claim(payload: bytes) -> bool:
+        return DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN.search(payload) is not None
+
     @classmethod
     def _documentation_cc_finding_is_benign_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         pattern = finding.get("pattern")
@@ -2523,11 +2708,22 @@ class TextScanner(BaseScanner):
             return False
         if any(match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_CC_PATTERN.finditer(line)):
             return True
+        if len(payload) > MAX_TEXT_FENCE_CONTEXT_BYTES or cls._bounded_documentation_has_harmful_behavior_claim(
+            payload
+        ):
+            return False
         absolute_position = finding["position"]
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
-        context = payload[absolute_position - position : context_end]
         if context_end < len(payload):
             return False
+        lookback = max(0, absolute_position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context_start: int | None = 0 if lookback == 0 else None
+        for separator in re.finditer(rb"\r?\n[ \t]*\r?\n", payload[lookback:absolute_position]):
+            context_start = lookback + separator.end()
+        if context_start is None:
+            return False
+        context = payload[context_start:context_end]
+        paragraph_position = absolute_position - context_start
         paragraphs = re.split(rb"\r?\n[ \t]*\r?\n", context)
         if any(
             paragraph.strip() and BENIGN_DOCUMENTATION_MISUSE_CONTINUATION_PATTERN.fullmatch(paragraph.strip()) is None
@@ -2535,7 +2731,7 @@ class TextScanner(BaseScanner):
         ):
             return False
         return any(
-            match.start() <= position < match.end()
+            match.start() <= paragraph_position < match.end()
             for match in BENIGN_DOCUMENTATION_MISUSE_PATTERN.finditer(paragraphs[0])
         )
 
@@ -2975,9 +3171,12 @@ class TextScanner(BaseScanner):
         if finding_limit.get(
             "truncated_finding_type"
         ) == "endpoint_redaction_classification" and cls._is_documentation_sidecar(path):
-            return all(
-                cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
-            ) and cls._documentation_network_token_lines_are_passive(payload)
+            try:
+                return all(
+                    cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
+                ) and cls._documentation_network_token_lines_are_passive(payload)
+            except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded):
+                return False
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
         truncated_finding = finding_limit.get("truncated_finding")
@@ -3573,13 +3772,19 @@ class TextScanner(BaseScanner):
         for index, finding in enumerate(findings):
             retarget_incomplete = False
             if documentation_sidecar:
-                finding, retarget_incomplete, remaining_occurrences = cls._retarget_documentation_finding(
-                    payload,
-                    lowered_payload,
-                    finding,
-                    remaining_occurrences,
-                    index == last_retargetable_index,
-                )
+                try:
+                    finding, retarget_incomplete, remaining_occurrences = cls._retarget_documentation_finding(
+                        payload,
+                        lowered_payload,
+                        finding,
+                        remaining_occurrences,
+                        index == last_retargetable_index,
+                    )
+                except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
+                    classification_incomplete = True
+                    classification_limit_sources.add(error.limit_source)
+                    classified_findings.append(finding)
+                    continue
                 classification_incomplete = classification_incomplete or retarget_incomplete
                 if retarget_incomplete:
                     classification_limit_sources.add("documentation")
@@ -3606,17 +3811,30 @@ class TextScanner(BaseScanner):
                     )
                 )
             )
-            if not retarget_incomplete and (
-                routine_example
-                or cls._sidecar_network_finding_is_informational(
-                    path,
-                    payload,
-                    finding,
-                    allow_documentation_image_examples=allow_documentation_image_examples,
-                    documentation_image_example_spans=documentation_image_example_spans,
-                )
-            ):
-                finding = {**finding, "severity": "INFO"}
+            try:
+                if not retarget_incomplete and (
+                    routine_example
+                    or cls._sidecar_network_finding_is_informational(
+                        path,
+                        payload,
+                        finding,
+                        allow_documentation_image_examples=allow_documentation_image_examples,
+                        documentation_image_example_spans=documentation_image_example_spans,
+                    )
+                ):
+                    finding = {**finding, "severity": "INFO"}
+                elif (
+                    documentation_sidecar
+                    and (
+                        finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES or finding.get("type") == "suspicious_port"
+                    )
+                    and cls._documentation_finding_actionability(payload, finding) is None
+                ):
+                    classification_incomplete = True
+                    classification_limit_sources.add("documentation_call_context")
+            except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
+                classification_incomplete = True
+                classification_limit_sources.add(error.limit_source)
             classified_findings.append(finding)
         return classified_findings, classification_incomplete, classification_limit_sources
 
@@ -3696,6 +3914,17 @@ class TextScanner(BaseScanner):
         )
 
     def _run_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
+        budget_token = _DOCUMENTATION_CALL_BUDGET.set(MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES)
+        quote_windows_token = _DOCUMENTATION_QUOTE_WINDOWS.set(None)
+        quote_budget_token = _DOCUMENTATION_QUOTE_BUDGET.set(MAX_DOCUMENTATION_QUOTE_PARSE_WORK)
+        try:
+            return self._run_bounded_content_security_checks(path, result, file_size)
+        finally:
+            _DOCUMENTATION_QUOTE_BUDGET.reset(quote_budget_token)
+            _DOCUMENTATION_QUOTE_WINDOWS.reset(quote_windows_token)
+            _DOCUMENTATION_CALL_BUDGET.reset(budget_token)
+
+    def _run_bounded_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
         check_secrets = self._get_bool_config("check_secrets", True)
         check_network = self._get_bool_config("check_network_comm", True)
         if not check_secrets:
@@ -3728,6 +3957,7 @@ class TextScanner(BaseScanner):
         truncated = len(payload) > read_limit
         inspected_payload = payload[:read_limit]
         inspected_bytes = len(inspected_payload)
+        _DOCUMENTATION_QUOTE_WINDOWS.set((inspected_payload, {}))
 
         detector_incomplete = False
         if check_secrets:
@@ -3826,6 +4056,17 @@ class TextScanner(BaseScanner):
                     if "tokenizer_vocabulary" in classification_limit_sources:
                         classification_details["max_tokenizer_vocabulary_cc_retarget_occurrences"] = (
                             MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+                        )
+                    if "documentation_call_context" in classification_limit_sources:
+                        classification_details["max_documentation_call_parse_bytes"] = (
+                            MAX_DOCUMENTATION_CALL_PARSE_BYTES
+                        )
+                        classification_details["max_documentation_total_call_parse_bytes"] = (
+                            MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES
+                        )
+                    if "documentation_quote_context" in classification_limit_sources:
+                        classification_details["max_documentation_quote_parse_work"] = (
+                            MAX_DOCUMENTATION_QUOTE_PARSE_WORK
                         )
                     self._mark_content_security_scan_incomplete(
                         result,
