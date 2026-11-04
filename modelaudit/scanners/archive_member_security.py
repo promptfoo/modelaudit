@@ -5312,21 +5312,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._bind_name(syntactic_name, frozenset(target_names))
         return True
 
-    def _resolve_target_bindings(self, target: ast.AST, value: ast.AST) -> _AliasScope:
-        if isinstance(target, ast.Name):
-            resolved_names = self._resolve_binding_value_names(value)
-            return {target.id: self._localize_instance_binding_value(target.id, value, resolved_names)}
-        if (
-            isinstance(target, (ast.Tuple, ast.List))
-            and isinstance(value, (ast.Tuple, ast.List))
-            and len(target.elts) == len(value.elts)
-        ):
-            bindings: _AliasScope = {}
-            for target_element, value_element in zip(target.elts, value.elts, strict=True):
-                bindings.update(self._resolve_target_bindings(target_element, value_element))
-            return bindings
-        return dict.fromkeys(_binding_names(target), None)
-
     def _bind_comprehension_target(self, target: ast.AST, iterable: ast.AST) -> None:
         if not isinstance(iterable, (ast.Tuple, ast.List, ast.Set)):
             self._shadow_binding_target(target)

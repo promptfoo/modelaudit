@@ -25,6 +25,8 @@ from itertools import chain
 from pathlib import Path
 from typing import Any, ClassVar
 
+from modelaudit_picklescan import api as _picklescan_api
+
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 from ..scanner_results import (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
@@ -438,7 +440,6 @@ _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
 _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES = 4 * 1024 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES = 64 * 1024 * 1024
-_PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
 _PICKLE_LITERAL_PRESERVATION_MAX_OPCODES = _PYTORCH_STORAGE_TRUST_MAX_OPCODES
 _PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES = 1024 * 1024
@@ -447,7 +448,6 @@ _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
 _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS = 10_000
 _PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX = 2**63 - 1
-_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT = str(_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX)
 _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PYTORCH_ZIP_INTEGRITY_PREFIX_BYTES = 8 * 1024 * 1024
 _PYTORCH_ZIP_HASH_CHUNK_BYTES = 1024 * 1024
@@ -2945,54 +2945,13 @@ class PyTorchZipScanner(BaseScanner):
             sample
         ) or PyTorchZipScanner._has_structural_pickle_evidence_in_incomplete_frame(sample)
 
-    @staticmethod
-    def _has_structural_pickle_evidence_in_incomplete_frame(sample: bytes) -> bool:
-        frame_end: int | None = None
-        payload_opcode_count = 0
-        try:
-            for opcode, arg, pos in pickletools.genops(sample):
-                if pos is None:
-                    continue
-                if opcode.name == "FRAME":
-                    if frame_end is not None or not isinstance(arg, int):
-                        return False
-                    frame_end = pos + _PICKLE_FRAME_OPCODE_BYTES + arg
-                    if frame_end <= len(sample):
-                        return False
-                    continue
-                if frame_end is None or pos >= frame_end:
-                    return False
-                payload_opcode_count += 1
-        except Exception as exc:
-            message = str(exc).lower()
-            return (
-                frame_end is not None
-                and frame_end > len(sample)
-                and payload_opcode_count >= _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES
-                and (
-                    "exhausted before seeing stop" in message
-                    or "no newline found when trying to read" in message
-                    or "not enough data" in message
-                    or "expected" in message
-                )
-            )
-        return frame_end is not None and payload_opcode_count >= _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES
+    _has_structural_pickle_evidence_in_incomplete_frame = staticmethod(
+        _picklescan_api._has_structural_pickle_evidence_in_incomplete_frame
+    )
 
-    @staticmethod
-    def _has_security_relevant_opcode_in_incomplete_frame(sample: bytes) -> bool:
-        incomplete_frame_seen = False
-        security_relevant_opcode_seen = False
-        try:
-            for opcode, arg, pos in pickletools.genops(sample):
-                if opcode.name == "FRAME" and isinstance(arg, int) and pos is not None:
-                    incomplete_frame_seen = pos + _PICKLE_FRAME_OPCODE_BYTES + arg > len(sample)
-                elif opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
-                    security_relevant_opcode_seen = True
-                if incomplete_frame_seen and security_relevant_opcode_seen:
-                    return True
-        except Exception:
-            return incomplete_frame_seen and security_relevant_opcode_seen
-        return False
+    _has_security_relevant_opcode_in_incomplete_frame = staticmethod(
+        _picklescan_api._has_security_relevant_opcode_in_incomplete_frame
+    )
 
     @staticmethod
     def _has_security_relevant_pickle_opcode(sample: bytes) -> bool:
@@ -3168,64 +3127,23 @@ class PyTorchZipScanner(BaseScanner):
             return len(candidate) - 2 < declared_size
         return False
 
-    @staticmethod
-    def _candidate_starts_with_binary_security_opcode_requiring_existing_stack(candidate: bytes) -> bool:
-        return bool(candidate) and candidate[0] in _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES
+    _candidate_starts_with_binary_security_opcode_requiring_existing_stack = staticmethod(
+        _picklescan_api._candidate_starts_with_binary_security_opcode_requiring_existing_stack
+    )
 
-    @staticmethod
-    def _looks_like_truncated_binary_pickle_operand_prefix(candidate: bytes) -> bool:
-        if candidate.startswith((b"B", b"T", b"X", b"\x8b")):
-            if len(candidate) < 5:
-                return True
-            declared_size = int.from_bytes(candidate[1:5], "little")
-            return len(candidate) - 5 < declared_size
-        if candidate.startswith((b"C", b"U", b"\x8a", b"\x8c")):
-            if len(candidate) < 2:
-                return True
-            declared_size = candidate[1]
-            return len(candidate) - 2 < declared_size
-        if candidate.startswith((b"\x8d", b"\x8e", b"\x96")):
-            if len(candidate) < 9:
-                return True
-            declared_size = int.from_bytes(candidate[1:9], "little")
-            return len(candidate) - 9 < declared_size
-        return False
+    _looks_like_truncated_binary_pickle_operand_prefix = staticmethod(
+        _picklescan_api._looks_like_truncated_binary_pickle_operand_prefix
+    )
 
-    @staticmethod
-    def _looks_like_truncated_fixed_width_pickle_operand_prefix(candidate: bytes) -> bool:
-        if candidate.startswith((b"K", b"h", b"q", b"\x82")):
-            return len(candidate) < 2
-        if candidate.startswith((b"M", b"\x83")):
-            return len(candidate) < 3
-        if candidate.startswith((b"J", b"j", b"r", b"\x84")):
-            return len(candidate) < 5
-        if candidate.startswith(b"G"):
-            return len(candidate) < 9
-        return False
+    _looks_like_truncated_fixed_width_pickle_operand_prefix = staticmethod(
+        _picklescan_api._looks_like_truncated_fixed_width_pickle_operand_prefix
+    )
 
-    @staticmethod
-    def _looks_like_truncated_security_opcode_prefix(candidate: bytes) -> bool:
-        if candidate.startswith(b"\x82"):
-            return len(candidate) < 2
-        if candidate.startswith(b"\x83"):
-            return len(candidate) < 3
-        if candidate.startswith(b"\x84"):
-            return len(candidate) < 5
-        return False
+    _looks_like_truncated_security_opcode_prefix = staticmethod(
+        _picklescan_api._looks_like_truncated_security_opcode_prefix
+    )
 
-    @staticmethod
-    def _candidate_truncates_extension_operand(
-        *,
-        candidate_start: int,
-        candidate: bytes,
-        offset: int,
-        marker: int,
-    ) -> bool:
-        operand_len = _BINARY_EXTENSION_OPCODE_OPERAND_LENGTHS.get(marker)
-        if operand_len is None:
-            return False
-        candidate_end = candidate_start + len(candidate)
-        return candidate_start <= offset < candidate_end < offset + 1 + operand_len
+    _candidate_truncates_extension_operand = staticmethod(_picklescan_api._candidate_truncates_extension_operand)
 
     @staticmethod
     def _has_executable_extension_opcode_before_stop(
@@ -3562,52 +3480,11 @@ class PyTorchZipScanner(BaseScanner):
             return False
         return not candidate.strip(bytes([candidate[0]]))
 
-    @staticmethod
-    def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
-        active_frame_end = 0
-        opcode_count = 0
-        has_non_trivial_opcode = False
-        try:
-            for opcode, arg, pos in pickletools.genops(sample):
-                opcode_count += 1
-                if pos is None:
-                    continue
-                if opcode.name == "FRAME":
-                    if not isinstance(arg, int):
-                        return None
-                    active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
-                elif opcode.name == "STOP":
-                    if opcode_count < 2 or active_frame_end > len(sample) or has_non_trivial_opcode:
-                        return None
-                    return sample[pos + 1 :]
-                elif opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
-                    has_non_trivial_opcode = True
-        except Exception:
-            return None
-        return None
+    _trivial_complete_pickle_prefix_trailing = staticmethod(_picklescan_api._trivial_complete_pickle_prefix_trailing)
 
-    @staticmethod
-    def _complete_headerless_byte_literal_prefix_trailing(sample: bytes) -> bytes | None:
-        if not sample or sample[0] not in _PICKLE_BINARY_BYTE_LITERAL_START_BYTES:
-            return None
-        opcode_count = 0
-        try:
-            for opcode, _arg, pos in pickletools.genops(sample):
-                opcode_count += 1
-                if pos is None:
-                    continue
-                if opcode_count == 1:
-                    if opcode.name not in _PICKLE_BINARY_BYTE_LITERAL_OPCODES:
-                        return None
-                elif opcode.name == "STOP":
-                    if opcode_count != 2:
-                        return None
-                    return sample[pos + 1 :]
-                else:
-                    return None
-        except Exception:
-            return None
-        return None
+    _complete_headerless_byte_literal_prefix_trailing = staticmethod(
+        _picklescan_api._complete_headerless_byte_literal_prefix_trailing
+    )
 
     @staticmethod
     def _complete_trivial_literal_pickle_has_nested_security_pickle(
@@ -7782,12 +7659,7 @@ class PyTorchZipScanner(BaseScanner):
                     return True
         return work_budget_remaining[0] < 0
 
-    @staticmethod
-    def _contains_pickle_frame_opcode(sample: bytes) -> bool:
-        try:
-            return any(opcode.name == "FRAME" for opcode, _arg, _pos in pickletools.genops(sample))
-        except Exception:
-            return False
+    _contains_pickle_frame_opcode = staticmethod(_picklescan_api._contains_pickle_frame_opcode)
 
     @staticmethod
     def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
@@ -8750,65 +8622,13 @@ class PyTorchZipScanner(BaseScanner):
             },
         )
 
-    @staticmethod
-    def _coerce_pickle_string_arg(value: Any) -> str | None:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, bytes):
-            try:
-                return value.decode("utf-8")
-            except UnicodeDecodeError:
-                return None
-        return None
+    _coerce_pickle_string_arg = staticmethod(_picklescan_api._coerce_pickle_string_arg)
 
-    @staticmethod
-    def _split_protocol0_persid_fields(text: str) -> list[str] | None:
-        if not text.startswith("(") or not text.endswith(")"):
-            return None
-        fields: list[str] = []
-        start = 1
-        in_quote: str | None = None
-        escaped = False
-        for index, char in enumerate(text[1:-1], start=1):
-            if escaped:
-                escaped = False
-                continue
-            if in_quote is not None:
-                if char == "\\":
-                    escaped = True
-                elif char == in_quote:
-                    in_quote = None
-                continue
-            if char in {"'", '"'}:
-                in_quote = char
-            elif char == ",":
-                fields.append(text[start:index].strip())
-                start = index + 1
-        if in_quote is not None:
-            return None
-        fields.append(text[start:-1].strip())
-        return fields
+    _split_protocol0_persid_fields = staticmethod(_picklescan_api._split_protocol0_persid_fields)
 
-    @staticmethod
-    def _quoted_protocol0_field_value(field: str) -> str | None:
-        if len(field) < 2 or field[0] not in {"'", '"'} or field[-1] != field[0]:
-            return None
-        value = field[1:-1]
-        return None if "\\" in value else value
+    _quoted_protocol0_field_value = staticmethod(_picklescan_api._quoted_protocol0_field_value)
 
-    @staticmethod
-    def _parse_pytorch_storage_element_count_text(storage_size: str) -> int | None:
-        if not storage_size.isascii() or not storage_size.isdecimal():
-            return None
-        normalized = storage_size.lstrip("0") or "0"
-        if len(normalized) > len(_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT):
-            return None
-        if (
-            len(normalized) == len(_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT)
-            and normalized > _PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT
-        ):
-            return None
-        return int(normalized)
+    _parse_pytorch_storage_element_count_text = staticmethod(_picklescan_api._parse_pytorch_storage_element_count_text)
 
     @classmethod
     def _storage_ref_from_protocol0_persid_text(

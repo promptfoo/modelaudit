@@ -8,11 +8,12 @@ import numbers
 import os
 import re
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from itertools import chain, islice, repeat
 from pathlib import Path
-from typing import Any, BinaryIO, ClassVar, NoReturn
+from typing import Any, BinaryIO, ClassVar, NoReturn, cast
 
 from ..scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY, VALIDATED_FORMAT_METADATA_KEY
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
@@ -113,8 +114,11 @@ _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT = 100
 _ONNX_WEIGHT_CONSUMER_SAMPLE_LIMIT = 20
 _ONNX_WEIGHT_ANALYSIS_GROUP_LIMIT = 100
 _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT = 32
+_ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT = 1_000_000
 _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
+_ONNX_INFERRED_SHAPE_DIMENSION_LIMIT = 1_000_000
+_ONNX_SHAPE_EXTENT_LIMIT = (1 << 63) - 1
 _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS: frozenset[str] = frozenset(
     {"dynamic_activation_lineage", "dynamic_input_lineage"}
 )
@@ -124,6 +128,8 @@ _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT = 5
 _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT = 20
 _ONNX_CUSTOM_OPERATOR_TEXT_LIMIT = 256
 _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
+_ONNX_CONSTANT_ATTRIBUTE_FALLBACK_BYTE_LIMIT = _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE
+_ONNX_CONSTANT_ATTRIBUTE_COPY_CHUNK_ELEMENTS = 1024
 _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
@@ -156,6 +162,7 @@ _ONNX_STRUCTURE_MAX_STRING_DATA_FIELDS = 100_000
 _ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES = 100_000
 _ONNX_STRUCTURE_MAX_FIELD_NUMBER = (1 << 29) - 1
 _ONNX_STRUCTURE_MAX_PARSE_STEPS = 5_000_000
+_ONNX_PREFLIGHT_MAX_DUPLICATE_SINGULAR_FIELDS = 4096
 _ONNX_STRUCTURE_MAX_UNKNOWN_FIELD_SAMPLES = 20
 _ONNX_STRUCTURE_MAX_RETAINED_OBJECTS = 1_000_000
 _ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES = 1_000_000
@@ -164,6 +171,19 @@ _ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES = 128 * 1024 * 1024
 _ONNX_STRUCTURE_RETAINED_OBJECT_BYTES = 1024
 _ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
 _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
+_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
+_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
+_ONNX_NESTED_PROMOTION_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_PRODUCER_INDEX_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_RUNTIME_INPUT_TYPE_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
+_ONNX_EINSUM_EQUATION_MAX_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
+_ONNX_EINSUM_EQUATION_BYTE_LIMIT = 4 * _ONNX_STRUCTURE_STRING_MAX_BYTES
+_ONNX_EINSUM_EQUATION_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+_ONNX_VECTOR_CONTROL_WORK_LIMIT = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -229,6 +249,24 @@ _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
         "ThresholdedRelu",
     }
 )
+_SHAPE_PRESERVING_UNARY_RANK_OPERATORS: frozenset[str] = _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS | frozenset(
+    {
+        "Clip",
+        "Dropout",
+    }
+)
+_RANK_PRESERVING_VARIADIC_OPERATORS: frozenset[str] = frozenset({"Concat"})
+_RANK_GAP_PROMOTING_OPERATORS: frozenset[str] = frozenset(
+    {
+        "Expand",
+        "Flatten",
+        "Gather",
+        "GatherND",
+        "Reshape",
+        "Squeeze",
+        "Unsqueeze",
+    }
+)
 _QUANTIZED_WEIGHT_OPERATORS: frozenset[str] = frozenset(
     {
         "ConvInteger",
@@ -291,25 +329,88 @@ def _onnx_int_attribute(node: Any, name: str, default: int = 0) -> int:
     return default
 
 
-def _onnx_text_attribute(node: Any, name: str) -> str | None:
-    """Read a UTF-8 ONNX string attribute without importing ONNX eagerly."""
+def _onnx_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None:
+    """Read an integer-list ONNX node attribute without importing ONNX eagerly."""
     for attribute in getattr(node, "attribute", []):
-        if attribute.name != name:
-            continue
-        try:
-            return bytes(attribute.s).decode("utf-8")
-        except (AttributeError, UnicodeDecodeError):
-            return None
+        if attribute.name == name:
+            return tuple(int(value) for value in attribute.ints)
     return None
 
 
-def _onnx_gather_axis(node: Any, rank: int) -> int | None:
-    axis = _onnx_int_attribute(node, "axis")
+def _onnx_shape_extent_product(dimensions: Iterable[int]) -> int:
+    """Keep symbolic and overflowing products unknown without growing Python integers."""
+    result = 1
+    unknown = False
+    overflow = False
+    for dimension in dimensions:
+        if dimension < 0 or dimension > _ONNX_SHAPE_EXTENT_LIMIT:
+            unknown = True
+        elif dimension == 0:
+            result = 0
+        elif result > _ONNX_SHAPE_EXTENT_LIMIT // dimension:
+            overflow = True
+        else:
+            result *= dimension
+    return -1 if unknown or (overflow and result != 0) else result
+
+
+def _onnx_concat_output_shape(
+    node: Any,
+    input_shapes: Iterable[tuple[int, ...] | None],
+    *,
+    axis: int | None = None,
+) -> tuple[int, ...] | None:
+    shapes = list(input_shapes)
+    if not shapes or any(shape is None for shape in shapes):
+        return None
+    concrete_shapes = [shape for shape in shapes if shape is not None]
+    ranks = {len(shape) for shape in concrete_shapes}
+    if len(ranks) != 1:
+        return None
+    rank = next(iter(ranks))
+    axis = _onnx_int_attribute(node, "axis", 0) if axis is None else axis
+    axis = axis if axis >= 0 else rank + axis
+    if axis < 0 or axis >= rank:
+        return None
+    output_dimensions = list(concrete_shapes[0])
+    for shape in concrete_shapes[1:]:
+        for index, dimension in enumerate(shape):
+            current = output_dimensions[index]
+            if index == axis:
+                output_dimensions[index] = (
+                    -1
+                    if current < 0 or dimension < 0 or current > _ONNX_SHAPE_EXTENT_LIMIT - dimension
+                    else current + dimension
+                )
+            elif current < 0 or dimension < 0:
+                output_dimensions[index] = -1
+            elif dimension != current:
+                return None
+    return tuple(output_dimensions)
+
+
+def _onnx_gather_axis(node: Any, rank: int, resolve_attribute: Callable[[Any], Any | None] | None = None) -> int | None:
+    axis = 0
+    for attribute in getattr(node, "attribute", ()):
+        if attribute.name != "axis":
+            continue
+        if getattr(attribute, "ref_attr_name", ""):
+            attribute = resolve_attribute(attribute) if resolve_attribute is not None else None
+            if attribute is None:
+                return None
+        axis = int(getattr(attribute, "i", 0))
+        break
     axis = axis if axis >= 0 else rank + axis
     return axis if 0 <= axis < rank else None
 
 
-def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tuple[int, ...] | None, str]:
+def _onnx_weight_output_axes(
+    node: Any,
+    input_index: int,
+    rank: int,
+    *,
+    einsum_equation: tuple[tuple[str, ...], str] | None = None,
+) -> tuple[tuple[int, ...] | None, str]:
     """Classify an initializer consumer for statistical weight analysis."""
     op_type = node.op_type
     domain = getattr(node, "domain", "")
@@ -357,11 +458,9 @@ def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tu
         return (0, 1), "eligible_recurrent_weight"
 
     if op_type == "Einsum":
-        equation = _onnx_text_attribute(node, "equation")
-        if equation is None or "..." in equation or equation.count("->") != 1:
+        if einsum_equation is None:
             return None, "unsupported_einsum_equation"
-        input_expression, output_expression = (part.strip() for part in equation.split("->", 1))
-        input_terms = [term.strip() for term in input_expression.split(",")]
+        input_terms, output_expression = einsum_equation
         if input_index >= len(input_terms):
             return None, "unsupported_einsum_equation"
         weight_term = input_terms[input_index]
@@ -410,6 +509,57 @@ def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tu
     }:
         return None, "bookkeeping_constant"
     return None, "unsupported_consumer"
+
+
+def _onnx_remove_shape_axis(shape: tuple[int, ...], raw_axis: int) -> tuple[int, ...] | None:
+    axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
+    if axis < 0 or axis >= len(shape):
+        return None
+    return (*shape[:axis], *shape[axis + 1 :])
+
+
+def _onnx_remove_rank_axis(rank: int, raw_axis: int) -> int | None:
+    axis = raw_axis if raw_axis >= 0 else rank + raw_axis
+    if axis < 0 or axis >= rank:
+        return None
+    return rank - 1
+
+
+def _onnx_remove_known_axis(
+    shape: tuple[int, ...] | None, rank: int | None, raw_axis: int
+) -> tuple[tuple[int, ...] | None, int | None]:
+    if shape is not None:
+        shape = _onnx_remove_shape_axis(shape, raw_axis)
+        return shape, len(shape) if shape is not None else None
+    if rank is not None:
+        return None, _onnx_remove_rank_axis(rank, raw_axis)
+    return shape, rank
+
+
+def _onnx_scan_bound_subgraph_input_shape(
+    parent_shape: tuple[int, ...] | None,
+    parent_rank: int | None,
+    *,
+    pair_index: int,
+    scan_input_start: int,
+    scan_input_offset: int,
+    scan_input_axes: Sequence[int],
+) -> tuple[tuple[int, ...] | None, int | None]:
+    scan8_batched_input = bool(scan_input_offset and pair_index >= scan_input_offset)
+    if scan8_batched_input and pair_index < scan_input_start:
+        return _onnx_remove_known_axis(parent_shape, parent_rank, 0)
+    if pair_index < scan_input_start:
+        return parent_shape, parent_rank
+
+    scan_input_index = pair_index - scan_input_start
+    default_scan_input_axis = 1 if scan_input_offset else 0
+    scan_input_axis = (
+        scan_input_axes[scan_input_index] if scan_input_index < len(scan_input_axes) else default_scan_input_axis
+    )
+    parent_shape, parent_rank = _onnx_remove_known_axis(parent_shape, parent_rank, scan_input_axis)
+    if scan8_batched_input:
+        parent_shape, parent_rank = _onnx_remove_known_axis(parent_shape, parent_rank, 0)
+    return parent_shape, parent_rank
 
 
 def _iter_attribute_graphs(attribute: Any) -> Any:
@@ -1370,6 +1520,15 @@ class _OnnxWeightLineage:
     unresolved_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _OnnxWeightLineageGapSummary:
+    lineages: tuple[_OnnxWeightLineage, ...] = ()
+    truncated: bool = False
+    # Pending nonnumeric provenance travels even when the numeric count is zero.
+    shape_control: bool = False
+    converted_shape_control: bool = False
+
+
 @dataclass
 class _OnnxWeightConsumerGroup:
     lineage: _OnnxWeightLineage
@@ -1409,7 +1568,22 @@ class _OnnxWeightAnalysisPlan:
     unresolved_lineage_samples: list[dict[str, Any]] = field(default_factory=list)
 
     def record_coverage_gap(self, reason: str, count: int = 1) -> None:
-        self.coverage_gaps[reason] = self.coverage_gaps.get(reason, 0) + count
+        current = self.coverage_gaps.get(reason, 0)
+        if reason == "lineages_per_value_limit":
+            self.coverage_gaps[reason] = _bounded_onnx_weight_lineage_gap_count(current, count)
+        else:
+            self.coverage_gaps[reason] = current + count
+
+
+def _bounded_onnx_weight_lineage_gap_count(*counts: int) -> int:
+    total = 0
+    for count in counts:
+        if count <= 0:
+            continue
+        if count >= _ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT - total:
+            return _ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT
+        total += count
+    return total
 
 
 def _bounded_onnx_metadata_text(plan: _OnnxWeightAnalysisPlan, value: Any) -> tuple[str, int, bool]:
@@ -1448,6 +1622,33 @@ def _bounded_onnx_integer_sequence(field_name: str, values: Any) -> dict[str, An
         f"{field_name}_count": value_count,
         f"{field_name}_truncated": value_count > _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT,
     }
+
+
+def _copy_onnx_repeated_constant_values(
+    tensor: Any,
+    values: Any,
+    *,
+    max_elements: int,
+    onnx: Any,
+) -> bool:
+    count = len(values)
+    if count > max_elements or len(tensor.dims) != 1 or int(tensor.dims[0]) != count:
+        return False
+    if int(tensor.data_type) == int(onnx.TensorProto.FLOAT):
+        destination = tensor.float_data
+    elif int(tensor.data_type) == int(onnx.TensorProto.INT64):
+        destination = tensor.int64_data
+    else:
+        return False
+    values_iter = iter(values)
+    for offset in range(0, count, _ONNX_CONSTANT_ATTRIBUTE_COPY_CHUNK_ELEMENTS):
+        chunk_count = min(_ONNX_CONSTANT_ATTRIBUTE_COPY_CHUNK_ELEMENTS, count - offset)
+        chunk = tuple(islice(values_iter, chunk_count))
+        if len(chunk) != chunk_count:
+            return False
+        destination.extend(chunk)
+    sentinel = object()
+    return next(values_iter, sentinel) is sentinel
 
 
 def _onnx_inline_storage_nbytes(initializer: Any) -> int:
@@ -1491,24 +1692,36 @@ def _resolve_onnx_reshape_shape(
     *,
     allowzero: bool,
     onnx: Any,
+    resolve_int64_vector: Callable[[Any], tuple[int, ...] | None] | None = None,
 ) -> tuple[int, ...] | None:
-    dims = tuple(int(dimension) for dimension in getattr(shape_initializer, "dims", ()))
-    element_count = math.prod(dims) if dims else 0
-    if (
-        len(dims) != 1
-        or element_count < 0
-        or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
-        or int(getattr(shape_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
-        or _onnx_inline_storage_nbytes(shape_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
-        or _onnx_tensor_uses_external_storage(shape_initializer, onnx=onnx)
-    ):
+    if any(dimension < 0 for dimension in input_shape):
         return None
+    if resolve_int64_vector is not None:
+        values = resolve_int64_vector(shape_initializer)
+        if values is None:
+            return None
+        target = list(values)
+        element_count = len(target)
+    else:
+        dims: Any = getattr(shape_initializer, "dims", ())
+        if len(dims) != 1:
+            return None
+        element_count = int(dims[0])
+        if (
+            len(dims) != 1
+            or element_count < 0
+            or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+            or int(getattr(shape_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
+            or _onnx_inline_storage_nbytes(shape_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
+            or _onnx_tensor_uses_external_storage(shape_initializer, onnx=onnx)
+        ):
+            return None
 
-    try:
-        target_values = onnx.numpy_helper.to_array(shape_initializer).reshape(-1).tolist()
-        target = [int(value) for value in target_values]
-    except Exception:
-        return None
+        try:
+            target_values = onnx.numpy_helper.to_array(shape_initializer).reshape(-1).tolist()
+            target = [int(value) for value in target_values]
+        except Exception:
+            return None
     if len(target) != element_count or any(value < -1 for value in target) or target.count(-1) > 1:
         return None
     if allowzero and -1 in target and 0 in target:
@@ -1523,29 +1736,53 @@ def _resolve_onnx_reshape_shape(
         else:
             normalized.append(value)
 
-    input_size = math.prod(input_shape)
-    known_size = math.prod(value for value in normalized if value != -1)
+    input_size = _onnx_shape_extent_product(input_shape)
+    known_size = _onnx_shape_extent_product(value for value in normalized if value != -1)
+    if input_size < 0 or known_size < 0:
+        return None
     if -1 in normalized:
         if known_size <= 0 or input_size % known_size != 0:
             return None
         normalized[normalized.index(-1)] = input_size // known_size
-    elif math.prod(normalized) != input_size:
+    elif known_size != input_size:
         return None
     return tuple(normalized)
 
 
-def _resolve_onnx_axes(node: Any, constants: dict[str, Any], *, onnx: Any) -> tuple[int, ...] | None:
+def _resolve_onnx_axes(
+    node: Any,
+    constants: dict[str, Any],
+    *,
+    onnx: Any,
+    resolve_attribute: Callable[[Any], Any | None] | None = None,
+    on_limit: Callable[[], None] | None = None,
+    resolve_int64_vector: Callable[[Any], tuple[int, ...] | None] | None = None,
+) -> tuple[int, ...] | None:
     for attribute in getattr(node, "attribute", ()):
         if attribute.name == "axes":
-            return tuple(int(value) for value in attribute.ints)
+            resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            if resolved_attribute is None or bool(getattr(resolved_attribute, "ref_attr_name", "")):
+                return None
+            values = getattr(resolved_attribute, "ints", ())
+            if len(values) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+                if on_limit is not None:
+                    on_limit()
+                return None
+            return tuple(int(value) for value in values)
     if len(getattr(node, "input", ())) < 2:
         return ()
 
     axes_initializer = constants.get(str(node.input[1]))
     if axes_initializer is None:
         return None
-    dims = tuple(int(dimension) for dimension in getattr(axes_initializer, "dims", ()))
-    element_count = math.prod(dims) if dims else 0
+    dims: Any = getattr(axes_initializer, "dims", ())
+    if len(dims) != 1:
+        return None
+    element_count = int(dims[0])
+    if element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT and on_limit is not None:
+        on_limit()
+    if resolve_int64_vector is not None:
+        return resolve_int64_vector(axes_initializer)
     if (
         len(dims) != 1
         or element_count < 0
@@ -1615,9 +1852,12 @@ def _onnx_potential_weight_input(
     *,
     is_model_local_function: bool = False,
     is_registered_standard_operator: bool = True,
+    identifier: tuple[str, str, str] | None = None,
 ) -> bool:
     """Return whether initializer lineage at this input needs weight coverage."""
-    domain = getattr(node, "domain", "")
+    if is_model_local_function:
+        return False
+    domain = getattr(node, "domain", "") if identifier is None else identifier[0]
     if domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
         # ONNX-ML operators store learned parameters in attributes; tensor inputs are data.
         if is_registered_standard_operator and domain == "ai.onnx.ml":
@@ -1625,34 +1865,74 @@ def _onnx_potential_weight_input(
         return not is_model_local_function and (
             domain in STANDARD_ONNX_DOMAINS or domain in SCHEMA_VALIDATED_ONNX_DOMAINS
         )
-    if node.op_type in {"Gemm", "MatMul"}:
+    op_type = node.op_type if identifier is None else identifier[1]
+    if op_type in {"Gemm", "MatMul"}:
         return input_index in {0, 1}
-    if node.op_type in {"Conv", "ConvTranspose"}:
+    if op_type in {"Conv", "ConvTranspose"}:
         return input_index == 1
-    if node.op_type in _RECURRENT_WEIGHT_OPERATORS:
+    if op_type in _RECURRENT_WEIGHT_OPERATORS:
         return input_index in {1, 2}
-    if node.op_type == "Gather":
+    if op_type == "Gather":
         return input_index == 0
-    if node.op_type == "PRelu":
+    if op_type == "PRelu":
         return input_index == 1
-    return node.op_type == "Einsum" or not is_registered_standard_operator
+    return op_type == "Einsum" or not is_registered_standard_operator
 
 
-def _onnx_activation_input_candidate(node: Any, input_index: int) -> bool:
-    if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+def _onnx_activation_input_candidate(
+    node: Any, input_index: int, *, identifier: tuple[str, str, str] | None = None
+) -> bool:
+    domain = getattr(node, "domain", "") if identifier is None else identifier[0]
+    if domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
         return False
-    if node.op_type in {"Einsum", "Gemm", "MatMul"}:
+    op_type = node.op_type if identifier is None else identifier[1]
+    if op_type in {"Einsum", "Gemm", "MatMul"}:
         return True
-    if node.op_type in {"Conv", "ConvTranspose"}:
+    if op_type in {"Conv", "ConvTranspose"}:
         return input_index == 0
-    if node.op_type in _RECURRENT_WEIGHT_OPERATORS:
+    if op_type in _RECURRENT_WEIGHT_OPERATORS:
         return input_index not in {1, 2}
-    return node.op_type == "Gather" and input_index == 1
+    return op_type == "Gather" and input_index == 1
 
 
 def _onnx_opaque_activation_input_candidate(node: Any, _input_index: int) -> bool:
     """Recognize opaque-domain inputs whose schema fixes an activation-only role."""
     return getattr(node, "domain", "") == "ai.onnx.ml"
+
+
+@dataclass
+class _OnnxAttributeStringPreflight:
+    # None means no complete wire provenance, including a refused prefix.
+    lengths: list[int | None] | None = None
+
+
+@dataclass
+class _OnnxTrainingStatePreflight:
+    # Root graph uses scope -1; other scopes index TrainingInfo.algorithm.
+    # None means no complete provenance, whereas [] proves no mutable owners.
+    positions: list[tuple[int, int]] | None = None
+
+
+@dataclass(frozen=True)
+class _OnnxRawControlAdmission:
+    """Private proof bound to a model loaded from the preflighted byte snapshot.
+
+    Until analysis completes, callers must preserve graph/attribute membership,
+    attribute strings, tensor membership, dtypes, dimensions, and raw bytes;
+    loading external data invalidates this proof.
+    Initializer names, training membership and binding keys must also remain
+    unchanged throughout analysis. Discarding unknown
+    fields preserves these invariants.
+    This is an internal loader contract, not permission to certify arbitrary
+    mutable ModelProto instances supplied by callers.
+    """
+
+    model: Any
+    vectors_bounded: bool
+    scalars_bounded: bool
+    error_reason: str | None = None
+    string_attribute_lengths: dict[int, tuple[Any, int]] = field(default_factory=dict)
+    mutable_initializer_owners: dict[int, Any] | None = None
 
 
 def _build_onnx_weight_analysis_plan(
@@ -1662,10 +1942,109 @@ def _build_onnx_weight_analysis_plan(
     np: Any,
     max_array_size: int | None,
     pre_materialization_check: Callable[[Any, str, int], bool] | None = None,
+    pre_view_check: Callable[[str, int], bool] | None = None,
     retain_array_check: Callable[[str, int], bool] | None = None,
+    raw_control_admission: _OnnxRawControlAdmission | None = None,
 ) -> _OnnxWeightAnalysisPlan:
-    """Build a bounded, semantically oriented plan for ONNX weight analysis."""
+    """Build a bounded plan; raw controls require exact-input loader provenance.
+
+    Private in-memory callers without provenance retain typed-control support
+    except for potentially mutable training initializer values.
+    Never manufacture provenance by serializing an untrusted ModelProto here.
+    """
     plan = _OnnxWeightAnalysisPlan()
+    inferred_dimensions = 0
+    scan_axis_decode_work_remaining = _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT
+
+    def shape_inference_available(rank: int) -> bool:
+        if rank > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+            return False
+        if inferred_dimensions + rank > _ONNX_INFERRED_SHAPE_DIMENSION_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_dimension_limit", 1)
+            return False
+        return True
+
+    def inferred_shape(rank: int, dimensions: Iterable[int]) -> tuple[int, ...] | None:
+        nonlocal inferred_dimensions
+        if not shape_inference_available(rank):
+            return None
+        inferred_dimensions += rank
+        return tuple(dimension if -1 <= dimension <= _ONNX_SHAPE_EXTENT_LIMIT else -1 for dimension in dimensions)
+
+    def transpose_permutation(
+        node: Any,
+        rank: int,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> tuple[int, ...] | None:
+        nonlocal inferred_dimensions
+        if not shape_inference_available(rank):
+            return None
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name != "perm":
+                continue
+            resolved = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            if resolved is None or not shape_inference_available(len(resolved.ints)):
+                return None
+            if len(resolved.ints) != rank:
+                return None
+            inferred_dimensions += rank
+            permutation = tuple(int(axis) for axis in resolved.ints)
+            return (
+                permutation if len(set(permutation)) == rank and all(0 <= axis < rank for axis in permutation) else None
+            )
+        inferred_dimensions += rank
+        return tuple(reversed(range(rank)))
+
+    def resolve_axes(
+        node: Any,
+        constants: dict[str, Any],
+        *,
+        onnx: Any,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> tuple[int, ...] | None:
+        def exhausted() -> None:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+
+        return _resolve_onnx_axes(
+            node,
+            constants,
+            onnx=onnx,
+            resolve_attribute=resolve_attribute,
+            on_limit=exhausted,
+            resolve_int64_vector=constant_int64_vector_values,
+        )
+
+    def unsqueezed_shape(shape: tuple[int, ...], axes: tuple[int, ...]) -> tuple[int, ...] | None:
+        rank = len(shape) + len(axes)
+        if not shape_inference_available(rank):
+            return None
+        normalized = {axis if axis >= 0 else rank + axis for axis in axes}
+        if not normalized or len(normalized) != len(axes) or any(axis < 0 or axis >= rank for axis in normalized):
+            return None
+        dimensions = iter(shape)
+        return inferred_shape(rank, (1 if index in normalized else next(dimensions) for index in range(rank)))
+
+    def inserted_shape(shape: tuple[int, ...], axis: int, dimensions: tuple[int, ...]) -> tuple[int, ...] | None:
+        return inferred_shape(len(shape) + len(dimensions), chain(shape[:axis], dimensions, shape[axis:]))
+
+    def promoted_shape(shape: tuple[int, ...], axis: int, rank: int, extent: int = -1) -> tuple[int, ...] | None:
+        return inferred_shape(rank, chain(shape[:axis], repeat(extent, rank - len(shape)), shape[axis:]))
+
+    def gather_shape_from_indices(
+        shape: tuple[int, ...], indices: tuple[int, ...], axis: int
+    ) -> tuple[int, ...] | None:
+        return inferred_shape(len(shape) + len(indices) - 1, chain(shape[:axis], indices, shape[axis + 1 :]))
+
+    def concat_shape(
+        node: Any, input_shapes: Iterable[tuple[int, ...] | None], *, axis: int | None = None
+    ) -> tuple[int, ...] | None:
+        shapes = list(input_shapes)
+        if any(shape is not None and not shape_inference_available(len(shape)) for shape in shapes):
+            return None
+        result = _onnx_concat_output_shape(node, shapes, axis=axis)
+        return inferred_shape(len(result), result) if result is not None else None
+
     graph = model.graph
     functions = {
         (
@@ -1679,6 +2058,37 @@ def _build_onnx_weight_analysis_plan(
         str(getattr(opset, "domain", "") or ""): int(opset.version) for opset in getattr(model, "opset_import", ())
     }
     training_infos = list(getattr(model, "training_info", ()))
+    mutable_initializer_owners = (
+        raw_control_admission.mutable_initializer_owners
+        if raw_control_admission is not None and raw_control_admission.model is model
+        else None
+    )
+    training_control_scopes: dict[int, Any] | None = {}
+    if mutable_initializer_owners is None:
+        # Missing wire provenance cannot make a training target immutable.
+        # Scope discovery reads container lengths, never protobuf binding keys.
+        training_scope_work = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        if len(training_infos) > training_scope_work:
+            training_control_scopes = None
+        else:
+            scopes: dict[int, Any] = {}
+            training_control_scopes = scopes
+            training_scope_work -= len(training_infos)
+            for training_info in training_infos:
+                if not len(training_info.initialization_binding) and not len(training_info.update_binding):
+                    continue
+                if training_scope_work < 2:
+                    training_control_scopes = None
+                    break
+                training_scope_work -= 2
+                scopes[id(graph)] = graph
+                scopes[id(training_info.algorithm)] = training_info.algorithm
+
+    def initializer_value_is_immutable(current_graph: Any, initializer: Any) -> bool:
+        if mutable_initializer_owners is not None:
+            return mutable_initializer_owners.get(id(initializer)) is not initializer
+        return training_control_scopes is not None and id(current_graph) not in training_control_scopes
+
     analysis_graph_roots: list[tuple[tuple[Any, ...], Any]] = [(("root_graph",), graph)]
     for training_index, training_info in enumerate(training_infos):
         for field_name in ("initialization", "algorithm"):
@@ -1780,18 +2190,4971 @@ def _build_onnx_weight_analysis_plan(
             and (lineage.shape is None or len(lineage.shape) >= 2)
         )
 
-    def value_info_shape(value_info: Any) -> tuple[int, ...] | None:
+    def lineage_could_be_weight_after_rank_increase(lineage: _OnnxWeightLineage) -> bool:
+        return (
+            lineage.unresolved_reason != "shape_control_lineage"
+            and lineage.shape is not None
+            and len(lineage.shape) < 2
+        )
+
+    def valid_cast_data_type(data_type: int) -> bool:
+        if data_type <= 0:
+            return False
+        try:
+            onnx.TensorProto.DataType.Name(data_type)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def cast_output_data_type(
+        node: Any,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> int | None:
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name != "to":
+                continue
+            resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            if (
+                resolved_attribute is None
+                or bool(getattr(resolved_attribute, "ref_attr_name", ""))
+                or int(getattr(resolved_attribute, "type", 0)) != int(onnx.AttributeProto.INT)
+                or not _onnx_has_singular_field(resolved_attribute, "i")
+            ):
+                return None
+            target_data_type = int(resolved_attribute.i)
+            return target_data_type if valid_cast_data_type(target_data_type) else None
+        return None
+
+    def cast_output_may_be_floating(
+        node: Any,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> bool:
+        target_data_type = cast_output_data_type(node, resolve_attribute)
+        return target_data_type is None or target_data_type in floating_types
+
+    vector_control_cache: dict[int, tuple[Any, tuple[int, ...] | None]] = {}
+    vector_control_work_remaining = _ONNX_VECTOR_CONTROL_WORK_LIMIT
+
+    def raw_control_read_admitted(*, scalar: bool = False) -> bool:
+        if raw_control_admission is None or raw_control_admission.model is not model:
+            plan.coverage_gaps.setdefault("raw_control_provenance_missing", 1)
+            return False
+        allowed = raw_control_admission.scalars_bounded if scalar else raw_control_admission.vectors_bounded
+        if not allowed:
+            plan.coverage_gaps.setdefault(raw_control_admission.error_reason or "raw_control_payload_size_limit", 1)
+        return allowed
+
+    def constant_int64_vector_values(initializer: Any | None) -> tuple[int, ...] | None:
+        nonlocal vector_control_work_remaining
+        if initializer is None:
+            return None
+        cached = vector_control_cache.get(id(initializer))
+        if cached is not None and cached[0] is initializer:
+            return cached[1]
+        if vector_control_work_remaining <= 0:
+            plan.coverage_gaps.setdefault("vector_control_work_limit", 1)
+            return None
+        # Retaining failed source owners prevents repeated protobuf payload
+        # materialization; a full cache refuses new owners before field access.
+        vector_control_work_remaining -= 1
+        vector_control_cache[id(initializer)] = (initializer, None)
+        dims: Any = getattr(initializer, "dims", ())
+        if len(dims) != 1:
+            return None
+        element_count = int(dims[0])
+        if (
+            element_count < 0
+            or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+            or int(getattr(initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
+        ):
+            return None
+        if element_count > vector_control_work_remaining:
+            plan.coverage_gaps.setdefault("vector_control_work_limit", 1)
+            return None
+        vector_control_work_remaining -= element_count
+        pending = pending_constant_values.get(id(initializer))
+        if pending is not None and pending[0] is initializer:
+            # The source field is already typed; read only this admitted small
+            # control vector without copying its full TensorProto payload.
+            values = tuple(int(value) for value in pending[1])
+            vector_control_cache[id(initializer)] = (initializer, values)
+            return values
+        if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
+            return None
+        # Container lengths do not materialize individual protobuf payloads.
+        if any(
+            len(getattr(initializer, field_name, ()))
+            for field_name in ("float_data", "int32_data", "double_data", "uint64_data", "string_data")
+        ):
+            plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+            return None
+        try:
+            if initializer.HasField("segment"):
+                plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+                return None
+            raw_present = bool(initializer.HasField("raw_data"))
+            typed_values = getattr(initializer, "int64_data", ())
+            if len(typed_values) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+                plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+                return None
+            if raw_present:
+                if not raw_control_read_admitted():
+                    return None
+                raw_data = initializer.raw_data
+                if getattr(initializer, "external_data", ()) and not raw_data:
+                    return None
+                if len(raw_data) != element_count * 8 or len(typed_values):
+                    plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+                    return None
+                values = tuple(int(value) for value in np.frombuffer(raw_data, dtype="<i8"))
+            else:
+                if getattr(initializer, "external_data", ()) or len(typed_values) != element_count:
+                    return None
+                values = tuple(int(value) for value in typed_values)
+        except Exception:
+            plan.coverage_gaps.setdefault("vector_control_decode_failure", 1)
+            return None
+        vector_control_cache[id(initializer)] = (initializer, values)
+        return values
+
+    scalar_control_cache: dict[tuple[int, int], tuple[Any, Any | None]] = {}
+
+    def constant_scalar_value(initializer: Any | None, expected_data_type: int) -> Any | None:
+        if initializer is None:
+            return None
+        key = (id(initializer), expected_data_type)
+        cached = scalar_control_cache.get(key)
+        if cached is not None and cached[0] is initializer:
+            return cached[1]
+        if len(scalar_control_cache) >= _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+            plan.coverage_gaps.setdefault("control_value_work_limit", 1)
+            return None
+        # Keep the immutable protobuf owner, including failed proofs, so repeated
+        # queries neither decode again nor reuse an unrelated wrapper's id.
+        scalar_control_cache[key] = (initializer, None)
+        raw_dims = getattr(initializer, "dims", ())
+        if len(raw_dims) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+            return None
+        if (
+            int(getattr(initializer, "data_type", -1)) != expected_data_type
+            or expected_data_type not in {int(onnx.TensorProto.INT64), int(onnx.TensorProto.BOOL)}
+            or any(int(dimension) != 1 for dimension in raw_dims)
+            or getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL
+        ):
+            return None
+        pending = pending_constant_values.get(id(initializer))
+        if pending is not None and pending[0] is initializer:
+            value = pending[1][0]
+            scalar_control_cache[key] = (initializer, value)
+            return value
+        is_bool = expected_data_type == int(onnx.TensorProto.BOOL)
+        typed_field = "int32_data" if is_bool else "int64_data"
+        if any(
+            len(getattr(initializer, field_name, ()))
+            for field_name in ("float_data", "int32_data", "int64_data", "double_data", "uint64_data", "string_data")
+            if field_name != typed_field
+        ):
+            plan.coverage_gaps.setdefault("scalar_control_decode_failure", 1)
+            return None
+        try:
+            if initializer.HasField("segment"):
+                return None
+            typed_values: Any = getattr(initializer, typed_field, ())
+            if initializer.HasField("raw_data"):
+                if len(typed_values) or not raw_control_read_admitted(scalar=True):
+                    return None
+                raw_data = initializer.raw_data
+                if len(raw_data) != (1 if is_bool else 8):
+                    plan.coverage_gaps.setdefault("scalar_control_decode_failure", 1)
+                    return None
+                value = bool(raw_data[0]) if is_bool else int.from_bytes(raw_data, "little", signed=True)
+            else:
+                if getattr(initializer, "external_data", ()) or len(typed_values) != 1:
+                    return None
+                value = bool(typed_values[0]) if is_bool else int(typed_values[0])
+        except Exception:
+            plan.coverage_gaps.setdefault("scalar_control_decode_failure", 1)
+            return None
+        scalar_control_cache[key] = (initializer, value)
+        return value
+
+    graph_constant_context_cache: dict[int, tuple[Any, frozenset[str], dict[str, Any]]] = {}
+    graph_constant_context_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def graph_initializer_context(current_graph: Any) -> tuple[Any, frozenset[str], dict[str, Any]]:
+        cached_context = graph_constant_context_cache.get(id(current_graph))
+        if cached_context is None or cached_context[0] is not current_graph:
+            local_declared_names = frozenset(_graph_declared_value_names(current_graph))
+            graph_input_names = {_onnx_value_name(graph_input) for graph_input in getattr(current_graph, "input", ())}
+            local_constants = {
+                str(initializer.name): initializer
+                for initializer in getattr(current_graph, "initializer", ())
+                if getattr(initializer, "name", "")
+                and str(initializer.name) not in graph_input_names
+                and initializer_value_is_immutable(current_graph, initializer)
+            }
+            cached_context = (current_graph, local_declared_names, local_constants)
+            graph_constant_context_cache[id(current_graph)] = cached_context
+        return cached_context
+
+    def graph_initializer_constants(
+        current_graph: Any,
+        inherited_constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal graph_constant_context_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
+        _owner, local_declared_names, local_constants = graph_initializer_context(current_graph)
+        external_names = graph_external_reference_names(
+            current_graph, attribute_bindings=attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
+        work = len(external_names) + len(local_constants)
+        if work > graph_constant_context_work_remaining:
+            graph_constant_context_work_remaining = 0
+            return {}
+        graph_constant_context_work_remaining -= work
+        graph_constants: dict[str, Any] = {}
+        for name in replay_admitted_values(external_names, replay_name_work):
+            if replay_name_work is not None and not replay_name_work(len(name)):
+                return {}
+            if name not in local_declared_names and name in inherited_constants:
+                graph_constants[name] = inherited_constants[name]
+        graph_constants.update(local_constants)
+        return graph_constants
+
+    function_opset_cache: dict[int, tuple[Any, dict[str, int] | None]] = {}
+    function_opset_work_remaining = _ONNX_FUNCTION_OPSET_ENVIRONMENT_WORK_LIMIT
+
+    def function_opset_versions(function: Any, caller_opset_versions: dict[str, int]) -> dict[str, int] | None:
+        nonlocal function_opset_work_remaining
+        cached = function_opset_cache.get(id(function))
+        if cached is None or cached[0] is not function:
+            imports = getattr(function, "opset_import", ())
+            work = len(imports) + 1
+            if work > function_opset_work_remaining:
+                plan.coverage_gaps.setdefault("function_opset_environment_work_limit", 1)
+                # Failed owners also cost a cache entry. Once none fit, reject in
+                # constant time without retaining more negative entries.
+                if function_opset_work_remaining > 0:
+                    function_opset_work_remaining -= 1
+                    function_opset_cache[id(function)] = (function, None)
+                return None
+            function_opset_work_remaining -= work
+            explicit_versions: dict[str, int] | None = _opset_versions_by_domain(imports)
+            function_opset_cache[id(function)] = (function, explicit_versions)
+        else:
+            explicit_versions = cached[1]
+        if explicit_versions is None:
+            return None
+        return explicit_versions or caller_opset_versions
+
+    function_attribute_reference_limit = frozenset({"\0modelaudit_function_reference_limit\0"})
+    function_attribute_references: dict[int, tuple[Any, frozenset[str] | None]] = {}
+    function_reference_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def reserve_function_reference_work(work: int) -> bool:
+        nonlocal function_reference_work_remaining
+        if work > function_reference_work_remaining:
+            function_reference_work_remaining = 0
+            plan.coverage_gaps.setdefault("attribute_binding_work_limit", 1)
+            return False
+        function_reference_work_remaining -= work
+        return True
+
+    def referenced_function_attributes(function: Any) -> frozenset[str] | None:
+        function_id = id(function)
+        cached = function_attribute_references.get(function_id)
+        if cached is not None and cached[0] is function:
+            return cached[1]
+        # One admitted immutable owner covers the fixed reference/default cache
+        # entries, including refusals. Exhaustion retains no further owners.
+        if not reserve_function_reference_work(1):
+            return function_attribute_reference_limit
+        function_attribute_references[function_id] = (function, function_attribute_reference_limit)
+        referenced_names: set[str] = set()
+        graphs = [function]
+        while graphs:
+            nodes = getattr(graphs.pop(), "node", ())
+            if not reserve_function_reference_work(len(nodes)):
+                return function_attribute_reference_limit
+            for node in nodes:
+                attributes = getattr(node, "attribute", ())
+                if not reserve_function_reference_work(len(attributes)):
+                    return function_attribute_reference_limit
+                for attribute in attributes:
+                    reference_name = str(getattr(attribute, "ref_attr_name", ""))
+                    if reference_name:
+                        # GRAPH=5 / GRAPHS=10 bindings may reference other function attributes.
+                        if getattr(attribute, "type", None) in {None, 5, 10}:
+                            function_attribute_references[function_id] = (function, None)
+                            return None
+                        referenced_names.add(reference_name)
+                    graph_count = len(getattr(attribute, "graphs", ())) + int(_onnx_has_singular_field(attribute, "g"))
+                    if not reserve_function_reference_work(graph_count):
+                        return function_attribute_reference_limit
+                    graphs.extend(_iter_attribute_graphs(attribute))
+        result = frozenset(referenced_names)
+        function_attribute_references[function_id] = (function, result)
+        return result
+
+    function_attribute_defaults: dict[int, tuple[Any, dict[str, Any], dict[str, tuple[Any, ...]]]] = {}
+    function_default_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def reserve_function_default_work(work: int) -> bool:
+        nonlocal function_default_work_remaining
+        if work > function_default_work_remaining:
+            function_default_work_remaining = 0
+            plan.coverage_gaps.setdefault("attribute_binding_work_limit", 1)
+            return False
+        function_default_work_remaining -= work
+        return True
+
+    def default_function_attribute_maps(function: Any) -> tuple[dict[str, Any], dict[str, tuple[Any, ...]]]:
+        cached = function_attribute_defaults.get(id(function))
+        if cached is not None and cached[0] is function:
+            return cached[1], cached[2]
+        attributes: dict[str, Any] = {}
+        source_keys: dict[str, tuple[Any, ...]] = {}
+        referenced_names = referenced_function_attributes(function)
+        if referenced_names is function_attribute_reference_limit:
+            return attributes, source_keys
+        defaults = getattr(function, "attribute_proto", ())
+        if referenced_names != frozenset() and reserve_function_default_work(2 * len(defaults)):
+            function_source_scope = (
+                "function",
+                str(getattr(function, "domain", "")),
+                str(getattr(function, "name", "")),
+                str(getattr(function, "overload", "")),
+            )
+            for position, attribute in enumerate(defaults):
+                name = str(attribute.name)
+                if referenced_names is None or name in referenced_names:
+                    attributes[name] = attribute
+                    source_keys[name] = (*function_source_scope, "default_attribute", position)
+        # Function owners and their immutable default environments are shared
+        # across calls, including failed budget checks.
+        function_attribute_defaults[id(function)] = (function, attributes, source_keys)
+        return attributes, source_keys
+
+    def bound_function_attributes(
+        function: Any,
+        node: Any,
+        resolve_attribute: Callable[[Any], Any | None],
+    ) -> dict[str, Any]:
+        referenced_names = referenced_function_attributes(function)
+        if referenced_names == frozenset() or referenced_names is function_attribute_reference_limit:
+            return {}
+        defaults, _source_keys = default_function_attribute_maps(function)
+        call_attributes = getattr(node, "attribute", ())
+        if not call_attributes:
+            return defaults
+        if not reserve_function_default_work(len(defaults) + len(call_attributes)):
+            return {}
+        attributes = defaults.copy()
+        for attribute in call_attributes:
+            name = str(attribute.name)
+            # The admitted attribute unit includes the first 64 name/reference
+            # characters. Bound membership work before reading a reference that
+            # may be unused; the first native read is not a pre-copy proof.
+            name_work = max(0, (len(name) - 1) // 64)
+            if name_work and not reserve_function_default_work(name_work):
+                return {}
+            if referenced_names is not None and name not in referenced_names:
+                continue
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            reference_work = max(0, (len(name) + len(reference_name) - 1) // 64) - name_work
+            if reference_work and not reserve_function_default_work(reference_work):
+                return {}
+            resolved_attribute = resolve_attribute(attribute)
+            if resolved_attribute is not None:
+                attributes[name] = resolved_attribute
+            else:
+                # An explicit failed override must not fall back to a valid default.
+                attributes.pop(name, None)
+        return attributes
+
+    def direct_graph_attributes(node: Any, function: Any | None) -> Iterable[Any]:
+        # Local-function arguments are bindings, not executable subgraphs. Their
+        # graphs are followed only at reference sites in the resolved callee.
+        return getattr(node, "attribute", ()) if function is None else ()
+
+    def replay_admitted_values(values: Iterable[Any], replay_name_work: Callable[[int], bool] | None) -> Iterable[Any]:
+        iterator = iter(values)
+        while replay_name_work is None or replay_name_work(0):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                return
+            yield value
+
+    def prepared_replay_value_name(value: Any, replay_name_work: Callable[[int], bool] | None) -> str:
+        # A local comprehension may contain one empty placeholder on refusal;
+        # its caller checks the sticky refusal before retaining any result.
+        name = admitted_replay_value_name(value, replay_name_work)
+        return name if name is not None else ""
+
+    def admitted_replay_value_name(
+        value: Any,
+        replay_name_work: Callable[[int], bool] | None,
+        *,
+        name_only: bool = False,
+    ) -> str | None:
+        # The first getter needed to measure a name is not a pre-copy guarantee.
+        # A previous refusal stops the next getter; successful zero-extra work
+        # may finish inside a traversal whose reservation consumed the allowance.
+        if replay_name_work is not None and not replay_name_work(0):
+            return None
+        if name_only:
+            raw_name = getattr(value, "name", "")
+            name = str(raw_name) if raw_name else ""
+        else:
+            name = _onnx_value_name(value)
+        if replay_name_work is not None and not replay_name_work(len(name)):
+            return None
+        return name
+
+    def bound_function_constants(
+        function: Any,
+        node_input_names: list[str],
+        constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}, {}
+        inherited: dict[str, Any] = {}
+        bound_inputs: dict[str, Any] = {}
+        for input_index, actual_name in enumerate(node_input_names):
+            if input_index >= len(getattr(function, "input", ())):
+                break
+            formal_name = admitted_replay_value_name(function.input[input_index], replay_name_work)
+            if formal_name is None:
+                return {}, {}
+            if formal_name and actual_name in constants:
+                inherited[formal_name] = constants[actual_name]
+                bound_inputs[formal_name] = constants[actual_name]
+        captured_names = graph_external_reference_names(function, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}, {}
+        for captured_name in captured_names:
+            if replay_name_work is not None and not replay_name_work(len(captured_name)):
+                return {}, {}
+            if captured_name in constants:
+                inherited[captured_name] = constants[captured_name]
+        return inherited, bound_inputs
+
+    operator_identifier_cache: dict[int, tuple[Any, tuple[str, str, str] | None]] = {}
+    operator_identifier_work_remaining = _ONNX_OPERATOR_IDENTIFIER_WORK_LIMIT
+
+    # Operator identifiers are immutable during this plan. Retaining each node
+    # also prevents id reuse from confusing completed or refused cache entries.
+
+    def bounded_operator_identifier(node: Any) -> tuple[str, str, str] | None:
+        nonlocal operator_identifier_work_remaining
+        cached = operator_identifier_cache.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        if operator_identifier_work_remaining <= 0:
+            return None
+        # The owner admits three fields and their first 64 combined characters.
+        # A rejected component must stop before the next native string getter.
+        operator_identifier_work_remaining -= 1
+        operator_identifier_cache[id(node)] = (node, None)
+        values: list[str] = []
+        characters = 0
+        admitted_blocks = 0
+        for field_name in ("domain", "op_type", "overload"):
+            value = str(getattr(node, field_name, "") or "")
+            characters += len(value)
+            blocks = max(0, (characters - 1) // 64)
+            work = blocks - admitted_blocks
+            if work > operator_identifier_work_remaining:
+                operator_identifier_work_remaining = 0
+                return None
+            operator_identifier_work_remaining -= work
+            admitted_blocks = blocks
+            values.append(value)
+        identifier = (values[0], values[1], values[2])
+        operator_identifier_cache[id(node)] = (node, identifier)
+        return identifier
+
+    def builtin_operator(
+        node: Any,
+        op_type: str | None = None,
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        # Overloads select an exact local function; an unmatched overload still
+        # uses the registered builtin schema.
+        identifier = bounded_operator_identifier(node) if identifier is None else identifier
+        return (
+            identifier is not None
+            and identifier[0] in _STANDARD_NEURAL_NETWORK_DOMAINS
+            and (op_type is None or identifier[1] == op_type)
+            and identifier not in functions
+        )
+
+    def resolved_constant_node_tensor(
+        node: Any,
+        resolve_attribute: Callable[[Any], Any | None],
+        reserve_copy_work: Callable[[int], bool],
+    ) -> Any | None:
+        if not builtin_operator(node, "Constant"):
+            return None
+
+        def repeated_attribute_tensor(values: Any, data_type: int) -> Any | None:
+            count = len(values)
+            if count > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK or not reserve_copy_work(count):
+                return None
+            tensor = onnx.TensorProto()
+            tensor.data_type = data_type
+            tensor.dims.append(count)
+            if not _copy_onnx_repeated_constant_values(
+                tensor, values, max_elements=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK, onnx=onnx
+            ):
+                return None
+            return tensor
+
+        for attribute in getattr(node, "attribute", ()):
+            resolved_attribute = resolve_attribute(attribute)
+            if resolved_attribute is None:
+                continue
+            if attribute.name == "value" and _onnx_has_singular_field(resolved_attribute, "t"):
+                return resolved_attribute.t
+            if attribute.name == "value_ints":
+                return repeated_attribute_tensor(resolved_attribute.ints, int(onnx.TensorProto.INT64))
+            if attribute.name == "value_int":
+                if not reserve_copy_work(1):
+                    return None
+                return onnx.helper.make_tensor("", onnx.TensorProto.INT64, [], [resolved_attribute.i])
+            if attribute.name == "value_floats":
+                return repeated_attribute_tensor(resolved_attribute.floats, int(onnx.TensorProto.FLOAT))
+            if attribute.name == "value_float":
+                if not reserve_copy_work(1):
+                    return None
+                return onnx.helper.make_tensor("", onnx.TensorProto.FLOAT, [], [resolved_attribute.f])
+            if attribute.name == "sparse_value" and _onnx_has_singular_field(resolved_attribute, "sparse_tensor"):
+                return resolved_attribute.sparse_tensor
+        return None
+
+    constant_attribute_tensors: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+    pending_constant_values: dict[int, tuple[Any, Any]] = {}
+    constant_attribute_bytes_remaining = _ONNX_CONSTANT_ATTRIBUTE_FALLBACK_BYTE_LIMIT
+
+    def primary_repeated_constant_tensor(
+        attribute: Any,
+        values: Any,
+        data_type: int,
+        source_key: tuple[Any, ...],
+        name: str,
+    ) -> Any:
+        cached = constant_attribute_tensors.get(source_key)
+        if cached is not None:
+            return cached[1]
+        tensor = onnx.TensorProto()
+        tensor.name = name
+        tensor.data_type = data_type
+        tensor.dims.append(len(values))
+        # Retain the immutable source and metadata during graph discovery.
+        # Payload copies join weight arrays in source-index admission order.
+        constant_attribute_tensors[source_key] = (attribute, tensor)
+        pending_constant_values[id(tensor)] = (tensor, values)
+        return tensor
+
+    def materialize_primary_constant(initializer: Any) -> bool:
+        nonlocal constant_attribute_bytes_remaining
+        pending = pending_constant_values.pop(id(initializer), None)
+        if pending is None:
+            return True
+        tensor, values = pending
+        assert tensor is initializer
+        count = len(values)
+        name = str(tensor.name)
+        data_type = int(tensor.data_type)
+        tensor_bytes = count * (4 if data_type == int(onnx.TensorProto.FLOAT) else 8)
+        bounded_name, _length, _truncated = _bounded_onnx_metadata_text(plan, name)
+        reason: str | None = None
+        # This metadata-only tensor lets callbacks check the declared size
+        # without iterating the source field or allocating its copied payload.
+        if (max_array_size is not None and max_array_size > 0 and tensor_bytes > max_array_size) or (
+            pre_materialization_check is not None and not pre_materialization_check(tensor, bounded_name, tensor_bytes)
+        ):
+            reason = "constant_attribute_decode_limit"
+        elif retain_array_check is not None:
+            if not retain_array_check(bounded_name, tensor_bytes):
+                reason = "constant_attribute_decode_limit"
+        elif tensor_bytes > constant_attribute_bytes_remaining:
+            reason = "constant_attribute_decode_limit"
+        else:
+            # Direct planner callers without a retention callback still get a
+            # finite aggregate copy budget, separate from the small reentry cap.
+            constant_attribute_bytes_remaining -= tensor_bytes
+
+        if reason is None:
+            try:
+                if not _copy_onnx_repeated_constant_values(tensor, values, max_elements=count, onnx=onnx):
+                    reason = "constant_attribute_decode_failure"
+            except Exception:
+                reason = "constant_attribute_decode_failure"
+            if reason is not None:
+                tensor.ClearField("float_data")
+                tensor.ClearField("int64_data")
+                plan.extraction_failures += 1
+        else:
+            plan.oversized_initializers_skipped += 1
+        if reason is not None:
+            plan.record_coverage_gap(reason)
+        # A source is attempted once in the final initializer walk. Successful
+        # copies stay charged while their payload and analysis arrays coexist.
+        return reason is None
+
+    def graph_value_is_constant_bool(
+        current_graph: Any,
+        value_name: str,
+        inherited_constants: dict[str, Any],
+        expected_value: bool,
+        attribute_bindings: dict[str, Any] | None = None,
+    ) -> bool:
+        _owner, local_declared_names, local_constants = graph_initializer_context(current_graph)
+        producers: dict[str, tuple[Any, ...]] | None = None
+        seen: set[str] = set()
+        current_name = value_name
+        for _ in range(8):
+            if not current_name or current_name in seen:
+                return False
+            seen.add(current_name)
+            # A bounded condition proof needs one immutable source, not a copy
+            # of the entire graph context. Local declarations still shadow captures.
+            initializer = local_constants.get(current_name)
+            if initializer is None and current_name not in local_declared_names:
+                initializer = inherited_constants.get(current_name)
+            constant_value = constant_scalar_value(initializer, int(onnx.TensorProto.BOOL))
+            if constant_value is not None:
+                return constant_value is expected_value
+            if producers is None:
+                producers = graph_output_producer_nodes_by_name(current_graph)
+                if producers is None:
+                    return False
+            candidates = producers.get(current_name, ())
+            producer = candidates[0] if len(candidates) == 1 else None
+            if (
+                producer is not None
+                and builtin_operator(producer, "Identity")
+                and bool(getattr(producer, "input", ()))
+                and producer.input[0]
+            ):
+                current_name = str(producer.input[0])
+                continue
+            if producer is not None and builtin_operator(producer, "Constant"):
+                tensor = resolved_constant_node_tensor(
+                    producer,
+                    lambda attribute: (
+                        (attribute_bindings or {}).get(str(attribute.ref_attr_name))
+                        if getattr(attribute, "ref_attr_name", "")
+                        else attribute
+                    ),
+                    # Scalar/repeated Constant attributes produce INT64/FLOAT,
+                    # never BOOL. A condition proof only needs the dense owner.
+                    reserve_copy_work=lambda _count: False,
+                )
+                constant_value = constant_scalar_value(tensor, int(onnx.TensorProto.BOOL))
+                return constant_value is expected_value if constant_value is not None else False
+            return False
+        return False
+
+    def graph_value_is_constant_false(
+        current_graph: Any,
+        value_name: str,
+        inherited_constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
+    ) -> bool:
+        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, False, attribute_bindings)
+
+    def graph_value_is_constant_true(
+        current_graph: Any,
+        value_name: str,
+        inherited_constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
+    ) -> bool:
+        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, True, attribute_bindings)
+
+    def loop_body_condition_is_constant_false(
+        node: Any, constants: dict[str, Any], attribute_bindings: dict[str, Any] | None = None
+    ) -> bool:
+        for attribute in getattr(node, "attribute", ()):
+            if getattr(attribute, "name", "") != "body":
+                continue
+            resolved = (
+                (attribute_bindings or {}).get(str(attribute.ref_attr_name))
+                if getattr(attribute, "ref_attr_name", "")
+                else attribute
+            )
+            if resolved is None:
+                return False
+            for body in _iter_attribute_graphs(resolved):
+                if not getattr(body, "output", ()):
+                    return False
+                condition_output_name = _onnx_value_name(body.output[0])
+                return graph_value_is_constant_false(body, condition_output_name, constants, attribute_bindings)
+        return False
+
+    def loop_body_condition_remains_true(
+        node: Any,
+        subgraph: Any,
+        constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        operator_type = node.op_type if identifier is None else identifier[1]
+        if operator_type != "Loop":
+            return True
+        graph_outputs = getattr(subgraph, "output", ())
+        if not graph_outputs:
+            return False
+        condition_output_name = _onnx_value_name(graph_outputs[0])
+        if not condition_output_name:
+            return False
+        graph_inputs: tuple[Any, ...] = tuple(getattr(subgraph, "input", ()))
+        condition_input_name = _onnx_value_name(graph_inputs[1]) if len(graph_inputs) > 1 else ""
+        if condition_output_name and condition_output_name == condition_input_name:
+            return True
+        producers = graph_output_producer_nodes_by_name(subgraph)
+        if producers is None:
+            return graph_value_is_constant_true(subgraph, condition_output_name, constants, attribute_bindings)
+        seen: set[str] = set()
+        current_name = condition_output_name
+        for _ in range(8):
+            if not current_name or current_name in seen:
+                break
+            seen.add(current_name)
+            if current_name == condition_input_name:
+                return True
+            candidates = producers.get(current_name, ())
+            producer = candidates[0] if len(candidates) == 1 else None
+            if producer is None or not builtin_operator(producer, "Identity") or not getattr(producer, "input", ()):
+                break
+            current_name = str(producer.input[0])
+        return graph_value_is_constant_true(subgraph, condition_output_name, constants, attribute_bindings)
+
+    def graph_input_is_runtime_overridable(
+        value_name: str,
+        graph_input_names: set[str],
+        constants: dict[str, Any],
+    ) -> bool:
+        return bool(value_name) and value_name in graph_input_names and value_name not in constants
+
+    def loop_body_is_proven_skipped(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
+        for index, data_type in ((0, onnx.TensorProto.INT64), (1, onnx.TensorProto.BOOL)):
+            name = str(node.input[index]) if len(node.input) > index and node.input[index] else ""
+            if graph_input_is_runtime_overridable(name, graph_input_names, constants):
+                continue
+            value = constant_scalar_value(constants.get(name), int(data_type))
+            if value is not None and ((index == 0 and int(value) <= 0) or (index == 1 and value is False)):
+                return True
+        return False
+
+    def loop_may_skip_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
+        trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
+        condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
+        if graph_input_is_runtime_overridable(trip_input, graph_input_names, constants) or (
+            graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
+        ):
+            return True
+        trip_count = (
+            constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64)) if trip_input else None
+        )
+        initial_condition = (
+            constant_scalar_value(constants.get(condition_input), int(onnx.TensorProto.BOOL))
+            if condition_input
+            else True
+        )
+        if trip_count is not None and int(trip_count) <= 0:
+            return True
+        if condition_input and initial_condition is False:
+            return True
+        trip_guarantees_iteration = not trip_input or (trip_count is not None and int(trip_count) > 0)
+        condition_guarantees_iteration = not condition_input or initial_condition is True
+        return not (trip_guarantees_iteration and condition_guarantees_iteration)
+
+    def loop_may_repeat_body(
+        node: Any,
+        constants: dict[str, Any],
+        graph_input_names: set[str],
+        attribute_bindings: dict[str, Any] | None = None,
+    ) -> bool:
+        trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
+        condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
+        if loop_body_condition_is_constant_false(node, constants, attribute_bindings):
+            return False
+        trip_count = (
+            constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
+            if trip_input and not graph_input_is_runtime_overridable(trip_input, graph_input_names, constants)
+            else None
+        )
+        initial_condition = (
+            constant_scalar_value(constants.get(condition_input), int(onnx.TensorProto.BOOL))
+            if condition_input
+            else True
+        )
+        if (
+            condition_input
+            and initial_condition is False
+            and not graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
+        ):
+            return False
+        return trip_count is None or int(trip_count) > 1
+
+    def constant_initializer_shape(constants: dict[str, Any], value_name: Any) -> tuple[int, ...] | None:
+        initializer = constants.get(str(value_name)) if value_name else None
+        if initializer is None:
+            return None
+        try:
+            return inferred_shape(len(initializer.dims), (int(dimension) for dimension in initializer.dims))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def squeeze_with_empty_axes_is_noop(
+        node: Any,
+        axes: tuple[int, ...],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+        *,
+        shape: tuple[int, ...] | None = None,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        operator_type = node.op_type if identifier is None else identifier[1]
+        noop_value = 0
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name != "noop_with_empty_axes":
+                continue
+            resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            noop_value = int(getattr(resolved_attribute, "i", 0)) if resolved_attribute is not None else 0
+            break
+        input_form = (
+            len(getattr(node, "input", ())) > 1
+            and bool(node.input[1])
+            and not any(attribute.name == "axes" for attribute in getattr(node, "attribute", ()))
+        )
+        return (
+            operator_type == "Squeeze"
+            and not axes
+            and (
+                bool(noop_value)
+                or (input_form and shape is not None and all(dimension >= 0 and dimension != 1 for dimension in shape))
+            )
+        )
+
+    def squeeze_axes_are_valid(
+        axes: tuple[int, ...],
+        rank: int,
+        shape: tuple[int, ...] | None,
+        *,
+        allow_unknown_dimensions: bool = False,
+    ) -> bool:
+        if len(set(axes)) != len(axes) or any(axis < 0 or axis >= rank for axis in axes):
+            return False
+        return shape is None or all(shape[axis] == 1 or (allow_unknown_dimensions and shape[axis] < 0) for axis in axes)
+
+    def implicit_squeeze_shape(
+        node: Any,
+        shape: tuple[int, ...],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> tuple[int, ...] | None:
+        if squeeze_with_empty_axes_is_noop(node, (), resolve_attribute, shape=shape, identifier=identifier):
+            return shape
+        if any(dimension < 0 for dimension in shape):
+            return None
+        # Present-empty axes disagree across ONNX schema/reference and runtime
+        # implementations. Neither singleton removal nor identity is proven.
+        explicit_axes = (len(getattr(node, "input", ())) > 1 and bool(node.input[1])) or any(
+            attribute.name == "axes" for attribute in getattr(node, "attribute", ())
+        )
+        if 1 in shape and explicit_axes:
+            return None
+        return tuple(dimension for dimension in shape if dimension != 1)
+
+    def gathernd_output_shape(
+        node: Any,
+        *,
+        input_shape: tuple[int, ...],
+        index_shape: tuple[int, ...],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> tuple[int, ...] | None:
+        if not index_shape:
+            return None
+        batch_dims = resolved_onnx_int_attribute(node, "batch_dims", resolve_attribute=resolve_attribute)
+        if batch_dims is None:
+            return None
+        index_depth = index_shape[-1]
+        if (
+            batch_dims < 0
+            or batch_dims >= len(index_shape)
+            or index_depth <= 0
+            or batch_dims + index_depth > len(input_shape)
+        ):
+            return None
+        output_rank = len(index_shape) - 1 + len(input_shape) - batch_dims - index_depth
+        if not shape_inference_available(output_rank):
+            return None
+        return inferred_shape(output_rank, chain(index_shape[:-1], input_shape[batch_dims + index_depth :]))
+
+    def scan_input_shape(
+        constants: dict[str, Any],
+        known_shapes: dict[str, tuple[int, ...]],
+        value_name: str,
+        trusted_shape_names: set[str],
+        untrusted_shape_names: set[str] | None = None,
+    ) -> tuple[int, ...] | None:
+        if value_name in (untrusted_shape_names or set()):
+            return None
+        # A bound Scan input describes one slice of its source initializer.
+        if value_name in trusted_shape_names and value_name in known_shapes:
+            return known_shapes[value_name]
+        return constant_initializer_shape(constants, value_name)
+
+    def scan_common_sequence_extent(
+        scan_inputs: Sequence[str],
+        scan_input_axes: tuple[int, ...],
+        resolve_shape: Callable[[str], tuple[int, ...] | None],
+    ) -> int | None:
+        # Valid Scan inputs share their sequence extent, even when some shapes
+        # are symbolic. Conflicting declarations cannot establish that proof.
+        common_extent = None
+        for index, name in enumerate(scan_inputs):
+            if not name:
+                return None
+            shape = resolve_shape(name)
+            if shape is None:
+                continue
+            raw_axis = scan_input_axes[index] if index < len(scan_input_axes) else 0
+            axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
+            if axis < 0 or axis >= len(shape):
+                return None
+            extent = shape[axis]
+            if extent < 0:
+                continue
+            if common_extent is not None and common_extent != extent:
+                return None
+            common_extent = extent
+        return common_extent
+
+    def scan_may_skip_body(
+        node: Any,
+        constants: dict[str, Any],
+        graph_input_names: set[str],
+        known_shapes: dict[str, tuple[int, ...]] | None = None,
+        trusted_shape_names: set[str] | None = None,
+        untrusted_shape_names: set[str] | None = None,
+        *,
+        scan_input_axes: tuple[int, ...] | None = None,
+        scan_input_offset: int = 0,
+        num_scan_inputs: int | None = None,
+        produced_sequence_extent: Callable[[str], int] | None = None,
+    ) -> bool:
+        num_scan_inputs = (
+            _onnx_int_attribute(node, "num_scan_inputs", 1) if num_scan_inputs is None else num_scan_inputs
+        )
+        if num_scan_inputs <= 0:
+            return True
+        scan_input_start = max(len(node.input) - num_scan_inputs, scan_input_offset)
+        scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
+        if len(scan_inputs) < num_scan_inputs:
+            return True
+        constant_sequence_lens: tuple[int, ...] | None = None
+        if scan_input_offset and node.input:
+            sequence_lens_input = str(node.input[0] or "")
+            if sequence_lens_input:
+                if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
+                    return True
+                constant_sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
+                if not constant_sequence_lens or any(length <= 0 for length in constant_sequence_lens):
+                    return True
+        scan_input_axes = (
+            scan_input_axes
+            if scan_input_axes is not None
+            else _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+        )
+        known_shapes = known_shapes or {}
+        trusted_shape_names = trusted_shape_names or set()
+        if not scan_input_offset:
+            extent = scan_common_sequence_extent(
+                scan_inputs,
+                scan_input_axes,
+                lambda name: scan_input_shape(
+                    constants, known_shapes, name, trusted_shape_names, untrusted_shape_names
+                ),
+            )
+            return extent is None or extent == 0
+        for input_index, scan_input in enumerate(scan_inputs):
+            shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
+            # Scan-8 pads a produced sequence even when its body executes less
+            # often. This bounds iteration without changing observed shapes.
+            if scan_input_offset and produced_sequence_extent is not None and produced_sequence_extent(scan_input) > 0:
+                continue
+            if not shape:
+                if constant_sequence_lens:
+                    continue
+                return True
+            default_axis = 1 if scan_input_offset else 0
+            raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else default_axis
+            axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
+            if axis < 0 or axis >= len(shape):
+                return True
+            if shape[axis] == 0 or (shape[axis] < 0 and not constant_sequence_lens):
+                return True
+        return False
+
+    def scan_may_repeat_body(
+        node: Any,
+        constants: dict[str, Any],
+        graph_input_names: set[str],
+        known_shapes: dict[str, tuple[int, ...]] | None = None,
+        trusted_shape_names: set[str] | None = None,
+        untrusted_shape_names: set[str] | None = None,
+        *,
+        scan_input_axes: tuple[int, ...] | None = None,
+        scan_input_offset: int = 0,
+        num_scan_inputs: int | None = None,
+    ) -> bool:
+        num_scan_inputs = (
+            _onnx_int_attribute(node, "num_scan_inputs", 1) if num_scan_inputs is None else num_scan_inputs
+        )
+        if num_scan_inputs <= 0:
+            return True
+        known_shapes = known_shapes or {}
+        scan_input_start = max(len(node.input) - num_scan_inputs, scan_input_offset)
+        scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
+        if len(scan_inputs) < num_scan_inputs:
+            return True
+        constant_sequence_lens: tuple[int, ...] | None = None
+        if scan_input_offset and node.input:
+            sequence_lens_input = str(node.input[0] or "")
+            if sequence_lens_input:
+                if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
+                    return True
+                constant_sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
+                if constant_sequence_lens is not None:
+                    if any(length < 0 for length in constant_sequence_lens):
+                        return True
+                    if max(constant_sequence_lens, default=0) <= 1:
+                        return False
+        scan_input_axes = (
+            scan_input_axes
+            if scan_input_axes is not None
+            else _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+        )
+        trusted_shape_names = trusted_shape_names or set()
+        if not scan_input_offset:
+            extent = scan_common_sequence_extent(
+                scan_inputs,
+                scan_input_axes,
+                lambda name: scan_input_shape(
+                    constants, known_shapes, name, trusted_shape_names, untrusted_shape_names
+                ),
+            )
+            return extent is None or extent > 1
+        for input_index, scan_input in enumerate(scan_inputs):
+            shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
+            if not shape:
+                return True
+            default_axis = 1 if scan_input_offset else 0
+            raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else default_axis
+            axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
+            if axis < 0 or axis >= len(shape):
+                return True
+            if shape[axis] < 0 or shape[axis] > 1:
+                return True
+        return False
+
+    def is_rank_gap_promoting_operator(
+        node: Any,
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        operator_domain = getattr(node, "domain", "") if identifier is None else identifier[0]
+        if operator_domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+            return False
+        operator_type = node.op_type if identifier is None else identifier[1]
+        return operator_type in _RANK_GAP_PROMOTING_OPERATORS
+
+    def scan_sequence_lens_input_offset(
+        node: Any,
+        opset_versions: dict[str, int],
+        *,
+        identifier: tuple[str, str, str],
+    ) -> int:
+        if not builtin_operator(node, "Scan", identifier=identifier):
+            return 0
+        domain = identifier[0]
+        version = opset_versions.get(domain)
+        if version is None and domain in {"", "ai.onnx"}:
+            version = opset_versions.get("ai.onnx" if domain == "" else "")
+        if version is None:
+            return 0
+        return 1 if version <= 8 else 0
+
+    def control_flow_subgraph_state_output_index(
+        node: Any,
+        parent_input_index: int,
+        opset_versions: dict[str, int],
+        *,
+        identifier: tuple[str, str, str],
+    ) -> int:
+        operator_type = identifier[1]
+        if operator_type == "Loop":
+            return parent_input_index - 1
+        if operator_type == "Scan":
+            return parent_input_index - scan_sequence_lens_input_offset(node, opset_versions, identifier=identifier)
+        return -1
+
+    def mapped_node_outputs(
+        body_outputs: list[str],
+        output_indexes: set[int],
+        *,
+        graph_output_offset: int = 0,
+    ) -> set[str]:
+        if not output_indexes:
+            return set()
+        mapped_outputs: set[str] = set()
+        for output_index in output_indexes:
+            output_index -= graph_output_offset
+            if output_index < 0:
+                continue
+            if output_index >= len(body_outputs):
+                return {output_name for output_name in body_outputs if output_name}
+            if body_outputs[output_index]:
+                mapped_outputs.add(body_outputs[output_index])
+        return mapped_outputs
+
+    def control_flow_output_offset(
+        node: Any,
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> int:
+        operator_type = node.op_type if identifier is None else identifier[1]
+        return 1 if operator_type == "Loop" else 0
+
+    def resolved_onnx_int_attribute(
+        node: Any,
+        name: str,
+        default: int = 0,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> int | None:
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name != name:
+                continue
+            resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            if resolved_attribute is None or bool(getattr(resolved_attribute, "ref_attr_name", "")):
+                return None
+            return int(getattr(resolved_attribute, "i", default))
+        return default
+
+    def scan_stacked_output_start(
+        node: Any,
+        opset_versions: dict[str, int],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+        *,
+        identifier: tuple[str, str, str],
+    ) -> int:
+        operator_domain = identifier[0]
+        operator_type = identifier[1]
+        if operator_type != "Scan" or operator_domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+            return len(getattr(node, "output", ()))
+        scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions, identifier=identifier)
+        num_scan_inputs = resolved_onnx_int_attribute(
+            node,
+            "num_scan_inputs",
+            1,
+            resolve_attribute=resolve_attribute,
+        )
+        if num_scan_inputs is None:
+            return 0
+        if num_scan_inputs <= 0:
+            return len(getattr(node, "output", ()))
+        return max(len(getattr(node, "input", ())) - scan_input_offset - num_scan_inputs, 0)
+
+    def control_flow_graph_output_is_stacked_output(
+        node: Any,
+        graph_output_index: int,
+        scan_output_start: int,
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        operator_domain = getattr(node, "domain", "") if identifier is None else identifier[0]
+        operator_type = node.op_type if identifier is None else identifier[1]
+        if operator_domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+            return False
+        parent_output_index = graph_output_index - control_flow_output_offset(node, identifier=identifier)
+        if parent_output_index < 0:
+            return False
+        if operator_type == "Loop":
+            return parent_output_index >= max(len(getattr(node, "input", ())) - 2, 0)
+        if operator_type == "Scan":
+            return parent_output_index >= scan_output_start
+        return False
+
+    cache_fingerprints: dict[int, tuple[Any, tuple[str, str]]] = {}
+    rank_reentry_constant_name_cache: dict[tuple[Any, ...], frozenset[str]] = {}
+
+    def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
+        return semantic_cache_fingerprint_with_owner(value, retain_owner=True)
+
+    def semantic_cache_fingerprint_with_owner(value: Any, *, retain_owner: bool) -> tuple[str, str]:
+        value_id = id(value)
+        if retain_owner:
+            cached_fingerprint = cache_fingerprints.get(value_id)
+            if cached_fingerprint is not None and cached_fingerprint[0] is value:
+                return cached_fingerprint[1]
+        type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+        # Proof keys are optional reuse aids, not payload consumers. Even
+        # protobuf ByteSize can serialize an unadmitted message. Keep identity
+        # without inspecting its data; the cache retains every participating
+        # owner for this plan, so Python cannot reuse its id for another binding.
+        fingerprint = (type_name, f"owner:{value_id}")
+        if retain_owner:
+            cache_fingerprints[value_id] = (value, fingerprint)
+        return fingerprint
+
+    dependency_names_key_cache: dict[frozenset[str], tuple[str, ...]] = {}
+
+    def dependency_names_cache_key(names: frozenset[str]) -> tuple[str, ...]:
+        cached_key = dependency_names_key_cache.get(names)
+        if cached_key is not None:
+            return cached_key
+        key = tuple(sorted(str(name) for name in names))
+        dependency_names_key_cache[names] = key
+        return key
+
+    def semantic_mapping_cache_key(
+        mapping: dict[str, Any] | None,
+        names: frozenset[str] | None = None,
+    ) -> tuple[tuple[str, str, str], ...]:
+        if not mapping or names == frozenset():
+            return ()
+        names_key = dependency_names_cache_key(names) if names is not None else None
+        items = (
+            tuple(sorted((str(name), value) for name, value in mapping.items()))
+            if names_key is None
+            else tuple((name, mapping[name]) for name in names_key if name in mapping)
+        )
+        return tuple((str(name), *semantic_cache_fingerprint(value)) for name, value in items)
+
+    attribute_binding_keys: dict[int, tuple[dict[str, Any], tuple[tuple[str, str, str], ...]]] = {}
+    attribute_binding_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def attribute_binding_cache_key(
+        attribute_bindings: dict[str, Any] | None,
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        nonlocal attribute_binding_work_remaining
+        if not attribute_bindings:
+            return ()
+        # Attribute environments are built before traversal and never rebound.
+        # Retain their owners so a later protobuf wrapper cannot reuse an id.
+        cached = attribute_binding_keys.get(id(attribute_bindings))
+        if cached is not None and cached[0] is attribute_bindings:
+            return cached[1]
+        if len(attribute_bindings) > attribute_binding_work_remaining:
+            plan.coverage_gaps.setdefault("attribute_binding_work_limit", 1)
+            # Dependent proofs must stop instead of aliasing or repeatedly
+            # traversing an unexamined binding environment.
+            return None
+        binding_work = len(attribute_bindings)
+        for name in attribute_bindings:
+            # Charge retained key characters before sorting/fingerprinting or
+            # keeping this environment, including maps from primary traversal.
+            binding_work += max(0, (len(name) - 1) // 64)
+            if binding_work > attribute_binding_work_remaining:
+                plan.coverage_gaps.setdefault("attribute_binding_work_limit", 1)
+                return None
+        attribute_binding_work_remaining -= binding_work
+        key = semantic_mapping_cache_key(attribute_bindings)
+        attribute_binding_keys[id(attribute_bindings)] = (attribute_bindings, key)
+        return key
+
+    constant_binding_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def constant_binding_cache_key(
+        constants: dict[str, Any],
+        names: frozenset[str],
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        nonlocal constant_binding_work_remaining
+        if not constants or not names:
+            return ()
+        # Charge every candidate lookup, including scopes with no constant
+        # matches, before filtering. Fingerprint work is admitted separately.
+        if len(names) > constant_binding_work_remaining:
+            constant_binding_work_remaining = 0
+            plan.coverage_gaps.setdefault("constant_binding_work_limit", 1)
+            return None
+        constant_binding_work_remaining -= len(names)
+        relevant_names = frozenset(name for name in names if name in constants)
+        if len(relevant_names) > constant_binding_work_remaining:
+            constant_binding_work_remaining = 0
+            plan.coverage_gaps.setdefault("constant_binding_work_limit", 1)
+            return None
+        constant_binding_work_remaining -= len(relevant_names)
+        return semantic_mapping_cache_key(constants, relevant_names)
+
+    def trusted_context_shape_cache_key(
+        trusted_context_shapes: dict[str, tuple[int, ...]],
+        names: frozenset[str] | None = None,
+    ) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        if not trusted_context_shapes or names == frozenset():
+            return ()
+        names_key = dependency_names_cache_key(names) if names is not None else None
+        return (
+            tuple(sorted((str(name), tuple(shape)) for name, shape in trusted_context_shapes.items()))
+            if names_key is None
+            else tuple(
+                (name, tuple(trusted_context_shapes[name])) for name in names_key if name in trusted_context_shapes
+            )
+        )
+
+    opset_key_work_remaining = _ONNX_OPSET_ENVIRONMENT_WORK_LIMIT
+    opset_keys_by_owner: dict[int, tuple[dict[str, int], int]] = {}
+    opset_environment_tokens: dict[tuple[tuple[str, int], ...], int] = {}
+
+    def opset_cache_key(opset_versions: dict[str, int]) -> int | None:
+        nonlocal opset_key_work_remaining
+        if not opset_versions:
+            return 0
+        cached = opset_keys_by_owner.get(id(opset_versions))
+        if cached is not None and cached[0] is opset_versions:
+            return cached[1]
+        work = len(opset_versions) + 1
+        if work > opset_key_work_remaining:
+            plan.coverage_gaps.setdefault("opset_environment_work_limit", 1)
+            return None
+        opset_key_work_remaining -= work
+        semantic_key = tuple(sorted((str(domain), int(version)) for domain, version in opset_versions.items()))
+        token = opset_environment_tokens.get(semantic_key)
+        if token is None:
+            token = len(opset_environment_tokens) + 1
+            opset_environment_tokens[semantic_key] = token
+        # These environments are immutable after construction. Retain their
+        # owners to prevent id reuse, and hash only the token in per-state keys.
+        opset_keys_by_owner[id(opset_versions)] = (opset_versions, token)
+        return token
+
+    def bound_control_flow_graph_inputs(
+        node: Any,
+        nested_graph: Any,
+        source_names: set[str],
+        opset_versions: dict[str, int],
+        *,
+        identifier: tuple[str, str, str],
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> dict[str, str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
+        operator_type = identifier[1]
+        if operator_type == "Loop":
+            input_pairs = zip(node_input_slots(node)[2:], nested_graph.input[2:], strict=False)
+        elif operator_type == "Scan":
+            scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions, identifier=identifier)
+            input_pairs = zip(node_input_slots(node)[scan_input_offset:], nested_graph.input, strict=False)
+        else:
+            return {}
+        bindings: dict[str, str] = {}
+        for parent_input, graph_input in input_pairs:
+            parent_name = str(parent_input)
+            graph_input_name = admitted_replay_value_name(graph_input, replay_name_work)
+            if graph_input_name is None:
+                return {}
+            if parent_name in source_names and graph_input_name:
+                bindings[graph_input_name] = parent_name
+        return bindings
+
+    def bound_control_flow_graph_constant_inputs(
+        node: Any,
+        nested_graph: Any,
+        inherited_constants: dict[str, Any],
+        opset_versions: dict[str, int],
+        local_constants: dict[str, Any] | None = None,
+        *,
+        identifier: tuple[str, str, str] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> dict[str, str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return {}
+        operator_type = node.op_type if identifier is None else identifier[1]
+        local_constants = local_constants or {}
+        if operator_type == "Loop":
+            input_pairs = zip(node_input_slots(node)[2:], nested_graph.input[2:], strict=False)
+        elif operator_type == "Scan":
+            return {}
+        else:
+            return {}
+        bindings: dict[str, str] = {}
+        for parent_input, graph_input in input_pairs:
+            parent_name = prepared_replay_value_name(parent_input, replay_name_work)
+            if replay_name_work is not None and not replay_name_work(0):
+                return {}
+            graph_input_name = prepared_replay_value_name(graph_input, replay_name_work)
+            if replay_name_work is not None and not replay_name_work(0):
+                return {}
+            if (parent_name in inherited_constants or parent_name in local_constants) and graph_input_name:
+                bindings[graph_input_name] = parent_name
+        return bindings
+
+    def rank_reentry_constant_names(
+        subgraph: Any,
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        include_bound_inputs: bool = False,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        cache_key = (id(subgraph), attribute_key, include_bound_inputs)
+        if cache_key in rank_reentry_constant_name_cache:
+            return rank_reentry_constant_name_cache[cache_key]
+        # Caller names shadowed by body declarations do not enter its constant
+        # environment. Formal inputs matter only for explicit argument bindings.
+        names: set[str] = set()
+        if include_bound_inputs:
+            merge_dependency_names(
+                names,
+                (
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(getattr(subgraph, "input", ()), replay_name_work)
+                ),
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return dependency_collection_limit
+        merge_dependency_names(
+            names, graph_external_reference_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        result = frozenset(names)
+        rank_reentry_constant_name_cache[cache_key] = result
+        return result
+
+    reentry_promotion_cache: dict[tuple[Any, ...], frozenset[int]] = {}
+    reentry_shape_cache: dict[tuple[Any, ...], dict[int, tuple[int, ...]]] = {}
+    reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
+    reentry_attribute_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def reserve_reentry_constant_copy_work(count: int) -> bool:
+        nonlocal reentry_attribute_work_remaining
+        if count > reentry_attribute_work_remaining:
+            reentry_attribute_work_remaining = 0
+            return False
+        reentry_attribute_work_remaining -= count
+        return True
+
+    # Recursive graph/function visits share one finite-replay allowance.
+    exact_loop_replay_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+    reentry_external_context_shape_cache: dict[tuple[Any, ...], dict[str, tuple[int, ...]]] = {}
+    graph_output_dependency_cache: dict[
+        tuple[int, tuple[int, ...], tuple[tuple[str, str, str], ...]], frozenset[str]
+    ] = {}
+    graph_value_dependency_cache: dict[
+        tuple[int, tuple[str, ...], tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
+    ] = {}
+    graph_node_direct_dependency_cache: dict[
+        tuple[int, tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
+    ] = {}
+    node_input_names_cache: dict[int, tuple[Any, list[str]]] = {}
+    node_io_slots_cache: dict[tuple[int, str], tuple[Any, list[str]]] = {}
+    node_output_names_cache: dict[int, tuple[Any, list[str]]] = {}
+    graph_output_producer_cache: dict[int, tuple[Any, dict[str, tuple[Any, ...]] | None]] = {}
+    graph_output_producer_work_remaining = _ONNX_PRODUCER_INDEX_WORK_LIMIT
+    graph_node_order_cache: dict[int, dict[int, tuple[int, Any]]] = {}
+    graph_nodes_cache: dict[int, tuple[Any, tuple[Any, ...]]] = {}
+    dependency_collection_limit_marker = "\0modelaudit_dependency_collection_limit\0"
+    dependency_collection_limit = frozenset({dependency_collection_limit_marker})
+    dependency_closure_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def graph_nodes_once(subgraph: Any) -> tuple[Any, ...]:
+        cached = graph_nodes_cache.get(id(subgraph))
+        if cached is None or cached[0] is not subgraph:
+            nodes = tuple(getattr(subgraph, "node", ()))
+            graph_nodes_cache[id(subgraph)] = (subgraph, nodes)
+            return nodes
+        return cached[1]
+
+    def dependency_names_exceeded_limit(dependency_names: frozenset[str]) -> bool:
+        return dependency_collection_limit_marker in dependency_names
+
+    def merge_dependency_names(target: set[str], dependency_names: Iterable[str]) -> bool:
+        for dependency_name in dependency_names:
+            if dependency_name:
+                target.add(str(dependency_name))
+            if len(target) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+                target.add(dependency_collection_limit_marker)
+                return True
+        return dependency_collection_limit_marker in target
+
+    def node_input_names(node: Any) -> list[str]:
+        cache_key = id(node)
+        cached = node_input_names_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        names = [input_name for input_name in node_input_slots(node) if input_name]
+        node_input_names_cache[cache_key] = (node, names)
+        return names
+
+    def node_io_slots(node: Any, field: str) -> list[str]:
+        cache_key = (id(node), field)
+        cached = node_io_slots_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        slots = [str(value_name) for value_name in getattr(node, field, ())]
+        node_io_slots_cache[cache_key] = (node, slots)
+        return slots
+
+    def node_input_slots(node: Any) -> list[str]:
+        return node_io_slots(node, "input")
+
+    def node_output_slots(node: Any) -> list[str]:
+        return node_io_slots(node, "output")
+
+    def node_output_names(node: Any) -> list[str]:
+        cache_key = id(node)
+        cached = node_output_names_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        names = [output_name for output_name in node_output_slots(node) if output_name]
+        node_output_names_cache[cache_key] = (node, names)
+        return names
+
+    def graph_output_producer_nodes_by_name(subgraph: Any) -> dict[str, tuple[Any, ...]] | None:
+        nonlocal graph_output_producer_work_remaining
+        cache_key = id(subgraph)
+        cached = graph_output_producer_cache.get(cache_key)
+        if cached is not None and cached[0] is subgraph:
+            return cached[1]
+        # Bound retained refusals as well as complete indexes. Admit every node
+        # and raw output slot before retaining the node tuple or copied names.
+        if graph_output_producer_work_remaining < 1:
+            return None
+        graph_output_producer_work_remaining -= 1
+        graph_output_producer_cache[cache_key] = (subgraph, None)
+        raw_nodes = getattr(subgraph, "node", ())
+        if len(raw_nodes) > graph_output_producer_work_remaining:
+            return None
+        graph_output_producer_work_remaining -= len(raw_nodes)
+        for node in raw_nodes:
+            output_work = len(getattr(node, "output", ()))
+            if output_work > graph_output_producer_work_remaining:
+                return None
+            graph_output_producer_work_remaining -= output_work
+        producers: dict[str, list[Any]] = {}
+        node_order: dict[int, tuple[int, Any]] = {}
+        for index, node in enumerate(graph_nodes_once(subgraph)):
+            node_order[id(node)] = (index, node)
+            for output_name in node_output_names(node):
+                producers.setdefault(output_name, []).append(node)
+        frozen = {name: tuple(nodes) for name, nodes in producers.items()}
+        graph_output_producer_cache[cache_key] = (subgraph, frozen)
+        graph_node_order_cache[cache_key] = node_order
+        return frozen
+
+    def graph_nodes_producing_names(subgraph: Any, dependency_names: Iterable[str]) -> frozenset[int] | None:
+        producers = graph_output_producer_nodes_by_name(subgraph)
+        if producers is None:
+            return None
+        node_ids: set[int] = set()
+        for dependency_name in dependency_names:
+            node_ids.update(id(node) for node in producers.get(dependency_name, ()))
+        return frozenset(node_ids)
+
+    def graph_nodes_in_dependency_order(subgraph: Any, dependency_names: Iterable[str]) -> tuple[Any, ...] | None:
+        node_ids = graph_nodes_producing_names(subgraph, dependency_names)
+        if node_ids is None:
+            return None
+        node_order = graph_node_order_cache[id(subgraph)]
+        return tuple(node_order[node_id][1] for node_id in sorted(node_ids, key=lambda value: node_order[value][0]))
+
+    def graph_node_direct_dependency_names(
+        node: Any,
+        local_attribute_bindings: dict[str, Any],
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        attribute_key = attribute_binding_cache_key(local_attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        cache_key = (id(node), attribute_key)
+        cached = graph_node_direct_dependency_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        dependencies: set[str] = set()
+        merge_dependency_names(
+            dependencies,
+            (
+                prepared_replay_value_name(value, replay_name_work)
+                for value in replay_admitted_values(getattr(node, "input", ()), replay_name_work)
+            ),
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        identifier = bounded_operator_identifier(node)
+        if identifier is None:
+            return dependency_collection_limit
+        function = functions.get(identifier)
+        if function is not None:
+            function_attributes = bound_function_attributes(
+                function,
+                node,
+                lambda attribute: (
+                    local_attribute_bindings.get(str(attribute.ref_attr_name))
+                    if getattr(attribute, "ref_attr_name", "")
+                    else attribute
+                ),
+            )
+            merge_dependency_names(
+                dependencies,
+                graph_external_reference_names(function, function_attributes, replay_name_work=replay_name_work),
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return dependency_collection_limit
+        if not dependency_names_exceeded_limit(frozenset(dependencies)):
+            for attribute in direct_graph_attributes(node, function):
+                reference_name = str(getattr(attribute, "ref_attr_name", ""))
+                resolved_attribute = local_attribute_bindings.get(reference_name) if reference_name else attribute
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    if merge_dependency_names(
+                        dependencies,
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        ),
+                    ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
+                        break
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                if dependency_collection_limit_marker in dependencies:
+                    break
+        result = frozenset(dependencies)
+        graph_node_direct_dependency_cache[cache_key] = (node, result)
+        return result
+
+    def graph_dependency_closure_names(
+        subgraph: Any,
+        value_names: Iterable[str],
+        local_attribute_bindings: dict[str, Any],
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> frozenset[str]:
+        nonlocal dependency_closure_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        dependencies: set[str] = set()
+        for value_name in value_names:
+            if dependency_closure_work_remaining <= 0:
+                return dependency_collection_limit
+            dependency_closure_work_remaining -= 1
+            if value_name:
+                dependencies.add(str(value_name))
+        pending = list(dependencies)
+        producer_nodes = graph_output_producer_nodes_by_name(subgraph)
+        if producer_nodes is None:
+            return dependency_collection_limit
+        visited_node_ids: set[int] = set()
+        while pending:
+            value_name = pending.pop()
+            for producer_node in producer_nodes.get(value_name, ()):
+                if dependency_closure_work_remaining <= 0:
+                    return dependency_collection_limit
+                dependency_closure_work_remaining -= 1
+                node_id = id(producer_node)
+                if node_id in visited_node_ids:
+                    continue
+                visited_node_ids.add(node_id)
+                for dependency_name in graph_node_direct_dependency_names(
+                    producer_node, local_attribute_bindings, replay_name_work=replay_name_work
+                ):
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                    if dependency_closure_work_remaining <= 0 or dependency_name == dependency_collection_limit_marker:
+                        return dependency_collection_limit
+                    dependency_closure_work_remaining -= 1
+                    if dependency_name and dependency_name not in dependencies:
+                        dependencies.add(dependency_name)
+                        pending.append(dependency_name)
+                if replay_name_work is not None and not replay_name_work(0):
+                    return dependency_collection_limit
+        return frozenset(dependencies)
+
+    invariant_state_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+    invariant_state_cache: dict[tuple[int, str, int], bool] = {}
+
+    def state_output_preserves_input(subgraph: Any, input_name: str, output_index: int) -> bool:
+        nonlocal invariant_state_work_remaining
+        cache_key = (id(subgraph), input_name, output_index)
+        if cache_key in invariant_state_cache:
+            return invariant_state_cache[cache_key]
+        invariant_state_cache[cache_key] = False
+        outputs = getattr(subgraph, "output", ())
+        if not 0 <= output_index < len(outputs):
+            return False
+        name = _onnx_value_name(outputs[output_index])
+        if name == input_name:
+            invariant_state_cache[cache_key] = True
+            return True
+        producers = graph_output_producer_nodes_by_name(subgraph)
+        if producers is None:
+            return False
+        visited: set[str] = set()
+        while name != input_name:
+            if name in visited or invariant_state_work_remaining <= 0:
+                return False
+            visited.add(name)
+            invariant_state_work_remaining -= 1
+            producer_nodes = producers.get(name, ())
+            if len(producer_nodes) != 1:
+                return False
+            producer = producer_nodes[0]
+            identifier = bounded_operator_identifier(producer)
+            if (
+                identifier is None
+                or identifier[1] != "Identity"
+                or identifier[0] not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                or identifier in functions
+                or len(producer.input) != 1
+                or len(producer.output) != 1
+            ):
+                return False
+            name = str(producer.input[0])
+        invariant_state_cache[cache_key] = True
+        return True
+
+    def graph_output_dependency_names(
+        subgraph: Any,
+        output_indexes: Iterable[int] | None = None,
+        attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        graph_outputs = getattr(subgraph, "output", ())
+        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
+            return dependency_collection_limit
+        output_index_key = (
+            None
+            if output_indexes is None
+            else tuple(sorted({index for index in output_indexes if 0 <= index < len(graph_outputs)}))
+        )
+        cache_output_indexes = tuple(range(len(graph_outputs))) if output_index_key is None else output_index_key
+        cache_key = (id(subgraph), cache_output_indexes, attribute_key)
+        if cache_key in graph_output_dependency_cache:
+            return graph_output_dependency_cache[cache_key]
+        initial_outputs = {
+            output_name
+            for index in replay_admitted_values(cache_output_indexes, replay_name_work)
+            if (output_name := prepared_replay_value_name(graph_outputs[index], replay_name_work))
+        }
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        result = graph_dependency_closure_names(
+            subgraph, initial_outputs, attribute_bindings or {}, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        graph_output_dependency_cache[cache_key] = result
+        return result
+
+    def graph_value_dependency_names(
+        subgraph: Any,
+        value_names: Iterable[str],
+        attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        value_name_key = tuple(sorted(str(value_name) for value_name in value_names if value_name))
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        cache_key = (id(subgraph), value_name_key, attribute_key)
+        cached_dependencies = graph_value_dependency_cache.get(cache_key)
+        if cached_dependencies is not None and cached_dependencies[0] is subgraph:
+            return cached_dependencies[1]
+        local_attribute_bindings = attribute_bindings or {}
+        result = graph_dependency_closure_names(
+            subgraph, value_name_key, local_attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        graph_value_dependency_cache[cache_key] = (subgraph, result)
+        return result
+
+    def reentry_shape_preserving_unary_operator(
+        node: Any,
+        inputs: Sequence[str],
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        identifier = bounded_operator_identifier(node) if identifier is None else identifier
+        if identifier is None:
+            return False
+        operator_type = identifier[1]
+        return (
+            builtin_operator(node, identifier=identifier)
+            and operator_type in (_SHAPE_PRESERVING_UNARY_RANK_OPERATORS | {"Cast", "Identity"})
+            and (len(inputs) == 1 or operator_type in {"Clip", "Dropout"})
+        )
+
+    graph_potential_weight_work_cache: dict[tuple[Any, ...], tuple[Any, dict[int, int] | None, int]] = {}
+    graph_potential_weight_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def subgraph_analysis_work_exceeds_limit(
+        subgraph: Any,
+        dependency_names: frozenset[str] | None = None,
+        *,
+        include_potential_weight_consumers: bool = False,
+        opset_versions: dict[str, int] | None = None,
+        attribute_bindings: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> bool:
+        nonlocal graph_potential_weight_work_remaining
+        replay_potential_entry_owned = False
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return True
+        graph_nodes = getattr(subgraph, "node", ())
+        potential_weight_consumer_seen = False
+        potential_weight_consumer_input_edges = 0
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_work_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        def node_may_have_potential_weight_input(
+            node: Any,
+            *,
+            is_model_local_function: bool,
+            is_registered_standard_operator: bool,
+            identifier: tuple[str, str, str],
+        ) -> bool:
+            domain = identifier[0]
+            if (
+                domain in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and is_registered_standard_operator
+                and not is_model_local_function
+            ):
+                return (
+                    identifier[1] in {"Conv", "ConvTranspose", "Einsum", "Gather", "Gemm", "MatMul", "PRelu"}
+                    or identifier[1] in _RECURRENT_WEIGHT_OPERATORS
+                )
+            return True
+
+        live_nodes: Sequence[Any]
+        if dependency_names is None:
+            live_nodes = graph_nodes
+        elif dependency_names_exceeded_limit(dependency_names):
+            return True
+        else:
+            ordered_nodes = graph_nodes_in_dependency_order(subgraph, dependency_names)
+            if ordered_nodes is None:
+                return True
+            live_nodes = ordered_nodes
+            if include_potential_weight_consumers:
+                opset_key = opset_cache_key(opset_versions or {})
+                if opset_key is None:
+                    return True
+                cache_key = (
+                    id(subgraph),
+                    opset_key,
+                    attribute_key,
+                )
+                cached_work = graph_potential_weight_work_cache.get(cache_key)
+                if cached_work is None or cached_work[0] is not subgraph:
+                    # Retain refusals as well as complete inventories. Charge the
+                    # owner before retention, then dispatch before enumeration.
+                    if graph_potential_weight_work_remaining < 1:
+                        return True
+                    graph_potential_weight_work_remaining -= 1
+                    graph_potential_weight_work_cache[cache_key] = (subgraph, None, 0)
+                    replay_potential_entry_owned = True
+                    if len(graph_nodes) > graph_potential_weight_work_remaining:
+                        return True
+                    graph_potential_weight_work_remaining -= len(graph_nodes)
+                    potential_inputs: dict[int, int] = {}
+                    for node in graph_nodes:
+                        function_key = bounded_operator_identifier(node)
+                        if function_key is None:
+                            return True
+                        is_model_local_function = function_key in functions
+                        is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                            node,
+                            opset_versions or {},
+                            identifier=function_key,
+                        )
+                        function = functions.get(function_key)
+                        if function is not None:
+                            function_attributes = bound_function_attributes(function, node, resolve_work_attribute)
+                            function_versions = function_opset_versions(function, opset_versions or {})
+                            if function_versions is None:
+                                return True
+                            if subgraph_has_potential_weight_consumer(
+                                function,
+                                function_versions,
+                                attribute_bindings=function_attributes,
+                                replay_name_work=replay_name_work,
+                            ):
+                                if replay_name_work is not None and not replay_name_work(0):
+                                    if replay_potential_entry_owned:
+                                        graph_potential_weight_work_cache.pop(cache_key, None)
+                                    return True
+                                input_count = len(getattr(node, "input", ()))
+                                if input_count > graph_potential_weight_work_remaining:
+                                    return True
+                                graph_potential_weight_work_remaining -= input_count
+                                potential_inputs[id(node)] = len(node_input_names(node))
+                            if replay_name_work is not None and not replay_name_work(0):
+                                if replay_potential_entry_owned:
+                                    graph_potential_weight_work_cache.pop(cache_key, None)
+                                return True
+                            continue
+                        if not node_may_have_potential_weight_input(
+                            node,
+                            is_model_local_function=is_model_local_function,
+                            is_registered_standard_operator=is_registered_standard_operator,
+                            identifier=function_key,
+                        ):
+                            continue
+                        input_count = len(getattr(node, "input", ()))
+                        if input_count > graph_potential_weight_work_remaining:
+                            return True
+                        graph_potential_weight_work_remaining -= input_count
+                        input_count = len(node_input_names(node))
+                        if any(
+                            _onnx_potential_weight_input(
+                                node,
+                                input_index,
+                                is_model_local_function=is_model_local_function,
+                                is_registered_standard_operator=is_registered_standard_operator,
+                                identifier=function_key,
+                            )
+                            for input_index in range(input_count)
+                        ):
+                            potential_inputs[id(node)] = input_count
+                    total_potential_input_edges = sum(potential_inputs.values())
+                    graph_potential_weight_work_cache[cache_key] = (
+                        subgraph,
+                        potential_inputs,
+                        total_potential_input_edges,
+                    )
+                else:
+                    _owner, cached_inputs, total_potential_input_edges = cached_work
+                    if cached_inputs is None:
+                        return True
+                    potential_inputs = cached_inputs
+                live_potential_nodes = [node for node in live_nodes if id(node) in potential_inputs]
+                potential_weight_consumer_seen = len(potential_inputs) > len(live_potential_nodes)
+                potential_weight_consumer_input_edges = total_potential_input_edges - sum(
+                    potential_inputs[id(node)] for node in live_potential_nodes
+                )
+        graph_node_count = len(live_nodes)
+        graph_input_count = len(getattr(subgraph, "input", ()))
+        node_input_edges = sum(len(getattr(node, "input", ())) for node in live_nodes)
+        work = graph_node_count * max(graph_input_count, 1) + node_input_edges
+        if potential_weight_consumer_seen:
+            potential_work = len(graph_nodes) * max(graph_input_count, 1) + potential_weight_consumer_input_edges
+            if potential_work > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+                return True
+        return work > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    graph_output_name_indexes_cache: dict[int, tuple[Any, dict[str, list[int]]]] = {}
+
+    def subgraph_reenters_state_with_rank_promotion(
+        subgraph: Any,
+        graph_input_name: str,
+        graph_output_index: int,
+        constants: dict[str, Any],
+        opset_versions: dict[str, int],
+        graph_input_shape: tuple[int, ...] | None,
+        attribute_bindings: dict[str, Any] | None = None,
+        bound_input_constants: dict[str, Any] | None = None,
+        trusted_context_shapes: dict[str, tuple[int, ...]] | None = None,
+        output_shapes_out: dict[int, tuple[int, ...]] | None = None,
+        related_graph_input_shapes: dict[str, tuple[int, ...] | None] | None = None,
+        output_dependency_names_override: frozenset[str] | None = None,
+        restorable_output_indexes_override: frozenset[int] | None = None,
+        promoted_outputs_out: set[int] | None = None,
+        related_graph_input_shapes_cache_key: tuple[tuple[str, tuple[int, ...] | None], ...] | None = None,
+        *,
+        depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> bool:
+        nonlocal reentry_attribute_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if depth > 6:
+            return True
+        graph_outputs = getattr(subgraph, "output", ())
+        if graph_output_index < 0 or graph_output_index >= len(graph_outputs):
+            return False
+        graph_output_name = prepared_replay_value_name(graph_outputs[graph_output_index], replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if not graph_output_name:
+            return False
+        if output_dependency_names_override is None:
+            output_dependency_names = graph_output_dependency_names(
+                subgraph,
+                (graph_output_index,),
+                attribute_bindings=attribute_bindings,
+                replay_name_work=replay_name_work,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
+        else:
+            output_dependency_names = output_dependency_names_override
+        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS or subgraph_analysis_work_exceeds_limit(
+            subgraph,
+            output_dependency_names,
+            include_potential_weight_consumers=True,
+            opset_versions=opset_versions,
+            attribute_bindings=attribute_bindings,
+            replay_name_work=replay_name_work,
+        ):
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
+            return True
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        restorable_output_indexes = (
+            restorable_output_indexes_override
+            if restorable_output_indexes_override is not None
+            else frozenset({graph_output_index})
+        )
+        trusted_context_shapes = trusted_context_shapes or {}
+        related_graph_input_shapes = related_graph_input_shapes or {}
+        if related_graph_input_shapes_cache_key is None:
+            related_graph_input_shapes_cache_key = tuple(sorted(related_graph_input_shapes.items()))
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if dependency_names_exceeded_limit(constant_names):
+            return True
+        constants_key = constant_binding_cache_key(constants, constant_names)
+        bound_constant_names = (
+            rank_reentry_constant_names(
+                subgraph, attribute_bindings, include_bound_inputs=True, replay_name_work=replay_name_work
+            )
+            if bound_input_constants
+            else frozenset()
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if dependency_names_exceeded_limit(bound_constant_names):
+            return True
+        bound_constants_key = constant_binding_cache_key(bound_input_constants or {}, bound_constant_names)
+        if constants_key is None or bound_constants_key is None:
+            return True
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return True
+        cache_key = (
+            id(subgraph),
+            graph_input_name,
+            graph_input_shape,
+            dependency_names_cache_key(output_dependency_names),
+            tuple(sorted(restorable_output_indexes)),
+            trusted_context_shape_cache_key(trusted_context_shapes, output_dependency_names),
+            related_graph_input_shapes_cache_key,
+            opset_key,
+            attribute_binding_cache_key(attribute_bindings),
+            constants_key,
+            bound_constants_key,
+            depth,
+        )
+        if cache_key in reentry_promotion_cache:
+            promoted_output_indexes = reentry_promotion_cache[cache_key]
+            if promoted_outputs_out is not None:
+                promoted_outputs_out.update(promoted_output_indexes)
+            if output_shapes_out is not None:
+                output_shapes_out.update(reentry_shape_cache.get(cache_key, {}))
+            return graph_output_index in promoted_output_indexes
+        if cache_key in reentry_promotion_in_progress:
+            return True
+        # The node allowance covers one output slot. Additional slots share the
+        # attribute/copy allowance across state and binding contexts.
+        live_nodes = graph_nodes_in_dependency_order(subgraph, output_dependency_names)
+        if live_nodes is None:
+            return True
+        attribute_work = sum(
+            len(getattr(node, "attribute", ())) + max(len(getattr(node, "output", ())) - 1, 0) for node in live_nodes
+        )
+        if attribute_work > reentry_attribute_work_remaining:
+            reentry_attribute_work_remaining = 0
+            return True
+        reentry_attribute_work_remaining -= attribute_work
+        reentry_promotion_in_progress.add(cache_key)
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        subgraph_constants = graph_initializer_constants(
+            subgraph, constants, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            reentry_promotion_in_progress.discard(cache_key)
+            return True
+        if bound_input_constants:
+            subgraph_constants.update(bound_input_constants)
+        tainted = {graph_input_name}
+        tainted_shapes = {graph_input_name: graph_input_shape} if graph_input_shape is not None else {}
+        promoted: set[str] = set()
+
+        def reentry_input_shape(input_name: str) -> tuple[int, ...] | None:
+            if input_name in tainted_shapes:
+                return tainted_shapes[input_name]
+            if input_name in related_graph_input_shapes:
+                return related_graph_input_shapes[input_name]
+            initializer_shape = constant_initializer_shape(subgraph_constants, input_name)
+            if initializer_shape is not None:
+                return initializer_shape
+            return trusted_context_shapes.get(input_name)
+
+        output_dependency_node_ids = graph_nodes_producing_names(subgraph, output_dependency_names)
+        if output_dependency_node_ids is None:
+            reentry_promotion_in_progress.discard(cache_key)
+            return True
+        for body_node in live_nodes:
+            body_outputs = node_output_names(body_node)
+            body_output_slots = [
+                prepared_replay_value_name(output, replay_name_work)
+                for output in replay_admitted_values(node_output_slots(body_node), replay_name_work)
+            ]
+            if replay_name_work is not None and not replay_name_work(0):
+                reentry_promotion_in_progress.discard(cache_key)
+                return True
+            if not body_outputs:
+                continue
+            body_outputs_feed_selected_output = id(body_node) in output_dependency_node_ids
+            if not body_outputs_feed_selected_output:
+                continue
+            body_inputs = node_input_names(body_node)
+            function_key = bounded_operator_identifier(body_node)
+            if function_key is None:
+                reentry_promotion_in_progress.discard(cache_key)
+                return True
+            if function_key[0] in _STANDARD_NEURAL_NETWORK_DOMAINS and function_key[1] == "Constant":
+                constant_tensor = resolved_constant_node_tensor(
+                    body_node, resolve_reentry_attribute, reserve_reentry_constant_copy_work
+                )
+                if constant_tensor is not None:
+                    for output_name in body_outputs:
+                        subgraph_constants[output_name] = constant_tensor
+                        tainted.discard(output_name)
+                        promoted.discard(output_name)
+                        tainted_shapes.pop(output_name, None)
+            function = functions.get(function_key)
+            is_model_local_function = function is not None
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+                identifier=function_key,
+            )
+            standard_reentry_operator = (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and function_key[0] in _STANDARD_NEURAL_NETWORK_DOMAINS
+            )
+            attributes_proven = all(
+                not getattr(attribute, "ref_attr_name", "")
+                or (
+                    (resolved := resolve_reentry_attribute(attribute)) is not None
+                    and not getattr(resolved, "ref_attr_name", "")
+                )
+                for attribute in getattr(body_node, "attribute", ())
+            )
+            if (
+                standard_reentry_operator
+                and function_key[1] in weight_transform_attribute_types
+                and weight_transform_proof_error(body_node, resolve_attribute=resolve_reentry_attribute) is not None
+            ):
+                attributes_proven = False
+            standard_reentry_operator = standard_reentry_operator and attributes_proven
+            is_shape_query = standard_reentry_operator and function_key[1] in {"Shape", "Size"}
+            data_input_promoted = bool(body_inputs and body_inputs[0] in promoted)
+            data_input_tainted = bool(body_inputs and body_inputs[0] in tainted)
+            any_promoted = any(input_name in promoted for input_name in body_inputs)
+            any_tainted = any(input_name in tainted for input_name in body_inputs)
+            data_input_shape = reentry_input_shape(body_inputs[0]) if body_inputs else None
+            index_input_shape = reentry_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None
+            if (
+                index_input_shape is None
+                and function_key[1] in {"Gather", "GatherElements", "GatherND"}
+                and len(body_inputs) > 1
+            ):
+                index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
+            input_shapes_by_name = {input_name: reentry_input_shape(input_name) for input_name in body_inputs}
+            elementwise_operator = standard_reentry_operator and (
+                function_key[1] in _SAME_TYPE_ELEMENTWISE_OPERATORS or function_key[1] == "Pow"
+            )
+            promotion_input_tainted = (
+                any_tainted
+                if elementwise_operator
+                or (standard_reentry_operator and function_key[1] in {"Einsum", "MatMul", "OneHot"})
+                else data_input_tainted
+            )
+            promotion_input_shapes = (
+                [input_shapes_by_name.get(input_name) for input_name in body_inputs if input_name in tainted]
+                if elementwise_operator
+                else None
+            )
+            data_input_may_promote = (
+                standard_reentry_operator
+                and promotion_input_tainted
+                and operator_output_may_have_weight_rank(
+                    body_node,
+                    input_shape=data_input_shape,
+                    index_shape=index_input_shape,
+                    constants=subgraph_constants,
+                    resolve_attribute=resolve_reentry_attribute,
+                    input_shapes_by_name=input_shapes_by_name,
+                    promotion_input_shapes=promotion_input_shapes,
+                    identifier=function_key,
+                )
+            )
+            if any_tainted and not attributes_proven:
+                data_input_may_promote = True
+            function_promoted_outputs: set[str] = set()
+            function_tainted_outputs: set[str] = set()
+            function_output_shapes: dict[int, tuple[int, ...]] = {}
+            nested_promoted_outputs: set[str] = set()
+            if function is not None and (any_tainted or body_outputs_feed_selected_output):
+                function_actuals = node_input_slots(body_node)
+                function_outputs = body_output_slots
+                if replay_name_work is not None and not replay_name_work(0):
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_constants, function_bound_input_constants = bound_function_constants(
+                    function,
+                    function_actuals,
+                    subgraph_constants,
+                    attribute_bindings=function_attributes,
+                    replay_name_work=replay_name_work,
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
+                function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
+                function_context_shapes: dict[str, tuple[int, ...]] = {}
+                for input_index, input_name in enumerate(function_actuals):
+                    if input_index >= len(getattr(function, "input", ())):
+                        continue
+                    function_input_name = prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    input_shape = input_shapes_by_name.get(input_name)
+                    if function_input_name and input_shape is not None:
+                        function_context_shapes[function_input_name] = input_shape
+                function_tainted_inputs: dict[str, tuple[int, ...] | None] = {}
+                for input_index, input_name in enumerate(function_actuals):
+                    if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
+                        continue
+                    function_input_name = prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    if function_input_name:
+                        function_tainted_inputs[function_input_name] = tainted_shapes.get(input_name)
+                downstream_live_function_output_indexes = {
+                    output_index
+                    for output_index, output_name in enumerate(function_outputs)
+                    if output_name in output_dependency_names
+                }
+                function_tainted_output_indexes: set[int] = set()
+                if function_tainted_inputs:
+                    function_tainted_output_indexes = graph_tainted_output_indexes(
+                        function,
+                        set(function_tainted_inputs),
+                        function_versions,
+                        attribute_bindings=function_attributes,
+                        depth=depth + 1,
+                        replay_name_work=replay_name_work,
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    function_tainted_outputs.update(
+                        mapped_node_outputs(
+                            function_outputs,
+                            function_tainted_output_indexes,
+                        )
+                    )
+                valid_function_tainted_output_indexes = {
+                    output_index
+                    for output_index in function_tainted_output_indexes
+                    if 0 <= output_index < len(function_outputs)
+                }
+                if valid_function_tainted_output_indexes or downstream_live_function_output_indexes:
+                    restorable_function_output_indexes = (
+                        valid_function_tainted_output_indexes | downstream_live_function_output_indexes
+                    )
+                    function_output_dependency_names = graph_output_dependency_names(
+                        function,
+                        restorable_function_output_indexes,
+                        attribute_bindings=function_attributes,
+                        replay_name_work=replay_name_work,
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    relevant_function_inputs: dict[str, tuple[int, ...] | None] = {
+                        function_input_name: function_input_shape
+                        for function_input_name, function_input_shape in function_tainted_inputs.items()
+                        if function_input_name in function_output_dependency_names
+                    }
+                    if not relevant_function_inputs and downstream_live_function_output_indexes:
+                        relevant_function_inputs = {
+                            function_input_name: function_input_shape
+                            for function_input_name, function_input_shape in function_context_shapes.items()
+                            if function_input_name in function_output_dependency_names
+                        }
+                    if (
+                        not relevant_function_inputs
+                        and downstream_live_function_output_indexes
+                        and function_tainted_inputs
+                    ):
+                        probe_name, probe_shape = next(iter(function_tainted_inputs.items()))
+                        relevant_function_inputs = {probe_name: probe_shape}
+                else:
+                    restorable_function_output_indexes = set()
+                    function_output_dependency_names = frozenset()
+                    relevant_function_inputs = {}
+                if restorable_function_output_indexes:
+                    function_analysis_exceeds_limit = (
+                        len(restorable_function_output_indexes) * max(len(relevant_function_inputs), 1)
+                        > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                        or len(getattr(function, "output", ())) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS
+                        or subgraph_analysis_work_exceeds_limit(
+                            function,
+                            function_output_dependency_names,
+                            include_potential_weight_consumers=True,
+                            opset_versions=function_versions,
+                            attribute_bindings=function_attributes,
+                            replay_name_work=replay_name_work,
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    if function_analysis_exceeds_limit:
+                        function_promoted_outputs.update(
+                            mapped_node_outputs(
+                                function_outputs,
+                                valid_function_tainted_output_indexes,
+                            )
+                        )
+                    else:
+                        representative_output_index = min(restorable_function_output_indexes)
+                        for function_input_name, function_input_shape in relevant_function_inputs.items():
+                            function_promoted_output_indexes: set[int] = set()
+                            representative_promoted = subgraph_reenters_state_with_rank_promotion(
+                                function,
+                                function_input_name,
+                                representative_output_index,
+                                function_constants,
+                                function_versions,
+                                function_input_shape,
+                                attribute_bindings=function_attributes,
+                                bound_input_constants=function_bound_input_constants,
+                                trusted_context_shapes=function_context_shapes,
+                                output_shapes_out=function_output_shapes,
+                                output_dependency_names_override=function_output_dependency_names,
+                                restorable_output_indexes_override=frozenset(restorable_function_output_indexes),
+                                promoted_outputs_out=function_promoted_output_indexes,
+                                depth=depth + 1,
+                                replay_name_work=replay_name_work,
+                            )
+                            if replay_name_work is not None and not replay_name_work(0):
+                                reentry_promotion_in_progress.discard(cache_key)
+                                return True
+                            if representative_promoted and not function_promoted_output_indexes:
+                                function_promoted_output_indexes.update(valid_function_tainted_output_indexes)
+                            function_promoted_outputs.update(
+                                mapped_node_outputs(
+                                    function_outputs,
+                                    valid_function_tainted_output_indexes & function_promoted_output_indexes,
+                                )
+                            )
+                for output_index, output_name in enumerate(function_outputs):
+                    if not output_name:
+                        continue
+                    output_shape = function_output_shapes.get(output_index)
+                    if output_shape is not None:
+                        tainted_shapes[output_name] = output_shape
+            nested_scan = (
+                builtin_operator(body_node, "Scan", identifier=function_key) and is_registered_standard_operator
+            )
+            nested_scan_offset = (
+                scan_sequence_lens_input_offset(body_node, opset_versions, identifier=function_key)
+                if nested_scan
+                else 0
+            )
+            nested_scan_count = (
+                resolved_onnx_int_attribute(body_node, "num_scan_inputs", 1, resolve_reentry_attribute)
+                if nested_scan and standard_reentry_operator
+                else None
+            )
+            nested_scan_axes: Sequence[int] = ()
+            if nested_scan and standard_reentry_operator:
+                for scan_attribute in body_node.attribute:
+                    if scan_attribute.name == "scan_input_axes":
+                        resolved_scan_attribute = resolve_reentry_attribute(scan_attribute)
+                        if resolved_scan_attribute is not None:
+                            nested_scan_axes = resolved_scan_attribute.ints
+                        break
+
+            def nested_bound_shape(
+                shape: tuple[int, ...] | None,
+                pair_index: int,
+                *,
+                is_scan: bool = nested_scan,
+                count: int | None = nested_scan_count,
+                input_count: int = len(body_node.input),
+                offset: int = nested_scan_offset,
+                axes: Sequence[int] = nested_scan_axes,
+            ) -> tuple[int, ...] | None:
+                if not is_scan:
+                    return shape
+                if count is None or not (0 < count <= input_count - offset):
+                    return None
+                return _onnx_scan_bound_subgraph_input_shape(
+                    shape,
+                    len(shape) if shape is not None else None,
+                    pair_index=pair_index,
+                    scan_input_start=input_count - count,
+                    scan_input_offset=offset,
+                    scan_input_axes=axes,
+                )[0]
+
+            # The enclosing live-node admission pays for a fixed number of
+            # attribute passes, not another pass for every nested output.
+            nested_stacked_output_start = scan_stacked_output_start(
+                body_node,
+                opset_versions,
+                resolve_reentry_attribute,
+                identifier=function_key,
+            )
+            nested_branch_shapes: list[dict[str, tuple[int, ...]]] = []
+            for attribute in direct_graph_attributes(body_node, function):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    branch_shapes: dict[str, tuple[int, ...]] = {}
+                    nested_branch_shapes.append(branch_shapes)
+                    nested_bound_input_constant_names = bound_control_flow_graph_constant_inputs(
+                        body_node,
+                        nested_graph,
+                        constants,
+                        opset_versions,
+                        subgraph_constants,
+                        identifier=function_key,
+                        replay_name_work=replay_name_work,
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    nested_graph_inputs = bound_control_flow_graph_inputs(
+                        body_node,
+                        nested_graph,
+                        tainted,
+                        opset_versions,
+                        identifier=function_key,
+                        replay_name_work=replay_name_work,
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    nested_tainted_shapes: dict[str, tuple[int, ...] | None] = {}
+                    nested_context_shapes: dict[str, tuple[int, ...]] = {}
+                    for pair_index, graph_input in enumerate(nested_graph.input, start=nested_scan_offset):
+                        input_name = prepared_replay_value_name(graph_input, replay_name_work)
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
+                        parent_name = nested_graph_inputs.get(input_name)
+                        if parent_name is None:
+                            continue
+                        nested_tainted_shapes[input_name] = nested_bound_shape(
+                            tainted_shapes.get(parent_name), pair_index
+                        )
+                        shape = nested_bound_shape(reentry_input_shape(parent_name), pair_index)
+                        if shape is not None:
+                            nested_context_shapes[input_name] = shape
+                    nested_external_names = graph_external_reference_names(
+                        nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    captured_names = nested_external_names & tainted
+                    related_nested_tainted_shapes = {
+                        name: shape
+                        for name, shape in related_graph_input_shapes.items()
+                        if name in nested_external_names
+                    }
+                    nested_tainted_shapes.update(
+                        {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
+                    )
+                    external_constants_key = constant_binding_cache_key(subgraph_constants, nested_external_names)
+                    if external_constants_key is None:
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    external_context_cache_key = (
+                        id(nested_graph),
+                        trusted_context_shape_cache_key(trusted_context_shapes, nested_external_names),
+                        external_constants_key,
+                        depth,
+                    )
+                    external_context_shapes = reentry_external_context_shape_cache.get(external_context_cache_key)
+                    if external_context_shapes is None:
+                        external_context_shapes = {}
+                        for external_name in nested_external_names:
+                            initializer_shape = constant_initializer_shape(subgraph_constants, external_name)
+                            if initializer_shape is not None:
+                                external_context_shapes[external_name] = initializer_shape
+                            elif (trusted_shape := trusted_context_shapes.get(external_name)) is not None:
+                                external_context_shapes[external_name] = trusted_shape
+                        reentry_external_context_shape_cache[external_context_cache_key] = external_context_shapes
+                    nested_context_shapes.update(external_context_shapes)
+                    nested_context_shapes.update(
+                        {
+                            captured_name: shape
+                            for captured_name in captured_names
+                            if (shape := tainted_shapes.get(captured_name)) is not None
+                        }
+                    )
+                    if not nested_tainted_shapes:
+                        continue
+                    available_nested_constants = subgraph_constants
+                    nested_bound_input_constants = {}
+                    if function_key[1] == "Loop" and not loop_may_repeat_body(
+                        body_node,
+                        available_nested_constants,
+                        set(),
+                        local_attribute_bindings,
+                    ):
+                        nested_bound_input_constants = {
+                            graph_input: available_nested_constants[parent_input]
+                            for graph_input, parent_input in nested_bound_input_constant_names.items()
+                            if parent_input in available_nested_constants
+                        }
+                    nested_constants = graph_initializer_constants(
+                        nested_graph,
+                        available_nested_constants,
+                        local_attribute_bindings,
+                        replay_name_work=replay_name_work,
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
+                    nested_constants.update(nested_bound_input_constants)
+                    nested_output_shapes: dict[int, tuple[int, ...]] = {}
+                    nested_captured_names = set(nested_tainted_shapes)
+                    related_nested_names = set(related_nested_tainted_shapes) | nested_captured_names
+                    related_nested_output_indexes: set[int] | None = None
+                    if related_nested_names != nested_captured_names:
+                        related_nested_output_indexes = graph_tainted_output_indexes(
+                            nested_graph,
+                            related_nested_names,
+                            opset_versions,
+                            attribute_bindings=local_attribute_bindings,
+                            depth=depth + 1,
+                            replay_name_work=replay_name_work,
+                        )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
+                    if related_nested_output_indexes == set():
+                        nested_tainted_output_indexes = set()
+                    else:
+                        nested_tainted_output_indexes = graph_tainted_output_indexes(
+                            nested_graph,
+                            nested_captured_names,
+                            opset_versions,
+                            attribute_bindings=local_attribute_bindings,
+                            depth=depth + 1,
+                            replay_name_work=replay_name_work,
+                        )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
+                    nested_output_offset = control_flow_output_offset(body_node, identifier=function_key)
+                    downstream_live_nested_output_indexes = {
+                        output_index + nested_output_offset
+                        for output_index, output_name in enumerate(body_output_slots)
+                        if output_name in output_dependency_names
+                    }
+                    nested_tainted_output_indexes &= downstream_live_nested_output_indexes
+                    if not nested_tainted_output_indexes:
+                        continue
+                    nested_recurrence_outputs = set(nested_tainted_output_indexes)
+                    nested_recurrence_proven = True
+                    nested_state_repeats = standard_reentry_operator and (
+                        function_key[1] == "Scan"
+                        or (
+                            function_key[1] == "Loop"
+                            and loop_may_repeat_body(
+                                body_node, available_nested_constants, set(), local_attribute_bindings
+                            )
+                        )
+                    )
+                    if nested_state_repeats:
+                        state_input_offset = 2 if function_key[1] == "Loop" else 0
+                        state_count = (
+                            max(len(body_node.input) - 2, 0)
+                            if function_key[1] == "Loop"
+                            else nested_stacked_output_start
+                        )
+                        state_outputs = {
+                            prepared_replay_value_name(value, replay_name_work): index
+                            - state_input_offset
+                            + nested_output_offset
+                            for index, value in replay_admitted_values(
+                                enumerate(getattr(nested_graph, "input", ())), replay_name_work
+                            )
+                            if state_input_offset <= index < state_input_offset + state_count
+                        }
+                        if replay_name_work is not None and not replay_name_work(0):
+                            reentry_promotion_in_progress.discard(cache_key)
+                            return True
+                        pending_outputs = list(nested_recurrence_outputs)
+                        dependency_work = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                        while pending_outputs:
+                            dependencies = graph_output_dependency_names(
+                                nested_graph,
+                                (pending_outputs.pop(),),
+                                attribute_bindings=local_attribute_bindings,
+                                replay_name_work=replay_name_work,
+                            )
+                            if replay_name_work is not None and not replay_name_work(0):
+                                reentry_promotion_in_progress.discard(cache_key)
+                                return True
+                            dependency_work -= max(len(dependencies), 1)
+                            if dependency_work < 0 or dependency_names_exceeded_limit(dependencies):
+                                nested_recurrence_proven = False
+                                break
+                            for name in dependencies:
+                                sibling_output = state_outputs.get(name)
+                                if sibling_output is not None and sibling_output not in nested_recurrence_outputs:
+                                    nested_recurrence_outputs.add(sibling_output)
+                                    pending_outputs.append(sibling_output)
+                        nested_tainted_output_indexes.update(nested_recurrence_outputs)
+                    tainted.update(
+                        mapped_node_outputs(
+                            body_output_slots,
+                            nested_tainted_output_indexes,
+                            graph_output_offset=nested_output_offset,
+                        )
+                    )
+                    nested_promoted_output_indexes: set[int] = set()
+                    for output_index in nested_tainted_output_indexes:
+                        if control_flow_graph_output_is_stacked_output(
+                            body_node,
+                            output_index,
+                            nested_stacked_output_start,
+                            identifier=function_key,
+                        ):
+                            nested_promoted_output_indexes.add(output_index)
+                    nested_promotion_work_remaining = min(
+                        _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK, _ONNX_NESTED_PROMOTION_WORK_LIMIT
+                    )
+                    nested_promotion_call_work = max(len(getattr(nested_graph, "node", ())), 1)
+                    for captured_name, captured_shape in nested_tainted_shapes.items():
+                        if nested_promotion_work_remaining <= 0:
+                            break
+                        for output_index in sorted(nested_tainted_output_indexes):
+                            if nested_promotion_work_remaining < nested_promotion_call_work:
+                                nested_promoted_output_indexes.update(nested_tainted_output_indexes)
+                                nested_promotion_work_remaining = 0
+                                break
+                            nested_promotion_work_remaining -= nested_promotion_call_work
+                            if subgraph_reenters_state_with_rank_promotion(
+                                nested_graph,
+                                captured_name,
+                                output_index,
+                                nested_constants,
+                                opset_versions,
+                                captured_shape,
+                                attribute_bindings=local_attribute_bindings,
+                                output_shapes_out=nested_output_shapes,
+                                bound_input_constants=nested_bound_input_constants,
+                                trusted_context_shapes=nested_context_shapes,
+                                related_graph_input_shapes=related_nested_tainted_shapes,
+                                depth=depth + 1,
+                                replay_name_work=replay_name_work,
+                            ):
+                                if replay_name_work is not None and not replay_name_work(0):
+                                    reentry_promotion_in_progress.discard(cache_key)
+                                    return True
+                                nested_promoted_output_indexes.add(output_index)
+                            if replay_name_work is not None and not replay_name_work(0):
+                                reentry_promotion_in_progress.discard(cache_key)
+                                return True
+                    if nested_state_repeats:
+                        input_slots = node_input_slots(body_node)
+                        parent_input_offset = (
+                            1
+                            if function_key[1] == "Loop"
+                            else scan_sequence_lens_input_offset(body_node, opset_versions, identifier=function_key)
+                        )
+                        nested_recurrence_proven = nested_recurrence_proven and all(
+                            index + parent_input_offset < len(input_slots)
+                            and (initial_shape := reentry_input_shape(input_slots[index + parent_input_offset]))
+                            is not None
+                            and nested_output_shapes.get(index) == initial_shape
+                            for index in nested_recurrence_outputs
+                        )
+                        if not nested_recurrence_proven:
+                            nested_promoted_output_indexes.update(nested_recurrence_outputs)
+                    nested_promoted_outputs.update(
+                        mapped_node_outputs(
+                            body_output_slots,
+                            nested_promoted_output_indexes,
+                            graph_output_offset=control_flow_output_offset(body_node, identifier=function_key),
+                        )
+                    )
+                    for output_index, output_shape in nested_output_shapes.items():
+                        node_output_index = output_index - nested_output_offset
+                        if 0 <= node_output_index < len(body_output_slots):
+                            # Only a joint carried-state invariant survives all
+                            # iterations. Stacked outputs are not body-shaped.
+                            if (
+                                standard_reentry_operator
+                                and function_key[1] == "Scan"
+                                and (
+                                    scan_sequence_lens_input_offset(body_node, opset_versions, identifier=function_key)
+                                    or control_flow_graph_output_is_stacked_output(
+                                        body_node,
+                                        output_index,
+                                        nested_stacked_output_start,
+                                        identifier=function_key,
+                                    )
+                                    or not nested_recurrence_proven
+                                )
+                            ):
+                                continue
+                            if standard_reentry_operator and function_key[1] == "Loop":
+                                # A skipped loop returns its initial state. Repeated
+                                # bodies need an invariant before one pass proves shape.
+                                initial_index = node_output_index + 2
+                                nested_input_slots = node_input_slots(body_node)
+                                initial_shape = (
+                                    reentry_input_shape(nested_input_slots[initial_index])
+                                    if initial_index < len(nested_input_slots)
+                                    else None
+                                )
+                                if (
+                                    loop_may_skip_body(body_node, available_nested_constants, set())
+                                    or nested_state_repeats
+                                ) and output_shape != initial_shape:
+                                    continue
+                                if not nested_recurrence_proven:
+                                    continue
+                            branch_shapes[body_output_slots[node_output_index]] = output_shape
+            if nested_branch_shapes:
+                for output_name, output_shape in nested_branch_shapes[0].items():
+                    if all(branch.get(output_name) == output_shape for branch in nested_branch_shapes[1:]):
+                        tainted_shapes[output_name] = output_shape
+            promoted_outputs = function_promoted_outputs | nested_promoted_outputs
+            body_tainted_outputs = function_tainted_outputs if function is not None else set(body_outputs)
+            if (
+                data_input_promoted
+                or any_promoted
+                or (any_tainted and not attributes_proven)
+                or (
+                    (
+                        (
+                            standard_reentry_operator
+                            and is_rank_gap_promoting_operator(body_node, identifier=function_key)
+                        )
+                        or function_key[1] == "Einsum"
+                        or function_key[1] == "MatMul"
+                        or function_key[1] == "OneHot"
+                        or function_key[1] in _SAME_TYPE_ELEMENTWISE_OPERATORS
+                        or function_key[1] == "Pow"
+                    )
+                    and data_input_may_promote
+                )
+                or promoted_outputs
+            ):
+                outputs_to_promote = set(promoted_outputs)
+                if data_input_promoted or any_promoted or data_input_may_promote:
+                    outputs_to_promote.update(body_tainted_outputs)
+                promoted.update(outputs_to_promote or body_tainted_outputs)
+                tainted.update(body_tainted_outputs)
+            elif any_tainted:
+                tainted.update(body_tainted_outputs)
+            if (
+                any_tainted
+                or is_shape_query
+                or any(input_shapes_by_name.get(input_name) is not None for input_name in body_inputs)
+            ):
+                output_shape = None
+                if (
+                    standard_reentry_operator
+                    and reentry_shape_preserving_unary_operator(body_node, body_inputs, identifier=function_key)
+                    and data_input_shape is not None
+                ):
+                    output_shape = data_input_shape
+                elif standard_reentry_operator and function_key[1] == "Flatten" and data_input_shape is not None:
+                    flattened_shape = flattened_output_shape(
+                        data_input_shape,
+                        resolved_onnx_int_attribute(body_node, "axis", 1, resolve_reentry_attribute),
+                    )
+                    if flattened_shape is not None:
+                        output_shape = inferred_shape(2, flattened_shape)
+                elif standard_reentry_operator and function_key[1] == "Transpose" and data_input_shape is not None:
+                    permutation = transpose_permutation(body_node, len(data_input_shape), resolve_reentry_attribute)
+                    if permutation is not None:
+                        output_shape = inferred_shape(
+                            len(permutation), (data_input_shape[axis] for axis in permutation)
+                        )
+                elif standard_reentry_operator and function_key[1] in _RANK_PRESERVING_VARIADIC_OPERATORS:
+                    concat_axis = resolved_onnx_int_attribute(
+                        body_node, "axis", resolve_attribute=resolve_reentry_attribute
+                    )
+                    if concat_axis is not None:
+                        output_shape = concat_shape(
+                            body_node,
+                            (input_shapes_by_name.get(input_name) for input_name in body_inputs),
+                            axis=concat_axis,
+                        )
+                elif standard_reentry_operator and function_key[1] == "MatMul":
+                    output_shape = matmul_output_shape(
+                        input_shapes_by_name.get(body_inputs[0]) if body_inputs else None,
+                        input_shapes_by_name.get(body_inputs[1]) if len(body_inputs) > 1 else None,
+                    )
+                elif standard_reentry_operator and function_key[1] == "OneHot":
+                    output_shape = onehot_output_shape(
+                        body_node,
+                        input_shapes_by_name.get(body_inputs[0]) if body_inputs else None,
+                        subgraph_constants,
+                        resolve_reentry_attribute,
+                    )
+                elif standard_reentry_operator and function_key[1] == "Einsum":
+                    output_shape = einsum_output_shape(body_node, input_shapes_by_name)
+                elif standard_reentry_operator and function_key[1] in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
+                    output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
+                elif standard_reentry_operator and function_key[1] == "Expand" and data_input_shape is not None:
+                    shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
+                    target_shape = constant_int64_vector_values(subgraph_constants.get(shape_name))
+                    if target_shape is not None:
+                        output_shape = broadcast_shapes((data_input_shape, target_shape))
+                elif standard_reentry_operator and function_key[1] == "Gather" and data_input_shape is not None:
+                    if index_input_shape is not None:
+                        gather_axis = _onnx_gather_axis(body_node, len(data_input_shape), resolve_reentry_attribute)
+                        if gather_axis is not None:
+                            output_shape = gather_shape_from_indices(data_input_shape, index_input_shape, gather_axis)
+                elif standard_reentry_operator and function_key[1] == "GatherElements":
+                    output_shape = index_input_shape
+                elif standard_reentry_operator and function_key[1] == "GatherND" and data_input_shape is not None:
+                    if index_input_shape:
+                        output_shape = gathernd_output_shape(
+                            body_node,
+                            input_shape=data_input_shape,
+                            index_shape=index_input_shape,
+                            resolve_attribute=resolve_reentry_attribute,
+                        )
+                elif standard_reentry_operator and function_key[1] == "Reshape" and data_input_shape is not None:
+                    shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
+                    shape_initializer = subgraph_constants.get(shape_name)
+                    allowzero = resolved_onnx_int_attribute(
+                        body_node, "allowzero", resolve_attribute=resolve_reentry_attribute
+                    )
+                    if shape_initializer is not None and allowzero is not None:
+                        output_shape = _resolve_onnx_reshape_shape(
+                            data_input_shape,
+                            shape_initializer,
+                            allowzero=bool(allowzero),
+                            onnx=onnx,
+                            resolve_int64_vector=constant_int64_vector_values,
+                        )
+                elif standard_reentry_operator and function_key[1] == "Unsqueeze" and data_input_shape is not None:
+                    axes = resolve_axes(
+                        body_node,
+                        subgraph_constants,
+                        onnx=onnx,
+                        resolve_attribute=resolve_reentry_attribute,
+                    )
+                    if axes is not None:
+                        output_shape = unsqueezed_shape(data_input_shape, axes)
+                elif standard_reentry_operator and function_key[1] == "Squeeze" and data_input_shape is not None:
+                    axes = resolve_axes(
+                        body_node,
+                        subgraph_constants,
+                        onnx=onnx,
+                        resolve_attribute=resolve_reentry_attribute,
+                    )
+                    if axes is not None:
+                        normalized_axes = tuple(axis if axis >= 0 else len(data_input_shape) + axis for axis in axes)
+                        if not normalized_axes:
+                            output_shape = implicit_squeeze_shape(
+                                body_node,
+                                data_input_shape,
+                                resolve_reentry_attribute,
+                                identifier=function_key,
+                            )
+                        elif len(set(normalized_axes)) == len(normalized_axes) and all(
+                            0 <= axis < len(data_input_shape) and data_input_shape[axis] == 1
+                            for axis in normalized_axes
+                        ):
+                            squeeze_axes = set(normalized_axes)
+                            output_shape = tuple(
+                                dimension
+                                for index, dimension in enumerate(data_input_shape)
+                                if index not in squeeze_axes
+                            )
+                elif is_shape_query and function_key[1] == "Shape" and data_input_shape is not None:
+                    start = resolved_onnx_int_attribute(body_node, "start", 0, resolve_reentry_attribute)
+                    end = resolved_onnx_int_attribute(
+                        body_node, "end", len(data_input_shape), resolve_reentry_attribute
+                    )
+                    if start is not None and end is not None:
+                        output_shape = (len(range(len(data_input_shape))[start:end]),)
+                elif is_shape_query and function_key[1] == "Size" and not any_tainted:
+                    output_shape = ()
+                if output_shape is not None:
+                    for output_name in body_outputs:
+                        tainted_shapes[output_name] = output_shape
+            elif (
+                standard_reentry_operator
+                and reentry_shape_preserving_unary_operator(body_node, body_inputs, identifier=function_key)
+                and data_input_shape is not None
+            ):
+                for output_name in body_outputs:
+                    tainted_shapes[output_name] = data_input_shape
+        # A temporary rank increase does not survive reentry when the body
+        # restores the same concrete carried shape.
+        cached_output_indexes = graph_output_name_indexes_cache.get(id(subgraph))
+        if cached_output_indexes is None or cached_output_indexes[0] is not subgraph:
+            output_indexes_by_name: dict[str, list[int]] = {}
+            for output_index, output in enumerate(graph_outputs):
+                output_indexes_by_name.setdefault(prepared_replay_value_name(output, replay_name_work), []).append(
+                    output_index
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    reentry_promotion_in_progress.discard(cache_key)
+                    return True
+            graph_output_name_indexes_cache[id(subgraph)] = (subgraph, output_indexes_by_name)
+        else:
+            _owner, output_indexes_by_name = cached_output_indexes
+        if graph_input_shape is not None:
+            promoted.update(
+                output_name
+                for output_name in output_indexes_by_name
+                if output_name in tainted
+                and output_name in tainted_shapes
+                and (shape := tainted_shapes.get(output_name)) is not None
+                and len(shape) > len(graph_input_shape)
+            )
+        promoted_output_indexes = frozenset(
+            output_index
+            for output_name in promoted
+            for output_index in output_indexes_by_name.get(output_name, ())
+            if not (
+                graph_input_shape is not None
+                and all(dimension >= 0 for dimension in graph_input_shape)
+                and tainted_shapes.get(output_name) == graph_input_shape
+            )
+        )
+        output_shapes = {
+            output_index: output_shape
+            for output_index in replay_admitted_values(sorted(restorable_output_indexes), replay_name_work)
+            if 0 <= output_index < len(graph_outputs)
+            and (
+                output_shape := reentry_input_shape(
+                    prepared_replay_value_name(graph_outputs[output_index], replay_name_work)
+                )
+            )
+            is not None
+        }
+        if replay_name_work is not None and not replay_name_work(0):
+            reentry_promotion_in_progress.discard(cache_key)
+            return True
+        reentry_promotion_in_progress.discard(cache_key)
+        reentry_promotion_cache[cache_key] = promoted_output_indexes
+        reentry_shape_cache[cache_key] = output_shapes
+        if promoted_outputs_out is not None:
+            promoted_outputs_out.update(promoted_output_indexes)
+        if output_shapes_out is not None:
+            output_shapes_out.update(output_shapes)
+        return graph_output_index in promoted_output_indexes
+
+    def graph_outputs_may_reference_tainted(
+        subgraph: Any,
+        graph_input_names: set[str],
+        opset_versions: dict[str, int],
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        depth: int = 0,
+    ) -> bool:
+        return bool(
+            graph_tainted_output_indexes(
+                subgraph,
+                graph_input_names,
+                opset_versions,
+                attribute_bindings=attribute_bindings,
+                depth=depth,
+            )
+        )
+
+    graph_taint_cache: dict[tuple[Any, ...], set[int]] = {}
+    graph_taint_in_progress: set[tuple[Any, ...]] = set()
+    graph_taint_nodes_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+    graph_taint_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def reserve_taint_constant_copy_work(count: int) -> bool:
+        nonlocal graph_taint_work_remaining
+        if count > graph_taint_work_remaining:
+            graph_taint_work_remaining = 0
+            return False
+        graph_taint_work_remaining -= count
+        return True
+
+    def graph_taint_work_is_exhausted() -> bool:
+        return graph_taint_work_remaining <= 0
+
+    def graph_tainted_output_indexes(
+        subgraph: Any,
+        graph_input_names: set[str],
+        opset_versions: dict[str, int],
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        depth: int = 0,
+        inherited_constants: dict[str, Any] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> set[int]:
+        nonlocal graph_taint_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return set(range(len(getattr(subgraph, "output", ()))))
+        if not graph_input_names:
+            return set()
+        graph_outputs = getattr(subgraph, "output", ())
+        if depth > 6 or graph_taint_work_remaining <= 0:
+            return set(range(len(graph_outputs)))
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return set(range(len(getattr(subgraph, "output", ()))))
+        if dependency_names_exceeded_limit(constant_names):
+            return set(range(len(graph_outputs)))
+        constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
+        if constants_key is None:
+            return set(range(len(graph_outputs)))
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return set(range(len(graph_outputs)))
+        cache_key = (
+            id(subgraph),
+            tuple(sorted(graph_input_names)),
+            opset_key,
+            attribute_binding_cache_key(attribute_bindings),
+            depth,
+            constants_key,
+        )
+        if cache_key in graph_taint_cache:
+            return set(graph_taint_cache[cache_key])
+        if cache_key in graph_taint_in_progress:
+            return set(range(len(graph_outputs)))
+        graph_taint_in_progress.add(cache_key)
+        local_attribute_bindings = attribute_bindings or {}
+        graph_constants = graph_initializer_constants(
+            subgraph, inherited_constants or {}, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            graph_taint_in_progress.discard(cache_key)
+            return set(range(len(getattr(subgraph, "output", ()))))
+        output_dependency_names = graph_output_dependency_names(
+            subgraph, attribute_bindings=attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            graph_taint_in_progress.discard(cache_key)
+            return set(range(len(getattr(subgraph, "output", ()))))
+        if dependency_names_exceeded_limit(output_dependency_names):
+            graph_taint_in_progress.discard(cache_key)
+            result = set(range(len(graph_outputs)))
+            graph_taint_cache[cache_key] = set(result)
+            return result
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        tainted = set(graph_input_names)
+        nodes_key = (id(subgraph), attribute_binding_cache_key(attribute_bindings))
+        if nodes_key not in graph_taint_nodes_cache:
+            ordered_nodes = graph_nodes_in_dependency_order(subgraph, output_dependency_names)
+            if ordered_nodes is None:
+                graph_taint_in_progress.discard(cache_key)
+                result = set(range(len(graph_outputs)))
+                graph_taint_cache[cache_key] = set(result)
+                return result
+            graph_taint_nodes_cache[nodes_key] = ordered_nodes
+        for body_node in graph_taint_nodes_cache[nodes_key]:
+            # Admit the attribute inventory before resolving Constants or nested graphs.
+            work = max(len(getattr(body_node, "input", ())) + len(getattr(body_node, "output", ())), 1) + len(
+                getattr(body_node, "attribute", ())
+            )
+            if work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                graph_taint_in_progress.discard(cache_key)
+                result = set(range(len(graph_outputs)))
+                graph_taint_cache[cache_key] = result
+                return result
+            graph_taint_work_remaining -= work
+            function_key = bounded_operator_identifier(body_node)
+            if function_key is None:
+                graph_taint_in_progress.discard(cache_key)
+                result = set(range(len(graph_outputs)))
+                graph_taint_cache[cache_key] = result
+                return result
+            if function_key[0] in _STANDARD_NEURAL_NETWORK_DOMAINS and function_key[1] == "Constant":
+                constant = resolved_constant_node_tensor(
+                    body_node, resolve_reentry_attribute, reserve_taint_constant_copy_work
+                )
+                if constant is not None:
+                    for name in node_output_names(body_node):
+                        graph_constants[name] = constant
+            body_inputs = node_input_names(body_node)
+            body_outputs = node_output_names(body_node)
+            body_output_slots = [
+                prepared_replay_value_name(output, replay_name_work)
+                for output in replay_admitted_values(node_output_slots(body_node), replay_name_work)
+            ]
+            if replay_name_work is not None and not replay_name_work(0):
+                graph_taint_in_progress.discard(cache_key)
+                return set(range(len(getattr(subgraph, "output", ()))))
+            if not body_outputs:
+                continue
+            function = functions.get(function_key)
+            any_tainted = any(input_name in tainted for input_name in body_inputs)
+            inspected_function_taint = False
+            if function is not None:
+                inspected_function_taint = True
+                mapped_outputs: set[str] = set()
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    tainted.update(body_outputs)
+                    continue
+                function_captures = graph_external_reference_names(
+                    function, function_attributes, replay_name_work=replay_name_work
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    graph_taint_in_progress.discard(cache_key)
+                    return set(range(len(getattr(subgraph, "output", ()))))
+                if dependency_names_exceeded_limit(function_captures):
+                    tainted.update(body_outputs)
+                    continue
+                function_input_names = {
+                    prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    for input_index, input_name in replay_admitted_values(
+                        enumerate(node_input_slots(body_node)), replay_name_work
+                    )
+                    if input_name in tainted and input_index < len(getattr(function, "input", ()))
+                }
+                if replay_name_work is not None and not replay_name_work(0):
+                    graph_taint_in_progress.discard(cache_key)
+                    return set(range(len(getattr(subgraph, "output", ()))))
+                function_input_names.discard("")
+                function_input_names.update(function_captures & tainted)
+                if function_input_names:
+                    mapped_outputs.update(
+                        mapped_node_outputs(
+                            body_output_slots,
+                            graph_tainted_output_indexes(
+                                function,
+                                function_input_names,
+                                function_versions,
+                                attribute_bindings=function_attributes,
+                                depth=depth + 1,
+                                inherited_constants=bound_function_constants(
+                                    function,
+                                    node_input_slots(body_node),
+                                    graph_constants,
+                                    attribute_bindings=function_attributes,
+                                    replay_name_work=replay_name_work,
+                                )[0],
+                                replay_name_work=replay_name_work,
+                            ),
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
+                tainted.update(mapped_outputs)
+                continue
+            nested_outputs: set[str] = set()
+            inspected_nested_taint = False
+            for attribute in getattr(body_node, "attribute", ()):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    captured_names = set(
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                        & tainted
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
+                    nested_input_names = set(
+                        bound_control_flow_graph_inputs(
+                            body_node,
+                            nested_graph,
+                            tainted,
+                            opset_versions,
+                            identifier=function_key,
+                            replay_name_work=replay_name_work,
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
+                    captured_names |= nested_input_names
+                    if not captured_names:
+                        continue
+                    inspected_nested_taint = True
+                    nested_outputs.update(
+                        mapped_node_outputs(
+                            body_output_slots,
+                            control_flow_tainted_outputs(
+                                body_node,
+                                nested_graph,
+                                captured_names,
+                                opset_versions,
+                                graph_constants,
+                                local_attribute_bindings,
+                                depth=depth + 1,
+                                replay_name_work=replay_name_work,
+                            )[0],
+                            graph_output_offset=control_flow_output_offset(body_node, identifier=function_key),
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        graph_taint_in_progress.discard(cache_key)
+                        return set(range(len(getattr(subgraph, "output", ()))))
+            if nested_outputs:
+                tainted.update(nested_outputs)
+            elif any_tainted and not inspected_nested_taint and not inspected_function_taint:
+                tainted.update(body_outputs)
+            if (any_tainted and builtin_operator(body_node, "If", identifier=function_key)) or (
+                builtin_operator(body_node, "Loop", identifier=function_key)
+                and any(name in tainted for name in node_input_slots(body_node)[:2])
+            ):
+                # Entry and trip-count controls affect outputs even when the body
+                # discards every tainted capture or recurrent input.
+                tainted.update(body_outputs)
+        result = {
+            output_index
+            for output_index, output in replay_admitted_values(enumerate(graph_outputs), replay_name_work)
+            if prepared_replay_value_name(output, replay_name_work) in tainted
+        }
+        if replay_name_work is not None and not replay_name_work(0):
+            graph_taint_in_progress.discard(cache_key)
+            return set(range(len(getattr(subgraph, "output", ()))))
+        graph_taint_in_progress.discard(cache_key)
+        graph_taint_cache[cache_key] = set(result)
+        return result
+
+    control_flow_taint_cache: dict[tuple[Any, ...], tuple[frozenset[int], frozenset[str]]] = {}
+    control_flow_state_maps: dict[tuple[Any, ...], tuple[dict[str, int], dict[int, str]]] = {}
+
+    def control_flow_tainted_outputs(
+        node: Any,
+        subgraph: Any,
+        input_names: set[str],
+        opset_versions: dict[str, int],
+        constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> tuple[set[int], set[str]]:
+        nonlocal graph_taint_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+        if not input_names:
+            return set(), set()
+        identifier = bounded_operator_identifier(node)
+        if identifier is None:
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
+
+        def resolve_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return (attribute_bindings or {}).get(reference_name) if reference_name else attribute
+
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings, replay_name_work=replay_name_work)
+        if replay_name_work is not None and not replay_name_work(0):
+            return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+        if dependency_names_exceeded_limit(constant_names):
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
+        constants_key = constant_binding_cache_key(constants, constant_names | frozenset(node_input_slots(node)[:2]))
+        if constants_key is None:
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            replay_result = (
+                set(range(len(subgraph.output))),
+                {
+                    prepared_replay_value_name(value, replay_name_work)
+                    for value in replay_admitted_values(subgraph.input, replay_name_work)
+                }
+                | input_names,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            return replay_result
+        key = (
+            id(node),
+            id(subgraph),
+            tuple(sorted(input_names)),
+            opset_key,
+            attribute_binding_cache_key(attribute_bindings),
+            depth,
+            constants_key,
+        )
+        if key in control_flow_taint_cache:
+            cached_outputs, cached_names = control_flow_taint_cache[key]
+            return set(cached_outputs), set(cached_names)
+        graph_inputs = getattr(subgraph, "input", ())
+        graph_outputs = getattr(subgraph, "output", ())
+        input_offset = 2 if identifier[1] == "Loop" else 0
+        output_offset = control_flow_output_offset(node, identifier=identifier)
+        is_loop = identifier[1] == "Loop" and identifier[0] in _STANDARD_NEURAL_NETWORK_DOMAINS
+        is_scan = identifier[1] == "Scan" and identifier[0] in _STANDARD_NEURAL_NETWORK_DOMAINS
+        if is_scan:
+            attribute_work = len(getattr(node, "attribute", ()))
+            if attribute_work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                replay_result = (
+                    set(range(len(graph_outputs))),
+                    {
+                        prepared_replay_value_name(value, replay_name_work)
+                        for value in replay_admitted_values(graph_inputs, replay_name_work)
+                    }
+                    | input_names,
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+                return replay_result
+            graph_taint_work_remaining -= attribute_work
+        state_count = (
+            max(len(node.input) - 2, 0)
+            if is_loop
+            else (
+                scan_stacked_output_start(node, opset_versions, resolve_attribute, identifier=identifier)
+                if is_scan
+                else 0
+            )
+        )
+        maps_key = (id(node), id(subgraph), state_count, input_offset, output_offset)
+        if maps_key not in control_flow_state_maps:
+            state_output_by_input = {
+                prepared_replay_value_name(graph_inputs[index + input_offset], replay_name_work): index + output_offset
+                for index in replay_admitted_values(
+                    range(min(state_count, max(len(graph_inputs) - input_offset, 0))), replay_name_work
+                )
+            }
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            state_input_by_output = {index: name for name, index in state_output_by_input.items() if name}
+            control_flow_state_maps[maps_key] = (state_output_by_input, state_input_by_output)
+        else:
+            state_output_by_input, state_input_by_output = control_flow_state_maps[maps_key]
+        iterations: int | None = None
+        may_skip = is_loop or is_scan
+        if is_loop:
+            may_skip = loop_may_skip_body(node, constants, set())
+            count = (
+                constant_scalar_value(
+                    constants.get(prepared_replay_value_name(node.input[0], replay_name_work)),
+                    int(onnx.TensorProto.INT64),
+                )
+                if node.input and node.input[0]
+                else None
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            condition = (
+                constant_scalar_value(
+                    constants.get(prepared_replay_value_name(node.input[1], replay_name_work)),
+                    int(onnx.TensorProto.BOOL),
+                )
+                if len(node.input) > 1 and node.input[1]
+                else True
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            if count is not None:
+                iterations = max(int(count), 0)
+            if condition is False:
+                iterations = 0
+            elif not loop_may_repeat_body(node, constants, set(), attribute_bindings):
+                iterations = min(iterations, 1) if iterations is not None else 1
+        elif not is_scan:
+            iterations = 1
+        outputs = (
+            {state_output_by_input[name] for name in input_names if name in state_output_by_input}
+            if may_skip
+            else set()
+        )
+        recurrent_names: set[str] = set()
+        current_names = set(input_names)
+        while current_names and iterations != 0:
+            work = max(len(current_names), 1)
+            if depth > 6 or work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                replay_result = (
+                    set(range(len(graph_outputs))),
+                    {
+                        prepared_replay_value_name(value, replay_name_work)
+                        for value in replay_admitted_values(graph_inputs, replay_name_work)
+                    }
+                    | input_names,
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+                return replay_result
+            graph_taint_work_remaining -= work
+            recurrent_names.update(current_names)
+            body_outputs = graph_tainted_output_indexes(
+                subgraph,
+                current_names,
+                opset_versions,
+                attribute_bindings=attribute_bindings,
+                depth=depth,
+                inherited_constants=constants,
+                replay_name_work=replay_name_work,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return (set(range(len(getattr(subgraph, "output", ())))), set(input_names))
+            if len(body_outputs) > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return set(range(len(graph_outputs))), set(state_output_by_input) | input_names
+            graph_taint_work_remaining -= len(body_outputs)
+            outputs.update(body_outputs)
+            next_names = current_names | {
+                state_input_by_output[index] for index in body_outputs if index in state_input_by_output
+            }
+            if next_names == current_names:
+                break
+            current_names = next_names
+            if iterations is not None:
+                iterations -= 1
+        control_flow_taint_cache[key] = (frozenset(outputs), frozenset(recurrent_names))
+        return outputs, recurrent_names
+
+    weight_reachability_cache: dict[tuple[Any, ...], bool] = {}
+    weight_reachability_in_progress: set[tuple[Any, ...]] = set()
+    potential_weight_consumer_cache: dict[tuple[Any, ...], bool] = {}
+    potential_weight_consumer_dependency_cache: dict[tuple[Any, ...], frozenset[str]] = {}
+
+    def subgraph_has_potential_weight_consumer(
+        subgraph: Any,
+        opset_versions: dict[str, int],
+        *,
+        attribute_bindings: dict[str, Any] | None = None,
+        depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> bool:
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if depth > 6:
+            return True
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return True
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return True
+        cache_key = (
+            id(subgraph),
+            opset_key,
+            attribute_key,
+            depth,
+        )
+        if cache_key in potential_weight_consumer_cache:
+            return potential_weight_consumer_cache[cache_key]
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        for body_node in getattr(subgraph, "node", ()):
+            body_inputs: list[str] = []
+            for input_value in getattr(body_node, "input", ()):
+                input_name = admitted_replay_value_name(input_value, replay_name_work)
+                if input_name is None:
+                    return True
+                body_inputs.append(input_name)
+            function_key = bounded_operator_identifier(body_node)
+            if function_key is None:
+                potential_weight_consumer_cache[cache_key] = True
+                return True
+            function = functions.get(function_key)
+            is_model_local_function = function_key in functions
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+                identifier=function_key,
+            )
+            if function is not None:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    potential_weight_consumer_cache[cache_key] = True
+                    return True
+                if subgraph_has_potential_weight_consumer(
+                    function,
+                    function_versions,
+                    attribute_bindings=function_attributes,
+                    depth=depth + 1,
+                    replay_name_work=replay_name_work,
+                ):
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return True
+                    potential_weight_consumer_cache[cache_key] = True
+                    return True
+                continue
+            elif any(
+                _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                    identifier=function_key,
+                )
+                for input_index in range(len(body_inputs))
+            ):
+                potential_weight_consumer_cache[cache_key] = True
+                return True
+            for attribute in getattr(body_node, "attribute", ()):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    if subgraph_has_potential_weight_consumer(
+                        nested_graph,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                        replay_name_work=replay_name_work,
+                    ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return True
+                        potential_weight_consumer_cache[cache_key] = True
+                        return True
+        potential_weight_consumer_cache[cache_key] = False
+        return False
+
+    def subgraph_potential_weight_consumer_dependency_names(
+        subgraph: Any,
+        opset_versions: dict[str, int],
+        *,
+        attribute_bindings: dict[str, Any] | None = None,
+        depth: int = 0,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> frozenset[str]:
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return dependency_collection_limit
+        cache_key = (
+            id(subgraph),
+            opset_key,
+            attribute_key,
+            depth,
+        )
+        if cache_key in potential_weight_consumer_dependency_cache:
+            return potential_weight_consumer_dependency_cache[cache_key]
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        dependencies: set[str] = set()
+        for body_node in getattr(subgraph, "node", ()):
+            body_input_slots = node_input_slots(body_node)
+            function_key = bounded_operator_identifier(body_node)
+            if function_key is None:
+                potential_weight_consumer_dependency_cache[cache_key] = dependency_collection_limit
+                return dependency_collection_limit
+            function = functions.get(function_key)
+            is_model_local_function = function_key in functions
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+                identifier=function_key,
+            )
+            if function is not None:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    potential_weight_consumer_dependency_cache[cache_key] = dependency_collection_limit
+                    return dependency_collection_limit
+                if subgraph_has_potential_weight_consumer(
+                    function,
+                    function_versions,
+                    attribute_bindings=function_attributes,
+                    depth=depth + 1,
+                    replay_name_work=replay_name_work,
+                ):
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                    dependencies.update(input_name for input_name in body_input_slots if input_name)
+                    if merge_dependency_names(
+                        dependencies,
+                        graph_external_reference_names(
+                            function, function_attributes, replay_name_work=replay_name_work
+                        ),
+                    ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
+                        potential_weight_consumer_dependency_cache[cache_key] = dependency_collection_limit
+                        return dependency_collection_limit
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                if replay_name_work is not None and not replay_name_work(0):
+                    return dependency_collection_limit
+                continue
+            for input_index, input_name in enumerate(body_input_slots):
+                if input_name and _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                    identifier=function_key,
+                ):
+                    dependencies.add(input_name)
+            parent_inputs = {input_name for input_name in body_input_slots if input_name}
+            for attribute in getattr(body_node, "attribute", ()):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    if not subgraph_has_potential_weight_consumer(
+                        nested_graph,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                        replay_name_work=replay_name_work,
+                    ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
+                        continue
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                    dependencies.update(
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        return dependency_collection_limit
+                    if parent_inputs:
+                        dependencies.update(
+                            bound_control_flow_graph_inputs(
+                                body_node,
+                                nested_graph,
+                                parent_inputs,
+                                opset_versions,
+                                identifier=function_key,
+                                replay_name_work=replay_name_work,
+                            ).values()
+                        )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return dependency_collection_limit
+        result = frozenset(dependencies)
+        potential_weight_consumer_dependency_cache[cache_key] = result
+        return result
+
+    def subgraph_state_input_can_reach_weight_consumer(
+        subgraph: Any,
+        graph_input_name: str,
+        opset_versions: dict[str, int],
+        *,
+        attribute_bindings: dict[str, Any] | None = None,
+        depth: int = 0,
+        inherited_constants: dict[str, Any] | None = None,
+        exclude_activation_inputs: bool = False,
+        proven_weight_inputs: dict[tuple[int, ...], tuple[Any, frozenset[int]]] | None = None,
+        proven_weight_inputs_path: tuple[int, ...] = (),
+        inherited_independent_value: Callable[[str], bool] | None = None,
+        control_flow_owner: Any | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> bool:
+        nonlocal graph_taint_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if not graph_input_name:
+            return False
+        if depth > 6:
+            return True
+        constant_names = rank_reentry_constant_names(
+            subgraph,
+            attribute_bindings,
+            include_bound_inputs=exclude_activation_inputs and isinstance(subgraph, onnx.FunctionProto),
+            replay_name_work=replay_name_work,
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if dependency_names_exceeded_limit(constant_names):
+            return True
+        constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
+        if constants_key is None:
+            return True
+        opset_key = opset_cache_key(opset_versions)
+        if opset_key is None:
+            return True
+        cache_key = (
+            id(subgraph),
+            graph_input_name,
+            opset_key,
+            attribute_binding_cache_key(attribute_bindings),
+            depth,
+            constants_key,
+            exclude_activation_inputs,
+        )
+        if not exclude_activation_inputs and cache_key in weight_reachability_cache:
+            return weight_reachability_cache[cache_key]
+        if not subgraph_has_potential_weight_consumer(
+            subgraph,
+            opset_versions,
+            attribute_bindings=attribute_bindings,
+            depth=depth,
+            replay_name_work=replay_name_work,
+        ):
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
+            if not exclude_activation_inputs:
+                weight_reachability_cache[cache_key] = False
+            return False
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if graph_taint_work_remaining <= 0:
+            return True
+        if subgraph_analysis_work_exceeds_limit(
+            subgraph,
+            graph_output_dependency_names(
+                subgraph, attribute_bindings=attribute_bindings, replay_name_work=replay_name_work
+            ),
+            include_potential_weight_consumers=True,
+            opset_versions=opset_versions,
+            attribute_bindings=attribute_bindings,
+            replay_name_work=replay_name_work,
+        ):
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
+            result = subgraph_has_potential_weight_consumer(
+                subgraph,
+                opset_versions,
+                attribute_bindings=attribute_bindings,
+                depth=depth,
+                replay_name_work=replay_name_work,
+            )
+            if replay_name_work is not None and not replay_name_work(0):
+                return True
+            if not exclude_activation_inputs:
+                weight_reachability_cache[cache_key] = result
+            return result
+        if replay_name_work is not None and not replay_name_work(0):
+            return True
+        if cache_key in weight_reachability_in_progress:
+            return True
+        weight_reachability_in_progress.add(cache_key)
+
+        def finish(result: bool) -> bool:
+            weight_reachability_in_progress.discard(cache_key)
+            if not exclude_activation_inputs:
+                weight_reachability_cache[cache_key] = result
+            return result
+
+        local_attribute_bindings = attribute_bindings or {}
+        graph_constants = graph_initializer_constants(
+            subgraph, inherited_constants or {}, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
+        if exclude_activation_inputs and isinstance(subgraph, onnx.FunctionProto):
+            graph_constants.update(
+                (name, inherited_constants[name])
+                for name in subgraph.input
+                if inherited_constants is not None and name in inherited_constants
+            )
+
+        graph_inputs = getattr(subgraph, "input", ()) if exclude_activation_inputs else ()
+        if len(graph_inputs) > graph_taint_work_remaining:
+            graph_taint_work_remaining = 0
+            return finish(True)
+        graph_taint_work_remaining -= len(graph_inputs)
+        graph_formals = {
+            prepared_replay_value_name(value, replay_name_work): index
+            for index, value in replay_admitted_values(enumerate(graph_inputs), replay_name_work)
+        }
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
+        current_graph_external_names = graph_external_reference_names(
+            subgraph, attribute_bindings, replay_name_work=replay_name_work
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
+
+        def independent_value(name: str) -> bool:
+            nonlocal graph_taint_work_remaining
+            dependencies = graph_value_dependency_names(subgraph, (name,), attribute_bindings)
+            if dependency_names_exceeded_limit(dependencies) or len(dependencies) > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return False
+            graph_taint_work_remaining -= len(dependencies)
+            for dependency in dependencies:
+                if dependency in graph_formals:
+                    if isinstance(subgraph, onnx.FunctionProto):
+                        if inherited_independent_value is None or not inherited_independent_value(dependency):
+                            return False
+                        continue
+                    if control_flow_owner is None:
+                        return False
+                    owner_identifier = bounded_operator_identifier(control_flow_owner)
+                    if owner_identifier is None or not builtin_operator(
+                        control_flow_owner, identifier=owner_identifier
+                    ):
+                        return False
+                    input_index = graph_formals[dependency]
+                    if owner_identifier[1] == "Loop" and input_index >= 2:
+                        parent_input_index = input_index
+                        output_index = input_index - 1
+                    elif owner_identifier[1] == "Scan":
+                        attribute_work = len(getattr(control_flow_owner, "attribute", ()))
+                        if attribute_work > graph_taint_work_remaining:
+                            graph_taint_work_remaining = 0
+                            return False
+                        graph_taint_work_remaining -= attribute_work
+                        if input_index >= scan_stacked_output_start(
+                            control_flow_owner,
+                            opset_versions,
+                            resolve_reentry_attribute,
+                            identifier=owner_identifier,
+                        ):
+                            return False
+                        parent_input_index = input_index + scan_sequence_lens_input_offset(
+                            control_flow_owner,
+                            opset_versions,
+                            identifier=owner_identifier,
+                        )
+                        output_index = input_index
+                    else:
+                        return False
+                    if (
+                        dependency == graph_input_name
+                        or parent_input_index >= len(control_flow_owner.input)
+                        or not state_output_preserves_input(subgraph, dependency, output_index)
+                    ):
+                        return False
+                    if inherited_independent_value is not None and not inherited_independent_value(
+                        str(control_flow_owner.input[parent_input_index])
+                    ):
+                        return False
+                elif dependency in current_graph_external_names and inherited_independent_value is not None:
+                    if not inherited_independent_value(dependency):
+                        return False
+            return True
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        live_names = {
+            name
+            for output in replay_admitted_values(getattr(subgraph, "output", ()), replay_name_work)
+            if (name := prepared_replay_value_name(output, replay_name_work))
+        }
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
+        live_names.update(
+            subgraph_potential_weight_consumer_dependency_names(
+                subgraph,
+                opset_versions,
+                attribute_bindings=attribute_bindings,
+                depth=depth,
+                replay_name_work=replay_name_work,
+            )
+        )
+        if replay_name_work is not None and not replay_name_work(0):
+            weight_reachability_in_progress.discard(cache_key)
+            return True
+        initial_live_node_ids = graph_nodes_producing_names(subgraph, live_names)
+        if initial_live_node_ids is None:
+            return finish(True)
+        body_nodes = graph_nodes_once(subgraph)
+        live_node_ids = set(initial_live_node_ids)
+        node_output_is_live_after_node: dict[int, bool] = {}
+        for body_node in reversed(body_nodes):
+            work = (
+                1
+                + len(getattr(body_node, "input", ()))
+                + len(getattr(body_node, "output", ()))
+                + len(getattr(body_node, "attribute", ()))
+            )
+            if work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return finish(True)
+            graph_taint_work_remaining -= work
+            output_is_live = id(body_node) in live_node_ids
+            node_output_is_live_after_node[id(body_node)] = output_is_live
+            body_function_key = bounded_operator_identifier(body_node)
+            if body_function_key is None:
+                return finish(True)
+            body_function = functions.get(body_function_key)
+            if not output_is_live:
+                for attribute in direct_graph_attributes(body_node, body_function):
+                    resolved_attribute = resolve_reentry_attribute(attribute)
+                    if resolved_attribute is None:
+                        continue
+                    for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                        if not subgraph_has_potential_weight_consumer(
+                            nested_graph,
+                            opset_versions,
+                            attribute_bindings=local_attribute_bindings,
+                            depth=depth + 1,
+                            replay_name_work=replay_name_work,
+                        ):
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
+                            continue
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                        external_names = graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                        live_names.update(external_names)
+                        dependency_node_ids = graph_nodes_producing_names(subgraph, external_names)
+                        if dependency_node_ids is None:
+                            return finish(True)
+                        live_node_ids.update(dependency_node_ids)
+                continue
+            if body_function is not None:
+                live_function_attributes = bound_function_attributes(
+                    body_function, body_node, resolve_reentry_attribute
+                )
+                live_function_captures = graph_external_reference_names(
+                    body_function, live_function_attributes, replay_name_work=replay_name_work
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
+                if dependency_names_exceeded_limit(live_function_captures):
+                    return finish(True)
+                if len(live_function_captures) > graph_taint_work_remaining:
+                    graph_taint_work_remaining = 0
+                    return finish(True)
+                graph_taint_work_remaining -= len(live_function_captures)
+                live_names.update(live_function_captures)
+                dependency_node_ids = graph_nodes_producing_names(subgraph, live_function_captures)
+                if dependency_node_ids is None:
+                    return finish(True)
+                live_node_ids.update(dependency_node_ids)
+            live_body_inputs = node_input_names(body_node)
+            live_names.update(live_body_inputs)
+            dependency_node_ids = graph_nodes_producing_names(subgraph, live_body_inputs)
+            if dependency_node_ids is None:
+                return finish(True)
+            live_node_ids.update(dependency_node_ids)
+            for attribute in direct_graph_attributes(body_node, body_function):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    external_names = graph_external_reference_names(
+                        nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                    live_names.update(external_names)
+                    dependency_node_ids = graph_nodes_producing_names(subgraph, external_names)
+                    if dependency_node_ids is None:
+                        return finish(True)
+                    live_node_ids.update(dependency_node_ids)
+
+        tainted = {graph_input_name}
+        for body_node in body_nodes:
+            work = (
+                1
+                + len(getattr(body_node, "input", ()))
+                + len(getattr(body_node, "output", ()))
+                + len(getattr(body_node, "attribute", ()))
+            )
+            if work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return finish(True)
+            graph_taint_work_remaining -= work
+            body_outputs = node_output_names(body_node)
+            body_output_slots = [
+                prepared_replay_value_name(output, replay_name_work)
+                for output in replay_admitted_values(node_output_slots(body_node), replay_name_work)
+            ]
+            if replay_name_work is not None and not replay_name_work(0):
+                weight_reachability_in_progress.discard(cache_key)
+                return True
+            body_outputs_live_after = node_output_is_live_after_node.get(id(body_node), False)
+            function_key = bounded_operator_identifier(body_node)
+            if function_key is None:
+                return finish(True)
+            function = functions.get(function_key)
+            is_model_local_function = function_key in functions
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+                identifier=function_key,
+            )
+            function_attributes: dict[str, Any] | None = None
+            function_versions: dict[str, int] | None = None
+            function_has_weight_consumer: bool | None = None
+            if not body_outputs_live_after and function is not None:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                if function_versions is None:
+                    return finish(True)
+                function_has_weight_consumer = subgraph_has_potential_weight_consumer(
+                    function,
+                    function_versions,
+                    attribute_bindings=function_attributes,
+                    depth=depth + 1,
+                    replay_name_work=replay_name_work,
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
+                if not function_has_weight_consumer:
+                    continue
+            if not body_outputs_live_after and function is None:
+                raw_input_count = len(getattr(body_node, "input", ()))
+                direct_potential_weight_input = any(
+                    _onnx_potential_weight_input(
+                        body_node,
+                        input_index,
+                        is_model_local_function=is_model_local_function,
+                        is_registered_standard_operator=is_registered_standard_operator,
+                        identifier=function_key,
+                    )
+                    for input_index in range(raw_input_count)
+                )
+                has_nested_graph = False
+                if not direct_potential_weight_input:
+                    for attribute in getattr(body_node, "attribute", ()):
+                        resolved_attribute = resolve_reentry_attribute(attribute)
+                        if resolved_attribute is not None and any(_iter_attribute_graphs(resolved_attribute)):
+                            has_nested_graph = True
+                            break
+                if not direct_potential_weight_input and not has_nested_graph:
+                    continue
+            if function_key[0] in _STANDARD_NEURAL_NETWORK_DOMAINS and function_key[1] == "Constant":
+                constant = resolved_constant_node_tensor(
+                    body_node, resolve_reentry_attribute, reserve_taint_constant_copy_work
+                )
+                if constant is not None:
+                    for name in node_output_names(body_node):
+                        graph_constants[name] = constant
+            if (
+                exclude_activation_inputs
+                and builtin_operator(body_node, "Identity", identifier=function_key)
+                and len(body_node.input) == 1
+                and (constant := graph_constants.get(prepared_replay_value_name(body_node.input[0], replay_name_work)))
+                is not None
+            ):
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
+                for name in body_outputs:
+                    graph_constants[name] = constant
+            if replay_name_work is not None and not replay_name_work(0):
+                weight_reachability_in_progress.discard(cache_key)
+                return True
+            body_inputs = node_input_names(body_node)
+            any_tainted = any(input_name in tainted for input_name in body_inputs)
+            function_captures: frozenset[str] = frozenset()
+            if function is not None:
+                if function_attributes is None:
+                    function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_captures = graph_external_reference_names(
+                    function, function_attributes, replay_name_work=replay_name_work
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
+                if dependency_names_exceeded_limit(function_captures):
+                    return finish(True)
+            tainted_function_captures = function_captures & tainted
+            has_tainted_nested_capture = False
+            if not any_tainted:
+                for attribute in direct_graph_attributes(body_node, function):
+                    resolved_attribute = resolve_reentry_attribute(attribute)
+                    if resolved_attribute is None:
+                        continue
+                    for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                        if not subgraph_has_potential_weight_consumer(
+                            nested_graph,
+                            opset_versions,
+                            attribute_bindings=local_attribute_bindings,
+                            depth=depth + 1,
+                            replay_name_work=replay_name_work,
+                        ):
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
+                            continue
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                        if (
+                            graph_external_reference_names(
+                                nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                            )
+                            & tainted
+                        ):
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
+                            has_tainted_nested_capture = True
+                            break
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                    if has_tainted_nested_capture:
+                        break
+            if (
+                not body_outputs_live_after
+                and not any_tainted
+                and not has_tainted_nested_capture
+                and not tainted_function_captures
+            ):
+                continue
+            function_tainted_outputs: set[str] = set()
+            inspected_nested_taint = False
+            if (any_tainted or tainted_function_captures) and function is not None:
+                if function_attributes is None:
+                    function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                if function_versions is None:
+                    function_versions = function_opset_versions(function, opset_versions)
+                    if function_versions is None:
+                        return finish(True)
+                if function_has_weight_consumer is None:
+                    function_has_weight_consumer = subgraph_has_potential_weight_consumer(
+                        function,
+                        function_versions,
+                        attribute_bindings=function_attributes,
+                        depth=depth + 1,
+                        replay_name_work=replay_name_work,
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                function_input_names = set(tainted_function_captures)
+                function_bindings = dict(
+                    zip(
+                        (
+                            prepared_replay_value_name(value, replay_name_work)
+                            for value in replay_admitted_values(function.input, replay_name_work)
+                        ),
+                        node_input_slots(body_node),
+                        strict=False,
+                    )
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    weight_reachability_in_progress.discard(cache_key)
+                    return True
+
+                def independent_function_value(
+                    name: str,
+                    bindings: Mapping[str, str] = function_bindings,
+                    captures: frozenset[str] = function_captures,
+                ) -> bool:
+                    if name in bindings:
+                        return independent_value(bindings[name])
+                    return name in captures and independent_value(name)
+
+                for input_index, input_name in enumerate(node_input_slots(body_node)):
+                    if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
+                        continue
+                    function_input_name = prepared_replay_value_name(function.input[input_index], replay_name_work)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                    if not function_input_name:
+                        continue
+                    function_input_names.add(function_input_name)
+                for function_input_name in sorted(function_input_names):
+                    if function_has_weight_consumer and subgraph_state_input_can_reach_weight_consumer(
+                        function,
+                        function_input_name,
+                        function_versions,
+                        attribute_bindings=function_attributes,
+                        depth=depth + 1,
+                        inherited_constants=bound_function_constants(
+                            function,
+                            node_input_slots(body_node),
+                            graph_constants,
+                            attribute_bindings=function_attributes,
+                            replay_name_work=replay_name_work,
+                        )[0],
+                        exclude_activation_inputs=exclude_activation_inputs,
+                        proven_weight_inputs=proven_weight_inputs,
+                        proven_weight_inputs_path=(*proven_weight_inputs_path, id(body_node), id(function)),
+                        inherited_independent_value=independent_function_value,
+                        replay_name_work=replay_name_work,
+                    ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                        return finish(True)
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                if function_input_names:
+                    function_tainted_outputs.update(
+                        mapped_node_outputs(
+                            body_output_slots,
+                            graph_tainted_output_indexes(
+                                function,
+                                function_input_names,
+                                function_versions,
+                                attribute_bindings=function_attributes,
+                                depth=depth + 1,
+                                inherited_constants=bound_function_constants(
+                                    function,
+                                    node_input_slots(body_node),
+                                    graph_constants,
+                                    attribute_bindings=function_attributes,
+                                    replay_name_work=replay_name_work,
+                                )[0],
+                                replay_name_work=replay_name_work,
+                            ),
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                tainted.update(function_tainted_outputs)
+            for attribute in direct_graph_attributes(body_node, function):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    captured_names = set(
+                        graph_external_reference_names(
+                            nested_graph, local_attribute_bindings, replay_name_work=replay_name_work
+                        )
+                        & tainted
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                    captured_names.update(
+                        bound_control_flow_graph_inputs(
+                            body_node,
+                            nested_graph,
+                            tainted,
+                            opset_versions,
+                            identifier=function_key,
+                            replay_name_work=replay_name_work,
+                        )
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                    if not captured_names:
+                        continue
+                    inspected_nested_taint = True
+                    output_indexes, recurrent_names = control_flow_tainted_outputs(
+                        body_node,
+                        nested_graph,
+                        captured_names,
+                        opset_versions,
+                        graph_constants,
+                        local_attribute_bindings,
+                        depth=depth + 1,
+                        replay_name_work=replay_name_work,
+                    )
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                    if subgraph_has_potential_weight_consumer(
+                        nested_graph,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                        replay_name_work=replay_name_work,
+                    ):
+                        if replay_name_work is not None and not replay_name_work(0):
+                            weight_reachability_in_progress.discard(cache_key)
+                            return True
+                        if recurrent_names and graph_taint_work_remaining <= 0:
+                            return finish(True)
+                        for input_name in recurrent_names:
+                            if subgraph_state_input_can_reach_weight_consumer(
+                                nested_graph,
+                                input_name,
+                                opset_versions,
+                                attribute_bindings=local_attribute_bindings,
+                                depth=depth + 1,
+                                inherited_constants=graph_constants,
+                                exclude_activation_inputs=exclude_activation_inputs,
+                                proven_weight_inputs=proven_weight_inputs,
+                                proven_weight_inputs_path=(*proven_weight_inputs_path, id(body_node), id(nested_graph)),
+                                inherited_independent_value=independent_value,
+                                control_flow_owner=body_node,
+                                replay_name_work=replay_name_work,
+                            ):
+                                if replay_name_work is not None and not replay_name_work(0):
+                                    weight_reachability_in_progress.discard(cache_key)
+                                    return True
+                                return finish(True)
+                            if replay_name_work is not None and not replay_name_work(0):
+                                weight_reachability_in_progress.discard(cache_key)
+                                return True
+                    if replay_name_work is not None and not replay_name_work(0):
+                        weight_reachability_in_progress.discard(cache_key)
+                        return True
+                    if body_outputs_live_after:
+                        tainted.update(
+                            mapped_node_outputs(
+                                body_output_slots,
+                                output_indexes,
+                                graph_output_offset=control_flow_output_offset(body_node, identifier=function_key),
+                            )
+                        )
+            recorded_weights = (proven_weight_inputs or {}).get((*proven_weight_inputs_path, id(body_node)))
+            activation_weight_inputs = {
+                input_index
+                for input_index, input_name in enumerate(node_input_slots(body_node))
+                if exclude_activation_inputs
+                and recorded_weights is not None
+                and recorded_weights[0] is body_node
+                and input_index in recorded_weights[1]
+                and input_name not in tainted
+                and independent_value(input_name)
+            }
+            if exclude_activation_inputs and graph_taint_work_remaining <= 0:
+                return finish(True)
+            if any(
+                input_name in tainted
+                and not (
+                    _onnx_activation_input_candidate(body_node, input_index, identifier=function_key)
+                    and activation_weight_inputs
+                    and (len(activation_weight_inputs) > 1 or input_index not in activation_weight_inputs)
+                )
+                and _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                    identifier=function_key,
+                )
+                for input_index, input_name in enumerate(node_input_slots(body_node))
+            ):
+                return finish(True)
+            if any_tainted and body_outputs_live_after and function is None and not inspected_nested_taint:
+                tainted.update(body_outputs)
+        return finish(False)
+
+    def stacked_scan_output_insert_axis(
+        scan_output_axes: tuple[int, ...],
+        stacked_scan_output_start: int,
+        output_index: int,
+        *,
+        default_axis: int = 0,
+    ) -> int:
+        scan_output_index = output_index - stacked_scan_output_start
+        if scan_output_index < 0 or scan_output_index >= len(scan_output_axes):
+            return default_axis
+        return scan_output_axes[scan_output_index]
+
+    def insert_shape_axis(shape: tuple[int, ...], raw_axis: int, extent: int = -1) -> tuple[int, ...] | None:
+        output_rank = len(shape) + 1
+        axis = raw_axis if raw_axis >= 0 else output_rank + raw_axis
+        if axis < 0 or axis > len(shape):
+            return None
+        if not shape_inference_available(output_rank):
+            return None
+        return inserted_shape(shape, axis, (extent,))
+
+    def insert_rank_axis(rank: int, raw_axis: int) -> int | None:
+        output_rank = rank + 1
+        axis = raw_axis if raw_axis >= 0 else output_rank + raw_axis
+        if axis < 0 or axis > rank:
+            return None
+        return output_rank
+
+    def graph_capture_container_size(attribute: Any) -> int:
+        return int(_onnx_has_singular_field(attribute, "g")) + len(getattr(attribute, "graphs", ()))
+
+    def graph_capture_attribute_is_resolved(attribute: Any, resolved: Any | None) -> bool:
+        if resolved is None or bool(getattr(resolved, "ref_attr_name", "")):
+            return False
+        if getattr(attribute, "ref_attr_name", ""):
+            expected_type = int(getattr(attribute, "type", 0))
+            if expected_type == 0 or int(getattr(resolved, "type", 0)) != expected_type:
+                return False
+        return int(getattr(resolved, "type", 0)) != int(onnx.AttributeProto.GRAPH) or _onnx_has_singular_field(
+            resolved, "g"
+        )
+
+    graph_external_reference_cache: dict[tuple[Any, ...], tuple[Any, frozenset[str]]] = {}
+    graph_external_reference_in_progress: set[tuple[Any, ...]] = set()
+    graph_external_function_owners = {id(function) for function in functions.values()}
+    graph_external_function_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def graph_external_reference_names(
+        graph: Any,
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        depth: int = 0,
+        require_resolved_bindings: bool = False,
+        capture_opset_versions: dict[str, int] | None = None,
+        replay_name_work: Callable[[int], bool] | None = None,
+    ) -> frozenset[str]:
+        nonlocal graph_external_function_work_remaining
+        if replay_name_work is not None and not replay_name_work(0):
+            return dependency_collection_limit
+        capture_opset_key = None
+        if require_resolved_bindings:
+            if capture_opset_versions is None:
+                return dependency_collection_limit
+            capture_opset_key = opset_cache_key(capture_opset_versions)
+            if capture_opset_key is None:
+                return dependency_collection_limit
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        # Capture names depend on graph-bearing values and scalar binding
+        # validity, not scalar contents. Preserve names and types in strict
+        # proofs so missing or mismatched bindings cannot reuse a valid result.
+        capture_attribute_key: list[tuple[str, str, str]] = []
+        for entry in attribute_key:
+            binding = (attribute_bindings or {}).get(entry[0])
+            graph_dependent = binding is not None and (
+                getattr(binding, "type", None) in {onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS}
+                or _onnx_has_singular_field(binding, "g")
+                or bool(getattr(binding, "graphs", ()))
+                or bool(getattr(binding, "ref_attr_name", ""))
+            )
+            if graph_dependent:
+                capture_attribute_key.append(entry)
+            elif require_resolved_bindings:
+                capture_attribute_key.append((entry[0], "capture-binding-type", str(getattr(binding, "type", None))))
+        attribute_key = tuple(capture_attribute_key)
+        cache_key = (id(graph), attribute_key, depth, require_resolved_bindings, capture_opset_key)
+        if depth > 6 or cache_key in graph_external_reference_in_progress:
+            return frozenset({dependency_collection_limit_marker})
+        cached_reference_names = graph_external_reference_cache.get(cache_key)
+        if cached_reference_names is not None and cached_reference_names[0] is graph:
+            return cached_reference_names[1]
+        if id(graph) in graph_external_function_owners or require_resolved_bindings:
+            work = max(len(getattr(graph, "input", ())) + len(getattr(graph, "output", ())) + len(graph.node), 1)
+            if require_resolved_bindings:
+                work += len(getattr(graph, "initializer", ())) + len(getattr(graph, "sparse_initializer", ()))
+            if work <= graph_external_function_work_remaining:
+                for function_node in graph.node:
+                    work += len(function_node.input) + len(function_node.output) + len(function_node.attribute)
+                    if work > graph_external_function_work_remaining:
+                        break
+            if work > graph_external_function_work_remaining:
+                graph_external_function_work_remaining = 0
+                plan.coverage_gaps.setdefault("function_capture_work_limit", 1)
+                return dependency_collection_limit
+            graph_external_function_work_remaining -= work
+        graph_external_reference_in_progress.add(cache_key)
+        local_names: set[str] = set()
+        for values, name_only in (
+            (getattr(graph, "input", ()), False),
+            (getattr(graph, "initializer", ()), True),
+            ((getattr(item, "values", None) for item in getattr(graph, "sparse_initializer", ())), True),
+        ):
+            for value in values:
+                name = admitted_replay_value_name(value, replay_name_work, name_only=name_only)
+                if name is None:
+                    graph_external_reference_in_progress.discard(cache_key)
+                    return dependency_collection_limit
+                if name:
+                    local_names.add(name)
+        produced_names = set(local_names)
+        referenced_names: set[str] = set()
+        for graph_output in getattr(graph, "output", ()):
+            output_name = admitted_replay_value_name(graph_output, replay_name_work)
+            if output_name is None:
+                graph_external_reference_in_progress.discard(cache_key)
+                return dependency_collection_limit
+            if output_name:
+                referenced_names.add(output_name)
+        for graph_node in getattr(graph, "node", ()):
+            for io_field, names in (("input", referenced_names), ("output", produced_names)):
+                for value in getattr(graph_node, io_field, ()):
+                    name = admitted_replay_value_name(value, replay_name_work)
+                    if name is None:
+                        graph_external_reference_in_progress.discard(cache_key)
+                        return dependency_collection_limit
+                    if name:
+                        names.add(name)
+            identifier = bounded_operator_identifier(graph_node)
+            if identifier is None:
+                graph_external_reference_in_progress.discard(cache_key)
+                graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                return dependency_collection_limit
+            function = functions.get(identifier)
+            if function is not None:
+                function_attributes = bound_function_attributes(
+                    function,
+                    graph_node,
+                    lambda attribute: (
+                        (attribute_bindings or {}).get(str(attribute.ref_attr_name))
+                        if getattr(attribute, "ref_attr_name", "")
+                        else attribute
+                    ),
+                )
+                nested_capture_opsets = capture_opset_versions
+                if require_resolved_bindings and capture_opset_versions is not None:
+                    nested_capture_opsets = function_opset_versions(function, capture_opset_versions)
+                    if nested_capture_opsets is None:
+                        graph_external_reference_in_progress.discard(cache_key)
+                        graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                        return dependency_collection_limit
+                function_references = graph_external_reference_names(
+                    function,
+                    function_attributes,
+                    depth=depth + 1,
+                    require_resolved_bindings=require_resolved_bindings,
+                    capture_opset_versions=nested_capture_opsets,
+                    replay_name_work=replay_name_work,
+                )
+                if replay_name_work is not None and not replay_name_work(0):
+                    graph_external_reference_in_progress.discard(cache_key)
+                    return dependency_collection_limit
+                if require_resolved_bindings and dependency_names_exceeded_limit(function_references):
+                    graph_external_reference_in_progress.discard(cache_key)
+                    graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                    return dependency_collection_limit
+                referenced_names.update(function_references)
+            for attribute in direct_graph_attributes(graph_node, function):
+                reference_name = str(getattr(attribute, "ref_attr_name", ""))
+                resolved_attribute = (attribute_bindings or {}).get(reference_name) if reference_name else attribute
+                if require_resolved_bindings and not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
+                    graph_external_reference_in_progress.discard(cache_key)
+                    graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                    return dependency_collection_limit
+                if resolved_attribute is not None:
+                    if require_resolved_bindings:
+                        container_work = graph_capture_container_size(resolved_attribute)
+                        if container_work > graph_external_function_work_remaining:
+                            graph_external_function_work_remaining = 0
+                            plan.coverage_gaps.setdefault("function_capture_work_limit", 1)
+                            graph_external_reference_in_progress.discard(cache_key)
+                            graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                            return dependency_collection_limit
+                        graph_external_function_work_remaining -= container_work
+                    for subgraph in _iter_attribute_graphs(resolved_attribute):
+                        subgraph_references = graph_external_reference_names(
+                            subgraph,
+                            attribute_bindings,
+                            depth=depth + 1,
+                            require_resolved_bindings=require_resolved_bindings,
+                            capture_opset_versions=capture_opset_versions,
+                            replay_name_work=replay_name_work,
+                        )
+                        if replay_name_work is not None and not replay_name_work(0):
+                            graph_external_reference_in_progress.discard(cache_key)
+                            return dependency_collection_limit
+                        if require_resolved_bindings and dependency_names_exceeded_limit(subgraph_references):
+                            graph_external_reference_in_progress.discard(cache_key)
+                            graph_external_reference_cache[cache_key] = (graph, dependency_collection_limit)
+                            return dependency_collection_limit
+                        referenced_names.update(subgraph_references)
+        reference_names = frozenset(referenced_names - produced_names - local_names)
+        if dependency_collection_limit_marker in referenced_names:
+            reference_names |= dependency_collection_limit
+        graph_external_reference_in_progress.discard(cache_key)
+        graph_external_reference_cache[cache_key] = (graph, reference_names)
+        return reference_names
+
+    def attribute_string_payload_size(attribute: Any) -> int | None:
+        if raw_control_admission is not None and raw_control_admission.model is model:
+            entry = raw_control_admission.string_attribute_lengths.get(id(attribute))
+            if entry is not None and entry[0] is attribute:
+                return entry[1]
+        plan.coverage_gaps.setdefault("attribute_string_provenance_missing", 1)
+        return None
+
+    padding_mode_cache: dict[int, tuple[Any, bytes | None]] = {}
+
+    def parsed_padding_mode(attribute: Any) -> bytes | None:
+        cached = padding_mode_cache.get(id(attribute))
+        if cached is not None and cached[0] is attribute:
+            return cached[1]
+        # Share the existing plan-wide attribute allowance, including refusals.
+        if not reserve_function_default_work(1):
+            return None
+        padding_mode_cache[id(attribute)] = (attribute, None)
+        payload_size = attribute_string_payload_size(attribute)
+        if payload_size is None:
+            return None
+        if payload_size > 10:  # The longest supported enum is SAME_UPPER/LOWER.
+            plan.coverage_gaps.setdefault("padding_mode_byte_limit", 1)
+            return None
+        value: bytes = attribute.s
+        if value not in {b"", b"NOTSET", b"VALID", b"SAME_UPPER", b"SAME_LOWER"}:
+            return None
+        padding_mode_cache[id(attribute)] = (attribute, value)
+        return value
+
+    einsum_equation_cache: dict[int, tuple[Any, tuple[tuple[str, ...], str] | None]] = {}
+    einsum_equation_work_remaining = _ONNX_EINSUM_EQUATION_WORK_LIMIT
+    einsum_equation_bytes_remaining = _ONNX_EINSUM_EQUATION_BYTE_LIMIT
+
+    def parsed_einsum_equation(node: Any) -> tuple[tuple[str, ...], str] | None:
+        nonlocal einsum_equation_work_remaining, einsum_equation_bytes_remaining
+        cached = einsum_equation_cache.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        if einsum_equation_work_remaining <= 0:
+            plan.coverage_gaps.setdefault("einsum_equation_work_limit", 1)
+            return None
+        if einsum_equation_bytes_remaining <= 0 or _ONNX_EINSUM_EQUATION_MAX_BYTES <= 0:
+            einsum_equation_work_remaining -= 1
+            einsum_equation_cache[id(node)] = (node, None)
+            plan.coverage_gaps.setdefault("einsum_equation_byte_limit", 1)
+            return None
+        attributes = getattr(node, "attribute", ())
+        work = 1 + len(attributes) + len(getattr(node, "input", ()))
+        if work > einsum_equation_work_remaining:
+            # Negative owners also consume an entry; exhaustion retains nothing.
+            einsum_equation_work_remaining -= 1
+            einsum_equation_cache[id(node)] = (node, None)
+            plan.coverage_gaps.setdefault("einsum_equation_work_limit", 1)
+            return None
+        einsum_equation_work_remaining -= work
+        # Nodes and literal attributes are immutable during a plan. Referenced
+        # equations remain unsupported, so this key does not depend on bindings.
+        einsum_equation_cache[id(node)] = (node, None)
+        attribute = next((item for item in attributes if item.name == "equation"), None)
+        if attribute is None or int(getattr(attribute, "type", 0)) != int(onnx.AttributeProto.STRING):
+            return None
+        if getattr(attribute, "ref_attr_name", "") or not _onnx_has_singular_field(attribute, "s"):
+            return None
+        payload_size = attribute_string_payload_size(attribute)
+        if payload_size is None:
+            return None
+        if payload_size > _ONNX_EINSUM_EQUATION_MAX_BYTES or payload_size > einsum_equation_bytes_remaining:
+            plan.coverage_gaps.setdefault("einsum_equation_byte_limit", 1)
+            return None
+        # The exact final wire-field length admits the allocating protobuf getter.
+        # Message ByteSize can itself serialize unrelated payloads on upb.
+        einsum_equation_bytes_remaining -= payload_size
+        try:
+            equation_bytes = bytes(attribute.s)
+            equation = equation_bytes.decode("utf-8")
+        except (AttributeError, TypeError, UnicodeDecodeError):
+            plan.coverage_gaps.setdefault("einsum_equation_decode_failure", 1)
+            return None
+        if "..." in equation or equation.count("->") != 1:
+            return None
+        input_expression, output_expression = (part.strip() for part in equation.split("->", 1))
+        input_count = len(node_input_names(node))
+        # An extra term proves a count mismatch without allocating every comma
+        # fragment in a malformed equation.
+        input_terms = tuple(term.strip() for term in input_expression.split(",", input_count))
+        if len(input_terms) != input_count:
+            return None
+        if len(output_expression) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+            return None
+        if len(set(output_expression)) != len(output_expression):
+            return None
+        parsed = (input_terms, output_expression)
+        einsum_equation_cache[id(node)] = (node, parsed)
+        return parsed
+
+    def einsum_output_shape(
+        node: Any,
+        input_shapes_by_name: dict[str, tuple[int, ...] | None],
+    ) -> tuple[int, ...] | None:
+        parsed = parsed_einsum_equation(node)
+        if parsed is None:
+            return None
+        input_terms, output_expression = parsed
+        input_names = node_input_names(node)
+        label_dimensions: dict[str, int] = {}
+        for term, input_name in zip(input_terms, input_names, strict=False):
+            input_shape = input_shapes_by_name.get(input_name)
+            if input_shape is None or len(term) != len(input_shape) or len(set(term)) != len(term):
+                return None
+            for label, dimension in zip(term, input_shape, strict=False):
+                existing_dimension = label_dimensions.get(label)
+                if existing_dimension is None:
+                    label_dimensions[label] = dimension
+                elif existing_dimension != dimension:
+                    label_dimensions[label] = -1
+        if not shape_inference_available(len(output_expression)):
+            return None
+        output_dimensions: list[int] = []
+        for label in output_expression:
+            if label not in label_dimensions:
+                return None
+            output_dimensions.append(label_dimensions[label])
+        return inferred_shape(len(output_dimensions), output_dimensions)
+
+    def gap_summary_may_exceed_input_rank(summary: _OnnxWeightLineageGapSummary, input_rank: int | None) -> bool:
+        if summary.truncated:
+            return True
+        if input_rank is None:
+            return bool(summary.lineages)
+        return any(lineage.shape is None or len(lineage.shape) > input_rank for lineage in summary.lineages)
+
+    def gap_summary_has_known_rank_above_input(
+        summary: _OnnxWeightLineageGapSummary,
+        input_rank: int | None,
+    ) -> bool:
+        if summary.truncated:
+            return True
+        if input_rank is None:
+            return bool(summary.lineages)
+        return any(lineage.shape is not None and len(lineage.shape) > input_rank for lineage in summary.lineages)
+
+    def gap_summary_is_dynamic_activation(summary: _OnnxWeightLineageGapSummary, count: int) -> bool:
+        if count <= 0:
+            return True
+        if summary.truncated or not summary.lineages:
+            return False
+        return all(
+            lineage.unresolved_reason in {"dynamic_activation_lineage", "shape_control_lineage"}
+            for lineage in summary.lineages
+        )
+
+    def operator_output_may_have_weight_rank(
+        node: Any,
+        *,
+        input_shape: tuple[int, ...] | None,
+        index_shape: tuple[int, ...] | None,
+        constants: dict[str, Any],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+        input_shapes_by_name: dict[str, tuple[int, ...] | None] | None = None,
+        promotion_input_shapes: Sequence[tuple[int, ...] | None] | None = None,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        operator_type = node.op_type if identifier is None else identifier[1]
+        if operator_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or operator_type == "Pow":
+            input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+            input_shapes = (
+                [input_shapes_by_name.get(input_name) for input_name in input_names] if input_shapes_by_name else []
+            )
+            if not input_shapes or any(shape is None for shape in input_shapes):
+                return True
+            output_shape = broadcast_shapes(input_shapes)
+            if output_shape is None:
+                return True
+            if promotion_input_shapes:
+                if any(shape is None for shape in promotion_input_shapes):
+                    return True
+                if all(shape == output_shape for shape in promotion_input_shapes):
+                    return False
+            return len(output_shape) >= 2
+        if operator_type == "MatMul":
+            input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+            left_shape = input_shape
+            right_shape = index_shape
+            if input_shapes_by_name and input_names:
+                left_shape = input_shapes_by_name.get(input_names[0])
+                right_shape = input_shapes_by_name.get(input_names[1]) if len(input_names) > 1 else None
+            output_shape = matmul_output_shape(left_shape, right_shape)
+            if output_shape is None:
+                return True
+            if output_shape in (left_shape, right_shape):
+                return False
+            return len(output_shape) >= 2
+        if operator_type == "OneHot":
+            input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+            indices_shape = input_shape
+            if input_shapes_by_name and input_names:
+                indices_shape = input_shapes_by_name.get(input_names[0])
+            output_shape = onehot_output_shape(node, indices_shape, constants, resolve_attribute)
+            return output_shape is None or len(output_shape) >= 2
+        if operator_type == "Einsum":
+            output_shape = einsum_output_shape(node, input_shapes_by_name or {})
+            return output_shape is None or len(output_shape) >= 2
+        if operator_type == "Expand":
+            shape_name = str(node.input[1]) if len(node.input) > 1 else ""
+            target_shape = constant_int64_vector_values(constants.get(shape_name))
+            if target_shape is None or input_shape is None:
+                return True
+            output_shape = broadcast_shapes((input_shape, target_shape))
+            return output_shape is None or len(output_shape) >= 2
+        if operator_type == "Gather":
+            if input_shape is None or index_shape is None:
+                return True
+            axis = _onnx_gather_axis(node, len(input_shape), resolve_attribute)
+            if axis is None:
+                return True
+            return len(input_shape) + len(index_shape) - 1 >= 2
+        if operator_type == "GatherElements":
+            return index_shape is None or len(index_shape) >= 2
+        if operator_type == "GatherND":
+            if input_shape is None or index_shape is None or not index_shape:
+                return True
+            output_shape = gathernd_output_shape(
+                node,
+                input_shape=input_shape,
+                index_shape=index_shape,
+                resolve_attribute=resolve_attribute,
+            )
+            if output_shape is None:
+                return True
+            return len(output_shape) >= 2
+        if operator_type == "Flatten":
+            return True
+        if operator_type == "Unsqueeze":
+            axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+            if axes is None or input_shape is None:
+                return True
+            output_rank = len(input_shape) + len(axes)
+            normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
+            if (
+                not normalized_axes
+                or len(set(normalized_axes)) != len(normalized_axes)
+                or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
+            ):
+                return True
+            return output_rank >= 2
+        if operator_type == "Squeeze":
+            axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+            if axes is None or input_shape is None:
+                return True
+            normalized_axes = tuple(axis if axis >= 0 else len(input_shape) + axis for axis in axes)
+            if not normalized_axes:
+                output_shape = implicit_squeeze_shape(node, input_shape, resolve_attribute, identifier=identifier)
+                return output_shape is None or len(output_shape) >= 2
+            if (
+                len(set(normalized_axes)) != len(normalized_axes)
+                or any(axis < 0 or axis >= len(input_shape) for axis in normalized_axes)
+                or any(input_shape[axis] != 1 for axis in normalized_axes)
+            ):
+                return True
+            return len(input_shape) - len(set(normalized_axes)) >= 2
+        if operator_type == "Reshape":
+            shape_name = str(node.input[1]) if len(node.input) > 1 else ""
+            shape_initializer = constants.get(shape_name)
+            allowzero = resolved_onnx_int_attribute(node, "allowzero", resolve_attribute=resolve_attribute)
+            if shape_initializer is None or input_shape is None or allowzero is None:
+                return True
+            resolved_shape = _resolve_onnx_reshape_shape(
+                input_shape,
+                shape_initializer,
+                allowzero=bool(allowzero),
+                onnx=onnx,
+                resolve_int64_vector=constant_int64_vector_values,
+            )
+            return resolved_shape is None or len(resolved_shape) >= 2
+        return False
+
+    def value_info_shape(value_info: Any, *, preserve_unknown: bool = False) -> tuple[int, ...] | None:
         try:
             tensor_type = value_info.type.tensor_type
             if not tensor_type.HasField("shape"):
                 return None
+            if not shape_inference_available(len(tensor_type.shape.dim)):
+                return None
             dimensions: list[int] = []
             for dimension in tensor_type.shape.dim:
                 if not dimension.HasField("dim_value"):
-                    return None
-                dimensions.append(int(dimension.dim_value))
+                    if not preserve_unknown:
+                        return None
+                    dimensions.append(-1)
+                else:
+                    dimensions.append(int(dimension.dim_value))
             return tuple(dimensions)
         except (AttributeError, TypeError, ValueError):
+            return None
+
+    def value_info_rank(value_info: Any) -> int | None:
+        try:
+            tensor_type = value_info.type.tensor_type
+            if not tensor_type.HasField("shape"):
+                return None
+            return len(tensor_type.shape.dim)
+        except AttributeError:
             return None
 
     def broadcast_shapes(shapes: Iterable[tuple[int, ...] | None]) -> tuple[int, ...] | None:
@@ -1800,6 +7163,8 @@ def _build_onnx_weight_analysis_plan(
             return None
         known_shapes = [shape for shape in concrete_shapes if shape is not None]
         output_rank = max((len(shape) for shape in known_shapes), default=0)
+        if not shape_inference_available(output_rank):
+            return None
         output_dimensions: list[int] = []
         for offset in range(1, output_rank + 1):
             dimensions = [shape[-offset] if len(shape) >= offset else 1 for shape in known_shapes]
@@ -1807,7 +7172,77 @@ def _build_onnx_weight_analysis_plan(
             if len(non_singleton_dimensions) > 1:
                 return None
             output_dimensions.append(next(iter(non_singleton_dimensions), 1))
-        return tuple(reversed(output_dimensions))
+        return inferred_shape(output_rank, reversed(output_dimensions))
+
+    def matmul_output_shape(
+        left_shape: tuple[int, ...] | None,
+        right_shape: tuple[int, ...] | None,
+    ) -> tuple[int, ...] | None:
+        if left_shape is None or right_shape is None:
+            return None
+        left_rank = len(left_shape)
+        right_rank = len(right_shape)
+        if left_rank == 0 or right_rank == 0:
+            return None
+        if left_rank == 1 and right_rank == 1:
+            return ()
+        if left_rank == 1:
+            return inferred_shape(right_rank - 1, chain(right_shape[:-2], (right_shape[-1],)))
+        if right_rank == 1:
+            return left_shape[:-1]
+        batch_shape = broadcast_shapes((left_shape[:-2], right_shape[:-2]))
+        if batch_shape is None:
+            return None
+        return inferred_shape(len(batch_shape) + 2, chain(batch_shape, (left_shape[-2], right_shape[-1])))
+
+    def onehot_output_shape(
+        node: Any,
+        indices_shape: tuple[int, ...] | None,
+        constants: dict[str, Any],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> tuple[int, ...] | None:
+        if indices_shape is None:
+            return None
+        output_rank = len(indices_shape) + 1
+        raw_axis = resolved_onnx_int_attribute(node, "axis", -1, resolve_attribute)
+        if raw_axis is None:
+            return None
+        axis = raw_axis if raw_axis >= 0 else output_rank + raw_axis
+        if axis < 0 or axis >= output_rank:
+            return None
+        depth_extent = -1
+        depth_name = str(node.input[1]) if len(node.input) > 1 else ""
+        depth_value = constant_scalar_value(constants.get(depth_name), int(onnx.TensorProto.INT64))
+        if depth_value is not None:
+            try:
+                depth_extent = max(int(depth_value), -1)
+            except (TypeError, ValueError):
+                depth_extent = -1
+        if not shape_inference_available(output_rank):
+            return None
+        return inserted_shape(indices_shape, axis, (depth_extent,))
+
+    def flattened_shape_extent(dimensions: tuple[int, ...]) -> int:
+        return _onnx_shape_extent_product(dimensions)
+
+    def flattened_output_shape(input_shape: tuple[int, ...], axis: int | None) -> tuple[int, ...] | None:
+        if axis is None:
+            return None
+        if axis < 0:
+            axis += len(input_shape)
+        if axis < 0 or axis > len(input_shape):
+            return None
+        return (flattened_shape_extent(input_shape[:axis]), flattened_shape_extent(input_shape[axis:]))
+
+    def broadcast_rank_from_input_ranks(ranks: Iterable[int | None]) -> int | None:
+        observed_ranks = list(ranks)
+        known_ranks = [rank for rank in observed_ranks if rank is not None]
+        if not known_ranks:
+            return None
+        output_rank = max(known_ranks)
+        if any(rank is None for rank in observed_ranks):
+            return None
+        return output_rank
 
     groups: list[dict[tuple[Any, ...], _OnnxWeightConsumerGroup]] = []
     eligible_initializer_indexes: set[int] = set()
@@ -1851,12 +7286,26 @@ def _build_onnx_weight_analysis_plan(
             unresolved_reason=unresolved_reason,
         )
 
+    def resolved_lineage_shape(lineages: Iterable[_OnnxWeightLineage]) -> tuple[int, ...] | None:
+        shape = None
+        for lineage in lineages:
+            if lineage.unresolved_reason is not None or lineage.shape is None:
+                return None
+            if shape is not None and shape != lineage.shape:
+                return None
+            shape = lineage.shape
+        return shape
+
     def record_exclusion(
         initializer_index: int,
         reason: str,
         node: Any | None = None,
         input_index: int | None = None,
+        *,
+        collect_weight_consumers: bool = True,
     ) -> None:
+        if not collect_weight_consumers:
+            return
         plan.exclusion_counts[reason] = plan.exclusion_counts.get(reason, 0) + 1
         if len(plan.exclusion_samples) >= _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
             return
@@ -1886,7 +7335,11 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         node_index: int,
         input_index: int,
+        *,
+        collect_weight_consumers: bool = True,
     ) -> None:
+        if not collect_weight_consumers:
+            return
         eligible_initializer_indexes.add(lineage.initializer_index)
         plan.record_coverage_gap("unresolved_initializer_lineage")
         if len(plan.unresolved_lineage_samples) >= _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
@@ -1904,6 +7357,10 @@ def _build_onnx_weight_analysis_plan(
                 "lineage_transform_count": len(lineage.transforms),
             },
         )
+
+    def record_weight_lineage_limit_gap(count: int, *, collect_weight_consumers: bool) -> None:
+        if collect_weight_consumers:
+            plan.record_coverage_gap("lineages_per_value_limit", count)
 
     def record_training_binding_gap(
         lineage: _OnnxWeightLineage,
@@ -1935,8 +7392,12 @@ def _build_onnx_weight_analysis_plan(
         node_index: int,
         input_index: int,
         output_axes: tuple[int, ...],
+        *,
+        collect_weight_consumers: bool = True,
     ) -> None:
         nonlocal consumer_sample_count
+        if not collect_weight_consumers:
+            return
         initializer = initializers[lineage.initializer_index]
         if int(initializer.data_type) not in floating_types:
             record_exclusion(lineage.initializer_index, "non_floating_weight", node, input_index)
@@ -1976,29 +7437,128 @@ def _build_onnx_weight_analysis_plan(
             consumer_sample_count += 1
         eligible_initializer_indexes.add(lineage.initializer_index)
 
+    weight_transform_attribute_types = {
+        "Cast": {"to": int(onnx.AttributeProto.INT)},
+        "Flatten": {"axis": int(onnx.AttributeProto.INT)},
+        "Transpose": {"perm": int(onnx.AttributeProto.INTS)},
+        "Squeeze": {
+            "axes": int(onnx.AttributeProto.INTS),
+            "noop_with_empty_axes": int(onnx.AttributeProto.INT),
+        },
+        "Unsqueeze": {"axes": int(onnx.AttributeProto.INTS)},
+        "Reshape": {"allowzero": int(onnx.AttributeProto.INT)},
+        "GatherND": {"batch_dims": int(onnx.AttributeProto.INT)},
+    }
+
+    def resolved_weight_transform_attribute(
+        node: Any,
+        attribute: Any,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> Any | None:
+        resolved = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+        expected_type = weight_transform_attribute_types.get(node.op_type, {}).get(str(attribute.name))
+        if (
+            resolved is None
+            or expected_type is None
+            or bool(getattr(resolved, "ref_attr_name", ""))
+            or int(getattr(resolved, "type", 0)) != expected_type
+            or (expected_type == int(onnx.AttributeProto.INT) and not _onnx_has_singular_field(resolved, "i"))
+        ):
+            return None
+        return resolved
+
+    def weight_transform_proof_error(
+        node: Any,
+        *,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+        cast_target_data_type: int | None = None,
+    ) -> str | None:
+        attribute_types = weight_transform_attribute_types.get(node.op_type, {})
+        for attribute in getattr(node, "attribute", ()):
+            reference_name = getattr(attribute, "ref_attr_name", "")
+            if (
+                reference_name
+                and node.op_type == "Cast"
+                and resolve_attribute is None
+                and cast_target_data_type is not None
+            ):
+                continue
+            if reference_name and (
+                resolve_attribute is None
+                or attribute.name not in attribute_types
+                or resolved_weight_transform_attribute(node, attribute, resolve_attribute) is None
+            ):
+                return "referenced_function_attribute"
+            if (
+                attribute.name in attribute_types
+                and resolved_weight_transform_attribute(node, attribute, resolve_attribute) is None
+            ):
+                return "invalid_transform_attribute"
+        if node.op_type == "Cast":
+            target_data_type = (
+                cast_output_data_type(node, resolve_attribute)
+                if resolve_attribute is not None or cast_target_data_type is None
+                else cast_target_data_type
+            )
+            if target_data_type is None or not valid_cast_data_type(target_data_type):
+                return "invalid_cast_target"
+        return None
+
     def transformed_lineage(
         lineage: _OnnxWeightLineage,
         node: Any,
         constants: dict[str, Any],
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineage:
-        if any(getattr(attribute, "ref_attr_name", "") for attribute in getattr(node, "attribute", ())):
+        effective_cast_data_type = None
+        if node.op_type == "Cast":
+            effective_cast_data_type = (
+                cast_output_data_type(node, resolve_attribute)
+                if resolve_attribute is not None or cast_target_data_type is None
+                else cast_target_data_type
+            )
+            if effective_cast_data_type is not None and not valid_cast_data_type(effective_cast_data_type):
+                effective_cast_data_type = None
+
+        def unresolved_transform(reason: str) -> _OnnxWeightLineage:
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=None,
-                data_type=lineage.data_type,
+                data_type=effective_cast_data_type if node.op_type == "Cast" else lineage.data_type,
                 transforms=lineage.transforms,
-                unresolved_reason=lineage.unresolved_reason or "referenced_function_attribute",
+                unresolved_reason=lineage.unresolved_reason or reason,
             )
+
+        def resolved_transform_attribute(attribute: Any) -> Any | None:
+            return resolved_weight_transform_attribute(node, attribute, resolve_attribute)
+
+        def transform_int_attribute(name: str, default: int = 0) -> int | None:
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name == name:
+                    resolved = resolved_transform_attribute(attribute)
+                    return int(resolved.i) if resolved is not None else None
+            return default
+
+        attribute_error = weight_transform_proof_error(
+            node, resolve_attribute=resolve_attribute, cast_target_data_type=cast_target_data_type
+        )
+        if attribute_error is not None:
+            return unresolved_transform(attribute_error)
         if node.op_type == "Identity":
             return lineage
         if node.op_type == "Cast":
-            target_data_type = _onnx_int_attribute(node, "to", -1)
+            target_data_type = effective_cast_data_type
+            if target_data_type is None:
+                return unresolved_transform("invalid_cast_target")
             if target_data_type == lineage.data_type:
                 return lineage
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=lineage.shape,
-                data_type=target_data_type if target_data_type >= 0 else None,
+                data_type=target_data_type,
                 transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason or "dtype_changing_cast_lineage",
             )
@@ -2022,9 +7582,8 @@ def _build_onnx_weight_analysis_plan(
         output_shape: tuple[int, ...]
         transform: _OnnxWeightTransform
         if node.op_type == "Flatten":
-            axis = _onnx_int_attribute(node, "axis", 1)
-            axis = axis if axis >= 0 else len(lineage.shape) + axis
-            if axis < 0 or axis > len(lineage.shape):
+            flattened_shape = flattened_output_shape(lineage.shape, transform_int_attribute("axis", 1))
+            if flattened_shape is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
                     shape=None,
@@ -2032,10 +7591,10 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "invalid_flatten_lineage",
                 )
-            output_shape = (math.prod(lineage.shape[:axis]), math.prod(lineage.shape[axis:]))
+            output_shape = flattened_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type in {"Squeeze", "Unsqueeze"}:
-            axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+            axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolved_transform_attribute)
             if axes is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -2047,12 +7606,12 @@ def _build_onnx_weight_analysis_plan(
             if node.op_type == "Squeeze":
                 normalized_axes = tuple(axis if axis >= 0 else len(lineage.shape) + axis for axis in axes)
                 if not normalized_axes:
+                    if squeeze_with_empty_axes_is_noop(node, axes, resolved_transform_attribute, shape=lineage.shape):
+                        return lineage
                     normalized_axes = tuple(index for index, dimension in enumerate(lineage.shape) if dimension == 1)
                 if (
-                    len(set(normalized_axes)) != len(normalized_axes)
-                    or any(axis < 0 or axis >= len(lineage.shape) for axis in normalized_axes)
-                    or any(lineage.shape[axis] != 1 for axis in normalized_axes)
-                ):
+                    not axes and implicit_squeeze_shape(node, lineage.shape, resolved_transform_attribute) is None
+                ) or not squeeze_axes_are_valid(normalized_axes, len(lineage.shape), lineage.shape):
                     return _OnnxWeightLineage(
                         initializer_index=lineage.initializer_index,
                         shape=None,
@@ -2064,13 +7623,8 @@ def _build_onnx_weight_analysis_plan(
                     dimension for index, dimension in enumerate(lineage.shape) if index not in normalized_axes
                 )
             else:
-                output_rank = len(lineage.shape) + len(axes)
-                normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
-                if (
-                    not normalized_axes
-                    or len(set(normalized_axes)) != len(normalized_axes)
-                    or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
-                ):
+                unsqueezed = unsqueezed_shape(lineage.shape, axes)
+                if unsqueezed is None:
                     return _OnnxWeightLineage(
                         initializer_index=lineage.initializer_index,
                         shape=None,
@@ -2078,20 +7632,11 @@ def _build_onnx_weight_analysis_plan(
                         transforms=lineage.transforms,
                         unresolved_reason=lineage.unresolved_reason or "invalid_unsqueeze_lineage",
                     )
-                source_dimensions = iter(lineage.shape)
-                output_shape = tuple(
-                    1 if index in normalized_axes else next(source_dimensions) for index in range(output_rank)
-                )
+                output_shape = unsqueezed
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "Transpose":
-            permutation = tuple(
-                int(value)
-                for value in next(
-                    (attribute.ints for attribute in node.attribute if attribute.name == "perm"),
-                    tuple(reversed(range(len(lineage.shape)))),
-                )
-            )
-            if sorted(permutation) != list(range(len(lineage.shape))):
+            permutation = transpose_permutation(node, len(lineage.shape), resolved_transform_attribute)
+            if permutation is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
                     shape=None,
@@ -2103,17 +7648,94 @@ def _build_onnx_weight_analysis_plan(
                 return lineage
             transform = _OnnxWeightTransform("Transpose", permutation)
             output_shape = tuple(lineage.shape[index] for index in permutation)
+        elif node.op_type == "Expand":
+            shape_name = str(node.input[1]) if len(node.input) > 1 else ""
+            target_shape = constant_int64_vector_values(constants.get(shape_name))
+            if target_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_expand_lineage",
+                )
+            expanded_shape = broadcast_shapes((lineage.shape, target_shape))
+            if expanded_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_expand_lineage",
+                )
+            output_shape = expanded_shape
+            transform = _OnnxWeightTransform("Expand", output_shape)
+        elif node.op_type == "Gather":
+            index_shape = resolve_value_shape(str(node.input[1])) if len(node.input) >= 2 else None
+            gather_axis = _onnx_gather_axis(node, len(lineage.shape))
+            if gather_axis is None or index_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_gather_lineage",
+                )
+            gather_shape = gather_shape_from_indices(lineage.shape, index_shape, gather_axis)
+            if gather_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_gather_lineage",
+                )
+            output_shape = gather_shape
+            transform = _OnnxWeightTransform("Reshape", output_shape)
+        elif node.op_type == "GatherND":
+            index_shape = resolve_value_shape(str(node.input[1])) if len(node.input) >= 2 else None
+            if not index_shape:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_gathernd_lineage",
+                )
+            gathered_shape = gathernd_output_shape(
+                node,
+                input_shape=lineage.shape,
+                index_shape=index_shape,
+                resolve_attribute=resolved_transform_attribute,
+            )
+            if gathered_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_gathernd_lineage",
+                )
+            return _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=gathered_shape,
+                data_type=lineage.data_type,
+                transforms=lineage.transforms,
+                unresolved_reason=lineage.unresolved_reason or "unresolved_gathernd_lineage",
+            )
         else:  # Reshape
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             shape_initializer = constants.get(shape_name)
+            allowzero = transform_int_attribute("allowzero")
             resolved_shape = (
                 _resolve_onnx_reshape_shape(
                     lineage.shape,
                     shape_initializer,
-                    allowzero=bool(_onnx_int_attribute(node, "allowzero")),
+                    allowzero=bool(allowzero),
                     onnx=onnx,
+                    resolve_int64_vector=constant_int64_vector_values,
                 )
-                if shape_initializer is not None
+                if shape_initializer is not None and allowzero is not None
                 else None
             )
             if resolved_shape is None:
@@ -2127,7 +7749,7 @@ def _build_onnx_weight_analysis_plan(
             output_shape = resolved_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
 
-        if output_shape == lineage.shape:
+        if output_shape == lineage.shape and transform.kind != "Transpose":
             return lineage
 
         return _OnnxWeightLineage(
@@ -2158,22 +7780,831 @@ def _build_onnx_weight_analysis_plan(
         compacted.update(dict(representatives.values()))
         return dict(sorted(compacted.items()))
 
-    def bounded_lineages(lineages: dict[int, _OnnxWeightLineage]) -> dict[int, _OnnxWeightLineage]:
+    empty_weight_gap_summary = _OnnxWeightLineageGapSummary()
+    unknown_weight_gap_summary = _OnnxWeightLineageGapSummary(truncated=True)
+    shape_control_gap_summary = _OnnxWeightLineageGapSummary(shape_control=True)
+    # A summary fact is never an initializer lineage or an analysis candidate.
+    # Its reserved token prevents source-ID filters from dropping aggregate facts.
+    shape_gap_summary_source = -1
+
+    def lineage_gap_summary_key(lineage: _OnnxWeightLineage) -> tuple[Any, ...]:
+        return (
+            lineage.initializer_index == shape_gap_summary_source,
+            lineage.shape,
+            lineage.data_type,
+            lineage.transforms,
+            lineage.unresolved_reason,
+        )
+
+    def summarize_lineage_gap(
+        lineages: Iterable[_OnnxWeightLineage],
+        predicate: Callable[[_OnnxWeightLineage], bool],
+        *,
+        truncated: bool = False,
+        shape_control: bool = False,
+        converted_shape_control: bool = False,
+    ) -> _OnnxWeightLineageGapSummary:
+        representatives: list[_OnnxWeightLineage] = []
+        seen: set[tuple[Any, ...]] = set()
+        for lineage in lineages:
+            if not predicate(lineage):
+                continue
+            key = lineage_gap_summary_key(lineage)
+            if key in seen:
+                continue
+            if len(representatives) >= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
+                return _OnnxWeightLineageGapSummary(
+                    tuple(representatives),
+                    truncated=True,
+                    shape_control=shape_control,
+                    converted_shape_control=converted_shape_control,
+                )
+            seen.add(key)
+            representatives.append(lineage)
+        return _OnnxWeightLineageGapSummary(
+            tuple(representatives),
+            truncated=truncated,
+            shape_control=shape_control,
+            converted_shape_control=converted_shape_control,
+        )
+
+    def summarize_weight_lineage_gap(
+        lineages: Iterable[_OnnxWeightLineage],
+        *,
+        truncated: bool = False,
+    ) -> _OnnxWeightLineageGapSummary:
+        return summarize_lineage_gap(lineages, lineage_could_be_weight, truncated=truncated)
+
+    def summarize_non_shape_lineage_gap(
+        lineages: Iterable[_OnnxWeightLineage],
+        *,
+        truncated: bool = False,
+        shape_control: bool = False,
+        converted_shape_control: bool = False,
+    ) -> _OnnxWeightLineageGapSummary:
+        return summarize_lineage_gap(
+            lineages,
+            lambda lineage: lineage.unresolved_reason != "shape_control_lineage",
+            truncated=truncated,
+            shape_control=shape_control,
+            converted_shape_control=converted_shape_control,
+        )
+
+    def summarize_rank_promotable_lineage_gap(
+        lineages: Iterable[_OnnxWeightLineage],
+        *,
+        truncated: bool = False,
+    ) -> _OnnxWeightLineageGapSummary:
+        return summarize_lineage_gap(lineages, lineage_could_be_weight_after_rank_increase, truncated=truncated)
+
+    def merge_weight_lineage_gap_summaries(
+        *summaries: _OnnxWeightLineageGapSummary,
+    ) -> _OnnxWeightLineageGapSummary:
+        representatives: list[_OnnxWeightLineage] = []
+        seen: set[tuple[Any, ...]] = set()
+        truncated = False
+        shape_control = any(summary.shape_control for summary in summaries)
+        converted_shape_control = any(summary.converted_shape_control for summary in summaries)
+        for summary in summaries:
+            truncated |= summary.truncated
+            for lineage in summary.lineages:
+                key = lineage_gap_summary_key(lineage)
+                if key in seen:
+                    continue
+                if len(representatives) >= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
+                    return _OnnxWeightLineageGapSummary(
+                        tuple(representatives),
+                        truncated=True,
+                        shape_control=shape_control,
+                        converted_shape_control=converted_shape_control,
+                    )
+                seen.add(key)
+                representatives.append(lineage)
+        return _OnnxWeightLineageGapSummary(
+            tuple(representatives),
+            truncated=truncated,
+            shape_control=shape_control,
+            converted_shape_control=converted_shape_control,
+        )
+
+    def known_weight_gap_summary(
+        summary: _OnnxWeightLineageGapSummary | None,
+        count: int,
+    ) -> _OnnxWeightLineageGapSummary:
+        pending_shape = summary is not None and summary.shape_control
+        if count <= 0:
+            return shape_control_gap_summary if pending_shape else empty_weight_gap_summary
+        if summary is not None and (summary.lineages or summary.truncated):
+            return summary
+        return (
+            _OnnxWeightLineageGapSummary(truncated=True, shape_control=True)
+            if pending_shape
+            else unknown_weight_gap_summary
+        )
+
+    def summary_has_shape_control_provenance(summary: _OnnxWeightLineageGapSummary) -> bool:
+        return summary.shape_control or summary.converted_shape_control
+
+    def converted_shape_control_gap_summary(
+        *,
+        shape: tuple[int, ...] | None = None,
+        data_type: int | None = None,
+        reason: str = "shape_dimensions_lineage",
+    ) -> _OnnxWeightLineageGapSummary:
+        # This source-independent fact exists only inside gap summaries.
+        # It retains whole-output facts without claiming a dropped source ID.
+        return _OnnxWeightLineageGapSummary(
+            (
+                _OnnxWeightLineage(
+                    initializer_index=shape_gap_summary_source,
+                    shape=shape,
+                    data_type=data_type,
+                    unresolved_reason=reason,
+                ),
+            ),
+            converted_shape_control=True,
+        )
+
+    def floating_cast_non_shape_gap_may_be_weight(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> bool:
+        if summary.truncated or not summary.lineages:
+            return True
+        return any(
+            lineage_could_be_weight(
+                transformed_lineage(
+                    lineage,
+                    node,
+                    constants,
+                    resolve_value_shape=resolve_value_shape,
+                    cast_target_data_type=cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                )
+            )
+            for lineage in summary.lineages
+        )
+
+    def weight_gap_summary_demotes_after_transform(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> bool:
+        if summary.truncated or not summary.lineages:
+            return False
+        for lineage in summary.lineages:
+            transformed = transformed_lineage(
+                lineage,
+                node,
+                constants,
+                resolve_value_shape=resolve_value_shape,
+                cast_target_data_type=cast_target_data_type,
+                resolve_attribute=resolve_attribute,
+            )
+            if lineage_could_be_weight(transformed) or not lineage_could_be_weight_after_rank_increase(transformed):
+                return False
+        return True
+
+    def transform_lineage_gap_summary(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+        predicate: Callable[[_OnnxWeightLineage], bool],
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> _OnnxWeightLineageGapSummary:
+        if not summary.lineages:
+            return _OnnxWeightLineageGapSummary(truncated=summary.truncated)
+        return summarize_lineage_gap(
+            (
+                transformed_lineage(
+                    lineage,
+                    node,
+                    constants,
+                    resolve_value_shape=resolve_value_shape,
+                    cast_target_data_type=cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                )
+                for lineage in summary.lineages
+            ),
+            predicate,
+            truncated=summary.truncated,
+        )
+
+    def transform_weight_gap_summary(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> _OnnxWeightLineageGapSummary:
+        return transform_lineage_gap_summary(
+            summary,
+            node,
+            constants,
+            lineage_could_be_weight,
+            resolve_value_shape=resolve_value_shape,
+            cast_target_data_type=cast_target_data_type,
+            resolve_attribute=resolve_attribute,
+        )
+
+    def transform_non_shape_gap_summary(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> _OnnxWeightLineageGapSummary:
+        transformed = transform_lineage_gap_summary(
+            summary,
+            node,
+            constants,
+            lambda lineage: lineage.unresolved_reason != "shape_control_lineage",
+            resolve_value_shape=resolve_value_shape,
+            cast_target_data_type=cast_target_data_type,
+            resolve_attribute=resolve_attribute,
+        )
+        return _OnnxWeightLineageGapSummary(
+            transformed.lineages, transformed.truncated, summary.shape_control, summary.converted_shape_control
+        )
+
+    def transform_rank_promotable_gap_summary(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> _OnnxWeightLineageGapSummary:
+        return transform_lineage_gap_summary(
+            summary,
+            node,
+            constants,
+            lineage_could_be_weight_after_rank_increase,
+            resolve_value_shape=resolve_value_shape,
+            cast_target_data_type=cast_target_data_type,
+            resolve_attribute=resolve_attribute,
+        )
+
+    def promoted_rank_gap_weight_summary(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+        count: int,
+        *,
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> _OnnxWeightLineageGapSummary:
+        if count <= 0:
+            return empty_weight_gap_summary
+        if not summary.lineages:
+            return unknown_weight_gap_summary if summary.truncated else empty_weight_gap_summary
+        transformed_summary = transform_weight_gap_summary(
+            summary,
+            node,
+            constants,
+            resolve_value_shape=resolve_value_shape,
+            resolve_attribute=resolve_attribute,
+        )
+        if transformed_summary.lineages or transformed_summary.truncated:
+            return transformed_summary
+        return empty_weight_gap_summary
+
+    def rank_gap_weight_summary_after_rank_increase(
+        summary: _OnnxWeightLineageGapSummary,
+        count: int,
+        *,
+        output_shape: tuple[int, ...] | None = None,
+        output_rank: int | None = None,
+        insert_axis: int = 0,
+    ) -> _OnnxWeightLineageGapSummary:
+        if count <= 0:
+            return empty_weight_gap_summary
+        if not summary.lineages:
+            return unknown_weight_gap_summary if summary.truncated else empty_weight_gap_summary
+        promoted_lineages: list[_OnnxWeightLineage] = []
+        for lineage in summary.lineages:
+            shape = None
+            if output_shape is not None:
+                shape = output_shape
+            elif lineage.shape is not None:
+                target_rank = output_rank if output_rank is not None else len(lineage.shape) + 1
+                if target_rank < len(lineage.shape):
+                    shape = None
+                elif target_rank == len(lineage.shape):
+                    shape = lineage.shape
+                else:
+                    axis = insert_axis if insert_axis >= 0 else target_rank + insert_axis
+                    if axis < 0 or axis > target_rank:
+                        axis = 0
+                    shape = promoted_shape(lineage.shape, axis, target_rank)
+            promoted_lineages.append(
+                _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=shape,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason,
+                )
+            )
+        return summarize_weight_lineage_gap(promoted_lineages, truncated=summary.truncated)
+
+    def rank_gap_weight_summary_after_repeated_rank_increase(
+        summary: _OnnxWeightLineageGapSummary,
+        count: int,
+    ) -> _OnnxWeightLineageGapSummary:
+        if count <= 0:
+            return empty_weight_gap_summary
+        if not summary.lineages:
+            return unknown_weight_gap_summary if summary.truncated else empty_weight_gap_summary
+        promoted_lineages: list[_OnnxWeightLineage] = []
+        for lineage in summary.lineages:
+            shape = lineage.shape
+            if shape is not None:
+                while len(shape) < 2:
+                    shape = (-1, *shape)
+            promoted_lineages.append(
+                _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=shape,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason,
+                )
+            )
+        return summarize_weight_lineage_gap(promoted_lineages, truncated=summary.truncated)
+
+    def same_carried_weight_view(initial: _OnnxWeightLineage, updated: _OnnxWeightLineage) -> bool:
+        if initial == updated:
+            return initial.unresolved_reason is None
+        if (
+            initial.unresolved_reason is not None
+            or updated.unresolved_reason is not None
+            or initial.initializer_index != updated.initializer_index
+            or initial.shape != updated.shape
+            or initial.data_type != updated.data_type
+            or updated.transforms[: len(initial.transforms)] != initial.transforms
+        ):
+            return False
+        # Consecutive C-order reshapes that restore the original shape restore
+        # the values too; a transpose or other value-changing view does not.
+        return all(transform.kind == "Reshape" for transform in updated.transforms[len(initial.transforms) :])
+
+    stack_invariance_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def control_flow_stack_values_are_invariant(
+        node: Any,
+        subgraph: Any,
+        graph_output_index: int,
+        graph_output_lineages: list[dict[int, _OnnxWeightLineage]],
+        parent_lineages: dict[str, dict[int, _OnnxWeightLineage]],
+        opset_versions: dict[str, int],
+        attribute_bindings: dict[str, Any],
+        *,
+        required_state_input: str | None = None,
+        input_shape: Callable[[str], tuple[int, ...] | None],
+    ) -> bool:
+        nonlocal stack_invariance_work_remaining
+        identifier = bounded_operator_identifier(node)
+        if identifier is None:
+            return False
+        input_offset = 2 if identifier[1] == "Loop" else 0
+        output_offset = 1 if identifier[1] == "Loop" else 0
+        parent_offset = (
+            2
+            if identifier[1] == "Loop"
+            else scan_sequence_lens_input_offset(node, opset_versions, identifier=identifier)
+        )
+
+        def resolve_attribute(attribute: Any) -> Any | None:
+            return (
+                attribute_bindings.get(str(attribute.ref_attr_name))
+                if getattr(attribute, "ref_attr_name", "")
+                else attribute
+            )
+
+        graph_inputs: Any = getattr(subgraph, "input", ())
+        work = len(graph_inputs) + (2 * len(getattr(node, "attribute", ())) if identifier[1] == "Scan" else 0)
+        if work > stack_invariance_work_remaining:
+            return False
+        stack_invariance_work_remaining -= work
+        state_count = (
+            len(node.input) - 2
+            if identifier[1] == "Loop"
+            else scan_stacked_output_start(
+                node,
+                opset_versions,
+                resolve_attribute=resolve_attribute,
+                identifier=identifier,
+            )
+        )
+        state_inputs = {
+            _onnx_value_name(graph_inputs[index + input_offset]): (
+                index + output_offset,
+                str(node.input[index + parent_offset]),
+            )
+            for index in range(max(state_count, 0))
+            if index + input_offset < len(graph_inputs) and index + parent_offset < len(node.input)
+        }
+        varying_inputs = {_onnx_value_name(value) for value in graph_inputs} - state_inputs.keys()
+        if identifier[1] == "Loop" and len(graph_inputs) > 1:
+            # Each executed iteration receives True; only its output condition
+            # decides whether another iteration executes.
+            varying_inputs.discard(_onnx_value_name(graph_inputs[1]))
+        elif identifier[1] == "Scan":
+            scan_axes: Sequence[int] = ()
+            for attribute in node.attribute:
+                if attribute.name == "scan_input_axes":
+                    resolved_attribute = resolve_attribute(attribute)
+                    if resolved_attribute is not None:
+                        scan_axes = resolved_attribute.ints
+                    break
+            for index in range(max(state_count, 0), len(graph_inputs)):
+                parent_index = index + parent_offset
+                if parent_index >= len(node.input):
+                    continue
+                shape = input_shape(str(node.input[parent_index]))
+                if shape is None:
+                    continue
+                if len(shape) > stack_invariance_work_remaining:
+                    return False
+                stack_invariance_work_remaining -= len(shape)
+                shape, _rank = _onnx_scan_bound_subgraph_input_shape(
+                    shape,
+                    len(shape),
+                    pair_index=parent_index,
+                    scan_input_start=state_count + parent_offset,
+                    scan_input_offset=parent_offset,
+                    scan_input_axes=scan_axes,
+                )
+                if shape is not None and _onnx_shape_extent_product(shape) == 0:
+                    varying_inputs.discard(_onnx_value_name(graph_inputs[index]))
+
+        def input_affects_output(names: set[str], output_index: int) -> bool:
+            return output_index in graph_tainted_output_indexes(
+                subgraph, names, opset_versions, attribute_bindings=attribute_bindings
+            )
+
+        # Local calls can be nested inside control-flow graphs.
+        may_call_functions = bool(functions)
+        pending = [graph_output_index]
+        visited: set[int] = set()
+        while pending:
+            output_index = pending.pop()
+            if output_index in visited:
+                continue
+            visited.add(output_index)
+            dependencies = graph_output_dependency_names(subgraph, (output_index,), attribute_bindings)
+            forced_state_input = required_state_input
+            if required_state_input is not None:
+                dependencies = dependencies | {required_state_input}
+                required_state_input = None
+            if dependency_names_exceeded_limit(dependencies) or len(dependencies) > stack_invariance_work_remaining:
+                return False
+            stack_invariance_work_remaining -= len(dependencies)
+            varying_dependencies = varying_inputs.intersection(dependencies)
+            if varying_dependencies and (
+                not may_call_functions or input_affects_output(varying_dependencies, output_index)
+            ):
+                return False
+            for name in dependencies:
+                binding = state_inputs.get(name)
+                if binding is None:
+                    continue
+                if may_call_functions and name != forced_state_input and not input_affects_output({name}, output_index):
+                    continue
+                next_index, parent_name = binding
+                initial = {
+                    index: lineage
+                    for index, lineage in parent_lineages.get(parent_name, {}).items()
+                    if lineage.unresolved_reason != "shape_control_lineage"
+                }
+                if identifier[1] == "Scan" and parent_offset:
+                    # Scan-8 executes its body on an individual batch. Match
+                    # the exact singleton-batch view used when binding inputs.
+                    initial = {
+                        index: _OnnxWeightLineage(
+                            initializer_index=lineage.initializer_index,
+                            shape=lineage.shape[1:],
+                            data_type=lineage.data_type,
+                            transforms=(*lineage.transforms, _OnnxWeightTransform("Reshape", lineage.shape[1:])),
+                            unresolved_reason=lineage.unresolved_reason,
+                        )
+                        if lineage.shape and lineage.shape[0] == 1 and all(dimension > 0 for dimension in lineage.shape)
+                        else lineage
+                        for index, lineage in initial.items()
+                    }
+                updated = (
+                    {
+                        index: lineage
+                        for index, lineage in graph_output_lineages[next_index].items()
+                        if lineage.unresolved_reason != "shape_control_lineage"
+                    }
+                    if next_index < len(graph_output_lineages)
+                    else {}
+                )
+                if (
+                    not initial
+                    or initial.keys() != updated.keys()
+                    or any(not same_carried_weight_view(lineage, updated[index]) for index, lineage in initial.items())
+                ):
+                    return False
+                pending.append(next_index)
+        return True
+
+    def fixed_loop_carried_reshape_shape(
+        node: Any,
+        subgraph: Any,
+        initial_lineages: dict[int, _OnnxWeightLineage],
+        updated_lineages: dict[int, _OnnxWeightLineage],
+        constants: dict[str, Any],
+        opset_versions: dict[str, int],
+        attribute_bindings: dict[str, Any],
+    ) -> tuple[int, ...] | None:
+        nonlocal stack_invariance_work_remaining
+        # This proof covers only a final carried value after a direct fixed
+        # Reshape. Body consumers and stacked outputs retain their own proofs.
+        if len(node.input) != 3 or len(node.output) != 1 or len(subgraph.input) != 3 or len(subgraph.output) != 2:
+            return None
+        work = len(initial_lineages) + len(updated_lineages) + len(subgraph.input) + len(subgraph.output)
+        if work > stack_invariance_work_remaining:
+            return None
+        stack_invariance_work_remaining -= work
+        state_name = _onnx_value_name(subgraph.input[2])
+        output_name = _onnx_value_name(subgraph.output[1])
+        producers = graph_output_producer_nodes_by_name(subgraph)
+        if producers is None or state_name in producers or len(producers.get(output_name, ())) != 1:
+            return None
+        reshape = producers[output_name][0]
+        identifier = bounded_operator_identifier(reshape)
+        if (
+            identifier is None
+            or identifier[0] not in _STANDARD_NEURAL_NETWORK_DOMAINS
+            or identifier[1] != "Reshape"
+            or identifier in functions
+            or not has_registered_standard_operator(reshape, opset_versions, identifier=identifier)
+        ):
+            return None
+        version = opset_versions.get(identifier[0])
+        if version is None and identifier[0] in {"", "ai.onnx"}:
+            version = opset_versions.get("ai.onnx" if identifier[0] == "" else "")
+        if version is None or version < 5:
+            return None
+        work = len(reshape.input) + len(reshape.output) + len(reshape.attribute)
+        if work > stack_invariance_work_remaining:
+            return None
+        stack_invariance_work_remaining -= work
+        if (
+            len(reshape.input) != 2
+            or len(reshape.output) != 1
+            or str(reshape.input[0]) != state_name
+            or len(reshape.attribute) > 1
+            or (version < 14 and bool(reshape.attribute))
+            or any(attribute.name != "allowzero" for attribute in reshape.attribute)
+        ):
+            return None
+
+        def resolve_attribute(attribute: Any) -> Any | None:
+            return attribute_bindings.get(str(attribute.ref_attr_name)) if attribute.ref_attr_name else attribute
+
+        if weight_transform_proof_error(reshape, resolve_attribute=resolve_attribute) is not None:
+            return None
+        body_constants = graph_initializer_constants(subgraph, constants, attribute_bindings)
+        target = constant_int64_vector_values(body_constants.get(str(reshape.input[1])))
+        if not target or any(dimension <= 0 for dimension in target):
+            return None
+        initial = {
+            index: lineage
+            for index, lineage in initial_lineages.items()
+            if lineage.unresolved_reason != "shape_control_lineage"
+        }
+        updated = {
+            index: lineage
+            for index, lineage in updated_lineages.items()
+            if lineage.unresolved_reason != "shape_control_lineage"
+        }
+        if not initial or initial.keys() != updated.keys():
+            return None
+        for index, lineage in initial.items():
+            if lineage.unresolved_reason is not None or updated[index].unresolved_reason is not None:
+                return None
+            expected = transformed_lineage(
+                lineage,
+                reshape,
+                body_constants,
+                resolve_value_shape=lambda _name: None,
+                resolve_attribute=resolve_attribute,
+            )
+            if expected != updated[index] or expected.shape != target:
+                return None
+            repeated = transformed_lineage(
+                expected,
+                reshape,
+                body_constants,
+                resolve_value_shape=lambda _name: None,
+                resolve_attribute=resolve_attribute,
+            )
+            if repeated != expected:
+                return None
+        return target
+
+    def lineages_after_control_flow_rank_increase(
+        lineages: dict[int, _OnnxWeightLineage],
+        *,
+        output_shape: tuple[int, ...] | None = None,
+        output_rank: int | None = None,
+        insert_axis: int = 0,
+        stack_extent: int | None = None,
+        materialize_stack_output: bool = False,
+    ) -> dict[int, _OnnxWeightLineage]:
+        if not lineages:
+            return lineages
+        promoted_lineages: dict[int, _OnnxWeightLineage] = {}
+        for initializer_index, lineage in lineages.items():
+            # Empty source views stay empty; rank alone cannot identify a final state.
+            if (
+                lineage.unresolved_reason is None
+                and lineage.shape is not None
+                and 0 in lineage.shape
+                and (output_shape is None or _onnx_shape_extent_product(output_shape) != 0)
+            ):
+                promoted_lineages[initializer_index] = lineage
+                continue
+            shape = None
+            if output_shape is not None:
+                shape = output_shape
+            elif lineage.shape is not None and output_rank is not None:
+                target_rank = output_rank
+                if target_rank < len(lineage.shape):
+                    shape = None
+                elif target_rank == len(lineage.shape):
+                    shape = lineage.shape
+                else:
+                    axis = insert_axis if insert_axis >= 0 else target_rank + insert_axis
+                    if axis < 0 or axis > target_rank:
+                        axis = 0
+                    shape = promoted_shape(lineage.shape, axis, target_rank)
+            transforms = lineage.transforms
+            unresolved_reason = lineage.unresolved_reason
+            if materialize_stack_output and unresolved_reason is None and shape != lineage.shape:
+                unresolved_reason = "unresolved_control_flow_stack_lineage"
+                if shape is not None and lineage.shape is not None and len(shape) > len(lineage.shape):
+                    axis = insert_axis if insert_axis >= 0 else len(shape) + insert_axis
+                    added_rank = len(shape) - len(lineage.shape)
+                    if 0 <= axis <= len(lineage.shape):
+                        view_shape = promoted_shape(lineage.shape, axis, len(shape), 1)
+                        if added_rank == 1 and stack_extent is not None:
+                            shape = (*shape[:axis], stack_extent, *shape[axis + 1 :])
+                        if (
+                            view_shape is not None
+                            and all(dimension >= 0 for dimension in shape)
+                            and broadcast_shapes((view_shape, shape)) == shape
+                            and len(transforms) + 2 <= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT
+                        ):
+                            transforms = (
+                                *transforms,
+                                _OnnxWeightTransform("Reshape", view_shape),
+                                _OnnxWeightTransform("Expand", shape),
+                            )
+                            unresolved_reason = None
+            elif unresolved_reason is None and shape != lineage.shape:
+                # A rank-only stack shape is not a materialized NumPy view.
+                # Preserve this fact when later transforms erase unknown extents.
+                marker = _OnnxWeightTransform("unmaterialized_stack")
+                if marker not in transforms and len(transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                    unresolved_reason = "lineage_transform_depth_limit"
+                else:
+                    transforms = append_transform_marker(transforms, marker)
+            promoted_lineages[initializer_index] = _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=shape,
+                data_type=lineage.data_type,
+                transforms=transforms,
+                unresolved_reason=unresolved_reason,
+            )
+        return promoted_lineages
+
+    def non_shape_gap_summary_after_rank_increase(
+        summary: _OnnxWeightLineageGapSummary,
+        count: int,
+        *,
+        insert_axis: int = 0,
+    ) -> _OnnxWeightLineageGapSummary:
+        if count <= 0:
+            return known_weight_gap_summary(summary, count)
+        if not summary.lineages:
+            return _OnnxWeightLineageGapSummary(
+                truncated=summary.truncated,
+                shape_control=summary.shape_control,
+                converted_shape_control=summary.converted_shape_control,
+            )
+        promoted_lineages: list[_OnnxWeightLineage] = []
+        for lineage in summary.lineages:
+            shape = None
+            if lineage.shape is not None:
+                target_rank = len(lineage.shape) + 1
+                axis = insert_axis if insert_axis >= 0 else target_rank + insert_axis
+                if axis < 0 or axis > target_rank:
+                    axis = 0
+                shape = inserted_shape(lineage.shape, axis, (-1,))
+            promoted_lineages.append(
+                _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=shape,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason,
+                )
+            )
+        return summarize_non_shape_lineage_gap(
+            promoted_lineages,
+            truncated=summary.truncated,
+            shape_control=summary.shape_control,
+            converted_shape_control=summary.converted_shape_control,
+        )
+
+    def bounded_lineages(
+        lineages: dict[int, _OnnxWeightLineage],
+    ) -> tuple[
+        dict[int, _OnnxWeightLineage],
+        int,
+        int,
+        _OnnxWeightLineageGapSummary,
+        int,
+        int,
+        _OnnxWeightLineageGapSummary,
+        _OnnxWeightLineageGapSummary,
+    ]:
         lineages = compact_runtime_bookkeeping_lineages(lineages)
         if len(lineages) <= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
-            return lineages
-        plan.record_coverage_gap(
-            "lineages_per_value_limit",
-            len(lineages) - _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT,
+            return (
+                lineages,
+                0,
+                0,
+                empty_weight_gap_summary,
+                0,
+                0,
+                empty_weight_gap_summary,
+                empty_weight_gap_summary,
+            )
+        ordered_lineages = sorted(
+            lineages.items(),
+            key=lambda item: (
+                item[1].unresolved_reason in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS,
+                item[0],
+            ),
         )
-        return dict(
-            sorted(
-                lineages.items(),
-                key=lambda item: (
-                    item[1].unresolved_reason in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS,
-                    item[0],
-                ),
-            )[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT]
+        dropped_lineages = ordered_lineages[_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:]
+        dropped_non_shape_lineages = sum(
+            1
+            for _initializer_index, lineage in dropped_lineages
+            if lineage.unresolved_reason != "shape_control_lineage"
+        )
+        dropped_weight_lineages = sum(
+            1 for _initializer_index, lineage in dropped_lineages if lineage_could_be_weight(lineage)
+        )
+        dropped_rank_promotable_lineages = sum(
+            1
+            for _initializer_index, lineage in dropped_lineages
+            if lineage_could_be_weight_after_rank_increase(lineage)
+        )
+        dropped_weight_lineage_summary = summarize_weight_lineage_gap(
+            lineage for _initializer_index, lineage in dropped_lineages
+        )
+        dropped_non_shape_lineage_summary = summarize_non_shape_lineage_gap(
+            (lineage for _initializer_index, lineage in dropped_lineages),
+            shape_control=any(
+                lineage.unresolved_reason == "shape_control_lineage" for _index, lineage in dropped_lineages
+            ),
+        )
+        dropped_rank_promotable_lineage_summary = summarize_rank_promotable_lineage_gap(
+            lineage for _initializer_index, lineage in dropped_lineages
+        )
+        return (
+            dict(ordered_lineages[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT]),
+            len(dropped_lineages),
+            dropped_non_shape_lineages,
+            dropped_non_shape_lineage_summary,
+            dropped_weight_lineages,
+            dropped_rank_promotable_lineages,
+            dropped_weight_lineage_summary,
+            dropped_rank_promotable_lineage_summary,
         )
 
     def merge_transform_markers(
@@ -2243,15 +8674,23 @@ def _build_onnx_weight_analysis_plan(
                 unresolved_reason=unresolved_reason,
             )
 
-    def has_registered_standard_operator(node: Any, opset_versions: dict[str, int]) -> bool:
-        domain = str(getattr(node, "domain", "") or "")
+    def has_registered_standard_operator(
+        node: Any,
+        opset_versions: dict[str, int],
+        *,
+        identifier: tuple[str, str, str] | None = None,
+    ) -> bool:
+        identifier = bounded_operator_identifier(node) if identifier is None else identifier
+        if identifier is None:
+            return False
+        domain = identifier[0]
         schema_domain = "" if domain == "ai.onnx" else domain
         version = opset_versions.get(domain)
         if version is None and domain in {"", "ai.onnx"}:
             version = opset_versions.get("ai.onnx" if domain == "" else "")
         if version is None:
             return False
-        key = (schema_domain, str(getattr(node, "op_type", "")), version)
+        key = (schema_domain, identifier[1], version)
         if key not in schema_cache:
             try:
                 schema_cache[key] = bool(onnx.defs.has(key[1], version, schema_domain))
@@ -2266,6 +8705,27 @@ def _build_onnx_weight_analysis_plan(
                 schema_cache[key] = False
         return schema_cache[key]
 
+    runtime_input_type_work_remaining = _ONNX_RUNTIME_INPUT_TYPE_WORK_LIMIT
+
+    def reserve_runtime_input_type_work(work: int) -> bool:
+        nonlocal runtime_input_type_work_remaining
+        if work > runtime_input_type_work_remaining:
+            return False
+        runtime_input_type_work_remaining -= work
+        return True
+
+    def runtime_type_producer_names(current_graph: Any) -> set[str] | None:
+        nodes = getattr(current_graph, "node", ())
+        if not reserve_runtime_input_type_work(1 + len(nodes)):
+            return None
+        produced: set[str] = set()
+        for current_node in nodes:
+            outputs = getattr(current_node, "output", ())
+            if not reserve_runtime_input_type_work(len(outputs)):
+                return None
+            produced.update(name for name in outputs if name)
+        return produced
+
     def walk_graph(
         current_graph: Any,
         inherited_lineages: dict[str, dict[int, _OnnxWeightLineage]],
@@ -2275,27 +8735,91 @@ def _build_onnx_weight_analysis_plan(
         root_graph: bool,
         source_scope: tuple[Any, ...],
         opset_versions: dict[str, int],
+        collect_weight_consumers: bool = True,
         bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] | None = None,
         bound_constants: dict[str, Any] | None = None,
         bound_dynamic_values: set[str] | None = None,
+        inherited_lineage_limit_gap_counts: dict[str, int] | None = None,
+        inherited_non_shape_lineage_limit_gap_counts: dict[str, int] | None = None,
+        inherited_non_shape_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
+        inherited_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
+        inherited_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
+        inherited_rank_promotable_lineage_limit_gap_counts: dict[str, int] | None = None,
+        inherited_rank_promotable_lineage_limit_gap_summaries: (dict[str, _OnnxWeightLineageGapSummary] | None) = None,
+        bound_lineage_limit_gap_counts: dict[str, int] | None = None,
+        bound_non_shape_lineage_limit_gap_counts: dict[str, int] | None = None,
+        bound_non_shape_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
+        bound_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
+        bound_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
+        bound_rank_promotable_lineage_limit_gap_counts: dict[str, int] | None = None,
+        bound_rank_promotable_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
+        bound_value_shapes: dict[str, tuple[int, ...]] | None = None,
+        bound_value_ranks: dict[str, int] | None = None,
+        bound_unknown_value_ranks: set[str] | None = None,
+        bound_proven_value_ranks: set[str] | None = None,
+        inherited_runtime_input_type: Callable[[str], int | None] | None = None,
+        bound_runtime_input_types: Mapping[str, int | None] | None = None,
         bound_attributes: dict[str, Any] | None = None,
         bound_attribute_keys: dict[str, tuple[Any, ...]] | None = None,
         function_depth: int = 0,
         fail_on_unbound_inputs: bool = False,
+        proven_weight_inputs_out: dict[tuple[int, ...], tuple[Any, frozenset[int]]] | None = None,
+        proven_weight_inputs_path: tuple[int, ...] = (),
         captured_state: tuple[
             dict[str, dict[int, _OnnxWeightLineage]],
             dict[str, Any],
             set[str],
+            dict[str, int],
+            dict[str, int],
+            dict[str, _OnnxWeightLineageGapSummary],
+            dict[str, int],
+            dict[str, _OnnxWeightLineageGapSummary],
+            dict[str, int],
+            dict[str, _OnnxWeightLineageGapSummary],
         ]
         | None = None,
-    ) -> tuple[list[dict[int, _OnnxWeightLineage]], list[bool]]:
-        nonlocal graph_counter, node_counter, total_consumer_count
+    ) -> tuple[
+        list[dict[int, _OnnxWeightLineage]],
+        list[bool],
+        list[int],
+        list[int],
+        list[_OnnxWeightLineageGapSummary],
+        list[int],
+        list[_OnnxWeightLineageGapSummary],
+        list[int],
+        list[_OnnxWeightLineageGapSummary],
+        list[tuple[int, ...] | None],
+        list[int | None],
+        list[bool],
+    ]:
+        nonlocal graph_counter, node_counter, total_consumer_count, graph_taint_work_remaining
         current_graph_index = graph_counter
         graph_counter += 1
+        inherited_lineage_limit_gap_counts = inherited_lineage_limit_gap_counts or {}
+        inherited_non_shape_lineage_limit_gap_counts = inherited_non_shape_lineage_limit_gap_counts or {}
+        inherited_non_shape_lineage_limit_gap_summaries = inherited_non_shape_lineage_limit_gap_summaries or {}
+        inherited_weight_lineage_limit_gap_counts = inherited_weight_lineage_limit_gap_counts or {}
+        inherited_weight_lineage_limit_gap_summaries = inherited_weight_lineage_limit_gap_summaries or {}
+        inherited_rank_promotable_lineage_limit_gap_counts = inherited_rank_promotable_lineage_limit_gap_counts or {}
+        inherited_rank_promotable_lineage_limit_gap_summaries = (
+            inherited_rank_promotable_lineage_limit_gap_summaries or {}
+        )
+        # Optional type proofs have their own aggregate admission. An incomplete
+        # shadow inventory disables the whole scope rather than trusting a prefix.
+        runtime_type_shadow_names = runtime_type_producer_names(current_graph)
         if root_graph:
             value_lineages = dict(inherited_lineages)
             constants = dict(inherited_constants)
             dynamic_values = set(inherited_dynamic_values)
+            value_lineage_limit_gap_counts = dict(inherited_lineage_limit_gap_counts)
+            value_non_shape_lineage_limit_gap_counts = dict(inherited_non_shape_lineage_limit_gap_counts)
+            value_non_shape_lineage_limit_gap_summaries = dict(inherited_non_shape_lineage_limit_gap_summaries)
+            value_weight_lineage_limit_gap_counts = dict(inherited_weight_lineage_limit_gap_counts)
+            value_weight_lineage_limit_gap_summaries = dict(inherited_weight_lineage_limit_gap_summaries)
+            value_rank_promotable_lineage_limit_gap_counts = dict(inherited_rank_promotable_lineage_limit_gap_counts)
+            value_rank_promotable_lineage_limit_gap_summaries = dict(
+                inherited_rank_promotable_lineage_limit_gap_summaries
+            )
         else:
             declared_names = _graph_declared_value_names(current_graph)
             value_lineages = {
@@ -2303,35 +8827,484 @@ def _build_onnx_weight_analysis_plan(
             }
             constants = {name: value for name, value in inherited_constants.items() if name not in declared_names}
             dynamic_values = {name for name in inherited_dynamic_values if name not in declared_names}
+            value_lineage_limit_gap_counts = {
+                name: count for name, count in inherited_lineage_limit_gap_counts.items() if name not in declared_names
+            }
+            value_non_shape_lineage_limit_gap_counts = {
+                name: count
+                for name, count in inherited_non_shape_lineage_limit_gap_counts.items()
+                if name not in declared_names
+            }
+            value_non_shape_lineage_limit_gap_summaries = {
+                name: summary
+                for name, summary in inherited_non_shape_lineage_limit_gap_summaries.items()
+                if name not in declared_names
+            }
+            value_weight_lineage_limit_gap_counts = {
+                name: count
+                for name, count in inherited_weight_lineage_limit_gap_counts.items()
+                if name not in declared_names
+            }
+            value_weight_lineage_limit_gap_summaries = {
+                name: summary
+                for name, summary in inherited_weight_lineage_limit_gap_summaries.items()
+                if name not in declared_names
+            }
+            value_rank_promotable_lineage_limit_gap_counts = {
+                name: count
+                for name, count in inherited_rank_promotable_lineage_limit_gap_counts.items()
+                if name not in declared_names
+            }
+            value_rank_promotable_lineage_limit_gap_summaries = {
+                name: summary
+                for name, summary in inherited_rank_promotable_lineage_limit_gap_summaries.items()
+                if name not in declared_names
+            }
 
         value_lineages.update(bound_lineages or {})
         constants.update(bound_constants or {})
         dynamic_values.update(bound_dynamic_values or set())
+        value_lineage_limit_gap_counts.update(bound_lineage_limit_gap_counts or {})
+        value_non_shape_lineage_limit_gap_counts.update(bound_non_shape_lineage_limit_gap_counts or {})
+        value_non_shape_lineage_limit_gap_summaries.update(bound_non_shape_lineage_limit_gap_summaries or {})
+        value_weight_lineage_limit_gap_counts.update(bound_weight_lineage_limit_gap_counts or {})
+        value_weight_lineage_limit_gap_summaries.update(bound_weight_lineage_limit_gap_summaries or {})
+        value_rank_promotable_lineage_limit_gap_counts.update(bound_rank_promotable_lineage_limit_gap_counts or {})
+        value_rank_promotable_lineage_limit_gap_summaries.update(
+            bound_rank_promotable_lineage_limit_gap_summaries or {}
+        )
         attribute_bindings = bound_attributes or {}
         attribute_binding_keys = bound_attribute_keys or {}
+        bound_proven_ranks = bound_proven_value_ranks or set()
+        graph_input_names = {
+            name for value_info in getattr(current_graph, "input", ()) if (name := _onnx_value_name(value_info))
+        }
         known_value_shapes: dict[str, tuple[int, ...]] = {}
-        for value_info in (
-            *getattr(current_graph, "input", ()),
-            *getattr(current_graph, "value_info", ()),
-            *getattr(current_graph, "output", ()),
-        ):
+        known_value_ranks: dict[str, int] = {}
+        proven_value_ranks: set[str] = set()
+        runtime_input_types: dict[str, int | None] = {}
+        formal_runtime_input_types = bound_runtime_input_types or {}
+
+        def trusted_runtime_input_type(name: str) -> int | None:
+            # A producer shadows declarations and formal bindings even if a
+            # selective replay does not visit that producer.
+            if runtime_type_shadow_names is None or name in runtime_type_shadow_names:
+                return None
+            if name in runtime_input_types:
+                return runtime_input_types[name]
+            if name in formal_runtime_input_types:
+                return formal_runtime_input_types[name]
+            if root_graph or name in declared_names or inherited_runtime_input_type is None:
+                return None
+            return inherited_runtime_input_type(name)
+
+        def set_known_value_shape(name: str, shape: tuple[int, ...], *, proven: bool) -> None:
+            bounded_shape = inferred_shape(len(shape), shape)
+            if bounded_shape is None:
+                set_known_value_rank(name, len(shape), proven=proven)
+                return
+            known_value_shapes[name] = bounded_shape
+            known_value_ranks[name] = len(bounded_shape)
+            if proven:
+                proven_value_ranks.add(name)
+            else:
+                proven_value_ranks.discard(name)
+
+        def set_known_value_rank(name: str, rank: int, *, proven: bool) -> None:
+            known_value_shapes.pop(name, None)
+            if not shape_inference_available(rank):
+                clear_known_value_rank(name)
+                return
+            known_value_ranks[name] = rank
+            if proven:
+                proven_value_ranks.add(name)
+            else:
+                proven_value_ranks.discard(name)
+
+        def clear_known_value_rank(name: str) -> None:
+            known_value_shapes.pop(name, None)
+            known_value_ranks.pop(name, None)
+            proven_value_ranks.discard(name)
+
+        def proven_value_shape(name: str) -> tuple[int, ...] | None:
+            return known_value_shapes.get(name) if name in proven_value_ranks else None
+
+        def proven_value_rank(name: str) -> int | None:
+            if name in proven_value_ranks:
+                return known_value_ranks.get(name)
+            return None
+
+        def value_rank_is_proven_or_unknown(name: str) -> bool:
+            return name not in known_value_ranks or name in proven_value_ranks
+
+        def value_has_unknown_dynamic_rank(name: str) -> bool:
+            return (
+                name in dynamic_values
+                and not any(
+                    lineage.unresolved_reason != "shape_control_lineage"
+                    for lineage in value_lineages.get(name, {}).values()
+                )
+                and name not in constants
+                and name not in known_value_shapes
+                and name not in proven_value_ranks
+            )
+
+        def rank_one_weight_gap_is_safe(name: str, summary: _OnnxWeightLineageGapSummary, count: int) -> bool:
+            if count <= 0:
+                return False
+            proven_rank = proven_value_rank(name)
+            value_rank = proven_rank
+            if value_rank is None and not summary.truncated and summary.lineages:
+                summary_ranks = {len(lineage.shape) for lineage in summary.lineages if lineage.shape is not None}
+                summary_shapes_known = all(lineage.shape is not None for lineage in summary.lineages)
+                if len(summary_ranks) == 1 and summary_shapes_known:
+                    value_rank = next(iter(summary_ranks))
+                elif summary_shapes_known and (known_rank := known_value_ranks.get(name)) is not None:
+                    value_rank = known_rank
+            return (
+                value_rank is not None
+                and value_rank < 2
+                and (not summary.truncated or proven_rank is not None)
+                and not any(
+                    lineage.shape is not None and len(lineage.shape) > value_rank for lineage in summary.lineages
+                )
+            )
+
+        admit_runtime_inputs = (
+            current_graph is graph
+            and source_scope == ("root_graph",)
+            and runtime_type_shadow_names is not None
+            and reserve_runtime_input_type_work(1 + len(getattr(current_graph, "input", ())))
+        )
+        for value_info in getattr(current_graph, "input", ()):
             name = _onnx_value_name(value_info)
+            if admit_runtime_inputs and name:
+                # Only the model's actual runtime inputs are authoritative;
+                # training/body/intermediate annotations are not type proofs.
+                data_type = None
+                value_type = getattr(value_info, "type", None)
+                if value_type is not None and _onnx_has_singular_field(value_type, "tensor_type"):
+                    candidate_type = int(value_type.tensor_type.elem_type)
+                    if valid_cast_data_type(candidate_type):
+                        data_type = candidate_type
+                runtime_input_types[name] = None if name in runtime_input_types else data_type
+            shape = value_info_shape(value_info, preserve_unknown=root_graph)
+            if name and shape is not None:
+                set_known_value_shape(name, shape, proven=root_graph)
+            elif name and (rank := value_info_rank(value_info)) is not None:
+                set_known_value_rank(name, rank, proven=root_graph)
+        for value_info in (*getattr(current_graph, "value_info", ()), *getattr(current_graph, "output", ())):
+            name = _onnx_value_name(value_info)
+            if root_graph and name in graph_input_names:
+                continue
             shape = value_info_shape(value_info)
             if name and shape is not None:
-                known_value_shapes[name] = shape
+                set_known_value_shape(name, shape, proven=False)
+            elif name and (rank := value_info_rank(value_info)) is not None:
+                set_known_value_rank(name, rank, proven=False)
+        for name, shape in (bound_value_shapes or {}).items():
+            set_known_value_shape(name, shape, proven=name in bound_proven_ranks)
+        for name, rank in (bound_value_ranks or {}).items():
+            if name not in known_value_shapes:
+                set_known_value_rank(name, rank, proven=name in bound_proven_ranks)
+        for name in bound_unknown_value_ranks or set():
+            clear_known_value_rank(name)
         for name, lineages in value_lineages.items():
-            lineage_shapes = {lineage.shape for lineage in lineages.values()}
-            if len(lineage_shapes) == 1 and None not in lineage_shapes:
-                known_value_shapes[name] = next(iter(lineage_shapes))  # type: ignore[arg-type]
+            if name in graph_input_names or name in dynamic_values:
+                continue
+            lineage_shape = resolved_lineage_shape(lineages.values())
+            if lineage_shape is not None:
+                set_known_value_shape(name, lineage_shape, proven=True)
         for name, constant in constants.items():
+            if name in graph_input_names or name in dynamic_values:
+                continue
             try:
-                known_value_shapes[name] = tuple(int(dimension) for dimension in constant.dims)
+                set_known_value_shape(name, tuple(int(dimension) for dimension in constant.dims), proven=True)
             except (AttributeError, TypeError, ValueError):
                 continue
+
+        def clear_value_gap_state(name: str) -> None:
+            value_lineage_limit_gap_counts.pop(name, None)
+            value_non_shape_lineage_limit_gap_counts.pop(name, None)
+            value_non_shape_lineage_limit_gap_summaries.pop(name, None)
+            value_weight_lineage_limit_gap_counts.pop(name, None)
+            value_weight_lineage_limit_gap_summaries.pop(name, None)
+            value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
+            value_rank_promotable_lineage_limit_gap_summaries.pop(name, None)
+
+        def value_has_bound_runtime_state(name: str) -> bool:
+            return (
+                name in value_lineages
+                or name in dynamic_values
+                or name in value_lineage_limit_gap_counts
+                or name in value_non_shape_lineage_limit_gap_counts
+                or name in value_weight_lineage_limit_gap_counts
+                or name in value_rank_promotable_lineage_limit_gap_counts
+            )
 
         def resolve_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return attribute_bindings.get(reference_name) if reference_name else attribute
+
+        def resolved_int_attribute(node: Any, name: str, default: int = 0) -> int:
+            for attribute in getattr(node, "attribute", []):
+                if attribute.name != name:
+                    continue
+                resolved_attribute = resolve_attribute(attribute)
+                return int(getattr(resolved_attribute, "i", default)) if resolved_attribute is not None else default
+            return default
+
+        int_sequence_attribute_cache: dict[tuple[int, str], tuple[Any, tuple[int, ...] | None]] = {}
+
+        def resolved_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None:
+            nonlocal scan_axis_decode_work_remaining
+            key = (id(node), name)
+            cached = int_sequence_attribute_cache.get(key)
+            if cached is not None and cached[0] is node:
+                return cached[1]
+            result = None
+            for attribute in getattr(node, "attribute", []):
+                if attribute.name != name:
+                    continue
+                resolved_attribute = resolve_attribute(attribute)
+                if resolved_attribute is not None:
+                    values = getattr(resolved_attribute, "ints", ())
+                    if len(values) > scan_axis_decode_work_remaining:
+                        plan.coverage_gaps.setdefault("scan_axis_decode_work_limit", 1)
+                    else:
+                        scan_axis_decode_work_remaining -= len(values)
+                        result = tuple(int(value) for value in values)
+                break
+            # The retained owner and this invocation's immutable attribute bindings
+            # make both successful and missing proofs safe to reuse.
+            int_sequence_attribute_cache[key] = (node, result)
+            return result
+
+        def expand_target_shape(name: str) -> tuple[int, ...] | None:
+            if graph_input_is_runtime_overridable(name, graph_input_names, constants):
+                return None
+            target_shape = constant_int64_vector_values(constants.get(name)) if name not in dynamic_values else None
+            if target_shape is None:
+                producer_index = graph_output_producer_nodes_by_name(current_graph)
+                if producer_index is None:
+                    return None
+                producers = producer_index.get(name, ())
+                if len(producers) == 1:
+                    producer = producers[0]
+                    identifier = bounded_operator_identifier(producer)
+                    if identifier is None:
+                        return None
+                    if (
+                        builtin_operator(producer, identifier=identifier)
+                        and identifier[1] == "Shape"
+                        and len(producer.input) == 1
+                        and not producer.attribute
+                    ):
+                        target_shape = proven_value_shape(str(producer.input[0]))
+            if target_shape is None or any(dimension < 0 for dimension in target_shape):
+                return None
+            return target_shape
+
+        def value_is_proven_nonempty_uniform(name: str) -> bool:
+            for depth in range(7):
+                shape = proven_value_shape(name)
+                if shape is not None and all(dimension == 1 for dimension in shape):
+                    return True
+                if depth == 6:
+                    return False
+                producer_index = graph_output_producer_nodes_by_name(current_graph)
+                if producer_index is None:
+                    return False
+                producers = producer_index.get(name, ())
+                if len(producers) != 1:
+                    return False
+                producer = producers[0]
+                identifier = bounded_operator_identifier(producer)
+                if identifier is None:
+                    return False
+                if not builtin_operator(producer, identifier=identifier) or not producer.input:
+                    return False
+                if identifier[1] in {"Expand", "Tile"}:
+                    if len(producer.input) != 2:
+                        return False
+                    extent_name = str(producer.input[1])
+                    extents = (
+                        expand_target_shape(extent_name)
+                        if identifier[1] == "Expand"
+                        else constant_int64_vector_values(constants.get(extent_name))
+                    )
+                    if extents is None or any(dimension <= 0 for dimension in extents):
+                        return False
+                structural_alias = identifier[1] in {
+                    "Cast",
+                    "Expand",
+                    "Flatten",
+                    "Identity",
+                    "Reshape",
+                    "Squeeze",
+                    "Tile",
+                    "Transpose",
+                    "Unsqueeze",
+                }
+                pointwise_unary = (
+                    identifier[1] in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                    and identifier[1] not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
+                    and len(producer.input) == 1
+                )
+                if not structural_alias and not pointwise_unary:
+                    return False
+                name = str(producer.input[0])
+            return False
+
+        def resolved_proof_attribute(attribute: Any, expected_type: int, field: str | None = None) -> Any | None:
+            resolved = resolve_attribute(attribute)
+            if (
+                resolved is None
+                or bool(getattr(resolved, "ref_attr_name", ""))
+                or int(getattr(resolved, "type", 0)) != expected_type
+                or (field is not None and not _onnx_has_singular_field(resolved, field))
+            ):
+                return None
+            return resolved
+
+        def has_no_padding(node: Any) -> bool:
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name not in {"pads", "auto_pad", "output_padding", "output_shape"}:
+                    continue
+                if attribute.name == "output_shape":
+                    return False
+                resolved = resolved_proof_attribute(
+                    attribute,
+                    int(onnx.AttributeProto.STRING if attribute.name == "auto_pad" else onnx.AttributeProto.INTS),
+                    "s" if attribute.name == "auto_pad" else None,
+                )
+                if resolved is None:
+                    return False
+                if attribute.name == "auto_pad":
+                    if parsed_padding_mode(resolved) not in {b"", b"NOTSET", b"VALID"}:
+                        return False
+                elif len(resolved.ints) > 2 * _ONNX_WEIGHT_RESHAPE_RANK_LIMIT or any(resolved.ints):
+                    return False
+            return True
+
+        def batch_normalization_is_inference(node: Any) -> bool:
+            if any(node.output[1:]):
+                return False
+            domain = str(getattr(node, "domain", "") or "")
+            version = opset_versions.get(domain)
+            if version is None and domain in {"", "ai.onnx"}:
+                version = opset_versions.get("ai.onnx" if domain == "" else "")
+            if version is None:
+                return False
+            inference = version >= 7
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name not in {"is_test", "training_mode"}:
+                    continue
+                resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INT), "i")
+                if resolved is None:
+                    return False
+                if attribute.name == "is_test":
+                    inference = bool(resolved.i)
+                elif resolved.i:
+                    return False
+            return inference
+
+        def pooling_has_nonempty_samples(node: Any) -> bool:
+            input_shape = proven_value_shape(str(node.input[0])) if node.input else None
+            if (
+                input_shape is None
+                or not 3 <= len(input_shape) <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+                or any(dimension <= 0 for dimension in input_shape)
+            ):
+                return False
+            spatial_rank = len(input_shape) - 2
+            kernel_shape = None
+            dilations = (1,) * spatial_rank
+            pads = (0,) * (2 * spatial_rank)
+            padding_mode = b"NOTSET"
+            explicit_pads = False
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name in {"kernel_shape", "strides", "dilations", "pads"}:
+                    resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INTS))
+                    expected_size = 2 * spatial_rank if attribute.name == "pads" else spatial_rank
+                    if resolved is None or len(resolved.ints) != expected_size:
+                        return False
+                    values = tuple(int(value) for value in resolved.ints)
+                    if any(value < (0 if attribute.name == "pads" else 1) for value in values):
+                        return False
+                    if attribute.name == "kernel_shape":
+                        kernel_shape = values
+                    elif attribute.name == "dilations":
+                        dilations = values
+                    elif attribute.name == "pads":
+                        pads = values
+                        explicit_pads = True
+                elif attribute.name == "auto_pad":
+                    resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.STRING), "s")
+                    if resolved is None:
+                        return False
+                    mode = parsed_padding_mode(resolved)
+                    if mode is None:
+                        return False
+                    padding_mode = mode
+                elif attribute.name == "ceil_mode":
+                    resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INT), "i")
+                    if resolved is None or int(resolved.i) not in {0, 1}:
+                        return False
+            if kernel_shape is None or (explicit_pads and padding_mode not in {b"", b"NOTSET"}):
+                return False
+            if has_no_padding(node):
+                # Every emitted unpadded window starts at an actual input sample.
+                return True
+            if any(dilation != 1 for dilation in dilations):
+                return False
+            if padding_mode in {b"SAME_UPPER", b"SAME_LOWER"}:
+                return True
+            # Unit-dilation windows intersect the input when each explicit pad
+            # is smaller than the kernel. Ceil mode drops starts in right padding.
+            return all(
+                pads[index] < kernel and pads[index + spatial_rank] < kernel
+                for index, kernel in enumerate(kernel_shape)
+            )
+
+        def aggregation_preserves_shape_control(node: Any) -> bool:
+            if not node.input or not value_is_proven_nonempty_uniform(str(node.input[0])):
+                return False
+            if node.op_type in {"GlobalAveragePool", "BatchNormalization"}:
+                return True
+            if node.op_type == "AveragePool":
+                includes_padding = False
+                for attribute in getattr(node, "attribute", ()):
+                    if attribute.name == "count_include_pad":
+                        resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INT), "i")
+                        if resolved is None:
+                            return False
+                        includes_padding = bool(resolved.i)
+                # Ceil-only overhang is excluded from the divisor, unlike explicit padding.
+                return pooling_has_nonempty_samples(node) and (not includes_padding or has_no_padding(node))
+            if not has_no_padding(node):
+                return False
+            if node.op_type == "Conv":
+                return True
+            kernel_shape = proven_value_shape(str(node.input[1])) if len(node.input) > 1 else None
+            if kernel_shape is None or len(kernel_shape) < 3 or any(dimension <= 0 for dimension in kernel_shape):
+                return False
+            spatial_shape = kernel_shape[2:]
+            strides = (1,) * len(spatial_shape)
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name not in {"kernel_shape", "strides", "dilations"}:
+                    continue
+                resolved = resolved_proof_attribute(attribute, int(onnx.AttributeProto.INTS))
+                if resolved is None or len(resolved.ints) != len(spatial_shape):
+                    return False
+                values = tuple(int(value) for value in resolved.ints)
+                if attribute.name == "strides":
+                    strides = values
+                elif (attribute.name == "kernel_shape" and values != spatial_shape) or (
+                    attribute.name == "dilations" and any(value != 1 for value in values)
+                ):
+                    return False
+            return strides == spatial_shape
 
         def attribute_source_key(
             attribute: Any,
@@ -2349,57 +9322,98 @@ def _build_onnx_weight_analysis_plan(
         for initializer_position, initializer in enumerate(getattr(current_graph, "initializer", ())):
             if initializer.name:
                 name = str(initializer.name)
-                lineage = register_initializer(
-                    initializer,
-                    current_graph_index,
-                    source_key=(*source_scope, "initializer", initializer_position),
-                )
-                value_lineages[name] = {lineage.initializer_index: lineage}
-                constants[name] = initializer
-                dynamic_values.discard(name)
-                known_value_shapes[name] = lineage.shape or ()
+                preserve_bound_runtime_state = name in graph_input_names and value_has_bound_runtime_state(name)
+                if not preserve_bound_runtime_state:
+                    lineage = register_initializer(
+                        initializer,
+                        current_graph_index,
+                        source_key=(*source_scope, "initializer", initializer_position),
+                    )
+                    value_lineages[name] = {lineage.initializer_index: lineage}
+                if name not in graph_input_names:
+                    if initializer_value_is_immutable(current_graph, initializer):
+                        constants[name] = initializer
+                    else:
+                        constants.pop(name, None)
+                    # Mutable values cannot prove controls, but their stored
+                    # weight lineage and shape remain available for analysis.
+                    dynamic_values.discard(name)
+                    if not preserve_bound_runtime_state:
+                        set_known_value_shape(name, lineage.shape or (), proven=True)
+                    clear_value_gap_state(name)
+                elif name not in constants:
+                    dynamic_values.add(name)
+                    if not preserve_bound_runtime_state:
+                        clear_value_gap_state(name)
         for sparse_position, sparse_initializer in enumerate(getattr(current_graph, "sparse_initializer", ())):
             if sparse_initializer.values.name:
                 name = str(sparse_initializer.values.name)
-                lineage = register_initializer(
-                    sparse_initializer.values,
-                    current_graph_index,
-                    shape=tuple(int(dimension) for dimension in sparse_initializer.dims),
-                    unresolved_reason="sparse_initializer_unsupported",
-                    source_key=(*source_scope, "sparse_initializer", sparse_position),
-                )
-                value_lineages[name] = {lineage.initializer_index: lineage}
-                dynamic_values.discard(name)
-                known_value_shapes[name] = lineage.shape or ()
+                preserve_bound_runtime_state = name in graph_input_names and value_has_bound_runtime_state(name)
+                if not preserve_bound_runtime_state:
+                    lineage = register_initializer(
+                        sparse_initializer.values,
+                        current_graph_index,
+                        shape=tuple(int(dimension) for dimension in sparse_initializer.dims),
+                        unresolved_reason="sparse_initializer_unsupported",
+                        source_key=(*source_scope, "sparse_initializer", sparse_position),
+                    )
+                    value_lineages[name] = {lineage.initializer_index: lineage}
+                if name not in graph_input_names:
+                    dynamic_values.discard(name)
+                    clear_value_gap_state(name)
+                    set_known_value_shape(name, lineage.shape or (), proven=True)
+                elif name not in constants:
+                    dynamic_values.add(name)
+                    if not preserve_bound_runtime_state:
+                        clear_value_gap_state(name)
 
         for graph_input in getattr(current_graph, "input", ()):
             name = _onnx_value_name(graph_input)
             if name and name not in value_lineages and name not in constants:
                 dynamic_values.add(name)
 
-        for local_node_index, node in enumerate(getattr(current_graph, "node", ())):
+        for local_node_index, node in enumerate(graph_nodes_once(current_graph)):
             current_node_index = node_counter
             node_counter += 1
-            function_key = (
-                str(getattr(node, "domain", "")),
-                str(getattr(node, "op_type", "")),
-                str(getattr(node, "overload", "")),
-            )
+            function_key = _operator_identifier(node)
             is_model_local_function = function_key in functions
-            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+            is_builtin_standard_operator = not is_model_local_function and has_registered_standard_operator(
                 node,
                 opset_versions,
+                identifier=function_key,
             )
-            supported_transform = getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type in {
+            is_registered_standard_operator = is_model_local_function or is_builtin_standard_operator
+            is_builtin_neural_operator = is_builtin_standard_operator and builtin_operator(
+                node, identifier=function_key
+            )
+            supported_transform = builtin_operator(node, identifier=function_key) and node.op_type in {
                 "Cast",
+                "Expand",
                 "Flatten",
+                "GatherND",
                 "Identity",
                 "Reshape",
                 "Squeeze",
                 "Transpose",
                 "Unsqueeze",
             }
+            rank_gap_promoting_operator = builtin_operator(
+                node, identifier=function_key
+            ) and is_rank_gap_promoting_operator(node, identifier=function_key)
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
+            all_input_lineage_limit_gap_count = 0
+            all_input_non_shape_lineage_limit_gap_count = 0
+            all_input_non_shape_lineage_gap_summary = empty_weight_gap_summary
+            # Bounded role bits classify omitted controls by their input edge,
+            # never by IDs that survived a different input's lineage cap.
+            shape_control_gap_roles = 0  # data=1, convolution kernel=2, other=4
+            all_input_weight_lineage_limit_gap_count = 0
+            all_input_weight_lineage_limit_gap_summary = empty_weight_gap_summary
+            all_input_rank_promotable_lineage_limit_gap_count = 0
+            all_input_rank_promotable_lineage_limit_gap_summary = empty_weight_gap_summary
+            all_input_lineage_limit_gap_names: set[str] = set()
+            transform_data_input_rank_promotable_lineage_limit_gap_count = 0
+            transform_data_input_rank_promotable_lineage_limit_gap_summary = empty_weight_gap_summary
             shape_control_input_lineages: dict[int, _OnnxWeightLineage] = {}
             terminal_weight_lineages: set[int] = set()
             activation_input_lineages: set[int] = set()
@@ -2424,9 +9438,43 @@ def _build_onnx_weight_analysis_plan(
                 input_index
                 for input_index, input_name in enumerate(node.input)
                 for lineage in value_lineages.get(str(input_name), {}).values()
-                if lineage.unresolved_reason is None
-                and _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))[0] is not None
+                if is_builtin_standard_operator
+                and lineage.unresolved_reason is None
+                and _onnx_weight_output_axes(
+                    node,
+                    input_index,
+                    len(lineage.shape or ()),
+                    einsum_equation=parsed_einsum_equation(node) if node.op_type == "Einsum" else None,
+                )[0]
+                is not None
             }
+            if proven_weight_inputs_out is not None:
+                proof_work = (
+                    1
+                    + len(node.input)
+                    + len(proven_weight_inputs_path)
+                    + sum(
+                        len(value_lineages.get(str(node.input[index]), {})) for index in resolved_weight_input_indexes
+                    )
+                )
+                if proof_work > graph_taint_work_remaining:
+                    graph_taint_work_remaining = 0
+                else:
+                    graph_taint_work_remaining -= proof_work
+                    proven_slots = frozenset(
+                        index
+                        for index in resolved_weight_input_indexes
+                        if not value_lineage_limit_gap_counts.get(str(node.input[index]), 0)
+                        and all(
+                            lineage.unresolved_reason in {None, "shape_control_lineage"}
+                            for lineage in value_lineages.get(str(node.input[index]), {}).values()
+                        )
+                    )
+                    proof_key = (*proven_weight_inputs_path, id(node))
+                    previous = proven_weight_inputs_out.get(proof_key)
+                    if previous is not None:
+                        proven_slots &= previous[1]
+                    proven_weight_inputs_out[proof_key] = (node, proven_slots)
             lineage_input_indexes = {
                 input_index for input_index, input_name in enumerate(node.input) if value_lineages.get(str(input_name))
             }
@@ -2439,8 +9487,26 @@ def _build_onnx_weight_analysis_plan(
                     for lineage in value_lineages[str(input_name)].values()
                 )
             }
+            batch_normalization_activation_parameter_lineages: set[int] = set()
+            if (
+                is_builtin_neural_operator
+                and node.op_type == "BatchNormalization"
+                and input_names
+                and (
+                    input_names[0] in dynamic_values
+                    or (
+                        bool(value_lineages.get(input_names[0]))
+                        and all(
+                            lineage.unresolved_reason == "dynamic_activation_lineage"
+                            for lineage in value_lineages[input_names[0]].values()
+                        )
+                    )
+                )
+            ):
+                for parameter_name in input_names[1:5]:
+                    batch_normalization_activation_parameter_lineages.update(value_lineages.get(parameter_name, {}))
             all_lineage_inputs_are_activation_contraction = (
-                getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                is_builtin_neural_operator
                 and node.op_type in {"Einsum", "MatMul"}
                 and len(lineage_input_indexes) >= 2
                 and lineage_input_indexes == dynamic_activation_input_indexes
@@ -2448,38 +9514,61 @@ def _build_onnx_weight_analysis_plan(
 
             for input_index, input_name in enumerate(node.input):
                 input_lineages = value_lineages.get(str(input_name), {})
+                input_lineage_limit_gap_count = value_lineage_limit_gap_counts.get(str(input_name), 0)
+                input_non_shape_lineage_limit_gap_count = value_non_shape_lineage_limit_gap_counts.get(
+                    str(input_name),
+                    0,
+                )
+                input_non_shape_lineage_gap_summary = known_weight_gap_summary(
+                    value_non_shape_lineage_limit_gap_summaries.get(str(input_name)),
+                    input_non_shape_lineage_limit_gap_count,
+                )
+                input_weight_lineage_limit_gap_count = value_weight_lineage_limit_gap_counts.get(str(input_name), 0)
+                input_weight_lineage_limit_gap_summary = known_weight_gap_summary(
+                    value_weight_lineage_limit_gap_summaries.get(str(input_name)),
+                    input_weight_lineage_limit_gap_count,
+                )
+                input_rank_promotable_lineage_limit_gap_count = value_rank_promotable_lineage_limit_gap_counts.get(
+                    str(input_name),
+                    0,
+                )
+                input_rank_promotable_lineage_limit_gap_summary = known_weight_gap_summary(
+                    value_rank_promotable_lineage_limit_gap_summaries.get(str(input_name)),
+                    input_rank_promotable_lineage_limit_gap_count,
+                )
+                if rank_gap_promoting_operator and input_index == 0:
+                    transform_data_input_rank_promotable_lineage_limit_gap_count = (
+                        input_rank_promotable_lineage_limit_gap_count
+                    )
+                    transform_data_input_rank_promotable_lineage_limit_gap_summary = (
+                        input_rank_promotable_lineage_limit_gap_summary
+                    )
                 is_array_feature_selector = (
-                    is_registered_standard_operator
+                    is_builtin_standard_operator
                     and getattr(node, "domain", "") == "ai.onnx.ml"
                     and node.op_type == "ArrayFeatureExtractor"
                     and input_index == 1
                 )
-                is_non_data_standard_input = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and (
-                        (node.op_type == "Clip" and input_index > 0)
-                        or (
-                            not is_model_local_function
-                            and node.op_type in _RECURRENT_WEIGHT_OPERATORS
-                            and input_index == 4
-                        )
-                    )
+                is_non_data_standard_input = is_builtin_neural_operator and (
+                    (node.op_type == "Clip" and input_index > 0)
+                    or (node.op_type in _RECURRENT_WEIGHT_OPERATORS and input_index == 4)
                 )
-                is_shape_control_input = (
-                    is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and (
-                        (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
-                        or (node.op_type == "Reshape" and input_index == 1)
-                        or (node.op_type == "Slice" and input_index > 0)
-                        or (node.op_type in {"Squeeze", "Unsqueeze"} and input_index == 1)
-                        or (node.op_type == "Tile" and input_index == 1)
-                        or (node.op_type == "Where" and input_index == 0)
-                    )
+                is_shape_control_input = is_builtin_neural_operator and (
+                    (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
+                    or (node.op_type == "Reshape" and input_index == 1)
+                    or (node.op_type == "Slice" and input_index > 0)
+                    or (node.op_type in {"Squeeze", "Unsqueeze"} and input_index == 1)
+                    or (node.op_type == "Tile" and input_index == 1)
+                    or (node.op_type == "Where" and input_index == 0)
                 )
                 if is_shape_control_input:
+                    if (input_lineages and input_lineage_limit_gap_count) or summary_has_shape_control_provenance(
+                        input_non_shape_lineage_gap_summary
+                    ):
+                        all_input_non_shape_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_non_shape_lineage_gap_summary, shape_control_gap_summary
+                        )
+                        shape_control_gap_roles |= 4
                     # Shape and Size can later turn output dimensions into numeric data.
                     shape_control_lineages = {
                         initializer_index: _OnnxWeightLineage(
@@ -2496,27 +9585,142 @@ def _build_onnx_weight_analysis_plan(
                         shape_control_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
+                    if (
+                        input_lineages or summary_has_shape_control_provenance(input_non_shape_lineage_gap_summary)
+                    ) and input_name not in all_input_lineage_limit_gap_names:
+                        all_input_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_lineage_limit_gap_count,
+                            input_lineage_limit_gap_count,
+                        )
+                        all_input_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_weight_lineage_limit_gap_count,
+                            input_weight_lineage_limit_gap_count,
+                        )
+                        all_input_weight_lineage_limit_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_weight_lineage_limit_gap_summary,
+                            input_weight_lineage_limit_gap_summary,
+                        )
+                        all_input_rank_promotable_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_rank_promotable_lineage_limit_gap_count,
+                            input_rank_promotable_lineage_limit_gap_count,
+                        )
+                        all_input_rank_promotable_lineage_limit_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_rank_promotable_lineage_limit_gap_summary,
+                            input_rank_promotable_lineage_limit_gap_summary,
+                        )
+                        all_input_lineage_limit_gap_names.add(input_name)
                     merge_lineages(
                         shape_control_input_lineages,
                         shape_control_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
                 elif not is_array_feature_selector and not is_non_data_standard_input:
+                    if input_non_shape_lineage_gap_summary.shape_control:
+                        shape_control_gap_roles |= (
+                            1
+                            if input_index == 0
+                            else 2
+                            if is_builtin_neural_operator
+                            and node.op_type in {"Conv", "ConvTranspose"}
+                            and input_index == 1
+                            else 4
+                        )
                     merge_lineages(
                         all_input_lineages,
                         input_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
-                for initializer_index, lineage in input_lineages.items():
-                    potential_weight_role = _onnx_potential_weight_input(
-                        node,
-                        input_index,
-                        is_model_local_function=is_model_local_function,
-                        is_registered_standard_operator=is_registered_standard_operator,
+                    if (
+                        input_lineages or summary_has_shape_control_provenance(input_non_shape_lineage_gap_summary)
+                    ) and input_name not in all_input_lineage_limit_gap_names:
+                        all_input_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_lineage_limit_gap_count,
+                            input_lineage_limit_gap_count,
+                        )
+                        all_input_non_shape_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_non_shape_lineage_limit_gap_count,
+                            input_non_shape_lineage_limit_gap_count,
+                        )
+                        all_input_non_shape_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_non_shape_lineage_gap_summary,
+                            input_non_shape_lineage_gap_summary,
+                        )
+                        all_input_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_weight_lineage_limit_gap_count,
+                            input_weight_lineage_limit_gap_count,
+                        )
+                        all_input_weight_lineage_limit_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_weight_lineage_limit_gap_summary,
+                            input_weight_lineage_limit_gap_summary,
+                        )
+                        all_input_rank_promotable_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_rank_promotable_lineage_limit_gap_count,
+                            input_rank_promotable_lineage_limit_gap_count,
+                        )
+                        all_input_rank_promotable_lineage_limit_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_rank_promotable_lineage_limit_gap_summary,
+                            input_rank_promotable_lineage_limit_gap_summary,
+                        )
+                        all_input_lineage_limit_gap_names.add(input_name)
+                recurrent_initial_state_input = (
+                    is_builtin_neural_operator
+                    and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                    and (input_index == 5 or (node.op_type == "LSTM" and input_index == 6))
+                )
+                potential_weight_role = _onnx_potential_weight_input(
+                    node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                    identifier=function_key,
+                )
+                opposite_resolved_weight_for_input = any(
+                    resolved_index != input_index for resolved_index in resolved_weight_input_indexes
+                )
+                prior_layer_activation_input = bool(input_lineages) and all(
+                    lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in input_lineages.values()
+                )
+                activation_input_role = prior_layer_activation_input and (
+                    (is_builtin_standard_operator and _onnx_opaque_activation_input_candidate(node, input_index))
+                    or (
+                        is_builtin_neural_operator
+                        and _onnx_activation_input_candidate(node, input_index, identifier=function_key)
+                        and (opposite_resolved_weight_for_input or all_lineage_inputs_are_activation_contraction)
                     )
+                )
+                activation_input_role |= recurrent_initial_state_input and opposite_resolved_weight_for_input
+                recognized_gap_activation_input = activation_input_role and gap_summary_is_dynamic_activation(
+                    input_weight_lineage_limit_gap_summary,
+                    input_weight_lineage_limit_gap_count,
+                )
+                rank_one_weight_gap = rank_one_weight_gap_is_safe(
+                    str(input_name),
+                    input_weight_lineage_limit_gap_summary,
+                    input_weight_lineage_limit_gap_count,
+                )
+                if rank_one_weight_gap:
+                    input_rank_for_gap = known_value_ranks.get(str(input_name))
+                    rank_one_weight_gap = not (
+                        gap_summary_has_known_rank_above_input(input_non_shape_lineage_gap_summary, input_rank_for_gap)
+                        or gap_summary_has_known_rank_above_input(
+                            input_rank_promotable_lineage_limit_gap_summary,
+                            input_rank_for_gap,
+                        )
+                    )
+                recorded_input_lineage_limit_gap = recognized_gap_activation_input
+                if (
+                    potential_weight_role
+                    and input_weight_lineage_limit_gap_count
+                    and not recognized_gap_activation_input
+                    and not rank_one_weight_gap
+                ):
+                    record_weight_lineage_limit_gap(
+                        input_weight_lineage_limit_gap_count, collect_weight_consumers=collect_weight_consumers
+                    )
+                    recorded_input_lineage_limit_gap = True
+                for initializer_index, lineage in input_lineages.items():
                     invalid_clip_bound = (
-                        is_registered_standard_operator
-                        and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        is_builtin_neural_operator
                         and node.op_type == "Clip"
                         and input_index > 0
                         and lineage.unresolved_reason != "shape_control_lineage"
@@ -2534,26 +9738,51 @@ def _build_onnx_weight_analysis_plan(
                             node,
                             current_node_index,
                             input_index,
+                            collect_weight_consumers=collect_weight_consumers,
                         )
                     potential_weight_input = potential_weight_role and lineage_could_be_weight(lineage)
+                    if (
+                        potential_weight_input
+                        and input_weight_lineage_limit_gap_count
+                        and not recorded_input_lineage_limit_gap
+                    ):
+                        record_weight_lineage_limit_gap(
+                            input_weight_lineage_limit_gap_count, collect_weight_consumers=collect_weight_consumers
+                        )
+                        recorded_input_lineage_limit_gap = True
                     if supported_transform and input_index == 0:
                         continue
-                    if potential_weight_input:
-                        terminal_weight_lineages.add(initializer_index)
-                    terminal_consumer_counts[initializer_index] += 1
-                    total_consumer_count += 1
-                    recurrent_initial_state = (
-                        is_registered_standard_operator
-                        and not is_model_local_function
-                        and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                        and node.op_type in _RECURRENT_WEIGHT_OPERATORS
-                        and (input_index == 5 or (node.op_type == "LSTM" and input_index == 6))
-                    )
+                    known_input_rank = proven_value_rank(str(input_name))
+                    if potential_weight_input and (
+                        (lineage.shape is not None and len(lineage.shape) < 2)
+                        or (
+                            known_input_rank is not None
+                            and known_input_rank < 2
+                            and (lineage.shape is None or len(lineage.shape) < 2)
+                            and not gap_summary_may_exceed_input_rank(
+                                input_weight_lineage_limit_gap_summary,
+                                known_input_rank,
+                            )
+                        )
+                    ):
+                        potential_weight_input = False
+                    if collect_weight_consumers:
+                        if potential_weight_input:
+                            terminal_weight_lineages.add(initializer_index)
+                        terminal_consumer_counts[initializer_index] += 1
+                        total_consumer_count += 1
+                    recurrent_initial_state = recurrent_initial_state_input
                     if recurrent_initial_state:
                         recurrent_state_lineages[initializer_index] = lineage
                     if lineage.unresolved_reason is not None:
                         if lineage.unresolved_reason == "shape_control_lineage":
-                            record_exclusion(initializer_index, "shape_control_input", node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                "shape_control_input",
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                             continue
                         opposite_resolved_weight = any(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
@@ -2564,11 +9793,12 @@ def _build_onnx_weight_analysis_plan(
                         )
                         recognized_activation_input = prior_layer_activation and (
                             (
-                                is_registered_standard_operator
+                                is_builtin_standard_operator
                                 and _onnx_opaque_activation_input_candidate(node, input_index)
                             )
                             or (
-                                _onnx_activation_input_candidate(node, input_index)
+                                is_builtin_neural_operator
+                                and _onnx_activation_input_candidate(node, input_index, identifier=function_key)
                                 and (opposite_resolved_weight or all_lineage_inputs_are_activation_contraction)
                             )
                         )
@@ -2578,7 +9808,13 @@ def _build_onnx_weight_analysis_plan(
                                 recurrent_state_lineages[initializer_index] = lineage
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
-                            record_exclusion(initializer_index, "dynamic_activation_input", node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                "dynamic_activation_input",
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                         elif potential_weight_input or (
                             (
                                 potential_weight_role
@@ -2591,9 +9827,21 @@ def _build_onnx_weight_analysis_plan(
                                 and lineage.unresolved_reason != "shape_control_lineage"
                             )
                         ):
-                            record_unresolved_lineage(lineage, node, current_node_index, input_index)
+                            record_unresolved_lineage(
+                                lineage,
+                                node,
+                                current_node_index,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                         else:
-                            record_exclusion(initializer_index, "unresolved_lineage_consumer", node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                "unresolved_lineage_consumer",
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                         continue
                     if has_referenced_attributes and not (supported_transform and input_index == 0):
                         if potential_weight_input:
@@ -2608,6 +9856,7 @@ def _build_onnx_weight_analysis_plan(
                                 node,
                                 current_node_index,
                                 input_index,
+                                collect_weight_consumers=collect_weight_consumers,
                             )
                         else:
                             record_exclusion(
@@ -2615,9 +9864,17 @@ def _build_onnx_weight_analysis_plan(
                                 "referenced_function_attribute_consumer",
                                 node,
                                 input_index,
+                                collect_weight_consumers=collect_weight_consumers,
                             )
                         continue
-                    output_axes, reason = _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))
+                    if is_model_local_function:
+                        continue  # The function body determines operand roles and weight axes.
+                    output_axes, reason = _onnx_weight_output_axes(
+                        node,
+                        input_index,
+                        len(lineage.shape or ()),
+                        einsum_equation=parsed_einsum_equation(node) if node.op_type == "Einsum" else None,
+                    )
                     if output_axes is None:
                         if reason != "non_weight_input" and potential_weight_input:
                             record_unresolved_lineage(
@@ -2631,11 +9888,25 @@ def _build_onnx_weight_analysis_plan(
                                 node,
                                 current_node_index,
                                 input_index,
+                                collect_weight_consumers=collect_weight_consumers,
                             )
                         else:
-                            record_exclusion(initializer_index, reason, node, input_index)
+                            record_exclusion(
+                                initializer_index,
+                                reason,
+                                node,
+                                input_index,
+                                collect_weight_consumers=collect_weight_consumers,
+                            )
                         continue
-                    add_consumer_group(lineage, node, current_node_index, input_index, output_axes)
+                    add_consumer_group(
+                        lineage,
+                        node,
+                        current_node_index,
+                        input_index,
+                        output_axes,
+                        collect_weight_consumers=collect_weight_consumers,
+                    )
                     if node.op_type == "Gather":
                         gather_axis = _onnx_gather_axis(node, len(lineage.shape or ()))
                         if gather_axis is not None and (gather_axis,) != output_axes:
@@ -2645,6 +9916,7 @@ def _build_onnx_weight_analysis_plan(
                                 current_node_index,
                                 input_index,
                                 (gather_axis,),
+                                collect_weight_consumers=collect_weight_consumers,
                             )
                     elif node.op_type == "PRelu":
                         slope_shape = lineage.shape or ()
@@ -2661,10 +9933,225 @@ def _build_onnx_weight_analysis_plan(
                                     current_node_index,
                                     input_index,
                                     (slope_axis,),
+                                    collect_weight_consumers=collect_weight_consumers,
                                 )
 
-            subgraph_results: list[tuple[list[dict[int, _OnnxWeightLineage]], list[bool]]] = []
+            subgraph_results: list[
+                tuple[
+                    list[dict[int, _OnnxWeightLineage]],
+                    list[bool],
+                    list[int],
+                    list[int],
+                    list[_OnnxWeightLineageGapSummary],
+                    list[int],
+                    list[_OnnxWeightLineageGapSummary],
+                    list[int],
+                    list[_OnnxWeightLineageGapSummary],
+                    list[tuple[int, ...] | None],
+                    list[int | None],
+                    list[bool],
+                ]
+            ] = []
+            node_loop_may_repeat = (
+                is_builtin_neural_operator
+                and node.op_type == "Loop"
+                and loop_may_repeat_body(node, constants, graph_input_names, attribute_bindings)
+            )
+            node_scan_may_repeat = (
+                is_builtin_neural_operator
+                and node.op_type == "Scan"
+                and scan_may_repeat_body(
+                    node,
+                    constants,
+                    graph_input_names,
+                    known_value_shapes,
+                    proven_value_ranks,
+                    {name for name in graph_input_names & value_lineages.keys() if name not in proven_value_ranks},
+                    scan_input_axes=resolved_int_sequence_attribute(node, "scan_input_axes") or (),
+                    scan_input_offset=scan_sequence_lens_input_offset(node, opset_versions, identifier=function_key),
+                    num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
+                )
+            )
+            standard_control_flow_operator = is_builtin_neural_operator
+            scan_output_axes = (
+                resolved_int_sequence_attribute(node, "scan_output_axes") or ()
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else ()
+            )
+            resolved_scan_input_axes = (
+                resolved_int_sequence_attribute(node, "scan_input_axes") or ()
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else ()
+            )
+            resolved_scan_input_offset = (
+                scan_sequence_lens_input_offset(node, opset_versions, identifier=function_key)
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else 0
+            )
+            resolved_scan_input_count = (
+                resolved_int_attribute(node, "num_scan_inputs", 1)
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else 0
+            )
+            trusted_scan_shape_names = proven_value_ranks
+            untrusted_scan_shape_names = (
+                {name for name in graph_input_names & value_lineages.keys() if name not in proven_value_ranks}
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else set()
+            )
+
+            scan_has_concrete_input_shape = False
+
+            def trusted_scan_input_shape(
+                scan_name: str,
+                trusted: set[str] = trusted_scan_shape_names,
+                untrusted: set[str] = untrusted_scan_shape_names,
+            ) -> tuple[int, ...] | None:
+                nonlocal scan_has_concrete_input_shape
+                shape = scan_input_shape(constants, known_value_shapes, scan_name, trusted, untrusted)
+                scan_has_concrete_input_shape |= shape is not None and (
+                    all(dimension >= 0 for dimension in shape)
+                    or not value_lineages.get(scan_name)
+                    or (
+                        (lineage_shape := resolved_lineage_shape(value_lineages[scan_name].values())) is not None
+                        and _onnx_shape_extent_product(lineage_shape) == 0
+                        and len(lineage_shape) == len(shape)
+                        and all(
+                            known < 0 or known == actual for known, actual in zip(shape, lineage_shape, strict=True)
+                        )
+                    )
+                )
+                return shape
+
+            common_scan_extent = None
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and not resolved_scan_input_offset
+                and 0 < resolved_scan_input_count <= len(node.input)
+            ):
+                common_scan_extent = scan_common_sequence_extent(
+                    node.input[-resolved_scan_input_count:],
+                    resolved_scan_input_axes,
+                    trusted_scan_input_shape,
+                )
+
+            node_scan8_skips_body = False
+            if (
+                is_builtin_neural_operator
+                and node.op_type == "Scan"
+                and scan_sequence_lens_input_offset(node, opset_versions, identifier=function_key)
+                and node.input
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and (lengths := constant_int64_vector_values(constants.get(str(node.input[0])))) is not None
+            ):
+                if lengths:
+                    node_scan8_skips_body = all(length == 0 for length in lengths)
+                else:
+                    scan_count = resolved_int_attribute(node, "num_scan_inputs", 1)
+                    scan_names = tuple(str(name) for name in node.input[max(1, len(node.input) - scan_count) :])
+                    node_scan8_skips_body = (
+                        scan_count > 0
+                        and len(scan_names) == scan_count
+                        and all(
+                            name
+                            and not graph_input_is_runtime_overridable(name, graph_input_names, constants)
+                            and (shape := constant_initializer_shape(constants, name)) is not None
+                            and len(shape) >= 2
+                            and shape[0] == 0
+                            for name in scan_names
+                        )
+                    )
+            scan_body_controls_resolved = True
+            if standard_control_flow_operator and node.op_type == "Scan":
+                seen_scan_controls: set[str] = set()
+                for scan_attribute in getattr(node, "attribute", ()):
+                    if scan_attribute.name not in {"num_scan_inputs", "scan_input_axes"}:
+                        continue
+                    bound_scan_attribute = resolve_attribute(scan_attribute)
+                    expected_attribute_type = 2 if scan_attribute.name == "num_scan_inputs" else 7
+                    if (
+                        scan_attribute.name in seen_scan_controls
+                        or bound_scan_attribute is None
+                        or bool(getattr(bound_scan_attribute, "ref_attr_name", ""))
+                        or int(getattr(bound_scan_attribute, "type", 0)) != expected_attribute_type
+                        or (scan_attribute.name == "num_scan_inputs" and not bound_scan_attribute.HasField("i"))
+                        or (
+                            scan_attribute.name == "scan_input_axes"
+                            and len(resolved_scan_input_axes) != resolved_scan_input_count
+                        )
+                    ):
+                        scan_body_controls_resolved = False
+                    seen_scan_controls.add(scan_attribute.name)
+            scan8_zero_batch_proven = False
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and resolved_scan_input_offset
+                and scan_body_controls_resolved
+                and "num_scan_inputs" in seen_scan_controls
+                and 0 < resolved_scan_input_count < len(node.input)
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and constant_int64_vector_values(constants.get(str(node.input[0]))) == ()
+            ):
+                # Scan-8 state and sequence inputs share their leading batch.
+                # One trusted zero suffices unless another declaration conflicts.
+                scan_input_start = len(node.input) - resolved_scan_input_count
+                for input_index, parent_input in enumerate(node.input[1:], 1):
+                    parent_name = str(parent_input)
+                    batch_shape = proven_value_shape(parent_name)
+                    if batch_shape is None:
+                        batch_shape = constant_initializer_shape(constants, parent_name)
+                    minimum_rank = 2 if input_index >= scan_input_start else 1
+                    if batch_shape is None or len(batch_shape) < minimum_rank or batch_shape[0] > 0:
+                        scan8_zero_batch_proven = False
+                        break
+                    scan8_zero_batch_proven |= batch_shape[0] == 0
+                node_scan8_skips_body |= scan8_zero_batch_proven
+            scan8_single_invocation_proven = False
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and resolved_scan_input_offset
+                and scan_body_controls_resolved
+                and "num_scan_inputs" in seen_scan_controls
+                and 0 < resolved_scan_input_count < len(node.input)
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and constant_int64_vector_values(constants.get(str(node.input[0]))) == (1,)
+            ):
+                # A single batch and step has exactly the visited body value,
+                # with no padded elements or additional iteration state.
+                single_batch_witness = False
+                single_sequence_witness = False
+                scan_input_start = len(node.input) - resolved_scan_input_count
+                for input_index, parent_input in enumerate(node.input[1:], 1):
+                    parent_name = str(parent_input)
+                    input_shape = proven_value_shape(parent_name)
+                    if input_shape is None:
+                        input_shape = constant_initializer_shape(constants, parent_name)
+                    minimum_rank = 2 if input_index >= scan_input_start else 1
+                    if input_shape is None or len(input_shape) < minimum_rank or input_shape[0] not in {-1, 1}:
+                        break
+                    single_batch_witness |= input_shape[0] == 1
+                    if input_index >= scan_input_start:
+                        if input_shape[1] not in {-1, 1}:
+                            break
+                        single_sequence_witness |= input_shape[1] == 1
+                else:
+                    scan8_single_invocation_proven = single_batch_witness and single_sequence_witness
+            node_body_proven_skipped = (
+                node_scan8_skips_body
+                or (
+                    is_builtin_neural_operator
+                    and node.op_type == "Loop"
+                    and loop_body_is_proven_skipped(node, constants, graph_input_names)
+                )
+                or (common_scan_extent == 0 and scan_has_concrete_input_shape and scan_body_controls_resolved)
+            )
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
+                if is_model_local_function:
+                    # Graph attributes are evaluated where the function body uses them.
+                    continue
                 resolved_attribute = resolve_attribute(attribute)
                 if resolved_attribute is None:
                     plan.record_coverage_gap("unresolved_function_attribute")
@@ -2674,44 +10161,3179 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
                     subgraph_bound_constants: dict[str, Any] = {}
                     subgraph_bound_dynamic: set[str] = set()
+                    subgraph_bound_lineage_gaps: dict[str, int] = {}
+                    subgraph_bound_non_shape_lineage_gaps: dict[str, int] = {}
+                    subgraph_bound_non_shape_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                    subgraph_bound_weight_lineage_gaps: dict[str, int] = {}
+                    subgraph_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                    subgraph_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
+                    subgraph_bound_rank_promotable_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                    subgraph_bound_value_shapes: dict[str, tuple[int, ...]] = {}
+                    subgraph_bound_value_ranks: dict[str, int] = {}
+                    subgraph_bound_unknown_value_ranks: set[str] = set()
+                    subgraph_bound_proven_value_ranks: set[str] = set()
+                    subgraph_input_names = {
+                        name for value_info in getattr(subgraph, "input", ()) if (name := _onnx_value_name(value_info))
+                    }
+                    subgraph_trusted_context_shapes = {
+                        name: known_value_shapes[name]
+                        for name in graph_external_reference_names(subgraph, attribute_bindings)
+                        if name in known_value_shapes and name in proven_value_ranks and name not in value_lineages
+                    }
                     input_pairs: Iterable[tuple[Any, Any]]
+                    input_pair_index_start = 0
+                    scan_input_start = len(node.input)
+                    scan_input_offset = 0
+                    scan_input_axes: tuple[int, ...] = ()
                     if node.op_type == "Loop":
                         input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
+                        input_pair_index_start = 2
                     elif node.op_type == "Scan":
-                        input_pairs = zip(node.input, subgraph.input, strict=False)
+                        num_scan_inputs = resolved_int_attribute(node, "num_scan_inputs", 1)
+                        scan_input_offset = scan_sequence_lens_input_offset(
+                            node, opset_versions, identifier=function_key
+                        )
+                        scan_input_start = max(len(node.input) - max(num_scan_inputs, 0), scan_input_offset)
+                        scan_input_axes = resolved_int_sequence_attribute(node, "scan_input_axes") or ()
+                        input_pairs = zip(node.input[scan_input_offset:], subgraph.input, strict=False)
+                        input_pair_index_start = scan_input_offset
                     else:
                         input_pairs = ()
-                    for parent_input, graph_input in input_pairs:
+                    input_pairs = tuple(input_pairs)
+
+                    def trusted_bound_context_shape(
+                        parent_name: str,
+                        pair_index: int,
+                        *,
+                        op_type: str = node.op_type,
+                        scan_input_start: int = scan_input_start,
+                        scan_input_offset: int = scan_input_offset,
+                        scan_input_axes: tuple[int, ...] = scan_input_axes,
+                    ) -> tuple[int, ...] | None:
+                        parent_shape = known_value_shapes.get(parent_name)
+                        if parent_shape is None:
+                            parent_shape = constant_initializer_shape(constants, parent_name)
+                        if op_type == "Scan" and pair_index >= scan_input_start:
+                            parent_shape, _parent_rank = _onnx_scan_bound_subgraph_input_shape(
+                                parent_shape,
+                                known_value_ranks.get(parent_name),
+                                pair_index=pair_index,
+                                scan_input_start=scan_input_start,
+                                scan_input_offset=scan_input_offset,
+                                scan_input_axes=scan_input_axes,
+                            )
+                        if parent_shape is None:
+                            return None
+                        if parent_name in proven_value_ranks:
+                            return parent_shape
+                        if parent_name in constants and parent_name not in graph_input_names:
+                            return parent_shape
+                        return None
+
+                    if node.op_type == "Loop" and len(node.input) > 1 and len(getattr(subgraph, "input", ())) > 1:
+                        loop_condition_name = str(node.input[1])
+                        loop_body_condition_name = _onnx_value_name(subgraph.input[1])
+                        loop_condition_shape = known_value_shapes.get(loop_condition_name)
+                        if loop_condition_shape is None:
+                            loop_condition_shape = constant_initializer_shape(constants, loop_condition_name)
+                        immutable_scalar_condition = (
+                            loop_condition_name in constants
+                            and loop_condition_name not in graph_input_names
+                            and constant_scalar_value(
+                                constants.get(loop_condition_name),
+                                int(onnx.TensorProto.BOOL),
+                            )
+                            is not None
+                        )
+                        if (
+                            loop_body_condition_name
+                            and loop_condition_shape is not None
+                            and (loop_condition_name in proven_value_ranks or immutable_scalar_condition)
+                            and (loop_condition_name not in value_lineages or immutable_scalar_condition)
+                        ):
+                            subgraph_trusted_context_shapes[loop_body_condition_name] = loop_condition_shape
+
+                    loop_exact_count_cache: dict[tuple[int, int, int, bool], int | None] = {}
+
+                    def loop_exact_iteration_count(
+                        current_node: Any = node,
+                        current_subgraph: Any = subgraph,
+                        *,
+                        current_identifier: tuple[str, str, str] = function_key,
+                        max_count: int = 1,
+                        require_bounded_trip_count: bool = False,
+                        count_cache: dict[tuple[int, int, int, bool], int | None] = loop_exact_count_cache,
+                    ) -> int | None:
+                        cache_key = (id(current_node), id(current_subgraph), max_count, require_bounded_trip_count)
+                        if cache_key in count_cache:
+                            return count_cache[cache_key]
+                        count_cache[cache_key] = None
+                        if loop_body_is_proven_skipped(current_node, constants, graph_input_names):
+                            count_cache[cache_key] = 0
+                            return 0
+                        trip_input = (
+                            str(current_node.input[0]) if len(current_node.input) > 0 and current_node.input[0] else ""
+                        )
+                        condition_input = (
+                            str(current_node.input[1]) if len(current_node.input) > 1 and current_node.input[1] else ""
+                        )
+                        if graph_input_is_runtime_overridable(trip_input, graph_input_names, constants) or (
+                            graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
+                        ):
+                            return None
+                        trip_count = (
+                            constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
+                            if trip_input
+                            else None
+                        )
+                        initial_condition = (
+                            constant_scalar_value(constants.get(condition_input), int(onnx.TensorProto.BOOL))
+                            if condition_input
+                            else True
+                        )
+                        if initial_condition is not True:
+                            return None
+                        if require_bounded_trip_count and (trip_count is None or int(trip_count) > max_count):
+                            return None
+                        if (not trip_input or (trip_count is not None and int(trip_count) > 0)) and (
+                            bool(getattr(current_subgraph, "output", ()))
+                            and graph_value_is_constant_false(
+                                current_subgraph,
+                                _onnx_value_name(current_subgraph.output[0]),
+                                constants,
+                                attribute_bindings,
+                            )
+                        ):
+                            count_cache[cache_key] = 1 if max_count >= 1 else None
+                            return count_cache[cache_key]
+                        if trip_count is None:
+                            return None
+                        exact_count = max(int(trip_count), 0)
+                        if exact_count > 1 and not loop_body_condition_remains_true(
+                            current_node,
+                            current_subgraph,
+                            constants,
+                            attribute_bindings,
+                            identifier=current_identifier,
+                        ):
+                            return None
+                        count_cache[cache_key] = exact_count if exact_count <= max_count else None
+                        return count_cache[cache_key]
+
+                    exact_loop_replay_work_exhausted = False
+
+                    def reserve_exact_loop_replay_name_work(name_characters: int = 0) -> bool:
+                        nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
+                        if exact_loop_replay_work_exhausted:
+                            return False
+                        extra_work = max(0, (name_characters - 1) // 64)
+                        if extra_work > exact_loop_replay_work_remaining:
+                            exact_loop_replay_work_exhausted = True
+                            exact_loop_replay_work_remaining = 0
+                            return False
+                        exact_loop_replay_work_remaining -= extra_work
+                        return True
+
+                    nested_attribute_reference_cache: dict[
+                        int,
+                        tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]],
+                    ] = {}
+                    nested_external_reference_cache: dict[int, tuple[Any, frozenset[str] | None]] = {}
+                    nested_reference_state = (
+                        nested_attribute_reference_cache,
+                        nested_external_reference_cache,
+                    )
+                    nested_reference_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+                    def resolved_replay_function_reference(
+                        body_node: Any, replay_name_work: Callable[[int], bool] | None = None
+                    ) -> tuple[Any, frozenset[str] | None] | None:
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return body_node, None
+                        identifier = bounded_operator_identifier(body_node)
+                        if identifier is None:
+                            return body_node, None
+                        replay_function = functions.get(identifier)
+                        if replay_function is None:
+                            return None
+                        replay_versions = function_opset_versions(replay_function, opset_versions)
+                        if replay_versions is None:
+                            return replay_function, None
+                        replay_bindings = bound_function_attributes(replay_function, body_node, resolve_attribute)
+                        replay_captures = graph_external_reference_names(
+                            replay_function,
+                            replay_bindings,
+                            require_resolved_bindings=True,
+                            capture_opset_versions=replay_versions,
+                            replay_name_work=replay_name_work,
+                        )
+                        return (
+                            replay_function,
+                            None if dependency_names_exceeded_limit(replay_captures) else replay_captures,
+                        )
+
+                    def bounded_nested_external_reference_names(
+                        graph: Any,
+                        external_reference_cache: dict[int, tuple[Any, frozenset[str] | None]],
+                        replay_name_work: Callable[[int], bool] | None = None,
+                    ) -> frozenset[str] | None:
+                        nonlocal nested_reference_work_remaining
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return None
+                        cache_key = id(graph)
+                        cached_reference_names = external_reference_cache.get(cache_key)
+                        if cached_reference_names is not None and cached_reference_names[0] is graph:
+                            return cached_reference_names[1]
+                        graph_nodes = tuple(getattr(graph, "node", ()))
+                        nested_reference_work_remaining -= max(len(graph_nodes), 1)
+                        if nested_reference_work_remaining < 0:
+                            return None
+                        local_names: set[str] = set()
+                        for values, name_only in (
+                            (getattr(graph, "input", ()), False),
+                            (getattr(graph, "initializer", ()), True),
+                            (
+                                (getattr(item, "values", None) for item in getattr(graph, "sparse_initializer", ())),
+                                True,
+                            ),
+                        ):
+                            for value in values:
+                                name = admitted_replay_value_name(value, replay_name_work, name_only=name_only)
+                                if name is None:
+                                    return None
+                                if name:
+                                    local_names.add(name)
+                        produced_names = set(local_names)
+                        referenced_names: set[str] = set()
+                        for graph_output in getattr(graph, "output", ()):
+                            output_name = admitted_replay_value_name(graph_output, replay_name_work)
+                            if output_name is None:
+                                return None
+                            if output_name:
+                                referenced_names.add(output_name)
+                        for graph_node in graph_nodes:
+                            for io_field, names in (("input", referenced_names), ("output", produced_names)):
+                                for value in getattr(graph_node, io_field, ()):
+                                    name = admitted_replay_value_name(value, replay_name_work)
+                                    if name is None:
+                                        return None
+                                    if name:
+                                        names.add(name)
+                            function_reference = resolved_replay_function_reference(graph_node, replay_name_work)
+                            nested_function = function_reference[0] if function_reference is not None else None
+                            if function_reference is not None:
+                                function_captures = function_reference[1]
+                                if function_captures is None:
+                                    return None
+                                if len(function_captures) > nested_reference_work_remaining:
+                                    nested_reference_work_remaining = 0
+                                    return None
+                                nested_reference_work_remaining -= len(function_captures)
+                                referenced_names.update(function_captures)
+                            for attribute in direct_graph_attributes(graph_node, nested_function):
+                                resolved_attribute = resolve_attribute(attribute)
+                                if not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
+                                    return None
+                                container_work = graph_capture_container_size(resolved_attribute)
+                                if container_work > nested_reference_work_remaining:
+                                    nested_reference_work_remaining = 0
+                                    return None
+                                nested_reference_work_remaining -= container_work
+                                for subgraph in _iter_attribute_graphs(resolved_attribute):
+                                    subgraph_references = bounded_nested_external_reference_names(
+                                        subgraph,
+                                        external_reference_cache,
+                                        replay_name_work,
+                                    )
+                                    if subgraph_references is None:
+                                        return None
+                                    referenced_names.update(subgraph_references)
+                        reference_names = frozenset(referenced_names - produced_names - local_names)
+                        external_reference_cache[cache_key] = (graph, reference_names)
+                        return reference_names
+
+                    def nested_attribute_graph_references(
+                        body_node: Any,
+                        attribute_reference_cache: dict[
+                            int,
+                            tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]],
+                        ],
+                        external_reference_cache: dict[int, tuple[Any, frozenset[str] | None]],
+                        replay_name_work: Callable[[int], bool] | None = None,
+                    ) -> tuple[tuple[Any, frozenset[str] | None], ...]:
+                        nonlocal nested_reference_work_remaining
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return ((body_node, None),)
+                        cache_key = id(body_node)
+                        cached_references = attribute_reference_cache.get(cache_key)
+                        if cached_references is not None and cached_references[0] is body_node:
+                            return cached_references[1]
+                        function_reference = resolved_replay_function_reference(body_node, replay_name_work)
+                        references: tuple[tuple[Any, frozenset[str] | None], ...]
+                        if function_reference is not None:
+                            references = (function_reference,)
+                        else:
+                            graph_references: list[tuple[Any, frozenset[str] | None]] = []
+                            for attribute in direct_graph_attributes(body_node, None):
+                                resolved_attribute = resolve_attribute(attribute)
+                                if not graph_capture_attribute_is_resolved(attribute, resolved_attribute):
+                                    graph_references = [(body_node, None)]
+                                    break
+                                container_work = graph_capture_container_size(resolved_attribute)
+                                if container_work > nested_reference_work_remaining:
+                                    nested_reference_work_remaining = 0
+                                    graph_references = [(body_node, None)]
+                                    break
+                                nested_reference_work_remaining -= container_work
+                                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                                    nested_references = bounded_nested_external_reference_names(
+                                        nested_graph, external_reference_cache, replay_name_work
+                                    )
+                                    if nested_references is None:
+                                        graph_references = [(body_node, None)]
+                                        break
+                                    graph_references.append((nested_graph, nested_references))
+                                if graph_references and graph_references[-1][1] is None:
+                                    break
+                            references = tuple(graph_references)
+                        if replay_name_work is not None and not replay_name_work(0):
+                            return ((body_node, None),)
+                        attribute_reference_cache[cache_key] = (body_node, references)
+                        return references
+
+                    exact_loop_replay_graph_work: dict[int, tuple[Any, int]] = {}
+
+                    def reserve_exact_loop_replay_traversal(
+                        replay_graph: Any,
+                        constant_count: int,
+                        context_count: int,
+                        graph_work_cache: dict[int, tuple[Any, int]] = exact_loop_replay_graph_work,
+                    ) -> bool:
+                        nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
+                        if exact_loop_replay_work_exhausted or exact_loop_replay_work_remaining <= 0:
+                            exact_loop_replay_work_exhausted = True
+                            exact_loop_replay_work_remaining = 0
+                            return False
+                        cached_work = graph_work_cache.get(id(replay_graph))
+                        if cached_work is None or cached_work[0] is not replay_graph:
+                            graph_nodes = getattr(replay_graph, "node", ())
+                            graph_work = max(len(graph_nodes), 1) + sum(
+                                len(getattr(replay_graph, field, ()))
+                                for field in ("input", "output", "initializer", "sparse_initializer")
+                            )
+                            if graph_work > exact_loop_replay_work_remaining:
+                                exact_loop_replay_work_exhausted = True
+                                exact_loop_replay_work_remaining = 0
+                                return False
+                            for value in chain(getattr(replay_graph, "input", ()), getattr(replay_graph, "output", ())):
+                                graph_work += max(0, (len(_onnx_value_name(value)) - 1) // 64)
+                                if graph_work > exact_loop_replay_work_remaining:
+                                    exact_loop_replay_work_exhausted = True
+                                    exact_loop_replay_work_remaining = 0
+                                    return False
+                            for replay_node in graph_nodes:
+                                graph_work += sum(
+                                    len(getattr(replay_node, field, ())) for field in ("input", "output", "attribute")
+                                )
+                                if graph_work > exact_loop_replay_work_remaining:
+                                    exact_loop_replay_work_exhausted = True
+                                    exact_loop_replay_work_remaining = 0
+                                    return False
+                                for value in chain(
+                                    getattr(replay_node, "input", ()), getattr(replay_node, "output", ())
+                                ):
+                                    graph_work += max(0, (len(str(value)) - 1) // 64)
+                                    if graph_work > exact_loop_replay_work_remaining:
+                                        exact_loop_replay_work_exhausted = True
+                                        exact_loop_replay_work_remaining = 0
+                                        return False
+                                for replay_attribute in getattr(replay_node, "attribute", ()):
+                                    # The existing attribute unit covers the first 64
+                                    # combined name/reference characters; charge further
+                                    # blocks before replay. The initial getters remain
+                                    # structural reads, not a pre-copy guarantee.
+                                    name_characters = sum(
+                                        len(str(getattr(replay_attribute, field, "")))
+                                        for field in ("name", "ref_attr_name")
+                                    )
+                                    graph_work += max(0, (name_characters - 1) // 64)
+                                    if graph_work > exact_loop_replay_work_remaining:
+                                        exact_loop_replay_work_exhausted = True
+                                        exact_loop_replay_work_remaining = 0
+                                        return False
+                            graph_work_cache[id(replay_graph)] = (replay_graph, graph_work)
+                        else:
+                            graph_work = cached_work[1]
+                        traversal_work = graph_work + constant_count + context_count
+                        if traversal_work > exact_loop_replay_work_remaining:
+                            exact_loop_replay_work_exhausted = True
+                            exact_loop_replay_work_remaining = 0
+                            return False
+                        exact_loop_replay_work_remaining -= traversal_work
+                        return True
+
+                    def subgraph_state_input_consumes_weight_rank_at_or_above_two(
+                        subgraph: Any,
+                        graph_input_name: str,
+                        initial_shape: tuple[int, ...],
+                        target_graph_output_index: int,
+                        related_input_shapes: Mapping[str, tuple[int, ...] | None] | None = None,
+                        reference_state: tuple[
+                            dict[int, tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]]],
+                            dict[int, tuple[Any, frozenset[str] | None]],
+                        ] = nested_reference_state,
+                        *,
+                        require_floating: bool = False,
+                        initial_data_type: int | None = None,
+                        trusted_body_shapes: Mapping[str, tuple[int, ...]] = subgraph_trusted_context_shapes,
+                    ) -> tuple[bool, tuple[int, ...] | None] | None:
+                        nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
+                        if not reserve_exact_loop_replay_traversal(
+                            subgraph, len(constants), len(related_input_shapes or {})
+                        ):
+                            return None
+                        graph_outputs = getattr(subgraph, "output", ())
+                        graph_output_name = (
+                            _onnx_value_name(graph_outputs[target_graph_output_index])
+                            if 0 <= target_graph_output_index < len(graph_outputs)
+                            else ""
+                        )
+                        subgraph_constants = graph_initializer_constants(
+                            subgraph,
+                            constants,
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
+                        )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
+                        output_dependency_names = graph_output_dependency_names(
+                            subgraph,
+                            (target_graph_output_index,),
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
+                        )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
+                        potential_weight_dependency_names = subgraph_potential_weight_consumer_dependency_names(
+                            subgraph,
+                            opset_versions,
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
+                        )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
+                        attribute_reference_cache, external_reference_cache = reference_state
+
+                        if dependency_names_exceeded_limit(output_dependency_names):
+                            return None
+                        if dependency_names_exceeded_limit(potential_weight_dependency_names):
+                            if not subgraph_state_input_can_reach_weight_consumer(
+                                subgraph,
+                                graph_input_name,
+                                opset_versions,
+                                inherited_constants=constants,
+                                attribute_bindings=attribute_bindings,
+                                replay_name_work=reserve_exact_loop_replay_name_work,
+                            ):
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
+                                potential_weight_dependency_names = frozenset()
+                            else:
+                                return None
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
+                        transitive_weight_dependency_names = graph_value_dependency_names(
+                            subgraph,
+                            potential_weight_dependency_names,
+                            attribute_bindings=attribute_bindings,
+                            replay_name_work=reserve_exact_loop_replay_name_work,
+                        )
+                        if not reserve_exact_loop_replay_name_work():
+                            return None
+                        if dependency_names_exceeded_limit(transitive_weight_dependency_names):
+                            return None
+                        combined_dependency_names = set(output_dependency_names)
+                        if merge_dependency_names(combined_dependency_names, transitive_weight_dependency_names):
+                            return None
+                        output_dependency_names = frozenset(combined_dependency_names)
+                        output_dependency_node_ids = graph_nodes_producing_names(subgraph, output_dependency_names)
+                        if output_dependency_node_ids is None:
+                            return None
+                        tainted_shapes: dict[str, tuple[int, ...] | None] = {graph_input_name: initial_shape}
+                        tainted_data_types: dict[str, int | None] = {graph_input_name: initial_data_type}
+
+                        def replay_constant_tensor(
+                            constant_node: Any,
+                            attribute_resolver: Callable[[Any], Any | None],
+                        ) -> Any | None:
+                            nonlocal exact_loop_replay_work_remaining, exact_loop_replay_work_exhausted
+                            attributes: Any = getattr(constant_node, "attribute", ())
+                            outputs: Any = getattr(constant_node, "output", ())
+                            metadata_work = 1 + len(attributes) + len(outputs)
+                            if metadata_work > exact_loop_replay_work_remaining:
+                                exact_loop_replay_work_exhausted = True
+                                return None
+                            exact_loop_replay_work_remaining -= metadata_work
+                            if (
+                                not builtin_operator(constant_node, "Constant")
+                                or bool(getattr(constant_node, "input", ()))
+                                or len(outputs) != 1
+                                or not outputs[0]
+                                or len(attributes) != 1
+                            ):
+                                return None
+                            attribute = attributes[0]
+                            kinds = {
+                                "value": (onnx.AttributeProto.TENSOR, "t"),
+                                "value_int": (onnx.AttributeProto.INT, "i"),
+                                "value_ints": (onnx.AttributeProto.INTS, None),
+                                "value_float": (onnx.AttributeProto.FLOAT, "f"),
+                                "value_floats": (onnx.AttributeProto.FLOATS, None),
+                            }
+                            kind = kinds.get(str(attribute.name))
+                            resolved = attribute_resolver(attribute)
+                            if (
+                                kind is None
+                                or resolved is None
+                                or bool(getattr(resolved, "ref_attr_name", ""))
+                                or int(getattr(resolved, "type", 0)) != int(kind[0])
+                                or (kind[1] is not None and not _onnx_has_singular_field(resolved, kind[1]))
+                            ):
+                                return None
+                            copy_work = (
+                                len(resolved.ints)
+                                if attribute.name == "value_ints"
+                                else len(resolved.floats)
+                                if attribute.name == "value_floats"
+                                else 0
+                                if attribute.name == "value"
+                                else 1
+                            )
+                            if copy_work > exact_loop_replay_work_remaining:
+                                exact_loop_replay_work_exhausted = True
+                                return None
+                            exact_loop_replay_work_remaining -= copy_work
+                            # Dense value reuses its TensorProto. Repeated/scalar
+                            # forms are copied only after shared replay admission.
+                            return resolved_constant_node_tensor(
+                                constant_node, lambda _attribute: resolved, lambda count: count == copy_work
+                            )
+
+                        def output_data_type(
+                            replay_node: Any,
+                            output_index: int,
+                            data_types: Mapping[str, int | None],
+                            replay_constants: Mapping[str, Any],
+                            attribute_resolver: Callable[[Any], Any | None],
+                            standard_operator: bool,
+                            context_data_type: Callable[[str], int | None],
+                            *,
+                            identifier: tuple[str, str, str],
+                        ) -> int | None:
+                            if not standard_operator:
+                                return None
+                            if identifier[1] == "Cast":
+                                if len(getattr(replay_node, "output", ())) != 1:
+                                    return None
+                                return cast_output_data_type(replay_node, attribute_resolver)
+                            if identifier[1] in {"Shape", "Size"} or (identifier[1] == "MaxPool" and output_index == 1):
+                                return onnx.TensorProto.INT64
+                            if len(getattr(replay_node, "output", ())) > 1:
+                                return None
+                            if identifier[1] not in (
+                                _SAME_TYPE_ELEMENTWISE_OPERATORS
+                                | _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                                | {
+                                    "Concat",
+                                    "Expand",
+                                    "Flatten",
+                                    "Gather",
+                                    "GatherElements",
+                                    "GatherND",
+                                    "Identity",
+                                    "MatMul",
+                                    "Reshape",
+                                    "Slice",
+                                    "Squeeze",
+                                    "Tile",
+                                    "Transpose",
+                                    "Unsqueeze",
+                                }
+                            ):
+                                return None
+                            inputs = node_input_slots(replay_node)
+                            if not inputs:
+                                return None
+                            if identifier[1] == "Where":
+                                data_inputs = inputs[1:3]
+                            elif identifier[1] in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Concat", "MatMul"}:
+                                data_inputs = inputs
+                            else:
+                                data_inputs = inputs[:1]
+                            known_types: set[int] = set()
+                            for input_name in data_inputs:
+                                if input_name in data_types:
+                                    data_type = data_types[input_name]
+                                else:
+                                    constant = replay_constants.get(input_name)
+                                    data_type = (
+                                        int(constant.data_type)
+                                        if constant is not None
+                                        else context_data_type(input_name)
+                                    )
+                                if data_type is None:
+                                    return None
+                                known_types.add(data_type)
+                            return next(iter(known_types)) if len(known_types) == 1 else None
+
+                        context_shapes = related_input_shapes or {}
+                        external_shape_names = graph_external_reference_names(
+                            subgraph, attribute_bindings, replay_name_work=reserve_exact_loop_replay_name_work
+                        )
+                        if dependency_names_exceeded_limit(external_shape_names):
+                            return None
+
+                        def known_input_data_type(input_name: str) -> int | None:
+                            if input_name in tainted_data_types:
+                                return tainted_data_types[input_name]
+                            constant = subgraph_constants.get(input_name)
+                            if constant is not None:
+                                return int(constant.data_type)
+                            if input_name in external_shape_names:
+                                return trusted_runtime_input_type(input_name)
+                            return None
+
+                        def external_input_data_type(input_name: str) -> int | None:
+                            if input_name in external_shape_names:
+                                return trusted_runtime_input_type(input_name)
+                            return None
+
+                        def known_input_shape(input_name: str) -> tuple[int, ...] | None:
+                            if input_name in tainted_shapes:
+                                return tainted_shapes[input_name]
+                            if input_name in context_shapes:
+                                return context_shapes[input_name]
+                            constant_shape = constant_initializer_shape(subgraph_constants, input_name)
+                            if constant_shape is not None:
+                                return constant_shape
+                            if input_name in external_shape_names:
+                                return trusted_body_shapes.get(input_name)
+                            return None
+
+                        def transformed_output_shape(
+                            body_node: Any,
+                            body_inputs: Sequence[str],
+                            *,
+                            identifier: tuple[str, str, str],
+                        ) -> tuple[int, ...] | None:
+                            if weight_transform_proof_error(body_node, resolve_attribute=resolve_attribute) is not None:
+                                return None
+                            data_input_shape = known_input_shape(body_inputs[0]) if body_inputs else None
+                            index_input_shape = known_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None
+                            if index_input_shape is None and len(body_inputs) > 1:
+                                index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
+                            input_shapes_by_name = {
+                                input_name: known_input_shape(input_name)
+                                for input_name in body_inputs
+                                if known_input_shape(input_name) is not None
+                            }
+                            if (
+                                reentry_shape_preserving_unary_operator(body_node, body_inputs, identifier=identifier)
+                                and data_input_shape is not None
+                            ):
+                                return data_input_shape
+                            if identifier[1] == "Flatten" and data_input_shape is not None:
+                                flattened_shape = flattened_output_shape(
+                                    data_input_shape,
+                                    resolved_onnx_int_attribute(body_node, "axis", 1, resolve_attribute),
+                                )
+                                return inferred_shape(2, flattened_shape) if flattened_shape is not None else None
+                            if identifier[1] == "Transpose" and data_input_shape is not None:
+                                permutation = transpose_permutation(body_node, len(data_input_shape), resolve_attribute)
+                                return (
+                                    inferred_shape(len(permutation), (data_input_shape[axis] for axis in permutation))
+                                    if permutation is not None
+                                    else None
+                                )
+                            if identifier[1] in _RANK_PRESERVING_VARIADIC_OPERATORS:
+                                return concat_shape(
+                                    body_node,
+                                    (known_input_shape(input_name) for input_name in body_inputs),
+                                    axis=_onnx_int_attribute(body_node, "axis"),
+                                )
+                            if identifier[1] == "MatMul":
+                                return matmul_output_shape(
+                                    known_input_shape(body_inputs[0]) if body_inputs else None,
+                                    known_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None,
+                                )
+                            if identifier[1] == "OneHot":
+                                return onehot_output_shape(
+                                    body_node,
+                                    tainted_shapes.get(body_inputs[0]) if body_inputs else None,
+                                    subgraph_constants,
+                                )
+                            if identifier[1] == "Einsum":
+                                return einsum_output_shape(body_node, input_shapes_by_name)
+                            if identifier[1] in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
+                                return broadcast_shapes(known_input_shape(input_name) for input_name in body_inputs)
+                            if identifier[1] == "Expand" and data_input_shape is not None:
+                                shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
+                                target_shape = constant_int64_vector_values(subgraph_constants.get(shape_name))
+                                return (
+                                    broadcast_shapes((data_input_shape, target_shape))
+                                    if target_shape is not None
+                                    else None
+                                )
+                            if identifier[1] == "Gather" and data_input_shape is not None:
+                                if index_input_shape is None:
+                                    return None
+                                gather_axis = _onnx_gather_axis(body_node, len(data_input_shape))
+                                if gather_axis is None:
+                                    return None
+                                return gather_shape_from_indices(data_input_shape, index_input_shape, gather_axis)
+                            if identifier[1] == "GatherElements":
+                                return index_input_shape
+                            if identifier[1] == "GatherND" and data_input_shape is not None:
+                                if not index_input_shape:
+                                    return None
+                                return gathernd_output_shape(
+                                    body_node,
+                                    input_shape=data_input_shape,
+                                    index_shape=index_input_shape,
+                                    resolve_attribute=None,
+                                )
+                            if identifier[1] == "Reshape" and data_input_shape is not None:
+                                shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
+                                shape_initializer = subgraph_constants.get(shape_name)
+                                if shape_initializer is None:
+                                    return None
+                                return _resolve_onnx_reshape_shape(
+                                    data_input_shape,
+                                    shape_initializer,
+                                    allowzero=bool(_onnx_int_attribute(body_node, "allowzero")),
+                                    onnx=onnx,
+                                    resolve_int64_vector=constant_int64_vector_values,
+                                )
+                            if identifier[1] == "Unsqueeze" and data_input_shape is not None:
+                                axes = resolve_axes(
+                                    body_node, subgraph_constants, onnx=onnx, resolve_attribute=resolve_attribute
+                                )
+                                if axes is None:
+                                    return None
+                                return unsqueezed_shape(data_input_shape, axes)
+                            if identifier[1] == "Squeeze" and data_input_shape is not None:
+                                axes = resolve_axes(
+                                    body_node, subgraph_constants, onnx=onnx, resolve_attribute=resolve_attribute
+                                )
+                                if axes is None:
+                                    return None
+                                normalized_axes = tuple(
+                                    axis if axis >= 0 else len(data_input_shape) + axis for axis in axes
+                                )
+                                if not normalized_axes:
+                                    return implicit_squeeze_shape(
+                                        body_node, data_input_shape, resolve_attribute, identifier=identifier
+                                    )
+                                if (
+                                    len(set(normalized_axes)) != len(normalized_axes)
+                                    or any(axis < 0 or axis >= len(data_input_shape) for axis in normalized_axes)
+                                    or any(data_input_shape[axis] != 1 for axis in normalized_axes)
+                                ):
+                                    return None
+                                squeeze_axes = set(normalized_axes)
+                                return tuple(
+                                    dimension
+                                    for index, dimension in enumerate(data_input_shape)
+                                    if index not in squeeze_axes
+                                )
+                            return None
+
+                        def function_input_consumes_weight_rank_at_or_above_two(
+                            function_graph: Any,
+                            function_input_name: str,
+                            function_input_shape: tuple[int, ...],
+                            function_versions: dict[str, int],
+                            function_attributes: dict[str, Any],
+                            function_constants: dict[str, Any],
+                            function_context_shapes: dict[str, tuple[int, ...]],
+                            function_context_data_types: Mapping[str, int | None],
+                            output_shapes_out: dict[str, tuple[int, ...]] | None = None,
+                            input_data_type: int | None = None,
+                            output_data_types_out: dict[str, int | None] | None = None,
+                            requested_output_indexes: tuple[int, ...] = (),
+                        ) -> bool | None:
+                            nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
+                            if not reserve_exact_loop_replay_traversal(
+                                function_graph,
+                                len(function_constants),
+                                len(function_context_shapes) + len(function_context_data_types),
+                            ):
+                                return None
+                            weight_dependency_names = subgraph_potential_weight_consumer_dependency_names(
+                                function_graph,
+                                function_versions,
+                                attribute_bindings=function_attributes,
+                                replay_name_work=reserve_exact_loop_replay_name_work,
+                            )
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
+                            if dependency_names_exceeded_limit(weight_dependency_names):
+                                return None
+                            if output_shapes_out is not None:
+                                function_outputs = getattr(function_graph, "output", ())
+                                if len(function_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
+                                    return None
+                                combined_names = set(weight_dependency_names)
+                                if any(index >= len(function_outputs) for index in requested_output_indexes):
+                                    return None
+                                if merge_dependency_names(
+                                    combined_names,
+                                    (_onnx_value_name(function_outputs[index]) for index in requested_output_indexes),
+                                ):
+                                    return None
+                                weight_dependency_names = frozenset(combined_names)
+                            weight_dependency_names = graph_value_dependency_names(
+                                function_graph,
+                                weight_dependency_names,
+                                attribute_bindings=function_attributes,
+                                replay_name_work=reserve_exact_loop_replay_name_work,
+                            )
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
+                            if dependency_names_exceeded_limit(weight_dependency_names):
+                                return None
+                            live_node_ids = graph_nodes_producing_names(function_graph, weight_dependency_names)
+                            if live_node_ids is None:
+                                return None
+
+                            def function_attribute(attribute: Any) -> Any | None:
+                                reference = str(getattr(attribute, "ref_attr_name", ""))
+                                return function_attributes.get(reference) if reference else attribute
+
+                            replay_function_node_ids: set[int] = set()
+                            for function_node in getattr(function_graph, "node", ()):
+                                function_key = bounded_operator_identifier(function_node)
+                                if function_key is None:
+                                    return None
+                                function_is_registered = has_registered_standard_operator(
+                                    function_node, function_versions, identifier=function_key
+                                )
+                                # Unused results do not make weight consumers or nested
+                                # graph captures irrelevant to coverage.
+                                if (
+                                    id(function_node) not in live_node_ids
+                                    and function_key not in functions
+                                    and not any(
+                                        int(getattr(attribute, "type", 0))
+                                        in {int(onnx.AttributeProto.GRAPH), int(onnx.AttributeProto.GRAPHS)}
+                                        or any(True for _graph in _iter_attribute_graphs(attribute))
+                                        for attribute in getattr(function_node, "attribute", ())
+                                    )
+                                    and not any(
+                                        input_name
+                                        and _onnx_potential_weight_input(
+                                            function_node,
+                                            input_index,
+                                            is_registered_standard_operator=function_is_registered,
+                                            identifier=function_key,
+                                        )
+                                        for input_index, input_name in enumerate(getattr(function_node, "input", ()))
+                                    )
+                                ):
+                                    continue
+                                replay_function_node_ids.add(id(function_node))
+                                for attribute in getattr(function_node, "attribute", ()):
+                                    reference = str(getattr(attribute, "ref_attr_name", ""))
+                                    if not reference:
+                                        continue
+                                    if function_key[0] not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+                                        return None
+                                    if function_key[1] == "Concat" and attribute.name == "axis":
+                                        bound_attribute = function_attribute(attribute)
+                                        if (
+                                            bound_attribute is None
+                                            or bool(getattr(bound_attribute, "ref_attr_name", ""))
+                                            or int(getattr(bound_attribute, "type", 0)) != int(onnx.AttributeProto.INT)
+                                            or not _onnx_has_singular_field(bound_attribute, "i")
+                                        ):
+                                            return None
+                                    elif (
+                                        resolved_weight_transform_attribute(
+                                            function_node, attribute, function_attribute
+                                        )
+                                        is None
+                                    ):
+                                        return None
+                            function_producers = graph_output_producer_nodes_by_name(function_graph)
+                            if function_producers is None or function_input_name in function_producers:
+                                return None
+                            local_tainted_shapes: dict[str, tuple[int, ...] | None] = {
+                                function_input_name: function_input_shape
+                            }
+                            local_data_types: dict[str, int | None] = {function_input_name: input_data_type}
+
+                            def function_context_data_type(input_name: str) -> int | None:
+                                if input_name in function_producers:
+                                    return None
+                                return function_context_data_types.get(input_name)
+
+                            def local_known_input_shape(input_name: str) -> tuple[int, ...] | None:
+                                if input_name in local_tainted_shapes:
+                                    return local_tainted_shapes[input_name]
+                                if input_name in function_context_shapes:
+                                    return function_context_shapes[input_name]
+                                return constant_initializer_shape(function_constants, input_name)
+
+                            def local_output_shape(
+                                function_node: Any,
+                                function_inputs: Sequence[str],
+                                *,
+                                identifier: tuple[str, str, str],
+                            ) -> tuple[int, ...] | None:
+                                if identifier[1] in _RANK_PRESERVING_VARIADIC_OPERATORS:
+                                    axis = resolved_onnx_int_attribute(function_node, "axis", 0, function_attribute)
+                                    if axis is None:
+                                        return None
+                                    return concat_shape(
+                                        function_node,
+                                        (local_known_input_shape(input_name) for input_name in function_inputs),
+                                        axis=axis,
+                                    )
+                                if (
+                                    weight_transform_proof_error(function_node, resolve_attribute=function_attribute)
+                                    is not None
+                                ):
+                                    return None
+                                data_input_shape = (
+                                    local_known_input_shape(function_inputs[0]) if function_inputs else None
+                                )
+                                input_shapes_by_name = {
+                                    input_name: local_known_input_shape(input_name)
+                                    for input_name in function_inputs
+                                    if local_known_input_shape(input_name) is not None
+                                }
+                                if (
+                                    reentry_shape_preserving_unary_operator(
+                                        function_node, function_inputs, identifier=identifier
+                                    )
+                                    and data_input_shape is not None
+                                ):
+                                    return data_input_shape
+                                if identifier[1] == "Flatten" and data_input_shape is not None:
+                                    flattened_shape = flattened_output_shape(
+                                        data_input_shape,
+                                        resolved_onnx_int_attribute(function_node, "axis", 1, function_attribute),
+                                    )
+                                    return inferred_shape(2, flattened_shape) if flattened_shape is not None else None
+                                if identifier[1] == "Transpose" and data_input_shape is not None:
+                                    permutation = transpose_permutation(
+                                        function_node, len(data_input_shape), function_attribute
+                                    )
+                                    return (
+                                        inferred_shape(
+                                            len(permutation), (data_input_shape[axis] for axis in permutation)
+                                        )
+                                        if permutation is not None
+                                        else None
+                                    )
+                                if identifier[1] == "MatMul":
+                                    return matmul_output_shape(
+                                        local_known_input_shape(function_inputs[0]) if function_inputs else None,
+                                        (
+                                            local_known_input_shape(function_inputs[1])
+                                            if len(function_inputs) > 1
+                                            else None
+                                        ),
+                                    )
+                                if identifier[1] == "OneHot":
+                                    return onehot_output_shape(
+                                        function_node,
+                                        local_known_input_shape(function_inputs[0]) if function_inputs else None,
+                                        function_constants,
+                                    )
+                                if identifier[1] == "Einsum":
+                                    return einsum_output_shape(function_node, input_shapes_by_name)
+                                if identifier[1] in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
+                                    return broadcast_shapes(
+                                        local_known_input_shape(input_name) for input_name in function_inputs
+                                    )
+                                if identifier[1] == "Expand" and data_input_shape is not None:
+                                    shape_name = function_inputs[1] if len(function_inputs) > 1 else ""
+                                    target_shape = constant_int64_vector_values(function_constants.get(shape_name))
+                                    return (
+                                        broadcast_shapes((data_input_shape, target_shape))
+                                        if target_shape is not None
+                                        else None
+                                    )
+                                if identifier[1] == "Reshape" and data_input_shape is not None:
+                                    shape_name = function_inputs[1] if len(function_inputs) > 1 else ""
+                                    shape_initializer = function_constants.get(shape_name)
+                                    if shape_initializer is None:
+                                        return None
+                                    allowzero = resolved_onnx_int_attribute(
+                                        function_node, "allowzero", 0, function_attribute
+                                    )
+                                    if allowzero is None:
+                                        return None
+                                    return _resolve_onnx_reshape_shape(
+                                        data_input_shape,
+                                        shape_initializer,
+                                        allowzero=bool(allowzero),
+                                        onnx=onnx,
+                                        resolve_int64_vector=constant_int64_vector_values,
+                                    )
+                                if identifier[1] == "Unsqueeze" and data_input_shape is not None:
+                                    axes = resolve_axes(
+                                        function_node,
+                                        function_constants,
+                                        onnx=onnx,
+                                        resolve_attribute=function_attribute,
+                                    )
+                                    if axes is None:
+                                        return None
+                                    return unsqueezed_shape(data_input_shape, axes)
+                                if identifier[1] == "Squeeze" and data_input_shape is not None:
+                                    axes = resolve_axes(
+                                        function_node,
+                                        function_constants,
+                                        onnx=onnx,
+                                        resolve_attribute=function_attribute,
+                                    )
+                                    if axes is None:
+                                        return None
+                                    normalized_axes = tuple(
+                                        axis if axis >= 0 else len(data_input_shape) + axis for axis in axes
+                                    )
+                                    if not normalized_axes:
+                                        return implicit_squeeze_shape(
+                                            function_node, data_input_shape, function_attribute, identifier=identifier
+                                        )
+                                    if (
+                                        len(set(normalized_axes)) != len(normalized_axes)
+                                        or any(axis < 0 or axis >= len(data_input_shape) for axis in normalized_axes)
+                                        or any(data_input_shape[axis] != 1 for axis in normalized_axes)
+                                    ):
+                                        return None
+                                    squeeze_axes = set(normalized_axes)
+                                    return tuple(
+                                        dimension
+                                        for index, dimension in enumerate(data_input_shape)
+                                        if index not in squeeze_axes
+                                    )
+                                return None
+
+                            for function_node in getattr(function_graph, "node", ()):
+                                if id(function_node) not in replay_function_node_ids:
+                                    continue
+                                function_inputs = node_input_names(function_node)
+                                function_outputs = node_output_names(function_node)
+                                function_key = bounded_operator_identifier(function_node)
+                                if function_key is None:
+                                    return None
+                                function_standard_domain = function_key[0] in _STANDARD_NEURAL_NETWORK_DOMAINS
+                                if builtin_operator(function_node, "Constant", identifier=function_key):
+                                    if id(function_node) not in live_node_ids:
+                                        continue
+                                    if not has_registered_standard_operator(
+                                        function_node, function_versions, identifier=function_key
+                                    ):
+                                        return None
+                                    constant_tensor = replay_constant_tensor(function_node, function_attribute)
+                                    if constant_tensor is None:
+                                        return None
+                                    for output_name in function_outputs:
+                                        function_constants[output_name] = constant_tensor
+                                        local_tainted_shapes.pop(output_name, None)
+                                        local_data_types.pop(output_name, None)
+                                    continue
+                                nested_function = functions.get(function_key)
+                                if nested_function is not None or any(
+                                    True
+                                    for attribute in getattr(function_node, "attribute", ())
+                                    for _graph in _iter_attribute_graphs(attribute)
+                                ):
+                                    return None
+                                is_registered_standard_operator = has_registered_standard_operator(
+                                    function_node,
+                                    function_versions,
+                                    identifier=function_key,
+                                )
+                                is_registered_standard_operator = is_registered_standard_operator or (
+                                    function_standard_domain
+                                    and (
+                                        function_key[1]
+                                        in (
+                                            _RANK_PRESERVING_VARIADIC_OPERATORS
+                                            | _SAME_TYPE_ELEMENTWISE_OPERATORS
+                                            | {
+                                                "Cast",
+                                                "Constant",
+                                                "Einsum",
+                                                "Expand",
+                                                "Identity",
+                                                "MatMul",
+                                                "OneHot",
+                                                "PRelu",
+                                                "Pow",
+                                                "Reshape",
+                                                "Squeeze",
+                                                "Unsqueeze",
+                                            }
+                                        )
+                                    )
+                                )
+                                any_tainted_input = any(
+                                    input_name in local_tainted_shapes for input_name in function_inputs
+                                )
+                                if not any_tainted_input:
+                                    continue
+                                input_work = max(len(function_inputs), 1)
+                                if exact_loop_replay_work_remaining < input_work:
+                                    exact_loop_replay_work_exhausted = True
+                                    return None
+                                exact_loop_replay_work_remaining -= input_work
+                                has_live_output = id(function_node) in live_node_ids
+                                has_tainted_weight_input = False
+                                for input_index, input_name in enumerate(function_inputs):
+                                    if input_name not in local_tainted_shapes:
+                                        continue
+                                    if not _onnx_potential_weight_input(
+                                        function_node,
+                                        input_index,
+                                        is_model_local_function=False,
+                                        is_registered_standard_operator=is_registered_standard_operator,
+                                        identifier=function_key,
+                                    ):
+                                        continue
+                                    has_tainted_weight_input = True
+                                    if require_floating and (
+                                        local_data_types.get(input_name) is not None
+                                        and local_data_types[input_name] not in floating_types
+                                    ):
+                                        continue
+                                    input_shape = local_tainted_shapes[input_name]
+                                    if input_shape is None:
+                                        return None
+                                    if len(input_shape) >= 2:
+                                        return True
+                                if not has_live_output and not has_tainted_weight_input:
+                                    continue
+                                output_shape = (
+                                    local_output_shape(function_node, function_inputs, identifier=function_key)
+                                    if function_standard_domain
+                                    else None
+                                )
+                                for output_index, output_name in enumerate(getattr(function_node, "output", ())):
+                                    if not output_name:
+                                        continue
+                                    local_data_types[output_name] = output_data_type(
+                                        function_node,
+                                        output_index,
+                                        local_data_types,
+                                        function_constants,
+                                        function_attribute,
+                                        function_standard_domain and is_registered_standard_operator,
+                                        function_context_data_type,
+                                        identifier=function_key,
+                                    )
+                                    local_tainted_shapes[output_name] = output_shape
+                            if output_shapes_out is not None:
+                                for output_index in requested_output_indexes:
+                                    output_name = _onnx_value_name(function_graph.output[output_index])
+                                    known_output_shape = local_tainted_shapes.get(output_name)
+                                    if known_output_shape is None:
+                                        return None
+                                    if (
+                                        output_name in output_shapes_out
+                                        and output_shapes_out[output_name] != known_output_shape
+                                    ):
+                                        return None
+                                    output_shapes_out[output_name] = known_output_shape
+                                    if output_data_types_out is not None:
+                                        data_type = local_data_types.get(output_name)
+                                        if (
+                                            output_name in output_data_types_out
+                                            and output_data_types_out[output_name] != data_type
+                                        ):
+                                            data_type = None
+                                        output_data_types_out[output_name] = data_type
+                            return False
+
+                        for body_node in getattr(subgraph, "node", ()):
+                            body_inputs = node_input_names(body_node)
+                            body_outputs = node_output_names(body_node)
+                            if not body_outputs:
+                                body_outputs = []
+                            function_key = bounded_operator_identifier(body_node)
+                            if function_key is None:
+                                return None
+                            function = functions.get(function_key)
+                            is_model_local_function = function is not None
+                            is_registered_standard_operator = (
+                                is_model_local_function
+                                or has_registered_standard_operator(
+                                    body_node,
+                                    opset_versions,
+                                    identifier=function_key,
+                                )
+                            )
+                            function_attributes: dict[str, Any] | None = None
+                            function_versions: dict[str, int] | None = None
+                            function_has_weight_consumer = False
+                            if function is not None:
+                                function_attributes = bound_function_attributes(
+                                    function,
+                                    body_node,
+                                    resolve_attribute,
+                                )
+                                function_versions = function_opset_versions(function, opset_versions)
+                                if function_versions is None:
+                                    return None
+                                function_has_weight_consumer = subgraph_has_potential_weight_consumer(
+                                    function,
+                                    function_versions,
+                                    attribute_bindings=function_attributes,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
+                                )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
+                            standard_operator = (
+                                is_registered_standard_operator
+                                and not is_model_local_function
+                                and function_key[0] in _STANDARD_NEURAL_NETWORK_DOMAINS
+                            )
+                            if (
+                                standard_operator
+                                and function_key[1] == "Loop"
+                                and loop_body_is_proven_skipped(body_node, subgraph_constants, set())
+                            ):
+                                state_inputs = node_input_slots(body_node)[2:]
+                                for output_index, output_name in enumerate(getattr(body_node, "output", ())):
+                                    if not output_name or output_index >= len(state_inputs):
+                                        continue
+                                    input_name = state_inputs[output_index]
+                                    if input_name in tainted_shapes:
+                                        tainted_shapes[output_name] = tainted_shapes[input_name]
+                                        tainted_data_types[output_name] = tainted_data_types.get(input_name)
+                                continue
+                            # Local-function captures have a liveness-aware path below.
+                            nested_attribute_references = (
+                                ()
+                                if function is not None
+                                else nested_attribute_graph_references(
+                                    body_node,
+                                    attribute_reference_cache,
+                                    external_reference_cache,
+                                    reserve_exact_loop_replay_name_work,
+                                )
+                            )
+                            if not reserve_exact_loop_replay_name_work():
+                                return None
+                            tainted_shape_names = set(tainted_shapes)
+                            has_tainted_nested_capture = any(
+                                reference_names is None or reference_names & tainted_shape_names
+                                for _nested_graph, reference_names in nested_attribute_references
+                            )
+                            tainted_inputs = [input_name for input_name in body_inputs if input_name in tainted_shapes]
+                            has_tainted_potential_weight_input = any(
+                                input_name in tainted_shapes
+                                and _onnx_potential_weight_input(
+                                    body_node,
+                                    input_index,
+                                    is_model_local_function=is_model_local_function,
+                                    is_registered_standard_operator=is_registered_standard_operator,
+                                    identifier=function_key,
+                                )
+                                for input_index, input_name in enumerate(body_inputs)
+                            )
+                            has_tainted_function_weight_input = function_has_weight_consumer and any(
+                                input_name in tainted_shapes for input_name in body_inputs
+                            )
+                            node_is_live_for_output = id(body_node) in output_dependency_node_ids
+                            if function is not None:
+                                function_captures = graph_external_reference_names(
+                                    function, function_attributes, replay_name_work=reserve_exact_loop_replay_name_work
+                                )
+                                if dependency_names_exceeded_limit(function_captures):
+                                    return None
+                                for captured_name in sorted(function_captures & tainted_shape_names):
+                                    if node_is_live_for_output or (
+                                        function_has_weight_consumer
+                                        and function_versions is not None
+                                        and subgraph_state_input_can_reach_weight_consumer(
+                                            function,
+                                            captured_name,
+                                            function_versions,
+                                            attribute_bindings=function_attributes,
+                                            inherited_constants=subgraph_constants,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
+                                        )
+                                    ):
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
+                                        has_tainted_nested_capture = True
+                                        break
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
+                            if (
+                                not node_is_live_for_output
+                                and not has_tainted_potential_weight_input
+                                and not has_tainted_function_weight_input
+                                and not has_tainted_nested_capture
+                            ):
+                                continue
+                            for attribute in getattr(body_node, "attribute", ()):
+                                if not getattr(attribute, "ref_attr_name", ""):
+                                    continue
+                                if function_key[1] == "Cast" and attribute.name == "to":
+                                    continue
+                                if (
+                                    not standard_operator
+                                    or function_key[1] not in {"Squeeze", "Unsqueeze"}
+                                    or attribute.name != "axes"
+                                    or int(attribute.type) != int(onnx.AttributeProto.INTS)
+                                    or len(body_node.attribute) != 1
+                                    or len(body_node.input) != 1
+                                    or len(body_node.output) != 1
+                                    or resolved_weight_transform_attribute(body_node, attribute, resolve_attribute)
+                                    is None
+                                ):
+                                    return None
+                                version = opset_versions.get(function_key[0])
+                                if version is None and function_key[0] in {"", "ai.onnx"}:
+                                    version = opset_versions.get("ai.onnx" if function_key[0] == "" else "")
+                                if version is None or version >= 13:
+                                    return None
+                            input_walk_work = max(
+                                len(node_input_slots(body_node)) if function is not None else len(body_inputs), 1
+                            )
+                            if exact_loop_replay_work_remaining < input_walk_work:
+                                exact_loop_replay_work_exhausted = True
+                                return None
+                            exact_loop_replay_work_remaining -= input_walk_work
+                            if (
+                                has_tainted_nested_capture
+                                and standard_operator
+                                and function_key[1] == "If"
+                                and len(nested_attribute_references) == 2
+                            ):
+                                for nested_graph, reference_names in nested_attribute_references:
+                                    if reference_names is None or not reserve_exact_loop_replay_traversal(
+                                        nested_graph, 0, len(reference_names)
+                                    ):
+                                        return None
+                                    for opaque_node in getattr(nested_graph, "node", ()):
+                                        opaque_key = bounded_operator_identifier(opaque_node)
+                                        if (
+                                            opaque_key is None
+                                            or opaque_key in functions
+                                            or any(
+                                                getattr(attribute, "ref_attr_name", "")
+                                                or int(getattr(attribute, "type", 0))
+                                                in {int(onnx.AttributeProto.GRAPH), int(onnx.AttributeProto.GRAPHS)}
+                                                for attribute in getattr(opaque_node, "attribute", ())
+                                            )
+                                        ):
+                                            return None
+                                    if (
+                                        subgraph_has_potential_weight_consumer(
+                                            nested_graph,
+                                            opset_versions,
+                                            attribute_bindings=attribute_bindings,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
+                                        )
+                                        or not reserve_exact_loop_replay_name_work()
+                                    ):
+                                        return None
+                                for output_name in body_outputs:
+                                    tainted_shapes[output_name] = None
+                                    tainted_data_types[output_name] = None
+                                continue
+                            if has_tainted_nested_capture:
+                                # A Loop without carried inputs cannot change captured
+                                # values. Its unused outputs need no shape replay, but
+                                # its weight consumers still require exact analysis.
+                                if (
+                                    not standard_operator
+                                    or function_key[1] != "Loop"
+                                    or len(getattr(body_node, "input", ())) > 2
+                                    or node_is_live_for_output
+                                ):
+                                    return None
+                                for nested_graph, reference_names in nested_attribute_references:
+                                    if reference_names is None or len(getattr(nested_graph, "input", ())) != 2:
+                                        return None
+                                    if not reserve_exact_loop_replay_traversal(
+                                        nested_graph, len(subgraph_constants), 2 * len(reference_names)
+                                    ):
+                                        return None
+                                    if referenced_function_attributes(nested_graph) != frozenset():
+                                        return None
+                                    captured_shapes = {
+                                        name: shape
+                                        for name in reference_names
+                                        if (shape := known_input_shape(name)) is not None
+                                    }
+                                    captured_data_types = {
+                                        name: known_input_data_type(name) for name in reference_names
+                                    }
+                                    nested_constants = graph_initializer_constants(
+                                        nested_graph,
+                                        subgraph_constants,
+                                        attribute_bindings=attribute_bindings,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
+                                    )
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
+                                    for captured_name in reference_names & tainted_shape_names:
+                                        captured_shape = tainted_shapes[captured_name]
+                                        if captured_shape is None:
+                                            return None
+                                        nested_consumes_weight_rank = (
+                                            function_input_consumes_weight_rank_at_or_above_two(
+                                                nested_graph,
+                                                captured_name,
+                                                captured_shape,
+                                                opset_versions,
+                                                {},
+                                                nested_constants,
+                                                captured_shapes,
+                                                captured_data_types,
+                                                input_data_type=tainted_data_types.get(captured_name),
+                                            )
+                                        )
+                                        if nested_consumes_weight_rank is None:
+                                            return None
+                                        if nested_consumes_weight_rank:
+                                            return True, None
+                                continue
+                            if standard_operator and function_key[1] == "Constant":
+                                constant_tensor = replay_constant_tensor(body_node, resolve_attribute)
+                                if constant_tensor is None:
+                                    return None
+                                for output_name in body_outputs:
+                                    subgraph_constants[output_name] = constant_tensor
+                                    tainted_shapes.pop(output_name, None)
+                                    tainted_data_types.pop(output_name, None)
+                                continue
+                            if not tainted_inputs:
+                                continue
+                            if function is not None:
+                                if function_attributes is None or function_versions is None:
+                                    return None
+                                function_actuals = node_input_slots(body_node)
+                                function_constants, function_bound_input_constants = bound_function_constants(
+                                    function,
+                                    function_actuals,
+                                    subgraph_constants,
+                                    attribute_bindings=function_attributes,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
+                                )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
+                                function_constants.update(function_bound_input_constants)
+                                function_context_shapes: dict[str, tuple[int, ...]] = {}
+                                function_context_data_types: dict[str, int | None] = {}
+                                # The actual-input walk was charged above; retain only
+                                # this call's explicit bindings, never a global map copy.
+                                for input_index, input_name in enumerate(function_actuals):
+                                    if input_index >= len(getattr(function, "input", ())):
+                                        continue
+                                    function_input_name = admitted_replay_value_name(
+                                        function.input[input_index], reserve_exact_loop_replay_name_work
+                                    )
+                                    if function_input_name is None:
+                                        return None
+                                    input_shape = known_input_shape(input_name)
+                                    if function_input_name and input_shape is not None:
+                                        function_context_shapes[function_input_name] = input_shape
+                                    if function_input_name:
+                                        function_context_data_types[function_input_name] = (
+                                            None
+                                            if function_input_name in function_context_data_types
+                                            else known_input_data_type(input_name)
+                                        )
+                                function_output_shapes: dict[str, tuple[int, ...]] = {}
+                                function_output_data_types: dict[str, int | None] = {}
+                                # Shape publication follows the selected result's
+                                # dependency cone, not every result of a live call.
+                                requested_function_output_indexes = tuple(
+                                    output_index
+                                    for output_index, output_name in enumerate(getattr(body_node, "output", ()))
+                                    if output_name and output_name in output_dependency_names
+                                )
+                                function_output_is_opaque = False
+                                for input_index, input_name in enumerate(function_actuals):
+                                    if input_name not in tainted_shapes or input_index >= len(
+                                        getattr(function, "input", ())
+                                    ):
+                                        continue
+                                    function_input_name = admitted_replay_value_name(
+                                        function.input[input_index], reserve_exact_loop_replay_name_work
+                                    )
+                                    if function_input_name is None:
+                                        return None
+                                    if not function_input_name or (
+                                        not node_is_live_for_output
+                                        and not subgraph_state_input_can_reach_weight_consumer(
+                                            function,
+                                            function_input_name,
+                                            function_versions,
+                                            attribute_bindings=function_attributes,
+                                            inherited_constants=constants,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
+                                        )
+                                    ):
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
+                                        continue
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
+                                    tainted_shape = tainted_shapes.get(input_name)
+                                    if tainted_shape is None:
+                                        return None
+                                    function_consumes_weight_rank = function_input_consumes_weight_rank_at_or_above_two(
+                                        function,
+                                        function_input_name,
+                                        tainted_shape,
+                                        function_versions,
+                                        function_attributes,
+                                        function_constants,
+                                        function_context_shapes,
+                                        function_context_data_types,
+                                        function_output_shapes if node_is_live_for_output else None,
+                                        tainted_data_types.get(input_name),
+                                        function_output_data_types if node_is_live_for_output else None,
+                                        requested_function_output_indexes,
+                                    )
+                                    if function_consumes_weight_rank is None:
+                                        if (
+                                            function_has_weight_consumer
+                                            or exact_loop_replay_work_exhausted
+                                            or not reserve_exact_loop_replay_name_work()
+                                        ):
+                                            return None
+                                        resolved_function = resolved_replay_function_reference(
+                                            body_node, reserve_exact_loop_replay_name_work
+                                        )
+                                        if (
+                                            resolved_function is None
+                                            or resolved_function[0] is not function
+                                            or resolved_function[1] is None
+                                            or not reserve_exact_loop_replay_name_work()
+                                        ):
+                                            return None
+                                        function_tainted_outputs = graph_tainted_output_indexes(
+                                            function,
+                                            {function_input_name},
+                                            function_versions,
+                                            attribute_bindings=function_attributes,
+                                            inherited_constants=function_constants,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
+                                        )
+                                        if (
+                                            graph_taint_work_is_exhausted()
+                                            or not reserve_exact_loop_replay_name_work()
+                                            or any(
+                                                output_index not in function_tainted_outputs
+                                                for output_index, output_name in enumerate(body_node.output)
+                                                if output_name
+                                            )
+                                        ):
+                                            return None
+                                        function_output_is_opaque = True
+                                        break
+                                    if function_consumes_weight_rank:
+                                        return True, None
+                                if function_output_is_opaque:
+                                    for output_name in body_outputs:
+                                        tainted_shapes[output_name] = None
+                                        tainted_data_types[output_name] = None
+                                    continue
+                                if node_is_live_for_output:
+                                    for output_index in requested_function_output_indexes:
+                                        output_name = body_node.output[output_index]
+                                        if output_index >= len(getattr(function, "output", ())):
+                                            return None
+                                        function_output_name = admitted_replay_value_name(
+                                            function.output[output_index], reserve_exact_loop_replay_name_work
+                                        )
+                                        if function_output_name is None:
+                                            return None
+                                        known_output_shape = function_output_shapes.get(function_output_name)
+                                        if known_output_shape is None:
+                                            return None
+                                        tainted_shapes[output_name] = known_output_shape
+                                        tainted_data_types[output_name] = function_output_data_types.get(
+                                            function_output_name
+                                        )
+                                continue
+                            if nested_attribute_references:
+                                if (
+                                    not standard_operator
+                                    or function_key[1] != "Loop"
+                                    or len(nested_attribute_references) != 1
+                                ):
+                                    return None
+                                nested_graph, nested_external_names = nested_attribute_references[0]
+                                if nested_external_names is None:
+                                    return None
+                                nested_seeds = set(
+                                    bound_control_flow_graph_inputs(
+                                        body_node,
+                                        nested_graph,
+                                        set(tainted_inputs),
+                                        opset_versions,
+                                        identifier=function_key,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
+                                    )
+                                )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
+                                nested_outputs, recurrent_names = control_flow_tainted_outputs(
+                                    body_node,
+                                    nested_graph,
+                                    nested_seeds,
+                                    opset_versions,
+                                    subgraph_constants,
+                                    attribute_bindings,
+                                    depth=1,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
+                                )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
+                                if graph_taint_work_is_exhausted():
+                                    return None
+                                for input_name in recurrent_names:
+                                    if subgraph_state_input_can_reach_weight_consumer(
+                                        nested_graph,
+                                        input_name,
+                                        opset_versions,
+                                        attribute_bindings=attribute_bindings,
+                                        inherited_constants=subgraph_constants,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
+                                    ):
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
+                                        return None
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
+                                input_slots = node_input_slots(body_node)
+                                state_count = max(len(input_slots) - 2, 0)
+                                nested_state_outputs: dict[str, int] = {}
+                                for index, value in enumerate(getattr(nested_graph, "input", ())):
+                                    if not 2 <= index < state_count + 2:
+                                        continue
+                                    nested_formal_name = admitted_replay_value_name(
+                                        value, reserve_exact_loop_replay_name_work
+                                    )
+                                    if nested_formal_name is None:
+                                        return None
+                                    nested_state_outputs[nested_formal_name] = index - 1
+                                live_names = output_dependency_names | potential_weight_dependency_names
+                                relevant_outputs = {
+                                    index
+                                    for index in nested_outputs
+                                    if 0 < index <= len(body_node.output)
+                                    and str(body_node.output[index - 1]) in live_names
+                                }
+                                if any(index > state_count for index in relevant_outputs):
+                                    return None
+                                used_outputs = set(relevant_outputs)
+                                pending_outputs = list(relevant_outputs)
+                                while pending_outputs:
+                                    dependencies = graph_output_dependency_names(
+                                        nested_graph,
+                                        (pending_outputs.pop(),),
+                                        attribute_bindings=attribute_bindings,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
+                                    )
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
+                                    work = max(len(dependencies), 1)
+                                    if (
+                                        dependency_names_exceeded_limit(dependencies)
+                                        or work > exact_loop_replay_work_remaining
+                                    ):
+                                        exact_loop_replay_work_exhausted = True
+                                        return None
+                                    exact_loop_replay_work_remaining -= work
+                                    for dependency in dependencies:
+                                        sibling_output = nested_state_outputs.get(dependency)
+                                        if sibling_output is not None and sibling_output not in relevant_outputs:
+                                            relevant_outputs.add(sibling_output)
+                                            pending_outputs.append(sibling_output)
+                                nested_shapes: dict[str, tuple[int, ...]] = {}
+                                for input_name, output_index in nested_state_outputs.items():
+                                    if output_index not in relevant_outputs:
+                                        continue
+                                    shape = known_input_shape(input_slots[output_index + 1])
+                                    if shape is None:
+                                        return None
+                                    nested_shapes[input_name] = shape
+                                nested_context = {
+                                    name: shape
+                                    for name in nested_external_names
+                                    if (shape := known_input_shape(name)) is not None
+                                }
+                                for input_name, shape in nested_shapes.items():
+                                    if not reserve_exact_loop_replay_traversal(
+                                        nested_graph, len(subgraph_constants), len(nested_shapes) + len(nested_context)
+                                    ):
+                                        return None
+                                    output_shapes: dict[int, tuple[int, ...]] = {}
+                                    output_index = nested_state_outputs[input_name]
+                                    promoted = subgraph_reenters_state_with_rank_promotion(
+                                        nested_graph,
+                                        input_name,
+                                        output_index,
+                                        subgraph_constants,
+                                        opset_versions,
+                                        shape,
+                                        attribute_bindings=attribute_bindings,
+                                        trusted_context_shapes=nested_context,
+                                        related_graph_input_shapes=dict(nested_shapes),
+                                        output_shapes_out=output_shapes,
+                                        depth=1,
+                                        replay_name_work=reserve_exact_loop_replay_name_work,
+                                    )
+                                    if not reserve_exact_loop_replay_name_work():
+                                        return None
+                                    if promoted or output_shapes.get(output_index) != shape:
+                                        return None
+                                for output_index in used_outputs:
+                                    output_name = str(body_node.output[output_index - 1])
+                                    nested_input_name = admitted_replay_value_name(
+                                        nested_graph.input[output_index + 1], reserve_exact_loop_replay_name_work
+                                    )
+                                    if nested_input_name is None:
+                                        return None
+                                    tainted_shapes[output_name] = nested_shapes[nested_input_name]
+                                    tainted_data_types[output_name] = None
+                                continue
+                            for input_index, input_name in enumerate(body_inputs):
+                                if input_name not in tainted_shapes:
+                                    continue
+                                if not _onnx_potential_weight_input(
+                                    body_node,
+                                    input_index,
+                                    is_model_local_function=is_model_local_function,
+                                    is_registered_standard_operator=is_registered_standard_operator,
+                                    identifier=function_key,
+                                ):
+                                    continue
+                                if require_floating and (
+                                    tainted_data_types.get(input_name) is not None
+                                    and tainted_data_types[input_name] not in floating_types
+                                ):
+                                    continue
+                                tainted_input_shape = tainted_shapes[input_name]
+                                if tainted_input_shape is None:
+                                    return None
+                                if len(tainted_input_shape) >= 2:
+                                    return True, None
+                            output_shape = (
+                                transformed_output_shape(body_node, body_inputs, identifier=function_key)
+                                if standard_operator
+                                else None
+                            )
+                            for output_index, output_name in enumerate(getattr(body_node, "output", ())):
+                                if not output_name:
+                                    continue
+                                tainted_data_types[output_name] = output_data_type(
+                                    body_node,
+                                    output_index,
+                                    tainted_data_types,
+                                    subgraph_constants,
+                                    resolve_attribute,
+                                    standard_operator,
+                                    external_input_data_type,
+                                    identifier=function_key,
+                                )
+                                tainted_shapes[output_name] = output_shape
+                        return False, tainted_shapes.get(graph_output_name) if graph_output_name else None
+
+                    def exact_loop_repeated_state_weight_rank_bounds(
+                        subgraph: Any,
+                        graph_input_name: str,
+                        graph_output_index: int,
+                        initial_shape: tuple[int, ...] | None,
+                        initial_rank: int | None,
+                        exact_loop_iterations: int,
+                        trusted_context_shapes: dict[str, tuple[int, ...]],
+                        related_graph_input_shapes: dict[str, tuple[int, ...] | None],
+                        node_input_count: int,
+                        current_node: Any = node,
+                        current_input_pairs: Iterable[tuple[Any, Any]] = input_pairs,
+                        current_input_pair_index_start: int = input_pair_index_start,
+                        *,
+                        current_identifier: tuple[str, str, str] = function_key,
+                        require_floating: bool = False,
+                        initial_data_type: int | None = None,
+                    ) -> tuple[bool, bool, tuple[int, ...]] | None:
+                        current_shape = initial_shape
+                        current_rank = len(current_shape) if current_shape is not None else initial_rank
+                        if current_shape is None and current_rank is not None:
+                            current_shape = tuple(-1 for _ in range(current_rank))
+                        if current_shape is None or current_rank is None:
+                            return None
+                        body_consumes_weight_rank = False
+                        nonlocal exact_loop_replay_work_remaining, exact_loop_replay_work_exhausted
+                        if exact_loop_replay_work_remaining <= 0:
+                            exact_loop_replay_work_exhausted = True
+                            return None
+                        current_related_shapes = dict(related_graph_input_shapes)
+                        current_related_shapes.pop(graph_input_name, None)
+                        for _iteration in range(exact_loop_iterations):
+                            related_shape_work = sum(
+                                max(len(shape), 1) for shape in current_related_shapes.values() if shape is not None
+                            )
+                            iteration_work = max(current_rank, 1) + related_shape_work
+                            if exact_loop_replay_work_remaining < iteration_work:
+                                exact_loop_replay_work_exhausted = True
+                                exact_loop_replay_work_remaining = 0
+                                return None
+                            exact_loop_replay_work_remaining -= iteration_work
+                            body_analysis = subgraph_state_input_consumes_weight_rank_at_or_above_two(
+                                subgraph,
+                                graph_input_name,
+                                current_shape,
+                                graph_output_index,
+                                current_related_shapes,
+                                require_floating=require_floating,
+                                initial_data_type=initial_data_type,
+                            )
+                            if body_analysis is None:
+                                return None
+                            body_consumes_current_rank, direct_next_shape = body_analysis
+                            body_consumes_weight_rank = body_consumes_weight_rank or body_consumes_current_rank
+                            promoted = direct_next_shape is not None and len(direct_next_shape) > current_rank
+                            next_shape = direct_next_shape
+                            if next_shape is None:
+                                output_shapes: dict[int, tuple[int, ...]] = {}
+                                promoted = subgraph_reenters_state_with_rank_promotion(
+                                    subgraph,
+                                    graph_input_name,
+                                    graph_output_index,
+                                    constants,
+                                    opset_versions,
+                                    current_shape,
+                                    trusted_context_shapes=trusted_context_shapes,
+                                    output_shapes_out=output_shapes,
+                                    related_graph_input_shapes=current_related_shapes,
+                                    attribute_bindings=attribute_bindings,
+                                    replay_name_work=reserve_exact_loop_replay_name_work,
+                                )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
+                                next_shape = output_shapes.get(graph_output_index)
+                                if next_shape is None:
+                                    return None
+                            next_rank = len(next_shape)
+                            if body_consumes_current_rank and promoted and next_rank <= current_rank:
+                                return None
+                            next_related_shapes: dict[str, tuple[int, ...] | None] = {}
+                            for related_input_name, related_shape in current_related_shapes.items():
+                                if related_shape is None:
+                                    next_related_shapes[related_input_name] = None
+                                    continue
+                                related_output_index = None
+                                for related_pair_index, (_parent_input, related_graph_input) in enumerate(
+                                    current_input_pairs,
+                                    start=current_input_pair_index_start,
+                                ):
+                                    related_formal_name = admitted_replay_value_name(
+                                        related_graph_input, reserve_exact_loop_replay_name_work
+                                    )
+                                    if related_formal_name is None:
+                                        return None
+                                    if related_formal_name == related_input_name:
+                                        related_output_index = control_flow_subgraph_state_output_index(
+                                            current_node,
+                                            related_pair_index,
+                                            opset_versions,
+                                            identifier=current_identifier,
+                                        )
+                                        break
+                                if related_output_index is None:
+                                    next_related_shapes[related_input_name] = related_shape
+                                    continue
+                                related_analysis = subgraph_state_input_consumes_weight_rank_at_or_above_two(
+                                    subgraph,
+                                    related_input_name,
+                                    related_shape,
+                                    related_output_index,
+                                    {**current_related_shapes, graph_input_name: current_shape},
+                                )
+                                if not reserve_exact_loop_replay_name_work():
+                                    return None
+                                if related_analysis is None:
+                                    next_related_shapes[related_input_name] = None
+                                else:
+                                    _related_consumes_weight_rank, related_next_shape = related_analysis
+                                    if related_next_shape is None:
+                                        shape_work = (
+                                            len(getattr(subgraph, "node", ()))
+                                            + len(constants)
+                                            + len(current_related_shapes)
+                                        )
+                                        if exact_loop_replay_work_remaining < shape_work:
+                                            exact_loop_replay_work_exhausted = True
+                                            exact_loop_replay_work_remaining = 0
+                                            return None
+                                        exact_loop_replay_work_remaining -= shape_work
+                                        related_output_shapes: dict[int, tuple[int, ...]] = {}
+                                        subgraph_reenters_state_with_rank_promotion(
+                                            subgraph,
+                                            related_input_name,
+                                            related_output_index,
+                                            constants,
+                                            opset_versions,
+                                            related_shape,
+                                            trusted_context_shapes=trusted_context_shapes,
+                                            output_shapes_out=related_output_shapes,
+                                            related_graph_input_shapes={
+                                                **current_related_shapes,
+                                                graph_input_name: current_shape,
+                                            },
+                                            attribute_bindings=attribute_bindings,
+                                            replay_name_work=reserve_exact_loop_replay_name_work,
+                                        )
+                                        if not reserve_exact_loop_replay_name_work():
+                                            return None
+                                        related_next_shape = related_output_shapes.get(related_output_index)
+                                    next_related_shapes[related_input_name] = related_next_shape
+                            current_related_shapes = next_related_shapes
+                            current_shape = next_shape
+                            current_rank = next_rank
+                        return body_consumes_weight_rank, current_rank >= 2, current_shape
+
+                    cross_state_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                    recurrent_dependency_cache: dict[int, frozenset[str] | None] = {}
+                    repeated_state_fallback_reachability: dict[int, bool | None] = {}
+
+                    def reserve_cross_state_work(work: int) -> bool:
+                        nonlocal cross_state_work_remaining
+                        if cross_state_work_remaining <= 0 or work > cross_state_work_remaining:
+                            cross_state_work_remaining = 0
+                            return False
+                        cross_state_work_remaining -= work
+                        return True
+
+                    def repeated_state_input_reaches_output_bounded(
+                        subgraph: Any,
+                        graph_input_name: str,
+                        graph_output_index: int,
+                        has_multiple_loop_states: bool = node.op_type == "Loop" and len(input_pairs) > 1,
+                        nested_attribute_reference_cache_for_node: dict[
+                            int,
+                            tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]],
+                        ] = nested_attribute_reference_cache,
+                        nested_external_reference_cache_for_node: dict[
+                            int,
+                            tuple[Any, frozenset[str] | None],
+                        ] = nested_external_reference_cache,
+                        fallback_reachability: dict[int, bool | None] = repeated_state_fallback_reachability,
+                    ) -> bool | None:
+                        graph_outputs = getattr(subgraph, "output", ())
+                        graph_output_name = (
+                            _onnx_value_name(graph_outputs[graph_output_index])
+                            if 0 <= graph_output_index < len(graph_outputs)
+                            else ""
+                        )
+                        if not graph_input_name or not graph_output_name:
+                            return None
+                        if has_multiple_loop_states:
+                            recurrent_dependencies = repeated_state_update_dependency_names_bounded(
+                                subgraph, graph_output_index
+                            )
+                            if recurrent_dependencies is not None:
+                                return graph_input_name in recurrent_dependencies
+                            if id(subgraph) in fallback_reachability:
+                                return fallback_reachability[id(subgraph)]
+                            fallback_reachability[id(subgraph)] = None
+                            if not reserve_cross_state_work(0):
+                                return None
+                            # One forward pass can prove that every carried input
+                            # is discarded, even when backward dependencies truncate.
+                            # A surviving input leaves each individual state unknown.
+                            tainted_names = {
+                                _onnx_value_name(value_info) for value_info in getattr(subgraph, "input", ())[2:]
+                            }
+                            body_nodes = getattr(subgraph, "node", ())
+                        else:
+                            tainted_names = {graph_input_name}
+                            output_dependencies = graph_output_dependency_names(
+                                subgraph, (graph_output_index,), attribute_bindings=attribute_bindings
+                            )
+                            body_nodes = (
+                                getattr(subgraph, "node", ())
+                                if dependency_names_exceeded_limit(output_dependencies)
+                                else graph_nodes_in_dependency_order(subgraph, output_dependencies)
+                            )
+                        if body_nodes is None:
+                            return None
+                        work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                        for body_node in body_nodes:
+                            if not has_multiple_loop_states and not reserve_cross_state_work(
+                                1
+                                + len(getattr(body_node, "input", ()))
+                                + len(getattr(body_node, "output", ()))
+                                + len(getattr(body_node, "attribute", ()))
+                            ):
+                                return None
+                            body_inputs = node_input_names(body_node)
+                            body_outputs = node_output_names(body_node)
+                            nested_attribute_references = nested_attribute_graph_references(
+                                body_node,
+                                nested_attribute_reference_cache_for_node,
+                                nested_external_reference_cache_for_node,
+                            )
+                            has_tainted_nested_capture = any(
+                                reference_names is None or bool(reference_names & tainted_names)
+                                for _nested_graph, reference_names in nested_attribute_references
+                            )
+                            if has_tainted_nested_capture:
+                                return None
+                            if not body_outputs or not any(input_name in tainted_names for input_name in body_inputs):
+                                continue
+                            if has_multiple_loop_states:
+                                work_remaining -= max(len(body_inputs), 1)
+                                if work_remaining < 0:
+                                    return None
+                            function_key = bounded_operator_identifier(body_node)
+                            if function_key is None:
+                                return None
+                            has_nested_attribute_graph = any(
+                                True
+                                for attribute in getattr(body_node, "attribute", ())
+                                for _graph in _iter_attribute_graphs(attribute)
+                            )
+                            if functions.get(function_key) is not None or has_nested_attribute_graph:
+                                return None
+                            tainted_names.update(body_outputs)
+                        if has_multiple_loop_states:
+                            if not any(_onnx_value_name(output) in tainted_names for output in graph_outputs[1:]):
+                                fallback_reachability[id(subgraph)] = False
+                            return fallback_reachability[id(subgraph)]
+                        return graph_output_name in tainted_names
+
+                    def state_weight_consumer_dependency_names_bounded(
+                        subgraph: Any,
+                        graph_input_name: str,
+                        reference_state: tuple[
+                            dict[int, tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]]],
+                            dict[int, tuple[Any, frozenset[str] | None]],
+                        ] = nested_reference_state,
+                    ) -> frozenset[str] | None:
+                        tainted_names = {graph_input_name}
+                        dependency_names: set[str] = set()
+                        for body_node in getattr(subgraph, "node", ()):
+                            if not reserve_cross_state_work(max(len(getattr(body_node, "input", ())), 1)):
+                                return None
+                            body_inputs = node_input_names(body_node)
+                            body_outputs = node_output_names(body_node)
+                            if not any(input_name in tainted_names for input_name in body_inputs):
+                                nested_references = nested_attribute_graph_references(body_node, *reference_state)
+                                if any(
+                                    reference_names is None or bool(reference_names & tainted_names)
+                                    for _nested_graph, reference_names in nested_references
+                                ):
+                                    return None
+                                continue
+                            function_key = bounded_operator_identifier(body_node)
+                            if function_key is None:
+                                return None
+                            function = functions.get(function_key)
+                            is_model_local_function = function is not None
+                            is_registered_standard_operator = (
+                                is_model_local_function
+                                or has_registered_standard_operator(
+                                    body_node,
+                                    opset_versions,
+                                    identifier=function_key,
+                                )
+                            )
+                            if function is not None:
+                                return None
+                            body_attributes = getattr(body_node, "attribute", ())
+                            if body_attributes and not reserve_cross_state_work(len(body_attributes)):
+                                return None
+                            has_nested_attribute_graph = any(
+                                True for attribute in body_attributes for _graph in _iter_attribute_graphs(attribute)
+                            )
+                            if has_nested_attribute_graph:
+                                return None
+                            for input_index, input_name in enumerate(body_inputs):
+                                if input_name not in tainted_names:
+                                    continue
+                                if not _onnx_potential_weight_input(
+                                    body_node,
+                                    input_index,
+                                    is_model_local_function=is_model_local_function,
+                                    is_registered_standard_operator=is_registered_standard_operator,
+                                    identifier=function_key,
+                                ):
+                                    continue
+                                if merge_dependency_names(
+                                    dependency_names,
+                                    graph_value_dependency_names(
+                                        subgraph, (input_name,), attribute_bindings=attribute_bindings
+                                    ),
+                                ):
+                                    return None
+                            tainted_names.update(body_outputs)
+                        return frozenset(dependency_names)
+
+                    repeated_state_output_indexes_by_input: dict[str, int] = {}
+                    repeated_state_sibling_bindings: list[tuple[int, str, str]] = []
+                    for related_pair_index, (_parent_input, related_graph_input) in enumerate(
+                        input_pairs,
+                        start=input_pair_index_start,
+                    ):
+                        if node.op_type == "Scan" and related_pair_index >= scan_input_start:
+                            continue
+                        related_graph_input_name = _onnx_value_name(related_graph_input)
+                        if not related_graph_input_name:
+                            continue
+                        related_output_index = control_flow_subgraph_state_output_index(
+                            node,
+                            related_pair_index,
+                            opset_versions,
+                            identifier=function_key,
+                        )
+                        repeated_state_output_indexes_by_input[related_graph_input_name] = related_output_index
+                        repeated_state_sibling_bindings.append(
+                            (related_output_index, str(_parent_input), related_graph_input_name)
+                        )
+
+                    def repeated_state_update_dependency_names_bounded(
+                        subgraph: Any,
+                        graph_output_index: int,
+                        state_output_indexes_by_input: dict[str, int] = repeated_state_output_indexes_by_input,
+                        dependency_cache: dict[int, frozenset[str] | None] = recurrent_dependency_cache,
+                    ) -> frozenset[str] | None:
+                        if graph_output_index in dependency_cache:
+                            return dependency_cache[graph_output_index]
+                        dependency_cache[graph_output_index] = None
+                        if not reserve_cross_state_work(0):
+                            return None
+                        initial_dependencies = graph_output_dependency_names(
+                            subgraph, (graph_output_index,), attribute_bindings=attribute_bindings
+                        )
+                        if dependency_collection_limit_marker in initial_dependencies:
+                            return None
+                        if not reserve_cross_state_work(len(initial_dependencies)):
+                            return None
+                        dependency_names = set(initial_dependencies)
+                        pending_inputs = [
+                            input_name for input_name in dependency_names if input_name in state_output_indexes_by_input
+                        ]
+                        visited_inputs: set[str] = set()
+                        while pending_inputs:
+                            input_name = pending_inputs.pop()
+                            if input_name in visited_inputs:
+                                continue
+                            if not reserve_cross_state_work(1):
+                                return None
+                            visited_inputs.add(input_name)
+                            sibling_output_index = state_output_indexes_by_input[input_name]
+                            sibling_dependency_names = graph_output_dependency_names(
+                                subgraph, (sibling_output_index,), attribute_bindings=attribute_bindings
+                            )
+                            if dependency_names_exceeded_limit(sibling_dependency_names):
+                                return None
+                            if not reserve_cross_state_work(len(sibling_dependency_names)):
+                                return None
+                            before_count = len(dependency_names)
+                            if merge_dependency_names(dependency_names, sibling_dependency_names):
+                                return None
+                            if len(dependency_names) == before_count:
+                                continue
+                            pending_inputs.extend(
+                                sibling_input_name
+                                for sibling_input_name in sibling_dependency_names
+                                if (
+                                    sibling_input_name in state_output_indexes_by_input
+                                    and sibling_input_name not in visited_inputs
+                                )
+                            )
+                        if not reserve_cross_state_work(len(dependency_names)):
+                            return None
+                        result = frozenset(dependency_names)
+                        dependency_cache[graph_output_index] = result
+                        return result
+
+                    related_repeated_state_shapes: dict[str, tuple[int, ...] | None] = {}
+                    future_state_weight_cache: dict[tuple[str, bool], bool] = {}
+                    future_consumer_rank_cache: dict[str, bool] = {}
+                    state_input_by_output = {
+                        output_index: input_name
+                        for input_name, output_index in repeated_state_output_indexes_by_input.items()
+                    }
+
+                    def repeated_state_output_may_reach_future_weight(
+                        subgraph: Any,
+                        graph_input_name: str,
+                        future_state_weight_cache: dict[tuple[str, bool], bool] = future_state_weight_cache,
+                        future_consumer_rank_cache: dict[str, bool] = future_consumer_rank_cache,
+                        state_input_by_output: dict[int, str] = state_input_by_output,
+                        op_type: str = node.op_type,
+                        related_graph_input_shapes: dict[str, tuple[int, ...] | None] = related_repeated_state_shapes,
+                        trusted_context_shapes: dict[str, tuple[int, ...]] = subgraph_trusted_context_shapes,
+                        state_output_indexes_by_input: dict[str, int] = repeated_state_output_indexes_by_input,
+                        node_input_count: int = len(node.input),
+                        *,
+                        include_current_iteration: bool = False,
+                    ) -> bool:
+                        cache_key = (graph_input_name, include_current_iteration)
+                        if cache_key in future_state_weight_cache:
+                            return future_state_weight_cache[cache_key]
+                        if not subgraph_has_potential_weight_consumer(
+                            subgraph, opset_versions, attribute_bindings=attribute_bindings
+                        ):
+                            future_state_weight_cache[cache_key] = False
+                            return False
+                        iteration_count = (
+                            loop_exact_iteration_count(max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK)
+                            if op_type == "Loop"
+                            else None
+                        )
+                        remaining_iterations = (
+                            None
+                            if iteration_count is None
+                            else max(iteration_count - (not include_current_iteration), 0)
+                        )
+                        pending_inputs = {graph_input_name}
+                        visited_inputs: set[str] = set()
+                        result = False
+                        while pending_inputs and remaining_iterations != 0:
+                            next_inputs: set[str] = set()
+                            for input_name in pending_inputs:
+                                if input_name in visited_inputs:
+                                    continue
+                                visited_inputs.add(input_name)
+                                if not reserve_cross_state_work(max(len(getattr(subgraph, "node", ())), 1)):
+                                    result = True
+                                    break
+                                if subgraph_state_input_can_reach_weight_consumer(
+                                    subgraph,
+                                    input_name,
+                                    opset_versions,
+                                    inherited_constants=constants,
+                                    attribute_bindings=attribute_bindings,
+                                ):
+                                    if input_name not in future_consumer_rank_cache:
+                                        # Reachability alone does not make a fixed
+                                        # vector view eligible for weight analysis.
+                                        initial_shape = related_graph_input_shapes.get(input_name)
+                                        consumes_weight_rank = True
+                                        if initial_shape is not None and iteration_count is not None:
+                                            rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                                subgraph,
+                                                input_name,
+                                                state_output_indexes_by_input[input_name],
+                                                initial_shape,
+                                                len(initial_shape),
+                                                iteration_count,
+                                                trusted_context_shapes,
+                                                related_graph_input_shapes,
+                                                node_input_count,
+                                            )
+                                            if rank_bounds is not None:
+                                                consumes_weight_rank = rank_bounds[0]
+                                        elif (
+                                            initial_shape is not None
+                                            and trusted_context_shapes.get(input_name) == initial_shape
+                                        ):
+                                            body_bounds = subgraph_state_input_consumes_weight_rank_at_or_above_two(
+                                                subgraph,
+                                                input_name,
+                                                initial_shape,
+                                                state_output_indexes_by_input[input_name],
+                                                trusted_context_shapes,
+                                            )
+                                            if body_bounds is not None:
+                                                consumes_weight_rank = body_bounds[0]
+                                        future_consumer_rank_cache[input_name] = consumes_weight_rank
+                                    if future_consumer_rank_cache[input_name]:
+                                        result = True
+                                        break
+                                output_indexes = graph_tainted_output_indexes(
+                                    subgraph,
+                                    {input_name},
+                                    opset_versions,
+                                    inherited_constants=constants,
+                                    attribute_bindings=attribute_bindings,
+                                )
+                                if not reserve_cross_state_work(len(output_indexes)):
+                                    result = True
+                                    break
+                                next_inputs.update(
+                                    state_input_by_output[index]
+                                    for index in output_indexes
+                                    if index in state_input_by_output
+                                )
+                            if result:
+                                break
+                            pending_inputs = next_inputs - visited_inputs
+                            if remaining_iterations is not None:
+                                remaining_iterations -= 1
+                        future_state_weight_cache[cache_key] = result
+                        return result
+
+                    def is_repeated_control_flow_state_input(
+                        pair_index: int,
+                        *,
+                        current_node: Any = node,
+                        current_scan_input_start: int = scan_input_start,
+                        current_scan_may_repeat: bool = node_scan_may_repeat,
+                        current_loop_may_repeat: bool = node_loop_may_repeat,
+                    ) -> bool:
+                        if current_node.op_type == "Loop":
+                            return pair_index >= 2 and current_loop_may_repeat
+                        if current_node.op_type == "Scan":
+                            return pair_index < current_scan_input_start and current_scan_may_repeat
+                        return False
+
+                    trusted_repeated_context_candidates: list[tuple[int, str, tuple[int, ...]]] = []
+                    for pair_index, (parent_input, graph_input) in enumerate(
+                        input_pairs,
+                        start=input_pair_index_start,
+                    ):
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
+                        trusted_parent_shape = trusted_bound_context_shape(parent_name, pair_index)
+                        if not graph_input_name or trusted_parent_shape is None:
+                            continue
+                        if is_repeated_control_flow_state_input(pair_index):
+                            trusted_repeated_context_candidates.append(
+                                (pair_index, graph_input_name, trusted_parent_shape)
+                            )
+                            continue
+                        subgraph_trusted_context_shapes[graph_input_name] = trusted_parent_shape
+                    for pair_index, (parent_input, graph_input) in enumerate(
+                        input_pairs,
+                        start=input_pair_index_start,
+                    ):
+                        graph_input_name = _onnx_value_name(graph_input)
+                        if not graph_input_name or not is_repeated_control_flow_state_input(pair_index):
+                            continue
+                        parent_name = str(parent_input)
+                        related_parent_shape = proven_value_shape(parent_name)
+                        if related_parent_shape is None and parent_name not in graph_input_names:
+                            related_parent_shape = constant_initializer_shape(constants, parent_name)
+                        if node.op_type == "Scan":
+                            related_parent_shape, _related_parent_rank = _onnx_scan_bound_subgraph_input_shape(
+                                related_parent_shape,
+                                proven_value_rank(parent_name),
+                                pair_index=pair_index,
+                                scan_input_start=scan_input_start,
+                                scan_input_offset=scan_input_offset,
+                                scan_input_axes=scan_input_axes,
+                            )
+                        related_repeated_state_shapes[graph_input_name] = related_parent_shape
+                    related_repeated_state_shapes_cache_key = tuple(sorted(related_repeated_state_shapes.items()))
+                    remaining_trusted_repeated_context_candidates = list(trusted_repeated_context_candidates)
+                    repeated_context_proof_budget = min(
+                        _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                        max(
+                            len(remaining_trusted_repeated_context_candidates),
+                            len(remaining_trusted_repeated_context_candidates)
+                            * len(remaining_trusted_repeated_context_candidates),
+                        ),
+                    )
+                    while remaining_trusted_repeated_context_candidates and repeated_context_proof_budget > 0:
+                        unresolved_repeated_context_candidates: list[tuple[int, str, tuple[int, ...]]] = []
+                        trusted_count_before = len(subgraph_trusted_context_shapes)
+                        for (
+                            pair_index,
+                            graph_input_name,
+                            trusted_parent_shape,
+                        ) in remaining_trusted_repeated_context_candidates:
+                            if repeated_context_proof_budget <= 0:
+                                unresolved_repeated_context_candidates.append(
+                                    (pair_index, graph_input_name, trusted_parent_shape)
+                                )
+                                continue
+                            repeated_context_proof_budget -= 1
+                            graph_output_index = control_flow_subgraph_state_output_index(
+                                node,
+                                pair_index,
+                                opset_versions,
+                                identifier=function_key,
+                            )
+                            output_shapes: dict[int, tuple[int, ...]] = {}
+                            if (
+                                not subgraph_reenters_state_with_rank_promotion(
+                                    subgraph,
+                                    graph_input_name,
+                                    graph_output_index,
+                                    constants,
+                                    opset_versions,
+                                    trusted_parent_shape,
+                                    trusted_context_shapes=subgraph_trusted_context_shapes,
+                                    output_shapes_out=output_shapes,
+                                    related_graph_input_shapes=related_repeated_state_shapes,
+                                    related_graph_input_shapes_cache_key=related_repeated_state_shapes_cache_key,
+                                    attribute_bindings=attribute_bindings,
+                                )
+                                and output_shapes.get(graph_output_index) == trusted_parent_shape
+                            ):
+                                subgraph_trusted_context_shapes[graph_input_name] = trusted_parent_shape
+                                continue
+                            unresolved_repeated_context_candidates.append(
+                                (pair_index, graph_input_name, trusted_parent_shape)
+                            )
+                        if len(subgraph_trusted_context_shapes) == trusted_count_before:
+                            break
+                        remaining_trusted_repeated_context_candidates = unresolved_repeated_context_candidates
+                    if node.op_type == "Loop" and len(repeated_state_output_indexes_by_input) > 1:
+                        # First-iteration equality is inductive only when every
+                        # recurrent dependency also preserves its initial shape.
+                        invariant_context_inputs = set(subgraph_trusted_context_shapes)
+                        for _pair_index, graph_input_name, _shape in trusted_repeated_context_candidates:
+                            if graph_input_name not in invariant_context_inputs:
+                                continue
+                            dependencies = repeated_state_update_dependency_names_bounded(
+                                subgraph, repeated_state_output_indexes_by_input[graph_input_name]
+                            )
+                            if dependencies is None or any(
+                                name in repeated_state_output_indexes_by_input and name not in invariant_context_inputs
+                                for name in dependencies
+                            ):
+                                subgraph_trusted_context_shapes.pop(graph_input_name, None)
+                    for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
+                        parent_name = str(parent_input)
+                        graph_input_name = _onnx_value_name(graph_input)
+                        parent_shape = known_value_shapes.get(parent_name)
+                        parent_shape_is_proven = parent_name in proven_value_ranks
+                        if parent_shape is None:
+                            parent_shape = constant_initializer_shape(constants, parent_name)
+                        if parent_shape is None and parent_name in value_lineages:
+                            parent_data_lineages = [
+                                lineage
+                                for lineage in value_lineages[parent_name].values()
+                                if lineage.unresolved_reason != "shape_control_lineage"
+                            ]
+                            lineage_shapes = {lineage.shape for lineage in parent_data_lineages}
+                            if len(lineage_shapes) == 1 and None not in lineage_shapes:
+                                parent_shape = next(iter(lineage_shapes))  # type: ignore[assignment]
+                                parent_shape_is_proven = all(
+                                    lineage.unresolved_reason is None for lineage in parent_data_lineages
+                                )
+                        if not parent_shape_is_proven:
+                            parent_shape = None
+                        parent_rank = known_value_ranks.get(parent_name) if parent_shape_is_proven else None
+                        repeated_control_flow_state_input = is_repeated_control_flow_state_input(pair_index)
+                        repeated_state_reenters_with_rank_promotion = False
+                        repeated_state_exact_loop_inconclusive = False
+                        exact_repeated_state_consumes_weight_rank = False
+                        repeated_state_output_shapes: dict[int, tuple[int, ...]] = {}
+                        graph_output_index = control_flow_subgraph_state_output_index(
+                            node, pair_index, opset_versions, identifier=function_key
+                        )
+                        if (
+                            repeated_control_flow_state_input
+                            and parent_shape is not None
+                            and subgraph_trusted_context_shapes.get(graph_input_name) == parent_shape
+                        ):
+                            repeated_state_output_shapes[graph_output_index] = parent_shape
+                        elif repeated_control_flow_state_input:
+                            recurrent_dependencies = None
+                            if node.op_type == "Loop" and len(repeated_state_output_indexes_by_input) > 1:
+                                recurrent_dependencies = repeated_state_update_dependency_names_bounded(
+                                    subgraph, graph_output_index
+                                )
+                            promoted_state_outputs: set[int] = set()
+                            repeated_state_reenters_with_rank_promotion = subgraph_reenters_state_with_rank_promotion(
+                                subgraph,
+                                graph_input_name,
+                                graph_output_index,
+                                constants,
+                                opset_versions,
+                                parent_shape,
+                                trusted_context_shapes=subgraph_trusted_context_shapes,
+                                output_shapes_out=repeated_state_output_shapes,
+                                related_graph_input_shapes=related_repeated_state_shapes,
+                                related_graph_input_shapes_cache_key=related_repeated_state_shapes_cache_key,
+                                output_dependency_names_override=recurrent_dependencies,
+                                promoted_outputs_out=promoted_state_outputs,
+                                attribute_bindings=attribute_bindings,
+                            )
+                            if (
+                                node.op_type == "Loop"
+                                and len(repeated_state_output_indexes_by_input) > 1
+                                and recurrent_dependencies is None
+                            ):
+                                repeated_state_reenters_with_rank_promotion = True
+                            if recurrent_dependencies is not None:
+                                repeated_state_reenters_with_rank_promotion |= any(
+                                    state_input in recurrent_dependencies and state_output in promoted_state_outputs
+                                    for state_input, state_output in repeated_state_output_indexes_by_input.items()
+                                )
+                        parent_rank_for_repeated_state = len(parent_shape) if parent_shape is not None else parent_rank
+                        finite_repeated_state_consumes_weight_rank = True
+                        # Stable states need only the normal body analysis; replay
+                        # is needed to bound shapes that can change across iterations.
+                        if (
+                            repeated_control_flow_state_input
+                            and node.op_type == "Loop"
+                            and not (
+                                not repeated_state_reenters_with_rank_promotion
+                                and parent_shape is not None
+                                and all(dimension >= 0 for dimension in parent_shape)
+                                and repeated_state_output_shapes.get(graph_output_index) == parent_shape
+                            )
+                            and (
+                                exact_loop_iterations := loop_exact_iteration_count(
+                                    max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                                )
+                            )
+                            is not None
+                        ):
+                            exact_loop_replay_work_exhausted = False
+                            exact_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                subgraph,
+                                graph_input_name,
+                                graph_output_index,
+                                parent_shape,
+                                parent_rank_for_repeated_state,
+                                exact_loop_iterations,
+                                subgraph_trusted_context_shapes,
+                                related_repeated_state_shapes,
+                                len(getattr(node, "input", ())),
+                            )
+                            if exact_rank_bounds is not None:
+                                finite_repeated_state_consumes_weight_rank = exact_rank_bounds[0]
+                                exact_repeated_state_consumes_weight_rank = exact_rank_bounds[0]
+                            else:
+                                repeated_state_exact_loop_inconclusive = True
+                                if (
+                                    exact_loop_replay_work_exhausted
+                                    and parent_name in value_lineage_limit_gap_counts
+                                    and repeated_state_input_reaches_output_bounded(
+                                        subgraph,
+                                        graph_input_name,
+                                        graph_output_index,
+                                    )
+                                    is not False
+                                ):
+                                    record_weight_lineage_limit_gap(
+                                        value_lineage_limit_gap_counts[parent_name],
+                                        collect_weight_consumers=collect_weight_consumers
+                                        and not node_body_proven_skipped,
+                                    )
+                        sibling_state_rank_promotion_may_affect_weight = False
+                        if (
+                            repeated_control_flow_state_input
+                            and node.op_type == "Loop"
+                            and len(getattr(node, "input", ())) > 3
+                            and subgraph_state_input_can_reach_weight_consumer(
+                                subgraph,
+                                graph_input_name,
+                                opset_versions,
+                                inherited_constants=constants,
+                                attribute_bindings=attribute_bindings,
+                            )
+                        ):
+                            current_update_dependency_names = repeated_state_update_dependency_names_bounded(
+                                subgraph,
+                                graph_output_index,
+                            )
+                            current_weight_consumer_dependency_names = (
+                                state_weight_consumer_dependency_names_bounded(subgraph, graph_input_name)
+                                if cross_state_work_remaining > 0
+                                else None
+                            )
+                            for (
+                                sibling_graph_output_index,
+                                sibling_parent_name,
+                                sibling_graph_input_name,
+                            ) in repeated_state_sibling_bindings:
+                                if not reserve_cross_state_work(1):
+                                    sibling_state_rank_promotion_may_affect_weight = True
+                                    break
+                                if sibling_graph_output_index == graph_output_index or not sibling_parent_name:
+                                    continue
+                                if (
+                                    current_update_dependency_names is not None
+                                    and sibling_graph_input_name not in current_update_dependency_names
+                                    and current_weight_consumer_dependency_names is not None
+                                    and sibling_graph_input_name not in current_weight_consumer_dependency_names
+                                ):
+                                    continue
+                                if not subgraph_state_input_can_reach_weight_consumer(
+                                    subgraph,
+                                    sibling_graph_input_name,
+                                    opset_versions,
+                                    inherited_constants=constants,
+                                    attribute_bindings=attribute_bindings,
+                                ):
+                                    continue
+                                sibling_parent_shape = proven_value_shape(sibling_parent_name)
+                                if sibling_parent_shape is None and sibling_parent_name not in graph_input_names:
+                                    sibling_parent_shape = constant_initializer_shape(constants, sibling_parent_name)
+                                if sibling_parent_shape is None:
+                                    sibling_parent_rank = proven_value_rank(sibling_parent_name)
+                                    if sibling_parent_rank is None:
+                                        sibling_state_rank_promotion_may_affect_weight = True
+                                        break
+                                    sibling_parent_shape = tuple(-1 for _ in range(sibling_parent_rank))
+                                if subgraph_reenters_state_with_rank_promotion(
+                                    subgraph,
+                                    sibling_graph_input_name,
+                                    sibling_graph_output_index,
+                                    constants,
+                                    opset_versions,
+                                    sibling_parent_shape,
+                                    trusted_context_shapes=subgraph_trusted_context_shapes,
+                                    related_graph_input_shapes=related_repeated_state_shapes,
+                                    related_graph_input_shapes_cache_key=related_repeated_state_shapes_cache_key,
+                                    attribute_bindings=attribute_bindings,
+                                ):
+                                    sibling_state_rank_promotion_may_affect_weight = True
+                                    break
+                        repeated_state_reaches_recurrent_use: bool | None = None
+                        if repeated_control_flow_state_input:
+                            repeated_state_reaches_recurrent_use = repeated_state_input_reaches_output_bounded(
+                                subgraph,
+                                graph_input_name,
+                                graph_output_index,
+                            )
+                            if (
+                                repeated_state_reaches_recurrent_use is False
+                                and repeated_state_output_shapes.get(graph_output_index) is None
+                                and repeated_state_output_may_reach_future_weight(
+                                    subgraph, graph_input_name, include_current_iteration=True
+                                )
+                            ):
+                                repeated_state_reenters_with_rank_promotion = True
+                                repeated_state_reaches_recurrent_use = True
+                            if (
+                                repeated_state_reaches_recurrent_use is False
+                                and (replacement_shape := repeated_state_output_shapes.get(graph_output_index))
+                                is not None
+                                and len(replacement_shape) >= 2
+                            ):
+                                # A discarded input does not prove that its replacement is
+                                # harmless when the body consumes the state on later iterations.
+                                replacement_bounds = subgraph_state_input_consumes_weight_rank_at_or_above_two(
+                                    subgraph,
+                                    graph_input_name,
+                                    replacement_shape,
+                                    graph_output_index,
+                                    related_repeated_state_shapes,
+                                )
+                                repeated_state_reaches_recurrent_use = (
+                                    replacement_bounds is None or replacement_bounds[0]
+                                )
+                                repeated_state_reenters_with_rank_promotion |= repeated_state_reaches_recurrent_use
+                                if replacement_bounds is not None and not replacement_bounds[0]:
+                                    finite_repeated_state_consumes_weight_rank = False
+                            if repeated_state_reaches_recurrent_use is False:
+                                # A discarded own state can feed a sibling's later weight.
+                                repeated_state_reaches_recurrent_use = repeated_state_output_may_reach_future_weight(
+                                    subgraph, graph_input_name, include_current_iteration=True
+                                )
+                        repeated_state_rank_gap_may_affect_weight = repeated_control_flow_state_input and (
+                            (repeated_state_reenters_with_rank_promotion and finite_repeated_state_consumes_weight_rank)
+                            or exact_repeated_state_consumes_weight_rank
+                            or sibling_state_rank_promotion_may_affect_weight
+                            or parent_rank_for_repeated_state is None
+                            or parent_rank_for_repeated_state != 1
+                        )
+                        repeated_state_gap_may_feed_weight = (
+                            not repeated_control_flow_state_input
+                            or repeated_state_rank_gap_may_affect_weight
+                            or repeated_state_exact_loop_inconclusive
+                            or node.op_type == "Scan"
+                        )
+                        if repeated_state_gap_may_feed_weight and repeated_state_reaches_recurrent_use is False:
+                            repeated_state_gap_may_feed_weight = False
                         if parent_name in value_lineages:
                             subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
-                        if parent_name in constants:
+                            if (
+                                (
+                                    repeated_state_reenters_with_rank_promotion
+                                    and finite_repeated_state_consumes_weight_rank
+                                )
+                                or exact_repeated_state_consumes_weight_rank
+                                or sibling_state_rank_promotion_may_affect_weight
+                            ) and repeated_state_reaches_recurrent_use is not False:
+                                repeated_state_body_reaches_weight_consumer = (
+                                    subgraph_state_input_can_reach_weight_consumer(
+                                        subgraph,
+                                        graph_input_name,
+                                        opset_versions,
+                                        inherited_constants=constants,
+                                        attribute_bindings=attribute_bindings,
+                                    )
+                                )
+                                retained_rank_summary = rank_gap_weight_summary_after_repeated_rank_increase(
+                                    summarize_rank_promotable_lineage_gap(value_lineages[parent_name].values()),
+                                    len(value_lineages[parent_name]),
+                                )
+                                if retained_rank_summary != empty_weight_gap_summary:
+                                    if repeated_state_body_reaches_weight_consumer:
+                                        record_weight_lineage_limit_gap(
+                                            len(retained_rank_summary.lineages),
+                                            collect_weight_consumers=collect_weight_consumers
+                                            and not node_scan8_skips_body,
+                                        )
+                                    subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                        _bounded_onnx_weight_lineage_gap_count(
+                                            subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
+                                            len(retained_rank_summary.lineages),
+                                        )
+                                    )
+                                    subgraph_bound_weight_lineage_gap_summaries[graph_input_name] = (
+                                        merge_weight_lineage_gap_summaries(
+                                            subgraph_bound_weight_lineage_gap_summaries.get(
+                                                graph_input_name, empty_weight_gap_summary
+                                            ),
+                                            retained_rank_summary,
+                                        )
+                                    )
+                        if parent_name in constants and (
+                            not repeated_control_flow_state_input
+                            or (
+                                (node.op_type == "Loop" or (node.op_type == "Scan" and not scan_input_offset))
+                                and state_output_preserves_input(subgraph, graph_input_name, graph_output_index)
+                            )
+                        ):
                             subgraph_bound_constants[graph_input_name] = constants[parent_name]
                         if parent_name in dynamic_values:
                             subgraph_bound_dynamic.add(graph_input_name)
+                        if node.op_type == "Scan":
+                            parent_shape, parent_rank = _onnx_scan_bound_subgraph_input_shape(
+                                parent_shape,
+                                parent_rank,
+                                pair_index=pair_index,
+                                scan_input_start=scan_input_start,
+                                scan_input_offset=scan_input_offset,
+                                scan_input_axes=scan_input_axes,
+                            )
+                            if (
+                                (pair_index >= scan_input_start or scan_input_offset)
+                                and parent_shape is not None
+                                and graph_input_name in subgraph_bound_lineages
+                            ):
+                                subgraph_bound_lineages[graph_input_name] = dict(
+                                    subgraph_bound_lineages[graph_input_name]
+                                )
+                                for initializer_index, lineage in value_lineages.get(parent_name, {}).items():
+                                    if (
+                                        lineage.shape is not None
+                                        and lineage.shape != parent_shape
+                                        and (lineage_size := _onnx_shape_extent_product(lineage.shape)) >= 0
+                                        and lineage_size == _onnx_shape_extent_product(parent_shape)
+                                    ):
+                                        # Singleton Scan axes and empty arrays have exact per-iteration views.
+                                        subgraph_bound_lineages[graph_input_name][initializer_index] = (
+                                            _OnnxWeightLineage(
+                                                initializer_index=initializer_index,
+                                                shape=parent_shape,
+                                                data_type=lineage.data_type,
+                                                transforms=(
+                                                    (*lineage.transforms, _OnnxWeightTransform("Reshape", parent_shape))
+                                                    if len(lineage.transforms) < _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT
+                                                    else lineage.transforms
+                                                ),
+                                                unresolved_reason=(
+                                                    lineage.unresolved_reason
+                                                    or (
+                                                        "lineage_transform_depth_limit"
+                                                        if len(lineage.transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT
+                                                        else None
+                                                    )
+                                                ),
+                                            )
+                                        )
+                                    elif (
+                                        lineage.shape is not None
+                                        and not (lineage.unresolved_reason is None and 0 in lineage.shape)
+                                        and (
+                                            len(parent_shape) != len(lineage.shape)
+                                            or any(
+                                                dimension >= 0 and dimension != lineage.shape[index]
+                                                for index, dimension in enumerate(parent_shape)
+                                            )
+                                        )
+                                        and (
+                                            pair_index >= scan_input_start
+                                            or subgraph_state_input_can_reach_weight_consumer(
+                                                subgraph,
+                                                graph_input_name,
+                                                opset_versions,
+                                                attribute_bindings=attribute_bindings,
+                                                inherited_constants=constants,
+                                            )
+                                        )
+                                    ):
+                                        subgraph_bound_lineages[graph_input_name][initializer_index] = (
+                                            _OnnxWeightLineage(
+                                                initializer_index=initializer_index,
+                                                shape=None,
+                                                data_type=lineage.data_type,
+                                                transforms=lineage.transforms,
+                                                unresolved_reason=(
+                                                    lineage.unresolved_reason or "unresolved_scan_input_lineage"
+                                                ),
+                                            )
+                                        )
+                        if (
+                            repeated_control_flow_state_input
+                            and graph_input_name not in subgraph_trusted_context_shapes
+                            and (
+                                parent_name in dynamic_values
+                                or finite_repeated_state_consumes_weight_rank
+                                or sibling_state_rank_promotion_may_affect_weight
+                            )
+                        ):
+                            # Both runtime and initializer shapes describe only the initial state.
+                            # Only invariance or finite replay can exclude later matrix weights.
+                            parent_shape = None
+                            parent_rank = None
+                        if parent_shape is not None:
+                            subgraph_bound_value_shapes[graph_input_name] = parent_shape
+                            if parent_shape_is_proven:
+                                subgraph_bound_proven_value_ranks.add(graph_input_name)
+                        elif parent_rank is not None:
+                            subgraph_bound_value_ranks[graph_input_name] = parent_rank
+                            if parent_name in proven_value_ranks:
+                                subgraph_bound_proven_value_ranks.add(graph_input_name)
+                        elif parent_name in dynamic_values or parent_name not in constants:
+                            subgraph_bound_unknown_value_ranks.add(graph_input_name)
+                        if parent_name in value_lineage_limit_gap_counts:
+                            subgraph_bound_lineage_gaps[graph_input_name] = value_lineage_limit_gap_counts[parent_name]
+                            inherited_gap_summary = known_weight_gap_summary(
+                                None,
+                                value_lineage_limit_gap_counts[parent_name],
+                            )
+                            if (
+                                repeated_state_rank_gap_may_affect_weight
+                                and repeated_state_reaches_recurrent_use is not False
+                            ):
+                                subgraph_bound_rank_promotable_lineage_gaps[graph_input_name] = (
+                                    _bounded_onnx_weight_lineage_gap_count(
+                                        subgraph_bound_rank_promotable_lineage_gaps.get(graph_input_name, 0),
+                                        value_lineage_limit_gap_counts[parent_name],
+                                    )
+                                )
+                                subgraph_bound_rank_promotable_lineage_gap_summaries[graph_input_name] = (
+                                    merge_weight_lineage_gap_summaries(
+                                        subgraph_bound_rank_promotable_lineage_gap_summaries.get(
+                                            graph_input_name, empty_weight_gap_summary
+                                        ),
+                                        inherited_gap_summary,
+                                    )
+                                )
+                            if repeated_state_gap_may_feed_weight:
+                                subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                    _bounded_onnx_weight_lineage_gap_count(
+                                        subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
+                                        value_lineage_limit_gap_counts[parent_name],
+                                    )
+                                )
+                                subgraph_bound_weight_lineage_gap_summaries[graph_input_name] = (
+                                    merge_weight_lineage_gap_summaries(
+                                        subgraph_bound_weight_lineage_gap_summaries.get(
+                                            graph_input_name, empty_weight_gap_summary
+                                        ),
+                                        inherited_gap_summary,
+                                    )
+                                )
+                        if parent_name in value_non_shape_lineage_limit_gap_counts:
+                            subgraph_bound_non_shape_lineage_gaps[graph_input_name] = (
+                                value_non_shape_lineage_limit_gap_counts[parent_name]
+                            )
+                            subgraph_bound_non_shape_lineage_gap_summaries[graph_input_name] = known_weight_gap_summary(
+                                value_non_shape_lineage_limit_gap_summaries.get(parent_name),
+                                value_non_shape_lineage_limit_gap_counts[parent_name],
+                            )
+                        if parent_name in value_weight_lineage_limit_gap_counts and repeated_state_gap_may_feed_weight:
+                            subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                value_weight_lineage_limit_gap_counts[parent_name]
+                            )
+                            subgraph_bound_weight_lineage_gap_summaries[graph_input_name] = known_weight_gap_summary(
+                                value_weight_lineage_limit_gap_summaries.get(parent_name),
+                                value_weight_lineage_limit_gap_counts[parent_name],
+                            )
+                        if parent_name in value_rank_promotable_lineage_limit_gap_counts:
+                            subgraph_bound_rank_promotable_lineage_gaps[graph_input_name] = (
+                                value_rank_promotable_lineage_limit_gap_counts[parent_name]
+                            )
+                            rank_promotable_summary = known_weight_gap_summary(
+                                value_rank_promotable_lineage_limit_gap_summaries.get(parent_name),
+                                value_rank_promotable_lineage_limit_gap_counts[parent_name],
+                            )
+                            subgraph_bound_rank_promotable_lineage_gap_summaries[graph_input_name] = (
+                                rank_promotable_summary
+                            )
+                            if repeated_state_gap_may_feed_weight:
+                                subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                    _bounded_onnx_weight_lineage_gap_count(
+                                        subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
+                                        value_rank_promotable_lineage_limit_gap_counts[parent_name],
+                                    )
+                                )
+                                subgraph_bound_weight_lineage_gap_summaries[graph_input_name] = (
+                                    merge_weight_lineage_gap_summaries(
+                                        subgraph_bound_weight_lineage_gap_summaries.get(
+                                            graph_input_name, empty_weight_gap_summary
+                                        ),
+                                        rank_promotable_summary,
+                                    )
+                                )
+                    for captured_name in graph_external_reference_names(subgraph, attribute_bindings):
+                        if captured_name in subgraph_input_names:
+                            continue
+                        if captured_name in known_value_shapes and captured_name not in subgraph_bound_value_shapes:
+                            subgraph_bound_value_shapes[captured_name] = known_value_shapes[captured_name]
+                            if captured_name in proven_value_ranks:
+                                subgraph_bound_proven_value_ranks.add(captured_name)
+                        elif captured_name in known_value_ranks and captured_name not in subgraph_bound_value_ranks:
+                            subgraph_bound_value_ranks[captured_name] = known_value_ranks[captured_name]
+                            if captured_name in proven_value_ranks:
+                                subgraph_bound_proven_value_ranks.add(captured_name)
+                    body_consumer_counts = {
+                        index: sum(group.consumer_count for group in groups[index].values())
+                        for lineages in subgraph_bound_lineages.values()
+                        for index, lineage in lineages.items()
+                        if lineage.unresolved_reason is None
+                    }
+                    subgraph_proven_weight_inputs = proven_weight_inputs_out
+                    subgraph_proof_path = (
+                        (*proven_weight_inputs_path, id(node), id(subgraph))
+                        if proven_weight_inputs_out is not None and graph_taint_work_remaining > 0
+                        else ()
+                    )
+                    if subgraph_proven_weight_inputs is None and (node_loop_may_repeat or node_scan_may_repeat):
+                        subgraph_proven_weight_inputs = {}
+                        subgraph_proof_path = ()
                     subgraph_results.append(
                         walk_graph(
                             subgraph,
                             value_lineages,
                             constants,
                             dynamic_values,
+                            inherited_lineage_limit_gap_counts=value_lineage_limit_gap_counts,
+                            inherited_non_shape_lineage_limit_gap_counts=value_non_shape_lineage_limit_gap_counts,
+                            inherited_non_shape_lineage_limit_gap_summaries=(
+                                value_non_shape_lineage_limit_gap_summaries
+                            ),
+                            inherited_weight_lineage_limit_gap_counts=value_weight_lineage_limit_gap_counts,
+                            inherited_weight_lineage_limit_gap_summaries=value_weight_lineage_limit_gap_summaries,
+                            inherited_rank_promotable_lineage_limit_gap_counts=(
+                                value_rank_promotable_lineage_limit_gap_counts
+                            ),
+                            inherited_rank_promotable_lineage_limit_gap_summaries=(
+                                value_rank_promotable_lineage_limit_gap_summaries
+                            ),
                             root_graph=False,
                             source_scope=(*resolved_attribute_key, "graph", subgraph_position),
                             opset_versions=opset_versions,
                             bound_lineages=subgraph_bound_lineages,
                             bound_constants=subgraph_bound_constants,
                             bound_dynamic_values=subgraph_bound_dynamic,
+                            bound_lineage_limit_gap_counts=subgraph_bound_lineage_gaps,
+                            bound_non_shape_lineage_limit_gap_counts=subgraph_bound_non_shape_lineage_gaps,
+                            bound_non_shape_lineage_limit_gap_summaries=(
+                                subgraph_bound_non_shape_lineage_gap_summaries
+                            ),
+                            bound_weight_lineage_limit_gap_counts=subgraph_bound_weight_lineage_gaps,
+                            bound_weight_lineage_limit_gap_summaries=subgraph_bound_weight_lineage_gap_summaries,
+                            bound_rank_promotable_lineage_limit_gap_counts=(
+                                subgraph_bound_rank_promotable_lineage_gaps
+                            ),
+                            bound_rank_promotable_lineage_limit_gap_summaries=(
+                                subgraph_bound_rank_promotable_lineage_gap_summaries
+                            ),
+                            bound_value_shapes=subgraph_bound_value_shapes,
+                            bound_value_ranks=subgraph_bound_value_ranks,
+                            bound_unknown_value_ranks=subgraph_bound_unknown_value_ranks,
+                            bound_proven_value_ranks=subgraph_bound_proven_value_ranks,
+                            inherited_runtime_input_type=trusted_runtime_input_type,
                             bound_attributes=attribute_bindings,
                             bound_attribute_keys=attribute_binding_keys,
                             function_depth=function_depth,
                             fail_on_unbound_inputs=fail_on_unbound_inputs,
+                            proven_weight_inputs_out=subgraph_proven_weight_inputs,
+                            proven_weight_inputs_path=subgraph_proof_path,
+                            collect_weight_consumers=collect_weight_consumers
+                            and not (node_body_proven_skipped and attribute.name == "body"),
                         ),
                     )
+                    if is_builtin_neural_operator and node.op_type in {"Loop", "Scan"}:
+                        # Body consumers also see later carried values, even when
+                        # the final state is unused by the parent graph.
+                        for pair_index, (parent_input, graph_input) in enumerate(
+                            input_pairs, start=input_pair_index_start
+                        ):
+                            graph_input_name = _onnx_value_name(graph_input)
+                            initial_lineages = {
+                                index: lineage
+                                for index, lineage in value_lineages.get(str(parent_input), {}).items()
+                                if lineage.unresolved_reason is None
+                                and sum(group.consumer_count for group in groups[index].values())
+                                > body_consumer_counts.get(index, 0)
+                            }
+                            if (
+                                not initial_lineages
+                                or not is_repeated_control_flow_state_input(pair_index)
+                                or not subgraph_state_input_can_reach_weight_consumer(
+                                    subgraph,
+                                    graph_input_name,
+                                    opset_versions,
+                                    attribute_bindings=attribute_bindings,
+                                    inherited_constants=constants,
+                                )
+                                or control_flow_stack_values_are_invariant(
+                                    node,
+                                    subgraph,
+                                    control_flow_subgraph_state_output_index(
+                                        node, pair_index, opset_versions, identifier=function_key
+                                    ),
+                                    subgraph_results[-1][0],
+                                    value_lineages,
+                                    opset_versions,
+                                    attribute_bindings,
+                                    required_state_input=graph_input_name,
+                                    input_shape=proven_value_shape,
+                                )
+                            ):
+                                continue
+                            state_output_index = control_flow_subgraph_state_output_index(
+                                node,
+                                pair_index,
+                                opset_versions,
+                                identifier=function_key,
+                            )
+                            next_state_lineages = (
+                                subgraph_results[-1][0][state_output_index]
+                                if state_output_index < len(subgraph_results[-1][0])
+                                else {}
+                            )
+                            if (
+                                next_state_lineages
+                                and not subgraph_results[-1][2][state_output_index]
+                                and not subgraph_state_input_can_reach_weight_consumer(
+                                    subgraph,
+                                    graph_input_name,
+                                    opset_versions,
+                                    attribute_bindings=attribute_bindings,
+                                    inherited_constants=constants,
+                                    exclude_activation_inputs=True,
+                                    proven_weight_inputs=subgraph_proven_weight_inputs,
+                                    proven_weight_inputs_path=subgraph_proof_path,
+                                    control_flow_owner=node,
+                                )
+                                and not any(
+                                    output_index in state_input_by_output
+                                    and state_input_by_output[output_index] != graph_input_name
+                                    for output_index in graph_tainted_output_indexes(
+                                        subgraph,
+                                        {graph_input_name},
+                                        opset_versions,
+                                        inherited_constants=constants,
+                                        attribute_bindings=attribute_bindings,
+                                    )
+                                )
+                            ):
+                                continue
+                            initial_shapes = {lineage.shape for lineage in initial_lineages.values()}
+                            initial_shape = next(iter(initial_shapes)) if len(initial_shapes) == 1 else None
+                            if node.op_type == "Scan":
+                                initial_shape, _initial_rank = _onnx_scan_bound_subgraph_input_shape(
+                                    initial_shape,
+                                    len(initial_shape) if initial_shape is not None else None,
+                                    pair_index=pair_index,
+                                    scan_input_start=scan_input_start,
+                                    scan_input_offset=scan_input_offset,
+                                    scan_input_axes=scan_input_axes,
+                                )
+                            if initial_shape is not None and (
+                                (node.op_type == "Loop" and len(input_pairs) == 1)
+                                or (node.op_type == "Scan" and scan_input_start - scan_input_offset == 1)
+                            ):
+                                body_rank_bounds = subgraph_state_input_consumes_weight_rank_at_or_above_two(
+                                    subgraph,
+                                    graph_input_name,
+                                    initial_shape,
+                                    state_output_index,
+                                    related_repeated_state_shapes,
+                                )
+                                if body_rank_bounds is not None:
+                                    consumes_weight, next_shape = body_rank_bounds
+                                    if next_shape is None:
+                                        next_state_shapes: dict[int, tuple[int, ...]] = {}
+                                        subgraph_reenters_state_with_rank_promotion(
+                                            subgraph,
+                                            graph_input_name,
+                                            state_output_index,
+                                            constants,
+                                            opset_versions,
+                                            initial_shape,
+                                            trusted_context_shapes=subgraph_trusted_context_shapes,
+                                            output_shapes_out=next_state_shapes,
+                                            related_graph_input_shapes=related_repeated_state_shapes,
+                                            related_graph_input_shapes_cache_key=related_repeated_state_shapes_cache_key,
+                                            attribute_bindings=attribute_bindings,
+                                        )
+                                        next_shape = next_state_shapes.get(state_output_index)
+                                    if not consumes_weight and next_shape == initial_shape:
+                                        continue
+                                    if (
+                                        node.op_type == "Loop"
+                                        and next_shape is not None
+                                        and (
+                                            iterations := loop_exact_iteration_count(
+                                                max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                                            )
+                                        )
+                                        is not None
+                                    ):
+                                        later_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                            subgraph,
+                                            graph_input_name,
+                                            state_output_index,
+                                            next_shape,
+                                            len(next_shape),
+                                            max(iterations - 1, 0),
+                                            subgraph_trusted_context_shapes,
+                                            {},
+                                            len(node.input),
+                                        )
+                                        if later_rank_bounds is not None and not later_rank_bounds[0]:
+                                            continue
+                            for lineage in initial_lineages.values():
+                                record_unresolved_lineage(
+                                    _OnnxWeightLineage(
+                                        initializer_index=lineage.initializer_index,
+                                        shape=lineage.shape,
+                                        data_type=lineage.data_type,
+                                        transforms=lineage.transforms,
+                                        unresolved_reason="unresolved_control_flow_stack_lineage",
+                                    ),
+                                    node,
+                                    current_node_index,
+                                    pair_index,
+                                    collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
+                                )
 
             function = functions.get(function_key)
-            if function is not None and function_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
-                plan.record_coverage_gap("function_call_depth_limit")
+            function_versions = None
+            function_scope_error = None
+            if function is not None:
+                if function_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                    function_scope_error = "function_call_depth_limit"
+                    plan.record_coverage_gap(function_scope_error)
+                else:
+                    function_versions = function_opset_versions(function, opset_versions)
+                    if function_versions is None:
+                        function_scope_error = "function_opset_environment_work_limit"
+            if function is not None and function_scope_error is not None:
                 for input_index, input_name in enumerate(node.input):
                     for initializer_index, lineage in value_lineages.get(str(input_name), {}).items():
                         record_unresolved_lineage(
@@ -2720,47 +13342,118 @@ def _build_onnx_weight_analysis_plan(
                                 shape=None,
                                 data_type=lineage.data_type,
                                 transforms=lineage.transforms,
-                                unresolved_reason="function_call_depth_limit",
+                                unresolved_reason=function_scope_error,
                             ),
                             node,
                             current_node_index,
                             input_index,
+                            collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
                         )
                 function = None
-            if function is not None:
+            if function is not None and function_versions is not None:
                 function_bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
                 function_bound_constants: dict[str, Any] = {}
                 function_bound_dynamic: set[str] = set()
+                function_bound_lineage_gaps: dict[str, int] = {}
+                function_bound_non_shape_lineage_gaps: dict[str, int] = {}
+                function_bound_non_shape_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                function_bound_weight_lineage_gaps: dict[str, int] = {}
+                function_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                function_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
+                function_bound_rank_promotable_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                function_bound_value_shapes: dict[str, tuple[int, ...]] = {}
+                function_bound_value_ranks: dict[str, int] = {}
+                function_bound_unknown_value_ranks: set[str] = set()
+                function_bound_proven_value_ranks: set[str] = set()
+                function_bound_runtime_input_types: dict[str, int | None] = {}
                 function_source_scope = ("function", *function_key)
-                function_bound_attributes: dict[str, Any] = {}
-                function_bound_attribute_keys: dict[str, tuple[Any, ...]] = {}
-                for default_position, attribute in enumerate(getattr(function, "attribute_proto", ())):
+                function_bound_attributes, function_bound_attribute_keys = default_function_attribute_maps(function)
+                referenced_attributes = referenced_function_attributes(function)
+                call_attributes = (
+                    ()
+                    if referenced_attributes == frozenset()
+                    or referenced_attributes is function_attribute_reference_limit
+                    else getattr(node, "attribute", ())
+                )
+                if call_attributes:
+                    if reserve_function_default_work(
+                        len(function_bound_attributes) + len(function_bound_attribute_keys)
+                    ):
+                        function_bound_attributes = function_bound_attributes.copy()
+                        function_bound_attribute_keys = function_bound_attribute_keys.copy()
+                    else:
+                        function_bound_attributes = {}
+                        function_bound_attribute_keys = {}
+                        call_attributes = ()
+                for attribute_position, attribute in enumerate(call_attributes):
                     attribute_name = str(attribute.name)
-                    function_bound_attributes[attribute_name] = attribute
-                    function_bound_attribute_keys[attribute_name] = (
-                        *function_source_scope,
-                        "default_attribute",
-                        default_position,
-                    )
-                for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
+                    if referenced_attributes is not None and attribute_name not in referenced_attributes:
+                        continue
                     resolved_attribute = resolve_attribute(attribute)
                     if resolved_attribute is not None:
-                        attribute_name = str(attribute.name)
                         function_bound_attributes[attribute_name] = resolved_attribute
                         function_bound_attribute_keys[attribute_name] = attribute_source_key(
                             attribute,
                             local_node_index,
                             attribute_position,
                         )
+                    else:
+                        function_bound_attributes.pop(attribute_name, None)
+                        function_bound_attribute_keys.pop(attribute_name, None)
+                admit_runtime_bindings = reserve_runtime_input_type_work(1 + min(len(node.input), len(function.input)))
                 for parent_input, function_input in zip(node.input, function.input, strict=False):
                     parent_name = str(parent_input)
                     function_input_name = _onnx_value_name(function_input)
+                    if admit_runtime_bindings:
+                        function_bound_runtime_input_types[function_input_name] = (
+                            None
+                            if function_input_name in function_bound_runtime_input_types
+                            else trusted_runtime_input_type(parent_name)
+                        )
                     if parent_name in value_lineages:
                         function_bound_lineages[function_input_name] = value_lineages[parent_name]
                     if parent_name in constants:
                         function_bound_constants[function_input_name] = constants[parent_name]
                     if parent_name in dynamic_values:
                         function_bound_dynamic.add(function_input_name)
+                    if parent_name in known_value_shapes:
+                        function_bound_value_shapes[function_input_name] = known_value_shapes[parent_name]
+                        if parent_name in proven_value_ranks:
+                            function_bound_proven_value_ranks.add(function_input_name)
+                    elif parent_name in known_value_ranks:
+                        function_bound_value_ranks[function_input_name] = known_value_ranks[parent_name]
+                        if parent_name in proven_value_ranks:
+                            function_bound_proven_value_ranks.add(function_input_name)
+                    elif parent_name in dynamic_values or parent_name not in constants:
+                        function_bound_unknown_value_ranks.add(function_input_name)
+                    if parent_name in value_lineage_limit_gap_counts:
+                        function_bound_lineage_gaps[function_input_name] = value_lineage_limit_gap_counts[parent_name]
+                    if parent_name in value_non_shape_lineage_limit_gap_counts:
+                        function_bound_non_shape_lineage_gaps[function_input_name] = (
+                            value_non_shape_lineage_limit_gap_counts[parent_name]
+                        )
+                        function_bound_non_shape_lineage_gap_summaries[function_input_name] = known_weight_gap_summary(
+                            value_non_shape_lineage_limit_gap_summaries.get(parent_name),
+                            value_non_shape_lineage_limit_gap_counts[parent_name],
+                        )
+                    if parent_name in value_weight_lineage_limit_gap_counts:
+                        function_bound_weight_lineage_gaps[function_input_name] = value_weight_lineage_limit_gap_counts[
+                            parent_name
+                        ]
+                        function_bound_weight_lineage_gap_summaries[function_input_name] = known_weight_gap_summary(
+                            value_weight_lineage_limit_gap_summaries.get(parent_name),
+                            value_weight_lineage_limit_gap_counts[parent_name],
+                        )
+                    if parent_name in value_rank_promotable_lineage_limit_gap_counts:
+                        function_bound_rank_promotable_lineage_gaps[function_input_name] = (
+                            value_rank_promotable_lineage_limit_gap_counts[parent_name]
+                        )
+                        function_bound_rank_promotable_lineage_gap_summaries[function_input_name] = (
+                            known_weight_gap_summary(
+                                value_rank_promotable_lineage_limit_gap_summaries.get(parent_name),
+                                value_rank_promotable_lineage_limit_gap_counts[parent_name],
+                            )
+                        )
                 subgraph_results.append(
                     walk_graph(
                         function,
@@ -2769,40 +13462,176 @@ def _build_onnx_weight_analysis_plan(
                         dynamic_values,
                         root_graph=False,
                         source_scope=function_source_scope,
-                        opset_versions={
-                            str(getattr(opset, "domain", "") or ""): int(opset.version)
-                            for opset in getattr(function, "opset_import", ())
-                        }
-                        or opset_versions,
+                        inherited_lineage_limit_gap_counts=value_lineage_limit_gap_counts,
+                        inherited_non_shape_lineage_limit_gap_counts=value_non_shape_lineage_limit_gap_counts,
+                        inherited_non_shape_lineage_limit_gap_summaries=value_non_shape_lineage_limit_gap_summaries,
+                        inherited_weight_lineage_limit_gap_counts=value_weight_lineage_limit_gap_counts,
+                        inherited_weight_lineage_limit_gap_summaries=value_weight_lineage_limit_gap_summaries,
+                        inherited_rank_promotable_lineage_limit_gap_counts=value_rank_promotable_lineage_limit_gap_counts,
+                        inherited_rank_promotable_lineage_limit_gap_summaries=value_rank_promotable_lineage_limit_gap_summaries,
+                        opset_versions=function_versions,
                         bound_lineages=function_bound_lineages,
                         bound_constants=function_bound_constants,
                         bound_dynamic_values=function_bound_dynamic,
+                        bound_lineage_limit_gap_counts=function_bound_lineage_gaps,
+                        bound_non_shape_lineage_limit_gap_counts=function_bound_non_shape_lineage_gaps,
+                        bound_non_shape_lineage_limit_gap_summaries=function_bound_non_shape_lineage_gap_summaries,
+                        bound_weight_lineage_limit_gap_counts=function_bound_weight_lineage_gaps,
+                        bound_weight_lineage_limit_gap_summaries=function_bound_weight_lineage_gap_summaries,
+                        bound_rank_promotable_lineage_limit_gap_counts=(function_bound_rank_promotable_lineage_gaps),
+                        bound_rank_promotable_lineage_limit_gap_summaries=(
+                            function_bound_rank_promotable_lineage_gap_summaries
+                        ),
+                        bound_value_shapes=function_bound_value_shapes,
+                        bound_value_ranks=function_bound_value_ranks,
+                        bound_unknown_value_ranks=function_bound_unknown_value_ranks,
+                        bound_proven_value_ranks=function_bound_proven_value_ranks,
+                        inherited_runtime_input_type=(trusted_runtime_input_type if admit_runtime_bindings else None),
+                        bound_runtime_input_types=function_bound_runtime_input_types,
                         bound_attributes=function_bound_attributes,
                         bound_attribute_keys=function_bound_attribute_keys,
                         function_depth=function_depth + 1,
                         fail_on_unbound_inputs=fail_on_unbound_inputs,
+                        proven_weight_inputs_out=proven_weight_inputs_out,
+                        proven_weight_inputs_path=(
+                            (*proven_weight_inputs_path, id(node), id(function))
+                            if proven_weight_inputs_out is not None and graph_taint_work_remaining > 0
+                            else ()
+                        ),
+                        collect_weight_consumers=collect_weight_consumers,
                     ),
                 )
 
             # Keep dimension provenance: a later Cast can turn dimensions into weights.
-            is_shape_query = (
-                is_registered_standard_operator
-                and not is_model_local_function
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type in {"Shape", "Size"}
-            )
+            is_shape_query = is_builtin_neural_operator and node.op_type in {"Shape", "Size"}
             output_lineages: dict[int, _OnnxWeightLineage] = {}
+            elementwise_output_shape: tuple[int, ...] | None = None
+            elementwise_output_rank: int | None = None
+            same_type_elementwise = is_builtin_neural_operator and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
+            same_type_unary_elementwise = (
+                is_builtin_neural_operator
+                and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                and len(input_names) == 1
+            )
+            clip_operator = is_builtin_neural_operator and node.op_type == "Clip"
+            batch_normalization_operator = is_builtin_neural_operator and node.op_type == "BatchNormalization"
+            pow_operator = is_builtin_neural_operator and node.op_type == "Pow"
+            size_operator = is_shape_query and node.op_type == "Size" and not all_input_lineages
+            elementwise_has_unknown_dynamic_rank = False
+            elementwise_output_rank_proven = True
+            if same_type_elementwise or same_type_unary_elementwise or pow_operator:
+                elementwise_output_shape = broadcast_shapes(
+                    known_value_shapes.get(input_name) for input_name in input_names
+                )
+                elementwise_input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
+                elementwise_output_rank = (
+                    len(elementwise_output_shape)
+                    if elementwise_output_shape is not None
+                    else broadcast_rank_from_input_ranks(elementwise_input_ranks)
+                )
+                elementwise_has_unknown_dynamic_rank = any(
+                    value_has_unknown_dynamic_rank(input_name) for input_name in input_names
+                )
+                if elementwise_has_unknown_dynamic_rank:
+                    elementwise_output_shape = None
+                    elementwise_output_rank = None
+                elementwise_output_rank_proven = all(
+                    value_rank_is_proven_or_unknown(input_name) for input_name in input_names
+                )
+            elif is_builtin_neural_operator and node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS and input_names:
+                elementwise_output_shape = concat_shape(
+                    node,
+                    (known_value_shapes.get(input_name) for input_name in input_names),
+                    axis=resolved_int_attribute(node, "axis", 0),
+                )
+                elementwise_output_rank_proven = all(
+                    value_rank_is_proven_or_unknown(input_name) for input_name in input_names
+                )
+                if elementwise_output_shape is not None:
+                    elementwise_output_rank = len(elementwise_output_shape)
+                else:
+                    input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
+                    known_ranks = {rank for rank in input_ranks if rank is not None}
+                    if len(known_ranks) == 1 and all(rank is not None for rank in input_ranks):
+                        elementwise_output_rank = next(iter(known_ranks))
+            elif is_builtin_neural_operator and node.op_type == "MatMul" and len(input_names) == 2:
+                matmul_left_shape = proven_value_shape(input_names[0])
+                matmul_right_shape = proven_value_shape(input_names[1])
+                if matmul_left_shape and matmul_right_shape:
+                    matmul_left_extent = matmul_left_shape[-1]
+                    matmul_right_extent = (
+                        matmul_right_shape[-2] if len(matmul_right_shape) >= 2 else matmul_right_shape[-1]
+                    )
+                    if matmul_left_extent < 0 or matmul_right_extent < 0 or matmul_left_extent == matmul_right_extent:
+                        elementwise_output_shape = matmul_output_shape(matmul_left_shape, matmul_right_shape)
+                if elementwise_output_shape is not None:
+                    elementwise_output_rank = len(elementwise_output_shape)
+            elif (clip_operator or batch_normalization_operator) and input_names:
+                elementwise_output_shape = known_value_shapes.get(input_names[0])
+                elementwise_output_rank = (
+                    len(elementwise_output_shape)
+                    if elementwise_output_shape is not None
+                    else known_value_ranks.get(input_names[0])
+                )
+                elementwise_output_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
+            elif size_operator:
+                elementwise_output_shape = ()
+                elementwise_output_rank = 0
+            resolved_cast_target_data_type = (
+                cast_output_data_type(node, resolve_attribute)
+                if supported_transform and node.op_type == "Cast"
+                else None
+            )
             if supported_transform:
                 data_lineages = value_lineages.get(str(node.input[0]), {}) if node.input else {}
                 for initializer_index, lineage in data_lineages.items():
                     transform_counts[initializer_index] += 1
-                    output_lineages[initializer_index] = transformed_lineage(lineage, node, constants)
+                    if (
+                        node.op_type not in {"Identity", "Cast"}
+                        and str(node.input[0]) in proven_value_ranks
+                        and (input_shape := known_value_shapes.get(str(node.input[0]))) is not None
+                        and lineage.shape is not None
+                        and (
+                            len(input_shape) != len(lineage.shape)
+                            or any(
+                                dimension >= 0 and dimension != lineage.shape[index]
+                                for index, dimension in enumerate(input_shape)
+                            )
+                        )
+                    ):
+                        # Whole Scan sequences and Scan-8 batches cannot stand in
+                        # for the per-iteration value when applying body transforms.
+                        lineage = _OnnxWeightLineage(
+                            initializer_index=initializer_index,
+                            shape=None,
+                            data_type=lineage.data_type,
+                            transforms=lineage.transforms,
+                            unresolved_reason=lineage.unresolved_reason or "unresolved_scan_input_lineage",
+                        )
+                    output_lineages[initializer_index] = transformed_lineage(
+                        lineage,
+                        node,
+                        constants,
+                        resolve_value_shape=proven_value_shape,
+                        cast_target_data_type=resolved_cast_target_data_type,
+                        resolve_attribute=resolve_attribute,
+                    )
                 merge_lineages(
                     output_lineages,
                     shape_control_input_lineages,
                     ambiguous_reason="ambiguous_operator_input_lineage",
                 )
             elif is_shape_query:
+                if all_input_non_shape_lineage_gap_summary.shape_control:
+                    all_input_non_shape_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        _OnnxWeightLineageGapSummary(
+                            all_input_non_shape_lineage_gap_summary.lineages,
+                            all_input_non_shape_lineage_gap_summary.truncated,
+                            converted_shape_control=all_input_non_shape_lineage_gap_summary.converted_shape_control,
+                        ),
+                        converted_shape_control_gap_summary(data_type=onnx.TensorProto.INT64),
+                    )
+                    all_input_non_shape_lineage_limit_gap_count = max(1, all_input_non_shape_lineage_limit_gap_count)
                 for initializer_index, lineage in all_input_lineages.items():
                     output_lineages[initializer_index] = _OnnxWeightLineage(
                         initializer_index=initializer_index,
@@ -2812,35 +13641,13 @@ def _build_onnx_weight_analysis_plan(
                         unresolved_reason="shape_dimensions_lineage",
                     )
             elif (
-                all_input_lineages
+                (all_input_lineages or summary_has_shape_control_provenance(all_input_non_shape_lineage_gap_summary))
                 and node.op_type not in _QUANTIZED_WEIGHT_OPERATORS
                 and function is None
                 and not subgraph_results
             ):
-                same_type_elementwise = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
-                )
-                same_type_unary_elementwise = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
-                    and len(input_names) == 1
-                )
-                clip_operator = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Clip"
-                )
-                pow_operator = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Pow"
-                )
                 prelu_data_is_activation = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    is_builtin_neural_operator
                     and node.op_type == "PRelu"
                     and bool(input_names)
                     and (
@@ -2854,63 +13661,475 @@ def _build_onnx_weight_analysis_plan(
                         )
                     )
                 )
-                elementwise_output_shape = (
-                    broadcast_shapes(known_value_shapes.get(input_name) for input_name in input_names)
-                    if same_type_elementwise or same_type_unary_elementwise or pow_operator
-                    else known_value_shapes.get(input_names[0])
-                    if clip_operator and input_names
-                    else None
-                )
                 carries_dynamic_activation = bool(terminal_weight_lineages) and has_dynamic_input
                 carries_dynamic_activation |= prelu_data_is_activation
                 carries_dynamic_activation |= any(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
-                preserves_shape_control = (
-                    is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and (
-                        same_type_elementwise
-                        or (
-                            same_type_unary_elementwise
-                            and node.op_type not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
+                preserves_shape_control = is_builtin_neural_operator and (
+                    same_type_elementwise
+                    or (
+                        same_type_unary_elementwise
+                        and node.op_type not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
+                    )
+                    or clip_operator
+                    or pow_operator
+                    or (batch_normalization_operator and batch_normalization_is_inference(node))
+                    or node.op_type in {"Concat", "GlobalMaxPool"}
+                    or (node.op_type == "MaxPool" and pooling_has_nonempty_samples(node))
+                    or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
+                )
+                preserved_shape_control_sources: frozenset[int] = frozenset()
+                pending_shape_control = all_input_non_shape_lineage_gap_summary.shape_control
+                converts_shape_control_gap = pending_shape_control and not preserves_shape_control
+                preserves_shape_control_gap = pending_shape_control and preserves_shape_control
+                if is_builtin_neural_operator and node.op_type in {
+                    "AveragePool",
+                    "BatchNormalization",
+                    "GlobalAveragePool",
+                    "Conv",
+                    "ConvTranspose",
+                }:
+                    data_sources = set(value_lineages.get(input_names[0], {})) if input_names else set()
+                    kernel_sources = (
+                        set(value_lineages.get(input_names[1], {}))
+                        if node.op_type in {"Conv", "ConvTranspose"} and len(input_names) > 1
+                        else set()
+                    )
+                    # Bias layout does not determine aggregation multiplicities.
+                    preserved_sources = set(all_input_lineages) - data_sources - kernel_sources
+                    aggregation_preserves_data_shape = bool(
+                        data_sources or (shape_control_gap_roles & 1)
+                    ) and aggregation_preserves_shape_control(node)
+                    if data_sources and aggregation_preserves_data_shape:
+                        preserved_sources.update(data_sources - kernel_sources)
+                    if pending_shape_control:
+                        converts_shape_control_gap = bool(
+                            (shape_control_gap_roles & 2)
+                            or ((shape_control_gap_roles & 1) and not aggregation_preserves_data_shape)
                         )
-                        or clip_operator
-                        or pow_operator
-                        or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
+                        preserves_shape_control_gap = bool(
+                            (shape_control_gap_roles & 4)
+                            or ((shape_control_gap_roles & 1) and aggregation_preserves_data_shape)
+                        )
+                    preserved_shape_control_sources = frozenset(preserved_sources)
+                preserves_data_type = (
+                    same_type_elementwise
+                    or same_type_unary_elementwise
+                    or clip_operator
+                    or (
+                        is_builtin_neural_operator
+                        and node.op_type
+                        in {"Concat", "Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                     )
                 )
-                for initializer_index, lineage in all_input_lineages.items():
-                    if initializer_index in activation_input_lineages:
-                        continue
+
+                lineage_output_shape = elementwise_output_shape if elementwise_output_rank_proven else None
+                if (
+                    lineage_output_shape is None
+                    and elementwise_output_rank_proven
+                    and elementwise_output_rank is not None
+                ):
+                    lineage_output_shape = inferred_shape(
+                        elementwise_output_rank, (-1 for _ in range(elementwise_output_rank))
+                    )
+
+                def unresolved_operator_output_lineage(
+                    lineage: _OnnxWeightLineage,
+                    *,
+                    output_shape: tuple[int, ...] | None = lineage_output_shape,
+                    keeps_shape_control: bool = preserves_shape_control,
+                    shape_control_sources: frozenset[int] = preserved_shape_control_sources,
+                    keeps_data_type: bool = preserves_data_type,
+                    activation_parameters: set[int] = batch_normalization_activation_parameter_lineages,
+                    fallback_reason: str = (
+                        "dynamic_activation_lineage"
+                        if carries_dynamic_activation
+                        else ("dynamic_input_lineage" if has_dynamic_input else "unsupported_lineage_operator")
+                    ),
+                ) -> _OnnxWeightLineage:
                     unresolved_reason = lineage.unresolved_reason
-                    if unresolved_reason == "shape_control_lineage" and not preserves_shape_control:
+                    if (
+                        unresolved_reason == "shape_control_lineage"
+                        and not keeps_shape_control
+                        and lineage.initializer_index not in shape_control_sources
+                    ):
                         # Reductions, normalization and unknown operators can turn extents into data values.
-                        unresolved_reason = "shape_dimensions_lineage"
+                        unresolved_reason = (
+                            "dynamic_activation_lineage"
+                            if fallback_reason == "dynamic_activation_lineage"
+                            else "shape_dimensions_lineage"
+                        )
                     if unresolved_reason is None:
-                        if carries_dynamic_activation:
-                            unresolved_reason = "dynamic_activation_lineage"
-                        else:
-                            unresolved_reason = (
-                                "dynamic_input_lineage" if has_dynamic_input else "unsupported_lineage_operator"
-                            )
-                    output_lineages[initializer_index] = _OnnxWeightLineage(
-                        initializer_index=initializer_index,
-                        shape=elementwise_output_shape,
-                        data_type=(
-                            lineage.data_type
-                            if same_type_elementwise or same_type_unary_elementwise or clip_operator
-                            else None
-                        ),
+                        unresolved_reason = (
+                            "dynamic_activation_lineage"
+                            if lineage.initializer_index in activation_parameters
+                            else fallback_reason
+                        )
+                    return _OnnxWeightLineage(
+                        initializer_index=lineage.initializer_index,
+                        shape=output_shape,
+                        data_type=lineage.data_type if keeps_data_type else None,
                         transforms=lineage.transforms,
                         unresolved_reason=unresolved_reason,
                     )
 
-            output_lineages = bounded_lineages(output_lineages)
+                for initializer_index, lineage in all_input_lineages.items():
+                    if initializer_index not in activation_input_lineages:
+                        output_lineages[initializer_index] = unresolved_operator_output_lineage(lineage)
+                # Exact rank-transform rules below own their input-role and gap accounting.
+                if not rank_gap_promoting_operator:
+                    # Deferred numeric provenance must obey the same output facts as
+                    # retained provenance; input rank and dtype are not output proofs.
+                    all_input_non_shape_lineage_gap_summary = summarize_non_shape_lineage_gap(
+                        (
+                            unresolved_operator_output_lineage(lineage)
+                            for lineage in all_input_non_shape_lineage_gap_summary.lineages
+                            if lineage.initializer_index not in activation_input_lineages
+                        ),
+                        truncated=all_input_non_shape_lineage_gap_summary.truncated,
+                        shape_control=preserves_shape_control_gap,
+                        converted_shape_control=all_input_non_shape_lineage_gap_summary.converted_shape_control,
+                    )
+                    if not (
+                        all_input_non_shape_lineage_gap_summary.lineages
+                        or all_input_non_shape_lineage_gap_summary.truncated
+                    ):
+                        all_input_non_shape_lineage_limit_gap_count = 0
+                    if converts_shape_control_gap:
+                        all_input_non_shape_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_non_shape_lineage_gap_summary,
+                            converted_shape_control_gap_summary(
+                                shape=lineage_output_shape,
+                                reason="dynamic_activation_lineage"
+                                if carries_dynamic_activation
+                                else "shape_dimensions_lineage",
+                            ),
+                        )
+                        # A presence bound is sufficient; saturated counters cannot
+                        # recover the exact number of omitted shape-only sources.
+                        all_input_non_shape_lineage_limit_gap_count = max(
+                            1, all_input_non_shape_lineage_limit_gap_count
+                        )
+                    all_input_weight_lineage_limit_gap_summary = summarize_weight_lineage_gap(
+                        all_input_non_shape_lineage_gap_summary.lineages,
+                        truncated=all_input_non_shape_lineage_gap_summary.truncated,
+                    )
+                    all_input_weight_lineage_limit_gap_count = (
+                        all_input_non_shape_lineage_limit_gap_count
+                        if all_input_weight_lineage_limit_gap_summary != empty_weight_gap_summary
+                        else 0
+                    )
+                    all_input_rank_promotable_lineage_limit_gap_summary = summarize_rank_promotable_lineage_gap(
+                        all_input_non_shape_lineage_gap_summary.lineages,
+                        truncated=all_input_non_shape_lineage_gap_summary.truncated,
+                    )
+                    all_input_rank_promotable_lineage_limit_gap_count = (
+                        all_input_non_shape_lineage_limit_gap_count
+                        if all_input_rank_promotable_lineage_limit_gap_summary != empty_weight_gap_summary
+                        else 0
+                    )
+            (
+                output_lineages,
+                output_lineage_limit_gap_count,
+                output_non_shape_lineage_limit_gap_count,
+                output_non_shape_lineage_gap_summary,
+                output_weight_lineage_limit_gap_count,
+                output_rank_promotable_lineage_limit_gap_count,
+                output_weight_lineage_gap_summary,
+                output_rank_promotable_lineage_gap_summary,
+            ) = bounded_lineages(output_lineages)
+            all_input_output_weight_lineage_limit_gap_count = all_input_weight_lineage_limit_gap_count
+            all_input_output_weight_lineage_gap_summary = all_input_weight_lineage_limit_gap_summary
+            all_input_output_rank_promotable_lineage_limit_gap_count = all_input_rank_promotable_lineage_limit_gap_count
+            all_input_output_rank_promotable_lineage_gap_summary = all_input_rank_promotable_lineage_limit_gap_summary
+            if elementwise_has_unknown_dynamic_rank and all_input_lineage_limit_gap_count:
+                all_input_output_weight_lineage_limit_gap_count = max(
+                    all_input_output_weight_lineage_limit_gap_count,
+                    min(all_input_lineage_limit_gap_count, _ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT),
+                )
+                all_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                    all_input_output_weight_lineage_gap_summary,
+                    known_weight_gap_summary(None, all_input_lineage_limit_gap_count),
+                )
+            if elementwise_has_unknown_dynamic_rank and output_rank_promotable_lineage_limit_gap_count:
+                promoted_output_rank_gap_summary = rank_gap_weight_summary_after_rank_increase(
+                    known_weight_gap_summary(
+                        output_rank_promotable_lineage_gap_summary,
+                        output_rank_promotable_lineage_limit_gap_count,
+                    ),
+                    output_rank_promotable_lineage_limit_gap_count,
+                )
+                if promoted_output_rank_gap_summary != empty_weight_gap_summary or elementwise_output_rank is None:
+                    output_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        output_weight_lineage_limit_gap_count,
+                        output_rank_promotable_lineage_limit_gap_count,
+                    )
+                    output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        output_weight_lineage_gap_summary,
+                        known_weight_gap_summary(
+                            promoted_output_rank_gap_summary,
+                            output_rank_promotable_lineage_limit_gap_count,
+                        ),
+                    )
+                    output_rank_promotable_lineage_limit_gap_count = 0
+                    output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
+            if is_shape_query:
+                all_input_output_weight_lineage_limit_gap_count = 0
+                all_input_output_weight_lineage_gap_summary = empty_weight_gap_summary
+                all_input_output_rank_promotable_lineage_limit_gap_count = 0
+                all_input_output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
+                output_weight_lineage_limit_gap_count = 0
+                output_weight_lineage_gap_summary = empty_weight_gap_summary
+                output_rank_promotable_lineage_limit_gap_count = 0
+                output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
+            pre_promotion_weight_lineage_limit_gap_count = all_input_output_weight_lineage_limit_gap_count
+            pre_promotion_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
+            transformed_input_output_non_shape_lineage_gap_summary = all_input_non_shape_lineage_gap_summary
+            transformed_input_output_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
+            transformed_input_output_rank_promotable_lineage_gap_summary = (
+                all_input_output_rank_promotable_lineage_gap_summary
+            )
+            cast_promoted_non_shape_weight_lineage_gap_summary = empty_weight_gap_summary
+            promoted_rank_lineage_limit_gap_count = 0
+            promoted_rank_lineage_gap_summary = empty_weight_gap_summary
+            rank_gap_control_input_is_overridable = (
+                node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
+                and len(node.input) > 1
+                and (
+                    graph_input_is_runtime_overridable(str(node.input[1]), graph_input_names, constants)
+                    or str(node.input[1]) in dynamic_values
+                )
+            )
+            if (
+                rank_gap_promoting_operator
+                and transform_data_input_rank_promotable_lineage_limit_gap_count
+                and rank_gap_control_input_is_overridable
+            ):
+                promoted_rank_lineage_limit_gap_count = transform_data_input_rank_promotable_lineage_limit_gap_count
+                promoted_rank_lineage_gap_summary = known_weight_gap_summary(
+                    None,
+                    promoted_rank_lineage_limit_gap_count,
+                )
+            elif rank_gap_promoting_operator and transform_data_input_rank_promotable_lineage_limit_gap_count:
+                candidate_promoted_summary = promoted_rank_gap_weight_summary(
+                    transform_data_input_rank_promotable_lineage_limit_gap_summary,
+                    node,
+                    constants,
+                    transform_data_input_rank_promotable_lineage_limit_gap_count,
+                    resolve_value_shape=proven_value_shape,
+                    resolve_attribute=resolve_attribute,
+                )
+                rank_gap_promotion_known_not_weight = (
+                    transform_data_input_rank_promotable_lineage_limit_gap_summary.lineages
+                    and not transform_data_input_rank_promotable_lineage_limit_gap_summary.truncated
+                    and candidate_promoted_summary == empty_weight_gap_summary
+                )
+                if candidate_promoted_summary != empty_weight_gap_summary or (
+                    not rank_gap_promotion_known_not_weight
+                    and operator_output_may_have_weight_rank(
+                        node,
+                        input_shape=proven_value_shape(input_names[0]) if input_names else None,
+                        index_shape=proven_value_shape(input_names[1]) if len(input_names) > 1 else None,
+                        constants=constants,
+                        resolve_attribute=resolve_attribute,
+                        identifier=function_key,
+                    )
+                ):
+                    promoted_rank_lineage_limit_gap_count = transform_data_input_rank_promotable_lineage_limit_gap_count
+                    promoted_rank_lineage_gap_summary = known_weight_gap_summary(
+                        candidate_promoted_summary,
+                        promoted_rank_lineage_limit_gap_count,
+                    )
+            rank_operator_promotes_deferred_gap = promoted_rank_lineage_limit_gap_count > 0
+            if rank_operator_promotes_deferred_gap:
+                all_input_output_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                    all_input_output_weight_lineage_limit_gap_count,
+                    promoted_rank_lineage_limit_gap_count,
+                )
+                all_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                    all_input_output_weight_lineage_gap_summary,
+                    promoted_rank_lineage_gap_summary,
+                )
+                if promoted_rank_lineage_limit_gap_count == all_input_output_rank_promotable_lineage_limit_gap_count:
+                    all_input_output_rank_promotable_lineage_limit_gap_count = 0
+                    all_input_output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
+                    transformed_input_output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
+            if (
+                supported_transform
+                and node.op_type == "Cast"
+                and cast_output_may_be_floating(node, resolve_attribute)
+                and all_input_non_shape_lineage_limit_gap_count > all_input_output_weight_lineage_limit_gap_count
+            ):
+                cast_non_shape_gap_summary = known_weight_gap_summary(
+                    all_input_non_shape_lineage_gap_summary,
+                    all_input_non_shape_lineage_limit_gap_count,
+                )
+                cast_output_may_have_weight_rank = not output_lineages or any(
+                    lineage.shape is None or len(lineage.shape) >= 2 for lineage in output_lineages.values()
+                )
+                if cast_output_may_have_weight_rank or floating_cast_non_shape_gap_may_be_weight(
+                    cast_non_shape_gap_summary,
+                    node,
+                    constants,
+                    resolve_value_shape=proven_value_shape,
+                    cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                ):
+                    all_input_output_weight_lineage_limit_gap_count = all_input_non_shape_lineage_limit_gap_count
+                    cast_promoted_non_shape_weight_lineage_gap_summary = transform_weight_gap_summary(
+                        cast_non_shape_gap_summary,
+                        node,
+                        constants,
+                        resolve_value_shape=proven_value_shape,
+                        cast_target_data_type=resolved_cast_target_data_type,
+                        resolve_attribute=resolve_attribute,
+                    )
+                    all_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        all_input_output_weight_lineage_gap_summary,
+                        cast_promoted_non_shape_weight_lineage_gap_summary,
+                    )
+                else:
+                    all_input_output_rank_promotable_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        all_input_output_rank_promotable_lineage_limit_gap_count,
+                        all_input_non_shape_lineage_limit_gap_count,
+                    )
+                    all_input_output_rank_promotable_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        all_input_output_rank_promotable_lineage_gap_summary,
+                        _OnnxWeightLineageGapSummary(
+                            cast_non_shape_gap_summary.lineages, cast_non_shape_gap_summary.truncated
+                        ),
+                    )
+                    transformed_input_output_rank_promotable_lineage_gap_summary = (
+                        all_input_output_rank_promotable_lineage_gap_summary
+                    )
+            if (
+                supported_transform
+                and node.op_type == "Cast"
+                and cast_output_may_be_floating(node, resolve_attribute)
+                and output_non_shape_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
+            ):
+                cast_output_non_shape_gap_summary = known_weight_gap_summary(
+                    output_non_shape_lineage_gap_summary,
+                    output_non_shape_lineage_limit_gap_count,
+                )
+                cast_output_may_have_weight_rank = not output_lineages or any(
+                    lineage.shape is None or len(lineage.shape) >= 2 for lineage in output_lineages.values()
+                )
+                if cast_output_may_have_weight_rank or floating_cast_non_shape_gap_may_be_weight(
+                    cast_output_non_shape_gap_summary,
+                    node,
+                    constants,
+                    resolve_value_shape=proven_value_shape,
+                    cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                ):
+                    output_weight_lineage_limit_gap_count = output_non_shape_lineage_limit_gap_count
+                    output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        output_weight_lineage_gap_summary,
+                        transform_weight_gap_summary(
+                            cast_output_non_shape_gap_summary,
+                            node,
+                            constants,
+                            resolve_value_shape=proven_value_shape,
+                            cast_target_data_type=resolved_cast_target_data_type,
+                            resolve_attribute=resolve_attribute,
+                        ),
+                    )
+                else:
+                    output_rank_promotable_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        output_rank_promotable_lineage_limit_gap_count,
+                        output_non_shape_lineage_limit_gap_count,
+                    )
+                    output_rank_promotable_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        output_rank_promotable_lineage_gap_summary,
+                        transform_rank_promotable_gap_summary(
+                            cast_output_non_shape_gap_summary,
+                            node,
+                            constants,
+                            resolve_value_shape=proven_value_shape,
+                            cast_target_data_type=resolved_cast_target_data_type,
+                            resolve_attribute=resolve_attribute,
+                        ),
+                    )
+            cast_output_is_nonfloating_transform = (
+                supported_transform
+                and node.op_type == "Cast"
+                and not cast_output_may_be_floating(node, resolve_attribute)
+            )
+            transform_control_input_is_overridable = rank_gap_control_input_is_overridable
+            transform_can_demote_weight_gap = not transform_control_input_is_overridable
+            transform_output_demotes_weight_gap = (
+                supported_transform
+                and transform_can_demote_weight_gap
+                and all_input_output_weight_lineage_limit_gap_count > 0
+                and weight_gap_summary_demotes_after_transform(
+                    all_input_output_weight_lineage_gap_summary,
+                    node,
+                    constants,
+                    resolve_value_shape=proven_value_shape,
+                    cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                )
+                and not any(lineage_could_be_weight(lineage) for lineage in output_lineages.values())
+                and any(lineage_could_be_weight_after_rank_increase(lineage) for lineage in output_lineages.values())
+            )
+            if supported_transform and all_input_output_weight_lineage_limit_gap_count > 0:
+                transformed_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                    transform_weight_gap_summary(
+                        pre_promotion_weight_lineage_gap_summary,
+                        node,
+                        constants,
+                        resolve_value_shape=proven_value_shape,
+                        cast_target_data_type=resolved_cast_target_data_type,
+                        resolve_attribute=resolve_attribute,
+                    )
+                    if pre_promotion_weight_lineage_limit_gap_count
+                    else empty_weight_gap_summary,
+                    cast_promoted_non_shape_weight_lineage_gap_summary,
+                    promoted_rank_lineage_gap_summary
+                    if rank_operator_promotes_deferred_gap
+                    else empty_weight_gap_summary,
+                )
+            if supported_transform and all_input_non_shape_lineage_limit_gap_count > 0:
+                transformed_input_output_non_shape_lineage_gap_summary = transform_non_shape_gap_summary(
+                    all_input_non_shape_lineage_gap_summary,
+                    node,
+                    constants,
+                    resolve_value_shape=proven_value_shape,
+                    cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                )
+            if supported_transform and all_input_output_rank_promotable_lineage_limit_gap_count > 0:
+                transformed_input_output_rank_promotable_lineage_gap_summary = transform_rank_promotable_gap_summary(
+                    all_input_output_rank_promotable_lineage_gap_summary,
+                    node,
+                    constants,
+                    resolve_value_shape=proven_value_shape,
+                    cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                )
+            if (
+                rank_operator_promotes_deferred_gap
+                and output_rank_promotable_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
+            ):
+                output_rank_promoted_summary = rank_gap_weight_summary_after_rank_increase(
+                    output_rank_promotable_lineage_gap_summary,
+                    output_rank_promotable_lineage_limit_gap_count,
+                    output_shape=next(
+                        (lineage.shape for lineage in output_lineages.values() if lineage.shape is not None),
+                        None,
+                    ),
+                )
+                if output_rank_promoted_summary != empty_weight_gap_summary:
+                    output_weight_lineage_limit_gap_count = output_rank_promotable_lineage_limit_gap_count
+                    output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        output_weight_lineage_gap_summary,
+                        output_rank_promoted_summary,
+                    )
             constant_output_names: set[str] = set()
             constant_output_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
-            if getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type == "Constant":
+            if builtin_operator(node, "Constant", identifier=function_key):
                 constant_tensor = None
                 sparse_constant = None
                 unresolved_constant_attribute = False
@@ -2923,12 +14142,25 @@ def _build_onnx_weight_analysis_plan(
                     if attribute.name == "value":
                         if _onnx_has_singular_field(resolved_attribute, "t"):
                             constant_tensor = resolved_attribute.t
-                    elif attribute.name == "value_ints":
-                        constant_tensor = onnx.helper.make_tensor(
-                            "",
-                            onnx.TensorProto.INT64,
-                            [len(resolved_attribute.ints)],
-                            list(resolved_attribute.ints),
+                    elif attribute.name in {"value_ints", "value_floats"}:
+                        is_float = attribute.name == "value_floats"
+                        expected_type = onnx.AttributeProto.FLOATS if is_float else onnx.AttributeProto.INTS
+                        if int(getattr(resolved_attribute, "type", 0)) != int(expected_type) or bool(
+                            getattr(resolved_attribute, "ref_attr_name", "")
+                        ):
+                            unresolved_constant_attribute = True
+                            plan.record_coverage_gap("invalid_constant_attribute")
+                            continue
+                        constant_source_key = (
+                            "constant_value",
+                            *attribute_source_key(attribute, local_node_index, attribute_position),
+                        )
+                        constant_tensor = primary_repeated_constant_tensor(
+                            resolved_attribute,
+                            resolved_attribute.floats if is_float else resolved_attribute.ints,
+                            int(onnx.TensorProto.FLOAT if is_float else onnx.TensorProto.INT64),
+                            constant_source_key,
+                            next((str(output_name) for output_name in node.output if output_name), ""),
                         )
                     elif attribute.name == "value_int":
                         constant_tensor = onnx.helper.make_tensor(
@@ -2936,13 +14168,6 @@ def _build_onnx_weight_analysis_plan(
                             onnx.TensorProto.INT64,
                             [],
                             [resolved_attribute.i],
-                        )
-                    elif attribute.name == "value_floats":
-                        constant_tensor = onnx.helper.make_tensor(
-                            "",
-                            onnx.TensorProto.FLOAT,
-                            [len(resolved_attribute.floats)],
-                            list(resolved_attribute.floats),
                         )
                     elif attribute.name == "value_float":
                         constant_tensor = onnx.helper.make_tensor(
@@ -2957,17 +14182,19 @@ def _build_onnx_weight_analysis_plan(
                     ):
                         sparse_constant = resolved_attribute.sparse_tensor
                     if constant_tensor is not None or sparse_constant is not None:
-                        constant_source_key = (
-                            "constant_value",
-                            *attribute_source_key(attribute, local_node_index, attribute_position),
-                        )
+                        if constant_source_key is None:
+                            constant_source_key = (
+                                "constant_value",
+                                *attribute_source_key(attribute, local_node_index, attribute_position),
+                            )
                         break
                 output_names = [str(output_name) for output_name in node.output if output_name]
                 if len(output_names) != 1:
                     plan.record_coverage_gap("invalid_constant_outputs")
                 elif constant_tensor is not None:
                     name = output_names[0]
-                    constant_tensor.name = name
+                    if constant_source_key not in initializer_source_indexes:
+                        constant_tensor.name = name
                     lineage = register_initializer(
                         constant_tensor,
                         current_graph_index,
@@ -2976,6 +14203,7 @@ def _build_onnx_weight_analysis_plan(
                     constants[name] = constant_tensor
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
+                    clear_value_gap_state(name)
                 elif sparse_constant is not None:
                     name = output_names[0]
                     sparse_constant.values.name = name
@@ -2988,6 +14216,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
+                    clear_value_gap_state(name)
                 elif unresolved_constant_attribute:
                     name = output_names[0]
                     unresolved_tensor = onnx.TensorProto()
@@ -3000,32 +14229,1331 @@ def _build_onnx_weight_analysis_plan(
                     )
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
+                    clear_value_gap_state(name)
 
             subgraph_output_lineages: list[dict[int, _OnnxWeightLineage]] = [{} for _ in node.output]
             subgraph_output_dynamic = [False for _ in node.output]
-            subgraph_output_offset = 1 if node.op_type == "Loop" else 0
-            for graph_output_lineages, graph_output_dynamic in subgraph_results:
+            subgraph_output_lineage_gap_counts = [0 for _ in node.output]
+            subgraph_output_non_shape_lineage_gap_counts = [0 for _ in node.output]
+            subgraph_output_non_shape_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
+            subgraph_output_weight_lineage_gap_counts = [0 for _ in node.output]
+            subgraph_output_weight_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
+            subgraph_output_rank_promotable_lineage_gap_counts = [0 for _ in node.output]
+            subgraph_output_rank_promotable_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
+            subgraph_output_shapes: list[tuple[int, ...] | None] = [None for _ in node.output]
+            subgraph_output_ranks: list[int | None] = [None for _ in node.output]
+            subgraph_output_proven_ranks = [False for _ in node.output]
+            subgraph_output_rank_seen = [False for _ in node.output]
+            subgraph_output_rank_unknown = [False for _ in node.output]
+
+            def merge_subgraph_output_gap_state(
+                output_index: int,
+                parent_name: str,
+                *,
+                output_dynamic: list[bool] = subgraph_output_dynamic,
+                output_lineage_gap_counts: list[int] = subgraph_output_lineage_gap_counts,
+                output_non_shape_gap_counts: list[int] = subgraph_output_non_shape_lineage_gap_counts,
+                output_non_shape_gap_summaries: list[_OnnxWeightLineageGapSummary] = (
+                    subgraph_output_non_shape_lineage_gap_summaries
+                ),
+                output_weight_gap_counts: list[int] = subgraph_output_weight_lineage_gap_counts,
+                output_weight_gap_summaries: list[_OnnxWeightLineageGapSummary] = (
+                    subgraph_output_weight_lineage_gap_summaries
+                ),
+                output_rank_promotable_gap_counts: list[int] = subgraph_output_rank_promotable_lineage_gap_counts,
+                output_rank_promotable_gap_summaries: list[_OnnxWeightLineageGapSummary] = (
+                    subgraph_output_rank_promotable_lineage_gap_summaries
+                ),
+            ) -> None:
+                output_dynamic[output_index] |= parent_name in dynamic_values
+                output_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                    output_lineage_gap_counts[output_index],
+                    value_lineage_limit_gap_counts.get(parent_name, 0),
+                )
+                output_non_shape_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                    output_non_shape_gap_counts[output_index],
+                    value_non_shape_lineage_limit_gap_counts.get(parent_name, 0),
+                )
+                output_non_shape_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
+                    output_non_shape_gap_summaries[output_index],
+                    known_weight_gap_summary(
+                        value_non_shape_lineage_limit_gap_summaries.get(parent_name),
+                        value_non_shape_lineage_limit_gap_counts.get(parent_name, 0),
+                    ),
+                )
+                parent_weight_gap_count = value_weight_lineage_limit_gap_counts.get(parent_name, 0)
+                output_weight_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                    output_weight_gap_counts[output_index],
+                    parent_weight_gap_count,
+                )
+                output_weight_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
+                    output_weight_gap_summaries[output_index],
+                    known_weight_gap_summary(
+                        value_weight_lineage_limit_gap_summaries.get(parent_name),
+                        parent_weight_gap_count,
+                    ),
+                )
+                output_rank_promotable_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                    output_rank_promotable_gap_counts[output_index],
+                    value_rank_promotable_lineage_limit_gap_counts.get(parent_name, 0),
+                )
+                output_rank_promotable_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
+                    output_rank_promotable_gap_summaries[output_index],
+                    known_weight_gap_summary(
+                        value_rank_promotable_lineage_limit_gap_summaries.get(parent_name),
+                        value_rank_promotable_lineage_limit_gap_counts.get(parent_name, 0),
+                    ),
+                )
+
+            def merge_subgraph_output_rank(
+                output_index: int,
+                output_shape: tuple[int, ...] | None,
+                output_rank: int | None,
+                output_rank_proven: bool,
+                *,
+                output_shapes: list[tuple[int, ...] | None] = subgraph_output_shapes,
+                output_ranks: list[int | None] = subgraph_output_ranks,
+                output_proven_ranks: list[bool] = subgraph_output_proven_ranks,
+                output_rank_seen: list[bool] = subgraph_output_rank_seen,
+                output_rank_unknown: list[bool] = subgraph_output_rank_unknown,
+            ) -> None:
+                if output_shape is not None:
+                    if not output_rank_seen[output_index]:
+                        output_shapes[output_index] = output_shape
+                        output_ranks[output_index] = len(output_shape)
+                        output_proven_ranks[output_index] = output_rank_proven
+                    elif output_shapes[output_index] == output_shape:
+                        output_proven_ranks[output_index] &= output_rank_proven
+                    else:
+                        current_rank = output_ranks[output_index]
+                        candidate_rank = len(output_shape)
+                        output_shapes[output_index] = None
+                        output_proven_ranks[output_index] &= output_rank_proven
+                        if current_rank == candidate_rank:
+                            output_ranks[output_index] = candidate_rank
+                        else:
+                            output_ranks[output_index] = None
+                            output_proven_ranks[output_index] = False
+                            output_rank_unknown[output_index] = True
+                    output_rank_seen[output_index] = True
+                elif output_rank is not None:
+                    if not output_rank_seen[output_index]:
+                        output_ranks[output_index] = output_rank
+                        output_proven_ranks[output_index] = output_rank_proven
+                    elif output_ranks[output_index] == output_rank:
+                        output_shapes[output_index] = None
+                        output_proven_ranks[output_index] &= output_rank_proven
+                    else:
+                        output_shapes[output_index] = None
+                        output_ranks[output_index] = None
+                        output_proven_ranks[output_index] = False
+                        output_rank_unknown[output_index] = True
+                    output_rank_seen[output_index] = True
+                else:
+                    output_shapes[output_index] = None
+                    output_ranks[output_index] = None
+                    output_proven_ranks[output_index] = False
+                    output_rank_seen[output_index] = True
+                    output_rank_unknown[output_index] = True
+
+            def control_flow_state_input_name(
+                output_index: int, *, current_node: Any = node, identifier: tuple[str, str, str] = function_key
+            ) -> str:
+                if current_node.op_type == "Loop":
+                    input_offset = 2
+                elif current_node.op_type == "Scan":
+                    input_offset = scan_sequence_lens_input_offset(current_node, opset_versions, identifier=identifier)
+                else:
+                    input_offset = 0
+                state_input_index = output_index + input_offset
+                if state_input_index >= len(current_node.input) or not current_node.input[state_input_index]:
+                    return ""
+                return str(current_node.input[state_input_index])
+
+            def control_flow_state_input_rank(output_index: int) -> int | None:
+                state_input_name = control_flow_state_input_name(output_index)
+                return proven_value_rank(state_input_name)
+
+            def scan8_batch_extent(
+                output_index: int,
+                *,
+                stacked_output: bool,
+                current_node: Any = node,
+                input_offset: int = resolved_scan_input_offset,
+                num_scan_inputs: int = resolved_scan_input_count,
+            ) -> int:
+                if stacked_output:
+                    scan_input_start = max(len(current_node.input) - max(num_scan_inputs, 0), input_offset)
+                    scan_output_index = output_index - max(len(current_node.input) - input_offset - num_scan_inputs, 0)
+                    scan_input_index = min(max(scan_output_index, 0), max(num_scan_inputs - 1, 0))
+                    value_index = scan_input_start + scan_input_index
+                    value_name = str(current_node.input[value_index]) if value_index < len(current_node.input) else ""
+                else:
+                    value_name = control_flow_state_input_name(output_index)
+                value_shape = known_value_shapes.get(value_name) if value_name in proven_value_ranks else None
+                if value_shape:
+                    return value_shape[0]
+                if graph_input_is_runtime_overridable(value_name, graph_input_names, constants):
+                    return -1
+                initializer_shape = constant_initializer_shape(constants, value_name)
+                if initializer_shape:
+                    return initializer_shape[0]
+                if value_name in dynamic_values:
+                    return -1
+                data_lineages = [
+                    lineage
+                    for lineage in value_lineages.get(value_name, {}).values()
+                    if lineage.unresolved_reason != "shape_control_lineage"
+                ]
+                shapes = {lineage.shape for lineage in data_lineages}
+                if len(shapes) == 1 and all(lineage.unresolved_reason is None for lineage in data_lineages):
+                    shape = next(iter(shapes))
+                    if shape:
+                        return shape[0]
+                return -1
+
+            def scan_stacked_output_extent(
+                current_node: Any,
+                output_index: int,
+                *,
+                trusted_shape_names: set[str] = trusted_scan_shape_names,
+                untrusted_shape_names: set[str] = untrusted_scan_shape_names,
+                allow_omitted_sequence_lens: bool = False,
+                common_extent: int | None = common_scan_extent,
+                owner_node: Any = node,
+                owner_scan_input_count: int = resolved_scan_input_count,
+                owner_identifier: tuple[str, str, str] = function_key,
+            ) -> int:
+                identifier = (
+                    owner_identifier if current_node is owner_node else bounded_operator_identifier(current_node)
+                )
+                if identifier is None:
+                    return -1
+                num_scan_inputs = (
+                    owner_scan_input_count
+                    if current_node is owner_node
+                    else resolved_int_attribute(current_node, "num_scan_inputs", 1)
+                )
+                if num_scan_inputs <= 0:
+                    return -1
+                input_offset = scan_sequence_lens_input_offset(current_node, opset_versions, identifier=identifier)
+                scan_input_start = max(len(current_node.input) - num_scan_inputs, input_offset)
+                if not input_offset:
+                    return common_extent if common_extent is not None else -1
+                scan_output_index = output_index - max(len(current_node.input) - input_offset - num_scan_inputs, 0)
+                scan_input_index = min(max(scan_output_index, 0), max(num_scan_inputs - 1, 0))
+                value_index = scan_input_start + scan_input_index
+                value_name = str(current_node.input[value_index]) if value_index < len(current_node.input) else ""
+                # Scan-8 pads each batch to the input sequence extent, even when
+                # sequence_lens processes fewer elements (including zero).
+                if input_offset and current_node.input:
+                    sequence_lens_input = str(current_node.input[0] or "")
+                    if sequence_lens_input or not allow_omitted_sequence_lens:
+                        if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
+                            return -1
+                        sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
+                        if sequence_lens is None or not sequence_lens or any(length < 0 for length in sequence_lens):
+                            return -1
+                if value_name not in trusted_shape_names or value_name in untrusted_shape_names:
+                    return -1
+                value_shape = known_value_shapes.get(value_name)
+                if not value_shape:
+                    return -1
+                scan_input_axes = resolved_int_sequence_attribute(current_node, "scan_input_axes") or ()
+                default_axis = 1 if input_offset else 0
+                raw_axis = (
+                    scan_input_axes[scan_input_index] if scan_input_index < len(scan_input_axes) else default_axis
+                )
+                axis = raw_axis if raw_axis >= 0 else len(value_shape) + raw_axis
+                if axis < 0 or axis >= len(value_shape):
+                    return -1
+                return value_shape[axis]
+
+            def produced_scan8_sequence_extent(value_name: str) -> int:
+                nonlocal stack_invariance_work_remaining
+                producer_index = graph_output_producer_nodes_by_name(current_graph)
+                if producer_index is None:
+                    return -1
+                producers = producer_index.get(value_name, ())
+                if len(producers) != 1:
+                    return -1
+                producer = producers[0]
+                identifier = bounded_operator_identifier(producer)
+                if identifier is None:
+                    return -1
+                if identifier[1] != "Scan" or not scan_sequence_lens_input_offset(
+                    producer, opset_versions, identifier=identifier
+                ):
+                    return -1
+                work = len(producer.output) + 3 * len(getattr(producer, "attribute", ()))
+                if work > stack_invariance_work_remaining:
+                    return -1
+                stack_invariance_work_remaining -= work
+                output_index = tuple(str(name) for name in producer.output).index(value_name)
+                if output_index < scan_stacked_output_start(
+                    producer,
+                    opset_versions,
+                    resolve_attribute=resolve_attribute,
+                    identifier=identifier,
+                ):
+                    return -1
+                return scan_stacked_output_extent(producer, output_index, allow_omitted_sequence_lens=True)
+
+            loop_returns_initial_state = (
+                standard_control_flow_operator
+                and node.op_type == "Loop"
+                and loop_body_is_proven_skipped(node, constants, graph_input_names)
+            )
+            scan8_returns_initial_state = node_scan8_skips_body or (
+                bool(resolved_scan_input_offset)
+                and bool(node.input)
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and (lengths := constant_int64_vector_values(constants.get(str(node.input[0])))) is not None
+                and bool(lengths)
+                and all(length == 0 for length in lengths)
+            )
+            subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
+            for (
+                graph_output_lineages,
+                graph_output_dynamic,
+                graph_output_lineage_gap_counts,
+                graph_output_non_shape_lineage_gap_counts,
+                graph_output_non_shape_lineage_gap_summaries,
+                graph_output_weight_lineage_gap_counts,
+                graph_output_weight_lineage_gap_summaries,
+                graph_output_rank_promotable_lineage_gap_counts,
+                graph_output_rank_promotable_lineage_gap_summaries,
+                graph_output_shapes,
+                graph_output_ranks,
+                graph_output_proven_ranks,
+            ) in subgraph_results:
+                stacked_scan_output_start = len(node.output)
+                if standard_control_flow_operator and node.op_type == "Loop":
+                    stacked_scan_output_start = max(len(node.input) - 2, 0)
+                elif standard_control_flow_operator and node.op_type == "Scan":
+                    stacked_scan_output_start = scan_stacked_output_start(
+                        node,
+                        opset_versions,
+                        resolve_attribute=resolve_attribute,
+                        identifier=function_key,
+                    )
                 for output_index in range(len(node.output)):
+                    if (
+                        loop_returns_initial_state
+                        or scan8_returns_initial_state
+                        or (common_scan_extent == 0 and scan_has_concrete_input_shape)
+                    ) and output_index < stacked_scan_output_start:
+                        continue
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):
                         continue
+                    graph_output_rank_promotable_gap_count = graph_output_rank_promotable_lineage_gap_counts[
+                        graph_output_index
+                    ]
+                    stacked_scan_output = standard_control_flow_operator and output_index >= stacked_scan_output_start
+                    graph_output_parent_lineages = graph_output_lineages[graph_output_index]
+                    graph_output_shape = graph_output_shapes[graph_output_index]
+                    graph_output_rank = graph_output_ranks[graph_output_index]
+                    graph_output_rank_proven = graph_output_proven_ranks[graph_output_index]
+                    repeated_carried_state_rank_may_increase = False
+                    repeated_carried_state_rank_decreases = False
+                    repeated_carried_state_input_may_feed_weight = False
+                    scan_output_insert_axis = stacked_scan_output_insert_axis(
+                        scan_output_axes,
+                        stacked_scan_output_start,
+                        output_index,
+                    )
+                    scan_output_extent = -1
+                    if stacked_scan_output and standard_control_flow_operator:
+                        if (
+                            node.op_type == "Loop"
+                            and (exact_loop_iterations := loop_exact_iteration_count(require_bounded_trip_count=True))
+                            is not None
+                        ):
+                            scan_output_extent = exact_loop_iterations
+                        elif node.op_type == "Scan":
+                            scan_output_extent = scan_stacked_output_extent(node, output_index)
+                    if stacked_scan_output:
+                        if graph_output_shape is not None:
+                            graph_output_shape = insert_shape_axis(
+                                graph_output_shape,
+                                scan_output_insert_axis,
+                                scan_output_extent,
+                            )
+                            graph_output_rank_proven = graph_output_rank_proven and (
+                                scan_output_extent >= 0
+                                or (
+                                    node.op_type == "Loop"
+                                    and loop_exact_iteration_count(
+                                        max_count=_ONNX_SHAPE_EXTENT_LIMIT, require_bounded_trip_count=True
+                                    )
+                                    is not None
+                                )
+                            )
+                            if graph_output_shape is not None and resolved_scan_input_offset:
+                                graph_output_shape = insert_shape_axis(
+                                    graph_output_shape,
+                                    0,
+                                    scan8_batch_extent(output_index, stacked_output=True),
+                                )
+                                graph_output_rank_proven = graph_output_rank_proven and graph_output_shape is not None
+                            graph_output_rank = len(graph_output_shape) if graph_output_shape is not None else None
+                        elif graph_output_rank is not None:
+                            graph_output_rank = insert_rank_axis(graph_output_rank, scan_output_insert_axis)
+                            graph_output_rank_proven = False
+                            if graph_output_rank is not None and resolved_scan_input_offset:
+                                graph_output_rank = insert_rank_axis(graph_output_rank, 0)
+                    elif standard_control_flow_operator and node.op_type == "Scan" and resolved_scan_input_offset:
+                        if graph_output_shape is not None:
+                            graph_output_shape = insert_shape_axis(
+                                graph_output_shape,
+                                0,
+                                scan8_batch_extent(output_index, stacked_output=False),
+                            )
+                            graph_output_rank_proven = graph_output_rank_proven and graph_output_shape is not None
+                            graph_output_rank = len(graph_output_shape) if graph_output_shape is not None else None
+                        elif graph_output_rank is not None:
+                            graph_output_rank = insert_rank_axis(graph_output_rank, 0)
+                            graph_output_rank_proven = False
+                    repeated_carried_state = (
+                        standard_control_flow_operator
+                        and not stacked_scan_output
+                        and (node_loop_may_repeat or (node.op_type == "Scan" and node_scan_may_repeat))
+                    )
+                    subgraph_state_input_name = ""
+                    if standard_control_flow_operator and node.op_type == "Loop" and not stacked_scan_output:
+                        subgraph_state_input_index = output_index + 2
+                        subgraph_state_input_name = (
+                            _onnx_value_name(subgraph.input[subgraph_state_input_index])
+                            if subgraph_state_input_index < len(subgraph.input)
+                            else ""
+                        )
+                    elif standard_control_flow_operator and node.op_type == "Scan" and not stacked_scan_output:
+                        subgraph_state_input_name = (
+                            _onnx_value_name(subgraph.input[output_index]) if output_index < len(subgraph.input) else ""
+                        )
+                    repeated_carried_state_cross_state_weight_transfer = False
+                    if repeated_carried_state:
+                        state_input_name = control_flow_state_input_name(output_index)
+                        repeated_carried_state_input_may_feed_weight = subgraph_state_input_can_reach_weight_consumer(
+                            subgraph,
+                            subgraph_state_input_name,
+                            opset_versions,
+                            inherited_constants=constants,
+                            attribute_bindings=attribute_bindings,
+                        )
+                        if (
+                            not repeated_carried_state_input_may_feed_weight
+                            and len(repeated_state_output_indexes_by_input) > 1
+                        ):
+                            repeated_carried_state_cross_state_weight_transfer = (
+                                repeated_state_output_may_reach_future_weight(subgraph, subgraph_state_input_name)
+                            )
+                            repeated_carried_state_input_may_feed_weight = (
+                                repeated_carried_state_cross_state_weight_transfer
+                            )
+                        state_input_shape = proven_value_shape(state_input_name)
+                        state_input_rank = proven_value_rank(state_input_name)
+                        sibling_state_shape_is_unproven = (
+                            node.op_type == "Loop"
+                            and len(repeated_state_output_indexes_by_input) > 1
+                            and subgraph_state_input_name not in subgraph_trusted_context_shapes
+                            and repeated_state_fallback_reachability.get(id(subgraph)) is not False
+                        )
+                        if graph_output_rank != state_input_rank or sibling_state_shape_is_unproven:
+                            repeated_carried_state_rank_decreases = (
+                                graph_output_rank is not None
+                                and state_input_rank is not None
+                                and graph_output_rank < state_input_rank
+                            )
+                            repeated_carried_state_rank_may_increase = (
+                                sibling_state_shape_is_unproven
+                                or graph_output_rank is None
+                                or state_input_rank is None
+                                or graph_output_rank > state_input_rank
+                            )
+                            graph_output_shape = None
+                            graph_output_rank = None
+                            graph_output_rank_proven = False
+                        elif graph_output_shape != state_input_shape:
+                            graph_output_shape = None
+                            graph_output_rank_proven = (
+                                graph_output_rank_proven and state_input_name in proven_value_ranks
+                            )
+                    if repeated_carried_state_cross_state_weight_transfer:
+                        # The single body visit has not materialized this value's
+                        # later path through another state's weight consumer.
+                        for lineage in graph_output_parent_lineages.values():
+                            if lineage_could_be_weight(lineage):
+                                record_unresolved_lineage(
+                                    _OnnxWeightLineage(
+                                        initializer_index=lineage.initializer_index,
+                                        shape=lineage.shape,
+                                        data_type=lineage.data_type,
+                                        transforms=lineage.transforms,
+                                        unresolved_reason="unresolved_control_flow_stack_lineage",
+                                    ),
+                                    node,
+                                    current_node_index,
+                                    output_index,
+                                    collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
+                                )
+                    if (
+                        graph_output_parent_lineages
+                        and (stacked_scan_output or repeated_carried_state)
+                        and (
+                            loop_exact_iteration_count(max_count=1) is None
+                            if node.op_type == "Loop"
+                            else node_scan_may_repeat
+                        )
+                        and not control_flow_stack_values_are_invariant(
+                            node,
+                            subgraph,
+                            graph_output_index,
+                            graph_output_lineages,
+                            value_lineages,
+                            opset_versions,
+                            attribute_bindings,
+                            input_shape=proven_value_shape,
+                        )
+                    ):
+                        fixed_reshape_shape = (
+                            fixed_loop_carried_reshape_shape(
+                                node,
+                                subgraph,
+                                value_lineages.get(str(node.input[2]), {}),
+                                graph_output_parent_lineages,
+                                constants,
+                                opset_versions,
+                                attribute_bindings,
+                            )
+                            if repeated_carried_state
+                            and node.op_type == "Loop"
+                            and len(node.input) == 3
+                            and len(subgraph_results) == 1
+                            and (
+                                iterations := loop_exact_iteration_count(
+                                    max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                                    require_bounded_trip_count=True,
+                                )
+                            )
+                            is not None
+                            and iterations > 1
+                            else None
+                        )
+                        if fixed_reshape_shape is not None:
+                            graph_output_shape = fixed_reshape_shape
+                            graph_output_rank = len(fixed_reshape_shape)
+                            graph_output_rank_proven = True
+                        else:
+                            # Shape invariance does not imply value invariance. A
+                            # later iteration can carry a different initializer.
+                            graph_output_parent_lineages = {
+                                initializer_index: _OnnxWeightLineage(
+                                    initializer_index=lineage.initializer_index,
+                                    shape=(
+                                        graph_output_shape
+                                        if graph_output_shape is not None and graph_output_rank_proven
+                                        else tuple(-1 for _ in range(graph_output_rank))
+                                        if graph_output_rank is not None and graph_output_rank_proven
+                                        else None
+                                    )
+                                    if repeated_carried_state
+                                    else lineage.shape,
+                                    data_type=lineage.data_type,
+                                    transforms=lineage.transforms,
+                                    unresolved_reason=lineage.unresolved_reason
+                                    or "unresolved_control_flow_stack_lineage",
+                                )
+                                for initializer_index, lineage in graph_output_parent_lineages.items()
+                            }
+                    if graph_output_parent_lineages and (
+                        stacked_scan_output
+                        or (
+                            standard_control_flow_operator
+                            and node.op_type == "Scan"
+                            and resolved_scan_input_offset
+                            and not stacked_scan_output
+                        )
+                    ):
+                        graph_output_parent_lineages = lineages_after_control_flow_rank_increase(
+                            graph_output_parent_lineages,
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
+                            insert_axis=scan_output_insert_axis if stacked_scan_output else 0,
+                            stack_extent=(
+                                loop_exact_iteration_count(max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK)
+                                if node.op_type == "Loop" and stacked_scan_output
+                                else None
+                            ),
+                            materialize_stack_output=(
+                                stacked_scan_output
+                                and (
+                                    node.op_type == "Loop"
+                                    or (node.op_type == "Scan" and not resolved_scan_input_offset)
+                                    or (
+                                        node.op_type == "Scan"
+                                        and scan8_single_invocation_proven
+                                        and graph_output_rank_proven
+                                        and graph_output_shape is not None
+                                        and all(dimension >= 0 for dimension in graph_output_shape)
+                                    )
+                                )
+                            )
+                            or (
+                                node.op_type == "Scan"
+                                and bool(resolved_scan_input_offset)
+                                and not stacked_scan_output
+                                and all(
+                                    lineage.shape is not None and len(lineage.shape) >= 2
+                                    for lineage in graph_output_parent_lineages.values()
+                                    if lineage.unresolved_reason != "shape_control_lineage"
+                                )
+                            ),
+                        )
                     merge_lineages(
                         subgraph_output_lineages[output_index],
-                        graph_output_lineages[graph_output_index],
+                        graph_output_parent_lineages,
                         ambiguous_reason="ambiguous_subgraph_output_lineage",
                     )
+                    merge_subgraph_output_rank(
+                        output_index,
+                        graph_output_shape,
+                        graph_output_rank,
+                        graph_output_rank_proven,
+                    )
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
+                    subgraph_output_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                        subgraph_output_lineage_gap_counts[output_index],
+                        graph_output_lineage_gap_counts[graph_output_index],
+                    )
+                    subgraph_output_non_shape_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                        subgraph_output_non_shape_lineage_gap_counts[output_index],
+                        graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                    )
+                    graph_output_non_shape_gap_summary = known_weight_gap_summary(
+                        graph_output_non_shape_lineage_gap_summaries[graph_output_index],
+                        graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                    )
+                    if stacked_scan_output and graph_output_non_shape_lineage_gap_counts[graph_output_index]:
+                        graph_output_non_shape_gap_summary = non_shape_gap_summary_after_rank_increase(
+                            graph_output_non_shape_gap_summary,
+                            graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                            insert_axis=scan_output_insert_axis,
+                        )
+                    elif (
+                        standard_control_flow_operator
+                        and node.op_type in {"Loop", "Scan"}
+                        and not stacked_scan_output
+                        and graph_output_non_shape_lineage_gap_counts[graph_output_index]
+                        and (node_loop_may_repeat or (node.op_type == "Scan" and node_scan_may_repeat))
+                    ):
+                        state_input_name = control_flow_state_input_name(output_index)
+                        if gap_summary_may_exceed_input_rank(
+                            graph_output_non_shape_gap_summary,
+                            known_value_ranks.get(state_input_name),
+                        ):
+                            graph_output_non_shape_gap_summary = non_shape_gap_summary_after_rank_increase(
+                                graph_output_non_shape_gap_summary,
+                                graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                            )
+                    subgraph_output_non_shape_lineage_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
+                        subgraph_output_non_shape_lineage_gap_summaries[output_index],
+                        graph_output_non_shape_gap_summary,
+                    )
+                    graph_output_weight_gap_summary = known_weight_gap_summary(
+                        graph_output_weight_lineage_gap_summaries[graph_output_index],
+                        graph_output_weight_lineage_gap_counts[graph_output_index],
+                    )
+                    finite_loop_rank_bounds: tuple[bool, bool, tuple[int, ...]] | None = None
+                    finite_loop_body_consumes_output_weight_gap = True
+                    if (
+                        (
+                            repeated_carried_state_rank_may_increase
+                            or repeated_carried_state_rank_decreases
+                            or graph_output_weight_lineage_gap_counts[graph_output_index]
+                        )
+                        and subgraph_state_input_name
+                        and node.op_type == "Loop"
+                        and (
+                            exact_loop_iterations := loop_exact_iteration_count(
+                                max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                            )
+                        )
+                        is not None
+                    ):
+                        state_input_name = control_flow_state_input_name(output_index)
+                        state_input_rank = control_flow_state_input_rank(output_index)
+                        finite_loop_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                            subgraph,
+                            subgraph_state_input_name,
+                            graph_output_index,
+                            proven_value_shape(state_input_name),
+                            state_input_rank,
+                            exact_loop_iterations,
+                            subgraph_trusted_context_shapes,
+                            related_repeated_state_shapes,
+                            len(getattr(node, "input", ())),
+                        )
+                        if finite_loop_rank_bounds is not None:
+                            finite_loop_body_consumes_output_weight_gap = finite_loop_rank_bounds[0]
+                            finite_loop_output_shape = finite_loop_rank_bounds[2]
+                            finite_loop_output_rank = len(finite_loop_output_shape)
+                            if len(getattr(node, "input", ())) <= 3 and len(subgraph_results) == 1:
+                                graph_output_shape = finite_loop_output_shape
+                                graph_output_rank = finite_loop_output_rank
+                                graph_output_rank_proven = True
+                                subgraph_output_shapes[output_index] = finite_loop_output_shape
+                                subgraph_output_ranks[output_index] = finite_loop_output_rank
+                                subgraph_output_proven_ranks[output_index] = True
+                                subgraph_output_rank_seen[output_index] = True
+                                subgraph_output_rank_unknown[output_index] = False
+                    recorded_future_body_gap = False
+                    if (
+                        repeated_carried_state_input_may_feed_weight
+                        and graph_output_weight_lineage_gap_counts[graph_output_index]
+                        and (
+                            finite_loop_body_consumes_output_weight_gap
+                            or repeated_carried_state_cross_state_weight_transfer
+                        )
+                    ):
+                        record_weight_lineage_limit_gap(
+                            graph_output_weight_lineage_gap_counts[graph_output_index],
+                            collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
+                        )
+                        recorded_future_body_gap = True
+                    if stacked_scan_output and graph_output_weight_lineage_gap_counts[graph_output_index]:
+                        graph_output_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
+                            graph_output_weight_gap_summary,
+                            graph_output_weight_lineage_gap_counts[graph_output_index],
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
+                            insert_axis=scan_output_insert_axis,
+                        )
+                    finite_loop_output_stays_below_weight_rank = (
+                        finite_loop_rank_bounds is not None and not finite_loop_rank_bounds[1]
+                    )
+                    suppress_finite_loop_output_weight_gap = (
+                        finite_loop_output_stays_below_weight_rank
+                        and not finite_loop_body_consumes_output_weight_gap
+                        and len(related_repeated_state_shapes) <= 1
+                        and len(getattr(node, "input", ())) <= 3
+                    )
+                    if not suppress_finite_loop_output_weight_gap:
+                        subgraph_output_weight_lineage_gap_counts[output_index] = (
+                            _bounded_onnx_weight_lineage_gap_count(
+                                subgraph_output_weight_lineage_gap_counts[output_index],
+                                graph_output_weight_lineage_gap_counts[graph_output_index],
+                            )
+                        )
+                        subgraph_output_weight_lineage_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
+                            subgraph_output_weight_lineage_gap_summaries[output_index],
+                            graph_output_weight_gap_summary,
+                        )
+                    else:
+                        assert finite_loop_rank_bounds is not None
+                        demoted_weight_summary = summarize_rank_promotable_lineage_gap(
+                            (
+                                _OnnxWeightLineage(
+                                    initializer_index=lineage.initializer_index,
+                                    shape=finite_loop_rank_bounds[2],
+                                    data_type=lineage.data_type,
+                                    transforms=lineage.transforms,
+                                    unresolved_reason=lineage.unresolved_reason,
+                                )
+                                for lineage in graph_output_weight_gap_summary.lineages
+                            ),
+                            truncated=graph_output_weight_gap_summary.truncated,
+                        )
+                        subgraph_output_rank_promotable_lineage_gap_counts[output_index] = (
+                            _bounded_onnx_weight_lineage_gap_count(
+                                subgraph_output_rank_promotable_lineage_gap_counts[output_index],
+                                graph_output_weight_lineage_gap_counts[graph_output_index],
+                            )
+                        )
+                        subgraph_output_rank_promotable_lineage_gap_summaries[output_index] = (
+                            merge_weight_lineage_gap_summaries(
+                                subgraph_output_rank_promotable_lineage_gap_summaries[output_index],
+                                demoted_weight_summary,
+                            )
+                        )
+                    rank_promotable_gap_promoted = False
+                    if (
+                        standard_control_flow_operator
+                        and node.op_type in {"Loop", "Scan"}
+                        and not stacked_scan_output
+                        and graph_output_rank_promotable_gap_count
+                        and repeated_carried_state_input_may_feed_weight
+                        and (node_loop_may_repeat or (node.op_type == "Scan" and node_scan_may_repeat))
+                    ):
+                        state_rank_gap_summary = known_weight_gap_summary(
+                            graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
+                            graph_output_rank_promotable_gap_count,
+                        )
+                        repeated_state_weight_gap_summary = empty_weight_gap_summary
+                        finite_loop_body_consumes_weight_rank = True
+                        finite_loop_output_reaches_weight_rank = True
+                        if (
+                            node.op_type == "Loop"
+                            and (
+                                exact_loop_iterations := loop_exact_iteration_count(
+                                    max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                                )
+                            )
+                            is not None
+                        ):
+                            state_input_rank = control_flow_state_input_rank(output_index)
+                            if finite_loop_rank_bounds is None:
+                                state_input_name = control_flow_state_input_name(output_index)
+                                finite_loop_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                    subgraph,
+                                    subgraph_state_input_name,
+                                    graph_output_index,
+                                    proven_value_shape(state_input_name),
+                                    state_input_rank,
+                                    exact_loop_iterations,
+                                    subgraph_trusted_context_shapes,
+                                    related_repeated_state_shapes,
+                                    len(getattr(node, "input", ())),
+                                )
+                            if finite_loop_rank_bounds is not None:
+                                finite_loop_body_consumes_weight_rank = finite_loop_rank_bounds[0]
+                                finite_loop_output_reaches_weight_rank = finite_loop_rank_bounds[1]
+                                finite_loop_output_shape = finite_loop_rank_bounds[2]
+                                finite_loop_output_rank = len(finite_loop_output_shape)
+                                if len(getattr(node, "input", ())) <= 3 and len(subgraph_results) == 1:
+                                    graph_output_shape = finite_loop_output_shape
+                                    graph_output_rank = finite_loop_output_rank
+                                    graph_output_rank_proven = True
+                                    subgraph_output_shapes[output_index] = finite_loop_output_shape
+                                    subgraph_output_ranks[output_index] = finite_loop_output_rank
+                                    subgraph_output_proven_ranks[output_index] = True
+                                    subgraph_output_rank_seen[output_index] = True
+                                    subgraph_output_rank_unknown[output_index] = False
+                        if repeated_carried_state_rank_may_increase and finite_loop_output_reaches_weight_rank:
+                            repeated_state_weight_gap_summary = rank_gap_weight_summary_after_repeated_rank_increase(
+                                state_rank_gap_summary,
+                                graph_output_rank_promotable_gap_count,
+                            )
+                        elif (
+                            not repeated_carried_state_rank_may_increase or finite_loop_output_reaches_weight_rank
+                        ) and gap_summary_may_exceed_input_rank(
+                            state_rank_gap_summary,
+                            control_flow_state_input_rank(output_index),
+                        ):
+                            repeated_state_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
+                                state_rank_gap_summary,
+                                graph_output_rank_promotable_gap_count,
+                                output_shape=graph_output_shape,
+                                output_rank=graph_output_rank,
+                            )
+                        if repeated_state_weight_gap_summary != empty_weight_gap_summary:
+                            if finite_loop_body_consumes_weight_rank:
+                                record_weight_lineage_limit_gap(
+                                    graph_output_rank_promotable_gap_count,
+                                    collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
+                                )
+                                recorded_future_body_gap = True
+                            subgraph_output_weight_lineage_gap_counts[output_index] = (
+                                _bounded_onnx_weight_lineage_gap_count(
+                                    subgraph_output_weight_lineage_gap_counts[output_index],
+                                    graph_output_rank_promotable_gap_count,
+                                )
+                            )
+                            subgraph_output_weight_lineage_gap_summaries[output_index] = (
+                                merge_weight_lineage_gap_summaries(
+                                    subgraph_output_weight_lineage_gap_summaries[output_index],
+                                    repeated_state_weight_gap_summary,
+                                )
+                            )
+                            rank_promotable_gap_promoted = True
+                    if (
+                        standard_control_flow_operator
+                        and node.op_type == "Loop"
+                        and node_loop_may_repeat
+                        and not stacked_scan_output
+                        and repeated_carried_state_input_may_feed_weight
+                        and graph_output_non_shape_lineage_gap_counts[graph_output_index]
+                        and not recorded_future_body_gap
+                    ):
+                        # A later body can reshape or cast a deferred state into a
+                        # weight even when the returned state stays rank-one or integer.
+                        future_state_summary = known_weight_gap_summary(
+                            graph_output_non_shape_lineage_gap_summaries[graph_output_index],
+                            graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                        )
+                        future_iterations = loop_exact_iteration_count(
+                            max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                        )
+                        incoming_summary = subgraph_bound_non_shape_lineage_gap_summaries.get(subgraph_state_input_name)
+                        invariant_shape = subgraph_trusted_context_shapes.get(subgraph_state_input_name)
+                        already_analyzed_gap = (
+                            len(getattr(node, "input", ())) <= 3
+                            and invariant_shape is not None
+                            and len(invariant_shape) == 1
+                            and all(dimension >= 0 for dimension in invariant_shape)
+                            and graph_output_rank_proven
+                            and graph_output_shape == invariant_shape
+                            and subgraph_bound_non_shape_lineage_gaps.get(subgraph_state_input_name, 0) > 0
+                            and incoming_summary is not None
+                            and not incoming_summary.truncated
+                            and bool(incoming_summary.lineages)
+                            and incoming_summary == future_state_summary
+                            and all(
+                                lineage.shape == invariant_shape and lineage.data_type in floating_types
+                                for lineage in incoming_summary.lineages
+                            )
+                        )
+                        # The normal body walk already analyzed this exact invariant
+                        # summary; branch multiplicity does not create a new context.
+                        future_body_may_consume_gap = (
+                            not already_analyzed_gap
+                            and repeated_state_output_may_reach_future_weight(
+                                subgraph, subgraph_state_input_name, include_current_iteration=True
+                            )
+                        )
+                        future_related_shapes = dict(related_repeated_state_shapes)
+                        if len(future_related_shapes) > 1:
+                            update_dependencies = repeated_state_update_dependency_names_bounded(
+                                subgraph, graph_output_index
+                            )
+                            consumer_dependencies = state_weight_consumer_dependency_names_bounded(
+                                subgraph, subgraph_state_input_name
+                            )
+                            if update_dependencies is not None and consumer_dependencies is not None:
+                                future_related_shapes = {
+                                    name: shape
+                                    for name, shape in future_related_shapes.items()
+                                    if name == subgraph_state_input_name
+                                    or name in update_dependencies
+                                    or name in consumer_dependencies
+                                }
+                        if (
+                            future_body_may_consume_gap
+                            and future_iterations is not None
+                            and future_iterations > 1
+                            and not future_state_summary.truncated
+                            and future_state_summary.lineages
+                            and len(future_related_shapes) <= 1
+                        ):
+                            future_body_may_consume_gap = False
+                            for deferred_lineage in future_state_summary.lineages:
+                                if deferred_lineage.shape is None:
+                                    future_body_may_consume_gap = True
+                                    break
+                                future_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                    subgraph,
+                                    subgraph_state_input_name,
+                                    graph_output_index,
+                                    deferred_lineage.shape,
+                                    len(deferred_lineage.shape),
+                                    future_iterations - 1,
+                                    subgraph_trusted_context_shapes,
+                                    future_related_shapes,
+                                    len(getattr(node, "input", ())),
+                                    require_floating=True,
+                                    initial_data_type=deferred_lineage.data_type,
+                                )
+                                if future_bounds is None or future_bounds[0]:
+                                    future_body_may_consume_gap = True
+                                    break
+                        if future_body_may_consume_gap:
+                            record_weight_lineage_limit_gap(
+                                graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                                collect_weight_consumers=collect_weight_consumers and not node_body_proven_skipped,
+                            )
+                    if (
+                        standard_control_flow_operator
+                        and node.op_type == "Scan"
+                        and resolved_scan_input_offset
+                        and not stacked_scan_output
+                        and graph_output_rank_promotable_gap_count
+                        and not rank_promotable_gap_promoted
+                    ):
+                        state_rank_gap_summary = known_weight_gap_summary(
+                            graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
+                            graph_output_rank_promotable_gap_count,
+                        )
+                        batched_state_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
+                            state_rank_gap_summary,
+                            graph_output_rank_promotable_gap_count,
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
+                        )
+                        if batched_state_weight_gap_summary != empty_weight_gap_summary:
+                            subgraph_output_weight_lineage_gap_counts[output_index] = (
+                                _bounded_onnx_weight_lineage_gap_count(
+                                    subgraph_output_weight_lineage_gap_counts[output_index],
+                                    graph_output_rank_promotable_gap_count,
+                                )
+                            )
+                            subgraph_output_weight_lineage_gap_summaries[output_index] = (
+                                merge_weight_lineage_gap_summaries(
+                                    subgraph_output_weight_lineage_gap_summaries[output_index],
+                                    batched_state_weight_gap_summary,
+                                )
+                            )
+                            rank_promotable_gap_promoted = True
+                    if rank_promotable_gap_promoted:
+                        continue
+                    if stacked_scan_output and graph_output_rank_promotable_gap_count:
+                        stacked_scan_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
+                            known_weight_gap_summary(
+                                graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
+                                graph_output_rank_promotable_gap_count,
+                            ),
+                            graph_output_rank_promotable_gap_count,
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
+                            insert_axis=scan_output_insert_axis,
+                        )
+                        if stacked_scan_weight_gap_summary != empty_weight_gap_summary:
+                            subgraph_output_weight_lineage_gap_counts[output_index] = (
+                                _bounded_onnx_weight_lineage_gap_count(
+                                    subgraph_output_weight_lineage_gap_counts[output_index],
+                                    graph_output_rank_promotable_gap_count,
+                                )
+                            )
+                            subgraph_output_weight_lineage_gap_summaries[output_index] = (
+                                merge_weight_lineage_gap_summaries(
+                                    subgraph_output_weight_lineage_gap_summaries[output_index],
+                                    stacked_scan_weight_gap_summary,
+                                )
+                            )
+                        else:
+                            subgraph_output_rank_promotable_lineage_gap_counts[output_index] = (
+                                _bounded_onnx_weight_lineage_gap_count(
+                                    subgraph_output_rank_promotable_lineage_gap_counts[output_index],
+                                    graph_output_rank_promotable_gap_count,
+                                )
+                            )
+                            subgraph_output_rank_promotable_lineage_gap_summaries[output_index] = (
+                                merge_weight_lineage_gap_summaries(
+                                    subgraph_output_rank_promotable_lineage_gap_summaries[output_index],
+                                    known_weight_gap_summary(
+                                        graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
+                                        graph_output_rank_promotable_gap_count,
+                                    ),
+                                )
+                            )
+                    else:
+                        subgraph_output_rank_promotable_lineage_gap_counts[output_index] = (
+                            _bounded_onnx_weight_lineage_gap_count(
+                                subgraph_output_rank_promotable_lineage_gap_counts[output_index],
+                                graph_output_rank_promotable_gap_count,
+                            )
+                        )
+                        subgraph_output_rank_promotable_lineage_gap_summaries[output_index] = (
+                            merge_weight_lineage_gap_summaries(
+                                subgraph_output_rank_promotable_lineage_gap_summaries[output_index],
+                                known_weight_gap_summary(
+                                    graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
+                                    graph_output_rank_promotable_gap_count,
+                                ),
+                            )
+                        )
+
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Loop"
+                and loop_may_skip_body(node, constants, graph_input_names)
+            ):
+                for output_index, parent_input in enumerate(node.input[2 : 2 + len(node.output)]):
+                    if not parent_input:
+                        continue
+                    parent_name = str(parent_input)
+                    merge_lineages(
+                        subgraph_output_lineages[output_index],
+                        value_lineages.get(parent_name, {}),
+                        ambiguous_reason="ambiguous_subgraph_output_lineage",
+                    )
+                    merge_subgraph_output_gap_state(output_index, parent_name)
+                    merge_subgraph_output_rank(
+                        output_index,
+                        known_value_shapes.get(parent_name),
+                        known_value_ranks.get(parent_name),
+                        parent_name in proven_value_ranks,
+                    )
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and scan_may_skip_body(
+                    node,
+                    constants,
+                    graph_input_names,
+                    known_value_shapes,
+                    trusted_scan_shape_names,
+                    untrusted_scan_shape_names,
+                    scan_input_axes=resolved_scan_input_axes,
+                    scan_input_offset=resolved_scan_input_offset,
+                    num_scan_inputs=resolved_scan_input_count,
+                    produced_sequence_extent=produced_scan8_sequence_extent,
+                )
+            ):
+                scan_state_input_count = max(
+                    len(node.input) - resolved_scan_input_offset - max(resolved_scan_input_count, 0), 0
+                )
+                state_inputs = node.input[
+                    resolved_scan_input_offset : resolved_scan_input_offset
+                    + min(scan_state_input_count, len(node.output))
+                ]
+                for output_index, parent_input in enumerate(state_inputs):
+                    if not parent_input:
+                        continue
+                    parent_name = str(parent_input)
+                    merge_lineages(
+                        subgraph_output_lineages[output_index],
+                        value_lineages.get(parent_name, {}),
+                        ambiguous_reason="ambiguous_subgraph_output_lineage",
+                    )
+                    merge_subgraph_output_gap_state(output_index, parent_name)
+                    merge_subgraph_output_rank(
+                        output_index,
+                        known_value_shapes.get(parent_name),
+                        known_value_ranks.get(parent_name),
+                        parent_name in proven_value_ranks,
+                    )
+
+            if elementwise_output_shape is None and elementwise_output_rank is None and input_names:
+                common_output_rank_operator = (
+                    is_builtin_neural_operator
+                    and (node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS or node.op_type == "Slice")
+                    and (len(input_names) == 1 or node.op_type in {"Clip", "Dropout", "Slice"})
+                )
+                if common_output_rank_operator:
+                    if value_has_unknown_dynamic_rank(input_names[0]):
+                        elementwise_has_unknown_dynamic_rank = True
+                    else:
+                        # Slice preserves rank, but its bounds can change every extent.
+                        elementwise_output_shape = (
+                            None if node.op_type == "Slice" else known_value_shapes.get(input_names[0])
+                        )
+                        elementwise_output_rank = (
+                            len(elementwise_output_shape)
+                            if elementwise_output_shape is not None
+                            else known_value_ranks.get(input_names[0])
+                        )
+                        elementwise_output_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
+
+            transform_output_shape: tuple[int, ...] | None = None
+            transform_output_rank: int | None = None
+            transform_output_rank_proven = True
+            transform_proof_error = (
+                weight_transform_proof_error(
+                    node,
+                    resolve_attribute=resolve_attribute,
+                    cast_target_data_type=resolved_cast_target_data_type,
+                )
+                if supported_transform
+                else None
+            )
+            clear_transform_output_rank = transform_proof_error is not None
+            if supported_transform and input_names and transform_proof_error is None:
+                transform_input_shape = known_value_shapes.get(input_names[0])
+                transform_input_rank = known_value_ranks.get(input_names[0])
+                transform_input_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
+                if node.op_type in {"Identity", "Cast"}:
+                    if value_has_unknown_dynamic_rank(input_names[0]):
+                        clear_transform_output_rank = True
+                    else:
+                        transform_output_shape = transform_input_shape
+                        transform_output_rank = (
+                            len(transform_output_shape) if transform_output_shape is not None else transform_input_rank
+                        )
+                        transform_output_rank_proven = transform_input_rank_proven
+                elif node.op_type == "Transpose":
+                    transform_output_rank_proven = transform_input_rank_proven
+                    if transform_input_shape is not None:
+                        permutation = transpose_permutation(node, len(transform_input_shape), resolve_attribute)
+                        if permutation is not None:
+                            transform_output_shape = inferred_shape(
+                                len(permutation), (transform_input_shape[index] for index in permutation)
+                            )
+                            transform_output_rank = len(permutation)
+                    elif transform_input_rank is not None and shape_inference_available(transform_input_rank):
+                        # The default permutation preserves rank without allocating a rank-sized tuple.
+                        if not any(attribute.name == "perm" for attribute in node.attribute) or (
+                            transpose_permutation(node, transform_input_rank, resolve_attribute) is not None
+                        ):
+                            transform_output_rank = transform_input_rank
+                elif node.op_type == "Flatten" and transform_input_rank is not None:
+                    transform_output_rank_proven = transform_input_rank_proven
+                    axis = resolved_int_attribute(node, "axis", 1)
+                    axis = axis if axis >= 0 else transform_input_rank + axis
+                    if 0 <= axis <= transform_input_rank:
+                        transform_output_rank = 2
+                        if transform_input_shape is not None:
+                            transform_output_shape = flattened_output_shape(transform_input_shape, axis)
+                elif node.op_type == "Expand" and len(input_names) == 2:
+                    expand_input_shape = proven_value_shape(input_names[0])
+                    target_shape = expand_target_shape(input_names[1])
+                    if (
+                        expand_input_shape is not None
+                        and all(dimension >= 0 for dimension in expand_input_shape)
+                        and target_shape is not None
+                    ):
+                        transform_output_shape = broadcast_shapes((expand_input_shape, target_shape))
+                        if transform_output_shape is not None:
+                            transform_output_rank = len(transform_output_shape)
+                elif node.op_type == "Reshape" and len(input_names) > 1:
+                    shape_initializer = constants.get(input_names[1])
+                    target_shape = constant_int64_vector_values(shape_initializer)
+                    if (
+                        target_shape is not None
+                        and all(value >= -1 for value in target_shape)
+                        and target_shape.count(-1) <= 1
+                        and not (
+                            bool(resolved_int_attribute(node, "allowzero")) and -1 in target_shape and 0 in target_shape
+                        )
+                    ):
+                        transform_output_rank = len(target_shape)
+                        shape_depends_on_input = -1 in target_shape or (
+                            0 in target_shape and not resolved_int_attribute(node, "allowzero")
+                        )
+                        if not shape_depends_on_input and (
+                            transform_input_shape is None
+                            or not transform_input_rank_proven
+                            or any(dimension < 0 for dimension in transform_input_shape)
+                        ):
+                            transform_output_shape = target_shape
+                        elif (
+                            transform_input_shape is not None
+                            and shape_initializer is not None
+                            and (transform_input_rank_proven or not shape_depends_on_input)
+                        ):
+                            transform_output_shape = _resolve_onnx_reshape_shape(
+                                transform_input_shape,
+                                shape_initializer,
+                                allowzero=bool(resolved_int_attribute(node, "allowzero")),
+                                onnx=onnx,
+                                resolve_int64_vector=constant_int64_vector_values,
+                            )
+                            if transform_output_shape is None:
+                                transform_output_rank = None
+                elif node.op_type == "Squeeze" and transform_input_rank is not None:
+                    transform_output_rank_proven = transform_input_rank_proven
+                    axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+                    if axes is not None:
+                        if not axes:
+                            if transform_input_shape is not None:
+                                transform_output_shape = implicit_squeeze_shape(
+                                    node,
+                                    transform_input_shape,
+                                    resolve_attribute,
+                                    identifier=function_key,
+                                )
+                                if transform_output_shape is not None:
+                                    transform_output_rank = len(transform_output_shape)
+                                else:
+                                    clear_transform_output_rank = True
+                            elif squeeze_with_empty_axes_is_noop(
+                                node, axes, resolve_attribute, identifier=function_key
+                            ):
+                                transform_output_rank = transform_input_rank
+                            else:
+                                clear_transform_output_rank = True
+                        else:
+                            normalized_axes = tuple(axis if axis >= 0 else transform_input_rank + axis for axis in axes)
+                            if squeeze_axes_are_valid(
+                                normalized_axes,
+                                transform_input_rank,
+                                transform_input_shape,
+                                allow_unknown_dimensions=True,
+                            ):
+                                transform_output_rank = transform_input_rank - len(normalized_axes)
+                                if transform_input_shape is not None:
+                                    squeeze_axes = set(normalized_axes)
+                                    transform_output_shape = tuple(
+                                        dimension
+                                        for index, dimension in enumerate(transform_input_shape)
+                                        if index not in squeeze_axes
+                                    )
+                            else:
+                                transform_proof_error = "invalid_squeeze_lineage"
+                                clear_transform_output_rank = True
+                elif node.op_type == "Unsqueeze" and transform_input_rank is not None:
+                    transform_output_rank_proven = transform_input_rank_proven
+                    axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+                    if axes is not None:
+                        output_rank = transform_input_rank + len(axes)
+                        normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
+                        if (
+                            shape_inference_available(output_rank)
+                            and normalized_axes
+                            and len(set(normalized_axes)) == len(normalized_axes)
+                            and all(0 <= axis < output_rank for axis in normalized_axes)
+                        ):
+                            transform_output_rank = output_rank
+                            if transform_input_shape is not None:
+                                transform_output_shape = unsqueezed_shape(transform_input_shape, axes)
 
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
                     continue
                 name = str(output_name)
+                inferred_output_shape = None
+                inferred_output_rank = None
+                inferred_output_rank_proven = True
+                if output_index == 0 or (node.op_type == "Dropout" and output_index == 1):
+                    inferred_output_shape = (
+                        elementwise_output_shape if elementwise_output_shape is not None else transform_output_shape
+                    )
+                    if elementwise_output_rank is not None:
+                        inferred_output_rank = elementwise_output_rank
+                        inferred_output_rank_proven = elementwise_output_rank_proven
+                    else:
+                        inferred_output_rank = transform_output_rank
+                        inferred_output_rank_proven = transform_output_rank_proven
+                if output_index < len(subgraph_output_shapes):
+                    subgraph_output_shape = subgraph_output_shapes[output_index]
+                    if subgraph_output_shape is not None:
+                        inferred_output_shape = subgraph_output_shape
+                        inferred_output_rank = len(subgraph_output_shape)
+                        inferred_output_rank_proven = subgraph_output_proven_ranks[output_index]
+                    elif subgraph_output_ranks[output_index] is not None and inferred_output_shape is None:
+                        inferred_output_rank = subgraph_output_ranks[output_index]
+                        inferred_output_rank_proven = subgraph_output_proven_ranks[output_index]
+                    elif subgraph_output_rank_unknown[output_index]:
+                        inferred_output_shape = None
+                        inferred_output_rank = None
+                if transform_proof_error is not None and output_index == 0:
+                    # Rejected transforms cannot establish a rank exclusion through
+                    # a separate generic or subgraph shape proof.
+                    inferred_output_shape = None
+                    inferred_output_rank = None
+                    inferred_output_rank_proven = False
+                subgraph_clears_output_rank = (
+                    output_index < len(subgraph_output_rank_unknown) and subgraph_output_rank_unknown[output_index]
+                )
+                elementwise_clears_output_rank = elementwise_has_unknown_dynamic_rank and output_index == 0
+                clear_output_rank = (
+                    (
+                        (clear_transform_output_rank and output_index == 0)
+                        or subgraph_clears_output_rank
+                        or elementwise_clears_output_rank
+                    )
+                    and inferred_output_shape is None
+                    and inferred_output_rank is None
+                )
                 per_output_lineages = dict(output_lineages)
+                if is_builtin_neural_operator and node.op_type == "MaxPool" and output_index == 1:
+                    per_output_lineages = {
+                        initializer_index: (
+                            _OnnxWeightLineage(
+                                initializer_index=lineage.initializer_index,
+                                shape=lineage.shape,
+                                data_type=onnx.TensorProto.INT64,
+                                transforms=lineage.transforms,
+                                unresolved_reason="shape_dimensions_lineage",
+                            )
+                            if lineage.unresolved_reason == "shape_control_lineage"
+                            else lineage
+                        )
+                        for initializer_index, lineage in per_output_lineages.items()
+                    }
                 if (
                     recurrent_state_lineages
-                    and is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and is_builtin_neural_operator
                     and node.op_type in _RECURRENT_WEIGHT_OPERATORS
                 ):
                     for initializer_index in recurrent_state_lineages:
@@ -3042,6 +15570,15 @@ def _build_onnx_weight_analysis_plan(
                             for initializer_index, lineage in recurrent_state_lineages.items()
                         }
                     else:
+                        # Final hidden/cell states preserve their corresponding
+                        # initial state's shape; sequence outputs do not.
+                        state_input_index = output_index + 4
+                        state_input = str(node.input[state_input_index]) if state_input_index < len(node.input) else ""
+                        state_shape = proven_value_shape(state_input)
+                        if state_shape is not None:
+                            inferred_output_shape = state_shape
+                            inferred_output_rank = len(state_shape)
+                            inferred_output_rank_proven = True
                         state_lineages = {
                             initializer_index: _OnnxWeightLineage(
                                 initializer_index=initializer_index,
@@ -3074,7 +15611,25 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_output_lineages[output_index],
                     ambiguous_reason="ambiguous_subgraph_output_lineage",
                 )
-                if subgraph_output_dynamic[output_index] and per_output_lineages:
+                # A runtime value with a proven empty batch has no weight data,
+                # even though its dynamic provenance must still propagate.
+                empty_scan8_state_shape = subgraph_output_shapes[output_index]
+                preserve_empty_scan8_state = (
+                    scan8_zero_batch_proven
+                    and output_index < len(node.input) - resolved_scan_input_count - resolved_scan_input_offset
+                    and subgraph_output_proven_ranks[output_index]
+                    and empty_scan8_state_shape is not None
+                    and len(empty_scan8_state_shape) > 0
+                    and empty_scan8_state_shape[0] == 0
+                    and all(
+                        lineage.unresolved_reason is None
+                        and lineage.shape is not None
+                        and len(lineage.shape) > 0
+                        and lineage.shape[0] == 0
+                        for lineage in per_output_lineages.values()
+                    )
+                )
+                if subgraph_output_dynamic[output_index] and per_output_lineages and not preserve_empty_scan8_state:
                     per_output_lineages = {
                         initializer_index: _OnnxWeightLineage(
                             initializer_index=initializer_index,
@@ -3085,24 +15640,246 @@ def _build_onnx_weight_analysis_plan(
                         )
                         for initializer_index, lineage in per_output_lineages.items()
                     }
-                per_output_lineages = bounded_lineages(per_output_lineages)
-                if per_output_lineages:
-                    value_lineages[name] = per_output_lineages
-                    lineage_shapes = {lineage.shape for lineage in per_output_lineages.values()}
-                    if len(lineage_shapes) == 1 and None not in lineage_shapes:
-                        known_value_shapes[name] = next(iter(lineage_shapes))  # type: ignore[arg-type]
-                else:
-                    value_lineages.pop(name, None)
-                    if name in constants:
-                        with suppress(AttributeError, TypeError, ValueError):
-                            known_value_shapes[name] = tuple(int(dimension) for dimension in constants[name].dims)
-
+                (
+                    per_output_lineages,
+                    per_output_lineage_limit_gap_count,
+                    per_output_non_shape_lineage_limit_gap_count,
+                    per_output_non_shape_lineage_gap_summary,
+                    per_output_weight_lineage_limit_gap_count,
+                    per_output_rank_promotable_lineage_limit_gap_count,
+                    per_output_weight_lineage_gap_summary,
+                    per_output_rank_promotable_lineage_gap_summary,
+                ) = bounded_lineages(per_output_lineages)
                 mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
                 output_is_dynamic = (
                     subgraph_output_dynamic[output_index]
                     if mapped_subgraph_output and per_output_lineages
                     else has_dynamic_input or (not per_output_lineages and name not in constant_output_names)
                 )
+                if per_output_lineages or any(
+                    summary_has_shape_control_provenance(summary)
+                    for summary in (
+                        transformed_input_output_non_shape_lineage_gap_summary
+                        if not subgraph_results
+                        else empty_weight_gap_summary,
+                        output_non_shape_lineage_gap_summary,
+                        per_output_non_shape_lineage_gap_summary,
+                        subgraph_output_non_shape_lineage_gap_summaries[output_index],
+                    )
+                ):
+                    value_lineages[name] = per_output_lineages
+                    input_lineage_limit_gap_count_for_output = (
+                        0 if subgraph_results else all_input_lineage_limit_gap_count
+                    )
+                    input_weight_lineage_limit_gap_count_for_output = (
+                        0
+                        if subgraph_results
+                        or transform_output_demotes_weight_gap
+                        or cast_output_is_nonfloating_transform
+                        else all_input_output_weight_lineage_limit_gap_count
+                    )
+                    input_weight_lineage_gap_summary_for_output = (
+                        empty_weight_gap_summary
+                        if input_weight_lineage_limit_gap_count_for_output == 0
+                        else transformed_input_output_weight_lineage_gap_summary
+                    )
+                    input_non_shape_lineage_limit_gap_count_for_output = (
+                        0 if subgraph_results else all_input_non_shape_lineage_limit_gap_count
+                    )
+                    input_non_shape_lineage_gap_summary_for_output = (
+                        empty_weight_gap_summary
+                        if subgraph_results
+                        else known_weight_gap_summary(
+                            transformed_input_output_non_shape_lineage_gap_summary,
+                            input_non_shape_lineage_limit_gap_count_for_output,
+                        )
+                    )
+                    if (
+                        is_builtin_neural_operator
+                        and node.op_type == "MaxPool"
+                        and output_index == 1
+                        and input_non_shape_lineage_gap_summary_for_output.shape_control
+                    ):
+                        # Indices convert layout into integer data. Keep that numeric
+                        # provenance for a later Cast without a current floating gap.
+                        input_non_shape_lineage_gap_summary_for_output = merge_weight_lineage_gap_summaries(
+                            _OnnxWeightLineageGapSummary(
+                                input_non_shape_lineage_gap_summary_for_output.lineages,
+                                input_non_shape_lineage_gap_summary_for_output.truncated,
+                                converted_shape_control=input_non_shape_lineage_gap_summary_for_output.converted_shape_control,
+                            ),
+                            converted_shape_control_gap_summary(data_type=onnx.TensorProto.INT64),
+                        )
+                        input_non_shape_lineage_limit_gap_count_for_output = max(
+                            1, input_non_shape_lineage_limit_gap_count_for_output
+                        )
+                    input_rank_promotable_lineage_limit_gap_count_for_output = (
+                        0
+                        if subgraph_results
+                        or rank_operator_promotes_deferred_gap
+                        or cast_output_is_nonfloating_transform
+                        else all_input_output_rank_promotable_lineage_limit_gap_count
+                    )
+                    if transform_output_demotes_weight_gap:
+                        input_rank_promotable_lineage_limit_gap_count_for_output = (
+                            _bounded_onnx_weight_lineage_gap_count(
+                                input_rank_promotable_lineage_limit_gap_count_for_output,
+                                all_input_output_weight_lineage_limit_gap_count,
+                            )
+                        )
+                        input_rank_promotable_lineage_gap_summary_for_output = merge_weight_lineage_gap_summaries(
+                            transformed_input_output_rank_promotable_lineage_gap_summary,
+                            transformed_input_output_weight_lineage_gap_summary,
+                        )
+                    else:
+                        input_rank_promotable_lineage_gap_summary_for_output = (
+                            empty_weight_gap_summary
+                            if input_rank_promotable_lineage_limit_gap_count_for_output == 0
+                            else transformed_input_output_rank_promotable_lineage_gap_summary
+                        )
+                    propagated_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        input_lineage_limit_gap_count_for_output,
+                        output_lineage_limit_gap_count,
+                        per_output_lineage_limit_gap_count,
+                        subgraph_output_lineage_gap_counts[output_index],
+                    )
+                    propagated_non_shape_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        input_non_shape_lineage_limit_gap_count_for_output,
+                        output_non_shape_lineage_limit_gap_count,
+                        per_output_non_shape_lineage_limit_gap_count,
+                        subgraph_output_non_shape_lineage_gap_counts[output_index],
+                    )
+                    propagated_non_shape_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        known_weight_gap_summary(
+                            input_non_shape_lineage_gap_summary_for_output,
+                            input_non_shape_lineage_limit_gap_count_for_output,
+                        ),
+                        known_weight_gap_summary(
+                            output_non_shape_lineage_gap_summary,
+                            output_non_shape_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            per_output_non_shape_lineage_gap_summary,
+                            per_output_non_shape_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            subgraph_output_non_shape_lineage_gap_summaries[output_index],
+                            subgraph_output_non_shape_lineage_gap_counts[output_index],
+                        ),
+                    )
+                    propagated_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        input_weight_lineage_limit_gap_count_for_output,
+                        output_weight_lineage_limit_gap_count,
+                        per_output_weight_lineage_limit_gap_count,
+                        subgraph_output_weight_lineage_gap_counts[output_index],
+                    )
+                    propagated_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        known_weight_gap_summary(
+                            input_weight_lineage_gap_summary_for_output,
+                            input_weight_lineage_limit_gap_count_for_output,
+                        ),
+                        known_weight_gap_summary(
+                            output_weight_lineage_gap_summary,
+                            output_weight_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            per_output_weight_lineage_gap_summary,
+                            per_output_weight_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            subgraph_output_weight_lineage_gap_summaries[output_index],
+                            subgraph_output_weight_lineage_gap_counts[output_index],
+                        ),
+                    )
+                    propagated_rank_promotable_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        input_rank_promotable_lineage_limit_gap_count_for_output,
+                        output_rank_promotable_lineage_limit_gap_count,
+                        per_output_rank_promotable_lineage_limit_gap_count,
+                        subgraph_output_rank_promotable_lineage_gap_counts[output_index],
+                    )
+                    propagated_rank_promotable_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        known_weight_gap_summary(
+                            input_rank_promotable_lineage_gap_summary_for_output,
+                            input_rank_promotable_lineage_limit_gap_count_for_output,
+                        ),
+                        known_weight_gap_summary(
+                            output_rank_promotable_lineage_gap_summary,
+                            output_rank_promotable_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            per_output_rank_promotable_lineage_gap_summary,
+                            per_output_rank_promotable_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            subgraph_output_rank_promotable_lineage_gap_summaries[output_index],
+                            subgraph_output_rank_promotable_lineage_gap_counts[output_index],
+                        ),
+                    )
+                    if propagated_lineage_limit_gap_count:
+                        value_lineage_limit_gap_counts[name] = propagated_lineage_limit_gap_count
+                    else:
+                        value_lineage_limit_gap_counts.pop(name, None)
+                    if (
+                        propagated_non_shape_lineage_limit_gap_count
+                        or propagated_non_shape_lineage_gap_summary.shape_control
+                    ):
+                        # Keep the zero entry: existing scope bindings use membership
+                        # to transport the pending summary independently of its count.
+                        value_non_shape_lineage_limit_gap_counts[name] = propagated_non_shape_lineage_limit_gap_count
+                        value_non_shape_lineage_limit_gap_summaries[name] = propagated_non_shape_lineage_gap_summary
+                    else:
+                        value_non_shape_lineage_limit_gap_counts.pop(name, None)
+                        value_non_shape_lineage_limit_gap_summaries.pop(name, None)
+                    if propagated_weight_lineage_limit_gap_count:
+                        value_weight_lineage_limit_gap_counts[name] = propagated_weight_lineage_limit_gap_count
+                        value_weight_lineage_limit_gap_summaries[name] = propagated_weight_lineage_gap_summary
+                    else:
+                        value_weight_lineage_limit_gap_counts.pop(name, None)
+                        value_weight_lineage_limit_gap_summaries.pop(name, None)
+                    if propagated_rank_promotable_lineage_limit_gap_count:
+                        value_rank_promotable_lineage_limit_gap_counts[name] = (
+                            propagated_rank_promotable_lineage_limit_gap_count
+                        )
+                        value_rank_promotable_lineage_limit_gap_summaries[name] = (
+                            propagated_rank_promotable_lineage_gap_summary
+                        )
+                    else:
+                        value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
+                        value_rank_promotable_lineage_limit_gap_summaries.pop(name, None)
+                    if inferred_output_shape is not None:
+                        set_known_value_shape(name, inferred_output_shape, proven=inferred_output_rank_proven)
+                    elif inferred_output_rank is not None:
+                        set_known_value_rank(name, inferred_output_rank, proven=inferred_output_rank_proven)
+                    elif clear_output_rank:
+                        clear_known_value_rank(name)
+                    elif (
+                        not output_is_dynamic
+                        and (lineage_shape := resolved_lineage_shape(per_output_lineages.values())) is not None
+                    ):
+                        set_known_value_shape(name, lineage_shape, proven=True)
+                else:
+                    value_lineages.pop(name, None)
+                    value_lineage_limit_gap_counts.pop(name, None)
+                    value_non_shape_lineage_limit_gap_counts.pop(name, None)
+                    value_non_shape_lineage_limit_gap_summaries.pop(name, None)
+                    value_weight_lineage_limit_gap_counts.pop(name, None)
+                    value_weight_lineage_limit_gap_summaries.pop(name, None)
+                    value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
+                    value_rank_promotable_lineage_limit_gap_summaries.pop(name, None)
+                    if name in constants and name not in graph_input_names:
+                        with suppress(AttributeError, TypeError, ValueError):
+                            set_known_value_shape(
+                                name,
+                                tuple(int(dimension) for dimension in constants[name].dims),
+                                proven=True,
+                            )
+                    if inferred_output_shape is not None:
+                        set_known_value_shape(name, inferred_output_shape, proven=inferred_output_rank_proven)
+                    elif inferred_output_rank is not None:
+                        set_known_value_rank(name, inferred_output_rank, proven=inferred_output_rank_proven)
+                    elif clear_output_rank:
+                        clear_known_value_rank(name)
+
                 if output_is_dynamic:
                     dynamic_values.add(name)
                 else:
@@ -3115,16 +15892,84 @@ def _build_onnx_weight_analysis_plan(
             captured_state[1].update(constants)
             captured_state[2].clear()
             captured_state[2].update(dynamic_values)
+            captured_state[3].clear()
+            captured_state[3].update(value_lineage_limit_gap_counts)
+            captured_state[4].clear()
+            captured_state[4].update(value_non_shape_lineage_limit_gap_counts)
+            captured_state[5].clear()
+            captured_state[5].update(value_non_shape_lineage_limit_gap_summaries)
+            captured_state[6].clear()
+            captured_state[6].update(value_weight_lineage_limit_gap_counts)
+            captured_state[7].clear()
+            captured_state[7].update(value_weight_lineage_limit_gap_summaries)
+            captured_state[8].clear()
+            captured_state[8].update(value_rank_promotable_lineage_limit_gap_counts)
+            captured_state[9].clear()
+            captured_state[9].update(value_rank_promotable_lineage_limit_gap_summaries)
 
+        output_names = [_onnx_value_name(graph_output) for graph_output in current_graph.output]
         return (
-            [dict(value_lineages.get(_onnx_value_name(graph_output), {})) for graph_output in current_graph.output],
-            [_onnx_value_name(graph_output) in dynamic_values for graph_output in current_graph.output],
+            [dict(value_lineages.get(output_name, {})) for output_name in output_names],
+            [output_name in dynamic_values for output_name in output_names],
+            [value_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
+            [value_non_shape_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
+            [
+                known_weight_gap_summary(
+                    value_non_shape_lineage_limit_gap_summaries.get(output_name),
+                    value_non_shape_lineage_limit_gap_counts.get(output_name, 0),
+                )
+                for output_name in output_names
+            ],
+            [value_weight_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
+            [
+                known_weight_gap_summary(
+                    value_weight_lineage_limit_gap_summaries.get(output_name),
+                    value_weight_lineage_limit_gap_counts.get(output_name, 0),
+                )
+                for output_name in output_names
+            ],
+            [value_rank_promotable_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
+            [
+                known_weight_gap_summary(
+                    value_rank_promotable_lineage_limit_gap_summaries.get(output_name),
+                    value_rank_promotable_lineage_limit_gap_counts.get(output_name, 0),
+                )
+                for output_name in output_names
+            ],
+            [known_value_shapes.get(output_name) for output_name in output_names],
+            [
+                len(known_value_shapes[output_name])
+                if output_name in known_value_shapes
+                else known_value_ranks.get(output_name)
+                for output_name in output_names
+            ],
+            [output_name in proven_value_ranks for output_name in output_names],
         )
 
     root_state_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
     root_state_constants: dict[str, Any] = {}
     root_state_dynamic: set[str] = set()
-    root_output_lineages, _root_output_dynamic = walk_graph(
+    root_state_lineage_limit_gap_counts: dict[str, int] = {}
+    root_state_non_shape_lineage_limit_gap_counts: dict[str, int] = {}
+    root_state_non_shape_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+    root_state_weight_lineage_limit_gap_counts: dict[str, int] = {}
+    root_state_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+    root_state_rank_promotable_lineage_limit_gap_counts: dict[str, int] = {}
+    root_state_rank_promotable_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+    (
+        root_output_lineages,
+        _root_output_dynamic,
+        _root_output_lineage_gaps,
+        _root_output_non_shape_lineage_gaps,
+        _root_output_non_shape_lineage_gap_summaries,
+        _root_output_weight_lineage_gaps,
+        _root_output_weight_lineage_gap_summaries,
+        _root_output_rank_promotable_lineage_gaps,
+        _root_output_rank_promotable_lineage_gap_summaries,
+        _root_output_shapes,
+        _root_output_ranks,
+        _root_output_proven_ranks,
+    ) = walk_graph(
         graph,
         {},
         {},
@@ -3132,7 +15977,18 @@ def _build_onnx_weight_analysis_plan(
         root_graph=True,
         source_scope=("root_graph",),
         opset_versions=model_opset_versions,
-        captured_state=(root_state_lineages, root_state_constants, root_state_dynamic),
+        captured_state=(
+            root_state_lineages,
+            root_state_constants,
+            root_state_dynamic,
+            root_state_lineage_limit_gap_counts,
+            root_state_non_shape_lineage_limit_gap_counts,
+            root_state_non_shape_lineage_limit_gap_summaries,
+            root_state_weight_lineage_limit_gap_counts,
+            root_state_weight_lineage_limit_gap_summaries,
+            root_state_rank_promotable_lineage_limit_gap_counts,
+            root_state_rank_promotable_lineage_limit_gap_summaries,
+        ),
     )
 
     main_initializer_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
@@ -3170,22 +16026,82 @@ def _build_onnx_weight_analysis_plan(
     }
     training_graph_results: dict[
         tuple[Any, ...],
-        tuple[Any, list[dict[int, _OnnxWeightLineage]], list[bool]],
+        tuple[
+            Any,
+            list[dict[int, _OnnxWeightLineage]],
+            list[bool],
+            list[int],
+            list[int],
+            list[_OnnxWeightLineageGapSummary],
+            list[int],
+            list[_OnnxWeightLineageGapSummary],
+            list[int],
+            list[_OnnxWeightLineageGapSummary],
+            list[tuple[int, ...] | None],
+            list[int | None],
+            list[bool],
+        ],
     ] = {}
     algorithm_initializer_lineages: dict[int, dict[str, dict[int, _OnnxWeightLineage]]] = {}
     for source_scope, training_graph in analysis_graph_roots[1:]:
         is_algorithm = source_scope[2] == "algorithm"
-        output_lineages, output_dynamic = walk_graph(
+        (
+            output_lineages,
+            output_dynamic,
+            output_lineage_gaps,
+            output_non_shape_lineage_gaps,
+            output_non_shape_lineage_gap_summaries,
+            output_weight_lineage_gaps,
+            output_weight_lineage_gap_summaries,
+            output_rank_promotable_lineage_gaps,
+            output_rank_promotable_lineage_gap_summaries,
+            output_shapes,
+            output_ranks,
+            output_proven_ranks,
+        ) = walk_graph(
             training_graph,
             root_state_lineages if is_algorithm else {},
             root_state_constants if is_algorithm else {},
             root_state_dynamic if is_algorithm else set(),
+            inherited_lineage_limit_gap_counts=root_state_lineage_limit_gap_counts if is_algorithm else {},
+            inherited_non_shape_lineage_limit_gap_counts=(
+                root_state_non_shape_lineage_limit_gap_counts if is_algorithm else {}
+            ),
+            inherited_non_shape_lineage_limit_gap_summaries=(
+                root_state_non_shape_lineage_limit_gap_summaries if is_algorithm else {}
+            ),
+            inherited_weight_lineage_limit_gap_counts=(
+                root_state_weight_lineage_limit_gap_counts if is_algorithm else {}
+            ),
+            inherited_weight_lineage_limit_gap_summaries=(
+                root_state_weight_lineage_limit_gap_summaries if is_algorithm else {}
+            ),
+            inherited_rank_promotable_lineage_limit_gap_counts=(
+                root_state_rank_promotable_lineage_limit_gap_counts if is_algorithm else {}
+            ),
+            inherited_rank_promotable_lineage_limit_gap_summaries=(
+                root_state_rank_promotable_lineage_limit_gap_summaries if is_algorithm else {}
+            ),
             root_graph=True,
             source_scope=source_scope,
             opset_versions=model_opset_versions,
             fail_on_unbound_inputs=True,
         )
-        training_graph_results[source_scope] = (training_graph, output_lineages, output_dynamic)
+        training_graph_results[source_scope] = (
+            training_graph,
+            output_lineages,
+            output_dynamic,
+            output_lineage_gaps,
+            output_non_shape_lineage_gaps,
+            output_non_shape_lineage_gap_summaries,
+            output_weight_lineage_gaps,
+            output_weight_lineage_gap_summaries,
+            output_rank_promotable_lineage_gaps,
+            output_rank_promotable_lineage_gap_summaries,
+            output_shapes,
+            output_ranks,
+            output_proven_ranks,
+        )
         if not is_algorithm:
             continue
         training_index = int(source_scope[1])
@@ -3224,7 +16140,21 @@ def _build_onnx_weight_analysis_plan(
             graph_result = training_graph_results.get(source_scope)
             output_lineages_by_name: dict[str, dict[int, _OnnxWeightLineage]] = {}
             if graph_result is not None:
-                training_graph, output_lineages, _output_dynamic = graph_result
+                (
+                    training_graph,
+                    output_lineages,
+                    _output_dynamic,
+                    _output_lineage_gaps,
+                    _output_non_shape_lineage_gaps,
+                    _output_non_shape_lineage_gap_summaries,
+                    _output_weight_lineage_gaps,
+                    _output_weight_lineage_gap_summaries,
+                    _output_rank_promotable_lineage_gaps,
+                    _output_rank_promotable_lineage_gap_summaries,
+                    _output_shapes,
+                    _output_ranks,
+                    _output_proven_ranks,
+                ) = graph_result
                 output_lineages_by_name = {
                     _onnx_value_name(graph_output): lineages
                     for graph_output, lineages in zip(training_graph.output, output_lineages, strict=False)
@@ -3280,11 +16210,26 @@ def _build_onnx_weight_analysis_plan(
             )
             record_exclusion(initializer_index, reason)
 
+    def reshape_without_copy(array: Any, shape: tuple[int, ...]) -> Any:
+        try:
+            return np.reshape(array, shape, copy=False)
+        except TypeError:
+            # NumPy 1.x has no copy argument; shape assignment to a view never copies.
+            view = array.view()
+            view.shape = shape
+            return view
+
     analyzed_initializer_indexes: set[int] = set()
     eligible_metadata: list[dict[str, Any]] = []
     analysis_id = 0
-    for initializer_index in sorted(eligible_initializer_indexes):
-        initializer = initializers[initializer_index]
+    for initializer_index, initializer in enumerate(initializers):
+        # Preserve source priority, including initializers whose consumers were
+        # discovered after a Constant. Output-only Constants retain their copy
+        # admission checks without consuming earlier weight-view capacity.
+        if not materialize_primary_constant(initializer):
+            continue
+        if initializer_index not in eligible_initializer_indexes:
+            continue
         initializer_groups = groups[initializer_index]
         if not initializer_groups:
             continue
@@ -3293,7 +16238,7 @@ def _build_onnx_weight_analysis_plan(
             continue
 
         try:
-            numel = math.prod(int(dimension) for dimension in initializer.dims)
+            numel = _onnx_shape_extent_product(int(dimension) for dimension in initializer.dims)
             itemsize = int(_tensor_data_type_to_np_dtype(initializer.data_type).itemsize)
             estimated_bytes = numel * itemsize
             if estimated_bytes < 0 or (
@@ -3310,100 +16255,192 @@ def _build_onnx_weight_analysis_plan(
                 plan.oversized_initializers_skipped += 1
                 continue
 
-            array = onnx.numpy_helper.to_array(initializer)
-            if retain_array_check is not None and not retain_array_check(bounded_name, int(array.nbytes)):
-                plan.oversized_initializers_skipped += 1
+            accepted_groups: list[tuple[_OnnxWeightConsumerGroup, int]] = []
+            oversized_view_skipped = False
+            for consumer_group in initializer_groups.values():
+                if consumer_group.lineage.shape is not None and 0 in consumer_group.lineage.shape:
+                    # Empty views have no weights, but a reduction can still
+                    # allocate output proportional to a nonempty axis.
+                    record_exclusion(initializer_index, "empty_weight_view")
+                    continue
+                logical_bytes = max(
+                    (
+                        estimated_bytes,
+                        *(
+                            (
+                                extent * itemsize
+                                if (extent := _onnx_shape_extent_product(transform.parameters)) >= 0
+                                else (_ONNX_SHAPE_EXTENT_LIMIT + 1) * itemsize
+                            )
+                            for transform in consumer_group.lineage.transforms
+                            if transform.kind == "Expand"
+                        ),
+                    )
+                )
+                view_fits_budget = not (
+                    max_array_size is not None and max_array_size > 0 and logical_bytes > max_array_size
+                )
+                if view_fits_budget and logical_bytes > estimated_bytes:
+                    if pre_view_check is not None:
+                        # Logical views reuse the source payload. Reinspect live
+                        # byte limits without materializing its storage again.
+                        view_fits_budget = pre_view_check(bounded_name, logical_bytes)
+                    elif pre_materialization_check is not None:
+                        view_fits_budget = pre_materialization_check(initializer, bounded_name, logical_bytes)
+                if not view_fits_budget:
+                    if not oversized_view_skipped:
+                        plan.oversized_initializers_skipped += 1
+                        oversized_view_skipped = True
+                    continue
+                accepted_groups.append((consumer_group, logical_bytes))
+            if not accepted_groups:
                 continue
 
+            array = onnx.numpy_helper.to_array(initializer)
+            prepared_specs: list[_OnnxWeightAnalysisSpec] = []
             transformed_views: dict[tuple[_OnnxWeightTransform, ...], Any] = {(): array}
-            for consumer_group in initializer_groups.values():
-                transformed = transformed_views.get(consumer_group.lineage.transforms)
-                if transformed is None:
-                    transformed = array
-                    for transform in consumer_group.lineage.transforms:
-                        if transform.kind == "Identity":
+            for consumer_group, logical_bytes in accepted_groups:
+                try:
+                    transformed = transformed_views.get(consumer_group.lineage.transforms)
+                    if transformed is None:
+                        transformed = array
+                        for transform in consumer_group.lineage.transforms:
+                            if transform.kind == "unmaterialized_stack":
+                                raise ValueError("ONNX control-flow stack has no proven materialized weight view")
+                            if transform.kind == "Identity":
+                                continue
+                            if transform.kind == "Transpose":
+                                transformed = np.transpose(transformed, axes=transform.parameters)
+                            elif transform.kind == "Reshape":
+                                transformed = reshape_without_copy(transformed, transform.parameters)
+                            elif transform.kind == "Expand":
+                                transformed = np.broadcast_to(transformed, transform.parameters)
+                            if transformed.size and not np.shares_memory(array, transformed):
+                                raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+                        transformed_views[consumer_group.lineage.transforms] = transformed
+
+                    expected_shape = consumer_group.lineage.shape
+                    if expected_shape is not None and (
+                        len(transformed.shape) != len(expected_shape)
+                        or any(
+                            expected >= 0 and actual != expected
+                            for actual, expected in zip(transformed.shape, expected_shape, strict=True)
+                        )
+                    ):
+                        raise ValueError("ONNX weight view does not match its proven lineage shape")
+
+                    output_axes = consumer_group.output_axes
+                    tensor_weights = transformed
+                    conceptual_output_axes = output_axes
+                    if consumer_group.node.op_type == "ConvTranspose":
+                        group_value = consumer_group.group
+                        if group_value <= 0 or int(transformed.shape[0]) % group_value != 0:
+                            raise ValueError("ConvTranspose initializer has an incompatible group")
+                        tensor_weights = reshape_without_copy(
+                            transformed,
+                            (group_value, int(transformed.shape[0]) // group_value, *transformed.shape[1:]),
+                        )
+                        conceptual_output_axes = (0, 2)
+                    if tensor_weights.size and not np.shares_memory(array, tensor_weights):
+                        raise RuntimeError("ONNX weight analysis requires a full-tensor copy")
+
+                    # Broadcast output axes duplicate complete output neurons.
+                    # Remove only those axes, preserving the other axes' roles.
+                    # This retains the established one-copy statistical view of
+                    # constant stacks without reinterpreting an input as an output.
+                    deduplicated_output = False
+                    for axis in reversed(conceptual_output_axes):
+                        if (
+                            tensor_weights.ndim <= 2
+                            or len(conceptual_output_axes) <= 1
+                            or tensor_weights.shape[axis] == 0
+                            or tensor_weights.strides[axis] != 0
+                        ):
                             continue
-                        if transform.kind == "Transpose":
-                            transformed = np.transpose(transformed, axes=transform.parameters)
-                        elif transform.kind == "Reshape":
-                            transformed = np.reshape(transformed, transform.parameters)
-                        if transformed.size and not np.shares_memory(array, transformed):
-                            raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
-                    transformed_views[consumer_group.lineage.transforms] = transformed
-
-                output_axes = consumer_group.output_axes
-                tensor_weights = transformed
-                conceptual_output_axes = output_axes
-                if consumer_group.node.op_type == "ConvTranspose":
-                    group_value = consumer_group.group
-                    if group_value <= 0 or int(transformed.shape[0]) % group_value != 0:
-                        raise ValueError("ConvTranspose initializer has an incompatible group")
-                    tensor_weights = transformed.reshape(
-                        group_value,
-                        int(transformed.shape[0]) // group_value,
-                        *transformed.shape[1:],
+                        selection = tuple(0 if index == axis else slice(None) for index in range(tensor_weights.ndim))
+                        tensor_weights = tensor_weights[selection]
+                        conceptual_output_axes = tuple(
+                            index - (index > axis) for index in conceptual_output_axes if index != axis
+                        )
+                        deduplicated_output = True
+                    matrix_analysis = consumer_group.analysis_kind == "matrix" or (
+                        deduplicated_output
+                        and tensor_weights.ndim == 2
+                        and len(conceptual_output_axes) == 1
+                        and consumer_group.node.op_type == "MatMul"
                     )
-                    conceptual_output_axes = (0, 2)
-                if tensor_weights.size and not np.shares_memory(array, tensor_weights):
-                    raise RuntimeError("ONNX weight analysis requires a full-tensor copy")
-
-                matrix_analysis = consumer_group.analysis_kind == "matrix"
-                analysis_weights = tensor_weights
-                if matrix_analysis:
-                    if len(output_axes) != 1 or transformed.ndim != 2:
-                        raise ValueError("Matrix weight analysis requires exactly one output axis")
-                    analysis_weights = np.moveaxis(transformed, output_axes[0], -1)
-                    conceptual_output_axes = (analysis_weights.ndim - 1,)
-                input_axes = tuple(axis for axis in range(analysis_weights.ndim) if axis not in conceptual_output_axes)
-                analysis_shape = [
-                    math.prod(int(analysis_weights.shape[axis]) for axis in input_axes),
-                    math.prod(int(analysis_weights.shape[axis]) for axis in conceptual_output_axes),
-                ]
-                first_consumer = consumer_group.consumers[0]
-                context = {
-                    "analysis_id": analysis_id,
-                    **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
-                    "initializer_graph_index": initializer_graph_indexes[initializer_index],
-                    "consumer_op": first_consumer["op"],
-                    "consumer_op_length": first_consumer["op_length"],
-                    "consumer_op_truncated": first_consumer["op_truncated"],
-                    "consumer_node": first_consumer["node"],
-                    "consumer_node_length": first_consumer["node_length"],
-                    "consumer_node_truncated": first_consumer["node_truncated"],
-                    "consumer_node_index": consumer_group.node_index,
-                    "consumer_input_index": consumer_group.input_index,
-                    "output_axis": output_axes[-1],
-                    **_bounded_onnx_integer_sequence("output_axes", output_axes),
-                    "analysis_kind": consumer_group.analysis_kind,
-                    "group": consumer_group.group,
-                    **_bounded_onnx_integer_sequence("stored_shape", initializer.dims),
-                    **_bounded_onnx_integer_sequence("transformed_shape", transformed.shape),
-                    "analysis_shape": analysis_shape,
-                    **_bounded_onnx_integer_sequence("conceptual_output_axes", conceptual_output_axes),
-                    "analysis_storage_shares_memory": bool(
-                        array.size == 0 or np.shares_memory(array, analysis_weights)
-                    ),
-                    "analysis_materialization": "zero_copy_view_chunked_reduction",
-                    "lineage": [transform.kind for transform in consumer_group.lineage.transforms],
-                    "lineage_transform_count": len(consumer_group.lineage.transforms),
-                    "consumer_count": consumer_group.consumer_count,
-                    "consumers": consumer_group.consumers,
-                    "consumers_truncated": consumer_group.consumer_count > len(consumer_group.consumers),
-                }
-                plan.specs.append(
-                    _OnnxWeightAnalysisSpec(
+                    analysis_weights = tensor_weights
+                    if matrix_analysis:
+                        if len(conceptual_output_axes) != 1 or tensor_weights.ndim != 2:
+                            raise ValueError("Matrix weight analysis requires exactly one output axis")
+                        analysis_weights = np.moveaxis(tensor_weights, conceptual_output_axes[0], -1)
+                        conceptual_output_axes = (analysis_weights.ndim - 1,)
+                    input_axes = tuple(
+                        axis for axis in range(analysis_weights.ndim) if axis not in conceptual_output_axes
+                    )
+                    analysis_shape = [
+                        math.prod(int(analysis_weights.shape[axis]) for axis in input_axes),
+                        math.prod(int(analysis_weights.shape[axis]) for axis in conceptual_output_axes),
+                    ]
+                    first_consumer = consumer_group.consumers[0]
+                    context = {
+                        "analysis_id": analysis_id + len(prepared_specs),
+                        **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+                        "initializer_graph_index": initializer_graph_indexes[initializer_index],
+                        "consumer_op": first_consumer["op"],
+                        "consumer_op_length": first_consumer["op_length"],
+                        "consumer_op_truncated": first_consumer["op_truncated"],
+                        "consumer_node": first_consumer["node"],
+                        "consumer_node_length": first_consumer["node_length"],
+                        "consumer_node_truncated": first_consumer["node_truncated"],
+                        "consumer_node_index": consumer_group.node_index,
+                        "consumer_input_index": consumer_group.input_index,
+                        "output_axis": output_axes[-1],
+                        **_bounded_onnx_integer_sequence("output_axes", output_axes),
+                        "analysis_kind": consumer_group.analysis_kind,
+                        "group": consumer_group.group,
+                        **_bounded_onnx_integer_sequence("stored_shape", initializer.dims),
+                        **_bounded_onnx_integer_sequence("transformed_shape", transformed.shape),
+                        "analysis_shape": analysis_shape,
+                        **_bounded_onnx_integer_sequence("conceptual_output_axes", conceptual_output_axes),
+                        "analysis_storage_shares_memory": bool(
+                            array.size == 0 or np.shares_memory(array, analysis_weights)
+                        ),
+                        "analysis_materialization": "zero_copy_view_chunked_reduction",
+                        "lineage": [transform.kind for transform in consumer_group.lineage.transforms],
+                        "lineage_transform_count": len(consumer_group.lineage.transforms),
+                        "consumer_count": consumer_group.consumer_count,
+                        "consumers": consumer_group.consumers,
+                        "consumers_truncated": consumer_group.consumer_count > len(consumer_group.consumers),
+                    }
+                    prepared_spec = _OnnxWeightAnalysisSpec(
                         initializer_index=initializer_index,
-                        analysis_id=analysis_id,
+                        analysis_id=analysis_id + len(prepared_specs),
                         weights=analysis_weights,
                         output_axes=conceptual_output_axes,
                         matrix_analysis=matrix_analysis,
                         context=context,
-                    ),
-                )
-                analysis_id += 1
+                    )
+                    if retain_array_check is not None and not retain_array_check(bounded_name, logical_bytes):
+                        if not oversized_view_skipped:
+                            plan.oversized_initializers_skipped += 1
+                            oversized_view_skipped = True
+                        continue
+                    prepared_specs.append(prepared_spec)
+                except Exception as exc:
+                    plan.extraction_failures += 1
+                    logger.warning(
+                        "Failed to prepare ONNX weight view for initializer '%s' (%s)",
+                        bounded_name,
+                        type(exc).__name__,
+                    )
+            if prepared_specs:
+                plan.specs.extend(prepared_specs)
+                analysis_id += len(prepared_specs)
                 analyzed_initializer_indexes.add(initializer_index)
-                if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
-                    eligible_metadata.append(context)
+                for prepared_spec in prepared_specs:
+                    if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+                        eligible_metadata.append(prepared_spec.context)
         except Exception as exc:
             plan.extraction_failures += 1
             bounded_name, _, _ = _bounded_onnx_metadata_text(plan, initializer.name)
@@ -3584,6 +16621,7 @@ class _OnnxLiteValueInfo:
 @dataclass
 class _OnnxLiteAttribute:
     name: str = ""
+    string_payload_length: int | None = None
     ref_attr_name: str = ""
     i: int = 0
     ints: list[int] = field(default_factory=list)
@@ -3672,6 +16710,12 @@ class _OnnxLiteModel:
 @dataclass
 class _OnnxStructureParseState:
     interrupt_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    # Strict duplicate rejection remains the structural scanner default.
+    merge_singular_messages: bool = False
+    preflight_singular_fields: dict[str, frozenset[int]] | None = field(default=None, repr=False)
+    preflight_seen_singular_fields: set[int] = field(default_factory=set, repr=False)
+    preflight_duplicate_singular_fields: int = 0
+    raw_control_tensors: list[_OnnxLiteTensor] = field(default_factory=list, repr=False)
     omitted_raw_data_fields: int = 0
     omitted_raw_data_bytes: int = 0
     omitted_packed_varint_fields: int = 0
@@ -3851,6 +16895,23 @@ def _read_onnx_message_key(
     field_number, wire_type = _read_onnx_key(handle, end, state)
     if field_number not in _onnx_known_field_numbers(message_name):
         state.record_unknown_field(message_name, field_number, wire_type)
+        if state.preflight_singular_fields is not None:
+            raise _OnnxStructureParseError("unknown_protobuf_fields", "ONNX preflight encountered an unknown field")
+    if state.preflight_singular_fields is not None and field_number in state.preflight_singular_fields.get(
+        message_name, ()
+    ):
+        # Duplicate singular messages count too, so splitting a scalar flood
+        # into merged fragments cannot reset the aggregate preflight budget.
+        if field_number in state.preflight_seen_singular_fields:
+            if state.preflight_duplicate_singular_fields >= _ONNX_PREFLIGHT_MAX_DUPLICATE_SINGULAR_FIELDS:
+                raise _OnnxStructureParseError(
+                    "raw_control_duplicate_singular_limit",
+                    "ONNX control preflight duplicate singular field work exceeds limit "
+                    f"({_ONNX_PREFLIGHT_MAX_DUPLICATE_SINGULAR_FIELDS})",
+                )
+            state.preflight_duplicate_singular_fields += 1
+        else:
+            state.preflight_seen_singular_fields.add(field_number)
     return field_number, wire_type
 
 
@@ -4004,11 +17065,22 @@ def _read_onnx_submessage(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
-    parser: Callable[[BinaryIO, int, _OnnxStructureParseState, int], Any],
+    parser: Callable[..., Any],
+    *,
+    existing: Any | None = None,
 ) -> Any:
     _ensure_onnx_parse_depth(depth + 1)
     _length, payload_end = _read_onnx_length_bounds(handle, end)
-    value = parser(handle, payload_end, state, depth + 1)
+    parent_singular_fields = state.preflight_seen_singular_fields
+    if state.preflight_singular_fields is not None:
+        state.preflight_seen_singular_fields = set()
+    try:
+        if existing is None:
+            value = parser(handle, payload_end, state, depth + 1)
+        else:
+            value = parser(handle, payload_end, state, depth + 1, existing=existing)
+    finally:
+        state.preflight_seen_singular_fields = parent_singular_fields
     handle.seek(payload_end)
     return value
 
@@ -4038,25 +17110,31 @@ def _parse_onnx_tensor(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
+    *,
+    existing: _OnnxLiteTensor | None = None,
 ) -> _OnnxLiteTensor:
     _ensure_onnx_parse_depth(depth)
-    state.record_retained_object()
+    if existing is None:
+        state.record_retained_object()
     state.tensor_count += 1
     if state.tensor_count > _ONNX_STRUCTURE_MAX_TENSORS:
         raise _OnnxStructureParseError(
             "tensor_count_limit_exceeded",
             f"ONNX tensor count exceeds limit ({_ONNX_STRUCTURE_MAX_TENSORS})",
         )
-    tensor = _OnnxLiteTensor()
+    tensor = existing if existing is not None else _OnnxLiteTensor()
+    if state.merge_singular_messages and existing is None:
+        state.record_retained_sequence_entry()
+        state.raw_control_tensors.append(tensor)
     counts = {
-        "float_data": 0,
-        "int32_data": 0,
-        "int64_data": 0,
-        "double_data": 0,
-        "uint64_data": 0,
+        "float_data": len(tensor.float_data),
+        "int32_data": len(tensor.int32_data),
+        "int64_data": len(tensor.int64_data),
+        "double_data": len(tensor.double_data),
+        "uint64_data": len(tensor.uint64_data),
     }
-    string_data_count = 0
-    string_data_bytes = 0
+    string_data_count = len(tensor.string_data)
+    string_data_bytes = sum(len(value) for value in tensor.string_data)
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.TensorProto")
         if field_number == 1:
@@ -4171,24 +17249,45 @@ def _parse_onnx_sparse_tensor(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
+    *,
+    existing: _OnnxLiteSparseTensor | None = None,
 ) -> _OnnxLiteSparseTensor:
     _ensure_onnx_parse_depth(depth)
-    state.record_retained_object(3)
-    sparse = _OnnxLiteSparseTensor()
+    if existing is None:
+        state.record_retained_object(3)
+    sparse = existing if existing is not None else _OnnxLiteSparseTensor()
+    if state.merge_singular_messages and existing is None:
+        for tensor in (sparse.values, sparse.indices):
+            state.record_retained_sequence_entry()
+            state.raw_control_tensors.append(tensor)
     seen_values = False
     seen_indices = False
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.SparseTensorProto")
         if field_number == 1 and wire_type == 2:
-            if seen_values:
+            if seen_values and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("SparseTensorProto.values")
             seen_values = True
-            sparse.values = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+            sparse.values = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_tensor,
+                existing=sparse.values if state.merge_singular_messages else None,
+            )
         elif field_number == 2 and wire_type == 2:
-            if seen_indices:
+            if seen_indices and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("SparseTensorProto.indices")
             seen_indices = True
-            sparse.indices = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+            sparse.indices = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_tensor,
+                existing=sparse.indices if state.merge_singular_messages else None,
+            )
         elif field_number == 3:
             if wire_type == 0:
                 _append_onnx_dimension(sparse.dims, _decode_int64_varint(_read_onnx_varint(handle, end)), state)
@@ -4226,14 +17325,18 @@ def _parse_onnx_attribute(
             attribute.ref_attr_name = _read_onnx_string(handle, end, state, field_name="attribute_ref_name")
         elif field_number == 3 and wire_type == 0:
             attribute.i = _decode_int64_varint(_read_onnx_varint(handle, end))
+        elif field_number == 4 and wire_type == 2:
+            # Singular bytes use the final occurrence, without reading payloads.
+            attribute.string_payload_length, payload_end = _read_onnx_length_bounds(handle, end)
+            handle.seek(payload_end)
         elif field_number == 5 and wire_type == 2:
-            if attribute.t is not None:
+            if attribute.t is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("AttributeProto.t")
-            attribute.t = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+            attribute.t = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor, existing=attribute.t)
         elif field_number == 6 and wire_type == 2:
-            if attribute.g is not None:
+            if attribute.g is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("AttributeProto.g")
-            attribute.g = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            attribute.g = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph, existing=attribute.g)
         elif field_number == 8:
             if wire_type == 0:
                 _append_onnx_sequence_value(
@@ -4277,9 +17380,11 @@ def _parse_onnx_attribute(
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 22 and wire_type == 2:
-            if attribute.sparse_tensor is not None:
+            if attribute.sparse_tensor is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("AttributeProto.sparse_tensor")
-            attribute.sparse_tensor = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_sparse_tensor)
+            attribute.sparse_tensor = _read_onnx_submessage(
+                handle, end, state, depth, _parse_onnx_sparse_tensor, existing=attribute.sparse_tensor
+            )
         elif field_number == 23 and wire_type == 2:
             _append_onnx_submessage_value(
                 attribute.sparse_tensors,
@@ -4378,16 +17483,19 @@ def _parse_onnx_graph(
     end: int,
     state: _OnnxStructureParseState,
     depth: int,
+    *,
+    existing: _OnnxLiteGraph | None = None,
 ) -> _OnnxLiteGraph:
     _ensure_onnx_parse_depth(depth)
-    state.record_retained_object()
+    if existing is None:
+        state.record_retained_object()
     state.graph_count += 1
     if state.graph_count > _ONNX_STRUCTURE_MAX_GRAPHS:
         raise _OnnxStructureParseError(
             "graph_count_limit_exceeded",
             f"ONNX graph count exceeds limit ({_ONNX_STRUCTURE_MAX_GRAPHS})",
         )
-    graph = _OnnxLiteGraph()
+    graph = existing if existing is not None else _OnnxLiteGraph()
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.GraphProto")
         if field_number == 1 and wire_type == 2:
@@ -4590,15 +17698,29 @@ def _parse_onnx_training_info(
     while handle.tell() < end:
         field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.TrainingInfoProto")
         if field_number == 1 and wire_type == 2:
-            if seen_initialization:
+            if seen_initialization and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("TrainingInfoProto.initialization")
             seen_initialization = True
-            training_info.initialization = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            training_info.initialization = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_graph,
+                existing=training_info.initialization if state.merge_singular_messages else None,
+            )
         elif field_number == 2 and wire_type == 2:
-            if seen_algorithm:
+            if seen_algorithm and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("TrainingInfoProto.algorithm")
             seen_algorithm = True
-            training_info.algorithm = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            training_info.algorithm = _read_onnx_submessage(
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_graph,
+                existing=training_info.algorithm if state.merge_singular_messages else None,
+            )
         elif field_number == 3 and wire_type == 2:
             _append_onnx_submessage_value(
                 training_info.initialization_binding,
@@ -4642,9 +17764,9 @@ def _parse_onnx_model(
         elif field_number == 2 and wire_type == 2:
             model.producer_name = _read_onnx_string(handle, end, state, field_name="producer_name")
         elif field_number == 7 and wire_type == 2:
-            if model._graph is not None:
+            if model._graph is not None and not state.merge_singular_messages:
                 _raise_duplicate_onnx_singular_message("ModelProto.graph")
-            model._graph = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+            model._graph = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph, existing=model._graph)
         elif field_number == 8 and wire_type == 2:
             _append_onnx_submessage_value(
                 model.opset_import,
@@ -4681,6 +17803,349 @@ def _parse_onnx_model(
         else:
             _skip_onnx_unknown_field(handle, wire_type, end)
     return model
+
+
+class _OnnxSerializedInput:
+    """Seek over admitted immutable input; copy only explicit bounded reads."""
+
+    def __init__(self, data: bytes):
+        self._data = memoryview(data)
+        self._position = 0
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        origin = 0 if whence == os.SEEK_SET else self._position if whence == os.SEEK_CUR else len(self._data)
+        if whence not in {os.SEEK_SET, os.SEEK_CUR, os.SEEK_END}:
+            raise ValueError("Unsupported seek origin")
+        position = origin + offset
+        if not 0 <= position <= len(self._data):
+            raise ValueError("ONNX preflight seek exceeds input")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise ValueError("ONNX preflight requires an explicit read bound")
+        end = min(self._position + size, len(self._data))
+        value = self._data[self._position : end].tobytes()
+        self._position = end
+        return value
+
+
+def _onnx_raw_control_schema_supported(*, singular_fields: dict[str, frozenset[int]] | None = None) -> bool:
+    """Refuse a schema with tensor-bearing edges the wire parser cannot visit."""
+    traversed_fields = {
+        "onnx.ModelProto": {
+            7: ("onnx.GraphProto", False),
+            20: ("onnx.TrainingInfoProto", True),
+            25: ("onnx.FunctionProto", True),
+        },
+        "onnx.GraphProto": {
+            1: ("onnx.NodeProto", True),
+            5: ("onnx.TensorProto", True),
+            15: ("onnx.SparseTensorProto", True),
+        },
+        "onnx.NodeProto": {5: ("onnx.AttributeProto", True)},
+        "onnx.AttributeProto": {
+            5: ("onnx.TensorProto", False),
+            6: ("onnx.GraphProto", False),
+            10: ("onnx.TensorProto", True),
+            11: ("onnx.GraphProto", True),
+            22: ("onnx.SparseTensorProto", False),
+            23: ("onnx.SparseTensorProto", True),
+        },
+        "onnx.FunctionProto": {7: ("onnx.NodeProto", True), 11: ("onnx.AttributeProto", True)},
+        "onnx.TrainingInfoProto": {1: ("onnx.GraphProto", False), 2: ("onnx.GraphProto", False)},
+        "onnx.SparseTensorProto": {1: ("onnx.TensorProto", False), 2: ("onnx.TensorProto", False)},
+    }
+    try:
+        import onnx
+
+        pending = [onnx.ModelProto.DESCRIPTOR]
+        descriptors: dict[str, Any] = {}
+        parents: dict[str, set[str]] = {}
+        field_work = 0
+        while pending:
+            descriptor = pending.pop()
+            name = descriptor.full_name
+            if name in descriptors:
+                continue
+            if len(descriptors) >= 1024:
+                return False
+            descriptors[name] = descriptor
+            for proto_field in descriptor.fields:
+                field_work += 1
+                if field_work > 8192:
+                    return False
+                child = proto_field.message_type
+                if child is not None:
+                    parents.setdefault(child.full_name, set()).add(name)
+                    pending.append(child)
+        if "onnx.TensorProto" not in descriptors:
+            return False
+        tensor_fields = descriptors["onnx.TensorProto"].fields_by_number
+        # Protobuf descriptor kinds: INT64=3, INT32=5, BYTES=12.
+        for number, kind, repeated in ((1, 3, True), (2, 5, False), (9, 12, False)):
+            proto_field = tensor_fields[number]
+            if proto_field.type != kind or _onnx_proto_field_is_repeated(proto_field) != repeated:
+                return False
+        tensor_bearing = {"onnx.TensorProto"}
+        pending_names = ["onnx.TensorProto"]
+        while pending_names:
+            for parent in parents.get(pending_names.pop(), ()):
+                if parent not in tensor_bearing:
+                    tensor_bearing.add(parent)
+                    pending_names.append(parent)
+        for name in tensor_bearing:
+            for proto_field in descriptors[name].fields:
+                child = proto_field.message_type
+                if child is not None and child.full_name in tensor_bearing:
+                    edge = (child.full_name, _onnx_proto_field_is_repeated(proto_field))
+                    if traversed_fields.get(name, {}).get(proto_field.number) != edge:
+                        return False
+        if singular_fields is not None:
+            singular_fields.update(
+                (
+                    name,
+                    frozenset(
+                        proto_field.number
+                        for proto_field in descriptor.fields
+                        if not _onnx_proto_field_is_repeated(proto_field)
+                    ),
+                )
+                for name, descriptor in descriptors.items()
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _iter_onnx_attribute_owners(model: Any, interrupt_check: Callable[[], None] | None = None) -> Any:
+    """Use the same canonical order for the fully merged lite and loaded models."""
+    for graph in _iter_model_initializer_graphs(model, interrupt_check):
+        for node in getattr(graph, "node", ()):
+            _check_onnx_traversal_interrupted(interrupt_check)
+            for attribute in getattr(node, "attribute", ()):
+                _check_onnx_traversal_interrupted(interrupt_check)
+                yield attribute
+    for function in getattr(model, "functions", ()):
+        for attribute in getattr(function, "attribute_proto", ()):
+            _check_onnx_traversal_interrupted(interrupt_check)
+            yield attribute
+
+
+def _bind_onnx_attribute_string_lengths(
+    model: Any,
+    preflight: _OnnxAttributeStringPreflight,
+    interrupt_check: Callable[[], None] | None = None,
+) -> dict[int, tuple[Any, int]]:
+    """Retain source owners from the same immutable snapshot, never a prefix."""
+    if preflight.lengths is None:
+        return {}
+    owners: dict[int, tuple[Any, int]] = {}
+    try:
+        for attribute, length in zip(
+            _iter_onnx_attribute_owners(model, interrupt_check), preflight.lengths, strict=True
+        ):
+            if _onnx_has_singular_field(attribute, "s") != (length is not None):
+                return {}
+            if length is not None:
+                owners[id(attribute)] = (attribute, length)
+    except Exception:
+        return {}
+    return owners
+
+
+def _onnx_training_mutable_initializer_positions(
+    structure: _OnnxLiteModel, state: _OnnxStructureParseState
+) -> list[tuple[int, int]]:
+    """Resolve already bounded, merged binding keys without native key getters."""
+    import onnx
+
+    training_fields = onnx.TrainingInfoProto.DESCRIPTOR.fields_by_number
+    for number in (3, 4):
+        binding_field = training_fields[number]
+        if (
+            not _onnx_proto_field_is_repeated(binding_field)
+            or binding_field.message_type is None
+            or binding_field.message_type.full_name != "onnx.StringStringEntryProto"
+        ):
+            raise ValueError("Unsupported ONNX training binding schema")
+        key_field = binding_field.message_type.fields_by_number[1]
+        if key_field.type != 9 or _onnx_proto_field_is_repeated(key_field):
+            raise ValueError("Unsupported ONNX training binding key schema")
+
+    def initializer_positions(graph: _OnnxLiteGraph) -> dict[str, int]:
+        positions: dict[str, int] = {}
+        for position, initializer in enumerate(graph.initializer):
+            state.check_interrupted()
+            state.record_retained_object(2)
+            state.record_retained_sequence_entry()
+            positions[initializer.name] = position
+        return positions
+
+    main_positions: dict[str, int] | None = None
+    positions: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for training_index, info in enumerate(structure.training_info):
+        state.check_interrupted()
+        state.record_retained_sequence_entry()
+        if not info.initialization_binding and not info.update_binding:
+            continue
+        if main_positions is None:
+            main_positions = initializer_positions(structure.graph)
+        local_positions = initializer_positions(info.algorithm)
+        for binding in chain(info.initialization_binding, info.update_binding):
+            state.check_interrupted()
+            state.record_retained_sequence_entry()
+            position = local_positions.get(binding.key)
+            source_scope = training_index
+            if position is None:
+                position = main_positions.get(binding.key)
+                source_scope = -1
+            if position is None or (source_scope, position) in seen:
+                continue
+            # Account for this index, its duplicate guard, and the future
+            # retained native owner dictionary before publishing metadata.
+            state.record_retained_object(4)
+            state.record_retained_sequence_entry()
+            state.record_retained_sequence_entry()
+            key = (source_scope, position)
+            seen.add(key)
+            positions.append(key)
+    return positions
+
+
+def _bind_onnx_mutable_initializer_owners(model: Any, preflight: _OnnxTrainingStatePreflight) -> dict[int, Any] | None:
+    if preflight.positions is None:
+        return None
+    owners: dict[int, Any] = {}
+    try:
+        for scope, position in preflight.positions:
+            graph = model.graph if scope == -1 else model.training_info[scope].algorithm
+            initializer = graph.initializer[position]
+            owners[id(initializer)] = initializer
+    except (IndexError, AttributeError, TypeError):
+        return None
+    return owners
+
+
+def _preflight_onnx_raw_controls(
+    data: bytes,
+    *,
+    interrupt_check: Callable[[], None] | None = None,
+    attribute_strings: _OnnxAttributeStringPreflight | None = None,
+    training_state: _OnnxTrainingStatePreflight | None = None,
+) -> tuple[bool, bool, str | None]:
+    """Certify raw-control lengths without accessing protobuf payload fields.
+
+    Check final merged tensor metadata, including fragments that had no dtype
+    or dimensions when encountered. This is not a certificate for other raw
+    readers or for a different/mutated ModelProto.
+    """
+    if attribute_strings is not None:
+        attribute_strings.lengths = None
+    if training_state is not None:
+        training_state.positions = None
+    if type(data) is not bytes:
+        return False, False, "raw_control_preflight_failed"
+    singular_fields: dict[str, frozenset[int]] = {}
+    if not _onnx_raw_control_schema_supported(singular_fields=singular_fields):
+        return False, False, "raw_control_schema_unsupported"
+    state = _OnnxStructureParseState(
+        interrupt_check=interrupt_check,
+        merge_singular_messages=True,
+        preflight_singular_fields=singular_fields,
+    )
+    handle = _OnnxSerializedInput(data)
+    try:
+        structure = _parse_onnx_model(cast(BinaryIO, handle), len(data), state, 0)
+        if handle.tell() != len(data) or state.coverage_gaps:
+            return False, False, "raw_control_preflight_failed"
+        vectors_bounded = True
+        scalars_bounded = True
+        for tensor in state.raw_control_tensors:
+            state.check_interrupted()
+            if not isinstance(tensor.raw_data, _OnnxOmittedBytes):
+                continue
+            raw_length = len(tensor.raw_data)
+            # ONNX TensorProto enum values are stable: INT64=7 and BOOL=9.
+            if (
+                tensor.data_type == 7
+                and len(tensor.dims) == 1
+                and 0 <= tensor.dims[0] <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+                and raw_length > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
+            ):
+                vectors_bounded = False
+            if (
+                tensor.data_type in {7, 9}
+                and len(tensor.dims) <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+                and all(dimension == 1 for dimension in tensor.dims)
+                and raw_length > 8
+            ):
+                scalars_bounded = False
+        training_positions = (
+            _onnx_training_mutable_initializer_positions(structure, state) if training_state is not None else None
+        )
+        lengths: list[int | None] | None = None
+        if attribute_strings is not None:
+            import onnx
+
+            string_field = onnx.AttributeProto.DESCRIPTOR.fields_by_number[4]
+            if string_field.type == 12 and not _onnx_proto_field_is_repeated(string_field):
+                # The descriptor reachability check above covers every current
+                # attribute-bearing edge. Merge before this canonical traversal:
+                # protobuf wire order is not the loaded repeated-field order.
+                lengths = []
+                for attribute in _iter_onnx_attribute_owners(structure, state.check_interrupted):
+                    state.record_retained_sequence_entry()
+                    if attribute.string_payload_length is not None:
+                        # Reserve the future retained owner, id key and tuple,
+                        # plus its index entry before publishing any metadata.
+                        state.record_retained_object(3)
+                        state.record_retained_sequence_entry()
+                    lengths.append(attribute.string_payload_length)
+        # Publish both complete inventories only after every parse/retention
+        # check succeeds; a failed later collection must expose no prefix.
+        if attribute_strings is not None:
+            attribute_strings.lengths = lengths
+        if training_state is not None:
+            training_state.positions = training_positions
+        return vectors_bounded, scalars_bounded, None
+    except _OnnxStructureParseError as exc:
+        reason = exc.reason if exc.reason == "raw_control_duplicate_singular_limit" else "raw_control_preflight_failed"
+        return False, False, reason
+    except Exception:
+        return False, False, "raw_control_preflight_failed"
+
+
+def _load_onnx_model_with_control_admission(
+    data: bytes,
+    *,
+    onnx: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> tuple[Any, _OnnxRawControlAdmission]:
+    """Load binary ONNX and bind control admission to the same byte snapshot."""
+    if type(data) is not bytes:
+        raise TypeError("ONNX control admission requires an immutable bytes snapshot")
+    attribute_strings = _OnnxAttributeStringPreflight()
+    training_state = _OnnxTrainingStatePreflight()
+    vectors_bounded, scalars_bounded, error_reason = _preflight_onnx_raw_controls(
+        data, interrupt_check=interrupt_check, attribute_strings=attribute_strings, training_state=training_state
+    )
+    if interrupt_check is not None:
+        interrupt_check()
+    model = onnx.load_model_from_string(data)
+    return model, _OnnxRawControlAdmission(
+        model,
+        vectors_bounded,
+        scalars_bounded,
+        error_reason,
+        _bind_onnx_attribute_string_lengths(model, attribute_strings, interrupt_check),
+        _bind_onnx_mutable_initializer_owners(model, training_state),
+    )
 
 
 def _load_onnx_structure_file_backed(
@@ -5100,6 +18565,7 @@ class OnnxScanner(BaseScanner):
             self.check_interrupted()
             file_backed_parse_state: _OnnxStructureParseState | None = None
             in_memory_unknown_field_bytes_discarded = 0
+            raw_control_admission: _OnnxRawControlAdmission | None = None
             model: Any
             if model_data is None:
                 model, file_backed_parse_state = _load_onnx_structure_file_backed(
@@ -5110,7 +18576,9 @@ class OnnxScanner(BaseScanner):
                 )
                 result.metadata["onnx_structure_parse"] = file_backed_parse_state.metadata()
             else:
-                model = onnx.load_model_from_string(model_data)
+                model, raw_control_admission = _load_onnx_model_with_control_admission(
+                    model_data, onnx=onnx, interrupt_check=self.check_interrupted
+                )
                 result.metadata["onnx_structure_parse"] = {"parse_mode": "in_memory_model_proto"}
                 in_memory_unknown_field_bytes_discarded = _discard_onnx_unknown_field_bytes(model)
             # Check for interrupts after loading completes.
@@ -5509,7 +18977,7 @@ class OnnxScanner(BaseScanner):
                 },
             )
         else:
-            self._check_weight_distribution(model, path, result)
+            self._check_weight_distribution(model, path, result, raw_control_admission=raw_control_admission)
 
         _finish_scan_result(result)
         return result
@@ -6264,11 +19732,20 @@ class OnnxScanner(BaseScanner):
                 },
             )
 
-    def _check_weight_distribution(self, model: Any, path: str, result: ScanResult) -> None:
+    def _check_weight_distribution(
+        self,
+        model: Any,
+        path: str,
+        result: ScanResult,
+        *,
+        raw_control_admission: _OnnxRawControlAdmission | None = None,
+    ) -> None:
         """Run bounded semantic weight analysis over eligible ONNX initializers."""
         try:
             import numpy as np
             import onnx
+
+            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
         except Exception as e:
             self._mark_weight_distribution_incomplete(
                 result,
@@ -6281,16 +19758,26 @@ class OnnxScanner(BaseScanner):
 
         configured_max_array_size = self.config.get("max_array_size", _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE)
         max_array_size = _configured_onnx_weight_array_limit(configured_max_array_size)
+        wd_scanner = WeightDistributionScanner({**self.config, "max_array_size": max_array_size or 0})
 
-        def inline_storage_fits_budget(initializer: Any, _name: str, _estimated_bytes: int) -> bool:
-            return max_array_size is None or _onnx_inline_storage_nbytes(initializer) <= max_array_size
+        def inline_storage_fits_budget(initializer: Any, name: str, estimated_bytes: int) -> bool:
+            return wd_scanner._tensor_fits_budget(
+                "onnx_initializer_storage_size_limit", name, tensor_nbytes=_onnx_inline_storage_nbytes(initializer)
+            ) and wd_scanner._tensor_fits_budget("onnx_initializer_size_limit", name, tensor_nbytes=estimated_bytes)
 
         plan = _build_onnx_weight_analysis_plan(
             model,
             onnx=onnx,
             np=np,
             max_array_size=max_array_size,
+            raw_control_admission=raw_control_admission,
             pre_materialization_check=inline_storage_fits_budget,
+            pre_view_check=lambda name, nbytes: wd_scanner._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=nbytes
+            ),
+            retain_array_check=lambda name, nbytes: wd_scanner._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=nbytes, retain=True
+            ),
         )
         result.metadata["onnx_weight_distribution_semantics"] = plan.metadata
 
@@ -6330,9 +19817,6 @@ class OnnxScanner(BaseScanner):
             if any(spec.matrix_analysis for spec in plan.specs):
                 from scipy import stats as _stats  # noqa: F401
 
-            # Lazy-import the weight distribution scanner to avoid circular deps
-            # and heavy library loads when the scanner is not needed.
-            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
         except Exception as e:
             self._mark_weight_distribution_incomplete(
                 result,
@@ -6344,7 +19828,6 @@ class OnnxScanner(BaseScanner):
             return
 
         try:
-            wd_scanner = WeightDistributionScanner(self.config)
             analyzed = wd_scanner._analyze_onnx_weight_specs(plan.specs)
             for anomaly, spec in analyzed:
                 details = dict(anomaly["details"])

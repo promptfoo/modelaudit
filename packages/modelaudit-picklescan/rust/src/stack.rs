@@ -53,7 +53,11 @@ pub(crate) enum StackValue {
     },
     ExternalBuffer,
     Global(GlobalRef),
-    Constructed(GlobalRef),
+    Constructed {
+        reference: GlobalRef,
+        // Constructor provenance only; generic instance dispatch stays unchanged.
+        defaultdict_without_factory: bool,
+    },
     CallIterator {
         callable: GlobalRef,
     },
@@ -114,7 +118,9 @@ pub(crate) fn resolve_global_operand(value: Option<&StackValue>, payload: &[u8])
 pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
     match value {
         Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
-        Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
+        Some(StackValue::Constructed { reference, .. }) => {
+            format!("constructed:{}", reference.symbol())
+        }
         Some(StackValue::CallIterator { callable }) => {
             format!("call_iterator:{}", callable.symbol())
         }

@@ -28,6 +28,7 @@ from typing import IO, Any, BinaryIO, cast
 from unittest.mock import create_autospec
 
 import pytest
+from modelaudit_picklescan import api as picklescan_api
 from modelaudit_picklescan.api import _source_backed_import_requires_initialization_proof
 from modelaudit_picklescan.call_graph import (
     _clear_source_sensitive_caches,
@@ -26435,3 +26436,126 @@ def test_pytorch_zip_complete_binary_nested_encoding_shares_raw_and_fallback_all
     assert remaining == [-1]
     assert routes[1](value, sample_is_prefix=False, work_budget_remaining=remaining) is True
     assert remaining == [-1]
+
+
+@pytest.mark.parametrize(
+    ("body", "structural", "security"),
+    [(b"NNNN", True, False), (b"cos\nsystem\n", False, True), (b"N", False, False)],
+)
+def test_pytorch_zip_incomplete_frame_probe_boundaries(body: bytes, structural: bool, security: bool) -> None:
+    sample = b"\x95" + (100).to_bytes(8, "little") + body
+    scanner = PyTorchZipScanner()
+
+    assert scanner._contains_pickle_frame_opcode(sample) is True
+    assert scanner._has_structural_pickle_evidence_in_incomplete_frame(sample) is structural
+    assert scanner._has_security_relevant_opcode_in_incomplete_frame(sample) is security
+    assert scanner._has_complete_pickle_stream_without_frame_stop_overrun(sample) is False
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        ("0", 0),
+        ("0001", 1),
+        ("9223372036854775807", 2**63 - 1),
+        ("9223372036854775808", None),
+        ("-1", None),
+        ("\uff19", None),
+    ],
+)
+def test_pytorch_zip_protocol0_storage_reference_numeric_boundaries(size: str, expected: int | None) -> None:
+    text = f"('storage', <class 'torch.FloatStorage'>, '0', 'cpu', {size})"
+    result = PyTorchZipScanner()._storage_ref_from_protocol0_persid_text(text.encode(), {"0"})
+
+    if expected is None:
+        assert result is None
+    else:
+        assert result is not None
+        key, reference = result
+        assert key == "0"
+        assert (reference.module, reference.name, reference.location) == ("torch", "FloatStorage", "cpu")
+        assert reference.element_count == expected
+        assert reference.item_size == 4
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        b"\xff",
+        "('storage', <class 'torch.FloatStorage'>, '1', 'cpu', 1)",
+        "('storage', <class 'torch.FloatStorage'>, '0', 'cpu', '1')",
+        "('storage', <class 'torch.FloatStorage'>, '0', 'cpu, 1)",
+        "('storage', <class 'torch.FloatStorage'>, '0', 'c\\pu', 1)",
+        "('storage', <class 'torch.UnknownStorage'>, '0', 'cpu', 1)",
+    ],
+)
+def test_pytorch_zip_protocol0_storage_reference_rejects_untrusted_fields(text: str | bytes) -> None:
+    assert PyTorchZipScanner()._storage_ref_from_protocol0_persid_text(text, {"0"}) is None
+
+
+def test_pytorch_zip_binunicode_prefix_keeps_root_specific_expansion() -> None:
+    sample = b"X\x01\x00\x00\x00aNNN"
+
+    assert PyTorchZipScanner._headerless_binary_pickle_prefix_needs_more_bytes(sample, candidate_is_prefix=True)
+    assert not PyTorchZipScanner._headerless_binary_pickle_prefix_needs_more_bytes(sample, candidate_is_prefix=False)
+    assert not PyTorchZipScanner._headerless_binary_pickle_prefix_needs_more_bytes(
+        sample + b".", candidate_is_prefix=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "arguments", "expected"),
+    [
+        (
+            "_has_structural_pickle_evidence_in_incomplete_frame",
+            {"sample": b"\x95" + (100).to_bytes(8, "little") + b"NNNN"},
+            True,
+        ),
+        (
+            "_has_security_relevant_opcode_in_incomplete_frame",
+            {"sample": b"\x95" + (100).to_bytes(8, "little") + b"cos\nsystem\n"},
+            True,
+        ),
+        ("_looks_like_truncated_binary_pickle_operand_prefix", {"candidate": b"X\x01"}, True),
+        ("_looks_like_truncated_fixed_width_pickle_operand_prefix", {"candidate": b"K"}, True),
+        ("_looks_like_truncated_security_opcode_prefix", {"candidate": b"\x83\x01"}, True),
+        (
+            "_candidate_truncates_extension_operand",
+            {"candidate_start": 10, "candidate": b"\x83\x01", "offset": 10, "marker": 0x83},
+            True,
+        ),
+        ("_trivial_complete_pickle_prefix_trailing", {"sample": b"N.trailing"}, b"trailing"),
+        ("_complete_headerless_byte_literal_prefix_trailing", {"sample": b"C\x01a.trailing"}, b"trailing"),
+        ("_coerce_pickle_string_arg", {"value": b"\xff"}, None),
+        ("_split_protocol0_persid_fields", {"text": "('storage', 'c,pu')"}, ["'storage'", "'c,pu'"]),
+        ("_quoted_protocol0_field_value", {"field": "'cpu'"}, "cpu"),
+        ("_parse_pytorch_storage_element_count_text", {"storage_size": "9223372036854775808"}, None),
+        ("_contains_pickle_frame_opcode", {"sample": b"\x95" + (1).to_bytes(8, "little") + b"."}, True),
+        ("_candidate_starts_with_binary_security_opcode_requiring_existing_stack", {"candidate": b"\x81"}, True),
+    ],
+)
+def test_pytorch_zip_shared_parser_alias_class_and_instance_contract(
+    helper_name: str, arguments: dict[str, Any], expected: Any
+) -> None:
+    shared_helper = getattr(picklescan_api, helper_name)
+
+    for owner in (PyTorchZipScanner, PyTorchZipScanner()):
+        helper = getattr(owner, helper_name)
+        assert helper is shared_helper
+        assert helper(**arguments) == expected
+
+
+def test_pytorch_zip_storage_reference_honors_class_parser_override() -> None:
+    observed_sizes: list[str] = []
+
+    class RejectStorageScanner(PyTorchZipScanner):
+        @staticmethod
+        def _parse_pytorch_storage_element_count_text(storage_size: str) -> int | None:
+            observed_sizes.append(storage_size)
+            return None
+
+    text = "('storage', <class 'torch.FloatStorage'>, '0', 'cpu', 1)"
+    assert PyTorchZipScanner._storage_ref_from_protocol0_persid_text(text, {"0"}) is not None
+    assert RejectStorageScanner._storage_ref_from_protocol0_persid_text(text, {"0"}) is None
+    assert RejectStorageScanner()._storage_ref_from_protocol0_persid_text(text, {"0"}) is None
+    assert observed_sizes == ["1", "1"]

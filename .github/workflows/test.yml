@@ -398,7 +398,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.12","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
+        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.12","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.14","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.14","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.14","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
     steps:
       - *checkout-repo
 
@@ -439,6 +439,34 @@ jobs:
             --modelaudit-shard-count ${{ matrix.shard-count }} \
             --modelaudit-shard-index ${{ matrix.shard-index }} \
             --tb=short --durations=15
+
+  python314-platform-smoke:
+    name: Python 3.14 Smoke (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      PROMPTFOO_DISABLE_TELEMETRY: "1"
+    steps:
+      - *checkout-repo
+
+      - *install-uv
+
+      - *install-rust-toolchain
+
+      - name: Sync Python 3.14 smoke dependencies
+        run: uv sync --locked --python 3.14 --extra all-ci-windows --extra h5
+
+      - name: Verify Python 3.14 native and H5 imports
+        run: uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"
+
+      - name: Test Python 3.14 native pickle and H5 scanning
+        run: uv run --locked --python 3.14 pytest tests/test_python_compatibility.py -n 0 --tb=short
 
   slow-tests:
     name: Slow/Integration Tests (Python 3.12)
@@ -485,11 +513,22 @@ jobs:
 
       - *install-uv
 
-      - *pin-python-312
+      # Python 3.12 traces large functions slowly: python/cpython#127953.
+      # The fast-test matrix retains Python 3.12 without coverage.
+      - name: Pin Python version
+        run: |
+          uv python pin 3.11
 
       - *install-rust-toolchain
 
-      - *cache-python-312-dependencies
+      - name: Cache Python dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: *python-cache-paths
+          key: ${{ runner.os }}-uv-py3.11-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-py3.11-
+            ${{ runner.os }}-uv-
 
       - *sync-all-ci-dependencies
 
@@ -852,20 +891,44 @@ jobs:
     needs: changes
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 30 || 15 }}
+    timeout-minutes: ${{ matrix.timeout-minutes || ((matrix.os == 'macos-15-intel' || matrix.os == 'windows-latest') && 30 || 15) }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+            timeout-minutes: 30
+          - os: ubuntu-latest
+            python-version: "3.13"
+            timeout-minutes: 30
+          - os: ubuntu-latest
+            python-version: "3.14"
+            timeout-minutes: 30
           # Exercise the release platform where scalar-probe timing regressed.
           - os: macos-15-intel
             python-version: "3.11"
+            timeout-minutes: 45
           - os: macos-15-intel
             python-version: "3.12"
+            timeout-minutes: 45
+          - os: macos-14
+            python-version: "3.14"
+            timeout-minutes: 60
+          - os: macos-15-intel
+            python-version: "3.14"
+            timeout-minutes: 75
+          - os: ubuntu-24.04-arm
+            python-version: "3.14"
+            timeout-minutes: 30
+          - os: windows-latest
+            python-version: "3.14"
+            timeout-minutes: 90
     defaults:
       run:
+        shell: bash
         working-directory: packages/modelaudit-picklescan
     steps:
       - *checkout-repo
@@ -876,7 +939,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.83.0 --profile minimal
+          rustup toolchain install 1.85.0 --profile minimal
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
 
@@ -904,7 +967,7 @@ jobs:
 
       - name: Check Rust scanner MSRV
         run: |
-          cargo +1.83.0 check --manifest-path Cargo.toml --locked
+          cargo +1.85.0 check --manifest-path Cargo.toml --locked
 
       - name: Lint Rust scanner crate
         run: |
@@ -916,11 +979,11 @@ jobs:
 
       - name: Lint standalone package with Ruff
         run: |
-          uv run --with 'ruff==0.17.0' ruff check src tests
+          uv run --with 'ruff==0.17.1' ruff check src tests
 
       - name: Check standalone package formatting with Ruff
         run: |
-          uv run --with 'ruff==0.17.0' ruff format --check src tests
+          uv run --with 'ruff==0.17.1' ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: |
@@ -928,7 +991,16 @@ jobs:
 
       - name: Run standalone package tests
         run: |
-          uv run --with pytest --with pytest-xdist --with 'typing-extensions>=4.14' pytest -n auto tests --tb=short
+          uv run --with pytest --with pytest-xdist --with 'typing-extensions>=4.14' pytest -n auto tests --tb=short --junitxml="$RUNNER_TEMP/picklescan-test-results.xml"
+
+      - name: Preserve Windows standalone test evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: picklescan-tests-${{ matrix.os }}-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/picklescan-test-results.xml
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Build standalone package
         run: |
@@ -942,6 +1014,11 @@ jobs:
         run: |
           set -euo pipefail
           uv venv /tmp/modelaudit-picklescan-wheel-smoke
+          if [[ -x /tmp/modelaudit-picklescan-wheel-smoke/bin/python ]]; then
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/bin/python
+          else
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/Scripts/python.exe
+          fi
 
           shopt -s nullglob
           picklescan_wheels=(/tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.whl)
@@ -951,23 +1028,69 @@ jobs:
             exit 1
           fi
 
-          uv pip install --python /tmp/modelaudit-picklescan-wheel-smoke/bin/python "${picklescan_wheels[0]}"
+          uv pip install --python "$SMOKE_PYTHON" "${picklescan_wheels[0]}"
 
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH='' /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' "$SMOKE_PYTHON" -I - <<'PY'
+          import importlib.metadata
           import importlib.util
+          import io
+          import pickle
+          import sys
+          from pathlib import Path
 
           import modelaudit_picklescan
+          import modelaudit_picklescan._rust as native
 
           assert importlib.util.find_spec("modelaudit") is None
-          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
-          report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
-          assert report.status.value == "complete", report
-          assert report.verdict.value == "clean", report
-          assert not any(notice.code == "engine_fallback" for notice in report.notices)
-          print("standalone modelaudit_picklescan wheel loaded without modelaudit")
+          assert not importlib.metadata.requires("modelaudit-picklescan")
+          for module in (modelaudit_picklescan, native):
+              origin = Path(module.__file__).resolve()
+              assert origin.is_relative_to(Path(sys.prefix).resolve()), origin
+              print(f"{module.__name__}: {origin}")
+          assert (Path(modelaudit_picklescan.__file__).parent / "py.typed").is_file()
+
+          for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+              payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=protocol)
+              path = Path(f"protocol-{protocol}.pkl")
+              path.write_bytes(payload)
+              for report in (
+                  modelaudit_picklescan.scan_bytes(payload),
+                  modelaudit_picklescan.scan_stream(io.BytesIO(payload)),
+                  modelaudit_picklescan.scan_file(path),
+              ):
+                  assert report.status.value == "complete", report
+                  assert report.verdict.value == "clean", report
+                  assert not any(notice.code == "engine_fallback" for notice in report.notices)
+
+          malicious = modelaudit_picklescan.scan_bytes(b"cos\nsystem\n(S'echo unexpected'\ntR.")
+          assert malicious.verdict.value == "malicious", malicious
+          assert any(finding.rule_code == "DANGEROUS_CALL" for finding in malicious.findings), malicious
+          truncated = modelaudit_picklescan.scan_bytes(b"\x80\x04")
+          assert truncated.status.value != "complete", truncated
+          assert truncated.verdict.value != "clean", truncated
+          import string
+
+          # Qualify normal lazy-pattern initialization after importing the scanner.
+          string.Template("warm").substitute({})
+          template = modelaudit_picklescan.scan_bytes(
+              b"\x80\x04cstring\nTemplate.substitute\ncstring\nTemplate\n\x8c\x05plain\x85R}\x86R."
+          )
+          assert template.status.value == "complete", template
+          assert template.verdict.value == "clean", template
+          assert any(
+              invocation.get("template_receiver_state_unmodified") is True
+              for invocation in template.metadata.get("callable_invocations", ())
+          ), template
+          if sys.version_info >= (3, 14):
+              for method in ("Template.is_valid", "Template.get_identifiers"):
+                  payload = b"\x80\x04cstring\n" + method.encode() + b"\ncstring\nTemplate\n\x8c\x05plain\x85R\x85R."
+                  helper = modelaudit_picklescan.scan_bytes(payload)
+                  assert helper.status.value == "complete", helper
+                  assert helper.verdict.value == "clean", helper
+          print(f"standalone wheel API passed on {sys.version}")
           PY
           )
 
@@ -983,6 +1106,7 @@ jobs:
         uv-lock-check,
         type-check,
         windows-tests,
+        python314-platform-smoke,
         test,
         slow-tests,
         coverage,
@@ -1015,6 +1139,7 @@ jobs:
           LICENSE_RESULT="${{ needs.license-check.result }}"
           UV_LOCK_RESULT="${{ needs.uv-lock-check.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
+          PYTHON314_SMOKE_RESULT="${{ needs.python314-platform-smoke.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
           SLOW_RESULT="${{ needs.slow-tests.result }}"
@@ -1045,6 +1170,7 @@ jobs:
           echo "  license-check: $LICENSE_RESULT"
           echo "  uv-lock-check: $UV_LOCK_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
+          echo "  python314-platform-smoke: $PYTHON314_SMOKE_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
           echo "  slow-tests: $SLOW_RESULT"
@@ -1078,6 +1204,7 @@ jobs:
           require_success "$EXPECT_DEPENDENCY_SURFACE" "$UV_LOCK_RESULT" "uv-lock-check"
           require_success "$EXPECT_CORE_FAST" "$TYPE_CHECK_RESULT" "type-check"
           require_success "$EXPECT_CORE_FAST" "$WINDOWS_RESULT" "windows-tests"
+          require_success "$EXPECT_CORE_FAST" "$PYTHON314_SMOKE_RESULT" "python314-platform-smoke"
           require_success "$EXPECT_TEST" "$TEST_RESULT" "test"
           require_success "$EXPECT_SLOW" "$SLOW_RESULT" "slow-tests"
           require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"

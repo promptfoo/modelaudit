@@ -29,6 +29,7 @@ from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    NestedScanCallback,
     _select_nested_scanner_id,
     scan_nested_file,
 )
@@ -56,6 +57,11 @@ from tests.helpers.file_creators import ExecPayload, ReadTrackingBuffer, SystemC
 from tests.helpers.scanners import scan_nested_critical_finding as nested_scan
 from tests.helpers.scanners import scan_nested_unsuccessful, scan_with_whitelisted_finding, without_keras_zip_scanner
 from tests.helpers.tensorflow import build_tf_savedmodel
+
+
+@pytest.fixture(params=["direct", "nested"])
+def json_dispatch(request: pytest.FixtureRequest) -> NestedScanCallback:
+    return core.scan_file if request.param == "direct" else scan_nested_file
 
 
 def _nested_scan_recorder(paths: list[str], *, finish: bool = True) -> Callable[[str, dict[str, Any]], ScanResult]:
@@ -5131,7 +5137,10 @@ def test_scan_nested_file_runs_xgboost_checks_for_renamed_mxnet_json_overlap(tmp
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
-def test_scan_nested_file_runs_xgboost_checks_for_probable_malformed_mxnet_json_overlap(tmp_path: Path) -> None:
+def test_scan_dispatch_runs_xgboost_checks_for_probable_malformed_mxnet_json_overlap(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "malformed-polyglot.json"
     extracted_member.write_text(
         '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
@@ -5139,7 +5148,7 @@ def test_scan_nested_file_runs_xgboost_checks_for_probable_malformed_mxnet_json_
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert result.success is False
@@ -5148,9 +5157,10 @@ def test_scan_nested_file_runs_xgboost_checks_for_probable_malformed_mxnet_json_
 
 
 @pytest.mark.parametrize("filename", ["malformed-0000.params", "malformed.jpg"])
-def test_scan_nested_file_runs_xgboost_checks_for_renamed_probable_malformed_mxnet_overlap(
+def test_scan_dispatch_runs_xgboost_checks_for_renamed_probable_malformed_mxnet_overlap(
     tmp_path: Path,
     filename: str,
+    json_dispatch: NestedScanCallback,
 ) -> None:
     extracted_member = tmp_path / filename
     extracted_member.write_text(
@@ -5159,7 +5169,7 @@ def test_scan_nested_file_runs_xgboost_checks_for_renamed_probable_malformed_mxn
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert result.success is False
@@ -5202,7 +5212,10 @@ def test_scan_nested_file_partial_malformed_renamed_mxnet_xgboost_overlap_fails_
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
-def test_scan_nested_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tmp_path: Path) -> None:
+def test_scan_dispatch_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "malformed-0000.params"
     extracted_member.write_text(
         '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
@@ -5210,7 +5223,7 @@ def test_scan_nested_file_xgboost_only_runs_renamed_probable_malformed_mxnet_ove
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
@@ -5252,7 +5265,10 @@ def test_scan_nested_file_runs_xgboost_checks_for_bounded_probable_malformed_mxn
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
-def test_scan_nested_file_keeps_benign_mxnet_json_near_match_out_of_xgboost_routing(tmp_path: Path) -> None:
+def test_scan_dispatch_keeps_benign_mxnet_json_near_match_out_of_xgboost_routing(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "benign-symbol.json"
     extracted_member.write_text(
         '{"learner":{"description":"benign metadata"},'
@@ -5260,16 +5276,17 @@ def test_scan_nested_file_keeps_benign_mxnet_json_near_match_out_of_xgboost_rout
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "mxnet"
     assert not any(check.name == "JSON Content Analysis" for check in result.checks)
 
 
 @pytest.mark.parametrize("filename", ["nested-metadata.json", "nested-metadata-symbol.json"])
-def test_scan_nested_file_keeps_nested_xgboost_marker_names_in_mxnet_metadata_out_of_xgboost_analysis(
+def test_scan_dispatch_keeps_nested_xgboost_marker_names_in_mxnet_metadata_out_of_xgboost_analysis(
     tmp_path: Path,
     filename: str,
+    json_dispatch: NestedScanCallback,
 ) -> None:
     extracted_member = tmp_path / filename
     extracted_member.write_text(
@@ -5279,13 +5296,16 @@ def test_scan_nested_file_keeps_nested_xgboost_marker_names_in_mxnet_metadata_ou
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "mxnet"
     assert not any(check.name == "JSON Content Analysis" for check in result.checks)
 
 
-def test_scan_nested_file_canonical_mxnet_symbol_composes_probable_xgboost_security_analysis(tmp_path: Path) -> None:
+def test_scan_dispatch_canonical_mxnet_symbol_composes_probable_xgboost_security_analysis(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "malformed-symbol.json"
     extracted_member.write_text(
         '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
@@ -5293,14 +5313,17 @@ def test_scan_nested_file_canonical_mxnet_symbol_composes_probable_xgboost_secur
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "mxnet"
     assert result.success is False
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
-def test_scan_nested_file_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysis(tmp_path: Path) -> None:
+def test_scan_dispatch_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysis(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "polyglot-0000.params"
     extracted_member.write_text(
         '\ufeff{"version":[1,7,4],"learner":{"gradient_booster":{}},'
@@ -5309,7 +5332,7 @@ def test_scan_nested_file_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysi
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert result.success is False
@@ -5347,7 +5370,10 @@ def test_scan_nested_file_xgboost_owned_shadowed_params_preserves_raw_signature_
     assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
 
 
-def test_scan_nested_file_xgboost_owned_analysis_failed_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
+def test_scan_dispatch_xgboost_owned_analysis_failed_params_preserves_raw_signature_findings(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "polyglot-0000.params"
     extracted_member.write_bytes(
         b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
@@ -5355,14 +5381,17 @@ def test_scan_nested_file_xgboost_owned_analysis_failed_params_preserves_raw_sig
         b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
     )
 
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
     assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
 
 
-def test_scan_nested_file_xgboost_only_skips_overlap_params_signature_analysis(tmp_path: Path) -> None:
+def test_scan_dispatch_xgboost_only_skips_overlap_params_signature_analysis(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "polyglot-0000.params"
     extracted_member.write_bytes(
         b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
@@ -5370,7 +5399,7 @@ def test_scan_nested_file_xgboost_only_skips_overlap_params_signature_analysis(t
         b'"metadata":"\x7fELF"}'
     )
 
-    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert result.success is True
@@ -5378,7 +5407,10 @@ def test_scan_nested_file_xgboost_only_skips_overlap_params_signature_analysis(t
     assert "mxnet" in result.metadata["skipped_scanner_ids"]
 
 
-def test_scan_nested_file_xgboost_only_skips_shadowed_params_signature_analysis(tmp_path: Path) -> None:
+def test_scan_dispatch_xgboost_only_skips_shadowed_params_signature_analysis(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "polyglot-0000.params"
     extracted_member.write_bytes(
         b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
@@ -5386,14 +5418,17 @@ def test_scan_nested_file_xgboost_only_skips_shadowed_params_signature_analysis(
         b'"metadata":"\x7fELF","nodes":[]}'
     )
 
-    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
 
     assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
     assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
     assert "mxnet" in result.metadata["skipped_scanner_ids"]
 
 
-def test_scan_nested_file_xgboost_only_skips_analysis_failed_params_signature_analysis(tmp_path: Path) -> None:
+def test_scan_dispatch_xgboost_only_skips_analysis_failed_params_signature_analysis(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "polyglot-0000.params"
     extracted_member.write_bytes(
         b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
@@ -5401,7 +5436,7 @@ def test_scan_nested_file_xgboost_only_skips_analysis_failed_params_signature_an
         b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
     )
 
-    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
 
     assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
     assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
@@ -5479,7 +5514,10 @@ def test_scan_nested_file_mxnet_only_selection_fails_closed_for_bounded_xgboost_
     )
 
 
-def test_scan_nested_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tmp_path: Path) -> None:
+def test_scan_dispatch_xgboost_only_selection_skips_overlap_mxnet_analysis(
+    tmp_path: Path,
+    json_dispatch: NestedScanCallback,
+) -> None:
     extracted_member = tmp_path / "polyglot.json"
     extracted_member.write_text(
         '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
@@ -5488,7 +5526,7 @@ def test_scan_nested_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tm
         encoding="utf-8",
     )
 
-    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+    result = json_dispatch(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert result.success is True
