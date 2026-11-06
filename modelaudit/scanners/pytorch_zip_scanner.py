@@ -806,6 +806,9 @@ class PyTorchZipScanner(BaseScanner):
                     trusted_pytorch_storage_persistent_id_data_pkl_members=(
                         validated_storage_data_pkl_members.persistent_id_downgrade_keys_by_data_pkl
                     ),
+                    trusted_storage_blob_members=self._storage_blob_members_from_data_pkl_members(
+                        validated_storage_data_pkl_members.storage_keys_by_data_pkl
+                    ),
                     pytorch_data_pickle_storage_sizes_by_data_pkl=(
                         validated_storage_data_pkl_members.storage_member_sizes_by_data_pkl
                     ),
@@ -7810,6 +7813,7 @@ class PyTorchZipScanner(BaseScanner):
         *,
         trusted_pytorch_storage_persistent_id_data_pkl_members: dict[str, set[str]],
         pytorch_data_pickle_storage_sizes_by_data_pkl: dict[str, dict[str, int]],
+        trusted_storage_blob_members: set[str],
     ) -> tuple[int, set[int]]:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -7933,7 +7937,13 @@ class PyTorchZipScanner(BaseScanner):
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
             result.merge_member_result(sub_result, name)
-            self._record_pickle_member_outcome(result, name, sub_result, location=pickle_source)
+            self._record_pickle_member_outcome(
+                result,
+                name,
+                sub_result,
+                location=pickle_source,
+                referenced_storage_bytes=info.file_size if name in trusted_storage_blob_members else None,
+            )
 
         return bytes_scanned, clean_pickle_entry_ids
 
@@ -8326,6 +8336,7 @@ class PyTorchZipScanner(BaseScanner):
         *,
         analysis_state: str = "scanned",
         location: str,
+        referenced_storage_bytes: int | None = None,
     ) -> None:
         normalized_name = pickle_name.replace("\\", "/").lstrip("/")
         record: dict[str, Any] = {
@@ -8333,6 +8344,8 @@ class PyTorchZipScanner(BaseScanner):
             "location": location,
             "analysis_state": analysis_state,
         }
+        if referenced_storage_bytes is not None:
+            record["referenced_tensor_storage_bytes"] = referenced_storage_bytes
         if member_result is not None:
             max_severity = cls._pickle_member_max_severity(member_result)
             record.update(
@@ -8348,6 +8361,11 @@ class PyTorchZipScanner(BaseScanner):
                     ),
                 }
             )
+
+            coverage = member_result.metadata.get("pickle_coverage")
+            if isinstance(coverage, dict):
+                # Metadata is merged in place as later archive members are scanned.
+                record["pickle_coverage"] = coverage.copy()
 
         outcomes = result.metadata.setdefault("pickle_member_outcomes", [])
         if isinstance(outcomes, list):
@@ -8732,14 +8750,15 @@ class PyTorchZipScanner(BaseScanner):
         all_persistent_ids_are_pytorch_storage = True
 
         def pop_marked_tuple() -> tuple[Any, ...] | None:
+            # Only five-field tuples can be storage IDs. Consume wider tuples
+            # (e.g. RNG state) without retaining their contents or losing the MARK.
             items: list[Any] = []
             while stack:
                 item = stack.pop()
                 if item is marker:
-                    return tuple(reversed(items))
-                items.append(item)
-                if len(items) > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
-                    raise ValueError("PyTorch storage persistent ID tuple exceeded trust parser width")
+                    return tuple(reversed(items)) if len(items) <= _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH else ()
+                if len(items) <= _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
+                    items.append(item)
             return None
 
         def within_limits() -> bool:

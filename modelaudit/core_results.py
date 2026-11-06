@@ -657,8 +657,9 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
     consolidated_checks: list[dict[str, Any]] = []
 
     for (check_name, primary_asset), group_checks in check_groups.items():
-        if len(group_checks) == 1:
-            consolidated_checks.append(group_checks[0])
+        if len(group_checks) == 1 or any((c.get("details") or {}).get("analysis_incomplete") for c in group_checks):
+            # Coverage notices carry member-specific evidence even when the check passed.
+            consolidated_checks.extend(group_checks)
             continue
 
         statuses = [c.get("status") for c in group_checks]

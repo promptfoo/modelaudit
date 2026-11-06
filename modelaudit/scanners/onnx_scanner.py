@@ -9478,15 +9478,19 @@ def _build_onnx_weight_analysis_plan(
             lineage_input_indexes = {
                 input_index for input_index, input_name in enumerate(node.input) if value_lineages.get(str(input_name))
             }
-            dynamic_activation_input_indexes = {
-                input_index
-                for input_index, input_name in enumerate(node.input)
-                if value_lineages.get(str(input_name))
-                and all(
-                    lineage.unresolved_reason == "dynamic_activation_lineage"
-                    for lineage in value_lineages[str(input_name)].values()
-                )
-            }
+            dynamic_activation_input_indexes: set[int] = set()
+            for input_index, input_name in enumerate(node.input):
+                input_reasons = {
+                    lineage.unresolved_reason for lineage in value_lineages.get(str(input_name), {}).values()
+                }
+                # Shape-only sources from e.g. a dynamic Reshape do not supply
+                # tensor values to the contraction. Require activation evidence
+                # on each operand and keep unaccounted sources inconclusive.
+                if input_reasons == {"dynamic_activation_lineage"} or (
+                    input_reasons == {"dynamic_activation_lineage", "shape_control_lineage"}
+                    and not value_lineage_limit_gap_counts.get(str(input_name))
+                ):
+                    dynamic_activation_input_indexes.add(input_index)
             batch_normalization_activation_parameter_lineages: set[int] = set()
             if (
                 is_builtin_neural_operator

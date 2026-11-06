@@ -13,6 +13,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raise the per-dictionary tracking bound from 1,024 to 2,048 entries for large state dictionaries. The aggregate 4 MiB tracked-state budget still applies. Entry-limit notices now report the observed count and the corresponding entry limit.
+
 - Require Rust 1.85 or newer when building from source to support PyO3 0.30. Prebuilt wheels do not require a Rust toolchain.
 
 ### Fixed
