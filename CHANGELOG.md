@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Report completed scans as successful in the Python API even when a security check raises a warning.
 - Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.
 - Resolve bound function attributes during finite ONNX replay and ignore unrelated dead transforms without dropping live weight consumers.
 - Bound duplicate singular fields during ONNX control preflight and preserve findings and explicit incomplete coverage when admission stops.
