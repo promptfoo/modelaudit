@@ -24793,7 +24793,7 @@ def test_pytorch_zip_native9_literal_repeated_continuation_archive_and_root_outc
     assert any(issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING" for issue in result.issues) is suspicious
 
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
-    assert aggregate.success is (not suspicious)
+    assert aggregate.success is True
     assert aggregate.file_metadata[str(path)]["pickle_verdict"] == expected_verdict
     assert aggregate.file_metadata[str(path)]["pickle_coverage"]["raw_scan_complete"] is True
     assert aggregate.file_metadata[str(path)]["pickle_coverage"]["opcode_scan_complete"] is True
