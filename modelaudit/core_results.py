@@ -14,6 +14,7 @@ from modelaudit.finding_identity import finding_identity, preserve_finding_ident
 from modelaudit.models import (
     ModelAuditResultModel,
     _details_have_incomplete_coverage,
+    _file_metadata_reports_scanner_failure,
     _metadata_has_coverage_only_operational_error,
     _metadata_has_incomplete_coverage,
     _metadata_value,
@@ -336,10 +337,6 @@ def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
     return records_have_incomplete_coverage(results.checks, allow_skipped_check_exemption=True)
 
 
-def _record_has_critical_severity(record: Any) -> bool:
-    return _normalized_enum_value(_metadata_value(record, "severity")) == IssueSeverity.CRITICAL.value
-
-
 def _record_is_failed_security_check(record: Any) -> bool:
     status = _normalized_enum_value(_metadata_value(record, "status"))
     return status == "failed" and _record_has_security_severity(record)
@@ -353,16 +350,12 @@ def results_have_security_findings(results: ModelAuditResultModel) -> bool:
 
 
 def results_should_be_unsuccessful(results: ModelAuditResultModel) -> bool:
-    """Return True when the aggregate result should not be considered successful."""
-    if results_have_operational_error(results):
-        return True
-
-    if results_have_inconclusive_outcome(results):
-        return True
-
-    has_failed_security_check = any(_record_is_failed_security_check(check) for check in (results.checks or []))
-    has_critical_issue = any(_record_has_critical_severity(issue) for issue in (results.issues or []))
-    return has_failed_security_check and not has_critical_issue
+    """Report incomplete or failed scans independently of security findings."""
+    return (
+        results_have_operational_error(results)
+        or results_have_inconclusive_outcome(results)
+        or _file_metadata_reports_scanner_failure(results.file_metadata)
+    )
 
 
 def to_telemetry_severity(severity: Any) -> str:
