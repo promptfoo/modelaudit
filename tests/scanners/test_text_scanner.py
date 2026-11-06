@@ -4447,7 +4447,7 @@ def test_text_scanner_documentation_passive_endpoint_redaction_limit_is_informat
     text_path = tmp_path / "README.md"
     text_path.write_text(
         "api_key references below are documentation-only.\n"
-        + "\n".join(f"api_key reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
         + "\n@misc{whisper,\n  url = {https://arxiv.org/abs/2212.04356},\n}\n"
         + "\n",
         encoding="utf-8",
