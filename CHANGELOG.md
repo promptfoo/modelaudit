@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Distinguish reshape dimensions from activation data when tracing both inputs of an ONNX attention contraction. Dynamically transformed weights retain their coverage gaps.
+
+- Preserve individual pickle coverage notices and member locations in consolidated scan results.
+- Validate PyTorch storage references alongside wide RNG state tuples and track up to 2,048 dictionary entries in pickle state analysis.
+- Recognize standalone Tekken vocabulary JSON without routing token spellings to model checkpoint parsers. Filtered domain-shaped code tokens in model cards no longer consume the network evidence classification budget.
+
 - Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.
 - Resolve bound function attributes during finite ONNX replay and ignore unrelated dead transforms without dropping live weight consumers.
 - Bound duplicate singular fields during ONNX control preflight and preserve findings and explicit incomplete coverage when admission stops.

@@ -914,7 +914,7 @@ jobs:
           - os: macos-15-intel
             python-version: "3.12"
             timeout-minutes: 45
-          - os: macos-14
+          - os: macos-15
             python-version: "3.14"
             timeout-minutes: 60
           - os: macos-15-intel
