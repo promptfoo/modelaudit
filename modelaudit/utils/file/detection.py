@@ -1868,6 +1868,15 @@ def _hf_tokenizer_json_digest_matches_identity(key: _HFTokenizerEOFProofKey, exp
     return hasher.digest() == expected_digest
 
 
+_TEKKEN_JSON_FILENAME = re.compile(r"(?:v[0-9]+\.)?tekken\.json")
+_TEKKEN_FIELDS = {
+    (): {"config", "vocab", "special_tokens"},
+    ("config",): {"pattern", "num_vocab_tokens", "default_vocab_size", "default_num_special_tokens", "version"},
+    ("vocab", "[]"): {"rank", "token_bytes", "token_str"},
+    ("special_tokens", "[]"): {"rank", "token_str", "is_control"},
+}
+
+
 def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
     """Return whether bounded streaming JSON proves exact tokenizer ownership."""
     try:
@@ -1925,6 +1934,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     except OSError:
         return False
 
+    tekken = _TEKKEN_JSON_FILENAME.fullmatch(file_path.name.lower()) is not None
+    tekken_vocab_seen = False
     stack: list[_JSONStreamContext] = []
     root_keys: set[str] = set()
     model_keys: set[str] = set()
@@ -1959,6 +1970,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     def tracked_keys(path: tuple[str, ...]) -> set[str] | None:
         if path == ():
             return root_keys
+        if tekken and path in _TEKKEN_FIELDS:
+            return set()
         if path == ("model",):
             return model_keys
         return None
@@ -1984,7 +1997,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         context.pending_key = None
 
     def finish_container(byte: int) -> None:
-        nonlocal root_complete, saw_model_schema
+        nonlocal root_complete, saw_model_schema, tekken_vocab_seen
         context = stack[-1] if stack else None
         if (
             context is None
@@ -1992,6 +2005,11 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             or (byte == ord("]") and context.kind != "array")
         ):
             raise _JSONProbeInvalid
+        if tekken and context.kind == "object":
+            if context.seen_keys != _TEKKEN_FIELDS.get(context.path):
+                raise _JSONProbeInvalid
+            if context.path == ("vocab", "[]"):
+                tekken_vocab_seen = True
         if context.path == ("model",) and model_type is not None and model_vocab_kind is not None:
             saw_model_schema = model_vocab_kind == ("array" if model_type == "Unigram" else "object")
         stack.pop()
@@ -2012,11 +2030,16 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     def string_needs_capture(path: tuple[str, ...], is_key: bool) -> bool:
         return (
             (is_key and not _hf_tokenizer_stream_path_skips_templates(path))
+            or (tekken and path in {("config", "pattern"), ("config", "version"), ("vocab", "[]", "token_bytes")})
             or path == ("model", "type")
             or (len(path) == 1 and path[0] in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS)
         )
 
     def string_scans_templates(path: tuple[str, ...]) -> bool:
+        if tekken:
+            # Token spellings can contain arbitrary text. Every object key is
+            # checked against the schema; only configuration strings need probing.
+            return not string_is_key and path[:1] == ("config",)
         return bool(path) and not _hf_tokenizer_stream_path_skips_templates(path)
 
     def begin_string(*, is_key: bool) -> None:
@@ -2040,6 +2063,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             context.pending_key = ""
             context.mode = "colon"
             return
+        if tekken and key not in _TEKKEN_FIELDS[context.path]:
+            raise _JSONProbeInvalid
         if context.seen_keys is not None:
             if key in context.seen_keys or len(context.seen_keys) >= _HF_TOKENIZER_STREAM_MAX_TRACKED_KEYS:
                 raise _JSONProbeInvalid
@@ -2056,6 +2081,17 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
 
     def note_string_value(value: str | None) -> None:
         nonlocal model_type
+        if tekken and value is not None:
+            if string_path == ("vocab", "[]", "token_bytes") and not (
+                len(value) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value)
+            ):
+                raise _JSONProbeInvalid
+            if string_path == ("config", "version") and not re.fullmatch(r"v[0-9]+", value):
+                raise _JSONProbeInvalid
+            if string_path == ("config", "pattern") and any(
+                marker in value for marker in _JSON_PROBE_TEMPLATE_INDICATORS
+            ):
+                raise _JSONProbeInvalid
         if string_path == ("model", "type"):
             model_type = value if value in _HF_TOKENIZER_MODEL_TYPES else None
         if (
@@ -2067,6 +2103,23 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             raise _JSONProbeInvalid
 
     def expected_value_marker(path: tuple[str, ...], byte: int) -> None:
+        if tekken:
+            field = path[-1]
+            if field in {"config", "[]"}:
+                markers = b"{"
+            elif field in {"vocab", "special_tokens"}:
+                markers = b"["
+            elif field == "token_str" and path[0] == "vocab":
+                markers = b'"n'
+            elif field in {"pattern", "version", "token_bytes", "token_str"}:
+                markers = b'"'
+            elif field == "is_control":
+                markers = b"tf"
+            else:
+                markers = b"0123456789"
+            if byte not in markers:
+                raise _JSONProbeInvalid
+            return
         if path in {("model",)} and byte != ord("{"):
             raise _JSONProbeInvalid
         if path in {("added_tokens",)} and byte != ord("["):
@@ -2110,6 +2163,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         if len(token) > _HF_TOKENIZER_STREAM_MAX_PRIMITIVE_BYTES:
             raise _JSONProbeInvalid
         if token not in {b"true", b"false", b"null"} and _JSON_NUMBER_PREFIX_RE.fullmatch(token) is None:
+            raise _JSONProbeInvalid
+        if tekken and token[:1].isdigit() and not token.isdigit():
             raise _JSONProbeInvalid
         if (
             model_vocab_kind == "object"
@@ -2280,8 +2335,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         and current_stat.st_dev == expected_stat.st_dev
         and current_stat.st_ino == expected_stat.st_ino
         and current_change_token == change_token
-        and root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"}
-        and saw_model_schema
+        and (tekken_vocab_seen if tekken else (root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"} and saw_model_schema))
     )
     if not owns_tokenizer:
         return False
@@ -2306,6 +2360,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
 def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
     """Return whether bounded filename and schema evidence proves tokenizer JSON ownership."""
     file_path = Path(path)
+    if _TEKKEN_JSON_FILENAME.fullmatch(file_path.name.lower()):
+        return _hf_tokenizer_json_eof_proves_ownership(file_path)
     if not _is_hf_tokenizer_json_schema_path(file_path):
         return False
     if _hf_tokenizer_json_eof_proves_ownership(file_path):

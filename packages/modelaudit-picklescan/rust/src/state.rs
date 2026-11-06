@@ -86,7 +86,9 @@ enum StrFormatRootItemLookup {
 }
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
-const MAX_TRACKED_DICT_ENTRIES: usize = 1024;
+// A large state dict can reference over 1,200 tensors. Aggregate tracked bytes
+// and opcode limits still apply independently of the per-dictionary cap.
+const MAX_TRACKED_DICT_ENTRIES: usize = 2048;
 const MAX_TRACKED_DICT_UNKNOWN_KEY_VALUES: usize = 16;
 const MAX_TRACKED_FUTURE_CALLBACKS: usize = 1024;
 const MAX_TRACKED_MEMO_VALUES: usize = 65_536;
@@ -1287,6 +1289,24 @@ impl<'a> ScanState<'a> {
             return;
         }
         self.tracked_state_budget_exhausted = true;
+        let (observed_field, limit_field, limit) = match reason {
+            "tracked_dict_entries" => (
+                "tracked_dict_entries",
+                "max_tracked_dict_entries",
+                MAX_TRACKED_DICT_ENTRIES,
+            ),
+            "stack_entries" => (
+                "stack_entries",
+                "max_stack_entries",
+                MAX_TRACKED_STACK_VALUES,
+            ),
+            "memo_entries" => ("memo_entries", "max_memo_entries", MAX_TRACKED_MEMO_VALUES),
+            _ => (
+                "tracked_state_bytes",
+                "max_tracked_state_bytes",
+                MAX_TRACKED_STATE_BYTES,
+            ),
+        };
         self.add_notice(Notice {
             message: "Pickle state simulation exceeded tracked-state resource bounds".to_string(),
             severity: "info",
@@ -1298,13 +1318,10 @@ impl<'a> ScanState<'a> {
                     DetailValue::String(reason.to_string()),
                 ),
                 (
-                    "tracked_state_bytes".to_string(),
+                    observed_field.to_string(),
                     DetailValue::UInt(observed as u64),
                 ),
-                (
-                    "max_tracked_state_bytes".to_string(),
-                    DetailValue::UInt(MAX_TRACKED_STATE_BYTES as u64),
-                ),
+                (limit_field.to_string(), DetailValue::UInt(limit as u64)),
                 ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
             ],
         });
@@ -7383,10 +7400,10 @@ impl<'a> ScanState<'a> {
         let modeled_template_call = template_receiver_state_unmodified == Some(true)
             && invocation.op_name == "REDUCE"
             && invocation.positional_arg_count == Some(invocation.args.len())
-            && !invocation
+            && invocation
                 .keyword_arg_names
                 .as_ref()
-                .is_some_and(|names| !names.is_empty())
+                .is_none_or(|names| names.is_empty())
             && match invocation.reference.name.as_str() {
                 "Template.substitute" | "Template.safe_substitute" => {
                     template_mapping_callbacks_complete == Some(true)

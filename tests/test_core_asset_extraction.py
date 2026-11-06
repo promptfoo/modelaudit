@@ -126,6 +126,27 @@ def test_npz_member_checks_keep_archive_member_locations(tmp_path: Path) -> None
     )
 
 
+def test_consolidation_preserves_each_incomplete_pickle_notice(tmp_path: Path) -> None:
+    archive = tmp_path / "weights.pt"
+    with zipfile.ZipFile(archive, "w") as stream:
+        stream.writestr("archive/version", "3\n")
+        stream.writestr("archive/byteorder", "little")
+        stream.writestr("archive/data/0", bytes(4))
+        stream.writestr("archive/data.pkl", b"cabsent_test_package\nrebuild\n)R.")
+        stream.writestr("archive/other.pkl", b"cabsent_test_package\nrestore\n)R.")
+
+    result = scan_model_directory_or_file(str(archive), cache_enabled=False)
+    notices = [check for check in result.checks if check.details.get("reason") == "source_unavailable"]
+
+    assert {
+        (check.details["import_reference"], check.details["pickle_source"].split(":")[-1]) for check in notices
+    } == {
+        ("absent_test_package.rebuild", "archive/data.pkl"),
+        ("absent_test_package.restore", "archive/other.pkl"),
+    }
+    assert all(check.details["analysis_incomplete"] and "source" in check.message for check in notices)
+
+
 def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) -> None:
     archive_path = tmp_path / "payload.npz"
     np.savez(archive_path, safe=np.arange(3), payload=np.array([ExecPayload()], dtype=object))

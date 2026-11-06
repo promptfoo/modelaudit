@@ -5362,6 +5362,12 @@ class NetworkCommDetector:
         """Preserve bounded evidence accounting for domain candidates filtered before reporting."""
         if not self._has_sensitive_evidence_hint or self._evidence_redaction_limit_reached:
             return
+        # A filtered token cannot produce a domain finding. Reserve shared
+        # classification for tokens attached to a credential-bearing record.
+        start = max(0, match_start - _MAX_URL_TEXT_LOOKUP_BYTES)
+        line_start = max(start, data.rfind(b"\n", start, match_start) + 1, data.rfind(b"\r", start, match_start) + 1)
+        if _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data, line_start, match_start) is None:
+            return
         if self._url_context_redaction_decision(data, match_start, value) is not None:
             return
         if _is_split_sensitive_url_value(data, match_start):
