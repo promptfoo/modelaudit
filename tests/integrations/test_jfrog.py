@@ -61,6 +61,13 @@ from tests.helpers.file_creators import (
 from tests.helpers.http import FakeStreamingResponse
 
 
+_download_models_folder = partial(
+    download_jfrog_folder,
+    "https://company.jfrog.io/artifactory/repo/models/",
+    show_progress=False,
+)
+
+
 class _FakeStreamingResponse(FakeStreamingResponse):
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -1667,11 +1674,9 @@ class TestJFrogFolderDownload:
         ]
 
         with pytest.raises(ValueError, match="exceeds maximum allowed size"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
                 max_file_size=5,
             )
 
@@ -1704,11 +1709,9 @@ class TestJFrogFolderDownload:
         mock_detect.side_effect = mock_detect_side_effect
         mock_download.side_effect = mock_download_side_effect
 
-        result = download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        result = _download_models_folder(
             cache_dir=tmp_path,
             api_token="test-token",
-            show_progress=False,
             max_size=5,
         )
 
@@ -1733,11 +1736,9 @@ class TestJFrogFolderDownload:
         ]
 
         with pytest.raises(ValueError, match="Cannot verify JFrog selected artifact size"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
                 max_size=5,
             )
 
@@ -1778,11 +1779,9 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = mock_download_side_effect
 
-        result = download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        result = _download_models_folder(
             cache_dir=tmp_path,
             api_token="test-token",
-            show_progress=False,
             max_size=9,
         )
 
@@ -1826,11 +1825,9 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = download_side_effect
 
-        result = download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        result = _download_models_folder(
             cache_dir=tmp_path,
             api_token="test-token",
-            show_progress=False,
             max_size=len(payload) * 2,
         )
 
@@ -1865,11 +1862,9 @@ class TestJFrogFolderDownload:
         mock_get.return_value = _FakeStreamingResponse(b"not-a-model")
 
         with pytest.raises(ValueError, match=r"content probe .*download budget"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
                 max_size=len(b"not-a-model"),
             )
 
@@ -1908,10 +1903,8 @@ class TestJFrogFolderDownload:
         mock_detect_format.side_effect = detect_side_effect
 
         with pytest.raises(ValueError, match="content probe was truncated by the download budget"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 max_file_size=5,
             )
 
@@ -1955,11 +1948,9 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = mock_download_side_effect
 
-        result = download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        result = _download_models_folder(
             cache_dir=tmp_path,
             api_token="test-token",
-            show_progress=False,
             max_size=4,
         )
 
@@ -1990,11 +1981,9 @@ class TestJFrogFolderDownload:
         ]
 
         with pytest.raises(ValueError, match="folder selected-file total"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
                 max_size=10,
             )
 
@@ -2021,11 +2010,9 @@ class TestJFrogFolderDownload:
         mock_download.side_effect = Exception("exceeds maximum allowed size")
 
         with pytest.raises(Exception, match="JFrog folder download failed"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
                 max_size=5,
             )
 
@@ -2053,11 +2040,9 @@ class TestJFrogFolderDownload:
         mock_copy.side_effect = OSError("backup volume full")
 
         with pytest.raises(Exception, match="JFrog folder download failed"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
                 max_size=5,
             )
 
@@ -2118,11 +2103,9 @@ class TestJFrogFolderDownload:
             patch("modelaudit.utils.sources.jfrog.shutil.copy2", side_effect=fail_restore_copy),
             pytest.raises(Exception, match="Failed to restore original JFrog cache file"),
         ):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
                 max_size=8,
             )
 
@@ -2165,10 +2148,8 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = download_side_effect
         with pytest.raises(KeyboardInterrupt):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 max_size=6,
             )
 
@@ -2214,10 +2195,8 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = download_side_effect
         with pytest.raises(Exception, match="JFrog folder download failed"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=cache_dir,
-                show_progress=False,
                 max_size=6,
             )
 
@@ -2298,11 +2277,9 @@ class TestJFrogFolderDownload:
             mock_get.side_effect = get_side_effect
             mock_download.side_effect = _write_plain_mock_download
 
-            result_dir = download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            result_dir = _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
             )
 
             assert result_dir == tmp_path
@@ -2359,10 +2336,8 @@ class TestJFrogFolderDownload:
             mock_get.side_effect = get_side_effect
 
             with pytest.raises(ValueError, match="No scannable model files found"):
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path,
-                    show_progress=False,
                 )
 
             assert {call.args[0] for call in mock_get.call_args_list} == {preview_url, malformed_safetensors_url}
@@ -2417,10 +2392,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path / "downloads",
-                show_progress=False,
             )
 
             assert {call.args[0] for call in mock_download.call_args_list} == set(payloads)
@@ -2442,10 +2415,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["jax_checkpoint"]),
             )
 
@@ -2482,10 +2453,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["jax_checkpoint"]),
             )
 
@@ -2507,10 +2476,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["flax_msgpack"]),
             )
 
@@ -2539,10 +2506,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["flax_msgpack"]),
             )
 
@@ -2607,10 +2572,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["xgboost"]),
             )
 
@@ -2647,10 +2610,8 @@ class TestJFrogFolderDownload:
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
             with pytest.raises(ValueError, match="No scannable model files found"):
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path,
-                    show_progress=False,
                     scanner_selection=scanner_selection_config_from_inputs(scanners=["mxnet"]),
                 )
 
@@ -2687,10 +2648,8 @@ class TestJFrogFolderDownload:
             mock_get.side_effect = lambda url, **_kwargs: _FakeStreamingResponse(payloads[url])
 
             with pytest.raises(ValueError, match="No scannable model files found"):
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path / "downloads",
-                    show_progress=False,
                 )
 
             mock_download.assert_not_called()
@@ -2713,10 +2672,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
             )
 
             assert {call.args[0] for call in mock_download.call_args_list} == set(payloads)
@@ -2770,11 +2727,9 @@ class TestJFrogFolderDownload:
             ]
 
             with pytest.raises(ValueError, match="selective filtering incomplete"):
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path,
                     api_token="test-token",
-                    show_progress=False,
                 )
 
             assert mock_get.call_args_list[0].args[0] == hidden_url
@@ -2802,11 +2757,9 @@ class TestJFrogFolderDownload:
             ]
 
             with pytest.raises(ValueError, match="selective filtering incomplete"):
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path,
                     api_token="test-token",
-                    show_progress=False,
                 )
 
             assert mock_get.call_args_list[0].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
@@ -2836,11 +2789,9 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
             )
 
             assert mock_get.call_args_list[1].args[0] == redirected_url
@@ -2879,11 +2830,9 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
             )
 
             assert mock_get.call_args_list[1].args[0] == redirected_url
@@ -2926,10 +2875,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            result_dir = download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            result_dir = _download_models_folder(
                 cache_dir=tmp_path / "downloads",
-                show_progress=False,
             )
 
             assert result_dir == tmp_path / "downloads"
@@ -2951,10 +2898,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["onnx"]),
             )
 
@@ -2986,10 +2931,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["pytorch_zip"]),
             )
 
@@ -3014,10 +2957,8 @@ class TestJFrogFolderDownload:
             mock_get.return_value = _FakeStreamingResponse(payload)
 
             with pytest.raises(ValueError, match="No scannable model files found"):
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path,
-                    show_progress=False,
                 )
 
             mock_download.assert_not_called()
@@ -3040,10 +2981,8 @@ class TestJFrogFolderDownload:
             mock_get.return_value = _FakeStreamingResponse(payload)
 
             with pytest.raises(ValueError, match="selective filtering incomplete"):
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path,
-                    show_progress=False,
                 )
 
             mock_download.assert_not_called()
@@ -3071,10 +3010,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["zip"]),
             )
 
@@ -3101,10 +3038,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = partial(_write_mock_download, b"mock file content")
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["tar"]),
             )
 
@@ -3131,10 +3066,8 @@ class TestJFrogFolderDownload:
         mock_detect.return_value = (None, "")
 
         with pytest.raises(ValueError, match="content probe limit"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
             )
 
         assert mock_detect.call_count == 256
@@ -3160,10 +3093,8 @@ class TestJFrogFolderDownload:
             mock_get.side_effect = PermissionError(f"denied {hidden_url}")
 
             with pytest.raises(ValueError) as excinfo:
-                download_jfrog_folder(
-                    "https://company.jfrog.io/artifactory/repo/models/",
+                _download_models_folder(
                     cache_dir=tmp_path,
-                    show_progress=False,
                 )
 
             error = str(excinfo.value)
@@ -3204,10 +3135,8 @@ class TestJFrogFolderDownload:
             mock_get.side_effect = get_side_effect
             mock_download.side_effect = _write_plain_mock_download
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scannable_extensions={".safetensors"},
                 scanner_selection=scanner_selection_config_from_inputs(scanners=["safetensors"]),
             )
@@ -3238,10 +3167,8 @@ class TestJFrogFolderDownload:
         mock_download.side_effect = download_side_effect
         policy = resolve_scanner_selection_policy(scanners=["metadata"])
 
-        download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        _download_models_folder(
             cache_dir=tmp_path,
-            show_progress=False,
             scannable_extensions=selected_scanner_extensions(policy, conservative=True),
             scannable_filenames=selected_scanner_filenames(policy, conservative=True),
             scanner_selection=policy.to_config(),
@@ -3273,10 +3200,8 @@ class TestJFrogFolderDownload:
 
             mock_download.side_effect = _write_plain_mock_download
 
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
                 scannable_extensions={".safetensors"},
             )
 
@@ -3304,11 +3229,9 @@ class TestJFrogFolderDownload:
         ]
 
         with pytest.raises(ValueError, match="Unsafe JFrog artifact path"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
             )
 
         assert not any(tmp_path.iterdir())
@@ -3390,11 +3313,9 @@ class TestJFrogFolderDownload:
         ]
 
         with pytest.raises(ValueError, match="Unsafe JFrog artifact path"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 selective=False,
-                show_progress=False,
             )
 
         mock_download.assert_not_called()
@@ -3419,10 +3340,8 @@ class TestJFrogFolderDownload:
         ]
 
         with pytest.raises(ValueError, match="Unsafe JFrog artifact path"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
             )
 
         mock_download.assert_not_called()
@@ -3442,10 +3361,8 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = partial(_write_mock_download, b"payload")
 
-        download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        _download_models_folder(
             cache_dir=tmp_path,
-            show_progress=False,
         )
 
         assert (tmp_path / "null.pkl").read_bytes() == b"payload"
@@ -3474,11 +3391,9 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = download_side_effect
 
-        download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        _download_models_folder(
             cache_dir=tmp_path,
             selective=False,
-            show_progress=False,
         )
 
         assert (tmp_path / "model.pkl").read_text(encoding="utf-8") == plain_url
@@ -3519,10 +3434,8 @@ class TestJFrogFolderDownload:
         ]
 
         with pytest.raises(ValueError, match="Colliding local JFrog artifact paths"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
-                show_progress=False,
             )
 
         mock_download.assert_not_called()
@@ -3546,10 +3459,8 @@ class TestJFrogFolderDownload:
 
         mock_download.side_effect = partial(_write_mock_download, b"payload")
 
-        download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        _download_models_folder(
             cache_dir=tmp_path,
-            show_progress=False,
         )
 
         assert [call.args[0] for call in mock_download.call_args_list] == [first_url, second_url]
@@ -3595,11 +3506,9 @@ class TestJFrogFolderDownload:
         mock_download.side_effect = mock_download_side_effect
 
         with pytest.raises(Exception, match=r"failed after 1 of 3 file\(s\) completed"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=tmp_path,
                 api_token="test-token",
-                show_progress=False,
             )
 
         assert attempted_downloads == ["model1.pkl", "model2.pt"]
@@ -3630,11 +3539,9 @@ class TestJFrogFolderDownload:
         mock_download.side_effect = Exception("boom")
 
         with pytest.raises(Exception, match=r"failed after 0 of 1 file\(s\) completed"):
-            download_jfrog_folder(
-                "https://company.jfrog.io/artifactory/repo/models/",
+            _download_models_folder(
                 cache_dir=None,
                 api_token="test-token",
-                show_progress=False,
             )
 
         assert not owned_download_dir.exists()
@@ -3677,10 +3584,8 @@ def _assert_jfrog_local_collision(
     ]
 
     with pytest.raises(ValueError, match="Colliding local JFrog artifact paths"):
-        download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
+        _download_models_folder(
             cache_dir=tmp_path,
-            show_progress=False,
         )
 
     mock_download.assert_not_called()
