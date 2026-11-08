@@ -114,14 +114,19 @@ def _same_displayed_destination(label: bytes, target: bytes) -> bool:
 
 def model_card_policy_evidence(
     payload: bytes, harmful_claim: re.Pattern[bytes], is_passive: Callable[[bytes, int], bool]
-) -> tuple[list[tuple[int, int]], frozenset[int]]:
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], frozenset[int]]:
     if len(payload) > MAX_DOCUMENTATION_BYTES:
-        return [], frozenset()
-    spans = [
-        match.span("domain")
-        for match in _CREDIT.finditer(payload)
-        if match.start() == 0 or payload.endswith((b"\n\n", b"\r\n\r\n"), 0, match.start())
-    ]
+        return [], [], frozenset()
+    spans: list[tuple[int, int]] = []
+    active_spans: list[tuple[int, int]] = []
+
+    def record(source: bytes, offset: int, position: int, left: int, right: int) -> None:
+        destination = spans if is_passive(source, position) else active_spans
+        destination.append((offset + left, offset + right))
+
+    for credit in _CREDIT.finditer(payload):
+        if credit.start() == 0 or payload.endswith((b"\n\n", b"\r\n\r\n"), 0, credit.start()):
+            record(payload, 0, credit.start(), *credit.span("domain"))
     for credit in _TOOL_CREDIT.finditer(payload):
         if (
             (credit.start() == 0 or payload.endswith((b"\n\n", b"\r\n\r\n"), 0, credit.start()))
@@ -129,20 +134,19 @@ def model_card_policy_evidence(
             and (not credit["author"] or credit["author"].lower() == credit["owner"].lower())
             and _plain_url(credit["url"].decode("ascii"))
         ):
-            spans.append(credit.span("url"))
+            record(payload, 0, credit.start(), *credit.span("url"))
     start, body = _displayed_license(payload)
     for match in _REPORT_CONTACT.finditer(body):
         if match["site"] and not _plain_url("https://" + match["site"].decode("ascii")):
             continue
         left, right = match.span("site" if match["site"] else "domain")
-        if is_passive(body, match.start()):
-            spans.append((start + left, start + right))
+        record(body, start, match.start(), left, right)
     for match in _PLAIN_REFERENCE.finditer(body):
-        if _plain_url(match["url"].decode("ascii")) and is_passive(body, match.start()):
-            spans.append((start + match.start("url"), start + match.end("url")))
+        if _plain_url(match["url"].decode("ascii")):
+            record(body, start, match.start(), *match.span("url"))
     for match in _LINK.finditer(body):
-        if _same_displayed_destination(match["label"], match["target"]) and is_passive(body, match.start()):
-            spans.append((start + match.start("label"), start + match.end("target")))
+        if _same_displayed_destination(match["label"], match["target"]):
+            record(body, start, match.start(), match.start("label"), match.end("target"))
     positions: set[int] = set()
     for heading in _PROHIBITED.finditer(body):
         boundary = _SECTION_END.search(body, heading.end())
@@ -155,4 +159,4 @@ def model_card_policy_evidence(
         )
     if positions and (harmful_claim.search(payload) or harmful_claim.search(body)):
         positions.clear()
-    return spans, frozenset(positions)
+    return spans, sorted(active_spans), frozenset(positions)

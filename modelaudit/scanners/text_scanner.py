@@ -231,6 +231,10 @@ DOCUMENTATION_CODE_CALL_PATTERN = re.compile(
     rb"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$"
 )
 DOCUMENTATION_LINKED_BLOCKQUOTE = re.compile(rb"(?m)^ {0,3}>[ \t]+[^#\r\n\"'`]*?\]\(https?://[^()\s#\"'`]+\)[^\r\n]*$")
+# A prose sentence citing an issue as "Use project.cpp(#123) …" is not an open Python call.
+DOCUMENTATION_PROSE_ISSUE_REFERENCE = re.compile(
+    rb"(?im)^((?:see|use|using|refer to) +[\w./-]+\()#(?=\d+\)[ \w.,-]*\r?$)"
+)
 DOCUMENTATION_ISSUE_LABEL_HASH = re.compile(rb"\[#(?=\d+\]\(https?://[^()\s]+\))")
 DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
 DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
@@ -1148,6 +1152,8 @@ class TextScanner(BaseScanner):
             source = DOCUMENTATION_LINKED_BLOCKQUOTE.sub(
                 lambda line: DOCUMENTATION_ISSUE_LABEL_HASH.sub(b"[", line[0]), source
             )
+        if b"(#" in source:
+            source = DOCUMENTATION_PROSE_ISSUE_REFERENCE.sub(rb"\1", source)
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
@@ -2624,6 +2630,7 @@ class TextScanner(BaseScanner):
         routine_spans: tuple[tuple[int, int], ...] = (),
         prohibited_terms: frozenset[int] = frozenset(),
         sql_regions: Sequence[tuple[int, int]] = (),
+        active_policy_spans: Sequence[tuple[int, int]] = (),
     ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
         token_bytes_options = cls._documentation_finding_tokens(finding, routine_spans)
@@ -2671,9 +2678,12 @@ class TextScanner(BaseScanner):
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
             elif finding_type == "domain_name":
                 # The detector emits only the first occurrence of a hostname.
-                actionable = not cls._routine_span_contains(routine_spans, position) and (
-                    cls._routine_span_contains(sql_regions, position)
-                    or cls._documentation_finding_is_actionable(payload, candidate)
+                actionable = cls._routine_span_contains(active_policy_spans, position) or (
+                    not cls._routine_span_contains(routine_spans, position)
+                    and (
+                        cls._routine_span_contains(sql_regions, position)
+                        or cls._documentation_finding_is_actionable(payload, candidate)
+                    )
                 )
             elif finding_type == "suspicious_port":
                 actionable = cls._documentation_finding_is_actionable(payload, candidate)
@@ -3863,6 +3873,7 @@ class TextScanner(BaseScanner):
         filename = os.path.basename(path).lower()
         routine_network_spans: tuple[tuple[int, int], ...] = ()
         sql_regions: list[tuple[int, int]] = []
+        active_policy_spans: list[tuple[int, int]] = []
         prohibited_terms: frozenset[int] = frozenset()
         if (
             findings
@@ -3874,7 +3885,7 @@ class TextScanner(BaseScanner):
             )
             if payload_complete:
                 try:
-                    references, prohibited_terms = model_card_policy_evidence(
+                    references, active_policy_spans, prohibited_terms = model_card_policy_evidence(
                         payload,
                         DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN,
                         cls._documentation_policy_reference_is_passive,
@@ -3913,6 +3924,7 @@ class TextScanner(BaseScanner):
                         routine_network_spans,
                         prohibited_terms,
                         sql_regions,
+                        active_policy_spans,
                     )
                     # The first occurrence was routine. Retargeting found an actionable use of the same host.
                     if (
@@ -3942,6 +3954,14 @@ class TextScanner(BaseScanner):
                     continue
                 finding = retargeted_finding
             position = finding.get("position")
+            # The decoded policy scalar can expose calls hidden by raw YAML escaping.
+            if (
+                isinstance(position, int)
+                and finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES
+                and cls._routine_span_contains(active_policy_spans, position)
+            ):
+                classified_findings.append(finding)
+                continue
             routine_example = (
                 isinstance(position, int)
                 and cls._routine_span_contains(routine_network_spans, position)

