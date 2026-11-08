@@ -200,7 +200,10 @@ class MetadataScanner(BaseScanner):
             if url in seen:
                 continue
             seen.add(url)
-            parsed = urlparse(url)
+            try:
+                parsed = urlparse(url)
+            except ValueError:
+                continue
             matched_domain = None
             matched_component = None
 

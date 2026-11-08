@@ -40,6 +40,7 @@ from tests.helpers.file_creators import (
     malicious_pickle_bytes,
     prefix_mock_onnx_with_unknown_field,
     valid_jpeg_bytes,
+    valid_pcm_wave_bytes,
     valid_png_bytes,
     write_sparse_safetensors_framing,
 )
@@ -181,6 +182,44 @@ class TestFileFilter:
 
         assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
         assert should_skip_file(str(media_path)) is False
+
+    @pytest.mark.parametrize(
+        ("trailing", "expected"),
+        [
+            (b"", "unknown"),
+            (malicious_pickle_bytes(), "pickle"),
+            (b"non-audio payload", PICKLE_ROUTING_INCONCLUSIVE_FORMAT),
+            (b"\0" * (MEDIA_ROUTE_READ_BYTES + 2) + malicious_pickle_bytes(), PICKLE_ROUTING_INCONCLUSIVE_FORMAT),
+        ],
+        ids=["pcm", "pickle", "unrecognized-tail", "over-budget-tail"],
+    )
+    def test_pcm_wave_routes_at_riff_boundary(self, tmp_path: Path, trailing: bytes, expected: str) -> None:
+        path = tmp_path / "example.wav"
+        path.write_bytes(valid_pcm_wave_bytes(80_000) + trailing)
+        assert file_detection.detect_file_format(str(path)) == expected
+        assert detect_file_format_for_skip_filter(str(path)) == expected
+
+    def test_wave_near_matches_preserve_serialized_routing(self, tmp_path: Path) -> None:
+        path = tmp_path / "example.wav"
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = msgpack.packb({"params": {"w": [1]}, "__reduce__": "os.system"}, use_bin_type=True)
+        path.write_bytes(checkpoint)
+        assert file_detection.detect_file_format(str(path)) == "flax_msgpack"
+        # These PCM samples form a complete MessagePack sequence containing the same checkpoint.
+        polyglot = bytearray(valid_pcm_wave_bytes(32))
+        polyglot[64 : 64 + len(checkpoint)] = checkpoint
+        path.write_bytes(polyglot)
+        from modelaudit.core import scan_file
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+        assert result.scanner_name == "flax_msgpack"
+        assert any("__reduce__" in issue.message and issue.severity.value == "critical" for issue in result.issues)
+        path.write_bytes(polyglot + b"\x01")
+        assert file_detection.detect_file_format(str(path)) == "flax_msgpack"
+        wave = valid_pcm_wave_bytes()
+        for malformed in (wave[:-1], wave[:28] + bytes(4) + wave[32:]):
+            path.write_bytes(malformed)
+            assert file_detection._detect_bounded_media_route(path, len(malformed)) is None
 
     def test_jpeg_fill_byte_media_pickle_polyglot_bypasses_default_prefilter(self, tmp_path: Path) -> None:
         media_path = tmp_path / "fill-polyglot.jpg"

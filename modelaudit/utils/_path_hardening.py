@@ -7,6 +7,26 @@ from contextlib import suppress
 from pathlib import Path
 
 
+def _cross_view_ctime_matches(descriptor_ctime_ns: int, path_ctime_ns: int) -> bool:
+    """Windows can report different creation times for a file through fstat and stat."""
+    return os.name == "nt" or descriptor_ctime_ns == path_ctime_ns
+
+
+def _file_stat_matches(left: os.stat_result, right: os.stat_result, *, cross_view: bool = False) -> bool:
+    """Compare identity and content metadata across reads. Use cross_view for fstat versus stat."""
+    return (
+        os.path.samestat(left, right)
+        and left.st_mode == right.st_mode
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and (
+            _cross_view_ctime_matches(left.st_ctime_ns, right.st_ctime_ns)
+            if cross_view
+            else left.st_ctime_ns == right.st_ctime_ns
+        )
+    )
+
+
 def _tighten_permissions(path: Path, mode: int) -> None:
     """Best-effort permission hardening for sensitive local paths."""
     if os.name == "nt":
