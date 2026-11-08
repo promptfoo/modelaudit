@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep the highest failed severity and its explanation when combining checks for one asset. Summaries that include informational findings now identify them as findings.
 - Preserve individual pickle coverage notices and member locations in consolidated scan results.
 - Validate PyTorch storage references alongside wide RNG state tuples and track up to 2,048 dictionary entries in pickle state analysis.
+- Validate storage IDs in PyTorch tensor batches and legacy TorchScript v1 parameter mappings with a separate allowance of 256,000 metadata opcodes and two million provenance-node visits per archive. Upgrade both `modelaudit` and `modelaudit-picklescan` to receive this fix. Member discovery limits and coverage diagnostics still apply.
 - Recognize standalone Tekken vocabulary JSON without routing token spellings to model checkpoint parsers. Filtered domain-shaped code tokens in model cards no longer consume the network evidence classification budget.
 - Recognize SentencePiece tokenizers with large trainer symbol lists and complete tiktoken rank files sharing the XGBoost model extension.
 

@@ -16,6 +16,7 @@ import re
 import stat
 import struct
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import suppress
@@ -76,7 +77,7 @@ from .pickle_scanner import (
     _pickle_literal_url_is_proven_inert,
     _pickle_literal_url_stripped_scan_view,
 )
-from .picklescan_adapter import apply_pickle_member_context
+from .picklescan_adapter import apply_pickle_member_context, scan_options_from_config
 from .pytorch_zip_support import (
     RelaxedZipCrcTracker,
     find_zip_entry,
@@ -341,6 +342,7 @@ class _ValidatedPytorchStorageDataPklMembers:
     storage_keys_by_data_pkl: dict[str, set[str]]
     storage_probe_keys_by_data_pkl: dict[str, set[str]]
     persistent_id_downgrade_keys_by_data_pkl: dict[str, set[str]]
+    additional_pid_keys_by_data_pkl: dict[str, set[str]]
     storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
 
 
@@ -807,6 +809,7 @@ class PyTorchZipScanner(BaseScanner):
                     path,
                     trusted_pytorch_storage_persistent_id_data_pkl_members=(
                         validated_storage_data_pkl_members.persistent_id_downgrade_keys_by_data_pkl
+                        | validated_storage_data_pkl_members.additional_pid_keys_by_data_pkl
                     ),
                     trusted_storage_blob_members=self._storage_blob_members_from_data_pkl_members(
                         validated_storage_data_pkl_members.storage_keys_by_data_pkl
@@ -8525,6 +8528,13 @@ class PyTorchZipScanner(BaseScanner):
         trusted_members: dict[str, set[str]] = {}
         storage_probe_members: dict[str, set[str]] = {}
         persistent_id_downgrade_members: dict[str, set[str]] = {}
+        additional_pid_keys: dict[str, set[str]] = {}
+        validator_type = getattr(_picklescan_api, "_PytorchZipStoragePidValidator", None)
+        pid_validator = (
+            validator_type(scan_options_from_config(self.config).max_opcodes)
+            if self.pickle_scanner is not None and validator_type is not None
+            else None
+        )
         storage_member_sizes_by_data_pkl: dict[str, dict[str, int]] = {}
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
@@ -8604,6 +8614,18 @@ class PyTorchZipScanner(BaseScanner):
                 pickle_data,
                 opcode_budget_remaining=storage_reference_opcodes_remaining,
             )
+            if pid_validator is not None:
+                pid_trust = pid_validator.validate(
+                    pickle_data,
+                    zip_file,
+                    entries_by_name,
+                    prefix,
+                    storage_entries_by_key,
+                    discovery_complete=reference_parse.parse_complete,
+                    deadline=time.monotonic() + self._get_remaining_time(),
+                )
+                if pid_trust is not None:
+                    additional_pid_keys[data_pkl_member] = pid_trust.storage_keys
             if not reference_parse.parse_complete:
                 self._record_storage_reference_validation_incomplete(
                     result,
@@ -8658,6 +8680,7 @@ class PyTorchZipScanner(BaseScanner):
             storage_keys_by_data_pkl=trusted_members,
             storage_probe_keys_by_data_pkl=storage_probe_members,
             persistent_id_downgrade_keys_by_data_pkl=persistent_id_downgrade_members,
+            additional_pid_keys_by_data_pkl=additional_pid_keys,
             storage_member_sizes_by_data_pkl=storage_member_sizes_by_data_pkl,
         )
 
@@ -9101,7 +9124,7 @@ class PyTorchZipScanner(BaseScanner):
 
     @classmethod
     def _is_pytorch_storage_persistent_id_record(cls, details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
-        if details.get("pickle_rule_code") != "PERSISTENT_ID":
+        if details.get("pickle_rule_code") != "PERSISTENT_ID" or "nested_details" in details:
             return False
         storage_key = details.get("pytorch_storage_key")
         if (

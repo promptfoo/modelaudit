@@ -8766,6 +8766,91 @@ def test_pytorch_zip_data_pkl_keeps_unvalidated_storage_pid_warning(tmp_path: Pa
     )
 
 
+def _legacy_torchscript_v1_tensor_state(*, foreign_second_id: bool) -> bytes:
+    payload = b"\x80\x02" + _pickle_global("__torch__", "Module") + b"q\x00)\x81}("
+    for key, parameter in ((b"0", b"weight"), (b"1", b"bias")):
+        storage_tag = b"foreign" if foreign_second_id and key == b"1" else b"storage"
+        payload += (
+            _pickle_binunicode(parameter)
+            + _pickle_global("torch._utils", "_rebuild_tensor_v2")
+            + b"(("
+            + _pickle_binunicode(storage_tag)
+            + _pickle_global("torch", "FloatStorage")
+            + _pickle_binunicode(key)
+            + _pickle_binunicode(b"cpu")
+            + b"K\x08NtQ"  # eight floats with no legacy view metadata
+            + b"K\x00"
+            + _pickle_int_tuple((8,))
+            + _pickle_int_tuple((1,))
+            + b"\x89"
+            + _pytorch_empty_ordered_dict_reduce_expr()
+            + b"tR"
+        )
+    return payload + b"ubq\x01."
+
+
+@pytest.mark.parametrize("case", ["canonical", "size", "foreign-second-id", "version"])
+def test_legacy_torchscript_v1_storage_ids_require_the_whole_archive_proof(tmp_path: Path, case: str) -> None:
+    path = tmp_path / "module.ot"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", b"2\n" if case == "version" else b"1\n")
+        archive.writestr(
+            "model/code/__torch__.py",
+            "class Module(Module):\n  __parameters__ = ['weight', 'bias']\n",
+        )
+        archive.writestr(
+            "model/data.pkl",
+            _legacy_torchscript_v1_tensor_state(foreign_second_id=case == "foreign-second-id"),
+        )
+        archive.writestr("model/data/0", b"cos\nsystem\n(S'test'\ntR.".ljust(32, b"\x00"))
+        archive.writestr("model/data/1", bytes(31 if case == "size" else 32))
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert any(issue.details.get("associated_global") == "__torch__.Module" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "model/data/0"
+        for issue in result.issues
+    )
+    assert any(
+        issue.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        and issue.details.get("pickle_filename") == "model/data.pkl"
+        for issue in result.issues
+    ) is (case != "canonical")
+    assert any(
+        check.status == CheckStatus.PASSED
+        and check.details.get("trusted_pytorch_archive_context") is True
+        and check.details.get("pytorch_storage_key") == "0"
+        for check in result.checks
+    ) is (case == "canonical")
+
+
+@pytest.mark.parametrize("storage_size", [24, 23])
+def test_large_state_pid_validation_keeps_hidden_member_and_coverage_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_size: int
+) -> None:
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    monkeypatch.setattr(pytorch_zip_scanner_module._picklescan_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    model_path = tmp_path / "state.pt"
+    hidden_pickle = b"cos\nsystem\n(S'x'\ntR."
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", _pytorch_rebuild_tensor_v2_payload())
+        archive.writestr("archive/data/0", hidden_pickle.ljust(storage_size, b"\x00"))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues) is (
+        storage_size != 24
+    )
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_storage_reference_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_marks_storage_reference_opcode_budget_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -9160,6 +9245,19 @@ def test_pytorch_zip_scanner_trusts_all_validated_tensor_storage_bytes_as_non_ex
         and check.details.get("file") == "archive/data/1"
         for check in result.checks
     )
+
+
+def test_pid_retry_skips_explicitly_disabled_pickle_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_retry(*_args: Any, **_kwargs: Any) -> set[str]:
+        pytest.fail("PID validation ran without an embedded pickle scanner")
+
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    monkeypatch.setattr(pytorch_zip_scanner_module._picklescan_api, "_PytorchZipStoragePidValidator", unexpected_retry)
+    path = tmp_path / "checkpoint.pt"
+    _write_referenced_float_storage(path, bytes(24))
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(path))
+    assert "pytorch_zip_storage_reference_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.details.get("skipped_scanner_id") == "pickle" for check in result.checks)
 
 
 def test_pytorch_zip_scanner_keeps_tensor_storage_trust_when_pickle_scanner_is_disabled(tmp_path: Path) -> None:
@@ -21319,6 +21417,7 @@ def test_pytorch_zip_literal_work_budget_checks_timeout_between_member_probes(
         storage_keys_by_data_pkl={"archive/data.pkl": {"0", "1"}},
         storage_probe_keys_by_data_pkl={},
         persistent_id_downgrade_keys_by_data_pkl={},
+        additional_pid_keys_by_data_pkl={},
         storage_member_sizes_by_data_pkl={},
     )
     buffer = io.BytesIO()

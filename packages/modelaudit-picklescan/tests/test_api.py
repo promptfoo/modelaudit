@@ -2989,6 +2989,118 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.coverage.bytes_scanned > 0
 
 
+def _legacy_torchscript_control() -> bytes:
+    control = b"\x80\x02" + _global(b"__torch__", b"Module") + b"q\x00)\x81}("
+    for key, name in ((b"0", b"weight"), (b"1", b"bias")):
+        storage = (
+            b"("
+            + _binunicode(b"storage")
+            + _global(b"torch", b"FloatStorage")
+            + _binunicode(key)
+            + _binunicode(b"cpu")
+            + b"K\x08NtQ"
+        )
+        tensor = _pytorch_rebuild_tensor_v2_payload(
+            storage_expr=storage, global_memo_expr=b"", element_count=8, size=(8,)
+        )
+        control += _binunicode(name) + tensor.removeprefix(b"\x80\x04").removesuffix(b".")
+    return control + b"ub."
+
+
+def _write_legacy_torchscript_zip(
+    path: Path, control: bytes, *, version: bytes = b"1\n", second_storage: bytes | None = bytes(32)
+) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", version)
+        archive.writestr("model/constants.pkl", b"\x80\x02).")
+        archive.writestr(
+            "model/code/__torch__.py",
+            (
+                'op_version_set = 1\nclass Module(Module):\n  __parameters__ = ["weight", "bias", ]\n'
+                '  __annotations__ = []\n  __annotations__["weight"] = Tensor\n  __annotations__["bias"] = Tensor\n'
+            ),
+        )
+        archive.writestr("model/data.pkl", control)
+        archive.writestr("model/data/0", bytes(32))
+        if second_storage is not None:
+            archive.writestr("model/data/1", second_storage)
+
+
+def test_scan_file_torchscript_v1_suppresses_only_proven_storage_ids(tmp_path: Path) -> None:
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, _legacy_torchscript_control())
+
+    report = scan_file(path)
+
+    assert report.metadata["container_type"] == "pytorch_zip"
+    assert not any(f.rule_code == "PERSISTENT_ID" for f in report.findings)
+    assert any(f.details.get("import_reference") == "__torch__.Module" for f in report.findings)
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        pytest.param(b"NtQ", b"K\x00tQ", id="non-none-view"),
+        pytest.param(b"NtQ", _global(b"builtins", b"print") + b")RtQ", id="computed-view"),
+        pytest.param(b"NtQ", b"NQtQ", id="nested-foreign-pid"),
+        pytest.param(b"NtQ", b"t0" + _binunicode(b"foreign") + b"Q", id="late-foreign-pid"),
+        pytest.param(b")RtR", b"}\x85RtR", id="nonempty-hooks-constructor"),
+        pytest.param(b")RtR", b")Rq\x01" + _binunicode(b"k") + b"Ns" + b"tR", id="mutated-hooks"),
+        pytest.param(b"ub.", b"ub", id="missing-stop"),
+        pytest.param(b"ub.", b"ub.\x80\x02N.", id="second-pickle"),
+    ],
+)
+def test_scan_file_torchscript_v1_keeps_aggregate_pid_for_unproven_control(
+    tmp_path: Path, original: bytes, replacement: bytes
+) -> None:
+    control = _legacy_torchscript_control()
+    prefix, matched, suffix = control.rpartition(original)
+    assert matched and b"tQ" in prefix
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, prefix + replacement + suffix)
+
+    report = scan_file(path)
+
+    first_pid_position = control.index(b"tQ") + 1
+    assert any(
+        f.rule_code == "PERSISTENT_ID" and f.location == f"{path}:model/data.pkl (pos {first_pid_position})"
+        for f in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "second_storage"),
+    [(b"2\n", bytes(32)), (b"1\n", bytes(31)), (b"1\n", None)],
+    ids=["other-version", "size-mismatch", "missing-storage"],
+)
+def test_scan_file_torchscript_v1_checks_archive_evidence(
+    tmp_path: Path, version: bytes, second_storage: bytes | None
+) -> None:
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, _legacy_torchscript_control(), version=version, second_storage=second_storage)
+
+    report = scan_file(path)
+
+    assert any(f.rule_code == "PERSISTENT_ID" for f in report.findings)
+
+
+def test_scan_file_torchscript_v1_still_scans_pickle_inside_storage(tmp_path: Path) -> None:
+    path = tmp_path / "model.ot"
+    malicious_storage = b"\x80\x02cos\nsystem\n)R."
+    _write_legacy_torchscript_zip(
+        path, _legacy_torchscript_control(), second_storage=malicious_storage.ljust(32, b"\x00")
+    )
+
+    report = scan_file(path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        f.details.get("name") == "system" and f.location is not None and "model/data/1" in f.location
+        for f in report.findings
+    )
+
+
 def test_scan_file_suppresses_rebuild_tensor_v2_for_valid_canonical_pytorch_zip(tmp_path: Path) -> None:
     _require_torch_distribution()
     archive_path = tmp_path / "model.pt"
@@ -7505,6 +7617,96 @@ def test_scan_file_keeps_untrusted_storage_lookalikes_on_hidden_pickle_path(
     _assert_storage_dangerous_call(report, archive_path)
     if expected_notice_code is not None:
         assert any(notice.code == expected_notice_code for notice in report.notices)
+
+
+@pytest.mark.parametrize("record_count", [100, 2000])
+def test_large_tensor_batches_validate_all_storage_ids_without_changing_discovery(
+    tmp_path: Path, record_count: int
+) -> None:
+    archive_path = tmp_path / "large-state.pt"
+    records = []
+    for record in range(record_count):
+        fields = []
+        for column in range(3):
+            key = str(3 * record + column)
+            tensor = (
+                _pytorch_rebuild_tensor_v2_payload(key=key)[2:-1]
+                if record == 0 and column == 0
+                else _pytorch_rebuild_tensor_v2_reduce_expr(key=key)
+            )
+            fields.append(_short_binunicode(f"field_{column}".encode("ascii")) + tensor)
+        records.append(b"}(" + b"".join(fields) + b"u")
+    batches = (b"(" + b"".join(records[i : i + 1000]) + b"e" for i in range(0, len(records), 1000))
+    payload = b"\x80\x04]" + b"".join(batches) + b"."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", payload)
+        for i in range(len(records) * 3):
+            archive.writestr(f"archive/data/{i}", bytes(24))
+
+    report = scan_file(archive_path)
+
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "none",
+        "size",
+        "missing",
+        "foreign-pid",
+        "device",
+        "second-stream",
+        "truncated",
+        "budget",
+        "provenance",
+        "bytes-key",
+        "tuple-setitem",
+        "tuple-dict",
+        "spaced-global",
+    ],
+)
+def test_large_storage_pid_proof_requires_complete_archive_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    monkeypatch.setattr(package_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    if defect == "provenance":
+        monkeypatch.setattr(package_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES", 1)
+    first = _pytorch_rebuild_tensor_v2_payload(key="0")[2:-1]
+    last = _pytorch_rebuild_tensor_v2_reduce_expr(key="1", location="custom:0" if defect == "device" else "cpu")
+    if defect == "bytes-key":
+        last = last.replace(_short_binunicode(b"1"), b"C\x011")
+    if defect == "spaced-global":
+        first = first.replace(b"torch._utils\n", b"torch._utils \n")
+    payload = b"\x80\x04}" + _short_binunicode(b"a") + first + b"s" + _short_binunicode(b"b") + last + b"s"
+    if defect == "foreign-pid":
+        payload += b"K\x01Q"
+    if defect in {"tuple-setitem", "tuple-dict"}:
+        repeated_tuple = b"K\x01\x85" + b"2\x86" * 8
+        payload += b"(" + repeated_tuple + b"Nd0" if defect == "tuple-dict" else repeated_tuple + b"Ns"
+    if defect != "truncated":
+        payload += b"."
+    if defect == "second-stream":
+        payload += b"Pexternal\n."
+    archive_path = tmp_path / "checkpoint.pt"
+    hidden_pickle = b"cos\nsystem\n(S'x'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/data/0", hidden_pickle.ljust(24, b"\x00"))
+        if defect != "missing":
+            archive.writestr("archive/data/1", bytes(23 if defect == "size" else 24))
+    options = ScanOptions(max_opcodes=20) if defect == "budget" else ScanOptions()
+
+    report = scan_file(archive_path, options=options)
+
+    assert any(f.rule_code == "PERSISTENT_ID" for f in report.findings) is (defect != "none")
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
+    _assert_storage_dangerous_call(report, archive_path)
 
 
 def test_scan_file_marks_storage_reference_opcode_budget_incomplete(
