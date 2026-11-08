@@ -1217,7 +1217,7 @@ def test_readme_bitcoin_addresses_require_a_valid_base58check_payload(tmp_path: 
     readme = tmp_path / "README.md"
     links = [f"https://colab.research.google.com/drive/{value}" for value in notebook_ids]
     content = "\n".join([*links, *addresses, "-----BEGIN RSA PRIVATE KEY-----"])
-    readme.write_text(content, encoding="utf-8")
+    readme.write_bytes(content.encode("utf-8"))
 
     result = scan_file(str(readme), config={"cache_scan_results": False})
 
