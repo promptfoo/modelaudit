@@ -12,6 +12,7 @@ on:
       - "requirements-tensorflow.txt"
       - "uv.lock"
       - ".github/workflows/docker-image-test.yml"
+      - ".github/scripts/fetch-verified-release.sh"
   push:
     branches:
       - main
@@ -45,11 +46,13 @@ jobs:
               - 'pyproject.toml'
               - 'uv.lock'
               - '.github/workflows/docker-image-test.yml'
+              - '.github/scripts/fetch-verified-release.sh'
             full-image:
               - 'Dockerfile.full'
               - 'docker-install-rust.sh'
               - 'packages/modelaudit-picklescan/**'
               - '.github/workflows/docker-image-test.yml'
+              - '.github/scripts/fetch-verified-release.sh'
             tensorflow-image:
               - 'Dockerfile.tensorflow'
               - 'docker-install-rust.sh'
@@ -58,6 +61,7 @@ jobs:
               - 'packages/modelaudit-picklescan/**'
               - 'pyproject.toml'
               - '.github/workflows/docker-image-test.yml'
+              - '.github/scripts/fetch-verified-release.sh'
 
   build-test-lightweight:
     name: Build and Test Lightweight Docker Image
@@ -103,12 +107,30 @@ jobs:
           # This should fail gracefully
           docker run --rm modelaudit:lightweight invalid-command && exit 1 || echo "Command properly rejected invalid input"
 
+      - &cache-trivy
+        name: Cache Trivy archive
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/trivy-0.69.2-linux-amd64.tar.gz
+          key: trivy-linux-amd64-0.69.2
+
+      - &install-trivy
+        name: Install verified Trivy
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/trivy-0.69.2-linux-amd64.tar.gz"
+          bash .github/scripts/fetch-verified-release.sh "$archive" \
+            affa59a1e37d86e4b8ab2cd02f0ab2e63d22f1bf9cf6a7aa326c884e25e26ce3 \
+            https://github.com/aquasecurity/trivy/releases/download/v0.69.2/trivy_0.69.2_Linux-64bit.tar.gz \
+            https://api.github.com/repos/aquasecurity/trivy/releases/assets/364790855
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/trivy-bin" trivy
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
-          # Pin an explicit released Trivy binary to avoid setup failures when
-          # auto-resolved tags exist without matching release assets.
-          version: v0.69.2
+          skip-setup-trivy: true
           image-ref: modelaudit:lightweight
           format: table
           exit-code: "1"
@@ -166,11 +188,13 @@ jobs:
         run: |
           docker run --rm modelaudit:full python -c "import os; uid = os.getuid(); print(f'Container UID: {uid}'); assert uid == 10001"
 
+      - *cache-trivy
+      - *install-trivy
+
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
-          # Keep full-image scan on the same pinned released Trivy version.
-          version: v0.69.2
+          skip-setup-trivy: true
           image-ref: modelaudit:full
           format: table
           exit-code: "1"
@@ -218,10 +242,13 @@ jobs:
         run: |
           docker run --rm --entrypoint python modelaudit:tensorflow -c "import os, tensorflow; print(tensorflow.__version__); assert os.getuid() == 10001"
 
+      - *cache-trivy
+      - *install-trivy
+
       - name: Scan TensorFlow image for vulnerabilities
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
-          version: v0.69.2
+          skip-setup-trivy: true
           image-ref: modelaudit:tensorflow
           format: table
           exit-code: "1"

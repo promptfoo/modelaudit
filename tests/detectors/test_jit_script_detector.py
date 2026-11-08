@@ -272,6 +272,14 @@ class TestJITScriptDetector:
 
         assert any(getattr(finding, "import_", "") == "os" for finding in findings)
 
+    def test_torchscript_load_followed_by_weights_only_is_not_a_legacy_tar_bypass(
+        self, detector: JITScriptDetector
+    ) -> None:
+        findings = detector.scan_advanced_torchscript_vulnerabilities(
+            b"script = torch.jit.load(script_path)\nweights = torch.load(weights_path, weights_only=True)"
+        )
+        assert all("CVE-2025-32434" not in finding.message for finding in findings)
+
     def test_detect_dangerous_builtins(self, detector: JITScriptDetector) -> None:
         """Test detection of dangerous builtins like eval, exec."""
 

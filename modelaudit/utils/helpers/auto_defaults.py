@@ -178,23 +178,30 @@ def generate_auto_defaults(paths: list[str]) -> dict[str, Any]:
     tty_caps = detect_tty_capabilities()
     is_ci = detect_ci_environment()
 
-    # Generate defaults
-    use_cache = _should_use_cache(input_types)
+    has_cloud = any(source.startswith("cloud_") for source in input_types)
+    has_cloud_download = any(source in ("cloud_s3", "cloud_gcs", "cloud_azure") for source in input_types)
+    has_registry = any(source in ("huggingface", "pytorch_hub", "mlflow", "jfrog") for source in input_types)
+    use_cache = has_cloud_download or has_registry
+
     defaults = {
         # Progress settings
-        "show_progress": _should_show_progress(input_types, max_file_size, tty_caps, is_ci),
+        "show_progress": (
+            not is_ci and bool(tty_caps["is_tty"]) and (has_cloud or has_registry or max_file_size > 100 * 1024**2)
+        ),
         "large_model_support": max_file_size > (1024 * 1024 * 1024),  # >1GB
         # Caching settings
         "use_cache": use_cache,
         # Download settings
-        "selective_download": _should_use_selective_download(input_types),
+        # Remote registries can filter server-side. Strict mode can override this later.
+        "selective_download": has_cloud_download or any(source in ("huggingface", "jfrog") for source in input_types),
         "stream_analysis": max_file_size > (10 * 1024 * 1024 * 1024),  # >10GB
         # File processing settings
-        "skip_non_model_files": not _has_strict_mode_inputs(input_types),
+        # Local directories may contain mixed file types.
+        "skip_non_model_files": "local_directory" not in input_types,
         # Timeout settings
-        "timeout": _calculate_auto_timeout(input_types, max_file_size),
+        "timeout": _calculate_auto_timeout(has_cloud, max_file_size),
         # Size limits
-        "max_file_size": _calculate_auto_size_limit(input_types),
+        "max_file_size": 50 * 1024**3 if has_cloud else 0,  # Bound cloud downloads; unlimited otherwise.
         # Output settings
         "format": "json" if is_ci else "text",
         "colors": tty_caps["colors_supported"] and not is_ci,
@@ -203,75 +210,19 @@ def generate_auto_defaults(paths: list[str]) -> dict[str, Any]:
 
     # Only set cache_dir if caching is enabled
     if use_cache:
-        defaults["cache_dir"] = _get_default_cache_dir()
+        defaults["cache_dir"] = str(Path.home() / ".modelaudit" / "cache")
 
     return defaults
 
 
-def _should_show_progress(input_types: list[str], max_size: int, tty_caps: dict[str, bool], is_ci: bool) -> bool:
-    """Determine if progress should be shown by default."""
-    if is_ci or not tty_caps["is_tty"]:
-        return False
-
-    # Show progress for cloud operations or large files
-    has_cloud = any(t.startswith("cloud_") for t in input_types)
-    has_remote = any(t in ["huggingface", "pytorch_hub", "mlflow", "jfrog"] for t in input_types)
-    is_large = max_size > (100 * 1024 * 1024)  # >100MB
-
-    return has_cloud or has_remote or is_large
-
-
-def _should_use_cache(input_types: list[str]) -> bool:
-    """Determine if caching should be enabled by default."""
-    # Enable caching for any remote/cloud operations
-    remote_types = ["cloud_s3", "cloud_gcs", "cloud_azure", "huggingface", "pytorch_hub", "mlflow", "jfrog"]
-    return any(t in remote_types for t in input_types)
-
-
-def _get_default_cache_dir() -> str:
-    """Get default cache directory."""
-    return str(Path.home() / ".modelaudit" / "cache")
-
-
-def _should_use_selective_download(input_types: list[str]) -> bool:
-    """Determine if selective download should be used."""
-    # Remote registries benefit from server-side filtering to avoid downloading
-    # entire model trees by default. Strict mode can still override this later.
-    return any(t in ["cloud_s3", "cloud_gcs", "cloud_azure", "huggingface", "jfrog"] for t in input_types)
-
-
-def _has_strict_mode_inputs(input_types: list[str]) -> bool:
-    """Determine if inputs suggest strict mode should be default."""
-    # Local directories might have mixed file types, so don't be strict by default
-    return any(t == "local_directory" for t in input_types)
-
-
-def _calculate_auto_timeout(input_types: list[str], max_size: int) -> int:
-    """Calculate timeout based on input characteristics."""
-    base_timeout = 3600  # 1 hour default
-
-    # Increase timeout for cloud operations
-    if any(t.startswith("cloud_") for t in input_types):
-        base_timeout *= 2  # 2 hours for cloud
-
-    # Increase timeout for very large files
-    if max_size > (10 * 1024 * 1024 * 1024):  # >10GB
-        base_timeout *= 3  # 3 hours for very large files
-    elif max_size > (1 * 1024 * 1024 * 1024):  # >1GB
-        base_timeout = int(base_timeout * 1.5)  # 1.5 hours for large files
-
-    return base_timeout
-
-
-def _calculate_auto_size_limit(input_types: list[str]) -> int:
-    """Calculate size limits based on input type."""
-    # No limit by default (0 = unlimited)
-    if any(t.startswith("cloud_") for t in input_types):
-        # 50GB limit for cloud to prevent runaway downloads
-        return 50 * 1024 * 1024 * 1024
-
-    # No limits for local files
-    return 0
+def _calculate_auto_timeout(has_cloud: bool, max_size: int) -> int:
+    """Allow extra time for cloud downloads and large models."""
+    timeout = 7200 if has_cloud else 3600
+    if max_size > 10 * 1024**3:
+        return timeout * 3
+    if max_size > 1024**3:
+        return int(timeout * 1.5)
+    return timeout
 
 
 def apply_auto_overrides(user_args: dict[str, Any], auto_defaults: dict[str, Any]) -> dict[str, Any]:

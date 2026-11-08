@@ -182,6 +182,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "priority": 6,
         },
         "pytorch_zip": {
+            "version": "1.1",
             "class": "PyTorchZipScanner",
             "description": "Scans PyTorch model files for suspicious code in embedded pickles",
             "extensions": [".pt", ".pth", ".ckpt", ".pkl", ".bin"],

@@ -22844,7 +22844,6 @@ class JITScriptDetector:
 
         # 8. TorchScript version-specific vulnerability patterns
         version_vulnerabilities = [
-            (r"torch\.jit\.load.*weights_only\s*=\s*True", "CVE-2025-32434: weights_only=True bypass pattern"),
             (r"torch\.load.*map_location.*exec", "Map location with code execution"),
             (r"torch\.serialization\..*exec", "Serialization with exec pattern"),
             (r"torch\._C\..*eval", "Internal C++ interface with eval"),
