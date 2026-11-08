@@ -34,6 +34,7 @@ from ..helpers.json_limits import validate_json_structural_limits
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
+from .safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
 
 # Known GGML header variants (older formats like GGMF and GGJT)
 GGML_MAGIC_VARIANTS = {
@@ -123,7 +124,8 @@ _SENTENCEPIECE_MIN_STRONG_PIECES = 8
 _SENTENCEPIECE_MAX_PIECE_FIELDS = 16
 _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
 _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES = 512
-_SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 512
+_SENTENCEPIECE_MAX_METADATA_FIELDS = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 4096
 _SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES = 64 * 1024
 _SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES = 4096
 _SENTENCEPIECE_UNKNOWN_PIECE_TYPE = 2
@@ -339,6 +341,15 @@ _STRUCTURED_JSON_TRAILING_READ_BYTES = 64 * 1024
 FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
 _FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
 _FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
+_FLAX_AUXILIARY_SUFFIXES = frozenset({".a", ".cact", ".dylib", ".jsonl", ".log", ".so", ".vocab", ".wav"})
+_FLAX_AUXILIARY_KEY_SCAN_BYTES = 128 * 1024 * 1024
+# Every supported MessagePack str/bin encoding ends its header with the key length.
+# Fixstr stores the same length in the low five bits of the marker itself.
+_FLAX_ROUTING_KEY_ENDINGS = tuple(
+    bytes([length_prefix | len(key)]) + key.encode("ascii")
+    for key in _FLAX_MSGPACK_ROUTING_KEYS
+    for length_prefix in (0, 0xA0)
+)
 _FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
 _FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
 _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
@@ -1936,6 +1947,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
 
     tekken = _TEKKEN_JSON_FILENAME.fullmatch(file_path.name.lower()) is not None
     tekken_vocab_seen = False
+    tekken_version: str | None = None
     stack: list[_JSONStreamContext] = []
     root_keys: set[str] = set()
     model_keys: set[str] = set()
@@ -2006,7 +2018,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         ):
             raise _JSONProbeInvalid
         if tekken and context.kind == "object":
-            if context.seen_keys != _TEKKEN_FIELDS.get(context.path):
+            legacy_root = context.path == () and tekken_version == "v7" and context.seen_keys == {"config", "vocab"}
+            if not legacy_root and context.seen_keys != _TEKKEN_FIELDS.get(context.path):
                 raise _JSONProbeInvalid
             if context.path == ("vocab", "[]"):
                 tekken_vocab_seen = True
@@ -2080,14 +2093,16 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         context.mode = "colon"
 
     def note_string_value(value: str | None) -> None:
-        nonlocal model_type
+        nonlocal model_type, tekken_version
         if tekken and value is not None:
             if string_path == ("vocab", "[]", "token_bytes") and not (
                 len(value) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value)
             ):
                 raise _JSONProbeInvalid
-            if string_path == ("config", "version") and not re.fullmatch(r"v[0-9]+", value):
-                raise _JSONProbeInvalid
+            if string_path == ("config", "version"):
+                if not re.fullmatch(r"v[0-9]+", value):
+                    raise _JSONProbeInvalid
+                tekken_version = value
             if string_path == ("config", "pattern") and any(
                 marker in value for marker in _JSON_PROBE_TEMPLATE_INDICATORS
             ):
@@ -2745,7 +2760,11 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
         if file_size < 4:
             return None
 
-        read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+        probe_index = (
+            file_path.name.lower() == "model.safetensors.index.json"
+            and MXNET_SYMBOL_SIGNATURE_READ_BYTES < file_size <= INDEX_PROBE_BYTES
+        )
+        read_size = file_size + 1 if probe_index else min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
         with file_path.open("rb") as handle:
             prefix = handle.read(read_size)
             normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
@@ -2753,6 +2772,9 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
             if trimmed_prefix and not trimmed_prefix.startswith(b"{"):
                 return None
     except OSError:
+        return None
+
+    if probe_index and len(prefix) == file_size and is_plain_safetensors_index(prefix):
         return None
 
     is_disguised_non_json = file_path.suffix.lower() != ".json"
@@ -2883,6 +2905,9 @@ class _PickleStructuralArgumentInconclusive(ValueError):
 
 def _canonicalize_cpython_numeric_line(opcode_byte: int, line: bytes) -> bytes | None:
     """Return a pickletools-readable line matching CPython's numeric parser."""
+    # A truncated memo index can still be ruled out by its first byte.
+    if opcode_byte in (ord("p"), ord("g")) and line and line[0] not in b"0123456789+- \t\r\v\f":
+        return _INVALID_PICKLE_NUMERIC_LINE
     if opcode_byte not in b"IFLpg" or not line.endswith(b"\n"):
         return None
 
@@ -3093,6 +3118,11 @@ def _gen_pickle_probe_ops(stream: _PickleProbeStream) -> Iterator[tuple[Any, Any
                 if not global_name:
                     raise ValueError(f"empty global name in {opcode.name} argument")
                 argument = ("global_argument", module_name, global_name)
+            elif opcode.name in {"PUT", "GET"} and opcode.arg is not None:
+                line = stream.readline()
+                if line == _INVALID_PICKLE_NUMERIC_LINE:
+                    raise ValueError(f"at position {position}, opcode {opcode.name} has an invalid memo index")
+                argument = opcode.arg.reader(BytesIO(line))
             elif opcode.name in {"SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
                 length_size = {"SHORT_BINBYTES": 1, "BINBYTES": 4, "BINBYTES8": 8, "BYTEARRAY8": 8}[opcode.name]
                 length_bytes = stream.read(length_size)
@@ -3444,7 +3474,7 @@ def _is_well_formed_sentencepiece_submessage_stream(
     end_offset: int,
     *,
     expected_wire_types: dict[int, int] | None = None,
-    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+    max_fields: int = _SENTENCEPIECE_MAX_METADATA_FIELDS,
 ) -> bool:
     fields_seen = 0
     while stream.tell() < end_offset and fields_seen < max_fields:
@@ -4142,7 +4172,7 @@ def _looks_like_coreml_description_proto_prefix(data: bytes, *, sample_is_prefix
         tag, value_offset = tag_result
         field_number = tag >> 3
         wire_type = tag & 0x07
-        if field_number == 0:
+        if field_number == 0 or wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
             return False
 
         if wire_type == 2 and field_number in _COREML_DESCRIPTION_FIELD_HINTS:
@@ -4211,7 +4241,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool
         tag, value_offset = tag_result
         field_number = tag >> 3
         wire_type = tag & 0x07
-        if field_number == 0:
+        if field_number == 0 or wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
             return False
         if field_number == 1 and wire_type != 0:
             return False
@@ -4451,8 +4481,13 @@ def _classify_protocolless_binary_pickle_security_signal(
         for opcode, _arg, position in pickletools.genops(sample):
             opcode_count += 1
             opcode_name = opcode.name
-            if opcode_name == "PROTO" and opcode_count == 1:
-                return False
+            if opcode_count == 1:
+                if opcode_name == "PROTO":
+                    return False
+                # A stack-consuming data opcode cannot start a fresh load. For
+                # example, TUPLE in "torch" fails before the apparent OBJ.
+                if opcode.stack_before and opcode_name not in _BINARY_PICKLE_SECURITY_OPCODES:
+                    return False
             if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_OPCODES:
                 has_binary_opcode = True
             if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
@@ -5049,15 +5084,38 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
     return _validated_safetensors_routing_header(path, magic8, file_size) is not None
 
 
-def has_safetensors_routing_candidate(path: str) -> bool:
-    """Return whether a local file has bounded plausible SafeTensors framing."""
+def safetensors_length_has_pickle_extension(magic8: bytes) -> bool:
+    """Recognize a reachable registry lookup followed by an invalid opcode in the length field."""
+    stream = BytesIO(magic8)
+    try:
+        for opcode, code, _ in pickletools.genops(stream):
+            if opcode.name in {"NEWTRUE", "NEWFALSE"}:
+                continue
+            return (
+                opcode.name in {"EXT1", "EXT2", "EXT4"}
+                and isinstance(code, int)
+                and code > 0
+                and stream.read(1) == b"\x00"
+            )
+    except (ValueError, OverflowError):
+        # A malformed pickle prefix cannot reach an extension lookup.
+        return False
+    return False
+
+
+def safetensors_routing_prefix(path: str) -> bytes | None:
+    """Return the length prefix for bounded plausible SafeTensors framing."""
     file_path = Path(path)
     try:
         file_size = file_path.stat().st_size
         magic8 = read_magic_bytes(path, 8)
     except OSError:
-        return False
-    return _is_safetensors_routing_candidate(file_path, magic8, file_size)
+        return None
+    return magic8 if _is_safetensors_routing_candidate(file_path, magic8, file_size) else None
+
+
+def has_safetensors_routing_candidate(path: str) -> bool:
+    return safetensors_routing_prefix(path) is not None
 
 
 def _apply_pickle_stack_effect(
@@ -5628,6 +5686,10 @@ def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_siz
         return "safetensors"
 
     header_len, header = validated_header
+    if header is not None and safetensors_length_has_pickle_extension(magic8):
+        # The extension lookup remains independently actionable. Archive dispatch
+        # composes the pickle scanner with the primary SafeTensors scanner.
+        return "safetensors"
     try:
         if header is None:
             with path.open("rb") as handle:
@@ -8030,6 +8092,18 @@ def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpoint
             return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
 
+    if file_path.suffix.lower() == ".jsonl":
+        first_line, newline, rest = prefix.lstrip().partition(b"\n")
+        if newline and rest.lstrip().startswith(b"{"):
+            try:
+                first_object = json.loads(first_line)
+            except (ValueError, RecursionError):
+                pass
+            else:
+                if isinstance(first_object, dict):
+                    # Subsequent records cannot add fields to this complete JSON root.
+                    return has_jax_json_checkpoint_structure(first_object)
+
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
     except json.JSONDecodeError:
@@ -8317,7 +8391,30 @@ def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | 
     """Inspect streamed maps, returning None when safe routing cannot complete."""
     try:
         with path.open("rb") as stream:
-            return _probe_flax_msgpack_checkpoint_stream(stream, file_size)
+            outcome = _probe_flax_msgpack_checkpoint_stream(stream, file_size)
+            if outcome is not None or file_size > _FLAX_AUXILIARY_KEY_SCAN_BYTES:
+                return outcome
+            if path.suffix.lower() not in _FLAX_AUXILIARY_SUFFIXES:
+                stream.seek(0)
+                if not stream.read(4).startswith(b"\x7fELF"):
+                    return None
+
+            # A delayed checkpoint root may lie beyond the structural probe budget.
+            # Exclude it only if every byte rules out all supported routing keys.
+            stream.seek(0)
+            remaining = file_size
+            overlap = max(map(len, _FLAX_ROUTING_KEY_ENDINGS)) - 1
+            tail = b""
+            while remaining:
+                chunk = stream.read(min(remaining, FLAX_MSGPACK_STRUCTURE_READ_BYTES))
+                if not chunk:
+                    return None
+                window = tail + chunk
+                if any(ending in window for ending in _FLAX_ROUTING_KEY_ENDINGS):
+                    return None
+                tail = window[-overlap:]
+                remaining -= len(chunk)
+            return None if stream.read(1) else False
     except OSError:
         return None
 
@@ -9061,6 +9158,30 @@ def _detect_complete_media_route_from_trailing(trailing: bytes, *, sample_is_pre
     return VALID_MEDIA_ROUTING_FORMAT
 
 
+def _detect_pcm_wave_route(header: bytes, file_size: int | None, read_at: Callable[[int, int], bytes]) -> str | None:
+    """Inspect trailing bytes on canonical PCM WAVE files without masking overlapping model formats."""
+    if len(header) < 44 or header[:4] != b"RIFF" or header[8:16] != b"WAVEfmt " or header[36:40] != b"data":
+        return None
+    fmt_size, codec, channels, sample_rate, byte_rate, frame_size, bits = struct.unpack_from("<IHHIIHH", header, 16)
+    if fmt_size != 16 or codec != 1 or not channels or not sample_rate or bits not in {8, 16, 24, 32}:
+        return None
+    if frame_size != channels * (bits // 8) or byte_rate != sample_rate * frame_size:
+        return None
+    data_size = int.from_bytes(header[40:44], "little")
+    riff_end = 8 + int.from_bytes(header[4:8], "little")
+    if data_size % frame_size or riff_end != 44 + data_size + (data_size % 2):
+        return None
+    if file_size is None or riff_end >= file_size:
+        return None
+    trailing_size = file_size - riff_end
+    try:
+        trailing = read_at(riff_end, min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1))
+    except (OSError, ValueError):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    route = _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=len(trailing) < trailing_size)
+    return None if route == VALID_MEDIA_ROUTING_FORMAT else route
+
+
 def _could_start_bounded_media_route(file_path: Path, sample: bytes, *, sample_is_prefix: bool = True) -> bool:
     """Return whether bounded bytes plausibly begin a supported media stream."""
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
@@ -9185,6 +9306,17 @@ def _detect_seekable_jpeg_media_route(file_path: Path, file_size: int, sample: b
 
 def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
     """Inspect a bounded complete media sample before serialized fallback routing."""
+    if file_path.suffix.lower() == ".wav":
+        try:
+            header = read_magic_bytes(str(file_path), 44)
+        except OSError:
+            return None
+        wave_route = _detect_pcm_wave_route(
+            header, file_size, lambda offset, size: _read_local_media_range(file_path, header, offset, size)
+        )
+        if wave_route is not None and _probe_flax_msgpack_checkpoint_file(file_path) is not False:
+            return None
+        return wave_route
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
         return None
     try:

@@ -307,20 +307,33 @@ def test_text_scanner_hashes_only_complete_inspected_content(truncated: bool, tm
         assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_real_scan_supplies_matching_document_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    fixture = report_for_case(tmp_path)
-    post = mock_api(monkeypatch, [assessment()])
-    args = ["scan", fixture.assets[0].path, "--format", "json", "--no-cache", "--quiet"]
-    result = CliRunner().invoke(cli_module.cli, args)
-    assert result.exit_code == 1, result.output
+def _write_real_scan_case(tmp_path: Path, case_id: str) -> Path:
+    document = next(case["document"] for case in CORPUS["cases"] if case["case_id"] == case_id)
+    path = tmp_path.resolve() / "README.md"
+    path.write_bytes(document.encode("utf-8"))
+    return path
+
+
+@pytest.mark.parametrize(("case_id", "expected_exit"), [("routine_clone", 0), ("clone_then_execute", 1)])
+def test_real_scan_triages_only_actionable_documentation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_id: str, expected_exit: int
+) -> None:
+    path = _write_real_scan_case(tmp_path, case_id)
+    post = mock_api(monkeypatch, [assessment(classification="needs_attention")])
+
+    result = CliRunner().invoke(cli_module.cli, ["scan", str(path), "--format", "json", "--no-cache", "--quiet"])
+    assert result.exit_code == expected_exit, result.output
     report = json.loads(result.stdout)
-    assert (
-        report["file_metadata"][fixture.assets[0].path]["text_content_sha256"]
-        == hashlib.sha256(Path(fixture.assets[0].path).read_bytes()).hexdigest()
-    )
+    assert report["file_metadata"][str(path)]["text_content_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    if expected_exit == 0:
+        post.assert_not_called()
+        return
+
+    post.assert_called_once()
     evidence = json.loads(post.call_args.kwargs["json"]["input"])
     if os.name == "posix":
-        assert evidence["findings"][0]["document"] == CORPUS["cases"][0]["document"]
+        assert evidence["findings"][0]["document"] == path.read_text(encoding="utf-8")
+    assert "needs_attention" in result.stderr
 
 
 def test_request_budgets_are_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -534,10 +547,10 @@ entry._run()
 
 
 def test_dry_run_never_calls_triage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    scanned = report_for_case(tmp_path)
+    path = _write_real_scan_case(tmp_path, "clone_then_execute")
     post = mock_api(monkeypatch, [])
-    result = CliRunner().invoke(cli_module.cli, ["scan", scanned.assets[0].path, "--dry-run", "--no-cache", "--quiet"])
-    assert result.exit_code == determine_exit_code(scanned), result.output
+    result = CliRunner().invoke(cli_module.cli, ["scan", str(path), "--dry-run", "--no-cache", "--quiet"])
+    assert result.exit_code == 1, result.output
     post.assert_not_called()
 
 
