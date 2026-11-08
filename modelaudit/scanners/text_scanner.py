@@ -26,7 +26,7 @@ from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FI
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
@@ -753,7 +753,8 @@ DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN = re.compile(
     rb");\s*$",
 )
 DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
-    rb"\b(?:beacon|callback|c2|command(?:[_ -]+and[_ -]+control)?|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
+    rb"\b(?:beacon|callback|c2|command(?![ -]+line(?:[ -]+interface)?[ \t]*:)(?:[_ -]+and[_ -]+control)?"
+    rb"|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
     rb"(?P<suffix>[^\n:]{0,32}):\s*$",
     re.IGNORECASE,
 )
@@ -775,6 +776,10 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"|\b(?:detect(?:ing|ion|s)?|mitigat(?:e|ing|ion)|resistan(?:ce|t)|robust(?:ness)?)\s+"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\b"
+    rb"|\b(?:does|do|will)\s+not\s+detect\s+[\w-]+\s+(?:and|or)\s+"
+    + GENERIC_CC_BENIGN_TERM_PATTERN
+    + rb"\b(?=[.!]?\s*$)"
+    rb"|\b(?:kill|reap|terminate)\s+zombie\s+(?:(?:gpu|cpu)\s+)?(?:process(?:es)?|procs?)\b"
     rb")",
     re.IGNORECASE,
 )
@@ -3697,6 +3702,9 @@ class TextScanner(BaseScanner):
         ordered_items: list[tuple[str, int | tuple[int, int, str, str]]] = []
         standalone: dict[int, dict[str, Any]] = {}
         for index, finding in enumerate(findings):
+            finding = {**finding, "evidence_source": "documentation"}
+            if finding.get("type") == "url_detected" and isinstance(url := finding.get("url"), str):
+                finding["message"] = f"URL detected in documentation: {url[:100]}"
             evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences, line_lookup)
             if evidence is None:
                 ordered_items.append(("standalone", index))
@@ -3750,6 +3758,7 @@ class TextScanner(BaseScanner):
         findings: list[dict[str, Any]],
         *,
         allow_documentation_image_examples: bool = False,
+        payload_complete: bool = True,
     ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
@@ -3757,9 +3766,10 @@ class TextScanner(BaseScanner):
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         filename = os.path.basename(path).lower()
-        routine_url_spans = (
-            routine_documentation_url_spans(payload)
+        routine_network_spans = (
+            routine_documentation_network_spans(payload)
             if findings
+            and payload_complete
             and os.path.splitext(filename)[1] in {"", ".md", ".markdown"}
             and (cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename))
             else ()
@@ -3808,7 +3818,7 @@ class TextScanner(BaseScanner):
             position = finding.get("position")
             routine_example = (
                 isinstance(position, int)
-                and any(start <= position < end for start, end in routine_url_spans)
+                and any(start <= position < end for start, end in routine_network_spans)
                 and (
                     cls._documentation_network_command_is_correlatable(finding)
                     or (
@@ -4032,6 +4042,7 @@ class TextScanner(BaseScanner):
                         inspected_payload,
                         network_findings,
                         allow_documentation_image_examples=allow_documentation_image_examples,
+                        payload_complete=not truncated,
                     )
                 )
                 network_findings = self._deduplicate_documentation_network_findings(

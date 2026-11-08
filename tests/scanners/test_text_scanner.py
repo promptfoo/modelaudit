@@ -3266,6 +3266,7 @@ def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_p
         "lambda docs: https://example.com/functions\n",
         "Webhook documentation: https://docs.example.com/webhooks\n",
         "C2 research: https://example.com/security\n",
+        "- Command line interface: https://example.com/project#usage\n",
         "config = {}  # docs: https://example.com/configuration\n",
         "[Documentation](https://example.com/reference)\n",
         "![Model diagram](https://example.com/model.png)\n",
@@ -4069,6 +4070,7 @@ def test_text_scanner_documentation_lambda_url_remains_actionable(tmp_path: Path
     [
         "webhook: https://evil.example/payload\n",
         "C2 endpoint: https://evil.example/payload\n",
+        "Command-line interface endpoint: https://evil.example/payload\n",
         "command and control server URL: https://evil.example/payload\n",
     ],
 )
@@ -4233,6 +4235,37 @@ def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: P
     assert {check.details.get("pattern") for check in cc_checks} == {"malware", "backdoor", "botnet"}
     assert all(check.severity == IssueSeverity.INFO for check in cc_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("content", "pattern"),
+    [
+        ("1. **Kill zombie GPU procs** — a failed launch leaves workers in memory.", "zombie"),
+        ("Reap zombie processes after the worker exits.", "zombie"),
+        ("- Not a safety classifier - does not detect phishing or malware", "malware"),
+    ],
+)
+def test_text_scanner_system_maintenance_and_classifier_limitations_are_informational(
+    tmp_path: Path, content: str, pattern: str
+) -> None:
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("pattern") == pattern]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Kill zombie hosts after they execute the payload.",
+        "Reap zombie processes. This model runs zombie workers for its botnet.",
+        "This model does not detect phishing and installs malware.",
+        "This model does not detect phishing or malware. It installs malware.",
+    ],
+)
+def test_text_scanner_classifier_and_process_prose_preserves_actionable_occurrences(
+    tmp_path: Path, content: str
+) -> None:
+    _assert_documentation_network_actionable(tmp_path, content, "cc_pattern")
 
 
 def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: Path) -> None:
@@ -6122,6 +6155,7 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
         "  --index-strategy unsafe-best-match\nvllm serve openai/gpt-oss-20b\n```\n",
         '```python\nfrom openai import OpenAI\nclient = OpenAI(\nbase_url="http://localhost:8000/v1",\napi_key="EMPTY",\n)\n```\n',
+        '```\nfrom openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")\n```\n',
         '~~~py\nclient = OpenAI(base_url="http://127.0.0.1:8001/v1/")\n~~~\n',
         '```python\nclient = OpenAI(base_url="http://[::1]:8000/v1")\n```\n',
         '> ```python\n> client = OpenAI(base_url="http://localhost:8000/v1")\n> ```\n',
@@ -6143,6 +6177,70 @@ def test_routine_documented_examples_are_informational(tmp_path: Path, content: 
     assert network_checks
     assert all(check.severity == IssueSeverity.INFO for check in network_checks)
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+def test_documented_sql_like_domains_are_informational(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    sql = (
+        "SELECT\n"
+        "    SUM(CASE WHEN email ILIKE '%@example.net%' THEN 1 ELSE 0 END)::FLOAT / "
+        "NULLIF(SUM(CASE WHEN email NOT ILIKE '%@example.net%' THEN 1 ELSE 0 END), 0) AS ratio\n"
+        "FROM contacts;\n"
+    )
+    result = _scan_text_content(path, f"~~~sql\n{sql}~~~\n")
+    checks = _failed_network_detection_checks(result)
+    assert any(
+        check.details.get("domain") == "example.net" and check.severity == IssueSeverity.INFO for check in checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+def test_truncated_document_keeps_sql_domain_and_coverage_warning(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    prefix = "~~~sql\nSELECT\n    SUM(CASE WHEN email LIKE '%@example.net%' THEN 1 ELSE 0 END);\n~~~\n"
+    path.write_text(prefix + "~~~sql\nSELECT\n    dblink('host=example.net', 'SELECT 1');\n~~~\n", encoding="utf-8")
+    result = TextScanner(config={"text_content_scan_bytes": len(prefix)}).scan(str(path))
+    assert any(
+        check.severity == IssueSeverity.WARNING and check.details.get("domain") == "example.net"
+        for check in _failed_network_detection_checks(result)
+    )
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any("truncated at configured limit" in check.message for check in result.checks)
+
+
+@pytest.mark.parametrize("connector", ["dblink('host=example.net', 'SELECT 1')", "http_get('https://example.net')"])
+def test_documented_sql_like_preserves_repeated_connector_domain(tmp_path: Path, connector: str) -> None:
+    path = tmp_path / "README.md"
+    source = (
+        f"~~~sql\nSELECT\n    SUM(CASE WHEN email LIKE '%@example.net%' THEN 1 ELSE 0 END),\n    {connector};\n~~~\n"
+    )
+    result = _scan_text_content(path, source)
+    assert any(
+        check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and check.details.get("domain") == "example.net"
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT\n    dblink('host=example.net', 'SELECT 1');",
+        "SELECT\n    dblink('host=example.net', 'SELECT email LIKE ''%@example.net%''');",
+        "SELECT\n    dblink('host=example.net', $$SELECT email LIKE '%@example.net%'$$);",
+    ],
+)
+def test_documented_sql_connector_keeps_its_domain_position(tmp_path: Path, query: str) -> None:
+    path = tmp_path / "README.md"
+    source = f"~~~sql\n{query}\n~~~\n"
+    result = _scan_text_content(path, source)
+    assert any(
+        check.severity == IssueSeverity.WARNING
+        and check.details.get("domain") == "example.net"
+        and check.details.get("position") == source.index("example.net")
+        for check in _failed_network_detection_checks(result)
+    )
 
 
 @pytest.mark.parametrize(
@@ -6586,6 +6684,7 @@ def test_routine_examples_in_extensionless_markdown_model_cards_are_informationa
         '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n',
         '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n~~~\n',
         '```text\n```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        '```\nfrom openai import OpenAI\nexec(requests.get("http://localhost:8000/v1").text)\n```\n',
         "```python\n# " + "x" * (16 * 1024) + '\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
         "```text\nexample\n```\n" * 129 + '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
     ],
@@ -6604,19 +6703,19 @@ def test_routine_example_policy_requires_complete_bounded_fences(tmp_path: Path,
     ],
 )
 def test_routine_clone_with_bibtex_fields(citation: bytes, routine: bool) -> None:
-    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
 
     document = b"```sh\ngit clone https://github.com/example/model\n```\n```bibtex\n" + citation + b"\n```\n"
-    assert bool(routine_documentation_url_spans(document)) is routine
+    assert bool(routine_documentation_network_spans(document)) is routine
 
 
 def test_documented_clone_ignores_non_utf8_url_in_shell_comment() -> None:
-    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
 
     url = b"https://github.com/example/model"
     source = b"```console\n  $ git clone " + url + b" # mirror https://example.org/caf\xe9\n```\n"
     start = source.index(url)
-    assert routine_documentation_url_spans(source) == ((start, start + len(url)),)
+    assert routine_documentation_network_spans(source) == ((start, start + len(url)),)
 
 
 @pytest.mark.parametrize(
@@ -6637,10 +6736,10 @@ def test_documented_clone_ignores_non_utf8_url_in_shell_comment() -> None:
     ],
 )
 def test_clone_exemption_requires_safe_loader_options(example: str, routine: bool) -> None:
-    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
 
     source = f"```sh\ngit clone https://github.com/example/model\n```\n```python\n{example}\n```\n".encode()
-    assert bool(routine_documentation_url_spans(source)) is routine
+    assert bool(routine_documentation_network_spans(source)) is routine
 
 
 def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6654,6 +6753,23 @@ def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, m
         documentation_examples.MAX_DOCUMENTATION_BYTES + 1
     )
     _assert_documentation_network_actionable(tmp_path, content, "network_command")
+
+
+@pytest.mark.parametrize("filename", ["README.md", "config.txt"])
+def test_http_request_reports_its_evidence_source(tmp_path: Path, filename: str) -> None:
+    content = "```bash\ncurl -X POST http://localhost:8080/embed -d @inputs.json\n```\n"
+    path = tmp_path / filename
+    result = _scan_text_content(path, content)
+    url_check = next(check for check in result.checks if check.details.get("type") == "url_detected")
+    assert url_check.severity == IssueSeverity.CRITICAL
+    if filename == "README.md":
+        assert url_check.message == "URL detected in documentation: http://localhost:8080/embed"
+        assert url_check.details["evidence_source"] == "documentation"
+        assert url_check.why and "documentation" in url_check.why
+        assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+    else:
+        assert "evidence_source" not in url_check.details
+        assert url_check.why == "Models should not contain network communication capabilities"
 
 
 def test_routine_example_does_not_hide_later_same_url_execution(tmp_path: Path) -> None:
@@ -6686,9 +6802,9 @@ def test_routine_example_keeps_blacklisted_destination_alerts(tmp_path: Path) ->
     ],
 )
 def test_routine_setup_proof_rejects_shell_substitution_and_incomplete_strings(command: str) -> None:
-    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
 
-    assert routine_documentation_url_spans(f"```bash\n{command}\n```\n".encode()) == ()
+    assert routine_documentation_network_spans(f"```bash\n{command}\n```\n".encode()) == ()
 
 
 def _assert_documentation_routed_to_text(tmp_path: Path, filename: str) -> None:

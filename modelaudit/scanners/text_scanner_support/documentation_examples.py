@@ -1,6 +1,6 @@
 """Recognize bounded, literal setup and inference examples in Markdown.
 
-The returned spans describe routine documented URLs, not the safety of a model
+The returned spans describe routine documented network references, not the safety of a model
 or of code downloaded by a reader. Other findings in each example stay intact.
 """
 
@@ -909,8 +909,31 @@ def _outside_fence_examples_execute_script(payload: bytes, regions: list[tuple[i
     return _inline_examples_execute_script(payload, inline_regions)
 
 
-def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
+def _sql_comparison_domain_spans(source: bytes) -> list[tuple[int, int]]:
+    """Find domain literals on the right of a LIKE predicate in a fenced query."""
+    if not re.match(rb"\s*(?:SELECT|WITH)\b", source, re.IGNORECASE):
+        return []
+    # Dialect-specific quoting and comments can change where a literal begins.
+    if re.search(rb'["`$\\#\[\]]|--|/\*', source):
+        return []
     spans: list[tuple[int, int]] = []
+    literals = re.finditer(rb"(?:(?P<like>\bI?LIKE)\s*)?'(?P<value>(?:[^']|'')*)'|'", source, re.IGNORECASE)
+    for literal in literals:
+        value = literal["value"]
+        if value is None:
+            return []  # Unclosed string.
+        if literal["like"] and re.fullmatch(rb"[a-zA-Z0-9_.%@-]+", value):
+            start = literal.start("value")
+            spans.extend(
+                (start + host.start(), start + host.end())
+                for host in NetworkCommDetector.DOMAIN_PATTERN.finditer(value)
+            )
+    return spans
+
+
+def _routine_documentation_network_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    sql_domains: set[tuple[int, int]] = set()
     opening: re.Match[bytes] | None = None
     executes_script = False
     outside_fences: list[tuple[int, int]] = []
@@ -936,13 +959,19 @@ def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], .
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
         ):
             source = payload[start:end]
-            if language in PYTHON_LANGUAGES:
+            if language in PYTHON_LANGUAGES or (
+                not language and re.match(rb"\s*from[ \t]+[\w.]+[ \t]+import[ \t]+\w", source)
+            ):
                 python_spans = _python_url_spans(source)
                 executes_script |= python_spans is None
                 examples = python_spans or []
             else:
                 executes_script |= _example_executes_script(source, language)
                 examples = _shell_url_spans(source) if language in SHELL_LANGUAGES else []
+                if language == b"sql":
+                    sql_domains.update(
+                        (start + left, start + right) for left, right in _sql_comparison_domain_spans(source)
+                    )
             spans.extend((start + left, start + right) for left, right in examples)
         else:
             executes_script = True
@@ -956,6 +985,14 @@ def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], .
         executes_script = _outside_fence_examples_execute_script(payload, outside_fences)
     if executes_script:
         spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
+    if sql_domains:
+        # The detector reports each domain once. Only lower it when the SQL
+        # comparisons account for every occurrence in the complete document.
+        comparison_only = {payload[left:right].lower() for left, right in sql_domains}
+        for host in NetworkCommDetector.DOMAIN_PATTERN.finditer(payload):
+            if host.span() not in sql_domains:
+                comparison_only.discard(host[0].lower())
+        spans.extend((left, right) for left, right in sql_domains if payload[left:right].lower() in comparison_only)
     return tuple(spans)
 
 
@@ -1013,15 +1050,15 @@ def _without_markdown_container_prefixes(payload: bytes) -> tuple[bytes, list[tu
     return bytes(normalized), removals
 
 
-def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
-    """Return original URL spans only after bounded Markdown example analysis."""
+def routine_documentation_network_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
+    """Return original network reference spans only after bounded Markdown example analysis."""
     if len(payload) > MAX_DOCUMENTATION_BYTES:
         return ()
     result = _without_markdown_container_prefixes(payload)
     if result is None:
         return ()
     normalized, removals = result
-    spans = _routine_documentation_url_spans(normalized)
+    spans = _routine_documentation_network_spans(normalized)
     starts = [start for start, _removed in removals]
 
     def original(position: int) -> int:
