@@ -34,6 +34,7 @@ from ..helpers.json_limits import validate_json_structural_limits
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
+from .safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
 
 # Known GGML header variants (older formats like GGMF and GGJT)
 GGML_MAGIC_VARIANTS = {
@@ -1936,6 +1937,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
 
     tekken = _TEKKEN_JSON_FILENAME.fullmatch(file_path.name.lower()) is not None
     tekken_vocab_seen = False
+    tekken_version: str | None = None
     stack: list[_JSONStreamContext] = []
     root_keys: set[str] = set()
     model_keys: set[str] = set()
@@ -2006,7 +2008,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         ):
             raise _JSONProbeInvalid
         if tekken and context.kind == "object":
-            if context.seen_keys != _TEKKEN_FIELDS.get(context.path):
+            legacy_root = context.path == () and tekken_version == "v7" and context.seen_keys == {"config", "vocab"}
+            if not legacy_root and context.seen_keys != _TEKKEN_FIELDS.get(context.path):
                 raise _JSONProbeInvalid
             if context.path == ("vocab", "[]"):
                 tekken_vocab_seen = True
@@ -2080,14 +2083,16 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         context.mode = "colon"
 
     def note_string_value(value: str | None) -> None:
-        nonlocal model_type
+        nonlocal model_type, tekken_version
         if tekken and value is not None:
             if string_path == ("vocab", "[]", "token_bytes") and not (
                 len(value) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value)
             ):
                 raise _JSONProbeInvalid
-            if string_path == ("config", "version") and not re.fullmatch(r"v[0-9]+", value):
-                raise _JSONProbeInvalid
+            if string_path == ("config", "version"):
+                if not re.fullmatch(r"v[0-9]+", value):
+                    raise _JSONProbeInvalid
+                tekken_version = value
             if string_path == ("config", "pattern") and any(
                 marker in value for marker in _JSON_PROBE_TEMPLATE_INDICATORS
             ):
@@ -2745,7 +2750,11 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
         if file_size < 4:
             return None
 
-        read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+        probe_index = (
+            file_path.name.lower() == "model.safetensors.index.json"
+            and MXNET_SYMBOL_SIGNATURE_READ_BYTES < file_size <= INDEX_PROBE_BYTES
+        )
+        read_size = file_size + 1 if probe_index else min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
         with file_path.open("rb") as handle:
             prefix = handle.read(read_size)
             normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
@@ -2753,6 +2762,9 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
             if trimmed_prefix and not trimmed_prefix.startswith(b"{"):
                 return None
     except OSError:
+        return None
+
+    if probe_index and len(prefix) == file_size and is_plain_safetensors_index(prefix):
         return None
 
     is_disguised_non_json = file_path.suffix.lower() != ".json"

@@ -11657,6 +11657,61 @@ def test_scan_file_routes_misnamed_mxnet_symbol_and_detects_custom_library(tmp_p
     )
 
 
+def test_scan_file_large_safetensors_index_keeps_manifest_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    index_path = tmp_path / "model.safetensors.index.json"
+    weight_map = {f"layers.{i}.weight": "model-00001-of-00001.safetensors" for i in range(16)}
+    index = {"metadata": {"total_size": 1024, "total_parameters": 512}, "weight_map": weight_map}
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    config = {"cache_scan_results": False, "jinja_template_collection_max_items": 8}
+
+    result = scan_file(str(index_path), config=config)
+
+    assert result.success
+    assert result.scanner_name == "manifest"
+    assert result.metadata["root_type"] == "dict"
+    assert not any(
+        check.name in {"MXNet Symbol Routing", "Embedded Jinja Collection Budget"} for check in result.checks
+    )
+
+    # A late executable field must still reach embedded-template analysis.
+    index_path.write_text(
+        json.dumps({**index, "chat_template": "{{ cycler.__init__.__globals__.os.system('id') }}"}),
+        encoding="utf-8",
+    )
+    overlap = scan_file(str(index_path), config=config)
+
+    assert any(check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in overlap.checks)
+    assert any(check.status == CheckStatus.FAILED and "Jinja2" in check.name for check in overlap.checks)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        ',"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        ',"weight_map":{"layer.weight":"safe.safetensors"}}',
+        "} {}",
+        "",
+    ],
+)
+def test_unproven_safetensors_index_preserves_mxnet_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 64)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        '{"weight_map":{' + ",".join(f'"layer.{i}":"one.safetensors"' for i in range(8)) + "}" + suffix,
+        encoding="utf-8",
+    )
+
+    assert (
+        file_detection.detect_mxnet_symbol_content_route(index_path)
+        == file_detection.MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    )
+
+
 def test_scan_file_routes_bom_prefixed_params_symbol_and_detects_custom_library(tmp_path: Path) -> None:
     disguised_symbol = tmp_path / "payload-0000.params"
     disguised_symbol.write_text(

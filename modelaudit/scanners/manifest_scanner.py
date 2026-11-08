@@ -16,6 +16,7 @@ from modelaudit.core_results import mark_operational_scan_error, scan_result_has
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from ..utils.file.safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
 from . import base as scanner_base
 from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
@@ -990,6 +991,10 @@ class ManifestScanner(BaseScanner):
         collection = self._collect_jinja_template_fields_with_budget(content)
         templates = collection.templates
         if collection.budget_exceeded:
+            if os.path.basename(path).lower() == "model.safetensors.index.json":
+                raw = self._manifest_text_cache.get(path, "")
+                if len(raw) <= INDEX_PROBE_BYTES and raw.isascii() and is_plain_safetensors_index(raw.encode("ascii")):
+                    return
             self._record_jinja_collection_budget_exceeded(result, path, collection)
             self._check_timeout()
 
