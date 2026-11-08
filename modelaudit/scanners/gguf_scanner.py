@@ -252,10 +252,13 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS = tuple(
     for pattern in patterns
     if pattern != r"{% macro .+ %}"  # Declaring a chat formatter is routine. Its default arguments and body still run.
 )
-_GGUF_JINJA_QUOTE = re.compile("""['"]""")
-_GGUF_JINJA_SELECTOR = re.compile(
-    r"""(?:[\w)}\]'"]\s*\[\s*|\b(?:attr|selectattr|rejectattr|groupby|from_string|render_template_string)\s*\(\s*|\battribute\s*=\s*)\Z"""
-)
+# These two signatures also match sentence punctuation and prose such as "format (brief)".
+# Keep unambiguous member references and calls even in captured text or quoted source.
+_GGUF_TEMPLATE_PROSE_PATTERNS = {
+    r"commands\.": re.compile(r"commands\.(?=\w|\s*(?:getoutput|getstatusoutput|getstatus|mkarg|mk2arg)\b)", re.I),
+    r"format\s*\(": re.compile(r"format\(|(?<=[.|])format\s*\(", re.I),
+}
+_GGUF_LITERAL_OUTPUT_START = re.compile(r"""{{[-+]?\s*(?=['"])""")
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
@@ -2390,44 +2393,38 @@ class GgufScanner(BaseScanner):
     def _oversized_chat_template_security_evidence(value: str) -> list[dict[str, Any]]:
         from .jinja2_template_scanner import Jinja2TemplateScanner
 
-        evidence: list[dict[str, Any]] = []
-        best = len(_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS)
-        for start, end in Jinja2TemplateScanner.iter_executable_tag_bounds(value):
-            tag = value[start:end]
-            # Keep literal arguments used to resolve attributes or compile templates.
-            # Blanking output strings preserves character offsets for the finding.
-            parts: list[str] = []
-            cursor = 0
-            while quote := _GGUF_JINJA_QUOTE.search(tag, cursor):
-                before = tag[cursor : quote.start()]
-                literal_end = Jinja2TemplateScanner.quoted_string_end(tag, quote.start())
-                literal = tag[quote.start() : literal_end]
-                parts.append(before)
-                if _GGUF_JINJA_SELECTOR.search(tag, max(0, cursor - 1), quote.start()):
-                    parts.append(literal)
-                elif len(literal) > 1:
-                    parts.append(literal[0] + " " * (len(literal) - 2) + literal[-1])
-                else:
-                    parts.append(literal)
-                cursor = literal_end
-            code = "".join((*parts, tag[cursor:])) if parts else tag
-            for index, (category, pattern) in enumerate(_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS):
-                if index >= best:
-                    break
-                if match := pattern.search(code):
-                    evidence = [
-                        {
-                            "evidence_type": "template_injection",
-                            "pattern": f"jinja2_{category}",
-                            "matched_pattern": pattern.pattern,
-                            "match_offset": start + match.start(),
-                        }
-                    ]
-                    best = index
-                    if category == "critical_injection":
-                        return evidence
-                    break
-        return evidence
+        for category, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
+            match = pattern.search(value)
+            if match is None:
+                continue
+
+            if stronger := _GGUF_TEMPLATE_PROSE_PATTERNS.get(pattern.pattern):
+                # Preserve the broad signature in executable expressions, where whitespace
+                # after a dot or before a call is legal. A lone quoted string is output.
+                match = stronger.search(value)
+                if match is None:
+                    for start, end in Jinja2TemplateScanner.iter_executable_tag_bounds(value):
+                        match = pattern.search(value, start, end)
+                        if match is None:
+                            continue
+                        opening = _GGUF_LITERAL_OUTPUT_START.match(value, start, end)
+                        if opening is not None:
+                            quote_end = Jinja2TemplateScanner.quoted_string_end(value, opening.end())
+                            if value[quote_end:end].strip() in {"}}", "-}}", "+}}"}:
+                                match = None
+                                continue
+                        break
+
+            if match:
+                return [
+                    {
+                        "evidence_type": "template_injection",
+                        "pattern": f"jinja2_{category}",
+                        "matched_pattern": pattern.pattern,
+                        "match_offset": match.start(),
+                    }
+                ]
+        return []
 
     @classmethod
     def _metadata_value_has_only_benign_documentation_urls(cls, key: str, value: str) -> bool:

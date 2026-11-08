@@ -1280,13 +1280,10 @@ def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidenc
 def test_gguf_oversized_chat_template_ignores_inert_injection_examples(tmp_path: Path) -> None:
     template = (
         "{% macro format_message(message) %}{{ message }}{% endmacro %}"
-        "Follow these commands. Use standard format (brief answer)."
-        "{{ 'This example calls commands.getoutput(x) and uses }} as a delimiter.' }}"
-        "{% set instructions = \"Use requests.get(x) or 'eval(x)' in examples.\" %}"
-        "{% raw %}{{ os.system('example') }}{% endraw %}"
-        "{# {{ request|attr('__class__') }} #}"
-        "{% set label = '__class__' %}{{ ['__class__'] }}"
-        r"{{ 'The escape \x5f means underscore.' }}"
+        "{% set instructions %}Follow these commands. Use the standard format (brief answer).{% endset %}"
+        "{{ instructions }}{{ 'This output mentions commands. and format (short).' }}"
+        "{% raw %}{{ format (example) }}{% endraw %}"
+        "{# {{ commands. example }} #}"
     )
     path = create_mock_gguf(tmp_path / "instructions.gguf", metadata={"tokenizer.chat_template": template})
 
@@ -1304,6 +1301,20 @@ def test_gguf_oversized_chat_template_ignores_inert_injection_examples(tmp_path:
         ("{{ commands.getoutput(command) }}", "critical_injection", "commands."),
         ("{% macro format_message(x=requests.get(url)) %}{{ x }}{% endmacro %}", "critical_injection", "requests."),
         ("{{ {'a': {'b': 1}} and os.system(command) }}", "critical_injection", "os.system("),
+        ("{{ commands. handler(value) }}", "critical_injection", "commands."),
+        ("{{ format (value) }}", "obfuscation", "format ("),
+        ("{% set source %}{{ 'commands.getoutput(x)' }}{% endset %}", "critical_injection", "commands."),
+        (
+            "{% set key %}__class__.__mro__{% endset %}{{ data|map(attribute=key) }}",
+            "object_traversal",
+            "__class__.__mro__",
+        ),
+        (r"{{ obj[prefix ~ '\x5fclass__'] }}", "obfuscation", r"\x5f"),
+        (
+            "{% set code = '{{ os.system(cmd) }}' %}{{ env.from_string(code).render() }}",
+            "critical_injection",
+            "os.system(",
+        ),
         ("{{ things|map(attribute='__class__.__mro__') }}", "object_traversal", "__class__.__mro__"),
         ("{{ env.from_string('{{ os.system(cmd) }}').render() }}", "critical_injection", "os.system("),
         ("{{ ''['__class__'] }}", "obfuscation", "['__class__']"),
@@ -1314,7 +1325,7 @@ def test_gguf_oversized_chat_template_ignores_inert_injection_examples(tmp_path:
 def test_gguf_oversized_chat_template_reports_late_executable_evidence(
     tmp_path: Path, payload: str, pattern: str, match: str
 ) -> None:
-    prefix = "π" * 190_000 + "Quoted commands. {{ 'commands.getoutput(x)' }}{# requests.get(x) #}"
+    prefix = "π" * 190_000 + "Quoted commands. {{ 'format (abbreviated)' }}{# commands. example #}"
     path = create_mock_gguf(tmp_path / "late.gguf", metadata={"tokenizer.chat_template": prefix + payload})
 
     result = GgufScanner().scan(str(path))
