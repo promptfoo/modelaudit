@@ -86,6 +86,27 @@ def _make_mock_tensor_proto(
     )
 
 
+@pytest.mark.parametrize(
+    ("dtype", "field", "components", "limit", "expected_dtype", "expected"),
+    [
+        (DataType.DT_HALF, "half_val", [0x3C00], 2, "float16", 1.0),
+        (DataType.DT_BFLOAT16, "half_val", [0x3C00], 2, "uint16", 0x3C00),
+        (DataType.DT_COMPLEX64, "scomplex_val", [2, -3], 8, "complex64", 2 - 3j),
+        (DataType.DT_COMPLEX128, "dcomplex_val", [2, -3], 16, "complex128", 2 - 3j),
+    ],
+)
+def test_tensor_proto_decodes_packed_fields(
+    dtype: int, field: str, components: list[int], limit: int, expected_dtype: str, expected: complex
+) -> None:
+    proto = _make_mock_tensor_proto(shape=[1], dtype=dtype)
+    getattr(proto, field).extend(components)
+
+    result = tensor_proto_to_ndarray(proto, max_tensor_bytes=limit)
+
+    assert result.dtype.name == expected_dtype
+    assert result.tolist() == [expected]
+
+
 def test_tensor_proto_to_ndarray_rejects_large_materialization_before_padding() -> None:
     tensor_proto = _make_mock_tensor_proto(shape=[1024, 1024], dtype=DataType.DT_FLOAT, float_values=[1.0])
 
