@@ -1987,6 +1987,12 @@ class TestXGBoostFailClosedEndToEnd:
             tokenizer.write_bytes(malformed)
             assert XGBoostScanner.can_handle(str(tokenizer))
 
+        # The first two rows also name a module and global to Python's unpickler.
+        colliding_row = rows.pop(byte_tokens.index(ord("p")))
+        tokenizer.write_bytes(colliding_row + b"".join(rows))
+        assert XGBoostScanner.can_handle(str(tokenizer))
+        assert not scan_file(str(tokenizer), config={"cache_enabled": False}).success
+
     def test_sentencepiece_tokenizer_model_core_is_not_xgboost_false_positive(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto())

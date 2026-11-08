@@ -29,10 +29,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+from io import BytesIO
 from typing import Any, ClassVar, cast
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
+    _classify_initial_pickle_security_signal,
     has_jax_json_checkpoint_structure,
     huggingface_tokenizer_json_has_jax_route_evidence,
     is_huggingface_tokenizer_json_file,
@@ -505,34 +507,48 @@ class XGBoostScanner(BaseScanner):
     @staticmethod
     def _is_tiktoken_rank_file(path: str) -> bool:
         """Recognize a complete byte-pair vocabulary sharing the .model extension."""
+        try:
+            with open(path, "rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size > _TIKTOKEN_MAX_BYTES:
+                    return False
+                # Most binary models can be ruled out without reading their full payload.
+                first_row = handle.readline(_TIKTOKEN_MAX_LINE_BYTES + 1)
+                if not re.fullmatch(rb"[A-Za-z0-9+/]+=* [0-9]{1,6}\r?\n", first_row):
+                    return False
+                handle.seek(0)
+                payload = handle.read(size + 1)
+        except OSError:
+            return False
+        if len(payload) != size:
+            return False
+
         tokens: set[bytes] = set()
         ranks: set[int] = set()
         single_bytes = 0
-        try:
-            with open(path, "rb") as handle:
-                remaining = os.fstat(handle.fileno()).st_size
-                if remaining > _TIKTOKEN_MAX_BYTES:
-                    return False
-                while remaining > 0:
-                    line = handle.readline(_TIKTOKEN_MAX_LINE_BYTES + 1)
-                    remaining -= len(line)
-                    if not line or len(line) > _TIKTOKEN_MAX_LINE_BYTES or remaining < 0:
-                        return False
-                    encoded, _, rank_text = line.rstrip(b"\r\n").partition(b" ")
-                    if not rank_text.isdigit() or len(rank_text) > 6:
-                        return False
-                    rank = int(rank_text)
-                    if rank >= _TIKTOKEN_MAX_RANKS or rank in ranks:
-                        return False
-                    token = base64.b64decode(encoded, validate=True)
-                    if not token or token in tokens or base64.b64encode(token) != encoded:
-                        return False
-                    ranks.add(rank)
-                    tokens.add(token)
-                    single_bytes += len(token) == 1
-                return single_bytes == 256 and not handle.read(1)
-        except (OSError, binascii.Error):
-            return False
+        for line in BytesIO(payload):
+            if len(line) > _TIKTOKEN_MAX_LINE_BYTES:
+                return False
+            encoded, _, rank_text = line.rstrip(b"\r\n").partition(b" ")
+            if not rank_text.isdigit() or len(rank_text) > 6:
+                return False
+            rank = int(rank_text)
+            if rank >= _TIKTOKEN_MAX_RANKS or rank in ranks:
+                return False
+            try:
+                token = base64.b64decode(encoded, validate=True)
+            except binascii.Error:
+                return False
+            if not token or token in tokens or base64.b64encode(token) != encoded:
+                return False
+            ranks.add(rank)
+            tokens.add(token)
+            single_bytes += len(token) == 1
+
+        # A base64 token starting with 'c' can introduce a protocol-0 GLOBAL.
+        return (
+            single_bytes == 256 and _classify_initial_pickle_security_signal(payload, sample_is_prefix=False) is False
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
