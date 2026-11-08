@@ -5,6 +5,7 @@ This module provides advanced utilities for scanning large model files (400B+ pa
 with bounded windowed I/O, sharded model support, and distributed scanning capabilities.
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -20,6 +21,7 @@ from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from .._path_hardening import _cross_view_ctime_matches
 from ..helpers.cache_decorator import (
     add_optional_dependency_availability_to_version_context,
     should_bypass_cache_for_safetensors_header_limit,
@@ -71,8 +73,10 @@ def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str
         ("inode", opened_stat.st_ino),
         ("size", opened_stat.st_size),
         ("mtime_ns", opened_stat.st_mtime_ns),
-        ("ctime_ns", opened_stat.st_ctime_ns),
     )
+    path_ctime = target.get("ctime_ns")
+    if isinstance(path_ctime, int) and not _cross_view_ctime_matches(opened_stat.st_ctime_ns, path_ctime):
+        return False
     return stat.S_ISREG(opened_stat.st_mode) and all(
         not isinstance(target.get(key), int) or target[key] == current_value for key, current_value in expected_values
     )
@@ -452,6 +456,70 @@ def _summarize_missing_shard_indices(
     return missing_indices, missing_count, missing_count > len(missing_indices)
 
 
+def _local_safetensors_index_target(directory: Path) -> Path | None:
+    path = directory / "model.safetensors.index.json"
+    if not path.is_symlink():
+        return path
+    # Only a snapshot alias inside its own configured Hugging Face blob store
+    # may supply evidence about local shard numbering.
+    cache_root = _find_hf_cache_root(directory)
+    if cache_root is None or not directory.resolve(strict=True).is_relative_to(cache_root / "snapshots"):
+        return None
+    blobs_root = _trusted_hf_blobs_root(cache_root)
+    target = path.resolve(strict=True)
+    return target if blobs_root is not None and target.is_relative_to(blobs_root) else None
+
+
+def _zero_based_singleton_manifest(shard: Path) -> str | None:
+    """Confirm that the index assigns every tensor to this zero-of-one shard."""
+    from ..sources.huggingface import (
+        _MAX_HF_SAFETENSORS_INDEX_BYTES,
+        _MAX_HF_SAFETENSORS_INDEX_TENSORS,
+        _loads_json_without_duplicate_keys,
+    )
+    from .detection import _same_regular_file_identity
+
+    if not re.fullmatch(r"model-0+-of-0*1\.safetensors", shard.name):
+        return None
+    try:
+        path = _local_safetensors_index_target(shard.parent)
+        if path is None:
+            return None
+        expected = path.lstat()
+        if not stat.S_ISREG(expected.st_mode) or not 0 < expected.st_size <= _MAX_HF_SAFETENSORS_INDEX_BYTES:
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(path, flags), "rb") as index_file:
+            if not _same_regular_file_identity(os.fstat(index_file.fileno()), expected):
+                return None
+            raw = index_file.read(expected.st_size + 1)
+            if (
+                len(raw) != expected.st_size
+                or not _same_regular_file_identity(os.fstat(index_file.fileno()), expected)
+                or _local_safetensors_index_target(shard.parent) != path
+                or not _same_regular_file_identity(path.lstat(), expected)
+            ):
+                return None
+        manifest, _, duplicate_count, _, _, error = _loads_json_without_duplicate_keys(raw)
+        if (
+            error
+            or duplicate_count
+            or not isinstance(manifest, dict)
+            or not isinstance(manifest.get("metadata", {}), dict)
+        ):
+            return None
+        weights = manifest.get("weight_map")
+        if not (
+            isinstance(weights, dict)
+            and 0 < len(weights) <= _MAX_HF_SAFETENSORS_INDEX_TENSORS
+            and all(name and member == shard.name for name, member in weights.items())
+        ):
+            return None
+        return hashlib.sha256(raw).hexdigest()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 class ShardedModelDetector:
     """Detect and handle sharded model files."""
 
@@ -686,9 +754,17 @@ class ShardedModelDetector:
                     shard_info["expected_total_shards"] = expected_total
                     if present_indices:
                         missing_indices, missing_count, missing_indices_truncated = _summarize_missing_shard_indices(
-                            present_indices,
-                            expected_total,
+                            present_indices, expected_total
                         )
+                        if (
+                            expected_total == 1
+                            and present_indices == {0}
+                            and shard_info["shards"] == [str(Path(file_path))]
+                        ):
+                            manifest_digest = _zero_based_singleton_manifest(Path(file_path))
+                            if manifest_digest is not None:
+                                shard_info["zero_based_manifest_sha256"] = manifest_digest
+                                missing_count = 0
                         if missing_count:
                             shard_info["missing_shard_count"] = missing_count
                             shard_info["missing_shard_indices"] = missing_indices
@@ -1304,6 +1380,9 @@ class ParallelShardHandler:
         current_file = Path(self.shard_info["current_file"])
         pattern = self.shard_info["pattern"]
         expected_total = self.shard_info.get("expected_total_shards")
+        manifest_digest = self.shard_info.get("zero_based_manifest_sha256")
+        if manifest_digest is not None and _zero_based_singleton_manifest(current_file) != manifest_digest:
+            raise OSError("SafeTensors shard manifest changed after detecting the zero-based family")
         members: set[str] = set()
         family_directories = {current_file.parent}
         shard_targets = self.shard_info.get("shard_targets")

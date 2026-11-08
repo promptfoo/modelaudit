@@ -387,56 +387,51 @@ REPLACEMENT_ENTRIES: tuple[CorpusEntry, ...] = (
 )
 
 TOOL_SPECS: dict[str, ToolSpec] = {
-    "fickling": ToolSpec(
-        "fickling",
-        "https://github.com/trailofbits/fickling.git",
-        "fickling",
-        (
+    name: ToolSpec(
+        name=name,
+        repo_url=repo_url,
+        default_path=name,
+        invocation=(
             "uv",
             "run",
             "--isolated",
             "--with-editable",
             "{path}",
+            name,
+            *arguments,
+        ),
+    )
+    for name, repo_url, arguments in (
+        (
             "fickling",
-            "--check-safety",
-            "-p",
-            "{artifact}",
+            "https://github.com/trailofbits/fickling.git",
+            (
+                "--check-safety",
+                "-p",
+                "{artifact}",
+            ),
         ),
-    ),
-    "modelscan": ToolSpec(
-        "modelscan",
-        "https://github.com/protectai/modelscan.git",
-        "modelscan",
         (
-            "uv",
-            "run",
-            "--isolated",
-            "--with-editable",
-            "{path}",
             "modelscan",
-            "-p",
-            "{artifact}",
-            "-r",
-            "json",
-            "-o",
-            "{output}",
+            "https://github.com/protectai/modelscan.git",
+            (
+                "-p",
+                "{artifact}",
+                "-r",
+                "json",
+                "-o",
+                "{output}",
+            ),
         ),
-    ),
-    "picklescan": ToolSpec(
-        "picklescan",
-        "https://github.com/mmaitre314/picklescan.git",
-        "picklescan",
         (
-            "uv",
-            "run",
-            "--isolated",
-            "--with-editable",
-            "{path}",
             "picklescan",
-            "--path",
-            "{artifact}",
+            "https://github.com/mmaitre314/picklescan.git",
+            (
+                "--path",
+                "{artifact}",
+            ),
         ),
-    ),
+    )
 }
 
 
@@ -1100,12 +1095,11 @@ def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:
     }
 
     records: list[dict[str, Any]] = []
-    for filename, payload in variants.items():
-        path = output_dir / filename
-        path.write_bytes(payload)
+
+    def record_variant(path: Path) -> None:
         records.append(
             {
-                "id": filename.split("_", 1)[0],
+                "id": path.name.split("_", 1)[0],
                 "kind": "synthetic",
                 "path": str(path),
                 "size_bytes": path.stat().st_size,
@@ -1114,34 +1108,21 @@ def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:
             }
         )
 
+    for filename, payload in variants.items():
+        path = output_dir / filename
+        path.write_bytes(payload)
+        record_variant(path)
+
     zip_variant = output_dir / "V12_pytorch_zip_data_pkl.pt"
     with zipfile.ZipFile(zip_variant, "w") as archive:
         archive.writestr("archive/data.pkl", malicious)
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-    records.append(
-        {
-            "id": "V12",
-            "kind": "synthetic",
-            "path": str(zip_variant),
-            "size_bytes": zip_variant.stat().st_size,
-            "sha256": _sha256_file(zip_variant),
-            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-    )
+    record_variant(zip_variant)
 
     malformed = output_dir / "V13_malformed_7z_like.pt"
     malformed.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 128 + malicious)
-    records.append(
-        {
-            "id": "V13",
-            "kind": "synthetic",
-            "path": str(malformed),
-            "size_bytes": malformed.stat().st_size,
-            "sha256": _sha256_file(malformed),
-            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-    )
+    record_variant(malformed)
     _write_json(output_dir / "synthetic-manifest.json", {"entries": records})
     return records
 
@@ -1284,11 +1265,9 @@ def cmd_download(args: argparse.Namespace) -> int:
     selected_ids = set(args.ids) if args.ids else None
     downloaded_bytes = 0
     budget_bytes = int(float(args.budget_gb) * 1024 * 1024 * 1024) if args.budget_gb is not None else None
-    updated = []
     download_failed = False
-    for entry in entries:
+    for index, entry in enumerate(entries):
         if selected_ids is not None and str(entry.get("id")) not in selected_ids:
-            updated.append(entry)
             continue
         try:
             (_validated_artifact_id(entry["id"]), _validated_remote_path(entry["path"]))
@@ -1300,7 +1279,6 @@ def cmd_download(args: argparse.Namespace) -> int:
             ):
                 entry["download_status"] = "skipped_budget"
                 entry.pop("download_error", None)
-                updated.append(entry)
                 continue
             entry = _download_entry(
                 entry,
@@ -1316,10 +1294,10 @@ def cmd_download(args: argparse.Namespace) -> int:
             download_failed = True
             entry["download_status"] = "error"
             entry["download_error"] = f"{type(error).__name__}: {error}"
-        updated.append(entry)
+        entries[index] = entry
     _write_lock(
         lock_path,
-        updated,
+        entries,
         tier=str(lock_payload.get("tier", "custom")),
         extra={str(key): value for key, value in lock_payload.items() if key not in LOCK_CORE_KEYS},
     )
@@ -1343,6 +1321,16 @@ def cmd_classify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scan_error_row(artifact_id: str, scanner: str, mode: str, message: str) -> dict[str, Any]:
+    return {
+        "artifact_id": artifact_id,
+        "scanner": scanner,
+        "mode": mode,
+        "status": "error",
+        "error": message,
+    }
+
+
 def _scan_records_for_entry(
     entry: Mapping[str, Any],
     *,
@@ -1357,28 +1345,12 @@ def _scan_records_for_entry(
     try:
         artifact_id = _validated_artifact_id(entry["id"])
     except ValueError as error:
-        return (
-            [
-                {
-                    "artifact_id": str(entry.get("id")),
-                    "scanner": "harness",
-                    "mode": "invalid-lock-entry",
-                    "status": "error",
-                    "error": f"{type(error).__name__}: {error}",
-                }
-            ],
-            [],
-        )
+        row = _scan_error_row(str(entry.get("id")), "harness", "invalid-lock-entry", f"{type(error).__name__}: {error}")
+        return [row], []
     scan_rows: list[dict[str, Any]] = []
     third_party_rows: list[dict[str, Any]] = []
     if not path.exists():
-        missing = {
-            "artifact_id": artifact_id,
-            "scanner": "harness",
-            "mode": "missing",
-            "status": "error",
-            "error": f"local path does not exist: {path}",
-        }
+        missing = _scan_error_row(artifact_id, "harness", "missing", f"local path does not exist: {path}")
         return [missing], third_party_rows
 
     classification = entry.get("classification")
@@ -1396,13 +1368,9 @@ def _scan_records_for_entry(
                 scan_rows.append(_scan_package(target_path, engine=engine, artifact_id=target_artifact_id))
             except Exception as error:
                 scan_rows.append(
-                    {
-                        "artifact_id": target_artifact_id,
-                        "scanner": "modelaudit-picklescan",
-                        "mode": engine,
-                        "status": "error",
-                        "error": f"{type(error).__name__}: {error}",
-                    }
+                    _scan_error_row(
+                        target_artifact_id, "modelaudit-picklescan", engine, f"{type(error).__name__}: {error}"
+                    )
                 )
 
     for root_mode in root_modes:
@@ -1411,13 +1379,9 @@ def _scan_records_for_entry(
                 scan_rows.append(_scan_root(path, engine=engine, root_mode=root_mode, artifact_id=artifact_id))
             except Exception as error:
                 scan_rows.append(
-                    {
-                        "artifact_id": artifact_id,
-                        "scanner": "modelaudit-root",
-                        "mode": f"{root_mode}:{engine}",
-                        "status": "error",
-                        "error": f"{type(error).__name__}: {error}",
-                    }
+                    _scan_error_row(
+                        artifact_id, "modelaudit-root", f"{root_mode}:{engine}", f"{type(error).__name__}: {error}"
+                    )
                 )
 
     for tool in third_party_tools:
@@ -1465,20 +1429,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
             for entry in synthetic_entries
         )
 
-    tools = []
-    if args.third_party_tools:
-        tool_names = [name for name in args.third_party_tools.split(",") if name]
-        tools = [
-            _sync_tool(
-                TOOL_SPECS[name],
-                tools_root=Path(args.tools_root).expanduser(),
-                allow_dirty=args.allow_dirty_tools,
-                skip_pull=args.skip_tool_pull,
-            )
-            for name in tool_names
-        ]
-    else:
-        tool_names = []
+    tool_names = [name for name in args.third_party_tools.split(",") if name] if args.third_party_tools else []
+    tools = [
+        _sync_tool(
+            TOOL_SPECS[name],
+            tools_root=Path(args.tools_root).expanduser(),
+            allow_dirty=args.allow_dirty_tools,
+            skip_pull=args.skip_tool_pull,
+        )
+        for name in tool_names
+    ]
 
     _write_json(run_dir / "environment.json", _environment_payload(tools=tools))
     _write_json(run_dir / "large-corpus.lock.json", lock_payload)
@@ -1518,7 +1478,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     finally:
         logging.disable(previous_logging_disable_level)
 
-    _write_qa_outputs(run_dir, all_scan_rows, all_third_party_rows)
+    has_blocking_drift = _write_qa_outputs(run_dir, all_scan_rows, all_third_party_rows)
     print(f"Wrote QA run to {run_dir}")
     scan_error_count = sum(1 for row in all_scan_rows if _scan_row_has_error(row))
     if scan_error_count:
@@ -1527,7 +1487,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    return 1 if _has_blocking_drift(all_scan_rows) and args.fail_on_drift else 0
+    return 1 if has_blocking_drift and args.fail_on_drift else 0
 
 
 def _scan_row_has_error(row: Mapping[str, Any]) -> bool:
@@ -1791,20 +1751,22 @@ def _write_benchmark_csv(
             )
 
 
-def _has_blocking_drift(rows: Sequence[Mapping[str, Any]]) -> bool:
-    drift = _build_parity_drift(rows)
-    return any(item["delta"] in {"potential_fn", "status_drift", "verdict_drift"} for item in drift["drifts"])
-
-
-def _write_report(
+def _write_qa_outputs(
     run_dir: Path,
     scan_rows: Sequence[Mapping[str, Any]],
     third_party_rows: Sequence[Mapping[str, Any]],
-) -> None:
+) -> bool:
+    """Write the QA reports and return whether they contain blocking parity drift."""
     drift = _build_parity_drift(scan_rows)
+    _write_json(run_dir / "parity-drift.json", drift)
     third_party = _build_third_party_differential(third_party_rows, scan_rows=scan_rows)
+    _write_json(run_dir / "third-party-differential.json", third_party)
     coverage = _build_coverage_matrix(scan_rows)
+    _write_json(run_dir / "coverage-matrix.json", coverage)
     benchmark = _build_benchmark_results(scan_rows, third_party_rows)
+    _write_json(run_dir / "benchmark-results.json", benchmark)
+    _write_benchmark_csv(run_dir / "benchmark-summary.csv", scan_rows, third_party_rows)
+
     lines = [
         "# PickleScan Rust Large-Corpus QA Report",
         "",
@@ -1836,22 +1798,7 @@ def _write_report(
             ]
         )
     (run_dir / "qa-report.md").write_text("\n".join(lines), encoding="utf-8")
-
-
-def _write_qa_outputs(
-    run_dir: Path,
-    scan_rows: Sequence[Mapping[str, Any]],
-    third_party_rows: Sequence[Mapping[str, Any]],
-) -> None:
-    _write_json(run_dir / "parity-drift.json", _build_parity_drift(scan_rows))
-    _write_json(
-        run_dir / "third-party-differential.json",
-        _build_third_party_differential(third_party_rows, scan_rows=scan_rows),
-    )
-    _write_json(run_dir / "coverage-matrix.json", _build_coverage_matrix(scan_rows))
-    _write_json(run_dir / "benchmark-results.json", _build_benchmark_results(scan_rows, third_party_rows))
-    _write_benchmark_csv(run_dir / "benchmark-summary.csv", scan_rows, third_party_rows)
-    _write_report(run_dir, scan_rows, third_party_rows)
+    return not {"potential_fn", "status_drift", "verdict_drift"}.isdisjoint(drift["summary"])
 
 
 def cmd_report(args: argparse.Namespace) -> int:

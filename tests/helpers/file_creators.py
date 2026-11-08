@@ -10,7 +10,6 @@ import io
 import json
 import pickle
 import struct
-import tarfile
 import zipfile
 import zlib
 from pathlib import Path
@@ -56,22 +55,17 @@ def valid_jpeg_bytes() -> bytes:
     return _VALID_JPEG_1X1
 
 
+def valid_pcm_wave_bytes(frame_count: int = 4) -> bytes:
+    """Return 8 kHz mono PCM audio with canonical RIFF and data chunk sizes."""
+    frames = b"\xfc\xff" * frame_count
+    fmt = struct.pack("<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16)
+    header = b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt " + fmt + b"data"
+    return header + struct.pack("<I", len(frames)) + frames
+
+
 def malicious_pickle_bytes() -> bytes:
     """Return a tiny binary pickle payload that resolves to os.system."""
     return _MALICIOUS_PICKLE
-
-
-def add_tar_bytes(archive: tarfile.TarFile, name: str, payload: bytes | bytearray) -> None:
-    info = tarfile.TarInfo(name)
-    info.size = len(payload)
-    archive.addfile(info, io.BytesIO(payload))
-
-
-def add_tar_link(archive: tarfile.TarFile, name: str, target: str, link_type: bytes) -> None:
-    info = tarfile.TarInfo(name)
-    info.type = link_type
-    info.linkname = target
-    archive.addfile(info)
 
 
 def _tar_octal_field(value: int, length: int) -> bytes:

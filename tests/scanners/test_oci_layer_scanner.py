@@ -23,9 +23,8 @@ from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_aggregate_not_cached
 from tests.helpers.file_creators import SystemCommandPayload
-from tests.helpers.file_creators import add_tar_bytes as _add_tar_bytes
-from tests.helpers.file_creators import add_tar_link as _add_tar_link
 from tests.helpers.file_creators import write_delayed_flax_cntk_overlap as _write_delayed_flax_cntk_overlap
+from tests.helpers.tar import add_tar_bytes, make_tar_link
 
 
 def _record_onnx_payloads(payloads: list[bytes], scan_path: str, _config: dict[str, Any]) -> ScanResult:
@@ -2163,7 +2162,7 @@ class TestOciLayerScanner:
         """Host-absolute symlink targets should be reported from layer metadata."""
         layer_path = tmp_path / "unsafe-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "links/system", link_type=tarfile.SYMTYPE, target=target)
+            tar.addfile(make_tar_link("links/system", target, tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "unsafe-link.manifest"
         manifest_path.write_text(json.dumps({"layers": ["unsafe-link.tar.gz"]}))
@@ -2181,7 +2180,7 @@ class TestOciLayerScanner:
         """Links without a target are malformed and must not be treated as safe."""
         layer_path = tmp_path / "empty-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "links/empty", link_type=link_type, target="")
+            tar.addfile(make_tar_link("links/empty", "", link_type))
 
         manifest_path = tmp_path / "empty-link.manifest"
         manifest_path.write_text(json.dumps({"layers": ["empty-link.tar.gz"]}))
@@ -2204,7 +2203,7 @@ class TestOciLayerScanner:
         """OCI rootfs symlinks may use ordinary POSIX-absolute container paths."""
         layer_path = tmp_path / "absolute-container-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "bin/sh", link_type=tarfile.SYMTYPE, target=target)
+            tar.addfile(make_tar_link("bin/sh", target, tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "absolute-container-link.manifest"
         manifest_path.write_text(json.dumps({"layers": ["absolute-container-link.tar.gz"]}))
@@ -2219,7 +2218,7 @@ class TestOciLayerScanner:
         """Hardlink targets remain archive-root relative and must not be absolute."""
         layer_path = tmp_path / "absolute-hardlink.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "bin/tool", link_type=tarfile.LNKTYPE, target="/bin/target")
+            tar.addfile(make_tar_link("bin/tool", "/bin/target", tarfile.LNKTYPE))
 
         manifest_path = tmp_path / "absolute-hardlink.manifest"
         manifest_path.write_text(json.dumps({"layers": ["absolute-hardlink.tar.gz"]}))
@@ -2230,7 +2229,7 @@ class TestOciLayerScanner:
         """Benign relative link metadata should remain clean."""
         layer_path = tmp_path / "safe-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "links/model", link_type=tarfile.SYMTYPE, target="model.bin")
+            tar.addfile(make_tar_link("links/model", "model.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "safe-link.manifest"
         manifest_path.write_text(json.dumps({"layers": ["safe-link.tar.gz"]}))
@@ -2257,7 +2256,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="payload.bin")
-            _add_tar_link(tar, "models/weights.pkl", link_type=link_type, target=link_target)
+            tar.addfile(make_tar_link("models/weights.pkl", link_target, link_type))
 
         manifest_path = tmp_path / "linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2281,7 +2280,7 @@ class TestOciLayerScanner:
         evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
         layer_path = tmp_path / "forward-linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "models/weights.pkl", link_type=tarfile.SYMTYPE, target=link_target)
+            tar.addfile(make_tar_link("models/weights.pkl", link_target, tarfile.SYMTYPE))
             tar.add(evil_pickle, arcname="payload.bin")
 
         manifest_path = tmp_path / "forward-linked-model.manifest"
@@ -2303,7 +2302,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "oversized-linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(payload, arcname="payload.bin")
-            _add_tar_link(tar, "models/weights.pkl", link_type=tarfile.SYMTYPE, target="../payload.bin")
+            tar.addfile(make_tar_link("models/weights.pkl", "../payload.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "oversized-linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2347,7 +2346,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "budgeted-linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(payload, arcname="payload.bin")
-            _add_tar_link(tar, "models/weights.pkl", link_type=tarfile.SYMTYPE, target="../payload.bin")
+            tar.addfile(make_tar_link("models/weights.pkl", "../payload.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "budgeted-linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2384,9 +2383,11 @@ class TestOciLayerScanner:
         members_by_name = {payload.name: payload}
         links: list[tarfile.TarInfo] = []
         for index in range(chain_length):
-            link = tarfile.TarInfo(f"link-{index}.pkl")
-            link.type = tarfile.SYMTYPE
-            link.linkname = f"link-{index + 1}.pkl" if index + 1 < chain_length else payload.name
+            link = make_tar_link(
+                f"link-{index}.pkl",
+                f"link-{index + 1}.pkl" if index + 1 < chain_length else payload.name,
+                tarfile.SYMTYPE,
+            )
             members_by_name[link.name] = link
             links.append(link)
 
@@ -2416,9 +2417,7 @@ class TestOciLayerScanner:
         alias_count = 128
         members_by_name: dict[str, tarfile.TarInfo] = {}
         for index in range(chain_length):
-            link = tarfile.TarInfo(f"d{index}")
-            link.type = tarfile.SYMTYPE
-            link.linkname = f"d{index + 1}"
+            link = make_tar_link(f"d{index}", f"d{index + 1}", tarfile.SYMTYPE)
             members_by_name[link.name] = link
 
         payload = tarfile.TarInfo(f"d{chain_length}/payload.bin")
@@ -2426,9 +2425,7 @@ class TestOciLayerScanner:
         members_by_name[payload.name] = payload
         aliases: list[tarfile.TarInfo] = []
         for index in range(alias_count):
-            alias = tarfile.TarInfo(f"model-{index}.pkl")
-            alias.type = tarfile.SYMTYPE
-            alias.linkname = "d0/payload.bin"
+            alias = make_tar_link(f"model-{index}.pkl", "d0/payload.bin", tarfile.SYMTYPE)
             aliases.append(alias)
 
         resolve_calls = _count_link_resolutions(monkeypatch)
@@ -2451,13 +2448,9 @@ class TestOciLayerScanner:
 
     def test_resolve_link_payload_member_does_not_cache_suffix_specific_cycle(self) -> None:
         """A cyclic child path must not poison benign siblings through the same directory link."""
-        directory_link = tarfile.TarInfo("a")
-        directory_link.type = tarfile.SYMTYPE
-        directory_link.linkname = "base"
+        directory_link = make_tar_link("a", "base", tarfile.SYMTYPE)
 
-        cyclic_child = tarfile.TarInfo("base/x")
-        cyclic_child.type = tarfile.SYMTYPE
-        cyclic_child.linkname = "../a/x"
+        cyclic_child = make_tar_link("base/x", "../a/x", tarfile.SYMTYPE)
 
         payload = tarfile.TarInfo("base/z/file.bin")
         payload.type = tarfile.REGTYPE
@@ -2467,12 +2460,8 @@ class TestOciLayerScanner:
             payload.name: payload,
         }
 
-        cyclic_alias = tarfile.TarInfo("cyclic.pkl")
-        cyclic_alias.type = tarfile.SYMTYPE
-        cyclic_alias.linkname = "a/x/file.bin"
-        benign_alias = tarfile.TarInfo("benign.pkl")
-        benign_alias.type = tarfile.SYMTYPE
-        benign_alias.linkname = "a/z/file.bin"
+        cyclic_alias = make_tar_link("cyclic.pkl", "a/x/file.bin", tarfile.SYMTYPE)
+        benign_alias = make_tar_link("benign.pkl", "a/z/file.bin", tarfile.SYMTYPE)
 
         resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
         resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
@@ -2500,13 +2489,9 @@ class TestOciLayerScanner:
 
     def test_resolve_link_payload_member_does_not_cache_suffix_rewrite_as_parent_target(self) -> None:
         """A child symlink rewrite must not change the cached target of its parent directory link."""
-        directory_link = tarfile.TarInfo("a")
-        directory_link.type = tarfile.SYMTYPE
-        directory_link.linkname = "base"
+        directory_link = make_tar_link("a", "base", tarfile.SYMTYPE)
 
-        child_link = tarfile.TarInfo("base/x")
-        child_link.type = tarfile.SYMTYPE
-        child_link.linkname = "../other/x"
+        child_link = make_tar_link("base/x", "../other/x", tarfile.SYMTYPE)
 
         rewritten_payload = tarfile.TarInfo("other/x/file.bin")
         rewritten_payload.type = tarfile.REGTYPE
@@ -2519,12 +2504,8 @@ class TestOciLayerScanner:
             sibling_payload.name: sibling_payload,
         }
 
-        rewritten_alias = tarfile.TarInfo("rewritten.pkl")
-        rewritten_alias.type = tarfile.SYMTYPE
-        rewritten_alias.linkname = "a/x/file.bin"
-        sibling_alias = tarfile.TarInfo("sibling.pkl")
-        sibling_alias.type = tarfile.SYMTYPE
-        sibling_alias.linkname = "a/z/file.bin"
+        rewritten_alias = make_tar_link("rewritten.pkl", "a/x/file.bin", tarfile.SYMTYPE)
+        sibling_alias = make_tar_link("sibling.pkl", "a/z/file.bin", tarfile.SYMTYPE)
 
         resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
         resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
@@ -2559,11 +2540,11 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "link-resolution-budget.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             payload = b"benign"
-            _add_tar_bytes(tar, "d1/payload.bin", payload)
+            add_tar_bytes(tar, "d1/payload.bin", payload)
 
-            _add_tar_link(tar, "d0", link_type=tarfile.SYMTYPE, target="d1")
+            tar.addfile(make_tar_link("d0", "d1", tarfile.SYMTYPE))
 
-            _add_tar_link(tar, "model.pkl", link_type=tarfile.SYMTYPE, target="d0/payload.bin")
+            tar.addfile(make_tar_link("model.pkl", "d0/payload.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "link-resolution-budget.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2584,7 +2565,7 @@ class TestOciLayerScanner:
         payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
         layer_path = tmp_path / "limited-linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "model.pkl", link_type=tarfile.SYMTYPE, target="payload.bin")
+            tar.addfile(make_tar_link("model.pkl", "payload.bin", tarfile.SYMTYPE))
             tar.add(payload, arcname="payload.bin")
 
         manifest_path = tmp_path / "limited-linked-model.manifest"
@@ -2605,8 +2586,8 @@ class TestOciLayerScanner:
         """Cyclic model links must terminate and fail closed without nested scans."""
         layer_path = tmp_path / "cyclic-linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "models/first.pkl", link_type=tarfile.SYMTYPE, target="second.pkl")
-            _add_tar_link(tar, "models/second.pkl", link_type=tarfile.SYMTYPE, target="first.pkl")
+            tar.addfile(make_tar_link("models/first.pkl", "second.pkl", tarfile.SYMTYPE))
+            tar.addfile(make_tar_link("models/second.pkl", "first.pkl", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "cyclic-linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2628,8 +2609,8 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "duplicate-target-linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             for payload in (b"first", b"second", b"third"):
-                _add_tar_bytes(tar, "payload.bin", payload)
-            _add_tar_link(tar, "model.pkl", link_type=tarfile.SYMTYPE, target="payload.bin")
+                add_tar_bytes(tar, "payload.bin", payload)
+            tar.addfile(make_tar_link("model.pkl", "payload.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "duplicate-target-linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2649,9 +2630,9 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "duplicate-link-name.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             for name, payload in (("benign.bin", b"benign"), ("malicious.bin", b"malicious")):
-                _add_tar_bytes(tar, name, payload)
+                add_tar_bytes(tar, name, payload)
             for target in ("benign.bin", "malicious.bin"):
-                _add_tar_link(tar, "model.onnx", link_type=tarfile.SYMTYPE, target=target)
+                tar.addfile(make_tar_link("model.onnx", target, tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "duplicate-link-name.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2670,11 +2651,11 @@ class TestOciLayerScanner:
         payload = b"model-payload"
         layer_path = tmp_path / "component-symlink.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_bytes(tar, "payloads/data.bin", payload)
+            add_tar_bytes(tar, "payloads/data.bin", payload)
 
-            _add_tar_link(tar, "models", link_type=tarfile.SYMTYPE, target="payloads")
+            tar.addfile(make_tar_link("models", "payloads", tarfile.SYMTYPE))
 
-            _add_tar_link(tar, "weights.onnx", link_type=tarfile.SYMTYPE, target="models/data.bin")
+            tar.addfile(make_tar_link("weights.onnx", "models/data.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "component-symlink.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2698,7 +2679,7 @@ class TestOciLayerScanner:
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(payload, arcname="payload.bin")
             for name in ("models/first.pkl", "models/second.pkl"):
-                _add_tar_link(tar, name, link_type=tarfile.SYMTYPE, target="../payload.bin")
+                tar.addfile(make_tar_link(name, "../payload.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "duplicate-linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2719,7 +2700,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "benign-linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(benign_pickle, arcname="payload.bin")
-            _add_tar_link(tar, "models/weights.pkl", link_type=tarfile.SYMTYPE, target="../payload.bin")
+            tar.addfile(make_tar_link("models/weights.pkl", "../payload.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "benign-linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2735,7 +2716,7 @@ class TestOciLayerScanner:
         """Symlink targets are resolved from the link directory but contained by the layer root."""
         layer_path = tmp_path / "safe-sibling-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "usr/bin/tool", link_type=tarfile.SYMTYPE, target="../lib/tool")
+            tar.addfile(make_tar_link("usr/bin/tool", "../lib/tool", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "safe-sibling-link.manifest"
         manifest_path.write_text(json.dumps({"layers": ["safe-sibling-link.tar.gz"]}))
@@ -2792,7 +2773,7 @@ class TestOciLayerScanner:
         """Symlink targets that escape the layer root should still be rejected."""
         layer_path = tmp_path / "unsafe-relative-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "usr/bin/tool", link_type=tarfile.SYMTYPE, target="../../../etc/passwd")
+            tar.addfile(make_tar_link("usr/bin/tool", "../../../etc/passwd", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "unsafe-relative-link.manifest"
         manifest_path.write_text(json.dumps({"layers": ["unsafe-relative-link.tar.gz"]}))
@@ -2809,7 +2790,7 @@ class TestOciLayerScanner:
         """Hardlink targets are archive-root relative, not relative to the link directory."""
         layer_path = tmp_path / "unsafe-hardlink.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "dir/link", link_type=tarfile.LNKTYPE, target="../dir/model.bin")
+            tar.addfile(make_tar_link("dir/link", "../dir/model.bin", tarfile.LNKTYPE))
 
         manifest_path = tmp_path / "unsafe-hardlink.manifest"
         manifest_path.write_text(json.dumps({"layers": ["unsafe-hardlink.tar.gz"]}))
@@ -2820,7 +2801,7 @@ class TestOciLayerScanner:
         """Benign hardlink targets under the archive root should remain clean."""
         layer_path = tmp_path / "safe-hardlink.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_link(tar, "dir/link", link_type=tarfile.LNKTYPE, target="dir/model.bin")
+            tar.addfile(make_tar_link("dir/link", "dir/model.bin", tarfile.LNKTYPE))
 
         manifest_path = tmp_path / "safe-hardlink.manifest"
         manifest_path.write_text(json.dumps({"layers": ["safe-hardlink.tar.gz"]}))
@@ -2836,7 +2817,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "many-links.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             for index in range(250):
-                _add_tar_link(tar, f"links/link-{index}", link_type=tarfile.SYMTYPE, target="../targets/model.bin")
+                tar.addfile(make_tar_link(f"links/link-{index}", "../targets/model.bin", tarfile.SYMTYPE))
 
         manifest_path = tmp_path / "many-links.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2893,7 +2874,7 @@ class TestOciLayerScanner:
         """Bare, reserved-target, or non-empty whiteouts are invalid OCI metadata."""
         layer_path = tmp_path / "invalid-whiteout.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            _add_tar_bytes(tar, member_name, payload)
+            add_tar_bytes(tar, member_name, payload)
 
         manifest_path = tmp_path / "invalid-whiteout.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2931,7 +2912,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "reserved-whiteout-parent.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             payload = b"benign"
-            _add_tar_bytes(tar, "root/.wh.deleted/payload.dat", payload)
+            add_tar_bytes(tar, "root/.wh.deleted/payload.dat", payload)
 
         manifest_path = tmp_path / "reserved-whiteout-parent.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2962,7 +2943,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "normalized-whiteout-parent.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             payload = b"benign"
-            _add_tar_bytes(tar, member_name, payload)
+            add_tar_bytes(tar, member_name, payload)
 
         manifest_path = tmp_path / "normalized-whiteout-parent.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2979,7 +2960,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "whiteout-parent-near-match.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             payload = b"benign"
-            _add_tar_bytes(tar, "root/.whitehouse/payload.dat", payload)
+            add_tar_bytes(tar, "root/.whitehouse/payload.dat", payload)
 
         manifest_path = tmp_path / "whiteout-parent-near-match.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
@@ -2994,7 +2975,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "normalized-whiteout-parent-near-match.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             payload = b"benign"
-            _add_tar_bytes(tar, "root/.whitehouse/../payload.dat", payload)
+            add_tar_bytes(tar, "root/.whitehouse/../payload.dat", payload)
 
         manifest_path = tmp_path / "normalized-whiteout-parent-near-match.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))

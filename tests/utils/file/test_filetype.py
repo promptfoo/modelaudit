@@ -57,8 +57,6 @@ from tests.helpers import (
 from tests.helpers.file_creators import (
     _encode_protobuf_varint as _encode_proto_varint,
 )
-from tests.helpers.file_creators import add_tar_bytes as _add_tar_member
-from tests.helpers.file_creators import add_tar_link as _add_tar_link
 from tests.helpers.file_creators import (
     bert_vocab_payload as _bert_vocab_payload,
 )
@@ -95,6 +93,7 @@ from tests.helpers.file_creators import (
 from tests.helpers.file_creators import (
     write_truncated_ordered_hf_tokenizer_json as _write_truncated_ordered_hf_tokenizer_json,
 )
+from tests.helpers.tar import add_tar_bytes, make_tar_link
 
 
 def _assert_magic_and_full_format(path: Path, expected: str) -> None:
@@ -370,6 +369,73 @@ def test_detect_large_renamed_flax_msgpack_by_later_root_without_promoting_gener
 
     _assert_magic_skip_and_full_format(disguised_checkpoint, "flax_msgpack")
     _assert_magic_skip_and_full_format(generic_map, "unknown")
+
+
+def test_jsonl_records_cannot_add_identity_to_the_first_jax_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+    records = tmp_path / "samples.jsonl"
+    records.write_bytes(b'{"text":"hello"}\n' * 32)
+
+    assert not file_detection.is_jax_json_checkpoint_file(records)
+    assert detect_file_format(str(records)) != "jax_checkpoint"
+
+    records.write_bytes(b'{"framework":"jax"}\n' + b'{"text":"hello"}\n' * 32)
+    assert file_detection.is_confirmed_jax_json_checkpoint_file(records)
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("training.log", b"INFO step=25 params=100\n" * 128),
+        ("review.jsonl", b'{"record":"example"}\n' * 128),
+        ("tokenizer.vocab", "▁sample\t-2.8\n".encode() * 128),
+        ("example.so", b"\x7fELF" + bytes(4096)),
+        ("example.dylib", b"\xcf\xfa\xed\xfe" + bytes(4096)),
+        ("libweights.a", b"!<arch>\n" + bytes(4096)),
+        ("tool", b"\x7fELF" + bytes(4096)),
+        ("weights.cact", b"\x84\x2a\xe1\x05" + bytes(4096)),
+    ],
+)
+def test_auxiliary_content_without_flax_keys_does_not_claim_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, content: bytes
+) -> None:
+    from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
+
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 16)
+    path = tmp_path / name
+    path.write_bytes(content)
+
+    assert not FlaxMsgpackScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) != "flax_msgpack"
+
+
+@pytest.mark.parametrize(
+    "encoding", [b"\xa6", b"\xd9\x06", b"\xda\0\x06", b"\xdb\0\0\0\x06", b"\xc4\x06", b"\xc5\0\x06", b"\xc6\0\0\0\x06"]
+)
+def test_auxiliary_flax_key_split_across_reads_retains_incomplete_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, encoding: bytes
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "FLAX_MSGPACK_STRUCTURE_READ_BYTES", 32)
+    path = tmp_path / "run.log"
+    # The "params" string in the second object straddles the first chunk boundary.
+    path.write_bytes(b"A" * (29 - len(encoding)) + b"\x81" + encoding + b"params\x81\xa6target\xa9os.system")
+
+    assert file_detection.is_flax_msgpack_checkpoint_file(path)
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+
+def test_auxiliary_flax_search_keeps_incomplete_coverage_when_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    path = tmp_path / "run.log"
+    path.write_bytes(b"A" * 65 + b"\x81\xa6params\x80")
+
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
 
 
 def test_detect_large_json_array_remains_a_fail_closed_flax_candidate(tmp_path: Path) -> None:
@@ -1138,6 +1204,30 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert detect_file_format(str(model_path)) == "coreml"
     assert detect_format_from_extension(str(model_path)) == "coreml"
     assert validate_file_type(str(model_path)) is True
+
+
+@pytest.mark.parametrize("tag", [0x34, 0x36, 0x37], ids=["unmatched-end-group", "reserved-6", "reserved-7"])
+def test_reject_invalid_wire_types_even_with_unread_protobuf_bytes(tag: int) -> None:
+    sample = b"\x08\x01" + bytes([tag])
+    assert file_detection._looks_like_coreml_model_proto_prefix(sample, sample_is_prefix=True) is False
+    assert file_detection._looks_like_coreml_description_proto_prefix(sample, sample_is_prefix=True) is False
+    # A valid length-delimited field with an unread payload remains unresolved.
+    assert file_detection._looks_like_coreml_model_proto_prefix(b"\x08\x01\x32\x08a", sample_is_prefix=True) is None
+
+
+def test_large_static_library_does_not_claim_protobuf_analysis(tmp_path: Path) -> None:
+    archive = tmp_path / "library.a"
+    members = bytearray(b"!<arch>\n")
+    for name, size in (("/", 106780), ("example.o/", 1024 * 1024)):
+        members.extend(f"{name:<16}{0:<12}{0:<6}{0:<6}{0:<8}{size:<10}`\n".encode("ascii"))
+        members.extend(b"\xc1" * size)
+    archive.write_bytes(members)
+    for detect in (detect_file_format, detect_file_format_from_magic, detect_file_format_for_skip_filter):
+        assert detect(str(archive)) == "unknown"
+
+    archive.write_bytes(b"cos\nsystem\n(S'id'\ntR.")
+    for detect in (detect_file_format, detect_file_format_from_magic, detect_file_format_for_skip_filter):
+        assert detect(str(archive)) == "pickle"
 
 
 def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_match(tmp_path: Path) -> None:
@@ -3146,7 +3236,7 @@ def test_bin_files_keep_pytorch_binary_routing_for_raw_content_signatures(tmp_pa
 def test_torch7_markers_in_gzip_header_do_not_override_tar_archive(tmp_path: Path) -> None:
     tar_payload = io.BytesIO()
     with tarfile.open(fileobj=tar_payload, mode="w") as archive:
-        _add_tar_member(archive, "weights.bin", b"safe weights")
+        add_tar_bytes(archive, "weights.bin", b"safe weights")
 
     archive_path = tmp_path / "weights.tar.gz"
     with (
@@ -3533,7 +3623,7 @@ def test_detect_file_format_rejects_invalid_zlib_header_near_match(tmp_path: Pat
 def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) -> None:
     tar_gz = tmp_path / "archive.tar.gz"
     with tarfile.open(tar_gz, "w:gz") as archive:
-        _add_tar_member(archive, "weights.bin", b"weights")
+        add_tar_bytes(archive, "weights.bin", b"weights")
 
     _assert_full_and_magic_format(tar_gz, "tar")
     assert detect_format_from_extension(str(tar_gz)) == "tar"
@@ -3562,7 +3652,7 @@ def test_detect_file_format_empty_tar_archive(tmp_path: Path) -> None:
 def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) -> None:
     archive_path = tmp_path / "archive.bin"
     with tarfile.open(archive_path, "w:gz") as archive:
-        _add_tar_member(archive, "payload.bin", b"payload")
+        add_tar_bytes(archive, "payload.bin", b"payload")
 
     _assert_full_and_magic_format(archive_path, "tar")
     assert validate_file_type(str(archive_path)) is False
@@ -3587,8 +3677,11 @@ def test_detect_file_format_routes_renamed_nemo_archive_by_linked_root_config(
     archive_path = tmp_path / "linked-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
         payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, payload_name, payload)
-        _add_tar_link(archive, config_name, link_type=link_type, target="payload.txt")
+        add_tar_bytes(archive, payload_name, payload)
+        link_info = tarfile.TarInfo(config_name)
+        link_info.type = link_type
+        link_info.linkname = "payload.txt"
+        archive.addfile(link_info)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3596,9 +3689,9 @@ def test_detect_file_format_routes_renamed_nemo_archive_by_linked_root_config(
 def test_detect_file_format_routes_forward_hardlink_root_config_for_fail_closed_scan(tmp_path: Path) -> None:
     archive_path = tmp_path / "forward-hardlink-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.LNKTYPE, target="payload.txt")
+        archive.addfile(make_tar_link("model_config.yaml", "payload.txt", tarfile.LNKTYPE))
         payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "payload.txt", payload)
+        add_tar_bytes(archive, "payload.txt", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3606,10 +3699,10 @@ def test_detect_file_format_routes_forward_hardlink_root_config_for_fail_closed_
 def test_detect_file_format_routes_forward_hardlink_root_config_chain_for_fail_closed_scan(tmp_path: Path) -> None:
     archive_path = tmp_path / "forward-hardlink-chain-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.LNKTYPE, target="alias.yaml")
-        _add_tar_link(archive, "alias.yaml", link_type=tarfile.LNKTYPE, target="payload.txt")
+        archive.addfile(make_tar_link("model_config.yaml", "alias.yaml", tarfile.LNKTYPE))
+        archive.addfile(make_tar_link("alias.yaml", "payload.txt", tarfile.LNKTYPE))
         payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "payload.txt", payload)
+        add_tar_bytes(archive, "payload.txt", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3618,9 +3711,9 @@ def test_detect_file_format_routes_backward_hardlink_root_config_chain_to_nemo(t
     archive_path = tmp_path / "backward-hardlink-chain-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
         payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "payload.txt", payload)
-        _add_tar_link(archive, "alias.yaml", link_type=tarfile.LNKTYPE, target="payload.txt")
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.LNKTYPE, target="alias.yaml")
+        add_tar_bytes(archive, "payload.txt", payload)
+        archive.addfile(make_tar_link("alias.yaml", "payload.txt", tarfile.LNKTYPE))
+        archive.addfile(make_tar_link("model_config.yaml", "alias.yaml", tarfile.LNKTYPE))
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3633,7 +3726,7 @@ def test_detect_file_format_routes_unknown_type_linked_root_config_to_nemo(tmp_p
         payload_info.type = b"Z"
         payload_info.size = len(payload)
         archive.addfile(payload_info, io.BytesIO(payload))
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.LNKTYPE, target="payload.txt")
+        archive.addfile(make_tar_link("model_config.yaml", "payload.txt", tarfile.LNKTYPE))
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3642,8 +3735,8 @@ def test_detect_file_format_routes_ancestor_symlink_materialized_root_config_to_
     archive_path = tmp_path / "ancestor-symlink-root-config.jpg"
     payload = b"model:\n  _target_: os.system\n"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "alias", link_type=tarfile.SYMTYPE, target=".")
-        _add_tar_member(archive, "alias/model_config.yaml", payload)
+        archive.addfile(make_tar_link("alias", ".", tarfile.SYMTYPE))
+        add_tar_bytes(archive, "alias/model_config.yaml", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3652,8 +3745,8 @@ def test_detect_file_format_routes_symlink_write_through_to_root_config_to_nemo(
     archive_path = tmp_path / "symlink-write-through-root-config.jpg"
     payload = b"model:\n  _target_: os.system\n"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "writer.yaml", link_type=tarfile.SYMTYPE, target="model_config.yaml")
-        _add_tar_member(archive, "writer.yaml", payload)
+        archive.addfile(make_tar_link("writer.yaml", "model_config.yaml", tarfile.SYMTYPE))
+        add_tar_bytes(archive, "writer.yaml", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3662,9 +3755,9 @@ def test_detect_file_format_routes_composed_symlink_write_to_root_config_to_nemo
     archive_path = tmp_path / "composed-symlink-write-root-config.jpg"
     payload = b"model:\n  _target_: os.system\n"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "alias", link_type=tarfile.SYMTYPE, target=".")
-        _add_tar_link(archive, "writer.bin", link_type=tarfile.SYMTYPE, target="alias/model_config.yaml")
-        _add_tar_member(archive, "writer.bin", payload)
+        archive.addfile(make_tar_link("alias", ".", tarfile.SYMTYPE))
+        archive.addfile(make_tar_link("writer.bin", "alias/model_config.yaml", tarfile.SYMTYPE))
+        add_tar_bytes(archive, "writer.bin", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3673,9 +3766,9 @@ def test_detect_file_format_routes_colliding_hardlink_fallback_write_to_root_con
     archive_path = tmp_path / "hardlink-fallback-symlink-root-config.jpg"
     payload = b"model:\n  _target_: os.system\n"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "writer.yaml", link_type=tarfile.SYMTYPE, target="model_config.yaml")
-        _add_tar_member(archive, "payload.bin", payload)
-        _add_tar_link(archive, "writer.yaml", link_type=tarfile.LNKTYPE, target="payload.bin")
+        archive.addfile(make_tar_link("writer.yaml", "model_config.yaml", tarfile.SYMTYPE))
+        add_tar_bytes(archive, "payload.bin", payload)
+        archive.addfile(make_tar_link("writer.yaml", "payload.bin", tarfile.LNKTYPE))
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3686,9 +3779,9 @@ def test_detect_file_format_routes_dangling_symlink_hardlink_fallback_write_to_r
     archive_path = tmp_path / "dangling-symlink-hardlink-root-config.jpg"
     payload = b"model:\n  _target_: os.system\n"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "target_link.bin", link_type=tarfile.SYMTYPE, target="model_config.yaml")
-        _add_tar_link(archive, "writer.bin", link_type=tarfile.LNKTYPE, target="target_link.bin")
-        _add_tar_member(archive, "writer.bin", payload)
+        archive.addfile(make_tar_link("target_link.bin", "model_config.yaml", tarfile.SYMTYPE))
+        archive.addfile(make_tar_link("writer.bin", "target_link.bin", tarfile.LNKTYPE))
+        add_tar_bytes(archive, "writer.bin", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3697,8 +3790,8 @@ def test_detect_file_format_keeps_unrelated_symlink_and_nested_config_on_tar_rou
     archive_path = tmp_path / "unrelated-symlink-nested-config.jpg"
     payload = b"model:\n  _target_: os.system\n"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "assets/latest", link_type=tarfile.SYMTYPE, target="logo.bin")
-        _add_tar_member(archive, "docs/model_config.yaml", payload)
+        archive.addfile(make_tar_link("assets/latest", "logo.bin", tarfile.SYMTYPE))
+        add_tar_bytes(archive, "docs/model_config.yaml", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "tar")
 
@@ -3706,10 +3799,10 @@ def test_detect_file_format_keeps_unrelated_symlink_and_nested_config_on_tar_rou
 def test_detect_file_format_routes_forward_symlink_root_config_chain_to_nemo(tmp_path: Path) -> None:
     archive_path = tmp_path / "forward-symlink-chain-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.SYMTYPE, target="alias.yaml")
-        _add_tar_link(archive, "alias.yaml", link_type=tarfile.SYMTYPE, target="payload.txt")
+        archive.addfile(make_tar_link("model_config.yaml", "alias.yaml", tarfile.SYMTYPE))
+        archive.addfile(make_tar_link("alias.yaml", "payload.txt", tarfile.SYMTYPE))
         payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "payload.txt", payload)
+        add_tar_bytes(archive, "payload.txt", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3717,8 +3810,8 @@ def test_detect_file_format_routes_forward_symlink_root_config_chain_to_nemo(tmp
 def test_detect_file_format_routes_cyclic_root_config_symlink_for_fail_closed_scan(tmp_path: Path) -> None:
     archive_path = tmp_path / "cyclic-link-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.SYMTYPE, target="alias.yaml")
-        _add_tar_link(archive, "alias.yaml", link_type=tarfile.SYMTYPE, target="model_config.yaml")
+        archive.addfile(make_tar_link("model_config.yaml", "alias.yaml", tarfile.SYMTYPE))
+        archive.addfile(make_tar_link("alias.yaml", "model_config.yaml", tarfile.SYMTYPE))
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3741,7 +3834,7 @@ def test_detect_file_format_keeps_non_root_config_names_on_tar_route(tmp_path: P
 def test_detect_file_format_keeps_unsafe_linked_root_config_on_tar_route(tmp_path: Path, link_type: bytes) -> None:
     archive_path = tmp_path / "unsafe-linked-generic.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "model_config.yaml", link_type=link_type, target="../payload.txt")
+        archive.addfile(make_tar_link("model_config.yaml", "../payload.txt", link_type))
 
     _assert_full_magic_and_skip_format(archive_path, "tar")
 
@@ -3753,10 +3846,12 @@ def test_detect_file_format_routes_safe_symlink_root_before_late_target(
     monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_ENTRIES", 2)
     archive_path = tmp_path / "late-linked-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.SYMTYPE, target="payload.txt")
-        _add_tar_member(archive, "assets/filler.bin", b"x")
+        archive.addfile(make_tar_link("model_config.yaml", "payload.txt", tarfile.SYMTYPE))
+        filler_info = tarfile.TarInfo("assets/filler.bin")
+        filler_info.size = 1
+        archive.addfile(filler_info, io.BytesIO(b"x"))
         payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "payload.txt", payload)
+        add_tar_bytes(archive, "payload.txt", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3768,10 +3863,12 @@ def test_detect_file_format_keeps_resolved_linked_root_config_before_route_budge
     monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_ENTRIES", 2)
     archive_path = tmp_path / "resolved-linked-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "model_config.yaml", link_type=tarfile.SYMTYPE, target="payload.txt")
+        archive.addfile(make_tar_link("model_config.yaml", "payload.txt", tarfile.SYMTYPE))
         payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "payload.txt", payload)
-        _add_tar_member(archive, "assets/filler.bin", b"x")
+        add_tar_bytes(archive, "payload.txt", payload)
+        filler_info = tarfile.TarInfo("assets/filler.bin")
+        filler_info.size = 1
+        archive.addfile(filler_info, io.BytesIO(b"x"))
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3784,7 +3881,7 @@ def test_detect_file_format_fails_closed_when_nemo_route_probe_limit_is_reached(
     archive_path = tmp_path / "large-generic.jpg"
     with tarfile.open(archive_path, "w") as archive:
         for name in ("one.bin", "two.bin", "three.bin"):
-            _add_tar_member(archive, name, b"x")
+            add_tar_bytes(archive, name, b"x")
 
     _assert_full_magic_and_skip_format(archive_path, NEMO_ROUTING_INCONCLUSIVE_FORMAT)
 
@@ -3823,9 +3920,11 @@ def test_detect_file_format_fails_closed_when_nemo_link_resolution_budget_is_rea
     monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS", 1)
     archive_path = tmp_path / "link-resolution-budget.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "alias-1", link_type=tarfile.SYMTYPE, target=".")
-        _add_tar_link(archive, "alias-2", link_type=tarfile.SYMTYPE, target="alias-1")
-        _add_tar_member(archive, "alias-2/payload.bin", b"x")
+        archive.addfile(make_tar_link("alias-1", ".", tarfile.SYMTYPE))
+        archive.addfile(make_tar_link("alias-2", "alias-1", tarfile.SYMTYPE))
+        info = tarfile.TarInfo("alias-2/payload.bin")
+        info.size = 1
+        archive.addfile(info, io.BytesIO(b"x"))
 
     _assert_full_magic_and_skip_format(archive_path, NEMO_ROUTING_INCONCLUSIVE_FORMAT)
 
@@ -3837,8 +3936,10 @@ def test_detect_file_format_charges_nemo_component_prefix_probes(
     monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS", 3)
     archive_path = tmp_path / "component-prefix-budget.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_link(archive, "alias", link_type=tarfile.SYMTYPE, target=".")
-        _add_tar_member(archive, "one/two/three/four/payload.bin", b"x")
+        archive.addfile(make_tar_link("alias", ".", tarfile.SYMTYPE))
+        info = tarfile.TarInfo("one/two/three/four/payload.bin")
+        info.size = 1
+        archive.addfile(info, io.BytesIO(b"x"))
 
     _assert_full_magic_and_skip_format(archive_path, NEMO_ROUTING_INCONCLUSIVE_FORMAT)
 
@@ -3852,7 +3953,7 @@ def test_detect_file_format_propagates_inconclusive_compressed_nemo_route(
     with tarfile.open(archive_path, "w:gz") as archive:
         for name in ("one.bin", "two.bin", "model_config.yaml"):
             payload = b"x"
-            _add_tar_member(archive, name, payload)
+            add_tar_bytes(archive, name, payload)
 
     _assert_full_magic_and_skip_format(archive_path, NEMO_ROUTING_INCONCLUSIVE_FORMAT)
 
@@ -3867,10 +3968,10 @@ def test_detect_file_format_hands_compressed_nemo_body_skip_budget_to_tar(
     archive_path = tmp_path / "renamed-model.jpg"
     with tarfile.open(archive_path, mode) as archive:
         first_payload = b"x" * 128
-        _add_tar_member(archive, "large-weights.bin", first_payload)
+        add_tar_bytes(archive, "large-weights.bin", first_payload)
 
         config_payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "model_config.yaml", config_payload)
+        add_tar_bytes(archive, "model_config.yaml", config_payload)
 
     _assert_full_magic_and_skip_format(archive_path, "tar")
 
@@ -3885,10 +3986,10 @@ def test_detect_file_format_seekable_raw_tar_preserves_nemo_route_after_large_me
     archive_path = tmp_path / f"large-nemo{suffix}"
     with tarfile.open(archive_path, "w") as archive:
         first_payload = b"x" * 128
-        _add_tar_member(archive, "large-weights.bin", first_payload)
+        add_tar_bytes(archive, "large-weights.bin", first_payload)
 
         config_payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "model_config.yaml", config_payload)
+        add_tar_bytes(archive, "model_config.yaml", config_payload)
 
     _assert_full_magic_and_skip_format(archive_path, "nemo")
 
@@ -3901,10 +4002,10 @@ def test_detect_file_format_compressed_canonical_tar_body_skip_budget_hands_to_t
     archive_path = tmp_path / "large-archive.tar.gz"
     with tarfile.open(archive_path, "w:gz") as archive:
         first_payload = b"x" * 128
-        _add_tar_member(archive, "large-weights.bin", first_payload)
+        add_tar_bytes(archive, "large-weights.bin", first_payload)
 
         config_payload = b"model:\n  _target_: os.system\n"
-        _add_tar_member(archive, "model_config.yaml", config_payload)
+        add_tar_bytes(archive, "model_config.yaml", config_payload)
 
     _assert_full_magic_and_skip_format(archive_path, "tar")
 
@@ -3917,7 +4018,7 @@ def test_detect_file_format_compressed_tar_content_with_raw_tar_suffix_routes_ta
     archive_path = tmp_path / "compressed-content.tar"
     with tarfile.open(archive_path, mode) as archive:
         payload = b"metadata"
-        _add_tar_member(archive, "metadata.txt", payload)
+        add_tar_bytes(archive, "metadata.txt", payload)
 
     _assert_full_magic_and_skip_format(archive_path, "tar")
 
@@ -4217,7 +4318,7 @@ def test_validate_file_type(tmp_path):
     # NeMo .nemo files are TAR archives by design
     nemo_path = tmp_path / "model.nemo"
     with tarfile.open(nemo_path, "w") as tar:
-        _add_tar_member(tar, "model_config.yaml", b"model: test\n")
+        add_tar_bytes(tar, "model_config.yaml", b"model: test\n")
     assert validate_file_type(str(nemo_path)) is True
 
     # Small file should be valid (can't determine magic bytes)
@@ -5067,7 +5168,7 @@ def _assert_generic_json_structure_unclaimed(tmp_path: Path, case_filename: str,
 def _assert_tar_config_routing(tmp_path: Path, config_name: str, case_filename: str, case_expected_format: str) -> None:
     archive_path = tmp_path / case_filename
     with tarfile.open(archive_path, "w") as archive:
-        _add_tar_member(archive, config_name, b"model:\n  _target_: os.system\n")
+        add_tar_bytes(archive, config_name, b"model:\n  _target_: os.system\n")
 
     _assert_full_magic_and_skip_format(archive_path, case_expected_format)
 
@@ -5083,22 +5184,28 @@ def _assert_tokenizer_route_evidence(tmp_path: Path, case_late_fields: str, case
     assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is case_expected_jax
 
 
-@pytest.mark.parametrize("filename", ["tekken.json", "v13.tekken.json"])
-def test_tekken_vocabulary_owns_only_complete_tokenizer_schema(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize(
+    ("filename", "version", "has_special_tokens"),
+    [("tekken.json", "v7", False), ("tekken.json", "v13", True), ("v13.tekken.json", "v13", True)],
+)
+def test_tekken_vocabulary_owns_only_complete_tokenizer_schema(
+    tmp_path: Path, filename: str, version: str, has_special_tokens: bool
+) -> None:
     path = tmp_path / filename
     config = {
-        "version": "v13",
+        "version": version,
         "pattern": ".",
         "num_vocab_tokens": 1,
         "default_vocab_size": 1,
         "default_num_special_tokens": 1,
     }
     vocab = [{"rank": 0, "token_str": "{{jax}}", "token_bytes": "e3tqYXh9fQ=="}]
-    document = {
+    document: dict[str, object] = {
         "config": config,
         "vocab": vocab,
-        "special_tokens": [{"rank": 0, "token_str": "<s>", "is_control": True}],
     }
+    if has_special_tokens:
+        document["special_tokens"] = [{"rank": 0, "token_str": "<s>", "is_control": True}]
     path.write_text(json.dumps(document))
     assert is_huggingface_tokenizer_json_file(path)
     assert detect_file_format(str(path)) == "unknown"

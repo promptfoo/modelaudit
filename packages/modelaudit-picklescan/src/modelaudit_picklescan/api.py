@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 from .call_graph import (
+    _PYTORCH_FIXED_STORAGE_ITEM_SIZES,
+    _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES,
     CallGraphFinding,
     UnanalyzedCallGraphReference,
     _begin_shared_source_report,
@@ -47,6 +49,7 @@ from .call_graph import (
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
+from .call_graph import _PYTORCH_STORAGE_REFERENCES as _PYTORCH_STORAGE_GLOBALS
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
@@ -252,6 +255,8 @@ _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES = 64 * 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES = 256_000
+_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES = 2_000_000
 _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
@@ -263,130 +268,14 @@ _MAX_INERT_INITIALIZATION_MODULES = 32
 _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
 _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES = 100_000
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
-_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
-    {
-        "BFloat16Storage",
-        "BoolStorage",
-        "ByteStorage",
-        "CharStorage",
-        "ComplexDoubleStorage",
-        "ComplexFloatStorage",
-        "DoubleStorage",
-        "FloatStorage",
-        "HalfStorage",
-        "IntStorage",
-        "LongStorage",
-        "QInt32Storage",
-        "QInt8Storage",
-        "QUInt8Storage",
-        "QUInt4x2Storage",
-        "QUInt2x4Storage",
-        "ShortStorage",
-        "UntypedStorage",
-    }
-)
-_PYTORCH_STORAGE_GLOBALS = frozenset(
-    (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
-)
 _PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT = str(_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX)
-_PYTORCH_STORAGE_ITEM_SIZES = {
-    "BFloat16Storage": 2,
-    "BoolStorage": 1,
-    "ByteStorage": 1,
-    "CharStorage": 1,
-    "ComplexDoubleStorage": 16,
-    "ComplexFloatStorage": 8,
-    "DoubleStorage": 8,
-    "FloatStorage": 4,
-    "HalfStorage": 2,
-    "IntStorage": 4,
-    "LongStorage": 8,
-    "QInt32Storage": 4,
-    "QInt8Storage": 1,
-    "QUInt8Storage": 1,
-    "ShortStorage": 2,
-    "UntypedStorage": 1,
-}
-_TRUSTED_FRAMEWORK_REDUCE_REFERENCES = frozenset(
+_PYTORCH_STORAGE_ITEM_SIZES = _PYTORCH_FIXED_STORAGE_ITEM_SIZES.copy()
+_TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES = frozenset(
     {
-        ("accelerate.utils.dataclasses", "DistributedType"),
-        ("torch", "device"),
-        ("transformers.trainer_utils", "HubStrategy"),
-        ("transformers.trainer_utils", "IntervalStrategy"),
-        ("transformers.trainer_utils", "SaveStrategy"),
-        ("transformers.trainer_utils", "SchedulerType"),
-        ("transformers.training_args", "OptimizerNames"),
+        ("string", "Formatter"),
+        ("weakref", "proxy"),
+        ("weakref", "ref"),
     }
-)
-_SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES = frozenset(
-    {
-        ("accelerate.state", "PartialState"),
-        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
-        ("accelerate.utils.dataclasses", "DistributedType"),
-        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
-        ("numpy", "dtype"),
-        ("numpy", "ndarray"),
-        ("numpy._core.multiarray", "_reconstruct"),
-        ("numpy._core.multiarray", "scalar"),
-        ("numpy.core.multiarray", "_reconstruct"),
-        ("numpy.core.multiarray", "scalar"),
-        ("torch", "BFloat16Storage"),
-        ("torch", "BoolStorage"),
-        ("torch", "ByteStorage"),
-        ("torch", "CharStorage"),
-        ("torch", "ComplexDoubleStorage"),
-        ("torch", "ComplexFloatStorage"),
-        ("torch", "DoubleStorage"),
-        ("torch", "FloatStorage"),
-        ("torch", "HalfStorage"),
-        ("torch", "IntStorage"),
-        ("torch", "LongStorage"),
-        ("torch", "QInt32Storage"),
-        ("torch", "QInt8Storage"),
-        ("torch", "QUInt2x4Storage"),
-        ("torch", "QUInt4x2Storage"),
-        ("torch", "QUInt8Storage"),
-        ("torch", "ShortStorage"),
-        ("torch", "Size"),
-        ("torch", "Storage"),
-        ("torch", "UntypedStorage"),
-        ("torch", "_rebuild_tensor"),
-        ("torch", "_rebuild_tensor_v2"),
-        ("torch", "bfloat16"),
-        ("torch", "device"),
-        ("torch._tensor", "_rebuild_from_type_v2"),
-        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
-        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
-        ("torch._utils", "_rebuild_nested_tensor"),
-        ("torch._utils", "_rebuild_parameter"),
-        ("torch._utils", "_rebuild_parameter_with_state"),
-        ("torch._utils", "_rebuild_qtensor"),
-        ("torch._utils", "_rebuild_sparse_tensor"),
-        ("torch._utils", "_rebuild_tensor"),
-        ("torch._utils", "_rebuild_tensor_v2"),
-        ("torch._utils", "_rebuild_tensor_v3"),
-        ("torch._utils", "_rebuild_wrapper_subclass"),
-        ("torch.serialization", "_get_layout"),
-        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
-        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
-        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
-        ("transformers.trainer_utils", "HubStrategy"),
-        ("transformers.trainer_utils", "IntervalStrategy"),
-        ("transformers.trainer_utils", "SaveStrategy"),
-        ("transformers.trainer_utils", "SchedulerType"),
-        ("transformers.training_args", "OptimizerNames"),
-        ("transformers.training_args", "TrainingArguments"),
-    }
-)
-_TRUSTED_REDUCE_REFERENCES = (
-    frozenset(
-        {
-            ("string", "Formatter"),
-            ("weakref", "proxy"),
-            ("weakref", "ref"),
-        }
-    )
-    | _TRUSTED_FRAMEWORK_REDUCE_REFERENCES
 )
 _TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES = frozenset(
     {
@@ -396,7 +285,6 @@ _TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES = frozenset(
         ("weakref", "ref"),
     }
 )
-_TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES = _TRUSTED_REDUCE_REFERENCES - _TRUSTED_FRAMEWORK_REDUCE_REFERENCES
 _NUMPY_RECONSTRUCT_REFERENCES = frozenset(
     {
         ("numpy._core.multiarray", "_reconstruct"),
@@ -531,12 +419,14 @@ class _PytorchStorageReferenceParse:
     discarded_tracked_storage_references: bool = False
     used_streaming_batch_compaction: bool = False
     accepted_oversized_state_batch: bool = False
+    first_legacy_pid_position: int | None = None
 
 
 @dataclass(frozen=True)
 class _PytorchZipDataPickleTrust:
     storage_keys: set[str]
     canonical_tensor_rebuild_invocations: frozenset[tuple[int, int]]
+    first_legacy_pid_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -622,7 +512,6 @@ class PickleScanner:
                 message=f"Could not read pickle stream: {error!s}",
                 category="short_read",
                 exception=error,
-                bytes_scanned=0,
                 bytes_total=error.expected_size,
             )
         except Exception as error:
@@ -631,7 +520,6 @@ class PickleScanner:
                 message=f"Could not read pickle stream: {error!s}",
                 category="io_error",
                 exception=error,
-                bytes_scanned=0,
                 bytes_total=normalized_size,
             )
         native_bytes_total = len(payload) if stream_truncated and normalized_size is not None else normalized_size
@@ -655,20 +543,17 @@ class PickleScanner:
                     remove_persistent_ids=False,
                 )
         if stream_truncated:
-            if normalized_size is None:
-                return _with_unbounded_stream_notice(
-                    report,
-                    source=source,
-                    bytes_scanned=len(payload),
-                    max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
-                )
-            return _with_known_stream_notice(
+            return _with_truncated_stream_notice(
                 report,
                 source=source,
                 bytes_scanned=len(payload),
                 bytes_total=normalized_size,
-                max_known_read_bytes=self.options.max_known_stream_read_bytes,
-                stream_start_offset=position_offset,
+                max_read_bytes=(
+                    self.options.max_unbounded_stream_read_bytes
+                    if normalized_size is None
+                    else self.options.max_known_stream_read_bytes
+                ),
+                stream_start_offset=0 if normalized_size is None else position_offset,
             )
         return report
 
@@ -731,7 +616,6 @@ class PickleScanner:
                 message=f"Could not read pickle file: {error!s}",
                 category="io_error",
                 exception=error,
-                bytes_scanned=0,
                 bytes_total=None,
             )
         except zipfile.BadZipFile as error:
@@ -740,7 +624,6 @@ class PickleScanner:
                 message=f"Could not read PyTorch ZIP file: {error!s}",
                 category="zip_error",
                 exception=error,
-                bytes_scanned=0,
                 bytes_total=size,
             )
 
@@ -786,7 +669,6 @@ class PickleScanner:
 
                 reports: list[PickleReport] = []
                 skipped_notices: list[Notice] = list(discovery_notices)
-                scanned_pickle_member_count = 0
                 scanned_pickle_member_bytes = 0
                 budget_skipped_entries: list[zipfile.ZipInfo] = []
                 for entry in pickle_entries:
@@ -813,12 +695,11 @@ class PickleScanner:
                         )
                         continue
                     if (
-                        scanned_pickle_member_count >= _MAX_PYTORCH_ZIP_PICKLE_MEMBERS
+                        len(reports) >= _MAX_PYTORCH_ZIP_PICKLE_MEMBERS
                         or scanned_pickle_member_bytes + entry.file_size > _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES
                     ):
                         budget_skipped_entries.append(entry)
                         continue
-                    scanned_pickle_member_count += 1
                     scanned_pickle_member_bytes += entry.file_size
                     try:
                         with archive.open(entry, "r") as member_stream:
@@ -842,7 +723,6 @@ class PickleScanner:
                                 message=f"Could not read PyTorch ZIP pickle member: {error!s}",
                                 category="zip_error",
                                 exception=error,
-                                bytes_scanned=0,
                                 bytes_total=entry.file_size,
                             )
                         )
@@ -861,7 +741,7 @@ class PickleScanner:
                             code="pytorch_zip_pickle_member_budget",
                             details={
                                 "pickle_member_count": pickle_member_count,
-                                "scanned_pickle_member_count": scanned_pickle_member_count,
+                                "scanned_pickle_member_count": len(reports),
                                 "skipped_pickle_member_count": len(budget_skipped_entries),
                                 "max_pickle_members": _MAX_PYTORCH_ZIP_PICKLE_MEMBERS,
                                 "total_pickle_member_bytes": total_pickle_member_bytes,
@@ -1001,13 +881,7 @@ def _bounded_zip_entries(
     size: int,
 ) -> list[zipfile.ZipInfo] | PickleReport:
     filelist = getattr(archive, "filelist", None)
-    if isinstance(filelist, list):
-        entry_count = len(filelist)
-        if entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
-            return _pytorch_zip_entry_limit_report(source=source, size=size, entry_count=entry_count)
-        return cast(list[zipfile.ZipInfo], filelist)
-
-    entries = archive.infolist()
+    entries = cast(list[zipfile.ZipInfo], filelist) if isinstance(filelist, list) else archive.infolist()
     entry_count = len(entries)
     if entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
         return _pytorch_zip_entry_limit_report(source=source, size=size, entry_count=entry_count)
@@ -1032,39 +906,17 @@ def _discover_pytorch_zip_pickle_entries(
     options: ScanOptions,
     deadline: float,
 ) -> tuple[list[zipfile.ZipInfo], tuple[Notice, ...], dict[str, _PytorchZipDataPickleTrust]]:
-    pickle_entries: list[zipfile.ZipInfo] = []
-    notices: list[Notice] = []
-    seen_entries: set[int] = set()
-    candidates: list[zipfile.ZipInfo] = []
-
-    def add_entry(entry: zipfile.ZipInfo) -> None:
-        entry_id = id(entry)
-        if entry_id in seen_entries:
-            return
-        pickle_entries.append(entry)
-        seen_entries.add(entry_id)
-
     def remaining_probe_entries(*entry_groups: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
-        remaining: list[zipfile.ZipInfo] = []
-        remaining_ids: set[int] = set()
-        for entry_group in entry_groups:
-            for entry in entry_group:
-                entry_id = id(entry)
-                if entry_id in remaining_ids:
-                    continue
-                remaining.append(entry)
-                remaining_ids.add(entry_id)
-        return remaining
+        return list({id(entry): entry for group in entry_groups for entry in group}.values())
 
+    explicit_pickle_entries: dict[int, zipfile.ZipInfo] = {}
     for entry in entries:
         if entry.is_dir():
             continue
-        name = entry.filename
-        lowered = name.lower()
+        lowered = entry.filename.lower()
         if _is_data_pickle_member(lowered) or lowered.endswith(_PICKLE_MEMBER_SUFFIXES):
-            add_entry(entry)
+            explicit_pickle_entries[id(entry)] = entry
 
-    explicit_pickle_entries = tuple(pickle_entries)
     storage_entries, storage_notices = _validated_pytorch_storage_entry_ids(
         archive,
         entries,
@@ -1072,12 +924,9 @@ def _discover_pytorch_zip_pickle_entries(
         options=options,
         deadline=deadline,
     )
-    notices.extend(storage_notices)
-
-    for entry in entries:
-        if entry.is_dir() or id(entry) in seen_entries:
-            continue
-        candidates.append(entry)
+    notices = list(storage_notices)
+    candidates = [entry for entry in entries if not entry.is_dir() and id(entry) not in explicit_pickle_entries]
+    discovered_entry_ids: set[int] = set()
 
     probe_bytes_remaining = [_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES]
     nul_padding_verify_bytes_remaining = [_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES]
@@ -1114,7 +963,7 @@ def _discover_pytorch_zip_pickle_entries(
                         defer_padding_probe=needs_deferred_padding_probe if phase < 2 else None,
                     )
                 if looks_like_pickle:
-                    add_entry(entry)
+                    discovered_entry_ids.add(entry_id)
                 elif phase == 0 and (
                     entry_id in storage_entries.expanded_trust_entry_ids or needs_deferred_expanded_probe[0]
                 ):
@@ -1146,8 +995,8 @@ def _discover_pytorch_zip_pickle_entries(
             break
 
     pickle_entries = [
-        *explicit_pickle_entries,
-        *(entry for entry in candidates if id(entry) in seen_entries),
+        *explicit_pickle_entries.values(),
+        *(entry for entry in candidates if id(entry) in discovered_entry_ids),
     ]
     return pickle_entries, tuple(notices), storage_entries.trusted_data_pkl_by_name
 
@@ -1176,6 +1025,7 @@ def _validated_pytorch_storage_entry_ids(
     notices: list[Notice] = []
     storage_reference_bytes_read = 0
     storage_reference_opcodes_remaining = [min(_PYTORCH_STORAGE_TRUST_MAX_OPCODES, options.max_opcodes)]
+    pid_validator = _PytorchZipStoragePidValidator(options.max_opcodes)
     for data_pkl_name, data_pkl_entries in entries_by_name.items():
         _check_pytorch_zip_deadline(deadline)
         if data_pkl_name.rsplit("/", 1)[-1] != "data.pkl":
@@ -1255,6 +1105,18 @@ def _validated_pytorch_storage_entry_ids(
             opcode_budget_remaining=storage_reference_opcodes_remaining,
             deadline=deadline,
         )
+        pid_trust = pid_validator.validate(
+            pickle_data,
+            archive,
+            entries_by_name,
+            prefix,
+            storage_entries_by_key,
+            discovery_complete=reference_parse.parse_complete,
+            deadline=deadline,
+        )
+        if pid_trust is not None:
+            # Only the PID finding receives this proof. Preserve storage probing and its coverage diagnostics.
+            trusted_data_pkl_by_name[data_pkl_name] = pid_trust
         if not reference_parse.parse_complete:
             notices.append(
                 _pytorch_zip_storage_reference_validation_notice(
@@ -1357,6 +1219,80 @@ def _trusted_pytorch_data_pkl_from_storage_member_sizes(
     storage_member_sizes: Mapping[str, int],
 ) -> _PytorchZipDataPickleTrust | None:
     reference_parse = _pytorch_storage_keys_from_pickle_bytes(pickle_data)
+    return _trusted_pytorch_storage_member_sizes(reference_parse, storage_member_sizes)
+
+
+class _PytorchZipStoragePidValidator:
+    """Validate aggregate PID findings with one work allowance per archive."""
+
+    def __init__(self, max_opcodes: int) -> None:
+        available = max(0, max_opcodes - _PYTORCH_STORAGE_TRUST_MAX_OPCODES)
+        self._opcodes_remaining = [min(available, _PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES)]
+        self._provenance_remaining = [_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES]
+
+    @staticmethod
+    def _is_legacy_module(
+        pickle_data: bytes, archive: zipfile.ZipFile, entries_by_name: Mapping[str, list[zipfile.ZipInfo]], prefix: str
+    ) -> bool:
+        if (
+            not pickle_data.startswith(b"\x80\x02c__torch__\nModule\n")
+            or len(entries_by_name.get(f"{prefix}code/__torch__.py", [])) != 1
+        ):
+            return False
+        versions = entries_by_name.get(f"{prefix}version", [])
+        if (
+            len(versions) != 1
+            or versions[0].file_size != 2
+            or versions[0].compress_type != zipfile.ZIP_STORED
+            or versions[0].compress_size != 2
+        ):
+            return False
+        try:
+            return archive.read(versions[0]) == b"1\n"
+        except Exception:
+            return False
+
+    def validate(
+        self,
+        pickle_data: bytes,
+        archive: zipfile.ZipFile,
+        entries_by_name: Mapping[str, list[zipfile.ZipInfo]],
+        prefix: str,
+        storage_entries_by_key: Mapping[str, zipfile.ZipInfo],
+        *,
+        discovery_complete: bool,
+        deadline: float,
+    ) -> _PytorchZipDataPickleTrust | None:
+        if self._opcodes_remaining[0] <= 0 or self._provenance_remaining[0] <= 0:
+            return None
+        legacy_module = self._is_legacy_module(pickle_data, archive, entries_by_name, prefix)
+        if discovery_complete and not legacy_module:
+            return None
+        parsed = _parse_single_pytorch_storage_stream(
+            pickle_data,
+            opcode_budget_remaining=self._opcodes_remaining,
+            max_opcodes=_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES,
+            large_pid_provenance_remaining=self._provenance_remaining,
+            legacy_module=legacy_module,
+            deadline=deadline,
+            position_offset=0,
+        )
+        if not parsed.canonical_tensor_rebuild_invocations or not all(
+            _pytorch_storage_ref_has_zip_size_proof(ref) for ref in parsed.storage_refs_by_key.values()
+        ):
+            return None
+        trust = _trusted_pytorch_storage_member_sizes(
+            parsed, {key: entry.file_size for key, entry in storage_entries_by_key.items()}
+        )
+        if trust is None:
+            return None
+        return _PytorchZipDataPickleTrust(trust.storage_keys, frozenset(), parsed.first_legacy_pid_position)
+
+
+def _trusted_pytorch_storage_member_sizes(
+    reference_parse: _PytorchStorageReferenceParse,
+    storage_member_sizes: Mapping[str, int],
+) -> _PytorchZipDataPickleTrust | None:
     if (
         not reference_parse.parse_complete
         or not reference_parse.referenced_keys
@@ -1419,21 +1355,12 @@ def _zip_entry_looks_like_pickle(
     if not prefix:
         return False
 
-    if prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
-        sample = _read_zip_entry_probe(
-            archive,
-            entry,
-            _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
-            probe_bytes_remaining,
-            deadline,
-        )
-        return _looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
-
-    if prefix[0] not in _PROTO0_1_START_BYTES:
+    binary = bool(prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES))
+    if not binary and prefix[0] not in _PROTO0_1_START_BYTES:
         return False
 
     sample = prefix
-    if entry.file_size > len(prefix):
+    if binary or entry.file_size > len(prefix):
         sample = _read_zip_entry_probe(
             archive,
             entry,
@@ -1441,6 +1368,8 @@ def _zip_entry_looks_like_pickle(
             probe_bytes_remaining,
             deadline,
         )
+    if binary:
+        return _looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
     return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
 
 
@@ -1600,6 +1529,29 @@ def _trusted_storage_zip_entry_looks_like_pickle(
         and _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
     ):
         return True
+
+    def nul_padding_requires_scan(padded_sample: bytes) -> bool:
+        if entry.file_size > len(padded_sample):
+            padded_sample = _verified_nul_padding_storage_probe_sample(
+                archive,
+                entry,
+                padded_sample,
+                len(padded_sample),
+                probe_bytes_remaining,
+                nul_padding_verify_bytes_remaining,
+                deadline,
+            )
+        if is_frame_first_candidate and _frame_first_trusted_storage_probe_should_scan(padded_sample):
+            return True
+        if not is_frame_first_candidate and _proto0_or_1_trusted_storage_probe_should_scan(
+            padded_sample,
+            sample_is_prefix=False,
+        ):
+            return True
+        if _trivial_complete_pickle_prefix_has_only_padding(padded_sample):
+            return False
+        raise ValueError("trusted PyTorch storage padding probe limit reached")
+
     if (
         entry.file_size > len(sample)
         and len(sample) >= _PICKLE_DISCOVERY_LONG_PROBE_BYTES
@@ -1627,15 +1579,7 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             if _trivial_complete_pickle_prefix_has_only_padding(sample):
                 if entry.file_size > len(sample):
                     if _trivial_complete_pickle_prefix_has_only_nul_padding(sample):
-                        return _verified_nul_padding_storage_probe_should_scan(
-                            archive,
-                            entry,
-                            sample,
-                            probe_bytes_remaining,
-                            nul_padding_verify_bytes_remaining,
-                            deadline,
-                            is_frame_first_candidate=is_frame_first_candidate,
-                        )
+                        return nul_padding_requires_scan(sample)
                     raise ValueError("trusted PyTorch storage padding probe limit reached")
                 return False
     if (
@@ -1645,50 +1589,10 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     ):
         if _trivial_complete_pickle_prefix_has_only_padding(sample):
             if _trivial_complete_pickle_prefix_has_only_nul_padding(sample):
-                return _verified_nul_padding_storage_probe_should_scan(
-                    archive,
-                    entry,
-                    sample,
-                    probe_bytes_remaining,
-                    nul_padding_verify_bytes_remaining,
-                    deadline,
-                    is_frame_first_candidate=is_frame_first_candidate,
-                )
+                return nul_padding_requires_scan(sample)
             raise ValueError("trusted PyTorch storage padding probe limit reached")
         raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
     return False
-
-
-def _verified_nul_padding_storage_probe_should_scan(
-    archive: zipfile.ZipFile,
-    entry: zipfile.ZipInfo,
-    sample: bytes,
-    probe_bytes_remaining: list[int],
-    nul_padding_verify_bytes_remaining: list[int],
-    deadline: float,
-    *,
-    is_frame_first_candidate: bool,
-) -> bool:
-    if entry.file_size > len(sample):
-        sample = _verified_nul_padding_storage_probe_sample(
-            archive,
-            entry,
-            sample,
-            len(sample),
-            probe_bytes_remaining,
-            nul_padding_verify_bytes_remaining,
-            deadline,
-        )
-    if is_frame_first_candidate and _frame_first_trusted_storage_probe_should_scan(sample):
-        return True
-    if not is_frame_first_candidate and _proto0_or_1_trusted_storage_probe_should_scan(
-        sample,
-        sample_is_prefix=False,
-    ):
-        return True
-    if _trivial_complete_pickle_prefix_has_only_padding(sample):
-        return False
-    raise ValueError("trusted PyTorch storage padding probe limit reached")
 
 
 def _verified_nul_padding_storage_probe_sample(
@@ -2080,11 +1984,9 @@ def _has_executable_extension_opcode_before_stop(
     saw_extension_opcode = False
     parsed_after_extension = False
 
-    def push(value: str) -> None:
-        stack.append(value)
-
-    def pop() -> str:
-        return stack.pop() if stack else "other"
+    def pop() -> None:
+        if stack:
+            stack.pop()
 
     def pop_until_mark() -> None:
         while stack:
@@ -2108,18 +2010,15 @@ def _has_executable_extension_opcode_before_stop(
         for opcode, arg, _pos in pickletools.genops(candidate):
             if opcode.name in _PICKLE_EXTENSION_OPCODES:
                 saw_extension_opcode = True
-                push("extension")
+                stack.append("extension")
                 continue
             if saw_extension_opcode:
                 parsed_after_extension = True
             if opcode.name == "MARK":
-                push("mark")
+                stack.append("mark")
                 continue
             if opcode.name == "STOP":
                 return False
-            if opcode.name == "POP":
-                pop()
-                continue
             if opcode.name == "POP_MARK":
                 pop_until_mark()
                 continue
@@ -2132,18 +2031,14 @@ def _has_executable_extension_opcode_before_stop(
                     memo[str(len(memo))] = stack[-1]
                 continue
             if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
-                push(memo.get(str(arg), "other"))
+                stack.append(memo.get(str(arg), "other"))
                 continue
             if opcode.name == "DUP":
-                push(stack[-1] if stack else "other")
+                stack.append(stack[-1] if stack else "other")
                 continue
-            if opcode.name == "TUPLE":
+            if opcode.name in {"TUPLE", "LIST", "DICT", "FROZENSET"}:
                 pop_until_mark()
-                push("other")
-                continue
-            if opcode.name in {"LIST", "DICT", "FROZENSET"}:
-                pop_until_mark()
-                push("other")
+                stack.append("other")
                 continue
             if opcode.name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
                 if mark_target_is_extension():
@@ -2161,56 +2056,21 @@ def _has_executable_extension_opcode_before_stop(
                 pop()
                 pop()
                 continue
-            if opcode.name == "EMPTY_TUPLE":
-                push("other")
-                continue
-            if opcode.name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-                for _ in range(int(opcode.name[-1])):
-                    pop()
-                push("other")
-                continue
-            if opcode.name == "REDUCE":
-                if callable_is_extension(2):
-                    return True
-                pop()
-                pop()
-                push("other")
-                continue
-            if opcode.name == "NEWOBJ":
-                if callable_is_extension(2):
-                    return True
-                pop()
-                pop()
-                push("other")
-                continue
-            if opcode.name == "NEWOBJ_EX":
-                if callable_is_extension(3):
-                    return True
-                pop()
-                pop()
-                pop()
-                push("other")
-                continue
+            if opcode.name in {"REDUCE", "NEWOBJ", "BUILD"} and callable_is_extension(2):
+                return True
+            if opcode.name == "NEWOBJ_EX" and callable_is_extension(3):
+                return True
             if opcode.name == "OBJ":
                 mark_index = last_mark_index()
                 if mark_index >= 0 and mark_index + 1 < len(stack) and stack[mark_index + 1] == "extension":
                     return True
                 pop_until_mark()
-                push("other")
+                stack.append("other")
                 continue
-            if opcode.name == "BUILD":
-                if callable_is_extension(2):
-                    return True
+            for _ in opcode.stack_before:
                 pop()
-                pop()
-                push("other")
-                continue
-            if opcode.stack_before:
-                for _ in opcode.stack_before:
-                    pop()
-            if opcode.stack_after:
-                for _ in opcode.stack_after:
-                    push("other")
+            for _ in opcode.stack_after:
+                stack.append("other")
     except Exception as error:
         if not saw_extension_opcode:
             return False
@@ -3633,48 +3493,10 @@ def _parse_pytorch_storage_element_count_text(storage_size: str) -> int | None:
     return int(normalized)
 
 
-def _storage_ref_from_protocol0_persid_text(
+def _parse_protocol0_storage_id(
     pid_text: Any,
     trusted_storage_keys: set[str] | None = None,
-) -> _PytorchStorageRef | None:
-    text = _coerce_pickle_string_arg(pid_text)
-    if text is None:
-        return None
-    fields = _split_protocol0_persid_fields(text)
-    if fields is None or len(fields) != 5:
-        return None
-    if _quoted_protocol0_field_value(fields[0]) != "storage":
-        return None
-    storage_type_field = fields[1]
-    if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
-        return None
-    module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
-    if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
-        return None
-    storage_key = _quoted_protocol0_field_value(fields[2])
-    if storage_key is None or not _is_ascii_decimal_digits(storage_key):
-        return None
-    if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
-        return None
-    if _quoted_protocol0_field_value(fields[3]) is None:
-        return None
-    element_count = _parse_pytorch_storage_element_count_text(fields[4])
-    if element_count is None:
-        return None
-    return _PytorchStorageRef(
-        storage_key,
-        module,
-        name,
-        _quoted_protocol0_field_value(fields[3]) or "",
-        element_count,
-        _PYTORCH_STORAGE_ITEM_SIZES.get(name),
-    )
-
-
-def _structural_storage_key_from_protocol0_persid_text(
-    pid_text: Any,
-    trusted_storage_keys: set[str] | None = None,
-) -> str | None:
+) -> _PytorchStorageRef | str | None:
     text = _coerce_pickle_string_arg(pid_text)
     if text is None:
         return None
@@ -3694,17 +3516,28 @@ def _structural_storage_key_from_protocol0_persid_text(
         return None
     if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
         return None
-    if _quoted_protocol0_field_value(fields[3]) is None:
+    location = _quoted_protocol0_field_value(fields[3])
+    if location is None:
         return None
-    return storage_key
+    element_count = _parse_pytorch_storage_element_count_text(fields[4]) if len(fields) == 5 else None
+    if element_count is None:
+        return storage_key
+    return _PytorchStorageRef(
+        storage_key,
+        module,
+        name,
+        location,
+        element_count,
+        _PYTORCH_STORAGE_ITEM_SIZES.get(name),
+    )
 
 
 def _storage_key_from_protocol0_persid_text(
     pid_text: Any,
     trusted_storage_keys: set[str] | None = None,
 ) -> str | None:
-    storage_ref = _storage_ref_from_protocol0_persid_text(pid_text, trusted_storage_keys)
-    return storage_ref.key if storage_ref is not None else None
+    storage_ref = _parse_protocol0_storage_id(pid_text, trusted_storage_keys)
+    return storage_ref.key if isinstance(storage_ref, _PytorchStorageRef) else None
 
 
 def _protocol0_persid_text_from_preview(preview: Any) -> str | None:
@@ -3721,7 +3554,7 @@ def _is_trusted_pytorch_storage_persistent_id_finding(
     finding: Finding,
     trusted_storage_keys: set[str],
 ) -> bool:
-    if finding.rule_code != "PERSISTENT_ID":
+    if finding.rule_code != "PERSISTENT_ID" or "nested_details" in finding.details:
         return False
     details = finding.details
     storage_key = details.get("pytorch_storage_key")
@@ -3752,7 +3585,15 @@ def _without_trusted_pytorch_data_pkl_findings(
         for finding in report.findings
         if not (
             remove_persistent_ids
-            and _is_trusted_pytorch_storage_persistent_id_finding(finding, trusted_data_pkl.storage_keys)
+            and (
+                _is_trusted_pytorch_storage_persistent_id_finding(finding, trusted_data_pkl.storage_keys)
+                or (
+                    trusted_data_pkl.first_legacy_pid_position is not None
+                    and finding.rule_code == "PERSISTENT_ID"
+                    and finding.details.get("opcode") == "BINPERSID"
+                    and finding.location == f"{report.source} (pos {trusted_data_pkl.first_legacy_pid_position})"
+                )
+            )
         )
         and not _is_trusted_canonical_pytorch_tensor_rebuild_finding(report, finding, trusted_data_pkl)
     )
@@ -3963,8 +3804,31 @@ def _pytorch_storage_keys_from_pickle_bytes(
             )
         )
 
+    return _parse_single_pytorch_storage_stream(
+        pickle_data,
+        opcode_budget_remaining=opcode_budget_remaining,
+        max_opcodes=_PYTORCH_STORAGE_TRUST_MAX_OPCODES,
+        deadline=deadline,
+        position_offset=position_offset,
+    )
+
+
+def _parse_single_pytorch_storage_stream(
+    pickle_data: bytes,
+    *,
+    opcode_budget_remaining: list[int] | None,
+    max_opcodes: int,
+    large_pid_provenance_remaining: list[int] | None = None,
+    legacy_module: bool = False,
+    deadline: float | None,
+    position_offset: int,
+) -> _PytorchStorageReferenceParse:
     marker = object()
     canonical_tensor = object()
+    legacy_instance = object()
+    legacy_built = object()
+    literal_none = object()
+    first_legacy_pid_position: int | None = None
     canonical_batch_placeholder = object()
     canonical_batch_entries: list[tuple[str, object]] = []
     canonical_batch_target: object | None = None
@@ -4031,7 +3895,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
         nonlocal provenance_nodes_inspected
 
         provenance_nodes_inspected += 1
-        if provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
+        if large_pid_provenance_remaining is not None:
+            if large_pid_provenance_remaining[0] <= 0:
+                raise ValueError("PyTorch storage ID validation exhausted its archive provenance budget")
+            large_pid_provenance_remaining[0] -= 1
+        elif provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
             raise ValueError("PyTorch storage trust parser exceeded its bounded provenance workload")
         if deadline is not None and provenance_nodes_inspected % 1024 == 0:
             _check_pytorch_zip_deadline(deadline)
@@ -4083,6 +3951,10 @@ def _pytorch_storage_keys_from_pickle_bytes(
     def apply_setitems_to_target(items: tuple[tuple[Any, Any], ...]) -> None:
         nonlocal discarded_tracked_storage_references
 
+        # Tuple keys may share nested tuples exponentially. Hashing them in
+        # Python would bypass the retry's opcode, provenance, and time limits.
+        if large_pid_provenance_remaining is not None and any(type(key) is not str for key, _value in items):
+            raise ValueError("PyTorch tensor batch contains a non-text dictionary key")
         canonical_storage_context = (
             trusted_canonical_batch_seen
             or bool(canonical_batch_entries)
@@ -4217,8 +4089,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
             return None
         return key if key >= 0 else None
 
-    def storage_ref_from_pid(pid: Any) -> _PytorchStorageRef | None:
-        if not isinstance(pid, tuple) or len(pid) != 5:
+    def parse_binary_storage_id(pid: Any) -> _PytorchStorageRef | str | None:
+        if not isinstance(pid, tuple) or len(pid) < 4:
             return None
         if pid[0] != "storage":
             return None
@@ -4234,6 +4106,9 @@ def _pytorch_storage_keys_from_pickle_bytes(
         location = _coerce_pickle_string_arg(pid[3])
         if location is None:
             return None
+        # PyTorch's v1 JIT writer appends a literal NONE for view metadata.
+        if len(pid) != (6 if legacy_module else 5) or (legacy_module and pid[5] is not literal_none):
+            return storage_key
         storage_size = pid[4]
         if (
             not isinstance(storage_size, int)
@@ -4241,7 +4116,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
             or storage_size < 0
             or storage_size > _PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX
         ):
-            return None
+            return storage_key
         storage_global_positions.add(storage_type.position)
         return _PytorchStorageRef(
             storage_key,
@@ -4251,22 +4126,6 @@ def _pytorch_storage_keys_from_pickle_bytes(
             storage_size,
             _PYTORCH_STORAGE_ITEM_SIZES.get(storage_type.name),
         )
-
-    def structural_storage_key_from_pid(pid: Any) -> str | None:
-        if not isinstance(pid, tuple) or len(pid) < 4:
-            return None
-        if pid[0] != "storage":
-            return None
-        storage_type = pid[1]
-        if not (
-            isinstance(storage_type, _PickleGlobalRef)
-            and (storage_type.module, storage_type.name) in _PYTORCH_STORAGE_GLOBALS
-        ):
-            return None
-        storage_key = _coerce_pickle_string_arg(pid[2])
-        if storage_key is None or storage_key == "":
-            return None
-        return storage_key if _coerce_pickle_string_arg(pid[3]) is not None else None
 
     def rebuild_tensor_v2_args_are_canonical(args: Any) -> bool:
         return (
@@ -4293,6 +4152,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
             "collections",
             "OrderedDict",
         ):
+            if legacy_module and args != ():
+                raise ValueError("Unexpected TorchScript hook constructor arguments")
             if args != () and value_contains_tracked_provenance(args):
                 discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
@@ -4310,6 +4171,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
             return None
+        if legacy_module:
+            raise ValueError("Unrecognized TorchScript reducer")
         if value_contains_tracked_provenance(function) or value_contains_tracked_provenance(args):
             discarded_tracked_storage_references = True
             invalidate_tensor_rebuild_proof()
@@ -4323,13 +4186,15 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if opcode_budget_remaining[0] <= 0:
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 opcode_budget_remaining[0] -= 1
-            if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
+            if opcode_count > max_opcodes:
                 return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
             position = position_offset + (_pos if type(_pos) is int else 0)
             opcode_name = opcode.name
             if opcode_name in {"PROTO", "FRAME"}:
                 continue
             if opcode_name == "STOP":
+                if legacy_module and (len(stack) != 1 or stack[0] is not legacy_built):
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 if canonical_batch_entries or (pending_uncanonical_metadata_batch and not trusted_canonical_batch_seen):
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 if (
@@ -4344,7 +4209,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                 if not isinstance(_pos, int) or _pos + 1 != len(pickle_data):
-                    invalidate_tensor_rebuild_proof()
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 continue
             if opcode_name == "MARK":
                 stack.append(marker)
@@ -4357,6 +4222,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 "BINBYTES",
                 "SHORT_BINBYTES",
             }:
+                if large_pid_provenance_remaining is not None and opcode_name not in {
+                    "BINUNICODE",
+                    "SHORT_BINUNICODE",
+                    "UNICODE",
+                }:
+                    # PyTorch formats the original key into the member name.
+                    # A bytes key b'0' does not address the text key's data/0.
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 stack.append(_coerce_pickle_string_arg(arg))
             elif opcode_name == "GLOBAL":
                 global_name = _coerce_pickle_string_arg(arg)
@@ -4364,6 +4237,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     stack.append(None)
                 else:
                     parts = global_name.split()
+                    if large_pid_provenance_remaining is not None and global_name != " ".join(parts):
+                        return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                     stack.append(_PickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else None)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
@@ -4417,6 +4292,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     for index in range(0, len(dict_items), 2):
                         key = dict_items[index]
                         value = dict_items[index + 1]
+                        if large_pid_provenance_remaining is not None and type(key) is not str:
+                            raise ValueError("PyTorch tensor batch contains a non-text dictionary key")
                         if key in built_dict and value_contains_tracked_provenance(built_dict[key]):
                             discarded_tracked_storage_references = True
                             invalidate_tensor_rebuild_proof()
@@ -4430,7 +4307,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
             elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT", "FLOAT", "BINFLOAT"}:
                 stack.append(arg)
             elif opcode_name == "NONE":
-                stack.append(None)
+                stack.append(literal_none if legacy_module else None)
             elif opcode_name == "NEWTRUE":
                 stack.append(True)
             elif opcode_name == "NEWFALSE":
@@ -4488,7 +4365,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     poison_stack_top()
             elif opcode_name == "APPENDS":
                 unmarked_items = []
-                appended_items = pop_marked_tuple(unmarked_items=unmarked_items)
+                appended_items = pop_marked_tuple(
+                    max_width=(
+                        _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+                        if large_pid_provenance_remaining is not None
+                        else _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH
+                    ),
+                    unmarked_items=unmarked_items,
+                )
                 if appended_items is None or not stack:
                     clear_stack_after_malformed_provenance(
                         *(unmarked_items if appended_items is None else appended_items)
@@ -4566,38 +4450,30 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if batch_has_canonical_tensor:
                     trusted_canonical_batch_seen = True
                     pending_uncanonical_metadata_batch = False
-            elif opcode_name == "BINPERSID":
-                pid = stack.pop() if stack else None
-                storage_ref = storage_ref_from_pid(pid)
+            elif opcode_name in {"BINPERSID", "PERSID"}:
+                if opcode_name == "BINPERSID":
+                    if legacy_module and first_legacy_pid_position is None:
+                        first_legacy_pid_position = position
+                    storage_id = parse_binary_storage_id(stack.pop() if stack else None)
+                else:
+                    storage_id = _parse_protocol0_storage_id(arg)
+                storage_ref = storage_id if isinstance(storage_id, _PytorchStorageRef) else None
                 if storage_ref is not None:
                     referenced_keys.add(storage_ref.key)
                     existing_ref = storage_refs_by_key.get(storage_ref.key)
                     if existing_ref is not None and existing_ref != storage_ref:
                         all_persistent_ids_are_pytorch_storage = False
-                        invalidate_tensor_rebuild_proof()
-                    storage_refs_by_key[storage_ref.key] = storage_ref
-                    stack.append(storage_ref)
-                else:
-                    storage_key = structural_storage_key_from_pid(pid)
-                    if storage_key is not None:
-                        referenced_keys.add(storage_key)
-                    all_persistent_ids_are_pytorch_storage = False
-                    stack.append(None)
-            elif opcode_name == "PERSID":
-                storage_ref = _storage_ref_from_protocol0_persid_text(arg)
-                if storage_ref is not None:
-                    referenced_keys.add(storage_ref.key)
-                    existing_ref = storage_refs_by_key.get(storage_ref.key)
-                    if existing_ref is not None and existing_ref != storage_ref:
-                        all_persistent_ids_are_pytorch_storage = False
+                        if opcode_name == "BINPERSID":
+                            invalidate_tensor_rebuild_proof()
                     storage_refs_by_key[storage_ref.key] = storage_ref
                 else:
-                    storage_key = _structural_storage_key_from_protocol0_persid_text(arg)
-                    if storage_key is not None:
-                        referenced_keys.add(storage_key)
+                    if isinstance(storage_id, str):
+                        referenced_keys.add(storage_id)
                     all_persistent_ids_are_pytorch_storage = False
-                invalidate_tensor_rebuild_proof()
-                stack.append(None)
+                if opcode_name == "PERSID":
+                    invalidate_tensor_rebuild_proof()
+                    storage_ref = None
+                stack.append(storage_ref)
             elif opcode_name == "REDUCE":
                 if len(stack) < 2:
                     clear_stack_after_malformed_provenance()
@@ -4605,13 +4481,34 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 args = stack.pop()
                 function = stack.pop()
                 stack.append(reduce_result(function, args, position))
+            elif opcode_name == "NEWOBJ" and legacy_module:
+                if (
+                    len(stack) != 2
+                    or stack[-1] != ()
+                    or not isinstance(stack[0], _PickleGlobalRef)
+                    or (stack[0].module, stack[0].name) != ("__torch__", "Module")
+                ):
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                stack[:] = [legacy_instance]
             elif opcode_name == "BUILD":
                 if len(stack) < 2:
                     clear_stack_after_malformed_provenance()
                     continue
                 state = stack.pop()
                 obj = stack.pop()
-                if isinstance(obj, _PytorchStorageRef):
+                if legacy_module:
+                    # Accept only the serialized parameter mapping for the PID proof.
+                    # The module constructor, BUILD handler and their findings stay untrusted.
+                    if (
+                        stack
+                        or obj is not legacy_instance
+                        or type(state) is not _PytorchDictionaryState
+                        or not state
+                        or not all(type(k) is str and v is canonical_tensor for k, v in state.items())
+                    ):
+                        return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                    stack.append(legacy_built)
+                elif isinstance(obj, _PytorchStorageRef):
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                     stack.append(None)
@@ -4649,6 +4546,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         discarded_tracked_storage_references=discarded_tracked_storage_references,
         used_streaming_batch_compaction=used_streaming_batch_compaction,
         accepted_oversized_state_batch=accepted_oversized_state_batch,
+        first_legacy_pid_position=first_legacy_pid_position,
     )
 
 
@@ -5009,54 +4907,13 @@ def _without_unproven_oversized_frame_tamper(
     )
 
 
-def _with_unbounded_stream_notice(
+def _with_truncated_stream_notice(
     report: PickleReport,
     *,
     source: str,
     bytes_scanned: int,
-    max_unbounded_read_bytes: int,
-) -> PickleReport:
-    report = _without_unproven_oversized_frame_tamper(report, bytes_total=None, stream_start_offset=0)
-    notices = (
-        *report.notices,
-        Notice(
-            message="Unbounded pickle stream scan stopped at configured byte limit",
-            severity=Severity.INFO,
-            location=source,
-            code="unbounded_stream_truncated",
-            details={
-                "bytes_scanned": bytes_scanned,
-                "max_unbounded_stream_read_bytes": max_unbounded_read_bytes,
-                "analysis_incomplete": True,
-            },
-        ),
-    )
-    status = ScanStatus.INCONCLUSIVE
-    verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
-    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
-    return replace(
-        report,
-        status=status,
-        verdict=verdict,
-        notices=notices,
-        coverage=CoverageSummary(
-            bytes_scanned=report.coverage.bytes_scanned,
-            bytes_total=None,
-            opcode_count=report.coverage.opcode_count,
-            raw_scan_complete=False,
-            opcode_scan_complete=False,
-        ),
-        metadata=metadata,
-    )
-
-
-def _with_known_stream_notice(
-    report: PickleReport,
-    *,
-    source: str,
-    bytes_scanned: int,
-    bytes_total: int,
-    max_known_read_bytes: int,
+    bytes_total: int | None,
+    max_read_bytes: int,
     stream_start_offset: int,
 ) -> PickleReport:
     report = _without_unproven_oversized_frame_tamper(
@@ -5064,27 +4921,25 @@ def _with_known_stream_notice(
         bytes_total=bytes_total,
         stream_start_offset=stream_start_offset,
     )
+    details = {"bytes_scanned": bytes_scanned}
+    if bytes_total is None:
+        message = "Unbounded pickle stream scan stopped at configured byte limit"
+        code = "unbounded_stream_truncated"
+        details["max_unbounded_stream_read_bytes"] = max_read_bytes
+    else:
+        message = "Known-size pickle stream coverage could not be proven complete"
+        code = "known_stream_truncated"
+        details.update(bytes_total=bytes_total, max_known_stream_read_bytes=max_read_bytes)
+    details["analysis_incomplete"] = True
     notices = (
         *report.notices,
-        Notice(
-            message="Known-size pickle stream coverage could not be proven complete",
-            severity=Severity.INFO,
-            location=source,
-            code="known_stream_truncated",
-            details={
-                "bytes_scanned": bytes_scanned,
-                "bytes_total": bytes_total,
-                "max_known_stream_read_bytes": max_known_read_bytes,
-                "analysis_incomplete": True,
-            },
-        ),
+        Notice(message=message, severity=Severity.INFO, location=source, code=code, details=details),
     )
-    status = ScanStatus.INCONCLUSIVE
     verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return replace(
         report,
-        status=status,
+        status=ScanStatus.INCONCLUSIVE,
         verdict=verdict,
         notices=notices,
         coverage=CoverageSummary(
@@ -5154,7 +5009,6 @@ def _io_error_report(
     message: str,
     category: str,
     exception: Exception,
-    bytes_scanned: int,
     bytes_total: int | None,
 ) -> PickleReport:
     return PickleReport(
@@ -5170,7 +5024,7 @@ def _io_error_report(
             ),
         ),
         coverage=CoverageSummary(
-            bytes_scanned=bytes_scanned,
+            bytes_scanned=0,
             bytes_total=bytes_total,
             raw_scan_complete=False,
             opcode_scan_complete=False,
@@ -5502,29 +5356,18 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
-    invocation_classification: (
-        tuple[
-            frozenset[int],
-            frozenset[int],
-            frozenset[tuple[str, str]],
-        ]
-        | None
-    )
     try:
-        invocation_classification = (
-            _invoked_global_positions(callable_invocations),
-            _trusted_reconstruction_global_positions(callable_invocations),
-            _trusted_reconstruction_references(callable_invocations),
-        )
+        invoked_global_positions = _invoked_global_positions(callable_invocations)
+        trusted_reconstruction_global_positions = _trusted_reconstruction_global_positions(callable_invocations)
+        trusted_reconstruction_references = _trusted_reconstruction_references(callable_invocations)
         if not suppress_safe_numpy_reconstruct:
-            numpy_reconstruct_positions = _numpy_reconstruct_global_positions(callable_invocations)
-            invocation_classification = (
-                invocation_classification[0],
-                invocation_classification[1] - numpy_reconstruct_positions,
-                invocation_classification[2] - _NUMPY_RECONSTRUCT_REFERENCES,
+            trusted_reconstruction_global_positions -= _invoked_global_positions(
+                callable_invocations, numpy_reconstruct_only=True
             )
+            trusted_reconstruction_references -= _NUMPY_RECONSTRUCT_REFERENCES
     except Exception as error:
-        invocation_classification = None
+        invoked_global_positions = frozenset()
+        trusted_reconstruction_global_positions = frozenset()
         callable_invocations_complete = False
         enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
@@ -5576,7 +5419,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         try:
             invocation_load_safe_modules = _invocation_load_safe_modules(
                 callable_invocations,
-                invocation_classification[0] if invocation_classification is not None else frozenset(),
+                invoked_global_positions,
             )
         except Exception as error:
             enrichment_errors.append(("python_import_invocation_initialization", error))
@@ -5584,10 +5427,10 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
             report = _with_untrusted_invoked_allowlisted_import_findings(
                 report,
                 import_references,
-                invocation_classification[0] if invocation_classification is not None else frozenset(),
+                invoked_global_positions,
                 analyzed_invocation_global_positions,
                 invocation_load_safe_modules,
-                invocation_classification[1] if invocation_classification is not None else frozenset(),
+                trusted_reconstruction_global_positions,
                 trusted_invocation_global_positions,
                 suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
             )
@@ -5623,14 +5466,8 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         source_snapshot_stable
         and callable_invocations_complete
         and non_allowlisted_global_imports_complete
-        and invocation_classification is not None
         and (inert_initialization_modules or trusted_import_references or trusted_invocation_global_positions)
     ):
-        (
-            invoked_global_positions,
-            trusted_reconstruction_global_positions,
-            trusted_reconstruction_references,
-        ) = invocation_classification
         report = _without_proven_safe_import_findings(
             report,
             inert_initialization_modules,
@@ -6320,19 +6157,14 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else False
     )
-    requires_loaded_identity = finding_is_invoked and _source_backed_import_requires_initialization_proof(
+    requires_initialization_proof = _source_backed_import_requires_initialization_proof(
         reference,
         suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
     )
-    requires_import_initialization_proof = (
-        not finding_is_invoked
-        and _source_backed_import_requires_initialization_proof(
-            reference,
-            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
-        )
-    )
+    requires_loaded_identity = finding_is_invoked and requires_initialization_proof
     import_initialization_is_proven_safe = (
-        not requires_import_initialization_proof
+        finding_is_invoked
+        or not requires_initialization_proof
         or module in inert_initialization_modules
         or module_is_loaded_without_import_hooks(module)
     )
@@ -6373,24 +6205,17 @@ def _finding_is_invoked(
     return finding.details.get("invoked") is True or position in invoked_global_positions
 
 
-def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:
+def _invoked_global_positions(callable_invocations: object, *, numpy_reconstruct_only: bool = False) -> frozenset[int]:
     positions: set[int] = set()
     for raw_invocation in _sequence(callable_invocations):
         invocation = _mapping(raw_invocation)
         position = _optional_int(invocation.get("global_position"))
-        if position is not None:
-            positions.add(position)
-    return frozenset(positions)
-
-
-def _numpy_reconstruct_global_positions(callable_invocations: object) -> frozenset[int]:
-    positions: set[int] = set()
-    for raw_invocation in _sequence(callable_invocations):
-        invocation = _mapping(raw_invocation)
-        position = _optional_int(invocation.get("global_position"))
-        module = str(invocation.get("module", ""))
-        name = str(invocation.get("name", ""))
-        if position is not None and (module, name) in _NUMPY_RECONSTRUCT_REFERENCES:
+        if numpy_reconstruct_only:
+            module = str(invocation.get("module", ""))
+            name = str(invocation.get("name", ""))
+            if position is not None and (module, name) in _NUMPY_RECONSTRUCT_REFERENCES:
+                positions.add(position)
+        elif position is not None:
             positions.add(position)
     return frozenset(positions)
 
@@ -7030,35 +6855,25 @@ def _read_stream_payload(
     max_unbounded_read_bytes: int,
 ) -> tuple[bytes, bool]:
     with tempfile.SpooledTemporaryFile(max_size=max_unbounded_read_bytes, mode="w+b") as spool:
-        stream_truncated = False
-        if size is None:
-            remaining = max_unbounded_read_bytes
-            while remaining > 0:
-                chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
-                if not chunk:
+        remaining = max_unbounded_read_bytes if size is None else min(size, max_known_read_bytes)
+        stream_truncated = size is not None and size > max_known_read_bytes
+        bytes_read = 0
+        while remaining > 0:
+            chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
+            if not chunk:
+                if size is None:
                     break
-                spool.write(chunk)
-                remaining -= len(chunk)
+                spool.seek(0)
+                raise _StreamShortReadError(expected_size=size, bytes_read=bytes_read, partial_payload=spool.read())
+            spool.write(chunk)
+            if size is not None:
+                bytes_read += len(chunk)
+            remaining -= len(chunk)
+        if size is None:
             if remaining == 0:
                 stream_truncated = bool(stream.read(1)) if _stream_is_seekable(stream) else True
-        else:
-            remaining = min(size, max_known_read_bytes)
-            stream_truncated = size > max_known_read_bytes
-            bytes_read = 0
-            while remaining > 0:
-                chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
-                if not chunk:
-                    spool.seek(0)
-                    raise _StreamShortReadError(
-                        expected_size=size,
-                        bytes_read=bytes_read,
-                        partial_payload=spool.read(),
-                    )
-                spool.write(chunk)
-                bytes_read += len(chunk)
-                remaining -= len(chunk)
-            if not stream_truncated and _known_stream_has_uncovered_data(stream):
-                stream_truncated = True
+        elif not stream_truncated and _known_stream_has_uncovered_data(stream):
+            stream_truncated = True
 
         spool.seek(0)
         return spool.read(), stream_truncated

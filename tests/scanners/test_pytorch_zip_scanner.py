@@ -58,7 +58,6 @@ from modelaudit.scanner_results import (
 from modelaudit.scanners import pytorch_zip_scanner as pytorch_zip_scanner_module
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from modelaudit.utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
@@ -1142,9 +1141,8 @@ def test_pytorch_zip_warns_on_unresolved_import_only_training_args_metadata_refs
         and issue.details.get("import_reference") == "transformers.training_args.TrainingArguments"
         for issue in result.issues
     )
-    assert any(
-        check.name == "CVE-2025-32434 Pickle Format Security Analysis" and check.status == CheckStatus.FAILED
-        for check in result.checks
+    assert not any(
+        check.details.get("cve_id") == "CVE-2025-32434" and "Version Check" not in check.name for check in result.checks
     )
 
 
@@ -1161,6 +1159,11 @@ def test_pytorch_zip_suppresses_safe_numpy_rng_state_reconstruct_call_graph_nois
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert all(
+        "CVE-2025-32434" not in check.name
+        for check in result.checks
+        if check.location == f"{model_path}:rng_state/data.pkl"
+    )
     assert not any(
         issue.rule_code == "DANGEROUS_CALL_GRAPH"
         and issue.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
@@ -8277,6 +8280,91 @@ def test_pytorch_zip_data_pkl_keeps_unvalidated_storage_pid_warning(tmp_path: Pa
     )
 
 
+def _legacy_torchscript_v1_tensor_state(*, foreign_second_id: bool) -> bytes:
+    payload = b"\x80\x02" + _pickle_global("__torch__", "Module") + b"q\x00)\x81}("
+    for key, parameter in ((b"0", b"weight"), (b"1", b"bias")):
+        storage_tag = b"foreign" if foreign_second_id and key == b"1" else b"storage"
+        payload += (
+            _pickle_binunicode(parameter)
+            + _pickle_global("torch._utils", "_rebuild_tensor_v2")
+            + b"(("
+            + _pickle_binunicode(storage_tag)
+            + _pickle_global("torch", "FloatStorage")
+            + _pickle_binunicode(key)
+            + _pickle_binunicode(b"cpu")
+            + b"K\x08NtQ"  # eight floats with no legacy view metadata
+            + b"K\x00"
+            + _pickle_int_tuple((8,))
+            + _pickle_int_tuple((1,))
+            + b"\x89"
+            + _pytorch_empty_ordered_dict_reduce_expr()
+            + b"tR"
+        )
+    return payload + b"ubq\x01."
+
+
+@pytest.mark.parametrize("case", ["canonical", "size", "foreign-second-id", "version"])
+def test_legacy_torchscript_v1_storage_ids_require_the_whole_archive_proof(tmp_path: Path, case: str) -> None:
+    path = tmp_path / "module.ot"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", b"2\n" if case == "version" else b"1\n")
+        archive.writestr(
+            "model/code/__torch__.py",
+            "class Module(Module):\n  __parameters__ = ['weight', 'bias']\n",
+        )
+        archive.writestr(
+            "model/data.pkl",
+            _legacy_torchscript_v1_tensor_state(foreign_second_id=case == "foreign-second-id"),
+        )
+        archive.writestr("model/data/0", b"cos\nsystem\n(S'test'\ntR.".ljust(32, b"\x00"))
+        archive.writestr("model/data/1", bytes(31 if case == "size" else 32))
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert any(issue.details.get("associated_global") == "__torch__.Module" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "model/data/0"
+        for issue in result.issues
+    )
+    assert any(
+        issue.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        and issue.details.get("pickle_filename") == "model/data.pkl"
+        for issue in result.issues
+    ) is (case != "canonical")
+    assert any(
+        check.status == CheckStatus.PASSED
+        and check.details.get("trusted_pytorch_archive_context") is True
+        and check.details.get("pytorch_storage_key") == "0"
+        for check in result.checks
+    ) is (case == "canonical")
+
+
+@pytest.mark.parametrize("storage_size", [24, 23])
+def test_large_state_pid_validation_keeps_hidden_member_and_coverage_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_size: int
+) -> None:
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    monkeypatch.setattr(pytorch_zip_scanner_module._picklescan_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    model_path = tmp_path / "state.pt"
+    hidden_pickle = b"cos\nsystem\n(S'x'\ntR."
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", _pytorch_rebuild_tensor_v2_payload())
+        archive.writestr("archive/data/0", hidden_pickle.ljust(storage_size, b"\x00"))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues) is (
+        storage_size != 24
+    )
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_storage_reference_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_marks_storage_reference_opcode_budget_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8671,6 +8759,19 @@ def test_pytorch_zip_scanner_trusts_all_validated_tensor_storage_bytes_as_non_ex
         and check.details.get("file") == "archive/data/1"
         for check in result.checks
     )
+
+
+def test_pid_retry_skips_explicitly_disabled_pickle_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_retry(*_args: Any, **_kwargs: Any) -> set[str]:
+        pytest.fail("PID validation ran without an embedded pickle scanner")
+
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    monkeypatch.setattr(pytorch_zip_scanner_module._picklescan_api, "_PytorchZipStoragePidValidator", unexpected_retry)
+    path = tmp_path / "checkpoint.pt"
+    _write_referenced_float_storage(path, bytes(24))
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(path))
+    assert "pytorch_zip_storage_reference_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.details.get("skipped_scanner_id") == "pickle" for check in result.checks)
 
 
 def test_pytorch_zip_scanner_keeps_tensor_storage_trust_when_pickle_scanner_is_disabled(tmp_path: Path) -> None:
@@ -14104,6 +14205,114 @@ def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path
     )
 
 
+# These archives predate __buffers__ and FORMAT_WITH_STRING_TABLE.
+_LEGACY_TORCHSCRIPT_DECLARATION = (
+    b'class Module(Module):\n  __parameters__ = ["weight", "bias", ]\n  __annotations__ = []\n'
+    b'  __annotations__["weight"] = Tensor\n  __annotations__["bias"] = Tensor\n'
+)
+_LEGACY_TORCHSCRIPT_DEBUG = bytes.fromhex("80024b005800000000710068004b008771014b004b0087868571022e")
+
+
+@pytest.mark.parametrize(("version", "compression"), [(1, zipfile.ZIP_STORED), (2, zipfile.ZIP_DEFLATED)])
+def test_pytorch_zip_legacy_torchscript_source_keeps_pickle_provenance(
+    tmp_path: Path, version: int, compression: int
+) -> None:
+    path = tmp_path / "legacy.ot"
+    declaration = (b"op_version_set = 1\n" if version == 1 else b"") + _LEGACY_TORCHSCRIPT_DECLARATION
+    payload = b"\x80\x02" + _metadata_newobj_build_payload("__torch__", "Module") + b"."
+    with zipfile.ZipFile(path, "w", compression=compression) as archive:
+        archive.writestr("model/version", f"{version}\n")
+        archive.writestr("model/data.pkl", payload)
+        archive.writestr("model/other.pkl", payload)
+        archive.writestr("model/code/__torch__.py", declaration)
+        archive.writestr("model/code/__torch__.py.debug_pkl", _LEGACY_TORCHSCRIPT_DEBUG)
+        archive.writestr("model/sidecar.py", b"import os\nos.system('id')\n")
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert {
+        check.details["file"]
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    } == {"model/sidecar.py"}
+    assert {
+        issue.details.get("pickle_filename")
+        for issue in result.issues
+        if issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "__torch__.Module"
+    } == {"model/data.pkl", "model/other.pkl"}
+
+    standalone = tmp_path / "standalone.pkl"
+    standalone.write_bytes(payload)
+    assert any(
+        issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "__torch__.Module"
+        for issue in scan_model_directory_or_file(str(standalone), cache_enabled=False).issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_name", "source", "debug"),
+    [
+        ("model/code/__torch__.py", _LEGACY_TORCHSCRIPT_DECLARATION + b"import os\n", _LEGACY_TORCHSCRIPT_DEBUG),
+        (
+            "model/code/__torch__.py",
+            _LEGACY_TORCHSCRIPT_DECLARATION.replace(b'"weight", "bias"', b'"bias", "weight"'),
+            _LEGACY_TORCHSCRIPT_DEBUG,
+        ),
+        ("model/code/__torch__.py", _LEGACY_TORCHSCRIPT_DECLARATION, _LEGACY_TORCHSCRIPT_DEBUG + b"."),
+        ("model/code/__torch__/other.py", _LEGACY_TORCHSCRIPT_DECLARATION, _LEGACY_TORCHSCRIPT_DEBUG),
+    ],
+    ids=["executable-source", "reordered-parameters", "noncanonical-debug", "noncanonical-path"],
+)
+def test_pytorch_zip_legacy_torchscript_source_requires_matching_declarations(
+    tmp_path: Path, source_name: str, source: bytes, debug: bytes
+) -> None:
+    path = tmp_path / "near-match.ot"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", b"2\n")
+        archive.writestr("model/data.pkl", pickle.dumps({}, protocol=2))
+        archive.writestr(source_name, source)
+        archive.writestr(f"{source_name}.debug_pkl", debug)
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert any(
+        check.name == "Python Code File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["file"] == source_name
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_legacy_torchscript_source_rejects_forged_size_and_crc(tmp_path: Path) -> None:
+    path = tmp_path / "truncated.ot"
+    name = "model/code/__torch__.py"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model/version", b"2\n")
+        archive.writestr("model/data.pkl", pickle.dumps({}, protocol=2))
+        archive.writestr(name, _LEGACY_TORCHSCRIPT_DECLARATION + b"import os\n")
+        archive.writestr(f"{name}.debug_pkl", _LEGACY_TORCHSCRIPT_DEBUG)
+        # Both headers describe the benign prefix, but the full compressed stream includes the import.
+        entry = archive.getinfo(name)
+        entry.file_size = len(_LEGACY_TORCHSCRIPT_DECLARATION)
+        entry.CRC = zlib.crc32(_LEGACY_TORCHSCRIPT_DECLARATION)
+    with path.open("r+b") as stream:
+        stream.seek(entry.header_offset + 14)
+        stream.write(struct.pack("<III", entry.CRC, entry.compress_size, entry.file_size))
+    with zipfile.ZipFile(path) as archive:
+        assert archive.read(name) == _LEGACY_TORCHSCRIPT_DECLARATION
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert any(
+        check.name == "Python Code File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["file"] == name
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "scripted.pt", prefix="archive")
     debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
@@ -14221,14 +14430,6 @@ def test_pytorch_zip_hf_google_bert_rust_model_torchscript_reconstruction_contro
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert not any(check.severity == IssueSeverity.CRITICAL for check in result.checks)
     assert any(
-        set(issue.details.get("import_analysis", {}).get("found_imports", ()))
-        >= {
-            "__torch__.Module",
-            "torch.jit._pickle.build_intlist",
-        }
-        for issue in result.issues
-    )
-    assert any(
         issue.details.get("associated_global") == "__torch__.Module"
         and str(issue.location).startswith(f"{model_path}:archive/data.pkl")
         for issue in result.issues
@@ -14259,26 +14460,12 @@ def test_pytorch_zip_hf_sentence_transformers_rust_model_classifies_members_inde
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    checks_by_member = _weights_only_analysis_checks_by_member(result)
+    outcomes = {record["pickle_filename"]: record for record in result.metadata["pickle_member_outcomes"]}
     assert {
         "archive/data.pkl",
         "archive/constants.pkl",
         "archive/code/__torch__.py.debug_pkl",
-    }.issubset(checks_by_member), f"{_HF_TORCHSCRIPT_ST_QA_REPO_ID}@{_HF_TORCHSCRIPT_ST_QA_REVISION}"
-    data_check = checks_by_member["archive/data.pkl"]
-    constants_check = checks_by_member["archive/constants.pkl"]
-    debug_check = checks_by_member["archive/code/__torch__.py.debug_pkl"]
-
-    assert data_check.status == CheckStatus.FAILED
-    assert data_check.severity == IssueSeverity.WARNING
-    assert data_check.details["nested_execution_opcode_evidence"] is False
-    assert data_check.details["opcode_counts"] == {"GLOBAL": 2, "NEWOBJ": 1, "REDUCE": 1, "BUILD": 1}
-    assert constants_check.status == CheckStatus.PASSED
-    assert constants_check.details["dangerous_opcodes_found"] is False
-    assert debug_check.status == CheckStatus.PASSED
-    assert debug_check.details["dangerous_opcodes_found"] is False
-
-    outcomes = {record["pickle_filename"]: record for record in result.metadata["pickle_member_outcomes"]}
+    }.issubset(outcomes), f"{_HF_TORCHSCRIPT_ST_QA_REPO_ID}@{_HF_TORCHSCRIPT_ST_QA_REVISION}"
     assert outcomes["archive/data.pkl"]["max_severity"] == "warning"
     assert outcomes["archive/constants.pkl"]["pickle_verdict"] == "clean"
     assert outcomes["archive/code/__torch__.py.debug_pkl"]["pickle_verdict"] == "clean"
@@ -14338,24 +14525,14 @@ def test_pytorch_zip_torchscript_member_does_not_mask_critical_sidecar_pickle(tm
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    checks_by_member = _weights_only_analysis_checks_by_member(result)
-    data_check = checks_by_member["archive/data.pkl"]
-    evil_check = checks_by_member["archive/evil.pkl"]
-    assert data_check.severity == IssueSeverity.WARNING
-    assert evil_check.status == CheckStatus.FAILED
-    assert evil_check.severity == IssueSeverity.CRITICAL
-    assert evil_check.details["opcode_counts"] == {"REDUCE": 1}
-    assert evil_check.details["assessment"] == "malicious"
-    assert evil_check.details["import_analysis"]["found_malicious"] == ["os.system"]
-
     assert result.has_errors is True
     assert result.metadata["pickle_member_worst_outcome"]["pickle_filename"] == "archive/evil.pkl"
     assert result.metadata["pickle_member_worst_outcome"]["max_severity"] == "critical"
     assert result.metadata["pickle_member_worst_outcome"]["pickle_verdict"] == "malicious"
     assert any(
-        issue.location == f"{model_path}:archive/evil.pkl"
+        str(issue.location).startswith(f"{model_path}:archive/evil.pkl")
         and issue.severity == IssueSeverity.CRITICAL
-        and issue.details.get("import_analysis", {}).get("found_malicious") == ["os.system"]
+        and issue.details.get("import_reference") == "os.system"
         for issue in result.issues
     )
 
@@ -16925,21 +17102,6 @@ def test_pinned_huggingface_pyannote_checkpoint_does_not_emit_metadata_only_runt
     assert PyTorchZipScanner.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON in pytorch_metadata["scan_outcome_reasons"]
 
 
-def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResult:
-    result = ScanResult(scanner_name="pickle")
-    details: dict[str, object] = {"opcode": "REDUCE"}
-    if import_reference is not None:
-        details["import_reference"] = import_reference
-    result.add_check(
-        name="Dangerous Pickle Opcode",
-        passed=False,
-        message="REDUCE opcode detected",
-        severity=IssueSeverity.WARNING,
-        details=details,
-    )
-    return result
-
-
 def _pickle_global_bytes(module: bytes, name: bytes) -> bytes:
     return b"c" + module + b"\n" + name + b"\n"
 
@@ -17054,19 +17216,6 @@ def _critical_s115_getattr_issues(result: ScanResult) -> list[Any]:
         and issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("import_reference") == "__builtin__.getattr"
     ]
-
-
-def _weights_only_analysis_check(result: ScanResult) -> Check:
-    return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
-
-
-def _weights_only_analysis_checks_by_member(result: ScanResult) -> dict[str, Check]:
-    return {
-        str(check.details["pickle_filename"]): check
-        for check in result.checks
-        if check.name == "CVE-2025-32434 Pickle Format Security Analysis"
-        and isinstance(check.details.get("pickle_filename"), str)
-    }
 
 
 def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(
@@ -17491,8 +17640,7 @@ def test_pytorch_zip_repository_inventory_marks_safetensors_available_without_lo
     result = scanner.scan(str(model_path))
 
     assert not (tmp_path / "model.safetensors").exists()
-    check = _weights_only_analysis_check(result)
-    assert check.details["safetensors_available"] is True
+    assert result.metadata["safetensors_available"] is True
 
 
 def test_pytorch_zip_repository_inventory_requires_same_directory_safetensors(tmp_path: Path) -> None:
@@ -17511,8 +17659,7 @@ def test_pytorch_zip_repository_inventory_requires_same_directory_safetensors(tm
 
     result = scanner.scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.details["safetensors_available"] is False
+    assert result.metadata["safetensors_available"] is False
 
 
 def test_pytorch_zip_repository_inventory_requires_related_safetensors_name(tmp_path: Path) -> None:
@@ -17523,8 +17670,7 @@ def test_pytorch_zip_repository_inventory_requires_related_safetensors_name(tmp_
 
     result = scanner.scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.details["safetensors_available"] is False
+    assert result.metadata["safetensors_available"] is False
 
 
 def test_pytorch_zip_local_safetensors_check_ignores_deceptive_directory_and_suffix(tmp_path: Path) -> None:
@@ -17534,8 +17680,7 @@ def test_pytorch_zip_local_safetensors_check_ignores_deceptive_directory_and_suf
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.details["safetensors_available"] is False
+    assert result.metadata["safetensors_available"] is False
 
 
 def test_pytorch_zip_local_safetensors_check_accepts_framed_related_file(tmp_path: Path) -> None:
@@ -17544,8 +17689,7 @@ def test_pytorch_zip_local_safetensors_check_accepts_framed_related_file(tmp_pat
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.details["safetensors_available"] is True
+    assert result.metadata["safetensors_available"] is True
 
 
 def test_pytorch_zip_local_safetensors_check_rejects_truncated_header_json(tmp_path: Path) -> None:
@@ -17554,8 +17698,7 @@ def test_pytorch_zip_local_safetensors_check_rejects_truncated_header_json(tmp_p
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.details["safetensors_available"] is False
+    assert result.metadata["safetensors_available"] is False
 
 
 def test_pytorch_zip_directory_scan_uses_repository_inventory_for_nested_sibling(tmp_path: Path) -> None:
@@ -17576,8 +17719,8 @@ def test_pytorch_zip_directory_scan_uses_repository_inventory_for_nested_sibling
         **repository_config,
     )
 
-    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
-    assert check.details["safetensors_available"] is True
+    metadata = next(value for key, value in result.file_metadata.items() if key.endswith("pytorch_model.bin"))
+    assert metadata["safetensors_available"] is True
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -17604,9 +17747,8 @@ def test_pytorch_zip_hf_snapshot_symlink_uses_snapshot_inventory_member(
         **repository_config,
     )
 
-    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
     assert result.files_scanned == 1
-    assert check.details["safetensors_available"] is True
+    assert result.file_metadata[str(blob_path.resolve())]["safetensors_available"] is True
 
 
 def test_pytorch_zip_directory_inventory_rejects_malformed_local_safetensors(
@@ -17626,8 +17768,8 @@ def test_pytorch_zip_directory_inventory_rejects_malformed_local_safetensors(
         **repository_config,
     )
 
-    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
-    assert check.details["safetensors_available"] is False
+    metadata = next(value for key, value in result.file_metadata.items() if key.endswith("pytorch_model.bin"))
+    assert metadata["safetensors_available"] is False
 
 
 def test_pytorch_zip_directory_scan_reuses_indexed_repository_inventory(
@@ -17695,8 +17837,8 @@ def _assert_pytorch_zip_streaming_repository_inventory(tmp_path: Path, member_pr
         **repository_config,
     )
 
-    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
-    assert check.details["safetensors_available"] is True
+    metadata = next(value for key, value in result.file_metadata.items() if key.endswith("pytorch_model.bin"))
+    assert metadata["safetensors_available"] is True
 
 
 def test_pytorch_zip_streaming_scan_uses_repository_inventory(tmp_path: Path) -> None:
@@ -17719,10 +17861,7 @@ def test_pytorch_zip_safetensors_inventory_does_not_suppress_malicious_pickle(tm
 
     result = scanner.scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.severity == IssueSeverity.CRITICAL
-    assert check.details["safetensors_available"] is True
+    assert result.metadata["safetensors_available"] is True
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
@@ -17733,10 +17872,8 @@ def test_pytorch_zip_embedded_safetensors_member_is_not_repository_alternative(t
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.severity == IssueSeverity.CRITICAL
-    assert check.details["safetensors_available"] is False
+    assert result.metadata["safetensors_available"] is False
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
 @pytest.mark.integration
@@ -17776,202 +17913,10 @@ def test_pinned_huggingface_inventory_marks_safetensors_available_without_weight
 
     result = scanner.scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.details["safetensors_available"] is True
+    assert result.metadata["safetensors_available"] is True
 
 
-def _legacy_s207_pickle_result(opcode_counts: dict[str, int]) -> ScanResult:
-    scanner = PickleScanner()
-    result = ScanResult(scanner_name="pickle", scanner=scanner)
-    result.metadata["opcode_counts"] = opcode_counts
-    result.metadata["import_references"] = [
-        {
-            "import_reference": "__main__.CustomModel",
-            "module": "__main__",
-            "name": "CustomModel",
-            "opcode": "STACK_GLOBAL",
-            "position": 42,
-            "is_dangerous": False,
-        }
-    ]
-    scanner._add_root_legacy_metadata_detectors(result, "data.pkl")
-    assert any(issue.rule_code == "S207" for issue in result.issues)
-    return result
-
-
-@pytest.mark.parametrize(
-    ("message", "details", "opcode", "expected_count"),
-    [
-        ("ignored", {"opcode_name": "BUILD"}, "BUILD", 1),
-        ("ignored", {"opcodes": ["OBJ", "OBJ", "REDUCE"]}, "OBJ", 2),
-        ("ignored", {"opcode_counts": {"NEWOBJ_EX": 2}}, "NEWOBJ_EX", 2),
-        ("Found GLOBAL opcode", {}, "GLOBAL", 1),
-        ("Found NEWOBJ_EXTRA opcode", {}, "NEWOBJ", 0),
-        ("Found BUILD opcode", {"opcode_counts": {"BUILD": True}}, "BUILD", 0),
-    ],
-)
-def test_pytorch_zip_cve_2025_32434_reads_exact_opcode_evidence(
-    message: str,
-    details: dict[str, Any],
-    opcode: str,
-    expected_count: int,
-) -> None:
-    assert PyTorchZipScanner._issue_pickle_opcode_count(message, details, opcode) == expected_count
-
-
-def test_pytorch_zip_cve_2025_32434_empty_imports_stay_suspicious(tmp_path: Path) -> None:
-    """Dangerous opcodes without import evidence must not be downgraded to INFO."""
-    scanner = PyTorchZipScanner()
-    pickle_result = _pickle_result_with_reduce()
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.severity == IssueSeverity.WARNING
-    assert check.details["import_analysis"]["all_legitimate"] is False
-    assert check.details["import_analysis"]["total_imports"] == 0
-
-
-def test_pytorch_zip_cve_2025_32434_ignores_opcode_name_substrings_and_prose(tmp_path: Path) -> None:
-    pickle_result = _pickle_result_with_reduce("numpy.core.multiarray._reconstruct")
-    pickle_result.add_check(
-        name="Dangerous Pickle Call Graph",
-        passed=False,
-        message=(
-            "Pickle global 'numpy.core.multiarray._reconstruct' reaches dangerous Python "
-            "primitive 'builtins.__import__' through the installed call graph"
-        ),
-        severity=IssueSeverity.CRITICAL,
-        details={
-            "import_reference": "numpy.core.multiarray._reconstruct",
-            "analysis": "python_call_graph",
-        },
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.details["opcode_counts"] == {"REDUCE": 1}
-    assert "GLOBAL" not in check.details["unique_opcode_types"]
-    assert "INST" not in check.details["unique_opcode_types"]
-    assert "OBJ" not in check.details["unique_opcode_types"]
-
-
-def test_pytorch_zip_cve_2025_32434_does_not_double_count_stack_global(tmp_path: Path) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.add_check(
-        name="Dangerous Pickle Opcode",
-        passed=False,
-        message="STACK_GLOBAL opcode detected",
-        severity=IssueSeverity.WARNING,
-        details={"opcode": "STACK_GLOBAL"},
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1}
-
-
-def test_pytorch_zip_cve_2025_32434_reports_newobj_ex(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "newobj_ex.pt", with_pickle=False)
-    with zipfile.ZipFile(model_path, "a") as zipf:
-        zipf.writestr("data.pkl", _malicious_newobj_ex_pickle_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.rule_code == "S204"
-    assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1, "NEWOBJ_EX": 1}
-    assert check.details["total_dangerous_opcodes"] == 2
-    assert set(check.details["unique_opcode_types"]) == {"STACK_GLOBAL", "NEWOBJ_EX"}
-    assert "NEWOBJ" not in check.details["unique_opcode_types"]
-    assert "OBJ" not in check.details["unique_opcode_types"]
-
-
-def test_pytorch_zip_cve_2025_32434_retains_supporting_only_opcode_evidence(tmp_path: Path) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.metadata["opcode_counts"] = {"NEWOBJ_EX": 1}
-    pickle_result.add_check(
-        name="NEWOBJ_EX Opcode Safety Check",
-        passed=False,
-        message="Found NEWOBJ_EX opcode invoking dangerous global: builtins.compile",
-        severity=IssueSeverity.CRITICAL,
-        details={
-            "opcode": "NEWOBJ_EX",
-            "import_reference": "builtins.compile",
-            "supporting_rule_code": True,
-        },
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.FAILED
-    assert check.severity == IssueSeverity.CRITICAL
-    assert check.details["opcode_counts"] == {"NEWOBJ_EX": 1}
-
-
-def test_pytorch_zip_cve_2025_32434_correlates_file_write_call_graph_invocations(tmp_path: Path) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.metadata["opcode_counts"] = {"NEWOBJ": 1, "REDUCE": 1}
-    pickle_result.metadata["callable_invocations"] = [
-        {"import_reference": "click.open_file", "module": "click", "name": "open_file", "opcode": "NEWOBJ"},
-        {"import_reference": "click.echo", "module": "click", "name": "echo", "opcode": "REDUCE"},
-    ]
-    pickle_result.add_check(
-        name="Standalone Pickle Finding",
-        passed=False,
-        message=(
-            "Pickle globals 'click.open_file' and 'click.echo' can open and write "
-            "attacker-controlled files through the installed call graph"
-        ),
-        severity=IssueSeverity.CRITICAL,
-        details={
-            "pickle_rule_code": "DANGEROUS_CALL_GRAPH_FILE_WRITE",
-            "module": "click",
-            "name": "echo",
-            "import_reference": "click.echo",
-            "opener_module": "click",
-            "opener_name": "open_file",
-            "opener_import_reference": "click.open_file",
-        },
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
-
-
-def test_pytorch_zip_cve_2025_32434_reports_real_file_write_call_graph_invocations(tmp_path: Path) -> None:
+def test_pytorch_zip_reports_real_file_write_call_graph_invocations(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "file_write.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("data.pkl", b"\x80\x04cclick\nopen_file\n)\x810cclick\necho\n)R.")
@@ -17979,12 +17924,9 @@ def test_pytorch_zip_cve_2025_32434_reports_real_file_write_call_graph_invocatio
     result = PyTorchZipScanner().scan(str(model_path))
 
     assert any(issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for issue in result.issues)
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
 
 
-def test_pytorch_zip_cve_2025_32434_reports_nested_execution_opcode_counts(tmp_path: Path) -> None:
+def test_pytorch_zip_reports_nested_execution_opcodes(tmp_path: Path) -> None:
     inner = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
     model_path = create_mock_pytorch_zip(tmp_path / "nested_file_write.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
@@ -17993,12 +17935,9 @@ def test_pytorch_zip_cve_2025_32434_reports_nested_execution_opcode_counts(tmp_p
     result = PyTorchZipScanner().scan(str(model_path))
 
     assert any(issue.details.get("nested_has_execution_opcode") is True for issue in result.issues)
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"NEWOBJ": 2, "REDUCE": 1}
 
 
-def test_pytorch_zip_cve_2025_32434_does_not_correlate_separate_nested_streams(tmp_path: Path) -> None:
+def test_pytorch_zip_does_not_correlate_separate_nested_streams(tmp_path: Path) -> None:
     opener = b"\x80\x04cclick\nopen_file\n)\x81."
     writer = b"\x80\x04cclick\necho\n)R."
     model_path = create_mock_pytorch_zip(tmp_path / "separate_nested_streams.pt", with_pickle=False)
@@ -18010,12 +17949,9 @@ def test_pytorch_zip_cve_2025_32434_does_not_correlate_separate_nested_streams(t
     assert not any(
         issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for issue in result.issues
     )
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
 
 
-def test_pytorch_zip_cve_2025_32434_reports_encoded_nested_execution_opcodes(tmp_path: Path) -> None:
+def test_pytorch_zip_reports_encoded_nested_execution_opcodes(tmp_path: Path) -> None:
     inner = b"\x80\x04cclick\nopen_file\n)\x810cclick\necho\n)R."
     model_path = create_mock_pytorch_zip(tmp_path / "encoded_nested.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
@@ -18027,68 +17963,9 @@ def test_pytorch_zip_cve_2025_32434_reports_encoded_nested_execution_opcodes(tmp
         issue.rule_code == "S601" and issue.details.get("nested_has_execution_opcode") is True
         for issue in result.issues
     )
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
 
 
-def test_pytorch_zip_cve_2025_32434_nested_evidence_does_not_unlock_outer_opcodes(tmp_path: Path) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.metadata["opcode_counts"] = {"STACK_GLOBAL": 1, "REDUCE": 1}
-    pickle_result.metadata["nested_opcode_counts"] = {"NEWOBJ": 1}
-    pickle_result.add_check(
-        name="Standalone Pickle Finding",
-        passed=False,
-        message="Nested pickle payload detected",
-        severity=IssueSeverity.CRITICAL,
-        details={"nested_has_execution_opcode": True},
-        rule_code="S213",
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"NEWOBJ": 1}
-
-
-@pytest.mark.parametrize("nested_rule_code", ["S213", "S601"])
-def test_pytorch_zip_cve_2025_32434_fails_closed_for_legacy_nested_execution_evidence(
-    tmp_path: Path,
-    nested_rule_code: str,
-) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.add_check(
-        name="Standalone Pickle Finding",
-        passed=False,
-        message="Nested pickle payload detected",
-        severity=IssueSeverity.CRITICAL,
-        details={"nested_has_execution_opcode": True},
-        rule_code=nested_rule_code,
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.FAILED
-    assert check.rule_code == nested_rule_code
-    assert check.details["opcode_counts"] == {}
-    assert check.details["nested_execution_opcode_evidence"] is True
-
-
-def test_pytorch_zip_cve_2025_32434_correlates_callable_singleton_alias(tmp_path: Path) -> None:
+def test_pytorch_zip_correlates_callable_singleton_alias(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "callable_alias.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("data.pkl", b"\x80\x04\x8c\x08builtins\x8c\x04help\x93)R.")
@@ -18101,47 +17978,9 @@ def test_pytorch_zip_cve_2025_32434_correlates_callable_singleton_alias(tmp_path
         and issue.details.get("opcode") == "REDUCE"
         for issue in result.issues
     )
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"REDUCE": 1}
 
 
-def test_pytorch_zip_cve_2025_32434_correlates_all_callable_singleton_alias_invocations(tmp_path: Path) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.metadata["opcode_counts"] = {"NEWOBJ": 1, "REDUCE": 1}
-    pickle_result.metadata["callable_invocations"] = [
-        {"import_reference": "builtins.help", "opcode": "NEWOBJ"},
-        {"import_reference": "builtins.help", "opcode": "REDUCE"},
-    ]
-    pickle_result.add_check(
-        name="Standalone Pickle Finding",
-        passed=False,
-        message=(
-            "Pickle global '_sitebuiltins._Helper.__call__' reaches dangerous Python primitive "
-            "'builtins.__import__' through the installed call graph"
-        ),
-        severity=IssueSeverity.CRITICAL,
-        details={
-            "import_reference": "_sitebuiltins._Helper.__call__",
-            "invocation_import_reference": "builtins.help",
-            "opcode": "REDUCE",
-        },
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
-
-
-def test_pytorch_zip_cve_2025_32434_callable_singleton_import_without_invocation_stays_clean(
+def test_pytorch_zip_callable_singleton_import_without_invocation_stays_clean(
     tmp_path: Path,
 ) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "callable_alias_import.pt", with_pickle=False)
@@ -18150,169 +17989,35 @@ def test_pytorch_zip_cve_2025_32434_callable_singleton_import_without_invocation
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.PASSED
-    assert check.details["dangerous_opcodes_found"] is False
+    assert result.metadata["pickle_member_worst_outcome"]["pickle_verdict"] == "clean"
 
 
-def test_pytorch_zip_cve_2025_32434_file_write_imports_without_invocation_stay_clean(tmp_path: Path) -> None:
+def test_pytorch_zip_file_write_imports_without_invocation_stay_clean(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "file_write_imports.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("data.pkl", b"\x80\x04cclick\nopen_file\ncclick\necho\n\x86.")
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    check = _weights_only_analysis_check(result)
-    assert check.status == CheckStatus.PASSED
-    assert check.details["dangerous_opcodes_found"] is False
+    assert result.metadata["pickle_member_worst_outcome"]["pickle_verdict"] == "clean"
 
 
-def test_pytorch_zip_cve_2025_32434_includes_s207_metadata_build_evidence(tmp_path: Path) -> None:
-    pickle_result = _legacy_s207_pickle_result({"STACK_GLOBAL": 1, "BUILD": 1})
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+def test_pytorch_zip_reports_newobj_ex(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "newobj_ex.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", _malicious_newobj_ex_pickle_payload())
 
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        call["opcode"] == "NEWOBJ_EX" and call["name"] == "_NewObjExImportGadget"
+        for call in result.metadata["callable_invocations"]
     )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1, "BUILD": 1}
-
-
-def test_pytorch_zip_cve_2025_32434_does_not_invent_build_for_s207(tmp_path: Path) -> None:
-    pickle_result = _legacy_s207_pickle_result({"STACK_GLOBAL": 1})
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
+    assert any(
+        str(issue.details.get("import_reference", "")).endswith("._NewObjExImportGadget")
+        and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for issue in result.issues
     )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.FAILED
-    assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1}
-
-
-def test_pytorch_zip_cve_2025_32434_ignores_unreported_build_metadata(tmp_path: Path) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.metadata["opcode_counts"] = {"BUILD": 1}
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.PASSED
-    assert check.details["dangerous_opcodes_found"] is False
-
-
-def test_pytorch_zip_cve_2025_32434_ignores_benign_opcode_near_matches(tmp_path: Path) -> None:
-    pickle_result = ScanResult(scanner_name="pickle")
-    pickle_result.add_check(
-        name="Pickle Metadata Diagnostic",
-        passed=False,
-        message=("Global build analysis reduced an installed object with newobject and stack_globalized metadata"),
-        severity=IssueSeverity.INFO,
-        details={"analysis": "metadata_diagnostic"},
-    )
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    PyTorchZipScanner()._add_weights_only_safety_warnings(
-        pickle_result,
-        pytorch_result,
-        str(tmp_path / "model.pt"),
-        "data.pkl",
-    )
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.status == CheckStatus.PASSED
-    assert check.details["dangerous_opcodes_found"] is False
-
-
-@pytest.mark.parametrize(
-    "import_reference",
-    [
-        "torch._utils.evil",
-        "collections.OrderedDictEvil",
-        "torch._rebuild_tensor_v2.evil",
-        "subprocesssafe.Popen",
-        "webbrowsersafe.open",
-        "socketed.connect",
-    ],
-)
-def test_pytorch_zip_cve_2025_32434_safe_prefix_spoofing_stays_suspicious(
-    tmp_path: Path, import_reference: str
-) -> None:
-    """Safe-looking prefixes must not count as legitimate imports by substring."""
-    scanner = PyTorchZipScanner()
-    pickle_result = _pickle_result_with_reduce(import_reference)
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.severity == IssueSeverity.WARNING
-    assert check.details["import_analysis"]["all_legitimate"] is False
-    assert import_reference in check.details["import_analysis"]["found_imports"]
-
-
-@pytest.mark.parametrize(
-    "import_reference",
-    [
-        "torch._utils._rebuild_tensor_v2",
-        "torch._rebuild_tensor",
-        "torch._rebuild_tensor_v2",
-    ],
-)
-def test_pytorch_zip_cve_2025_32434_known_rebuild_reference_stays_info(tmp_path: Path, import_reference: str) -> None:
-    """Known PyTorch rebuild functions remain informational to avoid noisy state-dict results."""
-    scanner = PyTorchZipScanner()
-    pickle_result = _pickle_result_with_reduce(import_reference)
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.severity == IssueSeverity.INFO
-    assert check.details["import_analysis"]["all_legitimate"] is True
-
-
-@pytest.mark.parametrize(
-    "import_reference",
-    [
-        "__builtins__.eval",
-        "asyncio.subprocess",
-        "asyncio.subprocess.create_subprocess_shell",
-        "builtins.compile",
-        "builtins.__import__",
-        "socket",
-        "subprocess",
-        "urllib",
-        "urllib2.urlopen",
-        "webbrowser",
-    ],
-)
-def test_pytorch_zip_cve_2025_32434_dangerous_references_stay_critical(tmp_path: Path, import_reference: str) -> None:
-    """Dangerous references reported exactly or by known risky prefixes remain malicious."""
-    scanner = PyTorchZipScanner()
-    pickle_result = _pickle_result_with_reduce(import_reference)
-    pytorch_result = ScanResult(scanner_name="pytorch_zip")
-
-    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
-
-    check = _weights_only_analysis_check(pytorch_result)
-    assert check.severity == IssueSeverity.CRITICAL
-    assert import_reference in check.details["import_analysis"]["found_malicious"]
 
 
 def test_pytorch_zip_cve_2026_24747_fixed_version(
@@ -20503,6 +20208,7 @@ def test_pytorch_zip_literal_work_budget_checks_timeout_between_member_probes(
         storage_keys_by_data_pkl={"archive/data.pkl": {"0", "1"}},
         storage_probe_keys_by_data_pkl={},
         persistent_id_downgrade_keys_by_data_pkl={},
+        additional_pid_keys_by_data_pkl={},
         storage_member_sizes_by_data_pkl={},
     )
     buffer = io.BytesIO()
