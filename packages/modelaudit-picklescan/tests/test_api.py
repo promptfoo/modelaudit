@@ -2139,6 +2139,54 @@ def test_scan_bytes_flags_untrusted_persistent_ids(payload: bytes, opcode: str) 
     )
 
 
+@pytest.mark.parametrize("operand", [b"\xff", b"\xc3\xa9"])
+def test_scan_bytes_rejects_non_ascii_protocol0_persistent_id(operand: bytes) -> None:
+    report = scan_bytes(b"P" + operand + b"\n.")
+
+    _assert_report_state(report, ScanStatus.ERROR, SafetyVerdict.UNKNOWN)
+    assert any("persistent ID must be ASCII" in error.message for error in report.errors)
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "rule"),
+    [
+        (b"cbuiltins\nopen\n", "DANGEROUS_GLOBAL"),
+        (b"\x82\x01", "EXTENSION_REF"),
+        (b"U\x03keyQ", "PERSISTENT_ID"),
+    ],
+)
+@pytest.mark.parametrize("encoded", [False, True], ids=["raw", "base64"])
+@pytest.mark.parametrize("tail", [b".", b"!"], ids=["stop", "malformed-tail"])
+def test_scan_bytes_preserves_nested_prefix_before_invalid_persid(
+    prefix: bytes, rule: str, encoded: bool, tail: bytes
+) -> None:
+    inner = b"\x80\x02" + prefix + b"P\xff\n" + tail
+    literal = base64.b64encode(inner) if encoded else inner
+    report = scan_bytes(pickle.dumps(literal, protocol=4))
+
+    assert any(finding.rule_code == rule for finding in report.findings)
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert not any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "PERSID"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_resumes_after_invalid_persid_operand() -> None:
+    report = scan_bytes(b"P\xc3\xa9Project\n." + b"\x80\x02\x82\x01.")
+
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert any(finding.rule_code == "EXTENSION_REF" for finding in report.findings)
+
+
+def test_scan_bytes_preserves_extension_in_malformed_follow_on_stream() -> None:
+    report = scan_bytes(b"!\x80\x02\x82\x01P\xff\n.")
+
+    assert any(finding.rule_code == "EXTENSION_REF" for finding in report.findings)
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+
+
 def test_scan_bytes_recurses_into_nested_persid_payload() -> None:
     inner = b"\x80\x04cos\nsystem\nPfake_id\n."
     outer = pickle.dumps({"inner": inner}, protocol=4)
@@ -7292,6 +7340,39 @@ def test_scan_file_skips_protocol0_persid_near_match_storage_blob(tmp_path: Path
     storage_blob = b"PNG\x00" * 8
     report = _assert_storage_skipped(archive_path, storage_blob)
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected_rule"),
+    [
+        (b"P\xff\n!", None),
+        (b"Pkey\n!", "PERSISTENT_ID"),
+        (b"P\xff\n!cposix\nsystem\n)R.", "DANGEROUS_CALL"),
+    ],
+)
+def test_scan_file_checks_persid_operand_inside_referenced_storage(
+    tmp_path: Path, candidate: bytes, expected_rule: str | None
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    literal = b"!" * 211 + candidate
+    literal = literal.ljust(8195, b"!")
+    storage_blob = b"B" + struct.pack("<I", len(literal)) + literal
+    _write_float_storage_zip(archive_path, storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert "archive/data/0" in report.metadata["pickle_files"]
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert any(notice.code == "parse_incomplete" for notice in report.notices)
+    if expected_rule is None:
+        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert not report.findings
+    else:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.rule_code == expected_rule and finding.location is not None and "archive/data/0" in finding.location
+            for finding in report.findings
+        )
 
 
 def test_scan_file_keeps_large_all_nul_storage_padding_clean(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-use crate::opcode::{parse_opcode, ParseError, ParsedOpcode};
+use crate::opcode::{parse_opcode, ParsedOpcode};
 use crate::options::DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS;
 use crate::policy::global_severity;
 
@@ -42,14 +42,8 @@ pub(crate) struct DecodedNestedPayload {
 }
 
 pub(crate) struct PicklePayloadExtentError {
-    error: ParseError,
-    structured_pickle_evidence: bool,
-}
-
-impl PicklePayloadExtentError {
-    pub(crate) fn is_structured_protocol0_line_operand_limit(&self) -> bool {
-        self.structured_pickle_evidence && self.error.is_protocol0_line_operand_limit()
-    }
+    pub(crate) scan_incomplete_prefix: bool,
+    pub(crate) invalid_id_end: Option<usize>,
 }
 
 pub(crate) fn decode_possible_encoded_pickle(
@@ -189,7 +183,7 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
                 return payloads;
             }
         }
-        Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+        Err(error) if error.scan_incomplete_prefix => {
             payloads.push((decoded.to_vec(), true));
             return payloads;
         }
@@ -227,9 +221,7 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
         let (payload_len, analysis_incomplete) =
             match pickle_payload_extent_result(probe, max_nested_pickle_bytes) {
                 Ok(Some(payload_len)) => (payload_len, false),
-                Err(error) if error.is_structured_protocol0_line_operand_limit() => {
-                    (probe.len(), true)
-                }
+                Err(error) if error.scan_incomplete_prefix => (probe.len(), true),
                 Ok(None) | Err(_)
                     if (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe))
@@ -250,9 +242,8 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
 }
 
 fn has_high_confidence_truncated_execution_prefix(value: &[u8]) -> bool {
-    let first_is_persid = parse_opcode(value, 0, value.len()).is_ok_and(|opcode| {
-        opcode.name == "PERSID" && opcode.arg.text(value).as_bytes().is_ascii()
-    });
+    let first_is_persid = parse_opcode(value, 0, value.len())
+        .is_ok_and(|opcode| opcode.name == "PERSID" && !opcode.has_invalid_persistent_id());
     first_is_persid
         || ((has_binary_pickle_prefix(value)
             || protocol0_global_or_inst_prefix_has_import_reference_lines(value))
@@ -374,9 +365,18 @@ fn confirmed_pickle_payload_extent_result(
     while index < value.len() {
         let parsed =
             parse_opcode(value, index, value.len()).map_err(|error| PicklePayloadExtentError {
-                error,
-                structured_pickle_evidence,
+                scan_incomplete_prefix: structured_pickle_evidence
+                    && error.is_protocol0_line_operand_limit(),
+                invalid_id_end: None,
             })?;
+        // A malformed ID alone cannot establish a nested stream. Retain a recognized prefix
+        // so the scanner can surface operations that run before the unpickler rejects the ID.
+        if parsed.has_invalid_persistent_id() {
+            return Err(PicklePayloadExtentError {
+                scan_incomplete_prefix: index > 0,
+                invalid_id_end: (index > 0).then_some(parsed.next),
+            });
+        }
         index = parsed.next;
         if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
             return Ok(None);
@@ -396,6 +396,9 @@ pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
             Ok(parsed) => parsed,
             Err(_) => return false,
         };
+        if parsed.has_invalid_persistent_id() {
+            return false;
+        }
         match parsed.name {
             "INST" if protocol0_opcode_operands_are_plausible(&parsed) => return true,
             "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "BUILD" | "PERSID" | "BINPERSID" => {
@@ -461,6 +464,9 @@ fn has_structurally_valid_execution_prefix(value: &[u8]) -> bool {
             Ok(parsed) => parsed,
             Err(_) => return false,
         };
+        if parsed.has_invalid_persistent_id() {
+            return false;
+        }
         if matches!(parsed.name, "GLOBAL" | "INST")
             && !protocol0_opcode_operands_are_import_references(&parsed)
         {
@@ -471,7 +477,17 @@ fn has_structurally_valid_execution_prefix(value: &[u8]) -> bool {
         }
         if matches!(
             parsed.name,
-            "INST" | "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "BUILD" | "PERSID" | "BINPERSID"
+            "INST"
+                | "REDUCE"
+                | "NEWOBJ"
+                | "NEWOBJ_EX"
+                | "OBJ"
+                | "BUILD"
+                | "PERSID"
+                | "BINPERSID"
+                | "EXT1"
+                | "EXT2"
+                | "EXT4"
         ) {
             return true;
         }
@@ -1262,7 +1278,7 @@ fn embedded_long_protocol0_base64_probe_windows(
             };
             let candidate_is_pickle = match extent {
                 Ok(Some(_)) => true,
-                Err(error) if error.is_structured_protocol0_line_operand_limit() => true,
+                Err(error) if error.scan_incomplete_prefix => true,
                 Ok(None) | Err(_) => false,
             };
             if candidate_is_pickle {
@@ -3257,7 +3273,7 @@ mod tests {
         assert!(decoded_pickle_payloads(&payload, payload.len() + 16).is_empty());
         let error = pickle_payload_extent_result(&payload, payload.len() + 16)
             .expect_err("overlong protocol 0 string should preserve its parse error");
-        assert!(!error.is_structured_protocol0_line_operand_limit());
+        assert!(!error.scan_incomplete_prefix);
     }
 
     #[test]
@@ -3489,7 +3505,7 @@ mod tests {
 
         let error = pickle_payload_extent_result(&payload, payload.len() + 16)
             .expect_err("overlong nested operand should preserve its parse error");
-        assert!(error.is_structured_protocol0_line_operand_limit());
+        assert!(error.scan_incomplete_prefix);
     }
 
     #[test]
@@ -3502,7 +3518,7 @@ mod tests {
 
         let error = pickle_payload_extent_result(&payload, payload.len() + 16)
             .expect_err("structured evidence after setup opcodes should survive the operand cap");
-        assert!(error.is_structured_protocol0_line_operand_limit());
+        assert!(error.scan_incomplete_prefix);
     }
 
     #[test]
