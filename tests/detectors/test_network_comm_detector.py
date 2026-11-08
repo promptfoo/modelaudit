@@ -9165,6 +9165,15 @@ def test_shared_evidence_redaction_classification_budget_fails_closed(
     assert findings[-1]["max_classifications"] == network_comm._MAX_EVIDENCE_REDACTION_CLASSIFICATIONS
 
 
+def test_filtered_code_tokens_leave_redaction_budget_for_real_endpoints() -> None:
+    data = b"api_key=value\n" + b"layer.weight.to(device)\n" * 50 + b"endpoint=45.33.32.156"
+
+    findings = NetworkCommDetector().scan(data, "README.md")
+
+    assert any(finding.get("ip") == "45.33.32.156" for finding in findings)
+    assert not any(finding.get("type") == "detector_finding_limit" for finding in findings)
+
+
 def _count_shared_redactions(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     calls = [0]
     original_redactor = network_comm._redact_network_evidence

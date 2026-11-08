@@ -255,12 +255,6 @@ def _record_is_failed_security_check(record: Any) -> bool:
     ) in {"warning", "critical"}
 
 
-def _scan_result_has_security_findings(scan_result: "ScanResult") -> bool:
-    if scan_result.has_errors or scan_result.has_warnings:
-        return True
-    return any(_record_is_failed_security_check(check) for check in scan_result.checks)
-
-
 def mark_inconclusive_scan_result(scan_result: "ScanResult", reason: str) -> None:
     """Mark a scan result as inconclusive while preserving existing reasons."""
     scan_result.metadata["analysis_incomplete"] = True
@@ -286,9 +280,14 @@ def normalize_unclassified_scan_failure(scan_result: "ScanResult") -> None:
         return
     if scan_result_has_inconclusive_outcome(scan_result):
         return
-    if _scan_result_has_security_findings(scan_result):
+    # Some scanners set success=False solely because they found a critical issue.
+    if scan_result.has_errors:
         return
-    mark_inconclusive_scan_result(scan_result, UNCLASSIFIED_SCAN_FAILURE_REASON)
+    if any(_record_is_failed_security_check(check) for check in scan_result.checks):
+        scan_result.metadata["scanner_reported_failure"] = True
+        return
+    if not scan_result.has_warnings:
+        mark_inconclusive_scan_result(scan_result, UNCLASSIFIED_SCAN_FAILURE_REASON)
 
 
 class IssueSeverity(Enum):

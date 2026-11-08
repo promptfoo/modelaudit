@@ -105,8 +105,10 @@ def test_docker_runtime_images_upgrade_vulnerable_debian_packages(dockerfile: st
     upgraded_packages = {package for command in upgrade_commands for package in command.split()}
 
     assert {
+        "apt",
         "bsdutils",
         "gzip",
+        "libapt-pkg7.0",
         "libblkid1",
         "liblastlog2-2",
         "libmount1",

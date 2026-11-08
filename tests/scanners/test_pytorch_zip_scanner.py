@@ -2186,6 +2186,37 @@ def test_pytorch_zip_discovery_finds_hidden_storage_pickle_with_data_pkl(tmp_pat
     )
 
 
+@pytest.mark.parametrize("use_as_persistent_id", [False, True])
+def test_wide_rng_state_tuple_preserves_storage_id_validation(use_as_persistent_id: bool) -> None:
+    storage_pickle = _pytorch_storage_persistent_id_payload("0")
+    wide_tuple = b"(" + b"K\x00" * 625 + b"t"
+    operation = b"Q" if use_as_persistent_id else b"0"
+    payload = storage_pickle[:-1] + wide_tuple + operation + b"."
+
+    parsed = PyTorchZipScanner._trusted_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete
+    assert parsed.referenced_keys == {"0"}
+    assert parsed.all_persistent_ids_are_pytorch_storage is (not use_as_persistent_id)
+
+
+def test_pickle_coverage_is_attributed_to_the_referenced_storage_member(tmp_path: Path) -> None:
+    blob = b"cos\nsystem\n."
+    result = _scan_referenced_float_storage_blob(tmp_path, "embedded.pt", blob)
+    outcomes = {record["pickle_filename"]: record for record in result.metadata["pickle_member_outcomes"]}
+
+    storage = outcomes["archive/data/0"]
+    assert (
+        storage["referenced_tensor_storage_bytes"]
+        == storage["pickle_coverage"]["bytes_total"]
+        == len(blob) + (-len(blob) % 4)
+    )
+    assert storage["pickle_verdict"] != "clean"
+    metadata = outcomes["archive/data.pkl"]
+    assert "referenced_tensor_storage_bytes" not in metadata
+    assert metadata["pickle_coverage"]["bytes_total"] != storage["pickle_coverage"]["bytes_total"]
+
+
 def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp_path: Path) -> None:
     """A data.pkl-referenced tensor blob is raw storage, not a follow-on pickle stream."""
     model_path = tmp_path / "referenced_storage_pickleish_bytes.pt"
@@ -24793,7 +24824,7 @@ def test_pytorch_zip_native9_literal_repeated_continuation_archive_and_root_outc
     assert any(issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING" for issue in result.issues) is suspicious
 
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
-    assert aggregate.success is (not suspicious)
+    assert aggregate.success is True
     assert aggregate.file_metadata[str(path)]["pickle_verdict"] == expected_verdict
     assert aggregate.file_metadata[str(path)]["pickle_coverage"]["raw_scan_complete"] is True
     assert aggregate.file_metadata[str(path)]["pickle_coverage"]["opcode_scan_complete"] is True
@@ -25786,7 +25817,7 @@ def test_pytorch_zip_mixed_tail_crc_retry_preserves_complete_archive(tmp_path: P
     )
 
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_network_comm=False)
-    assert aggregate.success is (not bad_crc)
+    assert aggregate.success is True
     assert should_cache_scan_result(aggregate.model_dump(mode="json")) is (not bad_crc)
     assert determine_exit_code(aggregate) == (1 if bad_crc else 0)
     assert "pytorch_zip_pickle_discovery_incomplete" not in aggregate.file_metadata[str(path)].get(
