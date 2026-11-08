@@ -133,71 +133,45 @@ class TestScanResultFromDict:
 
     def test_severity_normalization_warn(self) -> None:
         """Test 'warn' is normalized to 'warning'."""
-        result_dict = {
-            "scanner": "test",
-            "issues": [{"message": "Test", "severity": "warn", "timestamp": FIXED_TIMESTAMP}],
-            "checks": [],
-        }
-
-        result = scan_result_from_dict(result_dict)
+        result = _restore_cached_issue({"severity": "warn"})
 
         assert result.issues[0].severity == IssueSeverity.WARNING
 
     def test_severity_normalization_error(self) -> None:
         """Test 'error' is normalized to 'critical'."""
-        result_dict = {
-            "scanner": "test",
-            "issues": [{"message": "Test", "severity": "error", "timestamp": FIXED_TIMESTAMP}],
-            "checks": [],
-        }
-
-        result = scan_result_from_dict(result_dict)
+        result = _restore_cached_issue({"severity": "error"})
 
         assert result.issues[0].severity == IssueSeverity.CRITICAL
 
     def test_severity_normalization_invalid(self) -> None:
         """Test invalid severity defaults to INFO."""
-        result_dict = {
-            "scanner": "test",
-            "issues": [{"message": "Test", "severity": "invalid_value", "timestamp": FIXED_TIMESTAMP}],
-            "checks": [],
-        }
-
-        result = scan_result_from_dict(result_dict)
+        result = _restore_cached_issue({"severity": "invalid_value"})
 
         assert result.issues[0].severity == IssueSeverity.INFO
 
     def test_missing_issue_severity_defaults_to_info(self) -> None:
         """Missing cached issue severity should not become a warning."""
-        result_dict = {
-            "scanner": "test",
-            "issues": [{"message": "Test", "timestamp": FIXED_TIMESTAMP}],
-            "checks": [],
-        }
-
-        result = scan_result_from_dict(result_dict)
+        result = _restore_cached_issue({})
 
         assert result.issues[0].severity == IssueSeverity.INFO
 
     def test_check_status_normalization_ok(self) -> None:
         """Test 'ok' is normalized to 'passed'."""
-        _assert_normalized_passed_check_status("ok")
+        result = _restore_cached_check("ok")
+
+        assert result.checks[0].status == CheckStatus.PASSED
 
     def test_check_status_normalization_fail(self) -> None:
         """Test 'fail' is normalized to 'failed'."""
-        result_dict = {
-            "scanner": "test",
-            "issues": [],
-            "checks": [{"name": "test", "status": "fail", "message": "", "timestamp": FIXED_TIMESTAMP}],
-        }
-
-        result = scan_result_from_dict(result_dict)
+        result = _restore_cached_check("fail")
 
         assert result.checks[0].status == CheckStatus.FAILED
 
     def test_check_status_normalization_invalid(self) -> None:
         """Test invalid status defaults to PASSED."""
-        _assert_normalized_passed_check_status("invalid")
+        result = _restore_cached_check("invalid")
+
+        assert result.checks[0].status == CheckStatus.PASSED
 
     def test_end_time_from_duration(self) -> None:
         """Test end_time is calculated from duration."""
@@ -332,13 +306,21 @@ class TestRoundTrip:
         assert restored.checks[0].rule_code == "S201"
 
 
-def _assert_normalized_passed_check_status(case_status: str) -> None:
+def _restore_cached_issue(severity_fields: dict[str, str]) -> ScanResult:
+    return scan_result_from_dict(
+        {
+            "scanner": "test",
+            "issues": [{"message": "Test", **severity_fields, "timestamp": FIXED_TIMESTAMP}],
+            "checks": [],
+        }
+    )
+
+
+def _restore_cached_check(case_status: str) -> ScanResult:
     result_dict = {
         "scanner": "test",
         "issues": [],
         "checks": [{"name": "test", "status": case_status, "message": "", "timestamp": FIXED_TIMESTAMP}],
     }
 
-    result = scan_result_from_dict(result_dict)
-
-    assert result.checks[0].status == CheckStatus.PASSED
+    return scan_result_from_dict(result_dict)

@@ -9,7 +9,7 @@ import struct
 import sys
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
@@ -18,14 +18,10 @@ from ..scanner_selection import add_scanner_selection_skip_check, policy_from_co
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
-_PicklescanOwnerProof = Callable[[str, str, object], bool]
-_PicklescanLoadedReferenceState = Callable[[str, str], tuple[bool, object | None]]
-_PicklescanModuleOriginKind = Callable[[str], str | None]
-_PicklescanPayloadProof = Callable[[bytes | None], bool]
-_picklescan_current_loaded_interpreter_reference_state: _PicklescanLoadedReferenceState | None
-_picklescan_loaded_site_package_reference_owner_matches: _PicklescanOwnerProof | None
-_picklescan_trusted_module_origin_kind: _PicklescanModuleOriginKind | None
-_picklescan_payload_has_only_safe_numpy_ndarray_reconstruction: _PicklescanPayloadProof | None
+_picklescan_current_loaded_interpreter_reference_state: Callable[[str, str], tuple[bool, object | None]] | None
+_picklescan_loaded_site_package_reference_owner_matches: Callable[[str, str, object], bool] | None
+_picklescan_trusted_module_origin_kind: Callable[[str], str | None] | None
+_picklescan_payload_has_only_safe_numpy_ndarray_reconstruction: Callable[[bytes | None], bool] | None
 try:
     from modelaudit_picklescan.call_graph import (
         _current_loaded_interpreter_reference_state as _picklescan_current_loaded_interpreter_reference_state,
@@ -59,10 +55,7 @@ try:
     except (ImportError, AttributeError):
         # Fallback for potential import issues
         NUMPY_FORMAT_AVAILABLE = False
-        if TYPE_CHECKING:
-            import numpy.lib.format as fmt  # type: ignore[no-redef]
-        else:
-            fmt = None  # type: ignore[assignment]
+        fmt = None  # type: ignore[assignment]
 
     NUMPY_AVAILABLE = True
     NUMPY_VERSION = getattr(np, "__version__", "unknown")
@@ -72,12 +65,8 @@ except ImportError:
     NUMPY_FORMAT_AVAILABLE = False
     NUMPY_VERSION = "not available"
     NUMPY_MAJOR_VERSION = 0
-    if TYPE_CHECKING:
-        import numpy as np  # type: ignore[no-redef]
-        import numpy.lib.format as fmt  # type: ignore[no-redef]
-    else:
-        np = None  # type: ignore[assignment]
-        fmt = None  # type: ignore[assignment]
+    np = None  # type: ignore[assignment]
+    fmt = None  # type: ignore[assignment]
 
 
 def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
