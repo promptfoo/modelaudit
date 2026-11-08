@@ -1023,7 +1023,9 @@ jobs:
 
       - name: Build standalone package
         run: |
-          uv build --out-dir /tmp/modelaudit-picklescan-dist
+          # Earlier uv runs build this package and cache its pinned build backend.
+          uv build --out-dir /tmp/modelaudit-picklescan-dist ||
+            uv build --offline --out-dir /tmp/modelaudit-picklescan-dist
 
       - name: Validate standalone package metadata
         run: |

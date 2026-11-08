@@ -176,6 +176,12 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     evidence = _step_by_name(steps, "Preserve Windows standalone test evidence")
     assert evidence["if"] == "always() && runner.os == 'Windows'"
     assert evidence["uses"].startswith("actions/upload-artifact@")
+    build = _step_by_name(steps, "Build standalone package")
+    output_dir = "/tmp/modelaudit-picklescan-dist"
+    primary, retry = build["run"].split("||")
+    assert shlex.split(primary, comments=True) == ["uv", "build", "--out-dir", output_dir]
+    assert shlex.split(retry) == ["uv", "build", "--offline", "--out-dir", output_dir]
+    assert not build.get("continue-on-error")
     smoke = _step_by_name(steps, "Smoke test standalone package wheel install")["run"]
     assert 'uv pip install --python "$SMOKE_PYTHON"' in smoke
     assert "/Scripts/python.exe" in smoke
