@@ -2893,6 +2893,9 @@ class _PickleStructuralArgumentInconclusive(ValueError):
 
 def _canonicalize_cpython_numeric_line(opcode_byte: int, line: bytes) -> bytes | None:
     """Return a pickletools-readable line matching CPython's numeric parser."""
+    # A truncated memo index can still be ruled out by its first byte.
+    if opcode_byte in (ord("p"), ord("g")) and line and line[0] not in b"0123456789+- \t\r\v\f":
+        return _INVALID_PICKLE_NUMERIC_LINE
     if opcode_byte not in b"IFLpg" or not line.endswith(b"\n"):
         return None
 
@@ -3103,6 +3106,11 @@ def _gen_pickle_probe_ops(stream: _PickleProbeStream) -> Iterator[tuple[Any, Any
                 if not global_name:
                     raise ValueError(f"empty global name in {opcode.name} argument")
                 argument = ("global_argument", module_name, global_name)
+            elif opcode.name in {"PUT", "GET"} and opcode.arg is not None:
+                line = stream.readline()
+                if line == _INVALID_PICKLE_NUMERIC_LINE:
+                    raise ValueError(f"at position {position}, opcode {opcode.name} has an invalid memo index")
+                argument = opcode.arg.reader(BytesIO(line))
             elif opcode.name in {"SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
                 length_size = {"SHORT_BINBYTES": 1, "BINBYTES": 4, "BINBYTES8": 8, "BYTEARRAY8": 8}[opcode.name]
                 length_bytes = stream.read(length_size)
@@ -5059,15 +5067,38 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
     return _validated_safetensors_routing_header(path, magic8, file_size) is not None
 
 
-def has_safetensors_routing_candidate(path: str) -> bool:
-    """Return whether a local file has bounded plausible SafeTensors framing."""
+def safetensors_length_has_pickle_extension(magic8: bytes) -> bool:
+    """Recognize a reachable registry lookup followed by an invalid opcode in the length field."""
+    stream = BytesIO(magic8)
+    try:
+        for opcode, code, _ in pickletools.genops(stream):
+            if opcode.name in {"NEWTRUE", "NEWFALSE"}:
+                continue
+            return (
+                opcode.name in {"EXT1", "EXT2", "EXT4"}
+                and isinstance(code, int)
+                and code > 0
+                and stream.read(1) == b"\x00"
+            )
+    except (ValueError, OverflowError):
+        # A malformed pickle prefix cannot reach an extension lookup.
+        return False
+    return False
+
+
+def safetensors_routing_prefix(path: str) -> bytes | None:
+    """Return the length prefix for bounded plausible SafeTensors framing."""
     file_path = Path(path)
     try:
         file_size = file_path.stat().st_size
         magic8 = read_magic_bytes(path, 8)
     except OSError:
-        return False
-    return _is_safetensors_routing_candidate(file_path, magic8, file_size)
+        return None
+    return magic8 if _is_safetensors_routing_candidate(file_path, magic8, file_size) else None
+
+
+def has_safetensors_routing_candidate(path: str) -> bool:
+    return safetensors_routing_prefix(path) is not None
 
 
 def _apply_pickle_stack_effect(
@@ -5638,6 +5669,10 @@ def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_siz
         return "safetensors"
 
     header_len, header = validated_header
+    if header is not None and safetensors_length_has_pickle_extension(magic8):
+        # The extension lookup remains independently actionable. Archive dispatch
+        # composes the pickle scanner with the primary SafeTensors scanner.
+        return "safetensors"
     try:
         if header is None:
             with path.open("rb") as handle:

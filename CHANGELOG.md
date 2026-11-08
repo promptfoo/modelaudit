@@ -94,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound ONNX repeated-state reentry work while preserving local-function, shape, and lineage coverage.
 - Preserve caller-bound ONNX Loop conditions over body initializer defaults and reuse local-function analysis across unused attribute values.
 - Preserve early TAR findings after sparse-file probing and enforce SafeTensors JSON nesting limits consistently across Python versions.
+- Recognize SafeTensors files whose header length resembles a pickle. Preserve warnings for reachable pickle extension lookups.
 - Keep complete streamed pickle analysis available for oversized remote source URLs across Python versions, preserving SBOM findings and source associations.
 - Validate retired interleaved GGUF row groups within each matrix, so incomplete groups cannot pass by combining rows across higher dimensions.
 - Send metadata YAML fallback warnings to stderr so they do not contaminate JSON output.
