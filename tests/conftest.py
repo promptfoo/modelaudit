@@ -135,6 +135,7 @@ def pytest_runtest_setup(item):
 
         # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
         allowed_test_files = [
+            "test_triage.py",  # Optional API triage preserves scanner evidence and exits
             "test_python_compatibility.py",
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
@@ -304,6 +305,13 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture(autouse=True)
+def disable_live_triage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ordinary tests must never use a developer's API credentials."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MODELAUDIT_TRIAGE_MODEL", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def reset_rule_config_between_tests() -> Iterator[None]:
     """Keep CLI rule suppressions from leaking between tests."""
     from modelaudit.config import reset_config
@@ -391,54 +399,23 @@ def pytest_configure(config):
     """Configure pytest with custom markers."""
     global _xdist_worker_status_file, _xdist_workerid
 
-    # Test category markers
-    config.addinivalue_line(
-        "markers",
+    for marker in (
+        # Test category markers
         "slow: mark test as slow (deselect with '-m \"not slow\"')",
-    )
-    config.addinivalue_line("markers", "integration: mark test as integration test")
-    config.addinivalue_line(
-        "markers",
+        "integration: mark test as integration test",
         "performance: mark test as performance benchmark",
-    )
-
-    # Framework-specific markers (tests auto-skip if framework unavailable)
-    config.addinivalue_line(
-        "markers",
+        # Framework-specific markers (tests auto-skip if framework unavailable)
         "tensorflow: mark test as requiring TensorFlow",
-    )
-    config.addinivalue_line(
-        "markers",
         "pytorch: mark test as requiring PyTorch",
-    )
-    config.addinivalue_line(
-        "markers",
         "onnx: mark test as requiring ONNX",
-    )
-    config.addinivalue_line(
-        "markers",
         "h5py: mark test as requiring h5py",
-    )
-    config.addinivalue_line(
-        "markers",
         "msgpack: mark test as requiring msgpack",
-    )
-    config.addinivalue_line(
-        "markers",
         "xgboost: mark test as requiring XGBoost",
-    )
-    config.addinivalue_line(
-        "markers",
         "safetensors: mark test as requiring safetensors",
-    )
-    config.addinivalue_line(
-        "markers",
         "joblib: mark test as requiring joblib",
-    )
-    config.addinivalue_line(
-        "markers",
         "dill: mark test as requiring dill",
-    )
+    ):
+        config.addinivalue_line("markers", marker)
 
     workerinput = getattr(config, "workerinput", None)
     if not workerinput:

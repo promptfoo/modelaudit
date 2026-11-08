@@ -26,21 +26,24 @@ use crate::nested_surface::{
     nested_rule_code_for_encoding, raw_nested_payload_finding, NestedPayloadFinding,
     NestedSurfaceOutcome,
 };
-use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
+use crate::opcode::{
+    parse_opcode, ArgValue, ParseError, ParsedOpcode, STACK_GLOBAL_STRING_OPCODES,
+};
 use crate::options::{deadline_from_timeout, ScanOptions};
 use crate::policy::{
     callable_severity, global_import_is_allowlisted, global_import_requires_review, global_severity,
 };
 use crate::post_budget::post_budget_global_matches;
 use crate::report::{
-    detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
-    Finding, FindingDedupeKey, Notice, NoticeDedupeKey, ScanError,
+    detail_dict_to_py, detail_string, detail_usize, notice_to_detail_value,
+    scan_error_to_detail_value, text_field, DetailValue, Finding, FindingDedupeKey, Notice,
+    NoticeDedupeKey, ScanError,
 };
 use crate::stack::{
     collapse_tuple_values, is_known_pytorch_storage_global, operand_preview,
-    pytorch_storage_descriptor_ref, pytorch_storage_key, resolve_global_operand,
-    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
-    stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule, StackValue,
+    pytorch_storage_persistent_id, resolve_global_operand, stack_value_from_integer_arg,
+    stack_value_from_text_arg, stack_value_preview, stack_value_string, FutureCallbacks, GlobalRef,
+    RegexScannerRule, StackValue,
 };
 use crate::strings::{
     is_repeated_single_byte, is_suspicious_magic_method, suspicious_string_matches,
@@ -86,7 +89,9 @@ enum StrFormatRootItemLookup {
 }
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
-const MAX_TRACKED_DICT_ENTRIES: usize = 1024;
+// A large state dict can reference over 1,200 tensors. Aggregate tracked bytes
+// and opcode limits still apply independently of the per-dictionary cap.
+const MAX_TRACKED_DICT_ENTRIES: usize = 2048;
 const MAX_TRACKED_DICT_UNKNOWN_KEY_VALUES: usize = 16;
 const MAX_TRACKED_FUTURE_CALLBACKS: usize = 1024;
 const MAX_TRACKED_MEMO_VALUES: usize = 65_536;
@@ -99,15 +104,6 @@ const MAX_TRACKED_VALUE_DEPTH: usize = 64;
 const MAX_MAPPING_TRAVERSAL_NODES: usize = 2048;
 const MAX_TRACKED_STR_JOIN_RESULT_BYTES: usize = 4096;
 
-const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
-    "BINSTRING",
-    "BINUNICODE",
-    "BINUNICODE8",
-    "SHORT_BINSTRING",
-    "SHORT_BINUNICODE",
-    "STRING",
-    "UNICODE",
-];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
 // Receiver-state proof is deliberately limited to passive construction prefixes.
@@ -457,6 +453,12 @@ impl ScanStatus {
     fn is_complete(self) -> bool {
         self == Self::Complete
     }
+
+    fn mark_inconclusive(&mut self) {
+        if self.is_complete() {
+            *self = Self::Inconclusive;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -669,6 +671,24 @@ struct CallableInvocation {
     args: Vec<StackValue>,
 }
 
+impl CallableInvocation {
+    fn requested_latin1_encoding(&self, payload: &[u8]) -> Option<String> {
+        if self.op_name != "REDUCE" || self.positional_arg_count != Some(2) {
+            return None;
+        }
+        let [StackValue::TextSpan {
+            memo_read: false, ..
+        }, encoding @ StackValue::TextSpan {
+            memo_read: false, ..
+        }] = self.args.as_slice()
+        else {
+            return None;
+        };
+        direct_literal_text(encoding, payload, 7)
+            .filter(|name| matches!(name.as_str(), "latin1" | "latin-1"))
+    }
+}
+
 struct StaticGetattrReconstruction {
     target: GlobalRef,
     attribute_name: String,
@@ -697,6 +717,8 @@ enum MappingLookup<'a> {
     BudgetExceeded,
 }
 
+type OpcodeCounts = HashMap<&'static str, usize>;
+
 pub(crate) struct ScanState<'a> {
     source: String,
     payload: &'a [u8],
@@ -719,9 +741,9 @@ pub(crate) struct ScanState<'a> {
     template_execution_may_be_unmodeled: bool,
     non_allowlisted_global_imports: Vec<PendingGlobalImportFinding>,
     opcode_count: usize,
-    opcode_counts: HashMap<&'static str, usize>,
-    nested_opcode_counts: HashMap<&'static str, usize>,
-    follow_on_opcode_counts: HashMap<&'static str, usize>,
+    opcode_counts: OpcodeCounts,
+    nested_opcode_counts: OpcodeCounts,
+    follow_on_opcode_counts: OpcodeCounts,
     global_count: usize,
     bytes_scanned: usize,
     first_pickle_end_pos: Option<usize>,
@@ -863,56 +885,54 @@ impl<'a> ScanState<'a> {
                     }
                 };
 
-                if let Err(limit_error) = self.check_limits(&parsed) {
+                if parsed.has_invalid_persistent_id() {
+                    self.handle_parse_error(
+                        ParseError::new("protocol 0 persistent ID must be ASCII"),
+                        index,
+                    );
+                    // Recovery excludes the starting byte. The newline ends the invalid operand.
+                    self.scan_follow_on_pickle_streams(parsed.next - 1);
+                    self.finish_analysis();
+                    return;
+                }
+
+                if let Err(limit_error) = self.check_limits() {
                     self.status = ScanStatus::Inconclusive;
-                    match limit_error {
-                        LimitError::OpcodeBudgetExceeded => {
-                            self.add_notice(Notice {
-                                message: format!(
-                                    "Opcode analysis stopped after reaching max_opcodes={}",
-                                    self.options.max_opcodes
-                                ),
-                                severity: "info",
-                                location: Some(self.source.clone()),
-                                code: Some("opcode_budget"),
-                                details: vec![
-                                    (
-                                        "opcode_count".to_string(),
-                                        DetailValue::UInt(self.opcode_count as u64),
-                                    ),
-                                    (
-                                        "max_opcodes".to_string(),
-                                        DetailValue::UInt(self.options.max_opcodes as u64),
-                                    ),
-                                    ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
-                                ],
-                            });
-                            self.scan_post_budget_tail(parsed.pos);
-                        }
-                        LimitError::Timeout => {
-                            self.add_notice(Notice {
-                                message: format!(
-                                    "Opcode analysis timed out after {:.3} seconds",
-                                    self.options.timeout_s
-                                ),
-                                severity: "info",
-                                location: Some(self.source.clone()),
-                                code: Some("timeout"),
-                                details: vec![
-                                    (
-                                        "opcode_count".to_string(),
-                                        DetailValue::UInt(self.opcode_count as u64),
-                                    ),
-                                    (
-                                        "timeout_s".to_string(),
-                                        DetailValue::Float(self.options.timeout_s),
-                                    ),
-                                    ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
-                                ],
-                            });
-                            self.scan_post_budget_tail(parsed.pos);
-                        }
-                    }
+                    let (code, message, limit_key, limit_value) = match limit_error {
+                        LimitError::OpcodeBudgetExceeded => (
+                            "opcode_budget",
+                            format!(
+                                "Opcode analysis stopped after reaching max_opcodes={}",
+                                self.options.max_opcodes
+                            ),
+                            "max_opcodes",
+                            DetailValue::UInt(self.options.max_opcodes as u64),
+                        ),
+                        LimitError::Timeout => (
+                            "timeout",
+                            format!(
+                                "Opcode analysis timed out after {:.3} seconds",
+                                self.options.timeout_s
+                            ),
+                            "timeout_s",
+                            DetailValue::Float(self.options.timeout_s),
+                        ),
+                    };
+                    self.add_notice(Notice {
+                        message,
+                        severity: "info",
+                        location: Some(self.source.clone()),
+                        code: Some(code),
+                        details: vec![
+                            (
+                                "opcode_count".to_string(),
+                                DetailValue::UInt(self.opcode_count as u64),
+                            ),
+                            (limit_key.to_string(), limit_value),
+                            ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+                        ],
+                    });
+                    self.scan_post_budget_tail(parsed.pos);
                     self.finish_analysis();
                     return;
                 }
@@ -974,7 +994,7 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn check_limits(&self, _opcode: &ParsedOpcode) -> Result<(), LimitError> {
+    fn check_limits(&self) -> Result<(), LimitError> {
         if self.opcode_count >= self.options.max_opcodes {
             return Err(LimitError::OpcodeBudgetExceeded);
         }
@@ -994,23 +1014,21 @@ impl<'a> ScanState<'a> {
         value: StackValue,
         cost: usize,
         reason: &'static str,
-    ) -> bool {
+    ) {
         if self.stack.len() >= MAX_TRACKED_STACK_VALUES {
             self.record_tracked_state_budget_exhausted("stack_entries", self.stack.len() + 1);
             self.clear_stack_values();
             self.stack.push(StackValue::Other);
             self.tracked_stack_value_bytes.push(0);
-            return false;
+            return;
         }
-        if self.can_reserve_tracked_stack_bytes(cost, reason) {
+        if self.can_reserve_tracked_bytes(cost, reason) {
             self.stack.push(value);
             self.tracked_stack_value_bytes.push(cost);
             self.tracked_stack_bytes += cost;
-            true
         } else {
             self.stack.push(StackValue::Other);
             self.tracked_stack_value_bytes.push(0);
-            false
         }
     }
 
@@ -1049,79 +1067,65 @@ impl<'a> ScanState<'a> {
         self.tracked_state_bytes = 0;
     }
 
-    fn can_reserve_tracked_stack_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
-        if cost == 0 {
-            return true;
+    fn within_tracked_state_budget(&mut self, total: usize, reason: &'static str) -> bool {
+        if total > MAX_TRACKED_STATE_BYTES {
+            self.record_tracked_state_budget_exhausted(reason, total);
+            return false;
         }
-        match self
-            .tracked_state_bytes
-            .checked_add(self.tracked_stack_bytes)
-            .and_then(|total| total.checked_add(cost))
-        {
-            Some(total) if total <= MAX_TRACKED_STATE_BYTES => true,
-            Some(total) => {
-                self.record_tracked_state_budget_exhausted(reason, total);
-                false
-            }
-            None => {
-                self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-                false
-            }
-        }
+        true
+    }
+
+    fn can_reserve_tracked_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
+        cost == 0
+            || self.within_tracked_state_budget(
+                self.tracked_state_bytes
+                    .saturating_add(self.tracked_stack_bytes)
+                    .saturating_add(cost),
+                reason,
+            )
     }
 
     fn reserve_tracked_state_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
-        if cost == 0 {
-            return true;
+        if !self.can_reserve_tracked_bytes(cost, reason) {
+            return false;
         }
-        match self
-            .tracked_state_bytes
-            .checked_add(self.tracked_stack_bytes)
-            .and_then(|total| total.checked_add(cost))
-        {
-            Some(total) if total <= MAX_TRACKED_STATE_BYTES => {
-                self.tracked_state_bytes += cost;
-                true
-            }
-            Some(total) => {
-                self.record_tracked_state_budget_exhausted(reason, total);
-                false
-            }
-            None => {
-                self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-                false
-            }
-        }
+        self.tracked_state_bytes += cost;
+        true
     }
 
-    fn replace_memo_value(&mut self, index: i64, value: StackValue, reason: &'static str) -> bool {
+    fn projected_memo_state_bytes(
+        &mut self,
+        index: i64,
+        value: &StackValue,
+        retained_stack_bytes: usize,
+        reason: &'static str,
+    ) -> Option<usize> {
         if !self.can_insert_tracked_memo_value(index) {
-            return false;
+            return None;
         }
         let old_cost = self
             .memo
             .get(&index)
             .map(Self::stack_value_state_cost)
             .unwrap_or_default();
-        let new_cost = Self::stack_value_state_cost(&value);
-        let retained_state_bytes = self.tracked_state_bytes.saturating_sub(old_cost);
-        let Some(projected_state_bytes) = retained_state_bytes.checked_add(new_cost) else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-            return false;
-        };
-        let Some(projected_total_bytes) =
-            projected_state_bytes.checked_add(self.tracked_stack_bytes)
-        else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-            return false;
-        };
-        if projected_total_bytes > MAX_TRACKED_STATE_BYTES {
-            self.record_tracked_state_budget_exhausted(reason, projected_total_bytes);
-            return false;
+        let projected_state_bytes = self
+            .tracked_state_bytes
+            .saturating_sub(old_cost)
+            .saturating_add(Self::stack_value_state_cost(value));
+        self.within_tracked_state_budget(
+            projected_state_bytes.saturating_add(retained_stack_bytes),
+            reason,
+        )
+        .then_some(projected_state_bytes)
+    }
+
+    fn replace_memo_value(&mut self, index: i64, value: StackValue, reason: &'static str) {
+        if let Some(projected_state_bytes) =
+            self.projected_memo_state_bytes(index, &value, self.tracked_stack_bytes, reason)
+        {
+            self.tracked_state_bytes = projected_state_bytes;
+            self.memo.insert(index, value);
         }
-        self.tracked_state_bytes = projected_state_bytes;
-        self.memo.insert(index, value);
-        true
     }
 
     fn store_top_stack_value_in_memo(
@@ -1130,36 +1134,17 @@ impl<'a> ScanState<'a> {
         value: StackValue,
         reason: &'static str,
     ) -> bool {
-        if !self.can_insert_tracked_memo_value(index) {
-            return false;
-        }
-        let old_cost = self
-            .memo
-            .get(&index)
-            .map(Self::stack_value_state_cost)
-            .unwrap_or_default();
         let top_stack_cost = self
             .tracked_stack_value_bytes
             .last()
             .copied()
             .unwrap_or_default();
-        let new_cost = Self::stack_value_state_cost(&value);
-        let retained_state_bytes = self.tracked_state_bytes.saturating_sub(old_cost);
         let retained_stack_bytes = self.tracked_stack_bytes.saturating_sub(top_stack_cost);
-        let Some(projected_state_bytes) = retained_state_bytes.checked_add(new_cost) else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-            return false;
-        };
-        let Some(projected_total_bytes) = projected_state_bytes.checked_add(retained_stack_bytes)
+        let Some(projected_state_bytes) =
+            self.projected_memo_state_bytes(index, &value, retained_stack_bytes, reason)
         else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
             return false;
         };
-        if projected_total_bytes > MAX_TRACKED_STATE_BYTES {
-            self.record_tracked_state_budget_exhausted(reason, projected_total_bytes);
-            return false;
-        }
-
         let stack_value = Self::memo_value_for_stack(index, &value, false);
         self.tracked_state_bytes = projected_state_bytes;
         self.replace_top_stack_value_with_tracked_cost(stack_value, 0, "memo_stack_reference");
@@ -1280,13 +1265,29 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_tracked_state_budget_exhausted(&mut self, reason: &'static str, observed: usize) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         if self.tracked_state_budget_exhausted {
             return;
         }
         self.tracked_state_budget_exhausted = true;
+        let (observed_field, limit_field, limit) = match reason {
+            "tracked_dict_entries" => (
+                "tracked_dict_entries",
+                "max_tracked_dict_entries",
+                MAX_TRACKED_DICT_ENTRIES,
+            ),
+            "stack_entries" => (
+                "stack_entries",
+                "max_stack_entries",
+                MAX_TRACKED_STACK_VALUES,
+            ),
+            "memo_entries" => ("memo_entries", "max_memo_entries", MAX_TRACKED_MEMO_VALUES),
+            _ => (
+                "tracked_state_bytes",
+                "max_tracked_state_bytes",
+                MAX_TRACKED_STATE_BYTES,
+            ),
+        };
         self.add_notice(Notice {
             message: "Pickle state simulation exceeded tracked-state resource bounds".to_string(),
             severity: "info",
@@ -1298,13 +1299,10 @@ impl<'a> ScanState<'a> {
                     DetailValue::String(reason.to_string()),
                 ),
                 (
-                    "tracked_state_bytes".to_string(),
+                    observed_field.to_string(),
                     DetailValue::UInt(observed as u64),
                 ),
-                (
-                    "max_tracked_state_bytes".to_string(),
-                    DetailValue::UInt(MAX_TRACKED_STATE_BYTES as u64),
-                ),
+                (limit_field.to_string(), DetailValue::UInt(limit as u64)),
                 ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
             ],
         });
@@ -1694,7 +1692,8 @@ impl<'a> ScanState<'a> {
             }
             "DICT" => {
                 let values = self.pop_to_mark();
-                let tracked_dict = self.tracked_dict_from_values(&values);
+                let pairs = values.chunks_exact(2).map(|pair| (&pair[0], &pair[1]));
+                let tracked_dict = self.tracked_dict_from_pairs(pairs);
                 self.push_stack_value(tracked_dict);
             }
             "LIST" | "SET" | "FROZENSET" => {
@@ -1711,7 +1710,7 @@ impl<'a> ScanState<'a> {
             "APPENDS" | "SETITEMS" | "ADDITEMS" => {
                 let values = self.pop_to_mark();
                 if opcode.name == "SETITEMS" {
-                    self.apply_setitems(&values);
+                    self.apply_setitems(values);
                 }
             }
             "PUT" | "BINPUT" | "LONG_BINPUT" => {
@@ -1749,14 +1748,7 @@ impl<'a> ScanState<'a> {
             }
             "GLOBAL" => {
                 let (module, name) = opcode.arg.global_parts();
-                let reference = GlobalRef {
-                    module,
-                    name,
-                    position,
-                    malformed: false,
-                    memo_index: None,
-                    memo_read: false,
-                };
+                let reference = GlobalRef::new(module, name, position);
                 self.push_stack_value(StackValue::Global(reference.clone()));
                 self.record_global_ref(&reference, opcode.name);
             }
@@ -1769,14 +1761,7 @@ impl<'a> ScanState<'a> {
             }
             "EXT1" | "EXT2" | "EXT4" => {
                 let extension_code = opcode.arg.as_i64().unwrap_or_default();
-                let reference = GlobalRef {
-                    module: "copyreg.extension".to_string(),
-                    name: format!("code_{}", extension_code),
-                    position,
-                    malformed: true,
-                    memo_index: None,
-                    memo_read: false,
-                };
+                let reference = GlobalRef::extension(extension_code, position);
                 self.push_stack_value(StackValue::Global(reference.clone()));
                 self.add_finding(Finding {
                     message: format!(
@@ -2028,8 +2013,8 @@ impl<'a> ScanState<'a> {
         let requires_external_buffer_context = self.next_buffer_count > 0;
         let analysis_incomplete =
             requires_external_buffer_context || self.readonly_buffer_invalid_stack_count > 0;
-        if analysis_incomplete && self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
+        if analysis_incomplete {
+            self.status.mark_inconclusive();
         }
         let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
@@ -2081,12 +2066,9 @@ impl<'a> ScanState<'a> {
     }
 
     fn pop_value_operand_preserving_mark(&mut self) -> Option<StackValue> {
-        match self.pop_stack_value() {
-            Some(StackValue::Mark) => {
-                self.push_stack_value(StackValue::Mark);
-                None
-            }
-            value => value,
+        match self.stack.last() {
+            Some(StackValue::Mark) => None,
+            _ => self.pop_stack_value(),
         }
     }
 
@@ -2159,49 +2141,43 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn apply_setitems(&mut self, values: &[StackValue]) {
-        for pair in values.chunks_exact(2) {
-            let key = pair
-                .first()
-                .and_then(|value| stack_value_string(value, self.payload));
-            if let Some(value) = pair.get(1) {
-                if let Some(key) = key {
-                    self.record_top_tracked_dict_entry(key.as_ref(), value.clone());
-                } else {
-                    self.record_top_tracked_dict_unknown_key_value(value.clone());
-                }
+    fn apply_setitems(&mut self, values: Vec<StackValue>) {
+        let mut values = values.into_iter();
+        while let (Some(key), Some(value)) = (values.next(), values.next()) {
+            if let Some(key) = stack_value_string(&key, self.payload) {
+                self.record_top_tracked_dict_entry(&key, value);
+            } else {
+                self.record_top_tracked_dict_unknown_key_value(value);
             }
         }
     }
 
-    fn tracked_dict_from_values(&mut self, values: &[StackValue]) -> StackValue {
+    fn tracked_dict_from_pairs<'b>(
+        &mut self,
+        pairs: impl Iterator<Item = (&'b StackValue, &'b StackValue)>,
+    ) -> StackValue {
         let mut entries = Vec::new();
         let mut unknown_key_values = Vec::new();
         let mut unknown_key_values_overflowed = false;
         let mut entry_budget_exhausted = false;
-        for pair in values.chunks_exact(2) {
-            let key = pair
-                .first()
-                .and_then(|value| stack_value_string(value, self.payload));
-            if let Some(value) = pair.get(1) {
+        for (key, value) in pairs {
+            if let Some(key) = stack_value_string(key, self.payload) {
                 let security_relevant = Self::tracked_dict_value_is_security_relevant(value);
-                if let Some(key) = key {
-                    if security_relevant {
-                        if !Self::insert_tracked_dict_entry(&mut entries, key, value.clone()) {
-                            unknown_key_values_overflowed = true;
-                            entry_budget_exhausted = true;
-                        }
-                    } else if !Self::insert_tracked_dict_entry(&mut entries, key, StackValue::Other)
-                    {
-                        unknown_key_values_overflowed = true;
-                    }
+                let stored = if security_relevant {
+                    value.clone()
                 } else {
-                    Self::insert_tracked_dict_unknown_key_value(
-                        &mut unknown_key_values,
-                        &mut unknown_key_values_overflowed,
-                        value.clone(),
-                    );
+                    StackValue::Other
+                };
+                if !Self::insert_tracked_dict_entry(&mut entries, key, stored) {
+                    unknown_key_values_overflowed = true;
+                    entry_budget_exhausted |= security_relevant;
                 }
+            } else {
+                Self::insert_tracked_dict_unknown_key_value(
+                    &mut unknown_key_values,
+                    &mut unknown_key_values_overflowed,
+                    value.clone(),
+                );
             }
         }
         if entry_budget_exhausted {
@@ -2466,14 +2442,7 @@ impl<'a> ScanState<'a> {
             "INST" => {
                 let values = self.pop_to_mark();
                 let (module, name) = opcode.arg.global_parts();
-                let reference = GlobalRef {
-                    module,
-                    name,
-                    position,
-                    malformed: false,
-                    memo_index: None,
-                    memo_read: false,
-                };
+                let reference = GlobalRef::new(module, name, position);
                 self.record_global_ref(&reference, opcode.name);
                 self.push_stack_value(StackValue::Constructed {
                     reference: reference.clone(),
@@ -2645,25 +2614,18 @@ impl<'a> ScanState<'a> {
             entries,
             unknown_key_values,
             unknown_key_values_overflowed,
-            memo_index,
-        } = value?
+            ..
+        } = self.resolve_tracked_dict_alias(value?)
         else {
             return None;
         };
-        if !self
-            .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-            .is_empty()
-            || self.current_tracked_dict_unknown_key_values_overflowed(
-                *unknown_key_values_overflowed,
-                *memo_index,
-            )
-        {
+        if !unknown_key_values.is_empty() || *unknown_key_values_overflowed {
             return None;
         }
 
         let mut names = Vec::new();
         let mut total_bytes = 0usize;
-        for (name, _) in self.current_tracked_dict_entries(entries, *memo_index) {
+        for (name, _) in entries {
             total_bytes = total_bytes.checked_add(name.len())?;
             if names.len() >= MAX_CALLABLE_KEYWORD_ARGUMENTS
                 || total_bytes > MAX_CALLABLE_KEYWORD_ARGUMENT_BYTES
@@ -2842,8 +2804,8 @@ impl<'a> ScanState<'a> {
             entries,
             unknown_key_values,
             unknown_key_values_overflowed,
-            memo_index,
-        } = namespace
+            ..
+        } = self.resolve_tracked_dict_alias(namespace)
         else {
             return vec![DynamicTypeCallableAttribute {
                 attribute_name: None,
@@ -2853,7 +2815,7 @@ impl<'a> ScanState<'a> {
         };
 
         let mut attributes = Vec::new();
-        for (key, value) in self.current_tracked_dict_entries(entries, *memo_index) {
+        for (key, value) in entries {
             let key = key.to_ascii_lowercase();
             if !is_suspicious_magic_method(&key) {
                 continue;
@@ -2866,7 +2828,7 @@ impl<'a> ScanState<'a> {
                 });
             }
         }
-        for value in self.current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index) {
+        for value in unknown_key_values {
             if let Some(callable) = Self::callable_reference_from_value(Some(value)) {
                 attributes.push(DynamicTypeCallableAttribute {
                     attribute_name: None,
@@ -2875,10 +2837,7 @@ impl<'a> ScanState<'a> {
                 });
             }
         }
-        if self.current_tracked_dict_unknown_key_values_overflowed(
-            *unknown_key_values_overflowed,
-            *memo_index,
-        ) {
+        if *unknown_key_values_overflowed {
             attributes.push(DynamicTypeCallableAttribute {
                 attribute_name: None,
                 callable: None,
@@ -2899,28 +2858,20 @@ impl<'a> ScanState<'a> {
         let Some(arguments) = arguments else {
             return;
         };
-        match kind {
-            TrackedDictMutationKind::SetItem => {
-                let [target, key, value] = arguments else {
-                    return;
-                };
+        match (kind, arguments) {
+            (TrackedDictMutationKind::SetItem, [target, key, value]) => {
                 self.record_tracked_dict_mutation(target, key, value);
             }
-            TrackedDictMutationKind::SetDefault => {
-                let [target, key] = arguments else {
-                    if let [target, key, value] = arguments {
-                        self.record_tracked_dict_setdefault_mutation(target, key, Some(value));
-                    }
-                    return;
-                };
+            (TrackedDictMutationKind::SetDefault, [target, key]) => {
                 self.record_tracked_dict_setdefault_mutation(target, key, None);
             }
-            TrackedDictMutationKind::Update => {
-                let [target, source] = arguments else {
-                    return;
-                };
+            (TrackedDictMutationKind::SetDefault, [target, key, value]) => {
+                self.record_tracked_dict_setdefault_mutation(target, key, Some(value));
+            }
+            (TrackedDictMutationKind::Update, [target, source]) => {
                 self.record_tracked_dict_update_mutation(target, source);
             }
+            _ => {}
         }
     }
 
@@ -3032,48 +2983,11 @@ impl<'a> ScanState<'a> {
         key: &StackValue,
         value: &StackValue,
     ) {
-        let StackValue::TrackedDict { memo_index, .. } = target else {
-            return;
-        };
-        let Some(memo_index) = *memo_index else {
-            return;
-        };
-        let key = stack_value_string(key, self.payload);
-        if key.is_some() && !Self::tracked_dict_value_is_security_relevant(value) {
-            if let Some(key) = key.as_deref() {
-                self.record_top_tracked_dict_shadow_entry(key, Some(memo_index));
-            }
-            return;
-        }
-        let Some(mut tracked_dict) = self.memo.get(&memo_index).cloned() else {
-            return;
-        };
-        let mut entry_budget_exhausted = false;
-        if let StackValue::TrackedDict {
-            entries,
-            unknown_key_values,
-            unknown_key_values_overflowed,
-            ..
-        } = &mut tracked_dict
-        {
-            if let Some(key) = key {
-                if !Self::insert_tracked_dict_entry(entries, key, value.clone()) {
-                    *unknown_key_values_overflowed = true;
-                    entry_budget_exhausted = true;
-                }
-            } else {
-                Self::insert_tracked_dict_unknown_key_value(
-                    unknown_key_values,
-                    unknown_key_values_overflowed,
-                    value.clone(),
-                );
-            }
-        }
-        self.replace_memo_value(memo_index, tracked_dict, "tracked_dict_entry");
-        if entry_budget_exhausted {
-            self.record_tracked_state_budget_exhausted(
-                "tracked_dict_entries",
-                MAX_TRACKED_DICT_ENTRIES + 1,
+        if let Some(index) = Self::tracked_dict_memo_index(target) {
+            self.write_tracked_dict_entry(
+                index,
+                stack_value_string(key, self.payload),
+                Some(value),
             );
         }
     }
@@ -3084,34 +2998,30 @@ impl<'a> ScanState<'a> {
         key: &StackValue,
         value: Option<&StackValue>,
     ) {
-        let StackValue::TrackedDict {
-            memo_index,
-            entries,
-            ..
-        } = target
-        else {
-            return;
-        };
-        let Some(memo_index) = *memo_index else {
+        let Some(index) = Self::tracked_dict_memo_index(target) else {
             return;
         };
         let key = stack_value_string(key, self.payload);
         if key.as_ref().is_some_and(|key| {
-            self.current_tracked_dict_entries(entries, Some(memo_index))
-                .iter()
-                .any(|(candidate, _)| candidate == key)
+            matches!(self.resolve_tracked_dict_alias(target), StackValue::TrackedDict { entries, .. }
+                if entries.iter().any(|(candidate, _)| candidate == key))
         }) {
             return;
         }
-        let value = value.cloned().unwrap_or(StackValue::Primitive {
-            type_name: "NoneType",
-            repr: "None".to_string(),
-        });
-        if key.is_some() && !Self::tracked_dict_value_is_security_relevant(&value) {
-            if let Some(key) = key.as_deref() {
+        self.write_tracked_dict_entry(index, key, value);
+    }
+
+    fn write_tracked_dict_entry(
+        &mut self,
+        memo_index: i64,
+        key: Option<String>,
+        value: Option<&StackValue>,
+    ) {
+        if let Some(key) = key.as_deref() {
+            if !value.is_some_and(Self::tracked_dict_value_is_security_relevant) {
                 self.record_top_tracked_dict_shadow_entry(key, Some(memo_index));
+                return;
             }
-            return;
         }
         let Some(mut tracked_dict) = self.memo.get(&memo_index).cloned() else {
             return;
@@ -3124,6 +3034,10 @@ impl<'a> ScanState<'a> {
             ..
         } = &mut tracked_dict
         {
+            let value = value.cloned().unwrap_or_else(|| StackValue::Primitive {
+                type_name: "NoneType",
+                repr: "None".to_string(),
+            });
             if let Some(key) = key {
                 if !Self::insert_tracked_dict_entry(entries, key, value) {
                     *unknown_key_values_overflowed = true;
@@ -3147,10 +3061,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_tracked_dict_update_mutation(&mut self, target: &StackValue, source: &StackValue) {
-        let StackValue::TrackedDict { memo_index, .. } = target else {
-            return;
-        };
-        let Some(memo_index) = *memo_index else {
+        let Some(memo_index) = Self::tracked_dict_memo_index(target) else {
             return;
         };
         let Some((source_entries, source_unknown_key_values, source_overflowed)) =
@@ -3201,20 +3112,15 @@ impl<'a> ScanState<'a> {
             entries,
             unknown_key_values,
             unknown_key_values_overflowed,
-            memo_index,
-        } = value
+            ..
+        } = self.resolve_tracked_dict_alias(value)
         else {
             return None;
         };
         Some((
-            self.current_tracked_dict_entries(entries, *memo_index)
-                .to_vec(),
-            self.current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-                .to_vec(),
-            self.current_tracked_dict_unknown_key_values_overflowed(
-                *unknown_key_values_overflowed,
-                *memo_index,
-            ),
+            entries.to_vec(),
+            unknown_key_values.to_vec(),
+            *unknown_key_values_overflowed,
         ))
     }
 
@@ -4253,33 +4159,25 @@ impl<'a> ScanState<'a> {
             return Some(MappingLookup::BudgetExceeded);
         }
         *visited_nodes += 1;
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::DefaultDict { default_factory } => {
                 Some(MappingLookup::Found(default_factory))
             }
             StackValue::TrackedDict {
                 entries,
-                memo_index,
                 unknown_key_values,
                 unknown_key_values_overflowed,
                 ..
             } => {
-                if memo_index.is_some_and(|index| !visited.insert(index)) {
+                if Self::tracked_dict_memo_index(mapping)
+                    .is_some_and(|index| !visited.insert(index))
+                {
                     return None;
                 }
-                let entries = self.current_tracked_dict_entries(entries, *memo_index);
-                let unknown_key_lookup_is_opaque = key.is_none()
-                    && !self
-                        .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-                        .is_empty();
+                let unknown_key_lookup_is_opaque = key.is_none() && !unknown_key_values.is_empty();
                 if key.is_some_and(|key| entries.iter().any(|(candidate, _)| candidate == key)) {
                     Some(MappingLookup::Shadowed)
-                } else if unknown_key_lookup_is_opaque
-                    || self.current_tracked_dict_unknown_key_values_overflowed(
-                        *unknown_key_values_overflowed,
-                        *memo_index,
-                    )
-                {
+                } else if unknown_key_lookup_is_opaque || *unknown_key_values_overflowed {
                     Some(MappingLookup::BudgetExceeded)
                 } else {
                     None
@@ -4331,22 +4229,21 @@ impl<'a> ScanState<'a> {
             return Some(MappingLookup::BudgetExceeded);
         }
         *visited_nodes += 1;
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::DefaultDict { default_factory } => {
                 Some(MappingLookup::Found(default_factory))
             }
             StackValue::TrackedDict {
                 entries,
-                memo_index,
                 unknown_key_values,
                 unknown_key_values_overflowed,
                 ..
             } => {
-                let visit_key = memo_index.map(|index| (index, path.len()));
+                let visit_key =
+                    Self::tracked_dict_memo_index(mapping).map(|index| (index, path.len()));
                 if visit_key.is_some_and(|key| !visited.insert(key)) {
                     return Some(MappingLookup::BudgetExceeded);
                 }
-                let entries = self.current_tracked_dict_entries(entries, *memo_index);
                 let result = if let Some((key, remaining_path)) = path.split_first() {
                     if let Some(key) = key.as_deref() {
                         if let Some((_, value)) =
@@ -4363,29 +4260,15 @@ impl<'a> ScanState<'a> {
                                 )
                                 .or(Some(MappingLookup::Shadowed))
                             }
-                        } else if self.current_tracked_dict_unknown_key_values_overflowed(
-                            *unknown_key_values_overflowed,
-                            *memo_index,
-                        ) {
+                        } else if *unknown_key_values_overflowed {
                             Some(MappingLookup::BudgetExceeded)
                         } else {
                             None
                         }
+                    } else if unknown_key_values.is_empty() && !*unknown_key_values_overflowed {
+                        None
                     } else {
-                        let unknown_key_values = self.current_tracked_dict_unknown_key_values(
-                            unknown_key_values,
-                            *memo_index,
-                        );
-                        if unknown_key_values.is_empty()
-                            && !self.current_tracked_dict_unknown_key_values_overflowed(
-                                *unknown_key_values_overflowed,
-                                *memo_index,
-                            )
-                        {
-                            None
-                        } else {
-                            Some(MappingLookup::BudgetExceeded)
-                        }
+                        Some(MappingLookup::BudgetExceeded)
                     }
                 } else {
                     Some(MappingLookup::BudgetExceeded)
@@ -4435,51 +4318,22 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn current_tracked_dict_entries<'b>(
-        &'b self,
-        entries: &'b [(String, StackValue)],
-        memo_index: Option<i64>,
-    ) -> &'b [(String, StackValue)] {
-        memo_index
-            .and_then(|index| self.memo.get(&index))
-            .and_then(|value| match value {
-                StackValue::TrackedDict { entries, .. } => Some(entries.as_slice()),
-                _ => None,
-            })
-            .unwrap_or(entries)
+    fn tracked_dict_memo_index(value: &StackValue) -> Option<i64> {
+        match value {
+            StackValue::TrackedDict { memo_index, .. } => *memo_index,
+            _ => None,
+        }
     }
 
-    fn current_tracked_dict_unknown_key_values<'b>(
-        &'b self,
-        unknown_key_values: &'b [StackValue],
-        memo_index: Option<i64>,
-    ) -> &'b [StackValue] {
-        memo_index
-            .and_then(|index| self.memo.get(&index))
-            .and_then(|value| match value {
-                StackValue::TrackedDict {
-                    unknown_key_values, ..
-                } => Some(unknown_key_values.as_slice()),
-                _ => None,
-            })
-            .unwrap_or(unknown_key_values)
+    fn memoized_tracked_dict(&self, value: &StackValue) -> Option<&StackValue> {
+        self.memo
+            .get(&Self::tracked_dict_memo_index(value)?)
+            .filter(|stored| matches!(stored, StackValue::TrackedDict { .. }))
     }
 
-    fn current_tracked_dict_unknown_key_values_overflowed(
-        &self,
-        unknown_key_values_overflowed: bool,
-        memo_index: Option<i64>,
-    ) -> bool {
-        memo_index
-            .and_then(|index| self.memo.get(&index))
-            .and_then(|value| match value {
-                StackValue::TrackedDict {
-                    unknown_key_values_overflowed,
-                    ..
-                } => Some(*unknown_key_values_overflowed),
-                _ => None,
-            })
-            .unwrap_or(unknown_key_values_overflowed)
+    // Traversals use the original alias's memo index as their visit key.
+    fn resolve_tracked_dict_alias<'b>(&'b self, value: &'b StackValue) -> &'b StackValue {
+        self.memoized_tracked_dict(value).unwrap_or(value)
     }
 
     fn formatter_vformat_invocations(
@@ -4564,7 +4418,7 @@ impl<'a> ScanState<'a> {
         let Some(mapping) = invocation.args.get(1) else {
             return true;
         };
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::Constructed { reference, defaultdict_without_factory: true } => {
                 !reference.malformed && reference.module == "collections" && reference.name == "defaultdict"
             }
@@ -4579,18 +4433,11 @@ impl<'a> ScanState<'a> {
                 entries,
                 unknown_key_values,
                 unknown_key_values_overflowed,
-                memo_index,
+                ..
             } => {
-                !self.current_tracked_dict_unknown_key_values_overflowed(
-                    *unknown_key_values_overflowed,
-                    *memo_index,
-                ) && self
-                    .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-                    .is_empty()
-                    && self
-                        .current_tracked_dict_entries(entries, *memo_index)
-                        .iter()
-                        .all(|(_, value)| {
+                !*unknown_key_values_overflowed
+                    && unknown_key_values.is_empty()
+                    && entries.iter().all(|(_, value)| {
                             matches!(
                                 value,
                                 StackValue::Text { .. }
@@ -5273,144 +5120,63 @@ impl<'a> ScanState<'a> {
     }
 
     fn with_memo_index(&self, value: StackValue, index: i64) -> StackValue {
-        match value {
-            StackValue::FutureCallbacks(mut callbacks) => {
-                callbacks.memo_index = Some(index);
-                StackValue::FutureCallbacks(callbacks)
+        let value = self.memoized_tracked_dict(&value).cloned().unwrap_or(value);
+        Self::set_memo_index(value, index)
+    }
+
+    fn set_memo_index(mut value: StackValue, index: i64) -> StackValue {
+        let memo_index = match &mut value {
+            StackValue::Global(reference) | StackValue::Constructed { reference, .. } => {
+                &mut reference.memo_index
             }
-            StackValue::Global(mut reference) => {
-                reference.memo_index = Some(index);
-                StackValue::Global(reference)
-            }
-            StackValue::Constructed {
-                mut reference,
-                defaultdict_without_factory,
-            } => {
-                reference.memo_index = Some(index);
-                StackValue::Constructed {
-                    reference,
-                    defaultdict_without_factory,
-                }
-            }
-            StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
-                type_name,
-                memo_index: Some(index),
-            },
-            StackValue::TrackedDict {
-                entries,
-                unknown_key_values,
-                unknown_key_values_overflowed,
-                memo_index,
-            } => {
-                let entries = self
-                    .current_tracked_dict_entries(&entries, memo_index)
-                    .to_vec();
-                let unknown_key_values = self
-                    .current_tracked_dict_unknown_key_values(&unknown_key_values, memo_index)
-                    .to_vec();
-                let unknown_key_values_overflowed = self
-                    .current_tracked_dict_unknown_key_values_overflowed(
-                        unknown_key_values_overflowed,
-                        memo_index,
-                    );
-                StackValue::TrackedDict {
-                    entries,
-                    unknown_key_values,
-                    unknown_key_values_overflowed,
-                    memo_index: Some(index),
-                }
-            }
-            value => value,
-        }
+            StackValue::FutureCallbacks(callbacks) => &mut callbacks.memo_index,
+            StackValue::DynamicType { memo_index, .. }
+            | StackValue::TrackedDict { memo_index, .. } => memo_index,
+            _ => return value,
+        };
+        *memo_index = Some(index);
+        value
     }
 
     fn memo_value_for_stack(index: i64, value: &StackValue, memo_read: bool) -> StackValue {
-        match value {
-            StackValue::TrackedDict {
-                unknown_key_values_overflowed,
-                ..
-            } => StackValue::TrackedDict {
+        if let StackValue::TrackedDict {
+            unknown_key_values_overflowed,
+            ..
+        } = value
+        {
+            return StackValue::TrackedDict {
                 entries: Vec::new(),
                 unknown_key_values: Vec::new(),
                 unknown_key_values_overflowed: *unknown_key_values_overflowed,
                 memo_index: Some(index),
-            },
-            StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
-                type_name: type_name.clone(),
-                memo_index: Some(index),
-            },
-            StackValue::FutureCallbacks(callbacks) => {
-                let mut callbacks = callbacks.clone();
-                callbacks.memo_index = Some(index);
-                StackValue::FutureCallbacks(callbacks)
-            }
-            StackValue::Global(reference) => {
-                let mut reference = reference.clone();
-                reference.memo_index = Some(index);
-                reference.memo_read |= memo_read;
-                StackValue::Global(reference)
-            }
-            StackValue::Constructed {
-                reference,
-                defaultdict_without_factory,
-            } => {
-                let mut reference = reference.clone();
-                reference.memo_index = Some(index);
-                reference.memo_read |= memo_read;
-                StackValue::Constructed {
-                    reference,
-                    defaultdict_without_factory: *defaultdict_without_factory,
-                }
-            }
-            value => Self::memo_read_stack_value(value, memo_read),
+            };
         }
+        Self::set_memo_index(Self::memo_read_stack_value(value, memo_read), index)
     }
 
     fn memo_read_stack_value(value: &StackValue, memo_read: bool) -> StackValue {
         if !memo_read {
             return value.clone();
         }
-        match value {
-            StackValue::Global(reference) => {
-                let mut reference = reference.clone();
-                reference.memo_read = true;
-                StackValue::Global(reference)
-            }
-            StackValue::Constructed {
-                reference,
-                defaultdict_without_factory,
-            } => {
-                let mut reference = reference.clone();
-                reference.memo_read = true;
-                StackValue::Constructed {
-                    reference,
-                    defaultdict_without_factory: *defaultdict_without_factory,
-                }
-            }
-            StackValue::Text {
-                value,
-                memo_read: existing_memo_read,
-            } => StackValue::Text {
-                value: value.clone(),
-                memo_read: *existing_memo_read || memo_read,
-            },
-            StackValue::TextSpan {
-                start,
-                end,
-                memo_read: existing_memo_read,
-            } => StackValue::TextSpan {
-                start: *start,
-                end: *end,
-                memo_read: *existing_memo_read || memo_read,
-            },
-            StackValue::Tuple(values) => StackValue::Tuple(
+        if let StackValue::Tuple(values) = value {
+            return StackValue::Tuple(
                 values
                     .iter()
-                    .map(|item| Self::memo_read_stack_value(item, memo_read))
+                    .map(|item| Self::memo_read_stack_value(item, true))
                     .collect(),
-            ),
-            value => value.clone(),
+            );
         }
+        let mut value = value.clone();
+        match &mut value {
+            StackValue::Global(reference) | StackValue::Constructed { reference, .. } => {
+                reference.memo_read = true
+            }
+            StackValue::Text { memo_read, .. } | StackValue::TextSpan { memo_read, .. } => {
+                *memo_read = true
+            }
+            _ => {}
+        }
+        value
     }
 
     fn memoized_future_add_callback(&mut self, memo_index: i64, callback: GlobalRef) {
@@ -6051,65 +5817,29 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn tracked_dict_from_pair_iterable(&mut self, iterable: &StackValue) -> Option<StackValue> {
-        let mut iterable = iterable;
-        let items = loop {
+    fn tracked_dict_from_pair_iterable(&mut self, mut iterable: &StackValue) -> Option<StackValue> {
+        fn tuple_pair(item: &StackValue) -> Option<(&StackValue, &StackValue)> {
+            let StackValue::Tuple(items) = item else {
+                return None;
+            };
+            let [key, value] = items.as_slice() else {
+                return None;
+            };
+            Some((key, value))
+        }
+
+        loop {
             let StackValue::Tuple(items) = iterable else {
                 return None;
             };
-            if items.is_empty()
-                || items
-                    .iter()
-                    .all(|item| matches!(item, StackValue::Tuple(pair) if pair.len() == 2))
-            {
-                break items;
+            if items.iter().all(|item| tuple_pair(item).is_some()) {
+                return Some(self.tracked_dict_from_pairs(items.iter().filter_map(tuple_pair)));
             }
             let [wrapped] = items.as_slice() else {
                 return None;
             };
             iterable = wrapped;
-        };
-        let mut entries = Vec::new();
-        let mut unknown_key_values = Vec::new();
-        let mut unknown_key_values_overflowed = false;
-        let mut entry_budget_exhausted = false;
-        for item in items {
-            let StackValue::Tuple(pair) = item else {
-                return None;
-            };
-            let [key, value] = pair.as_slice() else {
-                return None;
-            };
-            let security_relevant = Self::tracked_dict_value_is_security_relevant(value);
-            if let Some(key) = stack_value_string(key, self.payload) {
-                if security_relevant {
-                    if !Self::insert_tracked_dict_entry(&mut entries, key, value.clone()) {
-                        unknown_key_values_overflowed = true;
-                        entry_budget_exhausted = true;
-                    }
-                } else if !Self::insert_tracked_dict_entry(&mut entries, key, StackValue::Other) {
-                    unknown_key_values_overflowed = true;
-                }
-            } else {
-                Self::insert_tracked_dict_unknown_key_value(
-                    &mut unknown_key_values,
-                    &mut unknown_key_values_overflowed,
-                    value.clone(),
-                );
-            }
         }
-        if entry_budget_exhausted {
-            self.record_tracked_state_budget_exhausted(
-                "tracked_dict_entries",
-                entries.len().saturating_add(1),
-            );
-        }
-        Some(StackValue::TrackedDict {
-            entries,
-            unknown_key_values,
-            unknown_key_values_overflowed,
-            memo_index: None,
-        })
     }
 
     fn mapping_wrapper_result(&self, values: &[StackValue]) -> Option<StackValue> {
@@ -6163,24 +5893,20 @@ impl<'a> ScanState<'a> {
             return true;
         }
         *visited_nodes += 1;
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::DefaultDict { .. } => true,
             StackValue::TrackedDict {
                 entries,
-                memo_index,
                 unknown_key_values_overflowed,
                 ..
             } => {
-                if memo_index.is_some_and(|index| !visited.insert(index)) {
+                if Self::tracked_dict_memo_index(mapping)
+                    .is_some_and(|index| !visited.insert(index))
+                {
                     return false;
                 }
-                self.current_tracked_dict_unknown_key_values_overflowed(
-                    *unknown_key_values_overflowed,
-                    *memo_index,
-                ) || self
-                    .current_tracked_dict_entries(entries, *memo_index)
-                    .iter()
-                    .any(|(_, value)| {
+                *unknown_key_values_overflowed
+                    || entries.iter().any(|(_, value)| {
                         self.mapping_may_contain_default_factory_inner(
                             value,
                             visited,
@@ -6245,52 +5971,34 @@ impl<'a> ScanState<'a> {
         name_value: Option<StackValue>,
         position: usize,
     ) -> GlobalRef {
-        let memo_read = stack_value_memo_read(module_value.as_ref())
-            || stack_value_memo_read(name_value.as_ref());
-        let module = resolve_global_operand(module_value.as_ref(), self.payload);
-        let name = resolve_global_operand(name_value.as_ref(), self.payload);
-
-        match (module, name) {
-            (Some(module), Some(name)) => GlobalRef {
-                module,
-                name,
-                position,
-                malformed: false,
-                memo_index: None,
-                memo_read,
-            },
-            (module, name) => {
-                let malformed = GlobalRef {
-                    module: module.unwrap_or_else(|| "__unknown__".to_string()),
-                    name: name.unwrap_or_else(|| "__unknown__".to_string()),
-                    position,
-                    malformed: true,
-                    memo_index: None,
-                    memo_read,
-                };
-                self.add_finding(Finding {
-                    message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"
-                        .to_string(),
-                    severity: "critical",
-                    location: Some(format!("{} (pos {})", self.source, position)),
-                    rule_code: Some("MALFORMED_STACK_GLOBAL"),
-                    details: vec![
-                        (
-                            "module_operand".to_string(),
-                            DetailValue::String(operand_preview(module_value.as_ref())),
-                        ),
-                        (
-                            "name_operand".to_string(),
-                            DetailValue::String(operand_preview(name_value.as_ref())),
-                        ),
-                    ],
-                    why: Some(
-                        "Malformed STACK_GLOBAL operands can be used to bypass scanners that assume string-only operands.",
+        let module = module_value.as_ref();
+        let name = name_value.as_ref();
+        let memo_read = stack_value_memo_read(module) || stack_value_memo_read(name);
+        let mut reference = GlobalRef::from_stack_operands(module, name, self.payload, position);
+        reference.memo_read = memo_read;
+        if reference.malformed {
+            self.add_finding(Finding {
+                message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"
+                    .to_string(),
+                severity: "critical",
+                location: Some(format!("{} (pos {})", self.source, position)),
+                rule_code: Some("MALFORMED_STACK_GLOBAL"),
+                details: vec![
+                    (
+                        "module_operand".to_string(),
+                        DetailValue::String(operand_preview(module)),
                     ),
-                });
-                malformed
-            }
+                    (
+                        "name_operand".to_string(),
+                        DetailValue::String(operand_preview(name)),
+                    ),
+                ],
+                why: Some(
+                    "Malformed STACK_GLOBAL operands can be used to bypass scanners that assume string-only operands.",
+                ),
+            });
         }
+        reference
     }
 
     fn scan_string_literal(
@@ -6490,7 +6198,7 @@ impl<'a> ScanState<'a> {
                     skip_offsets_before = offset.saturating_add(payload_len);
                     continue;
                 }
-                Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+                Err(error) if error.scan_incomplete_prefix => {
                     self.surface_nested_pickle_findings(probe, "raw", position + offset);
                     return;
                 }
@@ -6545,12 +6253,12 @@ impl<'a> ScanState<'a> {
                     .len()
                     .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
                 let probe = &value[offset..end];
-                let payload_extent =
-                    pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes);
-                let complete_payload = matches!(&payload_extent, Ok(Some(_)));
-                let operand_limit_exceeded = payload_extent
-                    .as_ref()
-                    .is_err_and(|error| error.is_structured_protocol0_line_operand_limit());
+                let candidate_is_pickle =
+                    pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes)
+                        .map_or_else(
+                            |error| error.scan_incomplete_prefix,
+                            |length| length.is_some(),
+                        );
                 let malformed_payload = has_execution_opcode(probe)
                     && (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
@@ -6559,11 +6267,7 @@ impl<'a> ScanState<'a> {
                         &value[offset..],
                         self.options.max_nested_pickle_bytes,
                     );
-                if !complete_payload
-                    && !operand_limit_exceeded
-                    && !malformed_payload
-                    && !truncated_payload
-                {
+                if !candidate_is_pickle && !malformed_payload && !truncated_payload {
                     continue;
                 }
                 if offsets.len() >= MAX_NESTED_PAYLOAD_PROBES {
@@ -6760,8 +6464,6 @@ impl<'a> ScanState<'a> {
 
         let probe_windows =
             encoded_nested_literal_probe_windows_with_limit(value, max_window_chars);
-        let probe_limit_exceeded = probe_windows.limit_exceeded;
-        let probe_limit_exceeded_encoding = probe_windows.limit_exceeded_encoding;
         for candidate in probe_windows.windows {
             if found_candidate && candidate.synthetic_prefix_bytes == 0 && candidate.value == value
             {
@@ -6783,7 +6485,7 @@ impl<'a> ScanState<'a> {
             );
         }
 
-        if let Some(encoding) = probe_limit_exceeded_encoding {
+        if let Some(encoding) = probe_windows.limit_exceeded_encoding {
             self.record_nested_probe_limit_exceeded(encoding, string_char_len(value), position);
         }
 
@@ -6791,7 +6493,7 @@ impl<'a> ScanState<'a> {
             return (true, whole_literal_is_encoded_pickle);
         }
 
-        if probe_coverage_incomplete || probe_limit_exceeded {
+        if probe_coverage_incomplete || probe_windows.limit_exceeded_encoding.is_some() {
             return (false, false);
         }
 
@@ -6868,9 +6570,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_raw_nested_payload_truncated(&mut self, payload_size: usize, position: usize) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: "Nested pickle payload exceeds configured deep-scan byte limit".to_string(),
             severity: "info",
@@ -6900,9 +6600,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         let details = vec![
             (
                 "encoding".to_string(),
@@ -7004,9 +6702,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: "Encoded pickle payload exceeds configured deep-scan byte limit".to_string(),
             severity: "info",
@@ -7136,10 +6832,10 @@ impl<'a> ScanState<'a> {
             })
         };
         self.push_stack_value(StackValue::Other);
-        let storage_descriptor = persistent_id
+        let storage_id = persistent_id
             .as_ref()
-            .and_then(|value| pytorch_storage_descriptor_ref(value, self.payload).cloned());
-        if let Some(descriptor) = storage_descriptor.as_ref() {
+            .and_then(|value| pytorch_storage_persistent_id(value, self.payload));
+        if let Some(descriptor) = storage_id.as_ref().and_then(|id| id.descriptor) {
             self.mark_pytorch_storage_persistent_id_import_reference(descriptor);
         }
         if self.persistent_id_count > 1 {
@@ -7155,14 +6851,14 @@ impl<'a> ScanState<'a> {
                 "persistent_id_preview".to_string(),
                 DetailValue::String(stack_value_preview(value, 0)),
             ));
-            if let Some(storage_key) = pytorch_storage_key(value, self.payload) {
+            if let Some(storage_id) = storage_id {
                 details.push((
                     "pytorch_storage_persistent_id".to_string(),
                     DetailValue::Bool(true),
                 ));
                 details.push((
                     "pytorch_storage_key".to_string(),
-                    DetailValue::String(storage_key),
+                    DetailValue::String(storage_id.key.into_owned()),
                 ));
             }
         }
@@ -7271,9 +6967,7 @@ impl<'a> ScanState<'a> {
         if self.import_references_truncated {
             return;
         }
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.import_references_truncated = true;
         self.add_notice(Notice {
             message: "Import reference metadata exceeded the scanner reporting limit".to_string(),
@@ -7305,9 +6999,7 @@ impl<'a> ScanState<'a> {
         if self.non_allowlisted_global_imports_truncated {
             return;
         }
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.non_allowlisted_global_imports_truncated = true;
         self.add_notice(Notice {
             message: "Non-allowlisted global findings exceeded the scanner reporting limit"
@@ -7383,10 +7075,10 @@ impl<'a> ScanState<'a> {
         let modeled_template_call = template_receiver_state_unmodified == Some(true)
             && invocation.op_name == "REDUCE"
             && invocation.positional_arg_count == Some(invocation.args.len())
-            && !invocation
+            && invocation
                 .keyword_arg_names
                 .as_ref()
-                .is_some_and(|names| !names.is_empty())
+                .is_none_or(|names| names.is_empty())
             && match invocation.reference.name.as_str() {
                 "Template.substitute" | "Template.safe_substitute" => {
                     template_mapping_callbacks_complete == Some(true)
@@ -7511,6 +7203,25 @@ impl<'a> ScanState<'a> {
             if !details.iter().any(|(key, _)| key == "invoked") {
                 details.push(("invoked".to_string(), DetailValue::Bool(true)));
             }
+            if symbol == "_codecs.encode"
+                && detail_usize(details, "latin1_reduce_position").is_none()
+            {
+                if let Some(name) = invocation.requested_latin1_encoding(self.payload) {
+                    let extra_bytes =
+                        "requested_encoding".len() + name.len() + "latin1_reduce_position".len();
+                    if self.non_allowlisted_global_import_bytes + extra_bytes
+                        > MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES
+                    {
+                        break;
+                    }
+                    self.non_allowlisted_global_import_bytes += extra_bytes;
+                    details.push(("requested_encoding".to_string(), DetailValue::String(name)));
+                    details.push((
+                        "latin1_reduce_position".to_string(),
+                        DetailValue::UInt(invocation.opcode_position as u64),
+                    ));
+                }
+            }
             break;
         }
     }
@@ -7519,9 +7230,7 @@ impl<'a> ScanState<'a> {
         if self.callable_invocations_truncated {
             return;
         }
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.callable_invocations_truncated = true;
         self.add_notice(Notice {
             message: "Callable invocation metadata exceeded the scanner reporting limit"
@@ -7826,18 +7535,43 @@ impl<'a> ScanState<'a> {
 
         for (symbol, position, details) in std::mem::take(&mut self.non_allowlisted_global_imports)
         {
+            if let Some(call_position) = detail_usize(&details, "latin1_reduce_position") {
+                if !called_global_keys.contains(&(symbol.clone(), position)) {
+                    self.add_finding(Finding {
+                        message: format!("Non-allowlisted pickle invocation of {symbol}. One REDUCE at byte {call_position} requests Latin-1 encoding"),
+                        severity: "warning",
+                        location: Some(format!("{} (pos {})", self.source, position)),
+                        rule_code: Some("NON_ALLOWLISTED_GLOBAL"),
+                        details,
+                        why: Some("Older checkpoints use this call to reconstruct bytes. The consumer's Python codec registry determines which encoder runs and can invoke application-defined code. Review other uses of this global separately."),
+                    });
+                }
+                continue;
+            }
             if called_global_keys.contains(&(symbol.clone(), position)) {
                 continue;
             }
+            let invoked = details
+                .iter()
+                .any(|(key, value)| key == "invoked" && matches!(value, DetailValue::Bool(true)));
+            let (message, why) = if invoked {
+                (
+                    format!("Found non-allowlisted global used by a pickle invocation: {symbol}"),
+                    "Resolving the global can run module initialization code. Using it during object reconstruction can run additional code.",
+                )
+            } else {
+                (
+                    format!("Found non-allowlisted import-only global reference: {symbol}"),
+                    "Unpickling import-only GLOBAL opcodes imports the referenced module, so non-allowlisted custom modules can execute import-time initialization code.",
+                )
+            };
             self.add_finding(Finding {
-                message: format!("Found non-allowlisted import-only global reference: {symbol}"),
+                message,
                 severity: "warning",
                 location: Some(format!("{} (pos {})", self.source, position)),
                 rule_code: Some("NON_ALLOWLISTED_GLOBAL"),
                 details,
-                why: Some(
-                    "Unpickling import-only GLOBAL opcodes imports the referenced module, so non-allowlisted custom modules can execute import-time initialization code.",
-                ),
+                why: Some(why),
             });
         }
         if called_global_keys.is_empty() {
@@ -7941,9 +7675,7 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: format!(
                 "{} literal scan truncated at configured limit",
@@ -7983,9 +7715,7 @@ impl<'a> ScanState<'a> {
         limit_name: &'static str,
         limit: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: message.to_string(),
             severity: "info",
@@ -8013,9 +7743,7 @@ impl<'a> ScanState<'a> {
             self.source, encoding, position
         );
         if self.nested_depth >= self.options.max_nested_depth {
-            if self.status.is_complete() {
-                self.status = ScanStatus::Inconclusive;
-            }
+            self.status.mark_inconclusive();
             let details = vec![
                 (
                     "nested_encoding".to_string(),
@@ -8093,59 +7821,31 @@ impl<'a> ScanState<'a> {
         }
         let nested_incomplete = !nested_scan.status.is_complete();
         let nested_import_references = std::mem::take(&mut nested_scan.import_references);
-        let nested_root_opcode_counts = std::mem::take(&mut nested_scan.opcode_counts);
-        let nested_descendant_opcode_counts = std::mem::take(&mut nested_scan.nested_opcode_counts);
-        let nested_follow_on_opcode_counts =
-            std::mem::take(&mut nested_scan.follow_on_opcode_counts);
+        let nested_counts = nested_scan.take_opcode_counts();
         self.merge_follow_on_import_references(
             nested_import_references,
             nested_scan.import_references_truncated,
         );
-        Self::merge_opcode_counts(&mut self.nested_opcode_counts, nested_root_opcode_counts);
-        Self::merge_opcode_counts(
-            &mut self.nested_opcode_counts,
-            nested_descendant_opcode_counts,
-        );
-        Self::merge_opcode_counts(
-            &mut self.nested_opcode_counts,
-            nested_follow_on_opcode_counts,
-        );
+        Self::merge_opcode_counts(&mut self.nested_opcode_counts, nested_counts);
 
         for nested_finding in nested_scan.findings {
             if nested_finding.severity == "critical" {
                 outcome.has_critical_finding = true;
             }
-            let nested_details = nested_finding
-                .details
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
+            let import_details = ["import_reference", "module", "name", "opcode"].map(|key| {
+                detail_string(&nested_finding.details, key)
+                    .map(|value| (key.to_string(), DetailValue::String(value)))
+            });
             let mut details = vec![
-                (
-                    "nested_encoding".to_string(),
-                    DetailValue::String(encoding.to_string()),
-                ),
-                (
-                    "nested_source".to_string(),
-                    DetailValue::String(nested_source.clone()),
-                ),
-                (
-                    "nested_rule_code".to_string(),
-                    match nested_finding.rule_code {
-                        Some(rule_code) => DetailValue::String(rule_code.to_string()),
-                        None => DetailValue::None,
-                    },
-                ),
+                text_field("nested_encoding", Some(encoding)),
+                text_field("nested_source", Some(nested_source.as_str())),
+                text_field("nested_rule_code", nested_finding.rule_code),
                 (
                     "nested_details".to_string(),
-                    DetailValue::Dict(nested_details),
+                    DetailValue::Dict(nested_finding.details),
                 ),
             ];
-            for key in ["import_reference", "module", "name", "opcode"] {
-                if let Some(value) = detail_string(&nested_finding.details, key) {
-                    details.push((key.to_string(), DetailValue::String(value)));
-                }
-            }
+            details.extend(import_details.into_iter().flatten());
             self.add_finding(Finding {
                 message: format!("Nested pickle finding: {}", nested_finding.message),
                 severity: nested_finding.severity,
@@ -8157,9 +7857,7 @@ impl<'a> ScanState<'a> {
         }
 
         if nested_incomplete {
-            if self.status.is_complete() {
-                self.status = ScanStatus::Inconclusive;
-            }
+            self.status.mark_inconclusive();
             self.add_finding(Finding {
                 message: "Nested pickle analysis did not complete".to_string(),
                 severity: "critical",
@@ -8182,12 +7880,12 @@ impl<'a> ScanState<'a> {
             });
             let nested_errors = nested_scan
                 .errors
-                .iter()
+                .into_iter()
                 .map(scan_error_to_detail_value)
                 .collect::<Vec<_>>();
             let nested_notices = nested_scan
                 .notices
-                .iter()
+                .into_iter()
                 .map(notice_to_detail_value)
                 .collect::<Vec<_>>();
             self.add_notice(Notice {
@@ -8233,20 +7931,7 @@ impl<'a> ScanState<'a> {
             .bytes_scanned
             .max(tail_start.saturating_add(tail.len()));
 
-        let initial_stack = self
-            .stack
-            .iter()
-            .map(|value| post_budget_owned_stack_value(value, self.payload))
-            .collect::<Vec<_>>();
-        let memo_snapshot = self
-            .memo
-            .iter()
-            .map(|(index, value)| (*index, post_budget_owned_stack_value(value, self.payload)))
-            .collect::<HashMap<_, _>>();
-        for global_match in
-            post_budget_global_matches(tail, &initial_stack, memo_snapshot.len(), |memo_index| {
-                memo_snapshot.get(&memo_index).cloned()
-            })
+        for global_match in post_budget_global_matches(tail, self.payload, &self.stack, &self.memo)
         {
             let absolute_position = read_offset.saturating_add(global_match.pattern_start);
             let severity = if global_match.reduce_proximate {
@@ -8332,10 +8017,14 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_probe_len = candidate.len().min(self.options.max_nested_pickle_bytes);
-            let Ok(Some(candidate_len)) = pickle_payload_extent_result(
+            let candidate_len = match pickle_payload_extent_result(
                 &candidate[..candidate_probe_len],
                 self.options.max_nested_pickle_bytes,
-            ) else {
+            ) {
+                Ok(extent) => extent,
+                Err(error) => error.invalid_id_end,
+            };
+            let Some(candidate_len) = candidate_len else {
                 continue;
             };
             let candidate = &candidate[..candidate_len];
@@ -8363,11 +8052,7 @@ impl<'a> ScanState<'a> {
             skip_offsets_before =
                 skip_offsets_before.max(absolute_offset.saturating_add(candidate_len));
             let had_findings = !follow_on_scan.findings.is_empty();
-            let follow_on_root_opcode_counts = std::mem::take(&mut follow_on_scan.opcode_counts);
-            let follow_on_nested_opcode_counts =
-                std::mem::take(&mut follow_on_scan.nested_opcode_counts);
-            let recursive_follow_on_opcode_counts =
-                std::mem::take(&mut follow_on_scan.follow_on_opcode_counts);
+            let follow_on_counts = follow_on_scan.take_opcode_counts();
             for finding in follow_on_scan.findings {
                 self.add_finding(finding);
             }
@@ -8379,18 +8064,7 @@ impl<'a> ScanState<'a> {
                 follow_on_scan.callable_invocations,
                 follow_on_scan.callable_invocations_truncated,
             );
-            Self::merge_opcode_counts(
-                &mut self.follow_on_opcode_counts,
-                follow_on_root_opcode_counts,
-            );
-            Self::merge_opcode_counts(
-                &mut self.follow_on_opcode_counts,
-                follow_on_nested_opcode_counts,
-            );
-            Self::merge_opcode_counts(
-                &mut self.follow_on_opcode_counts,
-                recursive_follow_on_opcode_counts,
-            );
+            Self::merge_opcode_counts(&mut self.follow_on_opcode_counts, follow_on_counts);
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),
@@ -8414,11 +8088,16 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn merge_opcode_counts(
-        target: &mut HashMap<&'static str, usize>,
-        counts: HashMap<&'static str, usize>,
-    ) {
-        for (opcode, count) in counts {
+    fn take_opcode_counts(&mut self) -> [OpcodeCounts; 3] {
+        [
+            std::mem::take(&mut self.opcode_counts),
+            std::mem::take(&mut self.nested_opcode_counts),
+            std::mem::take(&mut self.follow_on_opcode_counts),
+        ]
+    }
+
+    fn merge_opcode_counts(target: &mut OpcodeCounts, counts: [OpcodeCounts; 3]) {
+        for (opcode, count) in counts.into_iter().flatten() {
             *target.entry(opcode).or_insert(0) += count;
         }
     }
@@ -8576,23 +8255,9 @@ impl<'a> ScanState<'a> {
         report.set_item("status", self.status.as_str())?;
         report.set_item("verdict", self.verdict.as_str())?;
 
-        let findings = PyList::empty(py);
-        for finding in &self.findings {
-            findings.append(finding.to_py_object(py)?)?;
-        }
-        report.set_item("findings", findings)?;
-
-        let notices = PyList::empty(py);
-        for notice in &self.notices {
-            notices.append(notice.to_py_object(py)?)?;
-        }
-        report.set_item("notices", notices)?;
-
-        let errors = PyList::empty(py);
-        for error in &self.errors {
-            errors.append(error.to_py_object(py)?)?;
-        }
-        report.set_item("errors", errors)?;
+        report.set_item("findings", &self.findings)?;
+        report.set_item("notices", &self.notices)?;
+        report.set_item("errors", &self.errors)?;
 
         let raw_scan_complete = self.status.is_complete()
             && self
@@ -8618,7 +8283,7 @@ impl<'a> ScanState<'a> {
         metadata.set_item("globals_count", self.global_count)?;
         let import_references = PyList::empty(py);
         for reference in &self.import_references {
-            import_references.append(DetailValue::Dict(reference.clone()).to_py_object(py)?)?;
+            import_references.append(detail_dict_to_py(py, reference)?)?;
         }
         metadata.set_item("import_references", import_references)?;
         metadata.set_item(
@@ -8626,15 +8291,13 @@ impl<'a> ScanState<'a> {
             self.import_references_truncated,
         )?;
         let callable_invocations = PyList::empty(py);
+        // Serialize only the final report-wide proof, never an earlier true
+        // snapshot that a later opaque or recovered segment invalidated.
+        let template_execution_complete = self.template_execution_is_complete();
         for invocation in &self.callable_invocations {
-            // Serialize only the final report-wide proof, never an earlier true
-            // snapshot that a later opaque or recovered segment invalidated.
-            let mut details = invocation.clone();
-            details.push((
-                "template_execution_complete".to_string(),
-                DetailValue::Bool(self.template_execution_is_complete()),
-            ));
-            callable_invocations.append(DetailValue::Dict(details).to_py_object(py)?)?;
+            let details = detail_dict_to_py(py, invocation)?;
+            details.set_item("template_execution_complete", template_execution_complete)?;
+            callable_invocations.append(details)?;
         }
         metadata.set_item("callable_invocations", callable_invocations)?;
         metadata.set_item(
@@ -8749,30 +8412,6 @@ fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bo
     saw_import_reference
 }
 
-fn post_budget_owned_stack_value(value: &StackValue, payload: &[u8]) -> StackValue {
-    match value {
-        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
-            StackValue::Text {
-                value: String::from_utf8_lossy(&payload[*start..*end]).to_string(),
-                memo_read: false,
-            }
-        }
-        StackValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
-            StackValue::Bytes {
-                start: *start,
-                end: *end,
-            }
-        }
-        StackValue::Tuple(values) => StackValue::Tuple(
-            values
-                .iter()
-                .map(|item| post_budget_owned_stack_value(item, payload))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
 fn advance_chars_from(value: &str, start: usize, count: usize) -> usize {
     if count == 0 || start >= value.len() {
         return start;
@@ -8853,15 +8492,7 @@ mod tests {
     #[test]
     fn constructor_provenance_survives_memo_without_blessing_unknown_aliases() {
         let options = default_test_options();
-        let scan = ScanState::new(
-            "constructor-proof".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let scan = new_test_scan("constructor-proof", b"", &options);
         let known = factoryless_defaultdict();
         let StackValue::Constructed { reference, .. } = &known else {
             panic!("constructed fixture")
@@ -9116,15 +8747,7 @@ mod tests {
     #[test]
     fn template_execution_invalidates_before_invocation_dedupe_and_caps() {
         let options = default_test_options();
-        let mut scan = ScanState::new(
-            "template-dedupe".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("template-dedupe", b"", &options);
         let invocation = CallableInvocation {
             reference: GlobalRef {
                 module: "builtins".to_string(),
@@ -9167,15 +8790,7 @@ mod tests {
     #[test]
     fn template_mapping_proof_preserves_unproven_metadata_and_factory_callbacks() {
         let options = default_test_options();
-        let mut scan = ScanState::new(
-            "template-proof".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("template-proof", b"", &options);
         let reference = GlobalRef {
             module: "string".to_string(),
             name: "Template.safe_substitute".to_string(),
@@ -9282,20 +8897,28 @@ mod tests {
         }
     }
 
-    fn run_test_scan<'a>(
-        source: &str,
+    fn new_test_scan<'a>(
+        source: impl Into<String>,
         payload: &'a [u8],
         options: &'a ScanOptions,
     ) -> ScanState<'a> {
-        let mut scan = ScanState::new(
-            source.to_string(),
+        ScanState::new(
+            source.into(),
             payload,
             options,
             Some(payload.len()),
             0,
             0,
             None,
-        );
+        )
+    }
+
+    fn run_test_scan<'a>(
+        source: impl Into<String>,
+        payload: &'a [u8],
+        options: &'a ScanOptions,
+    ) -> ScanState<'a> {
+        let mut scan = new_test_scan(source, payload, options);
         scan.run();
         scan
     }
@@ -9498,15 +9121,7 @@ mod tests {
     fn discarded_stack_local_tracked_dict_entries_release_state_budget() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "discarded-stack-local-dicts.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("discarded-stack-local-dicts.pkl", payload, &options);
         let large_module = "A".repeat(64 * 1024);
 
         for _ in 0..(MAX_TRACKED_STATE_BYTES / large_module.len() + 2) {
@@ -9609,15 +9224,7 @@ mod tests {
     fn repeated_memoized_dict_entry_overwrites_release_previous_state_budget() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "memoized-dict-overwrite-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("memoized-dict-overwrite-budget.pkl", payload, &options);
         scan.push_stack_value(StackValue::TrackedDict {
             entries: Vec::new(),
             unknown_key_values: Vec::new(),
@@ -9670,15 +9277,7 @@ mod tests {
     fn mapping_lookup_budget_exhaustion_fails_closed() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "mapping-traversal-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("mapping-traversal-budget.pkl", payload, &options);
         let mut mappings = (0..MAX_MAPPING_TRAVERSAL_NODES)
             .map(|index| StackValue::TrackedDict {
                 entries: Vec::new(),
@@ -9720,15 +9319,7 @@ mod tests {
     fn dropped_inert_shadow_key_makes_missing_lookup_opaque() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "dropped-inert-shadow.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("dropped-inert-shadow.pkl", payload, &options);
         let entries = (0..MAX_TRACKED_DICT_ENTRIES)
             .map(|index| (format!("key{index:04}"), StackValue::Other))
             .collect();
@@ -9784,15 +9375,7 @@ mod tests {
     fn unknown_key_entry_makes_unresolved_lookup_opaque() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "unknown-key-entry.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("unknown-key-entry.pkl", payload, &options);
         let mapping = StackValue::MappingWrapper {
             reference: GlobalRef {
                 module: "collections".to_string(),
@@ -9833,14 +9416,10 @@ mod tests {
     fn finite_self_referential_mapping_path_does_not_fall_through_chainmap() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "finite-self-referential-mapping-path.pkl".to_string(),
+        let mut scan = new_test_scan(
+            "finite-self-referential-mapping-path.pkl",
             payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
         scan.memo.insert(
             0,
@@ -9914,15 +9493,7 @@ mod tests {
     fn deeply_nested_mapping_wrappers_fail_closed() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "nested-mapping-wrapper-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("nested-mapping-wrapper-budget.pkl", payload, &options);
         let mut value = StackValue::Other;
         for _ in 0..=MAX_TRACKED_VALUE_DEPTH {
             value = StackValue::MappingWrapper {
@@ -9949,15 +9520,7 @@ mod tests {
     fn zero_cost_stack_values_are_entry_bounded() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "stack-entry-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("stack-entry-budget.pkl", payload, &options);
 
         for _ in 0..=MAX_TRACKED_STACK_VALUES {
             scan.push_stack_value(StackValue::Other);
@@ -9972,15 +9535,7 @@ mod tests {
     fn zero_cost_memo_values_are_entry_bounded() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "memo-entry-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("memo-entry-budget.pkl", payload, &options);
         for index in 0..MAX_TRACKED_MEMO_VALUES {
             assert!(scan.can_insert_tracked_memo_value(index as i64));
             scan.memo.insert(index as i64, StackValue::Other);
@@ -9996,15 +9551,7 @@ mod tests {
     fn memoized_future_callbacks_are_entry_bounded() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "future-callback-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("future-callback-budget.pkl", payload, &options);
         scan.memo.insert(
             0,
             StackValue::FutureCallbacks(FutureCallbacks {
@@ -10062,24 +9609,9 @@ mod tests {
 
     #[test]
     fn str_join_result_counts_separator_bytes_before_appending() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"";
-        let scan = ScanState::new(
-            "str-join-bound.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let scan = new_test_scan("str-join-bound.pkl", payload, &options);
         let callable = StackValue::Global(GlobalRef {
             module: "builtins".to_string(),
             name: "str.join".to_string(),
@@ -10137,24 +9669,9 @@ mod tests {
 
     #[test]
     fn global_reference_dedupe_preserves_malformed_state() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "global-dedupe.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("global-dedupe.pkl", payload, &options);
         let malformed = GlobalRef {
             module: "os".to_string(),
             name: "system".to_string(),
@@ -10186,69 +9703,29 @@ mod tests {
 
     #[test]
     fn large_repeated_literals_skip_expensive_text_and_encoded_probes_only_when_complete() {
-        let mut options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let mut options = default_test_options();
         let payload = b".";
-        let scan = ScanState::new(
-            "large-repeated.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let scan = new_test_scan("large-repeated.pkl", payload, &options);
 
         assert!(scan.is_large_uninteresting_repeated_literal(&"A".repeat(1024 * 1024)));
         assert!(!scan.is_large_uninteresting_repeated_literal(&"A".repeat(1023)));
         assert!(!scan.is_large_uninteresting_repeated_literal("AAAos.system('id')AAA"));
 
         options.max_string_literal_scan_chars = 8;
-        let truncated_scan = ScanState::new(
-            "large-repeated-truncated.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let truncated_scan = new_test_scan("large-repeated-truncated.pkl", payload, &options);
         assert!(!truncated_scan.is_large_uninteresting_repeated_literal(&"A".repeat(1024)));
     }
 
     #[test]
     fn missing_memo_gets_push_opaque_operands() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (name, payload) in [
             ("GET", b"g0\n)R.".as_slice()),
             ("BINGET", b"h\x00)R.".as_slice()),
             ("LONG_BINGET", b"j\x00\x00\x00\x00)R.".as_slice()),
         ] {
-            let mut scan = ScanState::new(
-                format!("missing-memo-{name}.pkl"),
-                payload,
-                &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
-            );
-
-            scan.run();
+            let scan = run_test_scan(format!("missing-memo-{name}.pkl"), payload, &options);
 
             assert_eq!(scan.verdict.as_str(), "clean", "{name} should be opaque");
             assert!(scan.import_references.is_empty(), "{name} import refs");
@@ -10263,14 +9740,7 @@ mod tests {
 
     #[test]
     fn timeout_checks_are_amortized_by_opcode_interval() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
         let mut scan = ScanState::new(
             "timeout-amortized.pkl".to_string(),
@@ -10281,43 +9751,18 @@ mod tests {
             0,
             Instant::now().checked_sub(Duration::from_secs(1)),
         );
-        let opcode = ParsedOpcode {
-            name: "NONE",
-            arg: ArgValue::None,
-            pos: 0,
-            next: 1,
-        };
-
         scan.opcode_count = TIME_CHECK_INTERVAL_OPCODES - 1;
-        assert!(matches!(scan.check_limits(&opcode), Ok(())));
+        assert!(matches!(scan.check_limits(), Ok(())));
 
         scan.opcode_count = TIME_CHECK_INTERVAL_OPCODES;
-        assert!(matches!(
-            scan.check_limits(&opcode),
-            Err(LimitError::Timeout)
-        ));
+        assert!(matches!(scan.check_limits(), Err(LimitError::Timeout)));
     }
 
     #[test]
     fn global_finding_coalesce_uses_structured_positions_only() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "structured-position.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("structured-position.pkl", payload, &options);
         let call_finding = Finding {
             message: "call".to_string(),
             severity: "critical",
@@ -10396,14 +9841,7 @@ mod tests {
 
     #[test]
     fn stack_global_rejects_byte_operands_fail_closed() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (name, payload) in [
             (
@@ -10419,17 +9857,7 @@ mod tests {
                 b"\x80\x04\x8c\x02osC\x06system\x93.".as_slice(),
             ),
         ] {
-            let mut scan = ScanState::new(
-                format!("stack-global-{name}.pkl"),
-                payload,
-                &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
-            );
-
-            scan.run();
+            let scan = run_test_scan(format!("stack-global-{name}.pkl"), payload, &options);
 
             assert_eq!(scan.verdict.as_str(), "malicious", "{name}");
             assert!(
@@ -10449,24 +9877,9 @@ mod tests {
 
     #[test]
     fn notice_dedupe_state_can_be_rebuilt_after_notice_rewrites() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "notice-dedupe.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("notice-dedupe.pkl", payload, &options);
         let old_notice = Notice {
             message: "old notice".to_string(),
             severity: "info",
@@ -10496,26 +9909,9 @@ mod tests {
 
     #[test]
     fn inst_dispatch_flags_dangerous_global_calls() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"(ios\nsystem\n.";
-        let mut scan = ScanState::new(
-            "inst-dispatch.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("inst-dispatch.pkl", payload, &options);
 
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_CALL")
@@ -10527,26 +9923,9 @@ mod tests {
 
     #[test]
     fn obj_dispatch_uses_first_mark_value_as_callable() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"(cos\nsystem\nU\x04echoo.";
-        let mut scan = ScanState::new(
-            "obj-dispatch.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("obj-dispatch.pkl", payload, &options);
 
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_CALL")
@@ -10558,26 +9937,9 @@ mod tests {
 
     #[test]
     fn newobj_ex_dispatch_consumes_callable_args_and_kwargs() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04cos\nsystem\n)}\x92.";
-        let mut scan = ScanState::new(
-            "newobj-ex-dispatch.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("newobj-ex-dispatch.pkl", payload, &options);
 
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_CALL")
@@ -10589,26 +9951,9 @@ mod tests {
 
     #[test]
     fn newobj_ex_records_complete_bounded_keyword_argument_names() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04cprivate_payload\nGadget\n)}\x8c\x05token\x8c\x01xs\x92.";
-        let mut scan = ScanState::new(
-            "newobj-ex-keywords.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("newobj-ex-keywords.pkl", payload, &options);
 
         let invocation = scan
             .callable_invocations
@@ -10630,26 +9975,9 @@ mod tests {
 
     #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x97\x98\x93.";
-        let mut scan = ScanState::new(
-            "buffer-stack-global.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("buffer-stack-global.pkl", payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "malicious");
         let finding = scan
@@ -10673,26 +10001,9 @@ mod tests {
 
     #[test]
     fn protocol5_buffer_opcode_notices_are_collapsed() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x97\x97\x98\x97\x98.";
-        let mut scan = ScanState::new(
-            "many-buffer-opcodes.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("many-buffer-opcodes.pkl", payload, &options);
 
         let buffer_notices = scan
             .notices
@@ -10721,26 +10032,9 @@ mod tests {
 
     #[test]
     fn in_band_readonly_buffer_preserves_complete_coverage() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x96\x01\x00\x00\x00\x00\x00\x00\x00A\x98.";
-        let mut scan = ScanState::new(
-            "in-band-readonly-buffer.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("in-band-readonly-buffer.pkl", payload, &options);
 
         let notice = scan
             .notices
@@ -10768,26 +10062,9 @@ mod tests {
 
     #[test]
     fn non_buffer_readonly_operand_fails_closed() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05G\x00\x00\x00\x00\x00\x00\x00\x00\x98.";
-        let mut scan = ScanState::new(
-            "non-buffer-readonly.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("non-buffer-readonly.pkl", payload, &options);
 
         let notice = scan
             .notices
@@ -10808,26 +10085,9 @@ mod tests {
 
     #[test]
     fn readonly_buffer_empty_stack_does_not_fabricate_operand() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x98\x93.";
-        let mut scan = ScanState::new(
-            "readonly-empty-stack.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("readonly-empty-stack.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -10866,14 +10126,7 @@ mod tests {
 
     #[test]
     fn empty_collection_operands_report_precise_stack_preview_types() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (opcode, expected_preview) in
             [(b']', "list:[]"), (b'}', "dict:{}"), (b'\x8f', "set:set()")]
@@ -10884,17 +10137,11 @@ mod tests {
                 b"\x8c\x06system\x94\x93.".as_slice(),
             ]
             .concat();
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("empty-operand-{expected_preview}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             let finding = scan
                 .findings
@@ -10911,12 +10158,8 @@ mod tests {
     #[test]
     fn truncated_proto0_nested_payloads_are_not_silently_dropped() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
             max_nested_pickle_bytes: 4,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let inner = b"cos\nsystem\n.";
         let payload = [
@@ -10926,17 +10169,7 @@ mod tests {
             b".".as_slice(),
         ]
         .concat();
-        let mut scan = ScanState::new(
-            "truncated-proto0-nested.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("truncated-proto0-nested.pkl", &payload, &options);
 
         assert_eq!(scan.status.as_str(), "inconclusive");
         assert!(scan.findings.iter().any(|finding| {
@@ -10953,30 +10186,13 @@ mod tests {
 
     #[test]
     fn encoded_nested_probe_limit_fails_closed_after_decoys() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let literal = encoded_probe_limit_decoy_literal();
         let mut payload = b"\x80\x04X".to_vec();
         payload.extend_from_slice(&(literal.len() as u32).to_le_bytes());
         payload.extend_from_slice(literal.as_bytes());
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "encoded-nested-probe-limit.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("encoded-nested-probe-limit.pkl", &payload, &options);
 
         assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert_eq!(scan.verdict.as_str(), "malicious");
@@ -10997,23 +10213,8 @@ mod tests {
 
     #[test]
     fn callable_operand_underflow_does_not_clear_stack_state() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "operand-underflow.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("operand-underflow.pkl", b"", &options);
         scan.stack.push(StackValue::Text {
             value: "survivor".to_string(),
             memo_read: false,
@@ -11028,23 +10229,8 @@ mod tests {
 
     #[test]
     fn tuple_shortcuts_do_not_wrap_mark_sentinels() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "tuple-mark.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("tuple-mark.pkl", b"", &options);
         scan.stack.push(StackValue::Mark);
 
         scan.collapse_top_n(1);
@@ -11057,12 +10243,8 @@ mod tests {
     #[test]
     fn follow_on_streams_do_not_consume_nested_depth_budget() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
             max_nested_depth: 1,
+            ..default_test_options()
         };
         let payload = b"padding\x00\x80\x04cos\nsystem\n)R.";
         let mut scan = ScanState::new(
@@ -11089,23 +10271,8 @@ mod tests {
 
     #[test]
     fn import_reference_metadata_is_capped_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "import-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("import-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             scan.push_import_reference(vec![(
@@ -11127,23 +10294,8 @@ mod tests {
 
     #[test]
     fn non_allowlisted_global_findings_are_capped_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "non-allowlisted-global-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("non-allowlisted-global-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             scan.push_non_allowlisted_global_import((
@@ -11169,23 +10321,8 @@ mod tests {
 
     #[test]
     fn non_allowlisted_global_findings_are_byte_bounded_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "non-allowlisted-global-byte-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("non-allowlisted-global-byte-cap.pkl", b"", &options);
 
         scan.push_non_allowlisted_global_import((
             "x".repeat(MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES + 1),
@@ -11217,23 +10354,8 @@ mod tests {
 
     #[test]
     fn duplicate_import_reference_over_cap_does_not_mark_metadata_truncated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "duplicate-import-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("duplicate-import-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             scan.push_import_reference(vec![
@@ -11261,28 +10383,13 @@ mod tests {
 
     #[test]
     fn security_distinct_import_reference_overflow_marks_metadata_truncated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (module, name, overflow_opcode) in [
             ("cmath", "sin", "STACK_GLOBAL"),
             ("torch", "FloatStorage", "GLOBAL"),
         ] {
-            let mut scan = ScanState::new(
-                format!("{module}-{name}-import-cap.pkl"),
-                b"",
-                &options,
-                Some(0),
-                0,
-                0,
-                None,
-            );
+            let mut scan = new_test_scan(format!("{module}-{name}-import-cap.pkl"), b"", &options);
 
             for index in 0..MAX_IMPORT_REFERENCES {
                 scan.push_import_reference(vec![
@@ -11321,23 +10428,8 @@ mod tests {
 
     #[test]
     fn callable_invocation_metadata_is_capped_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "callable-invocation-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("callable-invocation-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             let invocation = ScanState::callable_invocation(
@@ -11369,23 +10461,8 @@ mod tests {
 
     #[test]
     fn follow_on_callable_invocation_truncation_is_propagated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "follow-on-truncated-invocations.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("follow-on-truncated-invocations.pkl", b"", &options);
 
         scan.merge_follow_on_callable_invocations(Vec::new(), true);
 
@@ -11398,23 +10475,8 @@ mod tests {
 
     #[test]
     fn repeated_callable_invocations_preserve_each_semantic_opcode() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "repeated-invocations.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("repeated-invocations.pkl", b"", &options);
         let first = ScanState::callable_invocation(
             GlobalRef {
                 module: "module".to_string(),
@@ -11465,23 +10527,8 @@ mod tests {
 
     #[test]
     fn follow_on_import_reference_truncation_is_propagated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "follow-on-truncated-imports.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("follow-on-truncated-imports.pkl", b"", &options);
 
         scan.merge_follow_on_import_references(Vec::new(), true);
 
@@ -11495,23 +10542,8 @@ mod tests {
 
     #[test]
     fn follow_on_duplicate_callable_invocations_do_not_mark_metadata_truncated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "follow-on-duplicate-invocation.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("follow-on-duplicate-invocation.pkl", b"", &options);
 
         for index in 0..MAX_IMPORT_REFERENCES {
             let invocation = ScanState::callable_invocation(
@@ -11541,26 +10573,9 @@ mod tests {
 
     #[test]
     fn persistent_id_opcodes_are_flagged() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"Pexternal-storage-key\n.";
-        let mut scan = ScanState::new(
-            "persistent.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("persistent.pkl", payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "suspicious");
         let finding = scan
@@ -11576,26 +10591,9 @@ mod tests {
 
     #[test]
     fn repeated_persistent_id_opcodes_are_summarized() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"Pa\nPb\nPc\n.";
-        let mut scan = ScanState::new(
-            "persistent-many.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("persistent-many.pkl", payload, &options);
 
         assert_eq!(
             scan.findings
@@ -11617,26 +10615,9 @@ mod tests {
 
     #[test]
     fn data_only_nested_payloads_emit_notice_not_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04C\x04\x80\x04}.\x94.";
-        let mut scan = ScanState::new(
-            "data-only-nested.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("data-only-nested.pkl", payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "clean");
         assert!(scan.findings.is_empty());
@@ -11653,30 +10634,13 @@ mod tests {
 
     #[test]
     fn benign_nested_constructor_payloads_emit_notice_not_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_payload = b"ccollections\nOrderedDict\n)R.";
         let mut payload = b"\x80\x04C".to_vec();
         payload.push(nested_payload.len() as u8);
         payload.extend_from_slice(nested_payload);
         payload.extend_from_slice(b"\x94.");
-        let mut scan = ScanState::new(
-            "benign-constructor-nested.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("benign-constructor-nested.pkl", &payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "clean");
         assert!(scan.findings.is_empty());
@@ -11698,30 +10662,13 @@ mod tests {
 
     #[test]
     fn raw_nested_payload_scan_continues_after_data_only_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"AAAAAA\x80\x04}.BBBBBBcos\nsystem\n)R.CCCC";
         let mut payload = b"\x80\x04B".to_vec();
         payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
         payload.extend_from_slice(nested_bytes);
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "raw-nested-benign-before-malicious.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("raw-nested-benign-before-malicious.pkl", &payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "malicious");
         assert!(scan
@@ -11744,12 +10691,8 @@ mod tests {
     fn raw_nested_byte_literal_scan_honors_string_literal_budget() {
         for (label, max_string_literal_scan_chars) in [("zero", 0), ("small", 8)] {
             let options = ScanOptions {
-                timeout_s: DEFAULT_TIMEOUT_S,
-                max_opcodes: DEFAULT_MAX_OPCODES,
-                post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
                 max_string_literal_scan_chars,
-                max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-                max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+                ..default_test_options()
             };
             let mut nested_bytes = vec![b'A'; 64];
             nested_bytes.extend_from_slice(b"cos\nsystem\n)R.");
@@ -11758,17 +10701,11 @@ mod tests {
             payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
             payload.extend_from_slice(&nested_bytes);
             payload.push(b'.');
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("raw-nested-{label}-literal-budget.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert_eq!(
                 scan.status.as_str(),
@@ -11793,14 +10730,7 @@ mod tests {
 
     #[test]
     fn legacy_string_opcodes_scan_raw_nested_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"AAAAAAcos\nsystem\n)R.BBBB";
         let mut binstring_payload = b"\x80\x02T".to_vec();
         binstring_payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
@@ -11820,17 +10750,11 @@ mod tests {
         ];
 
         for (label, payload) in payloads {
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("legacy-string-raw-nested-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert_eq!(scan.verdict.as_str(), "malicious", "missed {label}");
             assert!(scan.findings.iter().any(|finding| {
@@ -11848,14 +10772,7 @@ mod tests {
 
     #[test]
     fn unicode_string_opcodes_scan_raw_nested_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"AAAAAAcos\nsystem\n)R.BBBB";
         let payloads = [
             ("short-binunicode", {
@@ -11885,17 +10802,11 @@ mod tests {
         ];
 
         for (label, payload) in payloads {
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("unicode-raw-nested-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert_eq!(scan.verdict.as_str(), "malicious", "missed {label}");
             assert!(scan.findings.iter().any(|finding| {
@@ -11913,29 +10824,16 @@ mod tests {
 
     #[test]
     fn unicode_string_opcodes_fail_closed_for_malformed_protocol0_container_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"(cos\nsystem\n)R";
         let mut payload = b"\x80\x04".to_vec();
         payload.extend_from_slice(&short_binunicode(nested_bytes));
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "unicode-malformed-protocol0-container.pkl".to_string(),
+        let scan = run_test_scan(
+            "unicode-malformed-protocol0-container.pkl",
             &payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert_eq!(scan.status.as_str(), "inconclusive");
         assert_eq!(scan.verdict.as_str(), "malicious");
@@ -11951,12 +10849,8 @@ mod tests {
     #[test]
     fn unicode_string_opcodes_scan_large_ascii_literals_without_copying() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
             max_string_literal_scan_chars: 1024,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let mut nested_bytes = vec![b'A'; 128 * 1024];
         nested_bytes.extend_from_slice(b"cos\nsystem\n)R.");
@@ -11964,17 +10858,7 @@ mod tests {
         payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
         payload.extend_from_slice(&nested_bytes);
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "unicode-large-ascii-raw-nested.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("unicode-large-ascii-raw-nested.pkl", &payload, &options);
 
         assert_eq!(scan.status.as_str(), "inconclusive");
         assert_eq!(scan.verdict.as_str(), "malicious");
@@ -11988,22 +10872,11 @@ mod tests {
     #[test]
     fn unicode_raw_nested_scan_detects_payload_across_bounded_conversion_chunks() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
             max_string_literal_scan_chars: 0,
             max_nested_pickle_bytes: 32,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
-        let mut scan = ScanState::new(
-            "unicode-chunk-boundary.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("unicode-chunk-boundary.pkl", b"", &options);
         let value = format!("{}{}", "\u{ff}".repeat(60), "cos\nsystem\n)R.");
 
         scan.scan_raw_nested_unicode_text(&value, 0);
@@ -12024,26 +10897,9 @@ mod tests {
 
     #[test]
     fn oversized_frame_lengths_emit_structural_tamper_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.";
-        let mut scan = ScanState::new(
-            "oversized-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("oversized-frame.pkl", payload, &options);
 
         let notice = scan
             .notices
@@ -12073,26 +10929,9 @@ mod tests {
 
     #[test]
     fn slightly_oversized_frame_lengths_emit_structural_tamper_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
-        let mut scan = ScanState::new(
-            "slightly-oversized-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("slightly-oversized-frame.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12111,26 +10950,9 @@ mod tests {
 
     #[test]
     fn frame_crossing_stop_emits_structural_tamper_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\x05\x00\x00\x00\x00\x00\x00\x00}.\x80\x04N.";
-        let mut scan = ScanState::new(
-            "frame-crossing-stop.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("frame-crossing-stop.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12149,26 +10971,9 @@ mod tests {
 
     #[test]
     fn frame_ending_before_stop_is_not_oversized() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\x01\x00\x00\x00\x00\x00\x00\x00}.";
-        let mut scan = ScanState::new(
-            "short-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("short-frame.pkl", payload, &options);
 
         assert!(scan.findings.iter().all(|finding| {
             detail_string(&finding.details, "tamper_type").as_deref() != Some("oversized_frame")
@@ -12184,25 +10989,11 @@ mod tests {
     #[test]
     fn post_budget_tail_reports_oversized_frame_tamper() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04N\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
-        let mut scan = ScanState::new(
-            "post-budget-oversized-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-oversized-frame.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12222,25 +11013,11 @@ mod tests {
     #[test]
     fn post_budget_tail_reports_expanded_needles_at_precise_positions() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 1,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04cos\npopen\n.";
-        let mut scan = ScanState::new(
-            "post-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12258,12 +11035,8 @@ mod tests {
     #[test]
     fn post_budget_tail_detects_policy_dangerous_globals() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 1,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
 
         for (module, name) in [
@@ -12280,17 +11053,11 @@ mod tests {
             payload.extend_from_slice(name.as_bytes());
             payload.extend_from_slice(b"\n.");
             let expected_pattern = format!("{module}\n{name}");
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-{expected_pattern}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert!(
                 scan.findings.iter().any(|finding| {
@@ -12306,12 +11073,8 @@ mod tests {
     #[test]
     fn post_budget_tail_detects_modern_stack_global_forms() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let forms = [
             (
@@ -12349,17 +11112,7 @@ mod tests {
         for (label, tail) in forms {
             let mut payload = b"\x80\x04\x88\x88".to_vec();
             payload.extend_from_slice(&tail);
-            let mut scan = ScanState::new(
-                format!("post-budget-{label}.pkl"),
-                &payload,
-                &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
-            );
-
-            scan.run();
+            let scan = run_test_scan(format!("post-budget-{label}.pkl"), &payload, &options);
 
             let finding = scan
                 .findings
@@ -12377,25 +11130,11 @@ mod tests {
     #[test]
     fn post_budget_tail_resynchronizes_after_malformed_bytes_before_modern_globals() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
-        let mut scan = ScanState::new(
-            "post-budget-malformed-modern-global.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-malformed-modern-global.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12412,25 +11151,15 @@ mod tests {
     #[test]
     fn post_budget_tail_does_not_resolve_tuple_wrapped_globals_after_malformed_bytes() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x86\x93)R.";
-        let mut scan = ScanState::new(
-            "post-budget-malformed-tuple-wrapped-global.pkl".to_string(),
+        let scan = run_test_scan(
+            "post-budget-malformed-tuple-wrapped-global.pkl",
             payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert!(
             !scan.findings.iter().any(|finding| {
@@ -12445,12 +11174,9 @@ mod tests {
     #[test]
     fn post_budget_tail_does_not_resynchronize_inside_truncated_literals() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
             post_budget_scan_bytes: 32,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let inert_inner_bytes = b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
         let mut payload = b"\x80\x04\x88\x88X".to_vec();
@@ -12458,17 +11184,7 @@ mod tests {
         payload.extend_from_slice(inert_inner_bytes);
         payload.resize(4 + 1 + 4 + 64, b'A');
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "post-budget-truncated-literal.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-truncated-literal.pkl", &payload, &options);
 
         assert!(
             !scan.findings.iter().any(|finding| {
@@ -12500,12 +11216,8 @@ mod tests {
 
     fn post_budget_prememo_options() -> ScanOptions {
         ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 7,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         }
     }
 
@@ -12523,17 +11235,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-prememo-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             let finding = scan
                 .findings
@@ -12581,17 +11287,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(&tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-prememo-mixed-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             let finding = scan
                 .findings
@@ -12617,17 +11317,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-interleaved-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert!(
                 scan.findings.iter().any(|finding| {
@@ -12645,17 +11339,11 @@ mod tests {
     fn post_budget_tail_treats_tuple_wrapped_stack_global_operands_as_malformed() {
         let options = post_budget_prememo_options();
         let payload = pre_memoized_post_budget_stack_global_payload(b"h\x00h\x01\x86\x93)R.");
-        let mut scan = ScanState::new(
-            "post-budget-tuple-wrapped-stack-global.pkl".to_string(),
+        let scan = run_test_scan(
+            "post-budget-tuple-wrapped-stack-global.pkl",
             &payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert!(
             !scan.findings.iter().any(|finding| {
@@ -12675,24 +11363,14 @@ mod tests {
 
     fn assert_post_budget_subprocess_run_finding(payload: &[u8], label: &str) {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
-        let mut scan = ScanState::new(
+        let scan = run_test_scan(
             format!("post-budget-tail-local-{label}.pkl"),
             payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert!(
             scan.findings.iter().any(|finding| {
@@ -12764,17 +11442,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-prememo-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert!(
                 scan.findings.iter().any(|finding| {
@@ -12845,75 +11517,52 @@ mod tests {
     #[test]
     fn post_budget_tail_detects_inst_and_extension_refs() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
 
         let inst_payload = b"\x80\x04\x88\x88(isubprocess\nrun\n.".to_vec();
-        let mut inst_scan = ScanState::new(
-            "post-budget-inst.pkl".to_string(),
-            &inst_payload,
-            &options,
-            Some(inst_payload.len()),
-            0,
-            0,
-            None,
-        );
-        inst_scan.run();
+        let inst_scan = run_test_scan("post-budget-inst.pkl", &inst_payload, &options);
         assert!(inst_scan.findings.iter().any(|finding| {
             finding.rule_code == Some("POST_BUDGET_GLOBAL")
                 && detail_string(&finding.details, "pattern").as_deref() == Some("subprocess\nrun")
         }));
 
-        let ext_payload = b"\x80\x04\x88\x88\x82\x07R.".to_vec();
-        let mut ext_scan = ScanState::new(
-            "post-budget-ext.pkl".to_string(),
-            &ext_payload,
-            &options,
-            Some(ext_payload.len()),
-            0,
-            0,
-            None,
-        );
-        ext_scan.run();
-        let finding = ext_scan
-            .findings
-            .iter()
-            .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
-            .expect("post-budget extension finding");
-        assert_eq!(finding.severity, "critical");
-        assert_eq!(
-            detail_string(&finding.details, "pattern").as_deref(),
-            Some("copyreg.extension\ncode_7")
-        );
+        let expected = [
+            "copyreg.extension\ncode_7",
+            "copyreg.extension\ncode_4294967295",
+        ];
+        for (payload, expected_patterns) in [
+            (b"\x80\x04\x88\x88\x82\x07R.".as_slice(), &expected[..1]),
+            // The raw sweep continues past STOP and preserves the unsigned EXT4 code.
+            (
+                b"\x80\x04\x88\x88\x82\x07R.\x84\xff\xff\xff\xffR",
+                &expected[..],
+            ),
+        ] {
+            let ext_scan = run_test_scan("post-budget-ext.pkl", payload, &options);
+            let patterns: Vec<_> = ext_scan
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+                .map(|finding| {
+                    assert_eq!(finding.severity, "critical");
+                    detail_string(&finding.details, "pattern")
+                        .expect("post-budget extension pattern")
+                })
+                .collect();
+            assert_eq!(patterns, expected_patterns);
+        }
     }
 
     #[test]
     fn post_budget_tail_promotes_reduce_proximate_globals_to_critical() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 1,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04cos\npopen\n)R.";
-        let mut scan = ScanState::new(
-            "post-budget-critical.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-critical.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12931,11 +11580,7 @@ mod tests {
     fn timeout_limit_still_scans_post_budget_tail() {
         let options = ScanOptions {
             timeout_s: 0.001,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04csubprocess\nrun\n)R.";
         let mut scan = ScanState::new(

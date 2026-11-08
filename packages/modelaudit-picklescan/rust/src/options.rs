@@ -22,8 +22,16 @@ pub(crate) struct ScanOptions {
 
 impl ScanOptions {
     pub(crate) fn from_py(options: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let timeout_s = match options.get_item("timeout_s")? {
+            Some(value) => value.extract::<f64>()?,
+            None => DEFAULT_TIMEOUT_S,
+        };
         Ok(Self {
-            timeout_s: clamp_timeout_s(option_f64(options, "timeout_s", DEFAULT_TIMEOUT_S)?),
+            timeout_s: normalized_timeout_s(timeout_s).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "timeout_s must be greater than 0 and finite, got {timeout_s:?}"
+                ))
+            })?,
             max_opcodes: option_usize(options, "max_opcodes", DEFAULT_MAX_OPCODES)?,
             post_budget_scan_bytes: option_usize(
                 options,
@@ -46,16 +54,12 @@ impl ScanOptions {
     }
 }
 
-fn clamp_timeout_s(timeout_s: f64) -> f64 {
-    timeout_s.min(MAX_TIMEOUT_S)
+fn normalized_timeout_s(timeout_s: f64) -> Option<f64> {
+    (timeout_s.is_finite() && timeout_s > 0.0).then(|| timeout_s.min(MAX_TIMEOUT_S))
 }
 
 fn timeout_duration(timeout_s: f64) -> Duration {
-    if timeout_s.is_finite() && timeout_s > 0.0 {
-        Duration::from_secs_f64(clamp_timeout_s(timeout_s))
-    } else {
-        Duration::from_secs_f64(DEFAULT_TIMEOUT_S)
-    }
+    Duration::from_secs_f64(normalized_timeout_s(timeout_s).unwrap_or(DEFAULT_TIMEOUT_S))
 }
 
 pub(crate) fn deadline_from_timeout(timeout_s: f64) -> Instant {
@@ -83,27 +87,13 @@ fn require_minimum_usize(value: usize, key: &str, minimum: usize) -> PyResult<us
     Ok(value)
 }
 
-fn option_f64(options: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<f64> {
-    let value = match options.get_item(key)? {
-        Some(value) => value.extract::<f64>(),
-        None => Ok(default),
-    }?;
-    if value.is_finite() && value > 0.0 {
-        Ok(value)
-    } else {
-        Err(PyValueError::new_err(format!(
-            "{key} must be greater than 0 and finite, got {value:?}"
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn timeout_duration_clamps_excessive_values() {
-        assert_eq!(clamp_timeout_s(1.0e18), MAX_TIMEOUT_S);
+        assert_eq!(normalized_timeout_s(1.0e18), Some(MAX_TIMEOUT_S));
         assert_eq!(timeout_duration(1.0e18), Duration::from_secs(86_400));
         assert_eq!(timeout_duration(f64::NAN), Duration::from_secs(3600));
     }

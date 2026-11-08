@@ -709,51 +709,16 @@ def _enhance_explanation_with_context(message: str, base_explanation: str, conte
 
 # CVE-2025-32434 Specific Explanations
 def get_cve_2025_32434_explanation(vulnerability_type: str) -> str:
-    """Get specific explanation for CVE-2025-32434 vulnerability types"""
-
-    explanations = {
-        "pytorch_version": (
-            "CVE-2025-32434 affects PyTorch versions ≤2.5.1 and allows remote code execution "
-            "when loading models with torch.load(weights_only=True). The 'weights_only=True' "
-            "parameter was commonly believed to provide security protection, but this "
-            "vulnerability demonstrates that malicious pickle files can still execute "
-            "arbitrary code regardless of this setting. Upgrade to PyTorch 2.6.0+ immediately."
-        ),
-        "weights_only_false_security": (
-            "This model contains dangerous pickle opcodes that can execute arbitrary code "
-            "even when loaded with torch.load(weights_only=True). This is the core of "
-            "CVE-2025-32434 - the 'weights_only=True' parameter does NOT provide security "
-            "protection against sophisticated attacks. The parameter is a feature flag, not "
-            "a security boundary. Never rely on it for security with untrusted models."
-        ),
-        "dangerous_opcodes": (
-            "The detected opcodes (REDUCE, INST, OBJ, NEWOBJ, STACK_GLOBAL, BUILD) are "
-            "fundamental pickle operations that enable arbitrary code execution. These "
-            "opcodes can invoke __reduce__ methods, instantiate arbitrary classes, and "
-            "import dangerous modules. CVE-2025-32434 exploits the fact that torch.load() "
-            "processes these opcodes even with weights_only=True, allowing malicious models "
-            "to execute code during the loading process."
-        ),
-        "opcode_sequences": (
-            "Specific opcode sequences have been identified that indicate CVE-2025-32434 "
-            "exploitation attempts. These include PyTorch imports followed by execution "
-            "opcodes, chained REDUCE operations for complex payloads, and eval/exec "
-            "patterns with embedded string data. These sequences represent sophisticated "
-            "attacks designed to bypass the weights_only=True assumption."
-        ),
-        "torchscript_vulnerabilities": (
-            "TorchScript models can contain embedded code that executes during compilation "
-            "or loading. CVE-2025-32434 can be combined with TorchScript injection to "
-            "create multi-stage attacks. Dangerous patterns include serialization injection, "
-            "module manipulation, hook injection, and bytecode-level code execution. "
-            "These attacks can persist even after model loading completes."
-        ),
-    }
-
-    return explanations.get(
-        vulnerability_type,
-        "This issue is related to CVE-2025-32434, a critical PyTorch vulnerability. "
-        "Review the CVE documentation and update to PyTorch 2.6.0+ immediately.",
+    """Explain the scope of the legacy TAR loader vulnerability."""
+    if vulnerability_type in {"dangerous_opcodes", "opcode_sequences"}:
+        return (
+            "Pickle instructions such as REDUCE can invoke a callable during unpickling. "
+            "Their presence in a ZIP checkpoint does not establish CVE-2025-32434, "
+            "which affects the legacy TAR loader."
+        )
+    return (
+        "CVE-2025-32434 affects torch.load(weights_only=True) when loading a legacy PyTorch TAR "
+        "checkpoint with PyTorch before 2.6.0. Upgrade to PyTorch 2.6.0 or later."
     )
 
 
@@ -776,7 +741,7 @@ def get_cve_2026_24747_explanation(vulnerability_type: str) -> str:
             "consistent tensor metadata."
         ),
         "restricted_unpickler_bypass": (
-            "Unlike CVE-2025-32434 (where weights_only=True did not enforce restrictions), "
+            "Unlike CVE-2025-32434 in the legacy TAR loader, "
             "CVE-2026-24747 bypasses the enforcement mechanism itself. The restricted unpickler "
             "correctly blocks REDUCE/GLOBAL with dangerous modules, but fails to restrict "
             "SETITEM/SETITEMS on non-dict objects, allowing type confusion attacks that "
