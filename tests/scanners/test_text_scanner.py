@@ -6586,6 +6586,22 @@ def test_routine_example_policy_requires_complete_bounded_fences(tmp_path: Path,
     _assert_documentation_network_actionable(tmp_path, content, "url_detected")
 
 
+@pytest.mark.parametrize(
+    ("citation", "routine"),
+    [
+        (b'@article{key, title = "Models, part one", year = 2025}', True),
+        (b"@article{key, title = {A, B}, year = 2025, }", True),
+        (b"@article{key, title = {A} year = 2025}", False),
+        (b"@article{key, year = 2025", False),
+    ],
+)
+def test_routine_clone_with_bibtex_fields(citation: bytes, routine: bool) -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+
+    document = b"```sh\ngit clone https://github.com/example/model\n```\n```bibtex\n" + citation + b"\n```\n"
+    assert bool(routine_documentation_url_spans(document)) is routine
+
+
 def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from modelaudit.scanners.text_scanner_support import documentation_examples
 

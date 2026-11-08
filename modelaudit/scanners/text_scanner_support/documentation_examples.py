@@ -22,6 +22,8 @@ PYTHON_LANGUAGES = {b"py", b"python"}
 PARSED_FENCE_LANGUAGES = SHELL_LANGUAGES | PYTHON_LANGUAGES | {b""}
 FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r\n]*)\r?$")
 INDENTED_CODE_BLOCK_PATTERN = re.compile(rb"(?m)^(?: {4}|\t)[^\n]*\n?(?:(?: {4}|\t)[^\n]*\n?|[ \t]*\n)*")
+BIBTEX_HEADER = re.compile(rb"@[A-Za-z]+\{\s*[\w:.-]+\s*,\s*")
+BIBTEX_FIELD = re.compile(rb'[A-Za-z]+\s*=\s*(?:\{[^{}]*\}|"[^"\\\r\n]*"|\d+)\s*([,}])\s*')
 BACKTICK_PATTERN = re.compile(rb"`+")
 STANDALONE_HTML_COMMENT = re.compile(rb"(?m)^ {0,3}<!--[^<>\r\n]*-->[ \t]*\r?$")
 QUOTE_PREFIX_PATTERN = re.compile(rb" {0,3}>[ \t]?")
@@ -570,6 +572,22 @@ def _without_literal_cat_heredocs(source: bytes) -> bytes | None:
     return b"".join(commands)
 
 
+def _is_literal_bibtex(source: bytes) -> bool:
+    source = source.strip()
+    header = BIBTEX_HEADER.match(source)
+    if header is None:
+        return False
+    # Consume one complete field and its delimiter before looking for the next.
+    cursor = header.end()
+    while field := BIBTEX_FIELD.match(source, cursor):
+        cursor = field.end()
+        if field[1] == b"}":
+            return cursor == len(source)
+        if cursor == len(source) - 1 and source[cursor] == ord("}"):
+            return True  # Optional trailing comma.
+    return False
+
+
 def _example_executes_script(source: bytes, language: bytes) -> bool:
     if language == b"json":
         try:
@@ -577,13 +595,9 @@ def _example_executes_script(source: bytes, language: bytes) -> bool:
         except (ValueError, UnicodeDecodeError, RecursionError):
             return True
         return False
-    if language == b"bibtex" and re.fullmatch(
-        rb"\s*@[A-Za-z]+\{\s*[\w:.-]+\s*,\s*"
-        rb'(?:[A-Za-z]+\s*=\s*(?:\{[^{}]*\}|"[^"\\\r\n]*"|\d+)\s*,?\s*)+\}\s*',
-        source,
-    ):
-        return False
-    if language in {b"bibtex", b"json", b"text", b"plaintext"}:
+    if language == b"bibtex":
+        return not _is_literal_bibtex(source)
+    if language in {b"text", b"plaintext"}:
         language = b""
     elif language not in PARSED_FENCE_LANGUAGES:
         # An unparsed language cannot establish that a clone is setup-only.
