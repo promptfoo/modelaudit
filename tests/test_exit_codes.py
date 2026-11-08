@@ -9,6 +9,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import add_issue_to_model, consolidate_checks, results_have_inconclusive_outcome
 
 # Ensure models are rebuilt for forward references
+from modelaudit.finding_identity import preserve_finding_identity
 from modelaudit.models import ModelAuditResultModel, rebuild_models
 from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
@@ -816,3 +817,11 @@ def test_mixed_check_summary_preserves_security_evidence_in_either_order() -> No
     assert summary.severity == IssueSeverity.INFO
     assert summary.message == "Network reported 2 findings"
     assert result.failed_checks == 0
+
+    for check in (passive, active):
+        preserve_finding_identity(check, "directory_owner", message="Network indicator")
+    result = _create_result_model(checks=[passive, active])
+    consolidate_checks(result)
+    [summary] = result.checks
+    assert summary.message == active.message
+    assert summary.location == active.location

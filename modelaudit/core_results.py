@@ -655,25 +655,23 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
         else:
             consolidated_status = "skipped"
 
-        identity_checks = [finding_identity(check) for check in group_checks]
-        identity_message = _create_consolidated_message(check_name, identity_checks, consolidated_status, failed_count)
-        raw_check_name = group_checks[0].get("name", check_name)
-        message = next(
-            (
-                check["message"]
-                for check, identity in zip(group_checks, identity_checks, strict=True)
-                if identity.get("message") == identity_message
-            ),
-            _create_consolidated_message(raw_check_name, identity_checks, consolidated_status, failed_count),
-        )
-        representative = group_checks[0]
+        same_status = [check for check in group_checks if check.get("status") == consolidated_status]
+        representative = same_status[0]
         if failed_count:
             # Failed checks without a severity still count toward failure statistics.
             severity_rank = {"debug": 0, "info": 1, "warning": 3, "critical": 4}
             representative = max(
-                (check for check in group_checks if check.get("status") == "failed"),
+                same_status,
                 key=lambda check: (severity_rank.get(check.get("severity", ""), 2), bool(check.get("why"))),
             )
+        identity_checks = [finding_identity(check) for check in group_checks]
+        identity_message = _create_consolidated_message(check_name, identity_checks, consolidated_status, failed_count)
+        raw_check_name = representative.get("name", check_name)
+        representative_identity = finding_identity(representative)
+        if representative_identity.get("message") == identity_message:
+            message = representative["message"]
+        else:
+            message = _create_consolidated_message(raw_check_name, identity_checks, consolidated_status, failed_count)
         consolidated_check = {
             "name": raw_check_name,
             "status": consolidated_status,
@@ -688,7 +686,7 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
             "check_consolidation",
             name=check_name,
             message=identity_message,
-            location=finding_identity(representative).get("location", primary_asset),
+            location=representative_identity.get("location", primary_asset),
         )
         if failed_count:
             for field in ("severity", "why"):
