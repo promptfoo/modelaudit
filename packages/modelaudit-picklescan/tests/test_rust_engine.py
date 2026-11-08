@@ -72,11 +72,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _rust_source_text() -> str:
-    rust_src = Path(__file__).resolve().parents[1] / "rust" / "src"
-    return "\n".join(path.read_text(encoding="utf-8") for path in sorted(rust_src.glob("*.rs")))
-
-
 def _binary_opcode_os_system_reduce_payload() -> bytes:
     return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"true") + b"\x85R."
 
@@ -121,7 +116,8 @@ def parity_payloads() -> dict[str, tuple[bytes, ScanOptions | None]]:
 
 
 def test_rust_parser_declares_all_pickletools_opcodes() -> None:
-    source = _rust_source_text().split("pub(crate) fn parse_opcode(", 1)[1]
+    opcode_path = Path(__file__).resolve().parents[1] / "rust" / "src" / "opcode.rs"
+    source = opcode_path.read_text(encoding="utf-8").split("pub(crate) fn parse_opcode(", 1)[1]
     source = source.split("\nfn ", 1)[0]
     rust_opcodes = set(re.findall(r'\(\s*"([A-Z0-9_]+)",', source))
 
@@ -225,42 +221,19 @@ def test_rust_policy_detects_required_security_coverage(module: str, name: str) 
     )
 
 
+def _nested_blob_payloads(blob: bytes) -> list[bytes]:
+    encoded = base64.b64encode(blob).decode("ascii")
+    hex_string = binascii.hexlify(blob).decode("ascii")
+    return [
+        pickle.dumps({"blob": value}, protocol=4)
+        for value in (blob, encoded, "prefix:" + encoded, hex_string, "prefix:" + hex_string)
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
-    [
-        pytest.param(
-            pickle.dumps({"blob": _binary_opcode_os_system_reduce_payload()}, protocol=4),
-            id="raw-bytes",
-        ),
-        pytest.param(
-            pickle.dumps(
-                {"blob": base64.b64encode(_binary_opcode_os_system_reduce_payload()).decode("ascii")},
-                protocol=4,
-            ),
-            id="base64-string",
-        ),
-        pytest.param(
-            pickle.dumps(
-                {"blob": "prefix:" + base64.b64encode(_binary_opcode_os_system_reduce_payload()).decode("ascii")},
-                protocol=4,
-            ),
-            id="prefixed-base64-string",
-        ),
-        pytest.param(
-            pickle.dumps(
-                {"blob": binascii.hexlify(_binary_opcode_os_system_reduce_payload()).decode("ascii")},
-                protocol=4,
-            ),
-            id="hex-string",
-        ),
-        pytest.param(
-            pickle.dumps(
-                {"blob": "prefix:" + binascii.hexlify(_binary_opcode_os_system_reduce_payload()).decode("ascii")},
-                protocol=4,
-            ),
-            id="prefixed-hex-string",
-        ),
-    ],
+    _nested_blob_payloads(_binary_opcode_os_system_reduce_payload()),
+    ids=("raw-bytes", "base64-string", "prefixed-base64-string", "hex-string", "prefixed-hex-string"),
 )
 def test_rust_engine_detects_binary_opcode_nested_payload_without_proto(payload: bytes) -> None:
     report = scan_bytes(payload, source="binary-nested-without-proto.pkl")
@@ -275,28 +248,14 @@ def test_rust_engine_detects_binary_opcode_nested_payload_without_proto(payload:
 
 @pytest.mark.parametrize(
     "payload",
-    [
-        pytest.param(
-            pickle.dumps({"blob": b"K\x00." * 80}, protocol=4),
-            id="raw-scalar-pickle-fragments",
-        ),
-        pytest.param(
-            pickle.dumps({"blob": base64.b64encode(b"K\x00." * 80).decode("ascii")}, protocol=4),
-            id="base64-scalar-pickle-fragments",
-        ),
-        pytest.param(
-            pickle.dumps({"blob": "prefix:" + base64.b64encode(b"K\x00." * 80).decode("ascii")}, protocol=4),
-            id="prefixed-base64-scalar-pickle-fragments",
-        ),
-        pytest.param(
-            pickle.dumps({"blob": binascii.hexlify(b"K\x00." * 80).decode("ascii")}, protocol=4),
-            id="hex-scalar-pickle-fragments",
-        ),
-        pytest.param(
-            pickle.dumps({"blob": "prefix:" + binascii.hexlify(b"K\x00." * 80).decode("ascii")}, protocol=4),
-            id="prefixed-hex-scalar-pickle-fragments",
-        ),
-    ],
+    _nested_blob_payloads(b"K\x00." * 80),
+    ids=(
+        "raw-scalar-pickle-fragments",
+        "base64-scalar-pickle-fragments",
+        "prefixed-base64-scalar-pickle-fragments",
+        "hex-scalar-pickle-fragments",
+        "prefixed-hex-scalar-pickle-fragments",
+    ),
 )
 def test_rust_engine_ignores_data_only_scalar_pickle_near_matches(payload: bytes) -> None:
     report = scan_bytes(payload, source="scalar-fragment-near-match.pkl")

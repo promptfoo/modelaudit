@@ -377,8 +377,14 @@ def _has_suspicious_magic_method_finding(report: PickleReport) -> bool:
     )
 
 
-def _has_dynamic_type_callable_attribute_finding(report: PickleReport) -> bool:
-    return any(
+def _assert_suspicious_magic_method(report: PickleReport) -> None:
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+
+def _assert_suspicious_callable_attribute(report: PickleReport) -> None:
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
         finding.severity == Severity.WARNING
         and finding.rule_code == "DYNAMIC_TYPE_CALLABLE_ATTRIBUTE"
         and finding.details.get("callable_import_reference") == "pathlib.Path.touch"
@@ -386,8 +392,9 @@ def _has_dynamic_type_callable_attribute_finding(report: PickleReport) -> bool:
     )
 
 
-def _has_dynamic_type_unknown_key_overflow_finding(report: PickleReport) -> bool:
-    return any(
+def _assert_suspicious_unknown_key_overflow(report: PickleReport) -> None:
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
         finding.severity == Severity.WARNING
         and finding.rule_code == "DYNAMIC_TYPE_CALLABLE_ATTRIBUTE"
         and finding.details.get("tracked_dynamic_key_value_overflow") is True
@@ -402,6 +409,13 @@ def _has_critical_global_finding(report: PickleReport, module: str, name: str) -
         and finding.details.get("name") == name
         for finding in report.findings
     )
+
+
+def _scan_for_critical_global(payload: bytes, source: str, module: str, name: str) -> PickleReport:
+    report = scan_bytes(payload, source=source)
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, module, name)
+    return report
 
 
 def _has_critical_call_graph_limit_finding(report: PickleReport) -> bool:
@@ -2661,10 +2675,7 @@ def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) ->
 
     payload = pickle.dumps(MailcapFindmatchRce(), protocol=4)
 
-    report = scan_bytes(payload, source="mailcap-findmatch-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "mailcap", "findmatch")
+    _scan_for_critical_global(payload, "mailcap-findmatch-rce.pkl", "mailcap", "findmatch")
 
     assert not marker.exists()
     pickle.loads(payload)
@@ -2675,10 +2686,7 @@ def test_scan_bytes_blocks_atexit_register_exit_callback_rce(tmp_path: Path) -> 
     marker = tmp_path / "atexit_register_exit_callback_rce_marker"
     payload = _atexit_register_payload(marker)
 
-    report = scan_bytes(payload, source="atexit-register-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "atexit", "register")
+    _scan_for_critical_global(payload, "atexit-register-rce.pkl", "atexit", "register")
 
     assert not marker.exists()
     subprocess.run(
@@ -2698,10 +2706,7 @@ def test_scan_bytes_blocks_weakref_finalize_reclaim_callback_rce(tmp_path: Path)
     marker = tmp_path / "weakref_finalize_reclaim_callback_rce_marker"
     payload = _weakref_finalize_payload(marker)
 
-    report = scan_bytes(payload, source="weakref-finalize-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "weakref", "finalize")
+    _scan_for_critical_global(payload, "weakref-finalize-rce.pkl", "weakref", "finalize")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -2715,10 +2720,7 @@ def test_scan_bytes_blocks_sched_scheduler_queued_callback_rce(tmp_path: Path) -
     marker = tmp_path / "sched_scheduler_queued_callback_rce_marker"
     payload = _sched_scheduler_run_payload(marker)
 
-    report = scan_bytes(payload, source="sched-scheduler-run-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "sched", "scheduler.enter")
+    report = _scan_for_critical_global(payload, "sched-scheduler-run-rce.pkl", "sched", "scheduler.enter")
     assert _has_critical_global_finding(report, "sched", "scheduler.run")
 
     assert not marker.exists()
@@ -2731,10 +2733,9 @@ def test_scan_bytes_blocks_contextlib_exitstack_cleanup_callback_rce(tmp_path: P
     marker = tmp_path / "contextlib_exitstack_cleanup_callback_rce_marker"
     payload = _contextlib_exitstack_close_payload(marker)
 
-    report = scan_bytes(payload, source="contextlib-exitstack-close-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "contextlib", "ExitStack.callback")
+    report = _scan_for_critical_global(
+        payload, "contextlib-exitstack-close-rce.pkl", "contextlib", "ExitStack.callback"
+    )
     assert _has_critical_global_finding(report, "contextlib", "ExitStack.close")
 
     assert not marker.exists()
@@ -2749,8 +2750,7 @@ def test_scan_bytes_blocks_contextlib_exitstack_enter_context_dunder_enter_rce(t
     payload = _contextlib_exitstack_enter_context_payload(marker, include_call=True)
 
     control_report = scan_bytes(control_payload, source="contextlib-exitstack-enter-context-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -2773,10 +2773,7 @@ def test_scan_bytes_blocks_contextvars_context_run_callback_rce(tmp_path: Path) 
     marker = tmp_path / "contextvars_context_run_callback_rce_marker"
     payload = _contextvars_context_run_payload(marker)
 
-    report = scan_bytes(payload, source="contextvars-context-run-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "contextvars", "Context.run")
+    _scan_for_critical_global(payload, "contextvars-context-run-rce.pkl", "contextvars", "Context.run")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -2798,10 +2795,7 @@ def test_scan_bytes_blocks_types_methodtype_bound_method_rce(tmp_path: Path) -> 
     assert type(control_result).__name__ == "method"
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="types-methodtype-bound-method-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "types", "MethodType")
+    _scan_for_critical_global(payload, "types-methodtype-bound-method-rce.pkl", "types", "MethodType")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -2826,10 +2820,9 @@ def test_scan_bytes_blocks_types_dynamicclassattribute_get_descriptor_rce(tmp_pa
     assert type(control_result).__name__ == "DynamicClassAttribute"
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="types-dynamicclassattribute-get-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "types", "DynamicClassAttribute.__get__")
+    _scan_for_critical_global(
+        payload, "types-dynamicclassattribute-get-rce.pkl", "types", "DynamicClassAttribute.__get__"
+    )
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -2843,8 +2836,7 @@ def test_scan_bytes_blocks_functools_cached_property_get_descriptor_rce(tmp_path
     payload = _functools_cached_property_get_payload(marker, include_call=True)
 
     control_report = scan_bytes(control_payload, source="functools-cached-property-get-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -2852,10 +2844,7 @@ def test_scan_bytes_blocks_functools_cached_property_get_descriptor_rce(tmp_path
     assert control_result.attrname == "x"
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="functools-cached-property-get-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "functools", "cached_property.__get__")
+    _scan_for_critical_global(payload, "functools-cached-property-get-rce.pkl", "functools", "cached_property.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -2878,10 +2867,7 @@ def test_scan_bytes_blocks_functools_cmp_to_key_comparison_rce(tmp_path: Path) -
     assert len(control_result) == 2
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="functools-cmp-to-key-operator-lt-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "functools", "cmp_to_key")
+    _scan_for_critical_global(payload, "functools-cmp-to-key-operator-lt-rce.pkl", "functools", "cmp_to_key")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -2903,10 +2889,7 @@ def test_scan_bytes_blocks_logging_filterer_filter_callback_rce(tmp_path: Path) 
     assert len(control_result.filters) == 1
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="logging-filterer-filter-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "logging", "Filterer.filter")
+    _scan_for_critical_global(payload, "logging-filterer-filter-rce.pkl", "logging", "Filterer.filter")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3438,10 +3421,7 @@ def test_scan_bytes_blocks_builtin_dict_lookup_eval_recovery_rce(tmp_path: Path)
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="builtin-dict-get-eval-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "__dict__")
+    _scan_for_critical_global(payload, "builtin-dict-get-eval-rce.pkl", "builtins", "__dict__")
 
     direct_lookup = b"\x80\x04" + _global_operand("builtins", "__dict__.get") + b"."
     direct_report = scan_bytes(direct_lookup, source="builtin-dict-get-bound-method.pkl")
@@ -3467,10 +3447,7 @@ def test_scan_bytes_blocks_module_dict_fragmented_builtins_eval_recovery_rce(tmp
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="module-dict-builtins-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "sysconfig", "__dict__")
+    _scan_for_critical_global(payload, "module-dict-builtins-rce.pkl", "sysconfig", "__dict__")
 
     direct_payload = b"\x80\x04" + _global_operand("sysconfig", "__builtins__") + b"."
     direct_report = scan_bytes(direct_payload, source="module-builtins-direct.pkl")
@@ -3496,10 +3473,7 @@ def test_scan_bytes_blocks_string_formatter_get_field_eval_recovery_rce(tmp_path
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="formatter-get-field-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "string", "Formatter.get_field")
+    _scan_for_critical_global(payload, "formatter-get-field-rce.pkl", "string", "Formatter.get_field")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -3520,10 +3494,7 @@ def test_scan_bytes_blocks_unittest_mock_get_target_eval_recovery_rce(tmp_path: 
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="mock-get-target-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "unittest.mock", "_get_target")
+    _scan_for_critical_global(payload, "mock-get-target-rce.pkl", "unittest.mock", "_get_target")
 
     direct_payload = b"\x80\x04" + _global_operand("unittest.mock", "_get_target") + b"."
     direct_report = scan_bytes(direct_payload, source="mock-get-target-direct.pkl")
@@ -3552,10 +3523,7 @@ def test_scan_bytes_blocks_static_member_descriptor_builtins_eval_recovery_rce(t
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="static-member-descriptor-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "types", "MemberDescriptorType.__get__")
+    _scan_for_critical_global(payload, "static-member-descriptor-rce.pkl", "types", "MemberDescriptorType.__get__")
 
     for name in ["MemberDescriptorType.__get__", "GetSetDescriptorType.__get__"]:
         direct_payload = b"\x80\x04" + _global_operand("types", name) + b"."
@@ -3582,10 +3550,7 @@ def test_scan_bytes_blocks_wrapper_descriptor_getattribute_eval_recovery_rce(tmp
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="wrapper-descriptor-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "types", "WrapperDescriptorType.__get__")
+    _scan_for_critical_global(payload, "wrapper-descriptor-rce.pkl", "types", "WrapperDescriptorType.__get__")
 
     for name in [
         "ClassMethodDescriptorType.__get__",
@@ -3616,10 +3581,7 @@ def test_scan_bytes_blocks_legacy_global_bound_getattribute_eval_recovery_rce(tm
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="legacy-bound-getattribute-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "statistics", "mean.__getattribute__")
+    _scan_for_critical_global(payload, "legacy-bound-getattribute-rce.pkl", "statistics", "mean.__getattribute__")
 
     for module, name in [
         ("statistics", "__getattribute__"),
@@ -3652,10 +3614,7 @@ def test_scan_bytes_blocks_object_subclasses_popen_recovery_rce(tmp_path: Path) 
     assert "owned-by-subclasses-popen" in control_result[2]
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="object-subclasses-popen-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "object.__subclasses__")
+    _scan_for_critical_global(payload, "object-subclasses-popen-rce.pkl", "builtins", "object.__subclasses__")
 
     for global_payload in [
         _legacy_global_operand("builtins", "object.__subclasses__"),
@@ -3687,10 +3646,7 @@ def test_scan_bytes_blocks_gc_referents_builtin_eval_recovery_rce(tmp_path: Path
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="gc-referents-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "gc", "get_referents")
+    _scan_for_critical_global(payload, "gc-referents-rce.pkl", "gc", "get_referents")
 
     for name in ["get_objects", "get_referents", "get_referrers"]:
         for global_payload in [_legacy_global_operand("gc", name), _global_operand("gc", name)]:
@@ -3718,10 +3674,7 @@ def test_scan_bytes_blocks_frame_builtins_descriptor_eval_recovery_rce(tmp_path:
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="frame-builtins-descriptor-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "inspect", "currentframe")
+    report = _scan_for_critical_global(payload, "frame-builtins-descriptor-rce.pkl", "inspect", "currentframe")
     assert _has_critical_global_finding(report, "types", "FrameType.f_builtins.__get__")
 
     for module, name in [
@@ -3754,10 +3707,9 @@ def test_scan_bytes_blocks_callable_suffix_frame_builtins_descriptor_eval_recove
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="frame-builtins-call-suffix-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "inspect", "currentframe.__call__")
+    report = _scan_for_critical_global(
+        payload, "frame-builtins-call-suffix-rce.pkl", "inspect", "currentframe.__call__"
+    )
     assert _has_critical_global_finding(report, "types", "FrameType.f_builtins.__get__.__call__")
 
     for module, name in [
@@ -3795,10 +3747,9 @@ def test_scan_bytes_blocks_get_self_alias_frame_builtins_descriptor_eval_recover
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="frame-builtins-get-self-alias-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "inspect", "currentframe.__get__.__self__")
+    report = _scan_for_critical_global(
+        payload, "frame-builtins-get-self-alias-rce.pkl", "inspect", "currentframe.__get__.__self__"
+    )
     assert _has_critical_global_finding(report, "types", "FrameType.f_builtins.__get__.__self__.__get__")
 
     for module, name in [
@@ -3840,10 +3791,9 @@ def test_scan_bytes_blocks_repr_self_alias_frame_builtins_descriptor_eval_recove
     assert control_result == expected_code
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="frame-builtins-repr-self-alias-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "inspect", "currentframe.__repr__.__self__")
+    report = _scan_for_critical_global(
+        payload, "frame-builtins-repr-self-alias-rce.pkl", "inspect", "currentframe.__repr__.__self__"
+    )
     assert _has_critical_global_finding(report, "types", "FrameType.f_builtins.__get__.__repr__.__self__")
 
     for module, name in [
@@ -3886,10 +3836,7 @@ def test_scan_bytes_blocks_dotted_global_os_system_alias_rce(tmp_path: Path) -> 
     assert control_result == (command,)
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="site-os-system-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "site", "os.system")
+    _scan_for_critical_global(payload, "site-os-system-rce.pkl", "site", "os.system")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -4552,10 +4499,7 @@ def test_scan_bytes_blocks_codecs_open_write_rce(tmp_path: Path) -> None:
         control_result.close()
     marker.unlink()
 
-    report = scan_bytes(payload, source="codecs-open-write-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "codecs", "open")
+    report = _scan_for_critical_global(payload, "codecs-open-write-rce.pkl", "codecs", "open")
     assert _has_critical_global_finding(report, "codecs", "StreamReaderWriter.write")
 
     assert not marker.exists()
@@ -4752,9 +4696,7 @@ def test_scan_bytes_preserves_mailbox_add_detection_when_constructor_analysis_un
     assert control_report.status == ScanStatus.INCONCLUSIVE
     assert control_report.verdict == SafetyVerdict.UNKNOWN
 
-    report = scan_bytes(payload, source="mailbox-mbox-pth-rce.pkl")
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "mailbox", "mbox.add")
+    _scan_for_critical_global(payload, "mailbox-mbox-pth-rce.pkl", "mailbox", "mbox.add")
 
 
 def test_scan_bytes_keeps_mailbox_multi_arg_constructor_gap_inconclusive(
@@ -4827,10 +4769,7 @@ def test_scan_bytes_blocks_tkinter_tcl_process_execution(
 
     marker = tmp_path / f"tkinter_tcl_{method_name.rsplit('.', 1)[1]}_marker"
     payload = payload_builder(marker)
-    report = scan_bytes(payload, source=f"tkinter-tcl-{method_name}.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "_tkinter", method_name)
+    _scan_for_critical_global(payload, f"tkinter-tcl-{method_name}.pkl", "_tkinter", method_name)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -4856,10 +4795,7 @@ def test_scan_bytes_blocks_subinterpreters_run_string_rce(tmp_path: Path) -> Non
     assert not marker.exists()
 
     payload = _subinterpreters_run_string_payload(marker)
-    report = scan_bytes(payload, source="subinterpreters-run-string-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "_xxsubinterpreters", "run_string")
+    _scan_for_critical_global(payload, "subinterpreters-run-string-rce.pkl", "_xxsubinterpreters", "run_string")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -4880,10 +4816,7 @@ def test_scan_bytes_blocks_inspect_getmembers_descriptor_rce(tmp_path: Path) -> 
     assert type(control_result).__name__ == "DerivedPath"
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="inspect-getmembers-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "inspect", "getmembers")
+    _scan_for_critical_global(payload, "inspect-getmembers-rce.pkl", "inspect", "getmembers")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -4904,10 +4837,7 @@ def test_scan_bytes_blocks_builtins_hasattr_descriptor_rce(tmp_path: Path) -> No
     assert type(control_result).__name__ == "DerivedPath"
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="builtins-hasattr-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "hasattr")
+    _scan_for_critical_global(payload, "builtins-hasattr-rce.pkl", "builtins", "hasattr")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -4921,8 +4851,7 @@ def test_scan_bytes_blocks_builtins_type_del_finalizer_rce(tmp_path: Path) -> No
     payload = _builtins_type_del_finalizer_payload(marker, drop_instance=True)
 
     control_report = scan_bytes(control_payload, source="builtins-type-del-finalizer-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -4932,8 +4861,7 @@ def test_scan_bytes_blocks_builtins_type_del_finalizer_rce(tmp_path: Path) -> No
 
     report = scan_bytes(payload, source="builtins-type-del-finalizer-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -4950,8 +4878,7 @@ def test_scan_bytes_blocks_builtins_type_dynamic_del_finalizer_rce(tmp_path: Pat
         control_payload,
         source="builtins-type-dynamic-del-finalizer-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -4961,8 +4888,7 @@ def test_scan_bytes_blocks_builtins_type_dynamic_del_finalizer_rce(tmp_path: Pat
 
     report = scan_bytes(payload, source="builtins-type-dynamic-del-finalizer-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -4979,8 +4905,7 @@ def test_scan_bytes_fails_closed_on_dynamic_type_unknown_key_overflow(tmp_path: 
         control_payload,
         source="builtins-type-dynamic-del-overflow-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_unknown_key_overflow_finding(control_report)
+    _assert_suspicious_unknown_key_overflow(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -4990,8 +4915,7 @@ def test_scan_bytes_fails_closed_on_dynamic_type_unknown_key_overflow(tmp_path: 
 
     report = scan_bytes(payload, source="builtins-type-dynamic-del-overflow-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_unknown_key_overflow_finding(report)
+    _assert_suspicious_unknown_key_overflow(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5008,8 +4932,7 @@ def test_scan_bytes_blocks_type_new_dynamic_del_finalizer_rce(tmp_path: Path) ->
         control_payload,
         source="builtins-type-new-dynamic-del-finalizer-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5019,8 +4942,7 @@ def test_scan_bytes_blocks_type_new_dynamic_del_finalizer_rce(tmp_path: Path) ->
 
     report = scan_bytes(payload, source="builtins-type-new-dynamic-del-finalizer-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5037,8 +4959,7 @@ def test_scan_bytes_blocks_type_call_dynamic_del_finalizer_rce(tmp_path: Path) -
         control_payload,
         source="builtins-type-call-dynamic-del-finalizer-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5048,8 +4969,7 @@ def test_scan_bytes_blocks_type_call_dynamic_del_finalizer_rce(tmp_path: Path) -
 
     report = scan_bytes(payload, source="builtins-type-call-dynamic-del-finalizer-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5066,8 +4986,7 @@ def test_scan_bytes_blocks_dict_constructor_dynamic_type_namespace_rce(tmp_path:
         control_payload,
         source="builtins-type-dict-constructor-dynamic-del-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_unknown_key_overflow_finding(control_report)
+    _assert_suspicious_unknown_key_overflow(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5077,8 +4996,7 @@ def test_scan_bytes_blocks_dict_constructor_dynamic_type_namespace_rce(tmp_path:
 
     report = scan_bytes(payload, source="builtins-type-dict-constructor-dynamic-del-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_unknown_key_overflow_finding(report)
+    _assert_suspicious_unknown_key_overflow(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5117,8 +5035,7 @@ def test_scan_bytes_blocks_mutated_dynamic_type_namespace_rce(
         control_payload,
         source=f"{mutator_module.decode()}-{mutator_name.decode()}-dynamic-del-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5131,8 +5048,7 @@ def test_scan_bytes_blocks_mutated_dynamic_type_namespace_rce(
         source=f"{mutator_module.decode()}-{mutator_name.decode()}-dynamic-del-rce.pkl",
     )
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5174,8 +5090,7 @@ def test_scan_bytes_blocks_update_mutated_dynamic_type_namespace_rce(
         control_payload,
         source=f"{mutator_module.decode()}-{mutator_name.decode()}-dynamic-del-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5188,8 +5103,7 @@ def test_scan_bytes_blocks_update_mutated_dynamic_type_namespace_rce(
         source=f"{mutator_module.decode()}-{mutator_name.decode()}-dynamic-del-rce.pkl",
     )
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5229,8 +5143,7 @@ def test_scan_bytes_fails_closed_on_untracked_update_mutated_dynamic_type_namesp
         control_payload,
         source=f"{mutator_module.decode()}-{mutator_name.decode()}-untracked-update-control.pkl",
     )
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_unknown_key_overflow_finding(control_report)
+    _assert_suspicious_unknown_key_overflow(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5243,8 +5156,7 @@ def test_scan_bytes_fails_closed_on_untracked_update_mutated_dynamic_type_namesp
         source=f"{mutator_module.decode()}-{mutator_name.decode()}-untracked-update-rce.pkl",
     )
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_unknown_key_overflow_finding(report)
+    _assert_suspicious_unknown_key_overflow(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5264,8 +5176,7 @@ def test_scan_bytes_blocks_dict_copy_of_mutated_dynamic_type_namespace_rce(tmp_p
     )
 
     control_report = scan_bytes(control_payload, source="builtins-type-dict-copy-dynamic-del-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5275,8 +5186,7 @@ def test_scan_bytes_blocks_dict_copy_of_mutated_dynamic_type_namespace_rce(tmp_p
 
     report = scan_bytes(payload, source="builtins-type-dict-copy-dynamic-del-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5296,8 +5206,7 @@ def test_scan_bytes_blocks_dup_alias_mutated_dynamic_type_namespace_rce(tmp_path
     )
 
     control_report = scan_bytes(control_payload, source="builtins-type-dup-alias-dynamic-del-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5307,8 +5216,7 @@ def test_scan_bytes_blocks_dup_alias_mutated_dynamic_type_namespace_rce(tmp_path
 
     report = scan_bytes(payload, source="builtins-type-dup-alias-dynamic-del-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5322,8 +5230,7 @@ def test_scan_bytes_blocks_object_class_type_constructor_alias_rce(tmp_path: Pat
     payload = _builtins_object_class_dynamic_del_finalizer_payload(marker, drop_instance=True)
 
     control_report = scan_bytes(control_payload, source="builtins-object-class-type-constructor-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5333,8 +5240,7 @@ def test_scan_bytes_blocks_object_class_type_constructor_alias_rce(tmp_path: Pat
 
     report = scan_bytes(payload, source="builtins-object-class-type-constructor-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5348,8 +5254,7 @@ def test_scan_bytes_blocks_type_setattr_dynamic_del_finalizer_rce(tmp_path: Path
     payload = _builtins_type_setattr_dynamic_del_finalizer_payload(marker, drop_instance=True)
 
     control_report = scan_bytes(control_payload, source="builtins-type-setattr-dynamic-del-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5359,8 +5264,7 @@ def test_scan_bytes_blocks_type_setattr_dynamic_del_finalizer_rce(tmp_path: Path
 
     report = scan_bytes(payload, source="builtins-type-setattr-dynamic-del-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5385,8 +5289,7 @@ def test_scan_bytes_blocks_type_constructor_type_class_alias_rce(
     payload = payload_factory(marker, drop_instance=True, type_value_name=b"type.__class__")
 
     control_report = scan_bytes(control_payload, source=f"builtins-{constructor_name}-type-class-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(control_report)
+    _assert_suspicious_callable_attribute(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5396,8 +5299,7 @@ def test_scan_bytes_blocks_type_constructor_type_class_alias_rce(
 
     report = scan_bytes(payload, source=f"builtins-{constructor_name}-type-class-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_dynamic_type_callable_attribute_finding(report)
+    _assert_suspicious_callable_attribute(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5411,8 +5313,7 @@ def test_scan_bytes_blocks_builtins_type_eq_comparison_rce(tmp_path: Path) -> No
     payload = _builtins_type_eq_comparison_payload(marker, include_call=True)
 
     control_report = scan_bytes(control_payload, source="builtins-type-eq-comparison-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5421,8 +5322,7 @@ def test_scan_bytes_blocks_builtins_type_eq_comparison_rce(tmp_path: Path) -> No
 
     report = scan_bytes(payload, source="builtins-type-eq-comparison-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5459,8 +5359,7 @@ def test_scan_bytes_blocks_builtins_type_unary_operator_rce(
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-unary-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5469,8 +5368,7 @@ def test_scan_bytes_blocks_builtins_type_unary_operator_rce(
 
     report = scan_bytes(payload, source=f"builtins-type-{operator_name}-unary-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5509,8 +5407,7 @@ def test_scan_bytes_blocks_builtins_type_iteration_protocol_rce(
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{builtin_name}-iteration-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5519,8 +5416,7 @@ def test_scan_bytes_blocks_builtins_type_iteration_protocol_rce(
 
     report = scan_bytes(payload, source=f"builtins-type-{builtin_name}-iteration-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     if raises_type_error:
@@ -5564,8 +5460,7 @@ def test_scan_bytes_blocks_builtins_type_rounding_protocol_rce(
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{helper_name}-rounding-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5574,8 +5469,7 @@ def test_scan_bytes_blocks_builtins_type_rounding_protocol_rce(
 
     report = scan_bytes(payload, source=f"builtins-type-{helper_name}-rounding-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5666,8 +5560,7 @@ def test_scan_bytes_blocks_builtins_type_presentation_protocol_rce(
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{helper_name}-presentation-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     assert not marker.is_symlink()
@@ -5678,8 +5571,7 @@ def test_scan_bytes_blocks_builtins_type_presentation_protocol_rce(
 
     report = scan_bytes(payload, source=f"builtins-type-{helper_name}-presentation-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     if _runtime_before((3, 11)):
         return
@@ -5705,8 +5597,7 @@ def test_scan_bytes_blocks_builtins_type_fspath_protocol_file_write_rce(tmp_path
     payload = _builtins_type_fspath_protocol_payload(marker, include_write=True)
 
     control_report = scan_bytes(control_payload, source="builtins-type-fspath-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5796,8 +5687,7 @@ def test_scan_bytes_blocks_builtins_type_descriptor_set_name_rce(tmp_path: Path)
     payload = _builtins_type_descriptor_set_name_payload(marker, include_owner_class=True)
 
     control_report = scan_bytes(control_payload, source="builtins-type-descriptor-set-name-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5806,8 +5696,7 @@ def test_scan_bytes_blocks_builtins_type_descriptor_set_name_rce(tmp_path: Path)
 
     report = scan_bytes(payload, source="builtins-type-descriptor-set-name-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5880,8 +5769,7 @@ def test_scan_bytes_blocks_builtins_type_reflected_binary_operator_rce(
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-reflected-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5890,8 +5778,7 @@ def test_scan_bytes_blocks_builtins_type_reflected_binary_operator_rce(
 
     report = scan_bytes(payload, source=f"builtins-type-{operator_name}-reflected-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -5954,8 +5841,7 @@ def test_scan_bytes_blocks_builtins_type_ordering_comparison_rce(
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-comparison-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -5964,8 +5850,7 @@ def test_scan_bytes_blocks_builtins_type_ordering_comparison_rce(
 
     report = scan_bytes(payload, source=f"builtins-type-{operator_name}-comparison-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6000,8 +5885,7 @@ def test_scan_bytes_blocks_builtins_type_item_protocol_rce(
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-item-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6010,8 +5894,7 @@ def test_scan_bytes_blocks_builtins_type_item_protocol_rce(
 
     report = scan_bytes(payload, source=f"builtins-type-{operator_name}-item-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6025,8 +5908,7 @@ def test_scan_bytes_blocks_builtins_type_contains_membership_rce(tmp_path: Path)
     payload = _builtins_type_contains_membership_payload(marker, include_call=True)
 
     control_report = scan_bytes(control_payload, source="builtins-type-contains-membership-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6035,8 +5917,7 @@ def test_scan_bytes_blocks_builtins_type_contains_membership_rce(tmp_path: Path)
 
     report = scan_bytes(payload, source="builtins-type-contains-membership-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6050,8 +5931,7 @@ def test_scan_bytes_blocks_builtins_type_setitem_assignment_rce(tmp_path: Path) 
     payload = _builtins_type_setitem_assignment_payload(marker, include_call=True)
 
     control_report = scan_bytes(control_payload, source="builtins-type-setitem-assignment-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6104,10 +5984,7 @@ def test_scan_bytes_blocks_builtins_staticmethod_descriptor_rce(tmp_path: Path) 
     assert isinstance(control_result, staticmethod)
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="builtins-staticmethod-descriptor-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "staticmethod")
+    _scan_for_critical_global(payload, "builtins-staticmethod-descriptor-rce.pkl", "builtins", "staticmethod")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6128,10 +6005,7 @@ def test_scan_bytes_blocks_builtins_property_get_descriptor_rce(tmp_path: Path) 
     assert isinstance(control_result, property)
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="builtins-property-get-descriptor-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "property.__get__")
+    _scan_for_critical_global(payload, "builtins-property-get-descriptor-rce.pkl", "builtins", "property.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6154,10 +6028,7 @@ def test_scan_bytes_blocks_builtins_classmethod_get_descriptor_rce(tmp_path: Pat
     assert control_result.__self__ == marker
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="builtins-classmethod-get-descriptor-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "classmethod.__get__")
+    _scan_for_critical_global(payload, "builtins-classmethod-get-descriptor-rce.pkl", "builtins", "classmethod.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6180,10 +6051,7 @@ def test_scan_bytes_blocks_private_functools_partial_rce(tmp_path: Path) -> None
     assert type(control_result).__name__ == "partial"
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="private-functools-partial-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "_functools", "partial")
+    _scan_for_critical_global(payload, "private-functools-partial-rce.pkl", "_functools", "partial")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6206,10 +6074,7 @@ def test_scan_bytes_blocks_private_functools_reduce_rce(tmp_path: Path) -> None:
     assert len(control_result) == 3
     assert not marker.exists()
 
-    report = scan_bytes(payload, source="private-functools-reduce-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "_functools", "reduce")
+    _scan_for_critical_global(payload, "private-functools-reduce-rce.pkl", "_functools", "reduce")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6240,10 +6105,7 @@ def test_scan_bytes_blocks_functools_callable_wrapper_rce(tmp_path: Path, factor
     assert callable(control_result)
     assert not marker.exists()
 
-    report = scan_bytes(payload, source=f"functools-{factory_name}-wrapper-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "functools", factory_name)
+    _scan_for_critical_global(payload, f"functools-{factory_name}-wrapper-rce.pkl", "functools", factory_name)
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6255,10 +6117,7 @@ def test_scan_bytes_blocks_unittest_mock_side_effect_rce(tmp_path: Path) -> None
     marker = tmp_path / "unittest_mock_side_effect_rce_marker"
     payload = _unittest_mock_side_effect_payload(marker)
 
-    report = scan_bytes(payload, source="unittest-mock-side-effect-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "unittest.mock", "Mock")
+    _scan_for_critical_global(payload, "unittest-mock-side-effect-rce.pkl", "unittest.mock", "Mock")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6270,10 +6129,9 @@ def test_scan_bytes_blocks_threadpool_executor_submitted_callback_rce(tmp_path: 
     marker = tmp_path / "threadpool_executor_submitted_callback_rce_marker"
     payload = _threadpool_executor_submit_payload(marker)
 
-    report = scan_bytes(payload, source="threadpool-executor-submit-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "concurrent.futures", "ThreadPoolExecutor.submit")
+    report = _scan_for_critical_global(
+        payload, "threadpool-executor-submit-rce.pkl", "concurrent.futures", "ThreadPoolExecutor.submit"
+    )
     assert _has_critical_global_finding(report, "concurrent.futures", "ThreadPoolExecutor.shutdown")
 
     assert not marker.exists()
@@ -6295,10 +6153,9 @@ def test_scan_bytes_blocks_processpool_executor_submitted_callback_rce(tmp_path:
     marker = tmp_path / "processpool_executor_submitted_callback_rce_marker"
     payload = _processpool_executor_submit_payload(marker)
 
-    report = scan_bytes(payload, source="processpool-executor-submit-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "concurrent.futures", "ProcessPoolExecutor.submit")
+    report = _scan_for_critical_global(
+        payload, "processpool-executor-submit-rce.pkl", "concurrent.futures", "ProcessPoolExecutor.submit"
+    )
     assert _has_critical_global_finding(report, "concurrent.futures", "ProcessPoolExecutor.shutdown")
 
     script_path = tmp_path / "run_processpool_payload.py"
@@ -6459,10 +6316,7 @@ def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path)
 
     payload = pickle.dumps(DataclassesCreateFnRce(), protocol=4)
 
-    report = scan_bytes(payload, source="dataclasses-create-fn-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "dataclasses", "_create_fn")
+    _scan_for_critical_global(payload, "dataclasses-create-fn-rce.pkl", "dataclasses", "_create_fn")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6488,10 +6342,7 @@ def test_scan_bytes_blocks_pipes_template_copy_pipeline_rce(tmp_path: Path) -> N
 
     payload = pickle.dumps(PipesTemplateCopyRce(), protocol=4)
 
-    report = scan_bytes(payload, source="pipes-template-copy-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "pipes", "Template.copy")
+    _scan_for_critical_global(payload, "pipes-template-copy-rce.pkl", "pipes", "Template.copy")
 
     assert not marker.exists()
     pickle.loads(payload)
@@ -6503,10 +6354,7 @@ def test_scan_bytes_blocks_operator_call_public_alias_rce(tmp_path: Path) -> Non
     marker = tmp_path / "operator_call_rce_marker"
     payload = _operator_call_payload(marker)
 
-    report = scan_bytes(payload, source="operator-call-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "operator", "call")
+    _scan_for_critical_global(payload, "operator-call-rce.pkl", "operator", "call")
 
     import operator
 
@@ -6523,10 +6371,7 @@ def test_scan_bytes_blocks_builtins_map_forced_iteration_rce(tmp_path: Path) -> 
     marker = tmp_path / "builtins_map_tuple_rce_marker"
     payload = _builtins_map_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="builtins-map-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "map")
+    _scan_for_critical_global(payload, "builtins-map-tuple-rce.pkl", "builtins", "map")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6538,10 +6383,7 @@ def test_scan_bytes_blocks_builtins_filter_forced_iteration_rce(tmp_path: Path) 
     marker = tmp_path / "builtins_filter_tuple_rce_marker"
     payload = _builtins_filter_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="builtins-filter-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "builtins", "filter")
+    _scan_for_critical_global(payload, "builtins-filter-tuple-rce.pkl", "builtins", "filter")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6553,10 +6395,7 @@ def test_scan_bytes_blocks_itertools_accumulate_binary_function_rce(tmp_path: Pa
     marker = tmp_path / "itertools_accumulate_tuple_rce_marker"
     payload = _itertools_accumulate_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="itertools-accumulate-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "itertools", "accumulate")
+    _scan_for_critical_global(payload, "itertools-accumulate-tuple-rce.pkl", "itertools", "accumulate")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6568,10 +6407,7 @@ def test_scan_bytes_blocks_itertools_dropwhile_forced_iteration_rce(tmp_path: Pa
     marker = tmp_path / "itertools_dropwhile_tuple_rce_marker"
     payload = _itertools_dropwhile_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="itertools-dropwhile-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "itertools", "dropwhile")
+    _scan_for_critical_global(payload, "itertools-dropwhile-tuple-rce.pkl", "itertools", "dropwhile")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6583,10 +6419,7 @@ def test_scan_bytes_blocks_itertools_filterfalse_forced_iteration_rce(tmp_path: 
     marker = tmp_path / "itertools_filterfalse_tuple_rce_marker"
     payload = _itertools_filterfalse_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="itertools-filterfalse-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "itertools", "filterfalse")
+    _scan_for_critical_global(payload, "itertools-filterfalse-tuple-rce.pkl", "itertools", "filterfalse")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6598,10 +6431,7 @@ def test_scan_bytes_blocks_itertools_groupby_key_function_rce(tmp_path: Path) ->
     marker = tmp_path / "itertools_groupby_tuple_rce_marker"
     payload = _itertools_groupby_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="itertools-groupby-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "itertools", "groupby")
+    _scan_for_critical_global(payload, "itertools-groupby-tuple-rce.pkl", "itertools", "groupby")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6616,10 +6446,7 @@ def test_scan_bytes_blocks_itertools_starmap_forced_iteration_rce(tmp_path: Path
     marker = tmp_path / "itertools_starmap_tuple_rce_marker"
     payload = _itertools_starmap_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="itertools-starmap-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "itertools", "starmap")
+    _scan_for_critical_global(payload, "itertools-starmap-tuple-rce.pkl", "itertools", "starmap")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6631,10 +6458,7 @@ def test_scan_bytes_blocks_itertools_takewhile_forced_iteration_rce(tmp_path: Pa
     marker = tmp_path / "itertools_takewhile_tuple_rce_marker"
     payload = _itertools_takewhile_tuple_payload(marker)
 
-    report = scan_bytes(payload, source="itertools-takewhile-tuple-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "itertools", "takewhile")
+    _scan_for_critical_global(payload, "itertools-takewhile-tuple-rce.pkl", "itertools", "takewhile")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6646,10 +6470,7 @@ def test_scan_bytes_blocks_typing_eval_type_forward_ref_rce(tmp_path: Path) -> N
     marker = tmp_path / "typing_eval_type_forward_ref_rce_marker"
     payload = _typing_eval_type_forward_ref_payload(marker)
 
-    report = scan_bytes(payload, source="typing-eval-type-forward-ref-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "typing", "_eval_type")
+    _scan_for_critical_global(payload, "typing-eval-type-forward-ref-rce.pkl", "typing", "_eval_type")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6661,10 +6482,7 @@ def test_scan_bytes_blocks_typing_get_type_hints_annotation_rce(tmp_path: Path) 
     marker = tmp_path / "typing_get_type_hints_rce_marker"
     payload = _typing_get_type_hints_payload(marker)
 
-    report = scan_bytes(payload, source="typing-get-type-hints-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "typing", "get_type_hints")
+    _scan_for_critical_global(payload, "typing-get-type-hints-rce.pkl", "typing", "get_type_hints")
 
     assert not marker.exists()
     result = pickle.loads(payload)
@@ -6690,10 +6508,7 @@ def test_scan_bytes_blocks_setuptools_distutils_spawn_rce(tmp_path: Path) -> Non
 
     payload = pickle.dumps(SetuptoolsDistutilsSpawnRce(), protocol=4)
 
-    report = scan_bytes(payload, source="setuptools-distutils-spawn-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_global_finding(report, "setuptools._distutils.spawn", "spawn")
+    _scan_for_critical_global(payload, "setuptools-distutils-spawn-rce.pkl", "setuptools._distutils.spawn", "spawn")
 
     assert not marker.exists()
     pickle.loads(payload)
@@ -6903,8 +6718,7 @@ def _assert_binary_operator_rce(tmp_path: Path, method_name: str, operator_name:
     )
 
     control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-{operator_kind}-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
+    _assert_suspicious_magic_method(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -6913,8 +6727,7 @@ def _assert_binary_operator_rce(tmp_path: Path, method_name: str, operator_name:
 
     report = scan_bytes(payload, source=f"builtins-type-{operator_name}-{operator_kind}-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
+    _assert_suspicious_magic_method(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)
