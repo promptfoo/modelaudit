@@ -7507,6 +7507,71 @@ def test_scan_file_keeps_untrusted_storage_lookalikes_on_hidden_pickle_path(
         assert any(notice.code == expected_notice_code for notice in report.notices)
 
 
+def test_large_tensor_batches_validate_all_storage_ids_without_changing_discovery(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-state.pt"
+    records = []
+    for record in range(2000):
+        fields = []
+        for column in range(3):
+            key = str(3 * record + column)
+            tensor = (
+                _pytorch_rebuild_tensor_v2_payload(key=key)[2:-1]
+                if record == 0 and column == 0
+                else _pytorch_rebuild_tensor_v2_reduce_expr(key=key)
+            )
+            fields.append(_short_binunicode(f"field_{column}".encode("ascii")) + tensor)
+        records.append(b"}(" + b"".join(fields) + b"u")
+    batches = (b"(" + b"".join(records[i : i + 1000]) + b"e" for i in range(0, len(records), 1000))
+    payload = b"\x80\x04]" + b"".join(batches) + b"."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", payload)
+        for i in range(len(records) * 3):
+            archive.writestr(f"archive/data/{i}", bytes(24))
+
+    report = scan_file(archive_path)
+
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    "defect", ["none", "size", "missing", "foreign-pid", "device", "second-stream", "truncated", "budget", "provenance"]
+)
+def test_large_storage_pid_proof_requires_complete_archive_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    monkeypatch.setattr(package_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    if defect == "provenance":
+        monkeypatch.setattr(package_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES", 1)
+    first = _pytorch_rebuild_tensor_v2_payload(key="0")[2:-1]
+    last = _pytorch_rebuild_tensor_v2_reduce_expr(key="1", location="custom:0" if defect == "device" else "cpu")
+    payload = b"\x80\x04}" + _short_binunicode(b"a") + first + b"s" + _short_binunicode(b"b") + last + b"s"
+    if defect == "foreign-pid":
+        payload += b"K\x01Q"
+    if defect != "truncated":
+        payload += b"."
+    if defect == "second-stream":
+        payload += b"Pexternal\n."
+    archive_path = tmp_path / "checkpoint.pt"
+    hidden_pickle = b"cos\nsystem\n(S'x'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/data/0", hidden_pickle.ljust(24, b"\x00"))
+        if defect != "missing":
+            archive.writestr("archive/data/1", bytes(23 if defect == "size" else 24))
+    options = ScanOptions(max_opcodes=20) if defect == "budget" else ScanOptions()
+
+    report = scan_file(archive_path, options=options)
+
+    assert any(f.rule_code == "PERSISTENT_ID" for f in report.findings) is (defect != "none")
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
+    _assert_storage_dangerous_call(report, archive_path)
+
+
 def test_scan_file_marks_storage_reference_opcode_budget_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

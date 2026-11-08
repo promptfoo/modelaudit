@@ -16,6 +16,7 @@ import re
 import stat
 import struct
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import suppress
@@ -76,7 +77,7 @@ from .pickle_scanner import (
     _pickle_literal_url_is_proven_inert,
     _pickle_literal_url_stripped_scan_view,
 )
-from .picklescan_adapter import apply_pickle_member_context
+from .picklescan_adapter import apply_pickle_member_context, scan_options_from_config
 from .pytorch_zip_support import (
     RelaxedZipCrcTracker,
     find_zip_entry,
@@ -339,6 +340,7 @@ class _ValidatedPytorchStorageDataPklMembers:
     storage_keys_by_data_pkl: dict[str, set[str]]
     storage_probe_keys_by_data_pkl: dict[str, set[str]]
     persistent_id_downgrade_keys_by_data_pkl: dict[str, set[str]]
+    additional_pid_keys_by_data_pkl: dict[str, set[str]]
     storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
 
 
@@ -805,6 +807,7 @@ class PyTorchZipScanner(BaseScanner):
                     path,
                     trusted_pytorch_storage_persistent_id_data_pkl_members=(
                         validated_storage_data_pkl_members.persistent_id_downgrade_keys_by_data_pkl
+                        | validated_storage_data_pkl_members.additional_pid_keys_by_data_pkl
                     ),
                     trusted_storage_blob_members=self._storage_blob_members_from_data_pkl_members(
                         validated_storage_data_pkl_members.storage_keys_by_data_pkl
@@ -8471,6 +8474,15 @@ class PyTorchZipScanner(BaseScanner):
         trusted_members: dict[str, set[str]] = {}
         storage_probe_members: dict[str, set[str]] = {}
         persistent_id_downgrade_members: dict[str, set[str]] = {}
+        additional_pid_keys: dict[str, set[str]] = {}
+        large_pid_keys = getattr(_picklescan_api, "_large_pytorch_zip_storage_pid_keys", None)
+        large_pid_budget = [
+            min(
+                getattr(_picklescan_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES", 0),
+                max(0, scan_options_from_config(self.config).max_opcodes - _PYTORCH_STORAGE_TRUST_MAX_OPCODES),
+            )
+        ]
+        large_pid_provenance_budget = [getattr(_picklescan_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES", 0)]
         storage_member_sizes_by_data_pkl: dict[str, dict[str, int]] = {}
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
@@ -8551,6 +8563,16 @@ class PyTorchZipScanner(BaseScanner):
                 opcode_budget_remaining=storage_reference_opcodes_remaining,
             )
             if not reference_parse.parse_complete:
+                if large_pid_keys is not None:
+                    pid_keys = large_pid_keys(
+                        pickle_data,
+                        {key: entry.file_size for key, entry in storage_entries_by_key.items()},
+                        opcode_budget_remaining=large_pid_budget,
+                        provenance_budget_remaining=large_pid_provenance_budget,
+                        deadline=time.monotonic() + self._get_remaining_time(),
+                    )
+                    if pid_keys:
+                        additional_pid_keys[data_pkl_member] = pid_keys
                 self._record_storage_reference_validation_incomplete(
                     result,
                     data_pkl_member=data_pkl_member,
@@ -8604,6 +8626,7 @@ class PyTorchZipScanner(BaseScanner):
             storage_keys_by_data_pkl=trusted_members,
             storage_probe_keys_by_data_pkl=storage_probe_members,
             persistent_id_downgrade_keys_by_data_pkl=persistent_id_downgrade_members,
+            additional_pid_keys_by_data_pkl=additional_pid_keys,
             storage_member_sizes_by_data_pkl=storage_member_sizes_by_data_pkl,
         )
 

@@ -252,6 +252,8 @@ _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES = 64 * 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES = 256_000
+_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES = 2_000_000
 _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
@@ -1176,6 +1178,10 @@ def _validated_pytorch_storage_entry_ids(
     notices: list[Notice] = []
     storage_reference_bytes_read = 0
     storage_reference_opcodes_remaining = [min(_PYTORCH_STORAGE_TRUST_MAX_OPCODES, options.max_opcodes)]
+    large_pid_opcodes_remaining = [
+        min(_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES, options.max_opcodes - storage_reference_opcodes_remaining[0])
+    ]
+    large_pid_provenance_remaining = [_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES]
     for data_pkl_name, data_pkl_entries in entries_by_name.items():
         _check_pytorch_zip_deadline(deadline)
         if data_pkl_name.rsplit("/", 1)[-1] != "data.pkl":
@@ -1256,6 +1262,17 @@ def _validated_pytorch_storage_entry_ids(
             deadline=deadline,
         )
         if not reference_parse.parse_complete:
+            # This proof covers PID findings only. Leave generic member probing and
+            # its coverage diagnostic intact when archive discovery exhausted its budget.
+            pid_keys = _large_pytorch_zip_storage_pid_keys(
+                pickle_data,
+                {key: entry.file_size for key, entry in storage_entries_by_key.items()},
+                opcode_budget_remaining=large_pid_opcodes_remaining,
+                provenance_budget_remaining=large_pid_provenance_remaining,
+                deadline=deadline,
+            )
+            if pid_keys:
+                trusted_data_pkl_by_name[data_pkl_name] = _PytorchZipDataPickleTrust(pid_keys, frozenset())
             notices.append(
                 _pytorch_zip_storage_reference_validation_notice(
                     source=source,
@@ -1357,6 +1374,45 @@ def _trusted_pytorch_data_pkl_from_storage_member_sizes(
     storage_member_sizes: Mapping[str, int],
 ) -> _PytorchZipDataPickleTrust | None:
     reference_parse = _pytorch_storage_keys_from_pickle_bytes(pickle_data)
+    return _trusted_pytorch_storage_member_sizes(reference_parse, storage_member_sizes)
+
+
+def _large_pytorch_zip_storage_pid_keys(
+    pickle_data: bytes,
+    storage_member_sizes: Mapping[str, int],
+    *,
+    opcode_budget_remaining: list[int],
+    provenance_budget_remaining: list[int],
+    deadline: float,
+) -> set[str]:
+    # A single complete stream can validate PID warnings after discovery reaches
+    # its separate opcode cap. Never use this proof to change member routing.
+    if (
+        len(pickle_data) <= _PYTORCH_STORAGE_TRUST_MAX_OPCODES
+        or opcode_budget_remaining[0] <= 0
+        or provenance_budget_remaining[0] <= 0
+    ):
+        return set()
+    parsed = _parse_single_pytorch_storage_stream(
+        pickle_data,
+        opcode_budget_remaining=opcode_budget_remaining,
+        max_opcodes=_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES,
+        large_pid_provenance_remaining=provenance_budget_remaining,
+        deadline=deadline,
+        position_offset=0,
+    )
+    if not parsed.canonical_tensor_rebuild_invocations or not all(
+        _pytorch_storage_ref_has_zip_size_proof(ref) for ref in parsed.storage_refs_by_key.values()
+    ):
+        return set()
+    trust = _trusted_pytorch_storage_member_sizes(parsed, storage_member_sizes)
+    return trust.storage_keys if trust is not None else set()
+
+
+def _trusted_pytorch_storage_member_sizes(
+    reference_parse: _PytorchStorageReferenceParse,
+    storage_member_sizes: Mapping[str, int],
+) -> _PytorchZipDataPickleTrust | None:
     if (
         not reference_parse.parse_complete
         or not reference_parse.referenced_keys
@@ -3963,6 +4019,24 @@ def _pytorch_storage_keys_from_pickle_bytes(
             )
         )
 
+    return _parse_single_pytorch_storage_stream(
+        pickle_data,
+        opcode_budget_remaining=opcode_budget_remaining,
+        max_opcodes=_PYTORCH_STORAGE_TRUST_MAX_OPCODES,
+        deadline=deadline,
+        position_offset=position_offset,
+    )
+
+
+def _parse_single_pytorch_storage_stream(
+    pickle_data: bytes,
+    *,
+    opcode_budget_remaining: list[int] | None,
+    max_opcodes: int,
+    large_pid_provenance_remaining: list[int] | None = None,
+    deadline: float | None,
+    position_offset: int,
+) -> _PytorchStorageReferenceParse:
     marker = object()
     canonical_tensor = object()
     canonical_batch_placeholder = object()
@@ -4031,7 +4105,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
         nonlocal provenance_nodes_inspected
 
         provenance_nodes_inspected += 1
-        if provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
+        if large_pid_provenance_remaining is not None:
+            if large_pid_provenance_remaining[0] <= 0:
+                raise ValueError("PyTorch storage ID validation exhausted its archive provenance budget")
+            large_pid_provenance_remaining[0] -= 1
+        elif provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
             raise ValueError("PyTorch storage trust parser exceeded its bounded provenance workload")
         if deadline is not None and provenance_nodes_inspected % 1024 == 0:
             _check_pytorch_zip_deadline(deadline)
@@ -4323,7 +4401,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if opcode_budget_remaining[0] <= 0:
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 opcode_budget_remaining[0] -= 1
-            if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
+            if opcode_count > max_opcodes:
                 return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
             position = position_offset + (_pos if type(_pos) is int else 0)
             opcode_name = opcode.name
@@ -4344,7 +4422,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                 if not isinstance(_pos, int) or _pos + 1 != len(pickle_data):
-                    invalidate_tensor_rebuild_proof()
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 continue
             if opcode_name == "MARK":
                 stack.append(marker)
@@ -4488,7 +4566,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     poison_stack_top()
             elif opcode_name == "APPENDS":
                 unmarked_items = []
-                appended_items = pop_marked_tuple(unmarked_items=unmarked_items)
+                appended_items = pop_marked_tuple(
+                    max_width=(
+                        _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+                        if large_pid_provenance_remaining is not None
+                        else _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH
+                    ),
+                    unmarked_items=unmarked_items,
+                )
                 if appended_items is None or not stack:
                     clear_stack_after_malformed_provenance(
                         *(unmarked_items if appended_items is None else appended_items)

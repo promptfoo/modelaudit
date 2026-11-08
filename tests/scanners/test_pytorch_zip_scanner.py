@@ -8766,6 +8766,32 @@ def test_pytorch_zip_data_pkl_keeps_unvalidated_storage_pid_warning(tmp_path: Pa
     )
 
 
+@pytest.mark.parametrize("storage_size", [24, 23])
+def test_large_state_pid_validation_keeps_hidden_member_and_coverage_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_size: int
+) -> None:
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    monkeypatch.setattr(pytorch_zip_scanner_module._picklescan_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    model_path = tmp_path / "state.pt"
+    hidden_pickle = b"cos\nsystem\n(S'x'\ntR."
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", _pytorch_rebuild_tensor_v2_payload())
+        archive.writestr("archive/data/0", hidden_pickle.ljust(storage_size, b"\x00"))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues) is (
+        storage_size != 24
+    )
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_storage_reference_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_marks_storage_reference_opcode_budget_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -21211,6 +21237,7 @@ def test_pytorch_zip_literal_work_budget_checks_timeout_between_member_probes(
         storage_keys_by_data_pkl={"archive/data.pkl": {"0", "1"}},
         storage_probe_keys_by_data_pkl={},
         persistent_id_downgrade_keys_by_data_pkl={},
+        additional_pid_keys_by_data_pkl={},
         storage_member_sizes_by_data_pkl={},
     )
     buffer = io.BytesIO()
