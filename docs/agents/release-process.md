@@ -24,30 +24,26 @@ The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-pickle
 
 ## Release notes
 
-Add one file in `changes/` for ModelAudit or `packages/modelaudit-picklescan/changes/` for standalone PickleScan. Use a unique descriptive `.md` filename with lowercase letters, digits, and hyphens. Prefix it with the issue or PR number when known. A change affecting both packages can have different wording in each. Skip internal-only changes. For an open feature PR that already edits a shared changelog, move only that PR’s new bullets into a fragment and restore the shared file from the current base.
+Add one Towncrier fragment in `changes/` for ModelAudit or `packages/modelaudit-picklescan/changes/` for standalone PickleScan. Each file is plain Markdown and describes the effect on that package’s users. Internal-only changes can skip the fragment. When converting an open PR that already edits a shared changelog, move its new notes into a fragment and restore the shared changelog from the current base.
 
-For example, this entry belongs in `changes/1924-cli-triage.md`.
+Use `<issue-or-PR>.<type>.md`. The type is `highlight` for a major user-facing improvement, `upgrade` for compatibility or action users need to take, `security` for a security fix, or `other` for a secondary change. Towncrier supplies the section heading, list marker, and link to the issue or PR. If you have no issue or PR number yet, use a unique filename such as `+cli-triage.upgrade.md`. For a second note in the same category for the same issue, Towncrier also accepts a counter, such as `1924.upgrade.1.md`.
+
+The following upgrade note belongs in `changes/1924.upgrade.md`.
 
 ```markdown
-### Upgrade notes
-
-- When an OpenAI API key is set, documentation triage can send eligible findings and document text to OpenAI. Use `--no-triage` to keep the scan local.
+When an OpenAI API key is set, documentation triage can send eligible findings and document text to OpenAI. Use `--no-triage` to keep the scan local.
 ```
 
-Use `### Highlights` for the few changes readers should see first, `### Upgrade notes` for changed defaults, compatibility, or required actions, `### Security` for security fixes and advisory links, and `### Other changes` for secondary improvements. Include one or more Markdown bullets and link the originating PR if available. Each shipped filename stays in Git. For a later change, add a new filename.
-
-Run `python scripts/release_notes.py check` to validate the format. From a checkout of main with tags available, run `python scripts/release_notes.py pending --package modelaudit` or use `--package modelaudit-picklescan`. Each package uses its previous tag as the boundary.
+From the repository root, run `python scripts/release_notes.py check` to validate fragments. Run `python scripts/release_notes.py pending --package modelaudit` or `--package modelaudit-picklescan` to preview one package. These commands use uv and the pinned Towncrier environment in `scripts/release-tools/`. Each package uses its preceding tag as its boundary. Shipped fragment files stay in Git, so give later notes new filenames.
 
 ### Reviewing the rolling release PR
 
-Inspect the versioned section in each changed changelog. The metadata job renders the fragments beside the generated inventory; later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
+Inspect the versioned section in each changed changelog. The metadata job uses Towncrier to render the selected fragments beside the Release Please inventory. Later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
 
 ```markdown
-<!-- release-note: changes/1924-cli-triage.md -->
+<!-- release-note: changes/1924.upgrade.md -->
 
-### Upgrade notes
-
-- When an OpenAI API key is set, use `--no-triage` to keep documentation findings and document text local.
+When an OpenAI API key is set, use `--no-triage` to keep documentation findings and document text local.
 ```
 
 The most recently updated matching comment from a current writer wins for that filename. Edit that comment to revise the wording, or remove its marker and any earlier overrides for the same file to restore the fragment. New fragments appear independently. To apply edits before the next automatic refresh, run the existing metadata retry and check the resulting changelog diff before merging.

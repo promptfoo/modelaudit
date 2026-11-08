@@ -1,3 +1,0 @@
-### Other changes
-
-- Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached. [#1912](https://github.com/promptfoo/modelaudit/pull/1912)

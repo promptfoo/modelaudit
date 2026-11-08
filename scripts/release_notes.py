@@ -5,20 +5,19 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
-from collections import defaultdict
+import tempfile
 from pathlib import Path
 
 PACKAGES = {
     "modelaudit": (".", "v"),
     "modelaudit-picklescan": ("packages/modelaudit-picklescan", "modelaudit-picklescan-v"),
 }
-SECTIONS = ("Highlights", "Upgrade notes", "Security", "Other changes")
+TOOLS = Path(__file__).resolve().with_name("release-tools")
 RELEASE = re.compile(r"^## \[(Unreleased|\d+\.\d+\.\d+)\][^\n]*$", re.MULTILINE)
-SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.md\Z")
 INVENTORY = "<details>\n<summary>All changes</summary>"
-SECONDARY = "<details>\n<summary>Other changes</summary>"
 
 
 def git(*args: str) -> str:
@@ -58,38 +57,6 @@ def validate_unreleased(sections: dict[str, str], package: str, tag: str) -> Non
         )
 
 
-def parse_note(text: str, path: str) -> dict[str, list[str]]:
-    sections: dict[str, list[str]] = {}
-    section = None
-    for line in text.strip().splitlines():
-        if not line.strip():
-            continue
-        if line.startswith("### ") and line[4:] in SECTIONS:
-            section = line[4:]
-            if section in sections:
-                raise ValueError(f"{path}: duplicate {section}")
-            sections[section] = []
-        elif section is not None and line.startswith("- ") and line[2:].strip():
-            sections[section].append(line)
-        elif section is not None and sections[section] and line.startswith("  "):
-            sections[section][-1] += "\n" + line
-        else:
-            raise ValueError(f"{path}: expected a section ({', '.join(SECTIONS)}) followed by Markdown bullets")
-    if not sections or not all(sections.values()):
-        raise ValueError(f"{path}: empty release note")
-    return sections
-
-
-def fragments(folder: Path) -> list[Path]:
-    if folder.is_symlink():
-        raise ValueError(f"{folder}: expected a package-local directory of release notes")
-    paths = sorted(folder.glob("*"))
-    for path in paths:
-        if not SLUG.fullmatch(path.name) or path.is_symlink() or not path.is_file():
-            raise ValueError(f"Expected a Markdown fragment with a unique lowercase slug at {path}")
-    return paths
-
-
 def review_overrides(file: Path | None) -> dict[str, str]:
     if file is None:
         return {}
@@ -105,7 +72,16 @@ def review_overrides(file: Path | None) -> dict[str, str]:
     return overrides
 
 
-def collect(folder: Path, tag: str, reviews: dict[str, str]) -> dict[str, list[str]]:
+def pending_fragments(folder: Path, tag: str | None) -> list[Path]:
+    if folder.is_symlink():
+        raise ValueError(f"{folder}: expected a package-local directory of release notes")
+    paths = sorted(folder.glob("*"))
+    for path in paths:
+        if path.is_symlink() or not path.is_file() or path.suffix != ".md" or len(path.suffixes) < 2:
+            raise ValueError(f"{path}: expected a Towncrier Markdown fragment such as 123.upgrade.md")
+    if tag is None:
+        return paths
+
     ref = f"refs/tags/{tag}"
     if subprocess.run(["git", "show-ref", "--verify", "--quiet", ref]).returncode != 0:
         raise ValueError(f"Missing release boundary {tag}. Fetch it with 'git fetch origin tag {tag}'.")
@@ -114,27 +90,48 @@ def collect(folder: Path, tag: str, reviews: dict[str, str]) -> dict[str, list[s
     reused = sorted(tagged.intersection(changed) - {""})
     if reused:
         raise ValueError(f"{reused[0]}: this release note has shipped; use a new fragment filename")
-    summary: dict[str, list[str]] = defaultdict(list)
-    for path in fragments(folder):
-        name = path.as_posix()
-        if name in tagged:
-            continue
-        note = parse_note(reviews.get(name, path.read_text(encoding="utf-8")), name)
-        for group, bullets in note.items():
-            summary[group].extend(bullets)
-    return summary
+    return [path for path in paths if path.as_posix() not in tagged]
 
 
-def markdown(summary: dict[str, list[str]]) -> str:
-    out = []
-    for title in SECTIONS:
-        if lines := summary.get(title):
-            bullets = "\n".join(lines)
-            if title == "Other changes":
-                out.append(f"{SECONDARY}\n\n{bullets}\n\n</details>")
-            else:
-                out.append(f"### {title}\n\n{bullets}")
-    return "\n\n".join(out)
+def towncrier_summary(paths: list[Path], version: str, reviews: dict[str, str]) -> str:
+    if not paths:
+        return ""
+    # Stage only this component's pending fragments. Review comments replace prose,
+    # while the protected tool directory supplies the configuration and template.
+    with tempfile.TemporaryDirectory() as tmp:
+        stage = Path(tmp)
+        changes = stage / "changes"
+        changes.mkdir()
+        for filename in ("towncrier.toml", "template.md"):
+            shutil.copyfile(TOOLS / filename, stage / filename)
+        for path in paths:
+            body = reviews.get(path.as_posix(), path.read_text(encoding="utf-8"))
+            if not body.strip():
+                raise ValueError(f"{path}: empty release note")
+            (changes / path.name).write_text(body, encoding="utf-8", newline="\n")
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--frozen",
+                "--no-dev",
+                "--project",
+                str(TOOLS),
+                "towncrier",
+                "build",
+                "--draft",
+                "--config",
+                "towncrier.toml",
+                "--version",
+                version,
+            ],
+            cwd=stage,
+            capture_output=True,
+            encoding="utf-8",
+        )
+        if result.returncode:
+            raise ValueError(f"Towncrier could not render {paths[0].parent}: {result.stderr.strip()}")
+        return result.stdout.strip()
 
 
 def render(base: str, reviews: dict[str, str]) -> None:
@@ -166,10 +163,8 @@ def render(base: str, reviews: dict[str, str]) -> None:
             inventory = generated.rstrip().removesuffix("</details>").strip()
         else:
             inventory = inventory.strip() + "\n\n" + f"[Full comparison]({match[1]})"
-        summary = collect(Path(path) / "changes", prefix + before, reviews)
-        next_section = "\n\n".join(
-            filter(None, [heading, markdown(summary), f"{INVENTORY}\n\n{inventory}\n\n</details>"])
-        )
+        summary = towncrier_summary(pending_fragments(Path(path) / "changes", prefix + before), after, reviews)
+        next_section = "\n\n".join(filter(None, [heading, summary, f"{INVENTORY}\n\n{inventory}\n\n</details>"]))
         start = original.index(sections["Unreleased"])
         position = start + len(sections["Unreleased"])
         preamble = original[:start] + unreleased_section(package, prefix + after).rstrip()
@@ -205,16 +200,14 @@ def main() -> None:
             root = Path(path)
             sections = versioned_sections((root / "CHANGELOG.md").read_text(encoding="utf-8"))
             validate_unreleased(sections, package, prefix + current[path])
-            if args.base:
-                collect(root / "changes", prefix + previous[path], {})
-            else:
-                for fragment in fragments(root / "changes"):
-                    parse_note(fragment.read_text(encoding="utf-8"), fragment.as_posix())
+            tag = prefix + previous[path] if args.base else None
+            towncrier_summary(pending_fragments(root / "changes", tag), current[path], {})
     else:
         path, prefix = PACKAGES[args.package]
         if args.op == "pending":
             version = json.loads(Path(".release-please-manifest.json").read_text())[path]
-            print(markdown(collect(Path(path) / "changes", prefix + version, {})) or "No pending release notes.")
+            paths = pending_fragments(Path(path) / "changes", prefix + version)
+            print(towncrier_summary(paths, version, {}) or "No pending release notes.")
         else:
             file = Path(path) / "CHANGELOG.md"
             text = git("show", f"{args.ref}:{file.as_posix()}") if args.ref else file.read_text(encoding="utf-8")

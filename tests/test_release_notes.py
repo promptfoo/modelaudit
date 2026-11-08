@@ -72,19 +72,17 @@ def repository(tmp_path: Path) -> Path:
 
 def test_reviewed_notes_follow_each_package_across_release_boundaries(repository: Path) -> None:
     root = repository
-    source = "changes/triage.md"
-    fragment(root, source, "### Upgrade notes\n\n- Draft instructions.\n")
-    fragment(root, "changes/security-fix.md", "### Security\n\n- Updates a vulnerable dependency.\n")
-    fragment(root, f"{SIBLING}/changes/storage.md", "### Other changes\n\n- More storage coverage.\n")
+    source = "changes/42.upgrade.md"
+    fragment(root, source, "Draft instructions.\n")
+    fragment(root, "changes/43.security.md", "Updates a vulnerable dependency.\n")
+    fragment(root, f"{SIBLING}/changes/44.other.md", "More storage coverage.\n")
     base = commit(root, "first changes")
     write_manifest(root, "0.2.2", "0.1.2")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
     raw_section(root, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
     reviews = root.parent / f"{root.name}-reviews.json"
     marker = f"<!-- release-note: {source} -->"
-    reviews.write_text(
-        json.dumps([{"id": 1, "body": f"{marker}\r\n### Upgrade notes\r\n\r\n- Reviewed instructions."}])
-    )
+    reviews.write_text(json.dumps([{"id": 1, "body": f"{marker}\r\n\r\nReviewed instructions."}]))
     run(root, "render", "--base", base, "--reviews", str(reviews))
     changelogs = [root / "CHANGELOG.md", root / SIBLING / "CHANGELOG.md"]
     initial = [p.read_bytes() for p in changelogs]
@@ -93,6 +91,7 @@ def test_reviewed_notes_follow_each_package_across_release_boundaries(repository
     assert [p.read_bytes() for p in changelogs] == initial
     assert initial[0].count(b"Reviewed instructions.") == 1
     assert b"### Security\n\n- Updates a vulnerable dependency." in initial[0]
+    assert b"Reviewed instructions. [#42](https://github.com/promptfoo/modelaudit/issues/42)" in initial[0]
     assert b"Draft instructions" not in initial[0]
     assert b"storage coverage" not in initial[0]
     assert b"storage coverage" in initial[1]
@@ -102,7 +101,7 @@ def test_reviewed_notes_follow_each_package_across_release_boundaries(repository
     for file in changelogs:
         git(root, "restore", "--source", base, "--", str(file.relative_to(root)))
     write_manifest(root, "0.2.1", "0.1.1")
-    fragment(root, "changes/newer.md", "### Highlights\n\n- Newly merged.\n")
+    fragment(root, "changes/+late.highlight.md", "Newly merged.\n")
     base = commit(root, "another change while under review")
     write_manifest(root, "0.2.2", "0.1.2")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
@@ -122,7 +121,7 @@ def test_reviewed_notes_follow_each_package_across_release_boundaries(repository
     assert b"Reviewed instructions." in changelogs[0].read_bytes()
     assert b"Newly merged." in changelogs[0].read_bytes()
     sibling_after_release = changelogs[1].read_bytes()
-    fragment(root, "changes/later.md", "### Highlights\n\n- Post-release only.\n")
+    fragment(root, "changes/45.highlight.md", "Post-release only.\n")
     base = commit(root, "post-release change")
     pending = run(root, "pending", "--package", "modelaudit").stdout
     assert "Post-release only." in pending and "Reviewed instructions." not in pending
@@ -145,8 +144,10 @@ def test_invalid_unreleased_entries_and_fragments_report_a_fix(repository: Path,
     file.write_text(file.read_text().replace("## [Unreleased]", f"## [Unreleased]\n\n{entry}"))
     assert "changes/" in run(root, "check", check=False).stderr
     git(root, "restore", "CHANGELOG.md")
-    fragment(root, "changes/malformed.md", "### Bug fixes\n\n- Missing category.\n")
-    assert "malformed.md" in run(root, "check", check=False).stderr
+    fragment(root, "changes/7.unknown.md", "Misspelled category.\n")
+    invalid = run(root, "check", check=False)
+    assert invalid.returncode != 0
+    assert "7.unknown.md" in invalid.stderr
 
 
 def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Path) -> None:
@@ -163,16 +164,36 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
     assert (root / "CHANGELOG.md").read_bytes() == before
 
 
+def test_sibling_release_leaves_root_fragments_pending(repository: Path) -> None:
+    root = repository
+    fragment(root, "changes/42.upgrade.md", "Root callers must migrate.\n")
+    fragment(root, f"{SIBLING}/changes/42.other.md", "Standalone diagnostics improved.\n")
+    base = commit(root, "changes for both packages")
+    root_draft = run(root, "pending", "--package", "modelaudit").stdout
+    assert "Root callers must migrate." in root_draft
+    write_manifest(root, "0.2.1", "0.1.2")
+    raw_section(root, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    run(root, "render", "--base", base)
+    assert git(root, "diff", base, "--", "CHANGELOG.md") == ""
+    sibling = run(root, "extract", "--package", "modelaudit-picklescan", "--version", "0.1.2").stdout
+    assert "Standalone diagnostics improved." in sibling
+    assert "Root callers must migrate." not in sibling
+    commit(root, "standalone release")
+    git(root, "tag", "modelaudit-picklescan-v0.1.2")
+    assert run(root, "pending", "--package", "modelaudit").stdout == root_draft
+    assert run(root, "pending", "--package", "modelaudit-picklescan").stdout.strip() == "No pending release notes."
+
+
 def test_shipped_fragment_paths_cannot_be_silently_reused(repository: Path) -> None:
     root = repository
-    fragment(root, "changes/first.md", "### Other changes\n\n- First.\n")
+    fragment(root, "changes/46.other.md", "First.\n")
     base = commit(root, "first change")
     write_manifest(root, "0.2.2", "0.1.1")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
     run(root, "render", "--base", base)
     commit(root, "release")
     git(root, "tag", "v0.2.2")
-    fragment(root, "changes/first.md", "### Other changes\n\n- Different.\n")
+    fragment(root, "changes/46.other.md", "Different.\n")
     rejected = run(root, "pending", "--package", "modelaudit", check=False)
     assert rejected.returncode != 0
     assert "new fragment filename" in rejected.stderr
@@ -216,7 +237,7 @@ def test_publication_sends_the_exact_tagged_section(
     scratch = tmp_path_factory.mktemp("publish")
     (root / "scripts").mkdir()
     shutil.copyfile(SCRIPT, root / "scripts" / SCRIPT.name)
-    fragment(root, "changes/compatibility.md", "### Upgrade notes\n\n- Use the new interface.\n")
+    fragment(root, "changes/47.upgrade.md", "Use the new interface.\n")
     base = commit(root, "add reviewed fragment")
     write_manifest(root, "0.2.2", "0.1.1")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
@@ -273,17 +294,23 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
 ) -> None:
     root = repository
     scratch = tmp_path_factory.mktemp("review")
-    notes = "changes/triage.md"
+    notes = "changes/42.upgrade.md"
     (root / "scripts").mkdir()
     shutil.copyfile(SCRIPT, root / "scripts" / SCRIPT.name)
-    fragment(root, notes, "### Upgrade notes\n\n- Draft instructions.\n")
+    tools = root / "scripts/release-tools"
+    tools.mkdir()
+    for filename in ("towncrier.toml", "template.md", "uv.lock", "pyproject.toml"):
+        shutil.copyfile(SCRIPT.parent / "release-tools" / filename, tools / filename)
+    fragment(root, notes, "Draft instructions.\n")
     base = commit(root, "pending change")
     git(root, "update-ref", "refs/remotes/origin/main", base)
     (root / "scripts" / SCRIPT.name).write_text("raise SystemExit('candidate code was executed')\n")
+    (tools / "template.md").write_text("Candidate template was executed.\n")
+    (tools / "uv.lock").write_text("invalid-lock\n")
     write_manifest(root, "0.2.2", "0.1.1")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
     head = commit(root, "release proposal")
-    marker = f"<!-- release-note: {notes} -->\n\n### Upgrade notes\n\n- "
+    marker = f"<!-- release-note: {notes} -->\n\n"
     comments = [
         {"id": 1, "user": {"login": "editor"}, "body": marker + "Approved wording."},
         {"id": 2, "user": {"login": "visitor"}, "body": marker + "Unapproved wording."},
@@ -316,5 +343,6 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     subprocess.run(["bash", "-c", shell], cwd=root, env=env, check=True, capture_output=True)
     public = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2").stdout
     assert "Approved wording." in public
+    assert "Candidate template" not in public
     assert "Unapproved wording." not in public
     assert "Draft instructions." not in public

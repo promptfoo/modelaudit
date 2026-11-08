@@ -87,7 +87,7 @@ Driven from the shared `.github/workflows/release-please.yml`. The release PR me
 - **Fail-closed** — truncation, budget exhaustion, and engine errors must never return `SafetyVerdict.CLEAN`. Regressions here usually show up as `ScanStatus.COMPLETE` sneaking through the `_combine_verdict` / `_with_*_notice` paths in `api.py` — verify both `status` and `verdict` in tests.
 - **Standalone first** — when behavior belongs to pickle byte/stream analysis, prove it through the standalone public API and Rust-backed package tests before root adapter/parity checks. If Rust code changed, rebuild or otherwise prove `modelaudit_picklescan._rust` resolves to the current checkout before trusting Python results.
 - **Per-scan isolation** — no mutable global state may leak between scans. Tests that share a `PickleScanner` across calls must still see independent reports.
-- **Bounded resource use** — the `ScanOptions` defaults are a safety contract, not tunables. Adding new bounds: default them conservatively. Relaxing existing bounds: add an upgrade note fragment under `changes/`.
+- **Bounded resource use** — the `ScanOptions` defaults are a safety contract, not tunables. Adding new bounds: default them conservatively. Relaxing existing bounds: add an `.upgrade.md` fragment under `changes/`.
 
 ## README and PyPI
 

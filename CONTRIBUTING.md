@@ -257,7 +257,7 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 
 ### Release notes for contributors
 
-For a user-visible change, add one new Markdown file per affected package in [ModelAudit fragments](changes/) or [PickleScan fragments](packages/modelaudit-picklescan/changes/). A unique filename lets independent PRs merge in any order. Use a descriptive slug such as `1924-cli-triage.md`. Internal-only changes can skip the fragment. The release PR updates the shared changelogs. See the [fragment format and examples](docs/agents/release-process.md#release-notes).
+For a user-visible change, add one new Markdown file per affected package in [ModelAudit fragments](changes/) or [PickleScan fragments](packages/modelaudit-picklescan/changes/). A unique filename lets independent PRs merge in any order. For example, `changes/1924.upgrade.md` contains the upgrade guidance in plain Markdown. Towncrier uses the filename to group and link it. Internal-only changes can skip the fragment. The release PR updates the shared changelogs. See the [fragment format and examples](docs/agents/release-process.md#release-notes).
 
 ### Release Process (Maintainers)
 

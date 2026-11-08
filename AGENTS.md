@@ -81,7 +81,7 @@ gh pr create --title "feat: descriptive title" --body "Brief description"
 - After pushing, confirm the remote branch matches the intended local head before requesting review, resolving threads, or making merge/CI claims.
 - If `.git/index.lock` exists and no git process is running, remove the lock file.
 - Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
-- Add a unique Markdown fragment under the affected package’s `changes/` directory for a user-visible change. The release PR assembles the shared changelogs. See [Release notes](docs/agents/release-process.md#release-notes).
+- Add a Towncrier fragment such as `123.other.md` under the affected package’s `changes/` directory for a user-visible change. The release PR assembles the shared changelogs. See [Release notes](docs/agents/release-process.md#release-notes).
 
 ## CI Compliance Requirements
 

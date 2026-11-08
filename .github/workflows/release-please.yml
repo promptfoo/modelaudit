@@ -286,9 +286,10 @@ jobs:
             "$RUNNER_TEMP/candidates.json" > "$RUNNER_TEMP/reviewed-notes.json"
           unset GH_TOKEN
           base=$(git merge-base HEAD refs/remotes/origin/main)
-          # Run the renderer from protected main against the candidate Markdown.
-          git show "$base:scripts/release_notes.py" > "$RUNNER_TEMP/modelaudit-release-notes.py"
-          python3 -I "$RUNNER_TEMP/modelaudit-release-notes.py" render --base "$base" --reviews "$RUNNER_TEMP/reviewed-notes.json"
+          # Run the renderer, template, and dependency lock from protected main.
+          trusted=$(mktemp -d "$RUNNER_TEMP/release-notes.XXXXXX")
+          git archive "$base" scripts/release_notes.py scripts/release-tools | tar -x -C "$trusted"
+          python3 -I "$trusted/scripts/release_notes.py" render --base "$base" --reviews "$RUNNER_TEMP/reviewed-notes.json"
 
       - name: Format changelogs with Prettier
         run: |
