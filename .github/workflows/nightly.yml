@@ -56,6 +56,7 @@ jobs:
           uv run pytest -n auto -m "not performance" --modelaudit-shard-count 3 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
 
       - name: Capture ProcessProvider native diagnostic
+        id: capture-native
         if: ${{ always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && matrix.shard == 0 && steps.sync.outcome == 'success' }}
         shell: bash
         run: |
@@ -64,14 +65,15 @@ jobs:
           import importlib.metadata
           import importlib.util
           import json
+          import os
           import platform
           import shutil
           import subprocess
           import sys
           from pathlib import Path
 
-          output = Path("picklescan-process-provider-diagnostic")
-          output.mkdir(exist_ok=True)
+          output = Path(os.environ["RUNNER_TEMP"]) / "picklescan-process-provider-diagnostic"
+          output.mkdir()
           package = importlib.util.find_spec("modelaudit_picklescan")
           native = importlib.util.find_spec("modelaudit_picklescan._rust")
           assert package is not None and package.origin is not None
@@ -93,7 +95,7 @@ jobs:
               "platform": platform.platform(),
               "package_origin": package.origin,
               "native_origin": str(binary),
-              "native_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "native_sha256": hashlib.sha256((output / binary.name).read_bytes()).hexdigest(),
               "tracked_input_sha256": {
                   path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in paths
               },
@@ -106,11 +108,11 @@ jobs:
           PY
 
       - name: Upload ProcessProvider native diagnostic
-        if: ${{ always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && matrix.shard == 0 && steps.sync.outcome == 'success' }}
+        if: ${{ always() && steps.capture-native.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: picklescan-process-provider-native-${{ github.sha }}
-          path: picklescan-process-provider-diagnostic/
+          path: ${{ runner.temp }}/picklescan-process-provider-diagnostic/
           if-no-files-found: error
           retention-days: 7
 
