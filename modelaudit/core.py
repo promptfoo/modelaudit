@@ -1530,9 +1530,15 @@ def _validated_shard_family_scopes(
     target: dict[str, int | str],
 ) -> set[str]:
     """Return validated scopes that may identify one shard family."""
+    scopes: set[str] = set()
+    repository_directory = target.get("repository_directory")
+    if isinstance(repository_directory, str):
+        scopes.add(f"remote-directory:{repository_directory}")
+        if target.get("repository_inventory_only"):
+            return scopes
     parent = Path(source_path).absolute().parent
     normalized_parent = os.path.normcase(os.path.normpath(str(parent)))
-    scopes = {f"directory:{normalized_parent}"}
+    scopes.add(f"directory:{normalized_parent}")
     family_group = target.get("family_group")
     if isinstance(family_group, str) and family_group:
         scopes.add(f"trusted-group:{family_group}")
@@ -7425,6 +7431,7 @@ def scan_model_streaming(
             source_bytes_preaccounted = 0
             pretransferred_bytes = 0
             reported_source_path: str | None = None
+            huggingface_shard_source: str | None = None
             if len(streamed_item) == 4:
                 file_path, _is_last, precomputed_result, byte_accounting = streamed_item
                 if not isinstance(byte_accounting, StreamedSourceByteAccounting):
@@ -7432,6 +7439,7 @@ def scan_model_streaming(
                 pretransferred_bytes = byte_accounting.pretransferred_bytes
                 source_bytes_preaccounted = byte_accounting.source_bytes_preaccounted
                 reported_source_path = byte_accounting.source_path
+                huggingface_shard_source = byte_accounting.huggingface_shard_source
             elif len(streamed_item) == 3:
                 file_path, _is_last, precomputed_result = streamed_item
             elif len(streamed_item) == 2:
@@ -7501,6 +7509,18 @@ def scan_model_streaming(
                     )
                     resolved_report_path = str(source_path)
                     operational_scan_failure = _scan_result_has_operational_error(precomputed_result)
+                    if (
+                        huggingface_shard_source == report_path
+                        and metadata_dict.get("range_semantics") == "strict_206_content_range"
+                        and metadata_dict.get("remote_header_only") is True
+                    ):
+                        # The immutable ranged object occupies this filename even when
+                        # a header limit leaves its tensor validation inconclusive.
+                        validated_shard_targets[report_path] = {
+                            "resolved_path": report_path,
+                            "repository_directory": report_path.rpartition("/")[0],
+                            "repository_inventory_only": True,
+                        }
                     if operational_scan_failure:
                         preserve_shard_reconciliation_errors = True
                     aggregate_hash_complete = False
@@ -7911,8 +7931,16 @@ def scan_model_streaming(
                                 "family_group",
                             )
                         )
-                    if not operational_scan_failure and stable_while_scanning and stable_after_unpinning:
-                        validated_shard_targets.update(final_shard_target)
+                    if stable_while_scanning and stable_after_unpinning:
+                        for path, target in final_shard_target.items():
+                            if huggingface_shard_source is not None and huggingface_shard_source.endswith(
+                                "/" + source_path.name
+                            ):
+                                target["repository_directory"] = huggingface_shard_source.rpartition("/")[0]
+                                target["repository_inventory_only"] = operational_scan_failure
+                            elif operational_scan_failure:
+                                continue
+                            validated_shard_targets[path] = target
 
                     if file_hash is not None:
                         existing_hashes = metadata_dict.get("file_hashes")
