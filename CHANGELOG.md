@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Recognize NUL removal in the reviewed Flint chat template and record its digest in the passing check. Modified templates keep the existing obfuscation check.
+- Describe benign classifier and GPU maintenance terms in model cards as documentation references at INFO severity.
 - Recognize one-byte F8_E4M3 tensors in GGUF files and validate their payload bounds.
 - Avoid checkpoint routing errors on logs, JSON Lines datasets, tokenizer vocabularies, PCM audio, and native binaries. Keep inspecting possible serialized payloads in mixed-format files.
 - Attribute README and model-card network findings to their documentation source. Recognize passive SQL comparisons, local client examples, maintenance and classifier terminology, usage restrictions, and contact details. Preserve alerts for active uses.
