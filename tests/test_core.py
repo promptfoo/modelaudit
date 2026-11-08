@@ -4807,6 +4807,7 @@ def test_scan_file_reports_pickle_extension_in_safetensors_length(tmp_path: Path
 @pytest.mark.parametrize(
     "sample",
     [b"p\xa2", b"X\x01\x00\x00\x00xpe", b"X\x01\x00\x00\x00xpe" + (b"x" * 50_000) + b"\n"],
+    ids=["non-ascii-index", "truncated-invalid-index", "long-invalid-index"],
 )
 def test_safetensors_pickle_overlap_rejects_impossible_memo_index(sample: bytes) -> None:
     assert file_detection.classify_safetensors_pickle_overlap_sample(sample, file_size=10_000_000) is False
