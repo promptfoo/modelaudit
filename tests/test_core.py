@@ -86,6 +86,8 @@ from tests.helpers import (
 )
 from tests.helpers.file_creators import (
     SystemCommandPayload,
+    legacy_pytorch_container_from_object_stream,
+    legacy_pytorch_storage_list_prefix,
     valid_jpeg_bytes,
     valid_png_bytes,
     write_sparse_safetensors_framing,
@@ -96,7 +98,6 @@ from tests.helpers.file_creators import (
 from tests.helpers.file_creators import (
     build_printable_utf8_ambiguous_binary_route as _build_printable_utf8_ambiguous_binary_route,
 )
-from tests.helpers.file_creators import pickle_binunicode as _core_binunicode
 from tests.helpers.file_creators import (
     write_delayed_flax_cntk_overlap as _write_delayed_flax_cntk_overlap,
 )
@@ -514,56 +515,6 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     import os as os_module
 
     return pickle.dumps(SystemCommandPayload("echo core-dispatch-test", lambda: os_module.system), protocol=protocol)
-
-
-def _core_legacy_pytorch_object_stream(
-    storage_keys: tuple[str, ...],
-    storage_size: int,
-    *,
-    malicious_object: bool = False,
-) -> bytes:
-    object_stream = bytearray(b"\x80\x02]")
-    for key in storage_keys:
-        encoded_key = key.encode("ascii")
-        object_stream += b"(" + _core_binunicode(b"storage")
-        object_stream += b"ctorch\nByteStorage\n"
-        object_stream += _core_binunicode(encoded_key) + _core_binunicode(b"cpu")
-        object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
-        object_stream += b"NtQa"
-    if malicious_object:
-        malicious_pickle = _build_malicious_pickle(protocol=2)
-        object_stream += malicious_pickle[2:-1] + b"a"
-    object_stream += b"."
-    return bytes(object_stream)
-
-
-def _make_core_legacy_pytorch_container(
-    storage_payload: bytes,
-    *,
-    malicious_object: bool = False,
-    storage_keys: tuple[str, ...] = ("0",),
-) -> bytes:
-    storage_size = len(storage_payload)
-    control_streams = (
-        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
-        pickle.dumps(1001, protocol=2),
-        pickle.dumps(
-            {
-                "protocol_version": 1001,
-                "little_endian": True,
-                "type_sizes": {"short": 2, "int": 4, "long": 8},
-            },
-            protocol=2,
-        ),
-        _core_legacy_pytorch_object_stream(
-            storage_keys,
-            storage_size,
-            malicious_object=malicious_object,
-        ),
-        pickle.dumps(list(storage_keys), protocol=2),
-    )
-    storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
-    return b"".join(control_streams) + storage_record
 
 
 def test_scan_file_padded_media_pickle_polyglot_fails_closed(tmp_path: Path) -> None:
@@ -2916,6 +2867,19 @@ def _assert_system_pickle_detected(result: ScanResult, entry_name: str) -> None:
     ), f"Expected S201 finding for {entry_name}, got: {[(i.location, i.message, i.details) for i in result.issues]}"
 
 
+def _assert_pickle_format_detection(path: Path, expected: str) -> None:
+    assert file_detection.detect_file_format(str(path)) == expected
+    assert file_detection.detect_file_format_from_magic(str(path)) == expected
+    assert file_detection.detect_file_format_for_skip_filter(str(path)) == expected
+
+
+def _assert_system_pickle_routing(path: Path, config: dict[str, Any]) -> None:
+    _assert_pickle_format_detection(path, "pickle")
+    result = scan_file(str(path), config=config)
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
 def _assert_system_pickle_issue(result: ScanResult) -> None:
     """Assert a pickle finding identifies the dangerous system global."""
     assert any(
@@ -4801,17 +4765,7 @@ def test_scan_file_routes_pickle_safetensors_polyglot_to_pickle(
     polyglot = tmp_path / "payload.unknown"
     _write_pickle_safetensors_polyglot(polyglot, header_length)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(
-        str(polyglot),
-        config={"scanners": ["pickle"], "cache_enabled": False},
-    )
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"scanners": ["pickle"], "cache_enabled": False})
 
 
 @pytest.mark.parametrize("header_length", [63362, 133508, 492424])
@@ -4859,14 +4813,7 @@ def test_scan_file_routes_safetensors_pickle_operand_crossing_short_probe(tmp_pa
         struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + pickle_tail
     )
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def test_scan_file_routes_security_pickle_in_complete_frame(tmp_path: Path) -> None:
@@ -4875,14 +4822,7 @@ def test_scan_file_routes_security_pickle_in_complete_frame(tmp_path: Path) -> N
     polyglot = tmp_path / "framed-pickle.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def test_scan_file_routes_frame_spanning_binbytes_safetensors_collision_to_pickle(tmp_path: Path) -> None:
@@ -4899,14 +4839,7 @@ def test_scan_file_routes_frame_spanning_binbytes_safetensors_collision_to_pickl
     polyglot = tmp_path / "frame-spanning-binbytes.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 @pytest.mark.parametrize(
@@ -4927,14 +4860,7 @@ def test_scan_file_keeps_reached_pickle_security_signal_after_late_error(
     polyglot = tmp_path / "late-error.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def test_scan_file_routes_security_pickle_in_follow_on_stream(tmp_path: Path) -> None:
@@ -4942,14 +4868,7 @@ def test_scan_file_routes_security_pickle_in_follow_on_stream(tmp_path: Path) ->
     polyglot = tmp_path / "follow-on-stream.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def test_scan_file_routes_follow_on_pickle_using_persistent_memo(tmp_path: Path) -> None:
@@ -4958,9 +4877,7 @@ def test_scan_file_routes_follow_on_pickle_using_persistent_memo(tmp_path: Path)
     polyglot = tmp_path / "persistent-memo.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), first_stream + second_stream)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+    _assert_pickle_format_detection(polyglot, "pickle")
 
     result = scan_file(str(polyglot), config={"cache_enabled": False})
 
@@ -4973,9 +4890,7 @@ def test_scan_file_routes_empty_module_stack_global_safetensors_collision_to_pic
     polyglot = tmp_path / "empty-module-stack-global.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+    _assert_pickle_format_detection(polyglot, "pickle")
 
     result = scan_file(str(polyglot), config={"cache_enabled": False})
 
@@ -5000,14 +4915,7 @@ def test_scan_file_routes_security_pickle_after_early_frame_stop(tmp_path: Path)
     polyglot = tmp_path / "post-frame-stream.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def test_scan_file_routes_security_pickle_after_valid_list_setitem(tmp_path: Path) -> None:
@@ -5053,14 +4961,7 @@ def test_scan_file_routes_cpython_valid_safetensors_pickle_overlap(
         struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + pickle_tail
     )
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def test_scan_file_routes_binpersid_safetensors_polyglot_to_pickle(tmp_path: Path) -> None:
@@ -5069,9 +4970,7 @@ def test_scan_file_routes_binpersid_safetensors_polyglot_to_pickle(tmp_path: Pat
     polyglot = tmp_path / "persistent-id.unknown"
     polyglot.write_bytes(prefix + b"{}" + (b" " * (header_length - 2)))
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+    _assert_pickle_format_detection(polyglot, "pickle")
 
     result = scan_file(
         str(polyglot),
@@ -5178,14 +5077,7 @@ def test_scan_file_routes_executable_nested_frame_safetensors_collision_to_pickl
     safetensors_path = tmp_path / "nested-frame.unknown"
     _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(safetensors_path)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "pickle"
-
-    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(safetensors_path, {"cache_enabled": False})
 
 
 def test_scan_file_routes_large_safetensors_pickle_from_declared_frame_end(tmp_path: Path) -> None:
@@ -5203,9 +5095,7 @@ def test_scan_file_routes_large_safetensors_pickle_from_declared_frame_end(tmp_p
     polyglot = tmp_path / "large-frame-end.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+    _assert_pickle_format_detection(polyglot, "pickle")
 
     result = scan_file(str(polyglot), config={"cache_enabled": False})
 
@@ -5269,14 +5159,7 @@ def test_scan_file_routes_hashable_tuple_alias_pickle_overlap(tmp_path: Path) ->
     polyglot = tmp_path / "tuple-alias-pickle.unknown"
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 @pytest.mark.parametrize("header_length", [ord("F"), ord("S")], ids=["invalid-float", "invalid-string"])
@@ -5304,9 +5187,7 @@ def test_scan_file_keeps_semantically_invalid_pickle_prefix_safetensors_clean(tm
     safetensors_path = tmp_path / "invalid-bytearray-append.unknown"
     _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    _assert_pickle_format_detection(safetensors_path, "safetensors")
 
     result = scan_file(str(safetensors_path), config={"cache_enabled": False})
 
@@ -5320,9 +5201,7 @@ def test_scan_file_keeps_unhashable_pickle_dict_key_safetensors_clean(tmp_path: 
     safetensors_path = tmp_path / "unhashable-dict-key.unknown"
     _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    _assert_pickle_format_detection(safetensors_path, "safetensors")
 
     result = scan_file(str(safetensors_path), config={"cache_enabled": False})
 
@@ -5343,9 +5222,7 @@ def test_scan_file_keeps_unexpected_pickle_mark_safetensors_clean(
     safetensors_path = tmp_path / "unexpected-pickle-mark.unknown"
     _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    _assert_pickle_format_detection(safetensors_path, "safetensors")
 
     result = scan_file(str(safetensors_path), config={"cache_enabled": False})
 
@@ -5366,9 +5243,7 @@ def test_scan_file_keeps_known_type_invalid_pickle_safetensors_clean(
     safetensors_path = tmp_path / "known-type-invalid-pickle.unknown"
     _write_safetensors_pickle_tail(safetensors_path, ord("V"), b"\n0" + pickle_body)
 
-    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
-    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    _assert_pickle_format_detection(safetensors_path, "safetensors")
 
     result = scan_file(str(safetensors_path), config={"cache_enabled": False})
 
@@ -5437,14 +5312,7 @@ def test_scan_file_routes_oversized_pickle_safetensors_polyglot_to_pickle(
         header_length = struct.unpack("<Q", handle.read(8))[0]
         assert handle.read(1) == b"{"
     assert header_length > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def test_scan_file_routes_valid_gzip_safetensors_polyglot_to_compressed(tmp_path: Path) -> None:
@@ -5752,14 +5620,7 @@ def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(t
     disguised_pickle = tmp_path / filename
     disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle())
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 def test_scan_file_routes_padded_protocolless_binary_pickle_past_probe_limit(tmp_path: Path) -> None:
@@ -5767,14 +5628,7 @@ def test_scan_file_routes_padded_protocolless_binary_pickle_past_probe_limit(tmp
     padding = b"\x8c\x01x0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 4)
     disguised_pickle.write_bytes(padding + _build_protocolless_binary_malicious_pickle())
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 def test_scan_file_does_not_route_benign_binary_padding_past_opcode_budget(tmp_path: Path) -> None:
@@ -5892,14 +5746,7 @@ def test_scan_file_routes_protocolless_pickle_with_misleading_compressed_suffix(
     disguised_pickle = tmp_path / filename
     disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle())
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 def test_scan_file_routes_open_mark_protocolless_pickle_past_probe_limit(tmp_path: Path) -> None:
@@ -5908,14 +5755,7 @@ def test_scan_file_routes_open_mark_protocolless_pickle_past_probe_limit(tmp_pat
     assert len(padding) == file_detection.PROTO0_1_MAX_PROBE_BYTES
     disguised_pickle.write_bytes(padding + b"10" + _build_protocolless_binary_malicious_pickle())
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 def test_scan_file_routes_protocolless_pickle_with_operand_split_at_probe_limit(tmp_path: Path) -> None:
@@ -5923,28 +5763,14 @@ def test_scan_file_routes_protocolless_pickle_with_operand_split_at_probe_limit(
     padding = b"\x8c\x01x0" * ((file_detection.PROTO0_1_MAX_PROBE_BYTES // 4) - 2) + b"X\x0a\x00\x00\x00abcdefghij0"
     disguised_pickle.write_bytes(padding + _build_protocolless_binary_malicious_pickle())
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 def test_scan_file_routes_protocolless_prefix_before_proto_pickle(tmp_path: Path) -> None:
     disguised_pickle = tmp_path / "payload.jpg"
     disguised_pickle.write_bytes(b"\x8f0" + _build_malicious_pickle(protocol=4))
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 @pytest.mark.parametrize(
@@ -5970,28 +5796,14 @@ def test_scan_file_routes_large_protocolless_binary_operand_past_probe_limit(
         opcode + length_header + operand + b"0" + _build_protocolless_binary_malicious_pickle()
     )
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 def test_scan_file_routes_truncated_protocolless_binary_pickle_with_security_signal(tmp_path: Path) -> None:
     disguised_pickle = tmp_path / "payload.jpg"
     disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle()[:-1])
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
-
-    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(disguised_pickle, {"cache_scan_results": False})
 
 
 @pytest.mark.parametrize(
@@ -6009,9 +5821,7 @@ def test_scan_file_routes_protocolless_binary_pickle_extension_opcodes(
     disguised_pickle = tmp_path / "payload.jpg"
     disguised_pickle.write_bytes(payload)
 
-    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+    _assert_pickle_format_detection(disguised_pickle, "pickle")
 
     result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
 
@@ -6061,9 +5871,7 @@ def test_scan_file_does_not_route_protocolless_binary_pickle_scalar_near_match(
     payload = _build_protocolless_binary_benign_scalar_pickle()
     near_match.write_bytes(payload[:-1] if truncate_stop else payload)
 
-    assert file_detection.detect_file_format(str(near_match)) == "unknown"
-    assert file_detection.detect_file_format_from_magic(str(near_match)) == "unknown"
-    assert file_detection.detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+    _assert_pickle_format_detection(near_match, "unknown")
 
     result = scan_file(str(near_match), config={"cache_scan_results": False})
 
@@ -16452,12 +16260,12 @@ def test_scan_file_bypasses_cache_hash_for_bounded_legacy_pytorch_read_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path = tmp_path / "legacy-large.pt"
-    model_path.write_bytes(
-        _make_core_legacy_pytorch_container(
-            b"A" * 2048,
-            malicious_object=True,
-        )
-    )
+    storage_payload = b"A" * 2048
+    object_stream = legacy_pytorch_storage_list_prefix(("0",), len(storage_payload))
+    malicious_pickle = _build_malicious_pickle(protocol=2)
+    object_stream += malicious_pickle[2:-1] + b"a."
+    payload, _ = legacy_pytorch_container_from_object_stream(storage_payload, bytes(object_stream))
+    model_path.write_bytes(payload)
     cache_dir = tmp_path / "cache"
     config = {
         "cache_enabled": True,
@@ -17066,14 +16874,7 @@ def _assert_safetensors_pickle_stack_routing(tmp_path: Path, case_pickle_tail: b
     polyglot = tmp_path / case_filename
     _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
 
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_system_pickle_routing(polyglot, {"cache_enabled": False})
 
 
 def _assert_late_pickle_stop_in_msgpack(
