@@ -90,6 +90,42 @@ def _build_fixture_weight_plan(model: Any, *, fixture_model: Any | None = None, 
     return onnx_scanner_module._build_onnx_weight_analysis_plan(model, raw_control_admission=admission, **kwargs)
 
 
+@pytest.mark.parametrize("reshape_weight", [False, True])
+def test_attention_matmul_distinguishes_shape_sources_from_weights(reshape_weight: bool) -> None:
+    initializers = [onnx.numpy_helper.from_array(np.ones((4, 4), dtype=np.float32), name=name) for name in ("Wq", "Wk")]
+    initializers += [
+        onnx.numpy_helper.from_array(np.array([value], dtype=np.int64), name=name)
+        for name, value in (("zero", 0), ("width", 4))
+    ]
+    nodes = [
+        helper.make_node("MatMul", ["X", "Wq"], ["q"]),
+        helper.make_node("MatMul", ["X", "Wk"], ["k"]),
+        helper.make_node("Shape", ["X"], ["shape"]),
+        helper.make_node("Gather", ["shape", "zero"], ["batch"]),
+        helper.make_node("Concat", ["batch", "width"], ["target"], axis=0),
+        helper.make_node("Reshape", ["q", "target"], ["qr"]),
+        helper.make_node("Reshape", ["Wk" if reshape_weight else "k", "target"], ["kr"]),
+        helper.make_node("Transpose", ["kr"], ["kt"], perm=[1, 0]),
+        helper.make_node("MatMul", ["qr", "kt"], ["Y"], name="scores"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "attention",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, ["n", 4])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, ["n", "m"])],
+        initializer=initializers,
+    )
+    plan = _build_fixture_weight_plan(_checked_onnx_model(graph), onnx=onnx, np=np, max_array_size=100_000)
+
+    if reshape_weight:
+        assert any(
+            sample["initializer"] == "Wk" and sample["consumer_node"] == "scores"
+            for sample in plan.unresolved_lineage_samples
+        )
+    else:
+        assert not plan.coverage_gaps
+
+
 def _make_external_tensor(name: str, data_type: int, dims: list[int], external_path: str) -> Any:
     tensor = onnx.TensorProto()
     tensor.name = name
