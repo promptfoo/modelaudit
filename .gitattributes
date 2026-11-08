@@ -9,7 +9,3 @@
 
 # Vendored protobuf stubs are generated artifacts.
 modelaudit/protos/* linguist-generated=true
-
-# Changelogs are append-heavy; preserve concurrent additions during merges.
-CHANGELOG.md merge=union
-packages/modelaudit-picklescan/CHANGELOG.md merge=union
