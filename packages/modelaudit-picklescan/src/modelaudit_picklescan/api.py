@@ -5368,7 +5368,6 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
     except Exception as error:
         invoked_global_positions = frozenset()
         trusted_reconstruction_global_positions = frozenset()
-        trusted_reconstruction_references = frozenset()
         callable_invocations_complete = False
         enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
