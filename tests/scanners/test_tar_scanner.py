@@ -37,14 +37,10 @@ from modelaudit.scanners.tar_scanner import (
 from modelaudit.utils.file import detection as file_detection
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import SystemCommandPayload
+from tests.helpers.file_creators import add_tar_bytes as _add_tar_bytes
+from tests.helpers.file_creators import add_tar_link as _add_tar_link
 from tests.helpers.scanners import scan_nested_critical_finding as nested_scan
 from tests.helpers.scanners import scan_nested_unsuccessful
-
-
-def _add_tar_bytes(archive: tarfile.TarFile, name: str, payload: bytes | bytearray) -> None:
-    info = tarfile.TarInfo(name)
-    info.size = len(payload)
-    archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
 
 def _tar_octal_field(value: int, width: int) -> bytes:
@@ -237,10 +233,7 @@ class TestTarScanner:
         # Test uncompressed tar
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
-                info = tarfile.TarInfo("test.txt")
-                content = b"Hello World"
-                info.size = len(content)
-                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, "test.txt", b"Hello World")
             tmp_path = tmp.name
 
         try:
@@ -254,17 +247,11 @@ class TestTarScanner:
         """Test that the scanner correctly identifies compressed TAR files."""
         tmp_path_gz = tmp_path / "fixture.tar.gz"
         with tarfile.open(tmp_path_gz, "w:gz") as t:
-            info = tarfile.TarInfo("test.txt")
-            content = b"Hello World"
-            info.size = len(content)
-            t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+            _add_tar_bytes(t, "test.txt", b"Hello World")
 
         tmp_path_bz2 = tmp_path / "fixture.tar.bz2"
         with tarfile.open(tmp_path_bz2, "w:bz2") as t:
-            info = tarfile.TarInfo("test.txt")
-            content = b"Hello World"
-            info.size = len(content)
-            t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+            _add_tar_bytes(t, "test.txt", b"Hello World")
 
         tmp_path_gzip_pickle = tmp_path / "pickle.tar.gz"
         tmp_path_gzip_pickle.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
@@ -284,16 +271,10 @@ class TestTarScanner:
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
                 # Add a file with content
-                readme_info = tarfile.TarInfo("readme.txt")
-                readme_content = b"This is a readme file"
-                readme_info.size = len(readme_content)
-                t.addfile(readme_info, tarfile.io.BytesIO(readme_content))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, "readme.txt", b"This is a readme file")
 
                 # Add another file
-                data_info = tarfile.TarInfo("data.json")
-                data_content = b'{"key": "value"}'
-                data_info.size = len(data_content)
-                t.addfile(data_info, tarfile.io.BytesIO(data_content))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, "data.json", b'{"key": "value"}')
             tmp_path = tmp.name
 
         try:
@@ -880,10 +861,7 @@ class TestTarScanner:
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
                 # Add file with path traversal
-                info = tarfile.TarInfo("../../evil.txt")
-                content = b"malicious content"
-                info.size = len(content)
-                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, "../../evil.txt", b"malicious content")
             tmp_path = tmp.name
 
         try:
@@ -900,10 +878,7 @@ class TestTarScanner:
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
                 # Create a symlink pointing outside
-                info = tarfile.TarInfo("link.txt")
-                info.type = tarfile.SYMTYPE
-                info.linkname = "../../../etc/passwd"
-                t.addfile(info)
+                _add_tar_link(t, "link.txt", link_type=tarfile.SYMTYPE, target="../../../etc/passwd")
             tmp_path = tmp.name
 
         try:
@@ -919,10 +894,7 @@ class TestTarScanner:
         """External TAR links must use the dedicated symlink escape rule."""
         archive_path = tmp_path / "external_link.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("link.txt")
-            info.type = tarfile.SYMTYPE
-            info.linkname = "../../../etc/passwd"
-            archive.addfile(info)
+            _add_tar_link(archive, "link.txt", link_type=tarfile.SYMTYPE, target="../../../etc/passwd")
 
         result = self.scanner.scan(str(archive_path))
 
@@ -945,14 +917,9 @@ class TestTarScanner:
         """A symlink may traverse its parent while remaining inside the archive root."""
         archive_path = tmp_path / "parent_relative_link.tar"
         with tarfile.open(archive_path, "w") as archive:
-            target = tarfile.TarInfo("weights.bin")
-            target.size = 0
-            archive.addfile(target, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "weights.bin", b"")
 
-            link = tarfile.TarInfo("nested/link.bin")
-            link.type = tarfile.SYMTYPE
-            link.linkname = "../weights.bin"
-            archive.addfile(link)
+            _add_tar_link(archive, "nested/link.bin", link_type=tarfile.SYMTYPE, target="../weights.bin")
 
         result = self.scanner.scan(str(archive_path))
 
@@ -968,14 +935,9 @@ class TestTarScanner:
         """TAR hardlink targets are resolved from the archive root, not the member parent."""
         archive_path = tmp_path / "root_relative_hardlink.tar"
         with tarfile.open(archive_path, "w") as archive:
-            target = tarfile.TarInfo("weights.bin")
-            target.size = 0
-            archive.addfile(target, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "weights.bin", b"")
 
-            link = tarfile.TarInfo("nested/link.bin")
-            link.type = tarfile.LNKTYPE
-            link.linkname = "weights.bin"
-            archive.addfile(link)
+            _add_tar_link(archive, "nested/link.bin", link_type=tarfile.LNKTYPE, target="weights.bin")
 
         result = self.scanner.scan(str(archive_path))
 
@@ -988,10 +950,7 @@ class TestTarScanner:
         archive_path = tmp_path / "many_safe_links.tar"
         with tarfile.open(archive_path, "w") as archive:
             for index in range(250):
-                link = tarfile.TarInfo(f"links/link-{index}")
-                link.type = tarfile.SYMTYPE
-                link.linkname = "../targets/model.bin"
-                archive.addfile(link)
+                _add_tar_link(archive, f"links/link-{index}", link_type=tarfile.SYMTYPE, target="../targets/model.bin")
 
         result = self.scanner.scan(str(archive_path))
 
@@ -1002,10 +961,7 @@ class TestTarScanner:
         """Suppressing generic structure noise must not suppress TAR hardlink escapes."""
         archive_path = tmp_path / "external_link_suppressed.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("nested/link.txt")
-            info.type = tarfile.LNKTYPE
-            info.linkname = "../outside"
-            archive.addfile(info)
+            _add_tar_link(archive, "nested/link.txt", link_type=tarfile.LNKTYPE, target="../outside")
 
         reset_config()
         set_config(ModelAuditConfig(suppress={"S902"}))
@@ -1034,10 +990,7 @@ class TestTarScanner:
         """Malformed archive links with empty targets must not be reported as safe."""
         archive_path = tmp_path / f"empty_{expected_kind.lower().replace(' ', '_')}.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("nested/link.txt")
-            info.type = link_type
-            info.linkname = ""
-            archive.addfile(info)
+            _add_tar_link(archive, "nested/link.txt", link_type=link_type, target="")
 
         result = self.scanner.scan(str(archive_path))
 
@@ -1060,10 +1013,7 @@ class TestTarScanner:
         """The dedicated link escape rule remains directly suppressible."""
         archive_path = tmp_path / "external_link_s406_suppressed.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("link.txt")
-            info.type = tarfile.SYMTYPE
-            info.linkname = "../../../etc/passwd"
-            archive.addfile(info)
+            _add_tar_link(archive, "link.txt", link_type=tarfile.SYMTYPE, target="../../../etc/passwd")
 
         reset_config()
         set_config(ModelAuditConfig(suppress={"S406"}))
@@ -1080,10 +1030,7 @@ class TestTarScanner:
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
                 # Create a symlink to critical path
-                info = tarfile.TarInfo("etc_passwd")
-                info.type = tarfile.SYMTYPE
-                info.linkname = "/etc/passwd"
-                t.addfile(info)
+                _add_tar_link(t, "etc_passwd", link_type=tarfile.SYMTYPE, target="/etc/passwd")
             tmp_path = tmp.name
 
         try:
@@ -1099,10 +1046,7 @@ class TestTarScanner:
         # Create inner tar
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as inner_tmp:
             with tarfile.open(inner_tmp.name, "w") as inner_tar:
-                info = tarfile.TarInfo("inner.txt")
-                content = b"Inner content"
-                info.size = len(content)
-                inner_tar.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+                _add_tar_bytes(inner_tar, "inner.txt", b"Inner content")
             inner_path = inner_tmp.name
 
         # Create outer tar containing inner tar
@@ -1132,9 +1076,7 @@ class TestTarScanner:
                 with tarfile.open(tmp.name, "w") as t:
                     if i == 0:
                         # Innermost tar
-                        info = tarfile.TarInfo("deep.txt")
-                        info.size = len(content)
-                        t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+                        _add_tar_bytes(t, "deep.txt", content)
                     else:
                         # Add previous tar
                         t.add(tar_paths[-1], f"level{i}.tar")
@@ -1168,9 +1110,7 @@ class TestTarScanner:
                 import pickle
 
                 data = pickle.dumps({"key": "value"})
-                info = tarfile.TarInfo("data.pkl")
-                info.size = len(data)
-                t.addfile(info, tarfile.io.BytesIO(data))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, "data.pkl", data)
             tmp_path = tmp.name
 
         try:
@@ -1256,10 +1196,8 @@ class TestTarScanner:
         # Create inner tar.gz
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as inner_tmp:
             with tarfile.open(inner_tmp.name, "w:gz") as inner_tar:
-                info = tarfile.TarInfo("inner.txt")
                 content = b"Inner compressed content"
-                info.size = len(content)
-                inner_tar.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+                _add_tar_bytes(inner_tar, "inner.txt", content)
             inner_path = inner_tmp.name
 
         # Create outer tar containing inner tar.gz
@@ -1290,13 +1228,9 @@ class TestTarScanner:
                 data1 = pickle.dumps({"a": 1})
                 data2 = pickle.dumps({"b": 2})
 
-                info1 = tarfile.TarInfo("one.pkl")
-                info1.size = len(data1)
-                t.addfile(info1, tarfile.io.BytesIO(data1))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, "one.pkl", data1)
 
-                info2 = tarfile.TarInfo("two.pkl")
-                info2.size = len(data2)
-                t.addfile(info2, tarfile.io.BytesIO(data2))  # type: ignore[attr-defined]
+                _add_tar_bytes(t, "two.pkl", data2)
             tmp_path = tmp.name
 
         try:
@@ -1409,9 +1343,7 @@ class TestTarScanner:
             info.type = b"Z"
             info.size = 128
             archive.addfile(info, tarfile.io.BytesIO(b"A" * info.size))  # type: ignore[attr-defined]
-            later = tarfile.TarInfo("later.txt")
-            later.size = 5
-            archive.addfile(later, tarfile.io.BytesIO(b"later"))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "later.txt", b"later")
 
         result = TarScanner(
             config={
@@ -1597,10 +1529,7 @@ class TestTarScanner:
             first_payload = b"x" * 128
             _add_tar_bytes(archive, "large-weights.bin", first_payload)
 
-            link_info = tarfile.TarInfo("model_config.yaml")
-            link_info.type = tarfile.SYMTYPE
-            link_info.linkname = "payload.yaml"
-            archive.addfile(link_info)
+            _add_tar_link(archive, "model_config.yaml", link_type=tarfile.SYMTYPE, target="payload.yaml")
 
             config_payload = f"model:\n  _target_: {target}\n".encode()
             _add_tar_bytes(archive, "payload.yaml", config_payload)
@@ -1669,9 +1598,7 @@ class TestTarScanner:
         original_read = gzip.GzipFile.read
 
         with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            info = tarfile.TarInfo(long_name)
-            info.size = 0
-            archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, long_name, b"")
 
         tracked_read = _track_read_bytes(original_read, gzip_read_bytes)
 
@@ -2018,9 +1945,7 @@ class TestTarScanner:
     def test_tiny_total_budget_allows_tar_header_reads_for_empty_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "tiny_total_empty.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("empty.txt")
-            info.size = 0
-            archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "empty.txt", b"")
 
         result = TarScanner(config={"max_tar_total_uncompressed_size": 1}).scan(str(archive_path))
 
@@ -2340,10 +2265,7 @@ class TestTarScanner:
     def test_raw_tar_nonzero_tail_fails_closed(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "raw-nonzero-tail.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("safe.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "safe.txt", b"safe")
         archive_path.write_bytes(archive_path.read_bytes() + b"hidden")
 
         result = TarScanner().scan(str(archive_path))
@@ -2361,10 +2283,7 @@ class TestTarScanner:
 
         archive_path = tmp_path / "dense-zero-tail.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("safe.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "safe.txt", b"safe")
 
         with tarfile.open(archive_path, "r:") as archive:
             while archive.next() is not None:
@@ -2521,9 +2440,7 @@ class TestTarScanner:
     ) -> None:
         archive_path = tmp_path / "sparse-tail-end.tar"
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            info.size = 4
-            archive.addfile(info, io.BytesIO(b"safe"))
+            _add_tar_bytes(archive, "payload.bin", b"safe")
         with archive_path.open("ab") as handle:
             handle.truncate(32 * 1024 * 1024)
 
@@ -2799,10 +2716,7 @@ class TestTarScanner:
     def test_scan_compressed_tar_counts_concatenated_wrapper_tail_toward_size_limit(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "concatenated_tail.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", b"safe")
         with archive_path.open("ab") as archive_file:
             archive_file.write(gzip.compress(b"\0" * (1024 * 1024)))
 
@@ -2829,9 +2743,7 @@ class TestTarScanner:
         archive_path = tmp_path / f"padded-ratio-{'bomb' if high_ratio else 'safe'}.tar.gz"
         payload = b"A" * (12 * 1024 * 1024) if high_ratio else os.urandom(128 * 1024)
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("weights.bin")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            _add_tar_bytes(archive, "weights.bin", payload)
         with archive_path.open("ab") as archive_file:
             archive_file.write(b"\0" * (512 * 1024))
 
@@ -2853,10 +2765,7 @@ class TestTarScanner:
     def test_scan_compressed_tar_rejects_nonzero_concatenated_wrapper_tail(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "nonzero_tail.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", b"safe")
         with archive_path.open("ab") as archive_file:
             archive_file.write(gzip.compress(b"not-tar-data"))
 
@@ -2890,9 +2799,7 @@ class TestTarScanner:
         raw_tar = io.BytesIO()
         with tarfile.open(fileobj=raw_tar, mode="w") as archive:
             payload = b"A" * (12 * 1024 * 1024)
-            info = tarfile.TarInfo("weights.bin")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            _add_tar_bytes(archive, "weights.bin", payload)
         padding_size = 512 * 1024
         archive_path.write_bytes(compress(b"") + (b"\0" * padding_size) + compress(raw_tar.getvalue()))
 
@@ -2952,9 +2859,7 @@ class TestTarScanner:
         raw_tar = io.BytesIO()
         with tarfile.open(fileobj=raw_tar, mode="w") as archive:
             payload = random.Random(0).randbytes(128 * 1024)
-            info = tarfile.TarInfo("weights.bin")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            _add_tar_bytes(archive, "weights.bin", payload)
         payload_member = gzip.compress(raw_tar.getvalue(), mtime=0)
         empty_member = gzip.compress(b"", mtime=0)
         archive_path.write_bytes(payload_member + empty_member)
@@ -2987,10 +2892,7 @@ class TestTarScanner:
     ) -> None:
         archive_path = tmp_path / f"physical-tail{suffix}"
         with tarfile.open(archive_path, mode) as archive:
-            info = tarfile.TarInfo("payload.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", b"safe")
         with archive_path.open("ab") as archive_file:
             archive_file.write(b"physical trailing payload")
 
@@ -3010,10 +2912,7 @@ class TestTarScanner:
     def test_scan_xz_tar_accepts_valid_stream_padding(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "stream-padding.tar.xz"
         with tarfile.open(archive_path, "w:xz") as archive:
-            info = tarfile.TarInfo("payload.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", b"safe")
         with archive_path.open("ab") as archive_file:
             archive_file.write(b"\0" * 4)
 
@@ -3080,10 +2979,7 @@ class TestTarScanner:
     ) -> None:
         archive_path = tmp_path / "bounded-stream-padding.tar.xz"
         with tarfile.open(archive_path, "w:xz") as archive:
-            info = tarfile.TarInfo("payload.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", b"safe")
         padding_size = 1024 * 1024
         with archive_path.open("r+b") as archive_file:
             archive_file.seek(0, os.SEEK_END)
@@ -3128,10 +3024,7 @@ class TestTarScanner:
     ) -> None:
         archive_path = tmp_path / "high-ratio-tail.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.txt")
-            payload = b"safe"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.txt", b"safe")
         with archive_path.open("ab") as archive_file:
             archive_file.write(gzip.compress(b"X" * (8 * 1024 * 1024)))
 
@@ -3168,10 +3061,7 @@ class TestTarScanner:
         archive_path = tmp_path / "tiny.tar.gz"
 
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("payload.bin")
-            payload = b"tiny"
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            _add_tar_bytes(archive, "payload.bin", b"tiny")
 
         scanner = TarScanner(config={"compressed_max_decompressed_bytes": 4_096})
         result = scanner.scan(str(archive_path))
@@ -3381,10 +3271,7 @@ class TestTarScanner:
             payload = b"x" * 128
             _add_tar_bytes(archive, "large.bin", payload)
 
-            link = tarfile.TarInfo("alias")
-            link.type = tarfile.SYMTYPE
-            link.linkname = "."
-            archive.addfile(link)
+            _add_tar_link(archive, "alias", link_type=tarfile.SYMTYPE, target=".")
 
             config = b"model:\n  _target_: os.system\n"
             _add_tar_bytes(archive, "alias/model_config.yaml", config)
@@ -3406,20 +3293,11 @@ class TestTarScanner:
             payload = b"x" * 128
             _add_tar_bytes(archive, "large.bin", payload)
 
-            directory_alias = tarfile.TarInfo("dir")
-            directory_alias.type = tarfile.SYMTYPE
-            directory_alias.linkname = "."
-            archive.addfile(directory_alias)
+            _add_tar_link(archive, "dir", link_type=tarfile.SYMTYPE, target=".")
 
-            seed = tarfile.TarInfo("dir/seed")
-            seed.type = tarfile.SYMTYPE
-            seed.linkname = "."
-            archive.addfile(seed)
+            _add_tar_link(archive, "dir/seed", link_type=tarfile.SYMTYPE, target=".")
 
-            alias = tarfile.TarInfo("alias")
-            alias.type = tarfile.LNKTYPE
-            alias.linkname = "dir/seed"
-            archive.addfile(alias)
+            _add_tar_link(archive, "alias", link_type=tarfile.LNKTYPE, target="dir/seed")
 
             config = b"model:\n  _target_: os.system\n"
             _add_tar_bytes(archive, "alias/model_config.yaml", config)
@@ -3446,15 +3324,9 @@ class TestTarScanner:
             config = b"model:\n  _target_: os.system\n"
             _add_tar_bytes(archive, "payload.yaml", config)
 
-            alias = tarfile.TarInfo("alias")
-            alias.type = tarfile.SYMTYPE
-            alias.linkname = "."
-            archive.addfile(alias)
+            _add_tar_link(archive, "alias", link_type=tarfile.SYMTYPE, target=".")
 
-            root_link = tarfile.TarInfo("alias/model_config.yaml")
-            root_link.type = member_type
-            root_link.linkname = "payload.yaml"
-            archive.addfile(root_link)
+            _add_tar_link(archive, "alias/model_config.yaml", link_type=member_type, target="payload.yaml")
 
         result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 

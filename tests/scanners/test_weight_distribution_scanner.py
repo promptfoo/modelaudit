@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import zipfile
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -256,20 +257,59 @@ def _has_tensorflow_cached():
 
 def _install_fake_torch(
     monkeypatch: pytest.MonkeyPatch,
-    load: Any,
+    load: Callable[..., object] | None = None,
     *,
-    version: str = "2.12.0",
+    version: str | None = "2.12.0",
+    tensor_type: type | None = None,
 ) -> None:
     fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = version
+    if version is not None:
+        fake_torch.__version__ = version
 
-    class FakeTensor:  # pragma: no cover - simple test double
-        pass
+    if tensor_type is None:
 
-    fake_torch.Tensor = FakeTensor
+        class FakeTensor:  # pragma: no cover - simple test double
+            pass
+
+        tensor_type = FakeTensor
+    fake_torch.Tensor = tensor_type
     fake_torch.device = lambda value: value
+    if load is None:
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        load = fake_load
     fake_torch.load = load
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+
+def _write_checkpoint_index(tmp_path: Path) -> Path:
+    saved_model_dir = tmp_path / "saved_model"
+    variables_dir = saved_model_dir / "variables"
+    variables_dir.mkdir(parents=True)
+    (variables_dir / "variables.index").write_bytes(b"checkpoint index")
+    return saved_model_dir
+
+
+def _install_tf_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    read_checkpoint: Callable[[str], object],
+    variables: list[tuple[str, list[int]]],
+    load: Callable[[str, str], object],
+) -> None:
+    class FakeTrain:
+        load_checkpoint = staticmethod(read_checkpoint)
+
+        @staticmethod
+        def list_variables(_prefix: str) -> list[tuple[str, list[int]]]:
+            return [(name, shape.copy()) for name, shape in variables]
+
+        load_variable = staticmethod(load)
+
+    fake_tensorflow: Any = types.ModuleType("tensorflow")
+    fake_tensorflow.train = FakeTrain
+    monkeypatch.setitem(sys.modules, "tensorflow", fake_tensorflow)
 
 
 @pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
@@ -642,18 +682,9 @@ def test_pytorch_primary_load_is_blocked_by_archive_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
     fake_load = _RecordingTorchLoad()
 
-    fake_torch.load = fake_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fake_load, version="2.6.0")
 
     path = tmp_path / "large.pt"
     with zipfile.ZipFile(path, "w") as archive:
@@ -678,15 +709,6 @@ def test_pytorch_primary_storage_is_checked_before_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
     def fail_load(
         _path: str,
         *,
@@ -696,8 +718,7 @@ def test_pytorch_primary_storage_is_checked_before_load(
         del map_location, weights_only
         raise AssertionError("oversized storage should be rejected before torch.load")
 
-    fake_torch.load = fail_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fail_load, version="2.6.0")
 
     path = tmp_path / "oversized-storage.pt"
     with zipfile.ZipFile(path, "w") as archive:
@@ -721,18 +742,9 @@ def test_pytorch_load_budget_ignores_unrelated_archive_members(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
     fake_load = _RecordingTorchLoad()
 
-    fake_torch.load = fake_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fake_load, version="2.6.0")
 
     path = tmp_path / "metadata-heavy.pt"
     with zipfile.ZipFile(path, "w") as archive:
@@ -758,15 +770,6 @@ def test_pytorch_pickle_object_budget_blocks_compact_container_amplification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
     def fail_load(
         _path: str,
         *,
@@ -776,8 +779,7 @@ def test_pytorch_pickle_object_budget_blocks_compact_container_amplification(
         del map_location, weights_only
         raise AssertionError("object-heavy pickle should be rejected before torch.load")
 
-    fake_torch.load = fail_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fail_load, version="2.6.0")
 
     path = tmp_path / "object-heavy.pt"
     with zipfile.ZipFile(path, "w") as archive:
@@ -794,15 +796,6 @@ def test_pytorch_blocked_load_fallback_honors_remaining_metadata_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.5.1"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
     def fake_load(
         _path: str,
         *,
@@ -812,8 +805,7 @@ def test_pytorch_blocked_load_fallback_honors_remaining_metadata_budget(
         del map_location, weights_only
         raise AssertionError("unsafe torch.load must remain blocked")
 
-    fake_torch.load = fake_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fake_load, version="2.5.1")
 
     path = tmp_path / "unsafe-version.pt"
     with zipfile.ZipFile(path, "w") as archive:
@@ -842,9 +834,6 @@ def test_pytorch_primary_tensor_size_is_checked_before_numpy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
     class FakeTensor:
         shape = (2, 2)
 
@@ -860,9 +849,6 @@ def test_pytorch_primary_tensor_size_is_checked_before_numpy(
         def detach() -> object:
             raise AssertionError("oversized tensor should not be converted")
 
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
     def fake_load(
         _path: str,
         *,
@@ -872,8 +858,7 @@ def test_pytorch_primary_tensor_size_is_checked_before_numpy(
         del map_location, weights_only
         return {"layer.weight": FakeTensor()}
 
-    fake_torch.load = fake_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fake_load, version="2.6.0", tensor_type=FakeTensor)
 
     path = tmp_path / "tensor.pt"
     path.write_bytes(b"x")
@@ -896,9 +881,6 @@ def test_pytorch_unsupported_tensor_does_not_hide_valid_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import numpy as np
-
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
 
     class FakeTensor:
         shape = (2, 2)
@@ -925,9 +907,6 @@ def test_pytorch_unsupported_tensor_does_not_hide_valid_weights(
                 raise TypeError("unsupported tensor layout")
             return np.ones((2, 2), dtype=np.float32)
 
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
     def fake_load(
         _path: str,
         *,
@@ -940,8 +919,7 @@ def test_pytorch_unsupported_tensor_does_not_hide_valid_weights(
             "sparse.weight": FakeTensor(supported=False),
         }
 
-    fake_torch.load = fake_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fake_load, version="2.6.0", tensor_type=FakeTensor)
 
     path = tmp_path / "mixed.pt"
     path.write_bytes(b"x")
@@ -960,17 +938,7 @@ def test_pytorch_zip_alias_expansion_is_rejected_before_numpy(
 ) -> None:
     import numpy as np
 
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
-    fake_torch.load = fail_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fail_load, version="2.6.0")
 
     row = [1.0] * 100
     payload = {"layer.weight": [row] * 100}
@@ -1024,13 +992,6 @@ def test_pytorch_primary_load_reuses_budgeted_handle_after_path_replacement(
     path.write_bytes(original_payload)
     replacement_path.write_bytes(replacement_payload)
 
-    fake_torch: Any = types.ModuleType("torch")
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
     budgeted_handle: Any = None
     loaded_handle: Any = None
     loaded_payload: bytes | None = None
@@ -1047,8 +1008,7 @@ def test_pytorch_primary_load_reuses_budgeted_handle_after_path_replacement(
         loaded_payload = handle.read()
         return {}
 
-    fake_torch.load = fake_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fake_load, version=None)
 
     scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
     original_budget_check = scanner._pytorch_load_handle_within_budget
@@ -1084,20 +1044,10 @@ def test_pytorch_zip_small_shared_sequence_is_not_treated_as_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
     def fail_load(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("force restricted fallback")
 
-    fake_torch.load = fail_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fail_load, version="2.6.0")
 
     row = [1.0, 2.0]
     path = tmp_path / "small-alias.pt"
@@ -1116,17 +1066,7 @@ def test_pytorch_zip_discarded_vector_does_not_consume_retained_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
-    fake_torch.load = fail_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fail_load, version="2.6.0")
 
     payload = {
         "weight_names": [1] * 100,
@@ -1148,17 +1088,7 @@ def test_pytorch_zip_ignores_large_non_weight_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_torch: Any = types.ModuleType("torch")
-    fake_torch.__version__ = "2.6.0"
-
-    class FakeTensor:
-        pass
-
-    fake_torch.Tensor = FakeTensor
-    fake_torch.device = lambda value: value
-
-    fake_torch.load = fail_load
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    _install_fake_torch(monkeypatch, fail_load, version="2.6.0")
 
     row = [1.0] * 100
     payload = {
@@ -1181,32 +1111,20 @@ def test_tensorflow_unknown_dtype_is_skipped_before_load_variable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    saved_model_dir = tmp_path / "saved_model"
-    variables_dir = saved_model_dir / "variables"
-    variables_dir.mkdir(parents=True)
-    (variables_dir / "variables.index").write_bytes(b"checkpoint index")
+    saved_model_dir = _write_checkpoint_index(tmp_path)
 
     class FakeCheckpointReader:
         @staticmethod
         def get_variable_to_dtype_map() -> dict[str, object]:
             return {"dense/kernel": object}
 
-    class FakeTrain:
-        @staticmethod
-        def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
-            return FakeCheckpointReader()
+    def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
+        return FakeCheckpointReader()
 
-        @staticmethod
-        def list_variables(_prefix: str) -> list[tuple[str, list[int]]]:
-            return [("dense/kernel", [2, 2])]
+    def load_variable(_prefix: str, _name: str) -> object:
+        raise AssertionError("unknown dtype variable should not be loaded")
 
-        @staticmethod
-        def load_variable(_prefix: str, _name: str) -> object:
-            raise AssertionError("unknown dtype variable should not be loaded")
-
-    fake_tensorflow: Any = types.ModuleType("tensorflow")
-    fake_tensorflow.train = FakeTrain
-    monkeypatch.setitem(sys.modules, "tensorflow", fake_tensorflow)
+    _install_tf_checkpoint(monkeypatch, load_checkpoint, [("dense/kernel", [2, 2])], load_variable)
 
     scanner = WeightDistributionScanner()
     weights = scanner._extract_tensorflow_weights(str(saved_model_dir))
@@ -2180,20 +2098,10 @@ class TestWeightDistributionScanner:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        fake_torch: Any = types.ModuleType("torch")
-        fake_torch.__version__ = "2.6.0"
-
-        class FakeTensor:  # pragma: no cover - simple test double
-            pass
-
-        fake_torch.Tensor = FakeTensor
-        fake_torch.device = lambda value: value
-
         def fail_load(*_args: object, **_kwargs: object) -> object:
             raise RuntimeError("force zip fallback")
 
-        fake_torch.load = fail_load
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        _install_fake_torch(monkeypatch, fail_load, version="2.6.0")
 
         zip_path = tmp_path / "model.pt"
         with zipfile.ZipFile(zip_path, "w") as archive:
@@ -2248,10 +2156,7 @@ class TestWeightDistributionScanner:
     ) -> None:
         import numpy as np
 
-        saved_model_dir = tmp_path / "saved_model"
-        variables_dir = saved_model_dir / "variables"
-        variables_dir.mkdir(parents=True)
-        (variables_dir / "variables.index").write_bytes(b"checkpoint index")
+        saved_model_dir = _write_checkpoint_index(tmp_path)
 
         loaded_variables: list[str] = []
 
@@ -2262,28 +2167,18 @@ class TestWeightDistributionScanner:
                     "small/kernel": np.dtype("float32"),
                 }
 
-        class FakeTrain:
-            @staticmethod
-            def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
-                return FakeCheckpointReader()
+        def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
+            return FakeCheckpointReader()
 
-            @staticmethod
-            def list_variables(_prefix: str) -> list[tuple[str, list[int]]]:
-                return [
-                    ("dense/kernel", [1024, 1024]),
-                    ("small/kernel", [2, 2]),
-                ]
+        def load_variable(_prefix: str, name: str) -> object:
+            if name == "dense/kernel":
+                raise AssertionError("oversized checkpoint variable should not be loaded")
+            loaded_variables.append(name)
+            return np.ones((2, 2), dtype=np.float32)
 
-            @staticmethod
-            def load_variable(_prefix: str, name: str) -> object:
-                if name == "dense/kernel":
-                    raise AssertionError("oversized checkpoint variable should not be loaded")
-                loaded_variables.append(name)
-                return np.ones((2, 2), dtype=np.float32)
-
-        fake_tensorflow: Any = types.ModuleType("tensorflow")
-        fake_tensorflow.train = FakeTrain
-        monkeypatch.setitem(sys.modules, "tensorflow", fake_tensorflow)
+        _install_tf_checkpoint(
+            monkeypatch, load_checkpoint, [("dense/kernel", [1024, 1024]), ("small/kernel", [2, 2])], load_variable
+        )
 
         scanner = WeightDistributionScanner({"max_array_size": 128})
         weights = scanner._extract_tensorflow_weights(str(saved_model_dir))
@@ -2301,10 +2196,7 @@ class TestWeightDistributionScanner:
     ) -> None:
         import numpy as np
 
-        saved_model_dir = tmp_path / "saved_model"
-        variables_dir = saved_model_dir / "variables"
-        variables_dir.mkdir(parents=True)
-        (variables_dir / "variables.index").write_bytes(b"checkpoint index")
+        saved_model_dir = _write_checkpoint_index(tmp_path)
 
         loaded_variables: list[str] = []
 
@@ -2316,23 +2208,16 @@ class TestWeightDistributionScanner:
                     "dense/kernel": np.dtype("float32"),
                 }
 
-        class FakeTrain:
-            @staticmethod
-            def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
-                return FakeCheckpointReader()
+        def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
+            return FakeCheckpointReader()
 
-            @staticmethod
-            def list_variables(_prefix: str) -> list[tuple[str, list[int]]]:
-                return [("class_weight", [1024]), ("dense/kernel", [2, 2])]
+        def load_variable(_prefix: str, name: str) -> object:
+            loaded_variables.append(name)
+            return np.ones((2, 2), dtype=np.float32)
 
-            @staticmethod
-            def load_variable(_prefix: str, name: str) -> object:
-                loaded_variables.append(name)
-                return np.ones((2, 2), dtype=np.float32)
-
-        fake_tensorflow: Any = types.ModuleType("tensorflow")
-        fake_tensorflow.train = FakeTrain
-        monkeypatch.setitem(sys.modules, "tensorflow", fake_tensorflow)
+        _install_tf_checkpoint(
+            monkeypatch, load_checkpoint, [("class_weight", [1024]), ("dense/kernel", [2, 2])], load_variable
+        )
 
         scanner = WeightDistributionScanner({"max_array_size": 128})
         weights = scanner._extract_tensorflow_weights(str(saved_model_dir))
@@ -2584,10 +2469,7 @@ class TestWeightDistributionScanner:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         payload = pickle.dumps({"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}, protocol=4)
 
         distinct_path = tmp_path / "distinct-data-members.pt"
@@ -2620,10 +2502,7 @@ class TestWeightDistributionScanner:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         model_path = tmp_path / "marked-root.pt"
         with zipfile.ZipFile(model_path, "w") as archive:
             archive.writestr("decoy/data.pkl", pickle.dumps({"decoy.weight": [[9.0, 9.0], [9.0, 9.0]]}))
@@ -2643,10 +2522,7 @@ class TestWeightDistributionScanner:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         model_path = tmp_path / "multiple-credible-roots.pt"
         with zipfile.ZipFile(model_path, "w") as archive:
             archive.writestr("data.pkl", pickle.dumps({"decoy.weight": [[0.0, 0.0], [0.0, 0.0]]}))
@@ -2677,9 +2553,6 @@ class TestWeightDistributionScanner:
         zip_path = create_mock_pytorch_zip(tmp_path / "expanded.pt", data=data)
         array_called = False
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
         original_array = np.array
 
         def track_array(value: Any) -> Any:
@@ -2687,7 +2560,7 @@ class TestWeightDistributionScanner:
             array_called = True
             return original_array(value)
 
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         monkeypatch.setattr(np, "array", track_array)
         scanner = WeightDistributionScanner({"max_array_size": 1024})
         weights = scanner._extract_pytorch_weights(str(zip_path))
@@ -2712,9 +2585,6 @@ class TestWeightDistributionScanner:
         zip_path = create_mock_pytorch_zip(tmp_path / "aliased.pt", data=data)
         array_calls = 0
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
         original_array = np.array
 
         def track_array(value: Any) -> Any:
@@ -2722,7 +2592,7 @@ class TestWeightDistributionScanner:
             array_calls += 1
             return original_array(value)
 
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         monkeypatch.setattr(np, "array", track_array)
         scanner = WeightDistributionScanner({"max_array_size": 1024})
         weights = scanner._extract_pytorch_weights(str(zip_path))
@@ -2748,10 +2618,7 @@ class TestWeightDistributionScanner:
         }
         model_path = create_mock_pytorch_zip(tmp_path / "metadata.pt", data=data)
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         scanner = WeightDistributionScanner()
         weights = scanner._extract_pytorch_weights(str(model_path))
 
@@ -2775,14 +2642,11 @@ class TestWeightDistributionScanner:
         with zipfile.ZipFile(zip_path, "w") as archive:
             archive.writestr("data.pkl", payload)
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
         class FailIfInstantiatedUnpickler:
             def __init__(self, *_args: object, **_kwargs: object) -> None:
                 raise AssertionError("over-budget pickle must not be unpickled")
 
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         monkeypatch.setattr(pickle, "Unpickler", FailIfInstantiatedUnpickler)
         scanner = WeightDistributionScanner({"max_array_size": 16384})
         weights = scanner._extract_pytorch_weights(str(zip_path))
@@ -2804,14 +2668,11 @@ class TestWeightDistributionScanner:
         with zipfile.ZipFile(model_path, "a") as archive:
             archive.writestr("data.pkl", payload)
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
         class FailIfInstantiatedUnpickler:
             def __init__(self, *_args: object, **_kwargs: object) -> None:
                 raise AssertionError("sparse memo pickle must not be unpickled")
 
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         monkeypatch.setattr(pickle, "Unpickler", FailIfInstantiatedUnpickler)
         direct = WeightDistributionScanner().scan(str(model_path))
 
@@ -2858,9 +2719,6 @@ class TestWeightDistributionScanner:
         with zipfile.ZipFile(zip_path, "w") as archive:
             archive.writestr("data.pkl", b"x" * 1025)
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
         original_open = zipfile.ZipFile.open
 
         def fail_data_member_open(
@@ -2876,7 +2734,7 @@ class TestWeightDistributionScanner:
                 raise AssertionError("oversized data.pkl must not be opened")
             return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
 
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         monkeypatch.setattr(zipfile.ZipFile, "open", fail_data_member_open)
         scanner = WeightDistributionScanner({"max_array_size": 1024})
         weights = scanner._extract_pytorch_weights(str(zip_path))
@@ -2903,10 +2761,7 @@ class TestWeightDistributionScanner:
         }
         model_path = create_mock_pytorch_zip(tmp_path / "partial.pt", data=data)
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("torch.load must remain blocked")
-
-        _install_fake_torch(monkeypatch, fake_load)
+        _install_fake_torch(monkeypatch)
         direct = WeightDistributionScanner().scan(str(model_path))
 
         assert direct.success is False
