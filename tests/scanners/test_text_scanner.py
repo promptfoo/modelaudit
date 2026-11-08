@@ -4497,11 +4497,12 @@ def test_gating_policy_keeps_active_reference_offsets(tmp_path: Path, field: str
     ],
     ids=["wrapped-prose", "shell-substitution"],
 )
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 def test_gating_policy_preserves_severity_after_call_lookback_limit(
-    tmp_path: Path, line: str, severity: IssueSeverity
+    tmp_path: Path, line: str, severity: IssueSeverity, newline: str
 ) -> None:
     field = json.dumps("Terms (a).\n" * 165 + line)
-    content = f"---\nextra_gated_prompt: {field}\n---\n"
+    content = newline.join(("---", f"extra_gated_prompt: {field}", "---", ""))
     result = _scan_text_content(tmp_path / "README.md", content)
     assert any(
         check.details.get("type") == "url_detected"
@@ -7638,6 +7639,6 @@ def _assert_bibliography_informational(tmp_path: Path, content: str) -> None:
 
 
 def _scan_text_content(text_path: Path, content: str) -> ScanResult:
-    text_path.write_text(content, encoding="utf-8")
+    text_path.write_bytes(content.encode("utf-8"))
     result = TextScanner().scan(str(text_path))
     return result
