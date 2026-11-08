@@ -147,6 +147,29 @@ EXPECTED_SYSTEM_GLOBAL = _expected_system_global()
 SYSTEM_GLOBALS = frozenset({"os.system", EXPECTED_SYSTEM_GLOBAL, "nt.system", "posix.system"})
 
 
+def _has_reference_finding(report: PickleReport, rule_code: str, reference: str) -> bool:
+    return any(
+        finding.rule_code == rule_code and finding.details.get("import_reference") == reference
+        for finding in report.findings
+    )
+
+
+def _has_critical_call_reference(report: PickleReport, reference: str) -> bool:
+    return any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == reference
+        for finding in report.findings
+    )
+
+
+def _has_string_pattern(report: PickleReport, pattern: str) -> bool:
+    return any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == pattern
+        for finding in report.findings
+    )
+
+
 def _assert_clean_report(report: PickleReport) -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
@@ -167,10 +190,7 @@ def _assert_non_allowlisted_gadget(report: PickleReport, module_name: str, marke
 def _assert_suspicious_string_report(report: PickleReport, pattern: str) -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == pattern
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, pattern)
 
 
 def _assert_inconclusive_without_findings(
@@ -440,6 +460,12 @@ def _write_float_storage_zip(archive_path: Path, storage_blob: bytes) -> None:
         _float_storage_persistent_id_payload_for_bytes("0", storage_blob),
         storage_bytes=storage_blob,
     )
+
+
+def _scan_padded_float_storage_zip(archive_path: Path, storage_blob: bytes) -> PickleReport:
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    _write_float_storage_zip(archive_path, storage_blob)
+    return scan_file(archive_path)
 
 
 def _torch_rebuild_tensor_v2_warnings(report: PickleReport) -> list[Finding]:
@@ -1727,12 +1753,7 @@ def test_scan_bytes_escalates_main_reduce_to_malicious() -> None:
     report = scan_bytes(b"c__main__\nDanger\n)R.", source="main-reduce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "__main__.Danger"
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, "__main__.Danger")
 
 
 def test_scan_bytes_ignores_comment_only_importlib_literal() -> None:
@@ -2037,12 +2058,7 @@ def test_scan_bytes_blocks_operator_setitem_copyreg_dispatch_table_poisoning(
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert decimal.Decimal not in copyreg.dispatch_table
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "operator.setitem"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "operator.setitem")
 
         assert pickle.loads(payload) is None
         assert copyreg.dispatch_table.get(decimal.Decimal) is str
@@ -2187,10 +2203,7 @@ def test_scan_bytes_continues_raw_nested_scan_after_data_only_payload() -> None:
         and finding.details.get("payload_size") == len(b"cos\nsystem\n)R.")
         for finding in report.findings
     )
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", "os.system")
 
 
 def test_scan_bytes_continues_encoded_nested_scan_after_data_only_payload() -> None:
@@ -2207,10 +2220,7 @@ def test_scan_bytes_continues_encoded_nested_scan_after_data_only_payload() -> N
         and finding.details.get("payload_size") == len(b"cos\nsystem\n)R.")
         for finding in report.findings
     )
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", "os.system")
 
 
 @pytest.mark.parametrize(
@@ -2232,10 +2242,7 @@ def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload:
         and finding.details.get("payload_size") == len(b"cos\nsystem\n)R.")
         for finding in report.findings
     )
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", "os.system")
 
 
 RAW_NESTED_UNICODE_LITERAL = b"AAAAAAcos\nsystem\n)R.BBBB"
@@ -2264,10 +2271,7 @@ def test_scan_bytes_scans_unicode_opcodes_for_raw_nested_payloads(payload: bytes
         and finding.details.get("payload_size") == RAW_NESTED_PICKLE_SIZE
         for finding in report.findings
     )
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", "os.system")
 
 
 @pytest.mark.parametrize(
@@ -2290,10 +2294,7 @@ def test_scan_bytes_decodes_unicode_scalars_before_probing_raw_nested_payloads(p
         and finding.details.get("payload_size") == len(BINARY_STACK_GLOBAL_NESTED_PICKLE)
         for finding in report.findings
     )
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", "os.system")
 
 
 def test_scan_bytes_scans_protocol0_container_starts_in_unicode_literals() -> None:
@@ -2310,10 +2311,7 @@ def test_scan_bytes_scans_protocol0_container_starts_in_unicode_literals() -> No
         and finding.details.get("payload_size") == len(nested_payload)
         for finding in report.findings
     )
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", "os.system")
 
 
 def test_scan_bytes_fails_closed_for_under_limit_malformed_unicode_raw_nested_payloads() -> None:
@@ -2340,10 +2338,7 @@ def test_scan_bytes_scans_ascii_raw_nested_payloads_in_mixed_unicode_literals() 
     )
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", "os.system")
 
 
 @pytest.mark.parametrize("literal", ["Value " * 65, "I am a value. " * 65, "list " * 65])
@@ -2387,10 +2382,7 @@ def test_scan_bytes_scans_unicode_raw_nested_dangerous_globals_without_execution
     )
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(
-        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_GLOBAL", "os.system")
 
 
 def test_scan_bytes_fails_closed_for_unicode_raw_nested_payload_over_byte_limit() -> None:
@@ -2590,11 +2582,7 @@ def test_scan_bytes_does_not_warn_for_library_pytorch_storage_persistent_id(
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
-    assert not any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch.FloatStorage"
-        for finding in report.findings
-    )
+    assert not _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "torch.FloatStorage")
 
 
 def test_scan_bytes_warns_for_shadowed_pytorch_storage_persistent_id(
@@ -2623,11 +2611,7 @@ def test_scan_bytes_warns_for_shadowed_pytorch_storage_persistent_id(
 
     assert marker.exists() is False
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch.FloatStorage"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "torch.FloatStorage")
 
     completed = subprocess.run(
         [
@@ -2749,15 +2733,8 @@ def test_scan_bytes_preserves_native_storage_pid_flags_when_trust_parser_fails(
         report = scan_bytes(payload, source="parser-failed-pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert not any(
-        finding.rule_code == "DANGEROUS_CALL_GRAPH" and finding.details.get("import_reference") == "torch.FloatStorage"
-        for finding in report.findings
-    )
-    assert not any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch.FloatStorage"
-        for finding in report.findings
-    )
+    assert not _has_reference_finding(report, "DANGEROUS_CALL_GRAPH", "torch.FloatStorage")
+    assert not _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "torch.FloatStorage")
     storage_references = [
         reference
         for reference in report.metadata["import_references"]
@@ -2782,10 +2759,7 @@ def test_scan_bytes_preserves_unmatched_storage_global_call_graph_when_trust_par
         report = scan_bytes(payload, source="parser-failed-mixed-pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL_GRAPH" and finding.details.get("import_reference") == "torch.FloatStorage"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL_GRAPH", "torch.FloatStorage")
     storage_references = [
         reference
         for reference in report.metadata["import_references"]
@@ -5410,10 +5384,7 @@ def test_scan_file_scans_protocol0_int_crossing_trusted_probe_boundary(tmp_path:
 def test_scan_file_scans_extension_opcode_crossing_trusted_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + (b" " * 4093) + b"\x82\x01."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -5437,10 +5408,7 @@ def test_scan_file_routes_encoded_extension_operand_cut_after_recovered_mark(tmp
     archive_path = tmp_path / "recovered-mark-extension-boundary.pt"
     nested_payload = b"(" + (b"N" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES - 2)) + b"\x82\x01)R."
     storage_blob = _proto0_string_literal(base64.b64encode(nested_payload))
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict != SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -5450,10 +5418,7 @@ def test_scan_file_routes_nested_mark_extension_context(tmp_path: Path) -> None:
     archive_path = tmp_path / "nested-mark-extension.pt"
     payload = b"(N(N10\x82\x01)o\xff"
     storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict != SafetyVerdict.CLEAN
@@ -5470,10 +5435,7 @@ def test_scan_file_routes_nested_mark_extension_context(tmp_path: Path) -> None:
 def test_scan_file_routes_encoded_extension_fail_closed_suffixes(tmp_path: Path, payload: bytes) -> None:
     archive_path = tmp_path / "extension-fail-closed-suffix.pt"
     storage_blob = b"S'" + base64.b64encode(payload) + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict != SafetyVerdict.CLEAN
@@ -5493,10 +5455,7 @@ def test_scan_file_preserves_later_payload_after_exhausted_extension_context(
 ) -> None:
     archive_path = tmp_path / "extension-exhausted-context-later-payload.pt"
     storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
@@ -5827,10 +5786,7 @@ def test_scan_file_routes_binunicode8_literal_after_trivial_prefix(tmp_path: Pat
     archive_path = tmp_path / "model.pt"
     encoded_payload = base64.b64encode(b"cposix\nsystem\n)R.")
     storage_blob = b"N." + _binunicode8(encoded_payload) + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -5849,10 +5805,7 @@ def test_scan_file_scans_length_operand_crossing_trusted_probe_boundary(tmp_path
 def test_scan_file_marks_oversized_length_operand_inconclusive(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + b"X" + (70_000).to_bytes(4, "little") + (b"A" * 70_000)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert report.metadata["analysis_incomplete"] is True
@@ -5888,10 +5841,7 @@ def test_scan_file_scans_second_frame_header_crossing_trusted_probe_boundary(tmp
     second_frame = b"\x95" + len(second_frame_body).to_bytes(8, "little") + second_frame_body
     padding = b" " * (4096 - len(b"N.") - len(first_frame) - 1)
     storage_blob = b"N." + padding + first_frame + second_frame
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -5912,10 +5862,7 @@ def test_scan_file_marks_oversized_frame_payload_inconclusive(tmp_path: Path) ->
     frame_body += b"cposix\nsystem\n(S'echo hidden'\ntR."
     frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
     storage_blob = b"N." + frame
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert report.metadata["analysis_incomplete"] is True
@@ -6055,10 +6002,7 @@ def test_scan_file_scans_truncated_inst_operand_after_trivial_stream_at_trusted_
     storage_prefix = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"i"))) + b"i"
     assert len(storage_prefix) == package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + b"posix\nsystem\n(S'echo hidden'\ntR."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.status == ScanStatus.INCONCLUSIVE
@@ -6071,10 +6015,7 @@ def test_scan_file_scans_truncated_inst_operand_after_trivial_stream_at_trusted_
 def test_scan_file_routes_nested_extension_reference_literal_storage(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"U\x03\x82\x01.."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.status == ScanStatus.INCONCLUSIVE
@@ -6084,10 +6025,7 @@ def test_scan_file_routes_nested_extension_reference_literal_storage(tmp_path: P
 def test_scan_file_routes_base64_extension_reduce_literal_storage(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'ggFOMClSLg=='\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.verdict == SafetyVerdict.MALICIOUS
@@ -6200,10 +6138,7 @@ def test_scan_file_fails_closed_for_encoded_nested_pickle_after_candidate_budget
         (b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"Z" * 9000) + nested_payload
     )
     storage_blob = b"S'" + encoded_payload + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict != SafetyVerdict.CLEAN
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6240,10 +6175,7 @@ def test_scan_file_scans_scalar_literal_after_clean_nontrivial_stream(tmp_path: 
 def test_scan_file_preserves_suspicious_literal_after_trivial_stream(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N.]S'__reduce__'\na."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6270,10 +6202,7 @@ def test_scan_file_scans_scalar_literal_with_escaped_binary_nested_pickle(tmp_pa
 def test_scan_file_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'eval('\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6288,10 +6217,7 @@ def test_scan_file_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -
 def test_scan_file_continues_literal_inspection_after_surrogate_unicode(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"V\\ud800\nS'os.system'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6301,10 +6227,7 @@ def test_scan_file_continues_literal_inspection_after_surrogate_unicode(tmp_path
 def test_scan_file_scans_scalar_literal_with_magic_method_suspicious_string(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'__reduce__'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6374,10 +6297,7 @@ def test_scan_file_skips_repeated_malformed_separator_literal_near_match(tmp_pat
 def test_scan_file_routes_binunicode_literal_with_repeated_line_continuations(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"\x80\x02" + _binunicode(b"os\\\n\\\n.system('id') ") + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6409,10 +6329,7 @@ def test_scan_file_scans_malformed_separator_after_benign_binary_candidates(
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + tail
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.verdict == expected_verdict
@@ -6431,10 +6348,7 @@ def test_scan_file_scans_malformed_separator_after_benign_binary_candidates(
 def test_scan_file_reports_large_malformed_separator_tensor_noise_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + (b"\xff" * 100_000)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6449,10 +6363,7 @@ def test_scan_file_scans_malformed_separator_unicode_literal_nested_pickle(tmp_p
     archive_path = tmp_path / "model.pt"
     encoded = base64.b64encode(b"cbuiltins\neval\n(S'1'\ntR.")
     storage_blob = b"N.!V" + encoded + b"\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6673,10 +6584,7 @@ def test_scan_file_routes_scalar_literals_with_full_suspicious_string_policy(
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == expected_verdict
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6693,10 +6601,7 @@ def test_scan_file_skips_repeated_text_candidate_budget_near_match(tmp_path: Pat
     archive_path = tmp_path / "model.pt"
     literal = b"abc" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
     assert report.metadata["pickle_files"] == ("archive/data.pkl",)
@@ -6847,10 +6752,7 @@ def test_scan_file_routes_extension_opcode_after_raw_candidate_budget_gap(tmp_pa
     archive_path = tmp_path / "model.pt"
     literal = (b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"A" * 10) + b"\x82\x01."
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6866,10 +6768,7 @@ def test_scan_file_scans_whitespace_hex_nested_pickle_literal(tmp_path: Path) ->
     archive_path = tmp_path / "model.pt"
     encoded = binascii.hexlify(b"cposix\nsystem\n)R.")
     storage_blob = _proto0_string_literal(encoded[:8] + b" " + encoded[8:])
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6946,10 +6845,7 @@ def test_scan_file_marks_repeated_trivial_streams_filling_expanded_probe_inconcl
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = (b"N." * 32768) + pickle.dumps(MaliciousPayload(), protocol=4)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert report.metadata["analysis_incomplete"] is True
@@ -7020,10 +6916,7 @@ def test_scan_file_scans_comment_prefixed_pickle_after_trivial_scalar_prefix(tmp
 def test_scan_file_scans_persid_after_trivial_prefix_crossing_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N.P" + (b"A" * 4093) + b"\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert any(
@@ -7041,10 +6934,7 @@ def test_scan_file_scans_security_relevant_pickle_after_trivial_scalar_prefix(
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + trailing_payload
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert any(
@@ -8987,10 +8877,7 @@ def test_scan_bytes_keeps_network_url_reducers_actionable(payload: bytes, import
     report = scan_bytes(payload, source="network-reducer.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == import_reference
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", import_reference)
 
 
 def test_scan_bytes_keeps_build_url_state_actionable() -> None:
@@ -9315,12 +9202,7 @@ def test_scan_bytes_detects_pathlib_mutating_dotted_method_reduce(tmp_path: Path
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert target.exists() is False
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
     assert any(
         ref["import_reference"] == expected_reference and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
@@ -9338,12 +9220,7 @@ def test_scan_bytes_detects_pathlib_read_text_dotted_method_reduce(tmp_path: Pat
     report = scan_bytes(payload, source="pathlib-read-text.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
     assert pickle.loads(payload) == "modelaudit-secret-8\n"
 
 
@@ -9356,12 +9233,7 @@ def test_scan_bytes_detects_pathlib_read_bytes_dotted_method_reduce(tmp_path: Pa
     report = scan_bytes(payload, source="pathlib-read-bytes.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
     assert pickle.loads(payload) == b"\x00modelaudit-secret-8\xff"
 
 
@@ -9379,12 +9251,7 @@ def test_scan_bytes_detects_python313_pathlib_local_dotted_method_reduce(expecte
     report = scan_bytes(payload, source=f"{expected_reference}-local-method.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
 
 
 def test_scan_bytes_allows_benign_pathlib_path_constructor() -> None:
@@ -9425,12 +9292,7 @@ def test_scan_bytes_detects_file_truncating_stdlib_reduce(
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert target.stat().st_size > 0
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
     result = pickle.loads(payload)
     try:
         assert target.stat().st_size == 0
@@ -9467,12 +9329,7 @@ def test_scan_bytes_detects_stdlib_file_opening_wrappers(
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert target.read_bytes() == original
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
     result = pickle.loads(payload)
     close = getattr(result, "close", None)
     if close is not None:
@@ -9495,12 +9352,7 @@ def test_scan_bytes_detects_logging_disable_diagnostic_suppression() -> None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert logging.root.manager.disable == logging.NOTSET
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "logging.disable"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "logging.disable")
         assert pickle.loads(payload) is None
         assert logging.root.manager.disable == logging.CRITICAL
     finally:
@@ -9519,12 +9371,7 @@ def test_scan_bytes_detects_logging_capture_warnings_diagnostic_reroute() -> Non
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert warnings.showwarning is baseline_showwarning
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "logging.captureWarnings"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "logging.captureWarnings")
         assert pickle.loads(payload) is None
         assert warnings.showwarning is not baseline_showwarning
     finally:
@@ -9551,12 +9398,7 @@ def test_scan_bytes_detects_warnings_filter_suppression(payload: bytes, expected
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert warnings.filters == []
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
     assert pickle.loads(payload) is None
     assert warnings.filters[0][0] == "ignore"
 
@@ -9573,12 +9415,7 @@ def test_scan_bytes_detects_warnings_resetwarnings_policy_erasure() -> None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert warnings.filters[0][0] == "error"
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "warnings.resetwarnings"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "warnings.resetwarnings")
         assert pickle.loads(payload) is None
         assert warnings.filters == []
     finally:
@@ -9598,12 +9435,7 @@ def test_scan_bytes_detects_warnings_filters_list_clear_policy_erasure() -> None
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert warnings.filters[0][0] == "error"
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "builtins.list.clear"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "builtins.list.clear")
         assert pickle.loads(payload) is None
         assert warnings.filters == []
     finally:
@@ -9651,12 +9483,7 @@ def test_scan_bytes_detects_warnings_filters_list_insert_suppression() -> None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert warnings.filters[0][0] == "error"
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "builtins.list.insert"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "builtins.list.insert")
         assert pickle.loads(payload) is None
         warnings.warn("after-pickle", UserWarning, stacklevel=2)
         assert warnings.filters[0][0] == "ignore"
@@ -9677,12 +9504,7 @@ def test_scan_bytes_detects_logging_root_handlers_list_clear() -> None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert len(logging.root.handlers) == 1
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "builtins.list.clear"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "builtins.list.clear")
         assert pickle.loads(payload) is None
         assert logging.root.handlers == []
     finally:
@@ -9701,12 +9523,7 @@ def test_scan_bytes_detects_warnings_filters_list_pop_policy_erasure() -> None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert warnings.filters[0][0] == "error"
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "builtins.list.pop"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "builtins.list.pop")
         removed_filter = pickle.loads(payload)
         assert removed_filter[0] == "error"
         assert warnings.filters == []
@@ -9727,12 +9544,7 @@ def test_scan_bytes_detects_warnings_filters_list_setitem_suppression() -> None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert warnings.filters[0][0] == "error"
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "builtins.list.__setitem__"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "builtins.list.__setitem__")
         assert pickle.loads(payload) is None
         assert warnings.filters[0][0] == "ignore"
     finally:
@@ -9761,12 +9573,7 @@ def test_scan_bytes_detects_logging_root_handlers_list_item_removal(
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert logging.root.handlers == [handler]
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == expected_reference
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, expected_reference)
         pickle.loads(payload)
         assert logging.root.handlers == []
     finally:
@@ -9784,12 +9591,7 @@ def test_scan_bytes_detects_faulthandler_disable_diagnostic_suppression() -> Non
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert faulthandler.is_enabled() is True
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "faulthandler.disable"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "faulthandler.disable")
         assert pickle.loads(payload) is True
         assert faulthandler.is_enabled() is False
     finally:
@@ -9833,12 +9635,7 @@ def test_scan_bytes_detects_site_pth_execution_helpers(
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert marker.exists() is False
         assert site_dir_text not in sys.path
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == expected_reference
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, expected_reference)
         assert pickle.loads(payload) is None
         assert marker.read_text(encoding="utf-8") == message
         if helper == "addsitedir":
@@ -9856,12 +9653,7 @@ def test_scan_bytes_detects_dbm_open_resource_creation(tmp_path: Path) -> None:
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert not list(tmp_path.iterdir())
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "dbm.open"
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, "dbm.open")
     db = pickle.loads(payload)
     try:
         assert any(path.name.startswith("payload_dbm") for path in tmp_path.iterdir())
@@ -9877,12 +9669,7 @@ def test_scan_bytes_detects_maildir_resource_creation(tmp_path: Path) -> None:
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert maildir.exists() is False
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "mailbox.Maildir"
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, "mailbox.Maildir")
     pickle.loads(payload)
     assert sorted(path.name for path in maildir.iterdir()) == ["cur", "new", "tmp"]
 
@@ -9894,12 +9681,7 @@ def test_scan_bytes_detects_named_temporary_file_resource_creation(tmp_path: Pat
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert not list(tmp_path.iterdir())
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "tempfile.NamedTemporaryFile"
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, "tempfile.NamedTemporaryFile")
     created_path: Path | None = None
     wrapper = pickle.loads(payload)
     try:
@@ -9919,12 +9701,7 @@ def test_scan_bytes_detects_temporary_directory_resource_creation(tmp_path: Path
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert not list(tmp_path.iterdir())
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "tempfile.TemporaryDirectory"
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, "tempfile.TemporaryDirectory")
     created_path: Path | None = None
     temporary_directory = pickle.loads(payload)
     try:
@@ -9954,12 +9731,7 @@ def test_scan_bytes_detects_configparser_read_get_disclosure_chain(
     report = scan_bytes(payload, source=f"{expected_reference}-read-get.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
     assert pickle.loads(payload) == "modelaudit-config-secret-10"
 
 
@@ -9972,12 +9744,7 @@ def test_scan_bytes_detects_argparse_filetype_constructed_callable(tmp_path: Pat
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     assert target.stat().st_size > 0
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "argparse.FileType"
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, "argparse.FileType")
     handle = pickle.loads(payload)
     try:
         assert target.stat().st_size == 0
@@ -10007,12 +9774,7 @@ def test_scan_bytes_detects_copyreg_dispatch_table_poisoning(payload: bytes, exp
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert decimal.Decimal not in copyreg.dispatch_table
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == expected_reference
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, expected_reference)
         pickle.loads(payload)
         assert copyreg.dispatch_table.get(decimal.Decimal) is str
         with pytest.raises(pickle.PicklingError):
@@ -10087,12 +9849,7 @@ def test_scan_bytes_detects_copyreg_dispatch_table_reducer_deletion(
 
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == expected_reference
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, expected_reference)
         pickle.loads(payload)
         assert union_type not in copyreg.dispatch_table
         union_type_name = f"{union_type.__module__}.{union_type.__qualname__}"
@@ -10114,12 +9871,7 @@ def test_scan_bytes_detects_copyreg_dispatch_table_popitem_erasure() -> None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert copyreg.dispatch_table.get(decimal.Decimal) is str
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "builtins.dict.popitem"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "builtins.dict.popitem")
         popped_item = pickle.loads(payload)
         assert popped_item == (decimal.Decimal, str)
         assert decimal.Decimal not in copyreg.dispatch_table
@@ -10138,12 +9890,7 @@ def test_scan_bytes_detects_copyreg_dispatch_table_erasure() -> None:
 
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.MALICIOUS
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "builtins.dict.clear"
-            for finding in report.findings
-        )
+        assert _has_critical_call_reference(report, "builtins.dict.clear")
         assert pickle.loads(payload) is None
         assert copyreg.dispatch_table == {}
     finally:
@@ -10185,10 +9932,7 @@ def test_scan_bytes_requires_source_analysis_for_invoked_trusted_dill_dump(
     else:
         assert report.status == ScanStatus.INCONCLUSIVE
         assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
-            for finding in report.findings
-        )
+        assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "dill.dump")
         assert any(
             notice.code == "call_graph_source_unavailable"
             and notice.details.get("import_reference") == "dill.dump"
@@ -10212,10 +9956,7 @@ def test_scan_bytes_warns_when_invoked_dill_dump_resolves_to_shadow_module(
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "dill.dump")
 
 
 def test_scan_bytes_warns_when_invoked_dill_dump_origin_is_unresolved(
@@ -10233,10 +9974,7 @@ def test_scan_bytes_warns_when_invoked_dill_dump_origin_is_unresolved(
         report = scan_bytes(b"\x80\x02cdill\ndump\n(tR.", source="unresolved-dill-dump.pkl")
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "dill.dump")
     assert any(
         notice.code == "call_graph_source_unavailable"
         and notice.details.get("import_reference") == "dill.dump"
@@ -10330,12 +10068,7 @@ def test_scan_bytes_flags_expanded_high_risk_callables(payload: bytes, expected_
     report = scan_bytes(payload, source=f"{expected_reference}.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == expected_reference
-        for finding in report.findings
-    )
+    assert _has_critical_call_reference(report, expected_reference)
 
 
 def test_scan_bytes_flags_newobj_ex_dangerous_class() -> None:
@@ -10776,11 +10509,7 @@ def test_scan_bytes_warns_when_meta_path_finder_shadows_framework_reference(
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.SUSPICIOUS
         assert marker.exists() is False
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
-            for finding in report.findings
-        )
+        assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "torch._utils._rebuild_tensor_v2")
         pickle.loads(payload)
         assert marker.read_text(encoding="utf-8") == "owned"
     finally:
@@ -11637,10 +11366,7 @@ def test_scan_bytes_warns_when_known_safe_reference_resolves_to_shadow_module(
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "string.Template"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "string.Template")
 
 
 def test_scan_bytes_allows_trusted_argparse_namespace() -> None:
@@ -11667,11 +11393,7 @@ def test_scan_bytes_warns_when_argparse_namespace_resolves_to_shadow_module(
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "argparse.Namespace"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "argparse.Namespace")
     subprocess.run(
         [
             sys.executable,
@@ -11709,10 +11431,7 @@ def test_scan_bytes_warns_when_allowlisted_module_resolves_from_inactive_fake_en
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "numpy.Gadget")
     load_payload = f"import pickle, sys; sys.path.insert(0, {str(site_packages)!r}); pickle.loads({payload!r})"
     subprocess.run([sys.executable, "-c", load_payload], check=True)
     assert marker.read_text(encoding="utf-8") == "owned"
@@ -11739,10 +11458,7 @@ def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabl
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "numpy.Gadget")
     source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert str((tmp_path / "numpy.py").absolute()) in source_fingerprints["fingerprints"]
@@ -11803,11 +11519,7 @@ def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.SUSPICIOUS
         assert marker.exists() is False
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "__builtins__.Gadget"
-            for finding in report.findings
-        )
+        assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "__builtins__.Gadget")
         pickle.loads(payload)
         assert marker.read_text(encoding="utf-8") == "owned"
     finally:
@@ -11823,10 +11535,7 @@ def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pyt
         report = scan_bytes(b"cnumpy\nGadget\n.", source="unresolved-numpy-gadget.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "numpy.Gadget")
 
 
 @pytest.mark.parametrize(
@@ -11881,11 +11590,7 @@ def test_scan_bytes_warns_on_invoked_unresolved_framework_reconstruction_global(
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "torch._utils._rebuild_tensor_v2")
     assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
 
 
@@ -11900,11 +11605,7 @@ def test_scan_bytes_warns_on_unresolved_hf_training_args_framework_metadata(
         )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "transformers.training_args.TrainingArguments")
     assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
     assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
 
@@ -11921,11 +11622,7 @@ def test_scan_bytes_warns_on_unresolved_import_only_hf_training_args_metadata(
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "transformers.training_args.TrainingArguments")
 
 
 def test_scan_bytes_suppresses_import_only_hf_training_args_metadata_with_trusted_origin_and_inert_import(
@@ -12661,11 +12358,7 @@ def test_scan_bytes_suppresses_safe_numpy_ndarray_reconstruct_call_graph_noise()
         source="safe-numpy-ndarray-reconstruct.pkl",
     )
 
-    assert not any(
-        finding.rule_code == "DANGEROUS_CALL_GRAPH"
-        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
-        for finding in report.findings
-    )
+    assert not _has_reference_finding(report, "DANGEROUS_CALL_GRAPH", "numpy.core.multiarray._reconstruct")
     assert not any(finding.severity == Severity.CRITICAL for finding in report.findings)
 
 
@@ -12866,11 +12559,7 @@ def test_scan_bytes_warns_when_hf_import_only_metadata_resolves_to_shadow_module
 
     assert marker.exists() is False
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "transformers.training_args.TrainingArguments")
 
     completed = subprocess.run(
         [
@@ -12934,11 +12623,7 @@ def test_scan_bytes_warns_when_numpy_reconstruct_resolves_to_shadow_module(
 
     assert marker.exists() is False
     assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "numpy.core.multiarray._reconstruct")
 
     completed = subprocess.run(
         [
@@ -12997,10 +12682,8 @@ def test_scan_bytes_warns_when_hf_metadata_constructor_resolves_to_shadow_module
 
     assert marker.exists() is False
     assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
-    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) or any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
-        for finding in report.findings
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) or _has_reference_finding(
+        report, "NON_ALLOWLISTED_GLOBAL", "transformers.training_args.TrainingArguments"
     )
 
 
@@ -13026,11 +12709,7 @@ def test_scan_bytes_warns_when_framework_reconstruction_reference_resolves_to_sh
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "torch._utils._rebuild_tensor_v2")
 
     completed = subprocess.run(
         [sys.executable, "-c", f"import pickle; pickle.loads({payload!r})"],
@@ -13067,22 +12746,14 @@ def test_scan_bytes_warns_on_unresolved_reviewed_optional_global(monkeypatch: py
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "botocore.credentials.ProcessProvider"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "botocore.credentials.ProcessProvider")
 
 
 def test_scan_bytes_warns_on_invoked_non_allowlisted_custom_global() -> None:
     report = scan_bytes(b"cprivate_payload\nGadget\n)R.", source="invoked-custom-global.pkl")
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "private_payload.Gadget"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "private_payload.Gadget")
     assert all(finding.rule_code != "DANGEROUS_CALL" for finding in report.findings)
     assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
 
@@ -13097,11 +12768,7 @@ def test_scan_bytes_warns_on_invoked_trusted_import_reference_without_source_ana
     if report.status == ScanStatus.INCONCLUSIVE:
         assert report.metadata.get("analysis_incomplete") is True
     assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "_xxsubinterpreters.create"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "_xxsubinterpreters.create")
 
 
 def _assert_call_graph_source_stability_error(report: PickleReport) -> None:
@@ -13175,21 +12842,14 @@ def test_scan_bytes_warns_on_unreviewed_dotenv_global_when_source_changes(monkey
     assert report.status == ScanStatus.INCONCLUSIVE
     _assert_call_graph_source_stability_error(report)
     assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "dotenv.main.Gadget"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "dotenv.main.Gadget")
 
 
 def test_scan_bytes_warns_on_unreviewed_submodule_of_allowlisted_package() -> None:
     report = scan_bytes(b"cnumpy.evil\nGadget\n.", source="numpy-evil.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.evil.Gadget"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "numpy.evil.Gadget")
 
 
 def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
@@ -14442,10 +14102,7 @@ def test_direct_dangerous_call_suppresses_redundant_source_unavailable_notice() 
     report = scan_bytes(payload, source="direct-platform-system.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == import_reference
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_CALL", import_reference)
     assert not any(
         notice.code == "call_graph_source_unavailable" and notice.details.get("import_reference") == import_reference
         for notice in report.notices
@@ -14925,10 +14582,7 @@ def test_scan_bytes_warns_on_nested_allowlisted_global_from_shadow_module(
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
     assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "decimal.Decimal"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "NON_ALLOWLISTED_GLOBAL", "decimal.Decimal")
     load_payload = (
         f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads(pickle.loads({outer_payload!r}))"
     )
@@ -15525,10 +15179,7 @@ def test_scan_bytes_fails_closed_for_encoded_dangerous_global_prefix(
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_reference_finding(report, "DANGEROUS_GLOBAL", "os.system")
     assert any(
         finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
         for finding in report.findings
@@ -15774,10 +15425,7 @@ def test_scan_bytes_flags_suspicious_literal_content_across_truncated_literal_wi
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
     assert report.is_clean is False
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
@@ -15846,10 +15494,7 @@ def test_scan_bytes_detects_code_after_triple_quote_crossing_overlap_start(proto
         assert any(notice.code == "parse_incomplete" for notice in report.notices)
     else:
         assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-            for finding in report.findings
-        )
+        assert _has_string_pattern(report, "os.system")
         assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
@@ -15883,10 +15528,7 @@ def test_scan_bytes_detects_formatted_url_expression_when_quote_starts_overlap(p
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
@@ -15905,10 +15547,7 @@ def test_scan_bytes_rejects_embedded_prefix_at_overlap(max_chars: int, expected_
 
     assert report.status == expected_status
     assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
 
 
 @pytest.mark.parametrize("prefix", ["fr", "fR", "Fr", "FR", "rf", "rF", "Rf", "RF"])
@@ -15931,10 +15570,7 @@ def test_scan_bytes_preserves_formatted_prefix_split_at_overlap(prefix: str) -> 
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
 
 
 @pytest.mark.parametrize("prefix", ["br", "bR", "Br", "BR", "rb", "rB", "Rb", "RB"])
@@ -15971,10 +15607,7 @@ def test_scan_bytes_does_not_skip_base64_token_starting_at_overlap() -> None:
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 def test_scan_bytes_keeps_base64_payload_in_url_starting_at_overlap_inert() -> None:
@@ -16005,10 +15638,7 @@ def test_scan_bytes_preserves_shifted_base64_alignment(protocol: int, shift: int
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 def test_scan_bytes_preserves_shifted_mime_base64_alignment() -> None:
@@ -16022,10 +15652,7 @@ def test_scan_bytes_preserves_shifted_mime_base64_alignment() -> None:
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 def test_scan_bytes_preserves_shifted_urlsafe_base64_alignment() -> None:
@@ -16039,10 +15666,7 @@ def test_scan_bytes_preserves_shifted_urlsafe_base64_alignment() -> None:
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 def test_scan_bytes_detects_shifted_base64_without_windowing() -> None:
@@ -16056,10 +15680,7 @@ def test_scan_bytes_detects_shifted_base64_without_windowing() -> None:
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 def test_scan_bytes_keeps_shifted_base64_url_inert() -> None:
@@ -16103,10 +15724,7 @@ def test_scan_bytes_resets_base64_alignment_when_url_ends_at_overlap(protocol: i
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 @pytest.mark.parametrize("url_end_delta", [-1, 0, 1])
@@ -16133,10 +15751,7 @@ def test_scan_bytes_resets_encoded_alignment_around_removed_url(
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 def test_scan_bytes_keeps_benign_base64_after_removed_url_clean() -> None:
@@ -16166,10 +15781,7 @@ def test_scan_bytes_detects_base64_after_removed_url_without_windowing() -> None
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "base64 os.system")
 
 
 @pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
@@ -16192,10 +15804,7 @@ def test_scan_bytes_preserves_odd_backslash_parity_at_overlap(protocol: int, sla
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
 
 
 @pytest.mark.parametrize("slash_count", [4, 6, 8])
@@ -16239,10 +15848,7 @@ def test_scan_bytes_detects_odd_backslash_payload_without_windowing() -> None:
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
 
 
 def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
@@ -16254,10 +15860,7 @@ def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
@@ -16299,10 +15902,7 @@ def test_scan_bytes_preserves_call_after_bounded_cross_window_quoted_url() -> No
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
@@ -16882,10 +16482,7 @@ def _assert_storage_skipped(archive_path: Path, storage_blob: bytes) -> PickleRe
 
 
 def _assert_storage_pickle_detected(archive_path: Path, storage_blob: bytes) -> None:
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_malicious_storage_report(report, archive_path)
 
@@ -16975,10 +16572,7 @@ def _assert_dill_reference_dangerous(payload_bytes: bytes, source_name: str, rul
 def _assert_encoded_extension_routes(tmp_path: Path, filename: str, payload_bytes: bytes) -> None:
     archive_path = tmp_path / filename
     storage_blob = payload_bytes
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
@@ -17047,10 +16641,7 @@ def _assert_large_literal_detected(trailing_windows: int, leading_size: int, sou
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
-        for finding in report.findings
-    )
+    assert _has_string_pattern(report, "os.system")
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 

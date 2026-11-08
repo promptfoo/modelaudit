@@ -52,6 +52,143 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+_CHECK_EMPTY_LIST_AND_MARKER = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != []:
+    raise SystemExit(f"expected empty list result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+
+
+_CHECK_FACTORY_VALUE_AND_MARKER = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+
+
+_CHECK_TYPE_ERROR_WITHOUT_MARKER = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+try:
+    pickle.loads(payload)
+except TypeError:
+    pass
+else:
+    raise SystemExit("expected TypeError")
+if marker.exists():
+    raise SystemExit("marker was written")
+"""
+
+
+_CHECK_SHADOWED_CHAINMAP_VALUE = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "safe":
+    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
+if marker.exists():
+    raise SystemExit("default factory unexpectedly imported pydoc")
+"""
+
+
+def _create_module_dir(tmp_path: Path) -> Path:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    return module_dir
+
+
+def _module_dir_and_marker_path(tmp_path: Path, marker_name: str) -> tuple[Path, Path]:
+    module_dir = _create_module_dir(tmp_path)
+    return module_dir, tmp_path / marker_name
+
+
+def _prepend_module_dir_and_clear_caches(monkeypatch: pytest.MonkeyPatch, module_dir: Path) -> None:
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+
+def _assert_critical_helper_import(report: PickleReport) -> None:
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+
+
+def _has_callable_invocation(report: PickleReport, module: str, name: str, positional_arg_count: int) -> bool:
+    return any(
+        invocation.get("module") == module
+        and invocation.get("name") == name
+        and invocation.get("positional_arg_count") == positional_arg_count
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+def _has_zero_arg_help_invocation(report: PickleReport) -> bool:
+    return _has_callable_invocation(report, "builtins", "help", 0)
+
+
+def _assert_zero_arg_help_detected_without_execution(report: PickleReport, marker: Path) -> None:
+    _assert_critical_helper_import(report)
+    assert _has_zero_arg_help_invocation(report)
+    assert not marker.exists()
+
+
 def _args_tuple(*arg_operands: bytes) -> bytes:
     if not arg_operands:
         return b")"
@@ -445,14 +582,11 @@ def test_shared_source_sensitive_caches_refreshes_between_outer_scopes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_rewritten_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
 
     try:
@@ -480,14 +614,11 @@ def test_shared_source_sensitive_caches_refreshes_changed_source_within_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_changed_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo changed"))
 
     try:
@@ -512,14 +643,11 @@ def test_shared_source_sensitive_caches_fails_closed_when_final_validation_obser
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_inflight_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo inflight"))
 
     try:
@@ -556,14 +684,11 @@ def test_shared_source_sensitive_caches_fails_closed_after_mid_report_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_mid_report_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo mid-report"))
 
     try:
@@ -1898,13 +2023,7 @@ def test_scan_bytes_retains_late_invocation_after_duplicate_metadata_budget() ->
 
     report = scan_bytes(b"".join(parts), source="duplicate-invocation-budget-help-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
+    _assert_critical_helper_import(report)
     callable_invocations = report.metadata.get("callable_invocations", [])
     assert (
         sum(
@@ -1960,13 +2079,7 @@ def test_scan_bytes_retains_callable_aliases_at_import_reference_limit() -> None
 
     report = scan_bytes(b"".join(parts), source="import-reference-limit-help-alias-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
+    _assert_critical_helper_import(report)
 
 
 @pytest.mark.parametrize("function_name", ["harmless_nested_def", "harmless_lambda"])
@@ -1975,9 +2088,7 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
     monkeypatch: pytest.MonkeyPatch,
     function_name: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "nested_body_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "nested_body_marker")
     command_args = (sys.executable, str(marker))
     module_name = "modelaudit_fp_probe_nested_body"
     (module_dir / f"{module_name}.py").write_text(
@@ -2021,9 +2132,7 @@ def test_scan_bytes_does_not_treat_newobj_as_init_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "newobj_init_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "newobj_init_marker")
     command = f"{sys.executable} -c \"from pathlib import Path; Path({str(marker)!r}).write_text('owned')\""
     module_name = "modelaudit_fp_probe_newobj_init"
     (module_dir / f"{module_name}.py").write_text(
@@ -2068,8 +2177,7 @@ def test_scan_bytes_preserves_nested_signature_execution_calls(
     monkeypatch: pytest.MonkeyPatch,
     function_name: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_nested_signature"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\n"
@@ -2149,16 +2257,13 @@ def test_call_graph_keeps_module_dict_dotted_lookup_clean(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_dict_dunder_getattr"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         findings = call_graph.find_dangerous_call_graphs(
@@ -2174,16 +2279,13 @@ def test_call_graph_models_missing_dotted_dunder_module_getattr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_missing_dunder_getattr"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         findings = call_graph.find_dangerous_call_graphs(
@@ -3122,8 +3224,7 @@ def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_source_available_meta_path_probe"
     (module_dir / f"{module_name}.py").write_text("def invoke(command):\n    return command\n", encoding="utf-8")
     marker = tmp_path / "meta_path_called"
@@ -3151,8 +3252,7 @@ def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
 
 
 def test_call_graph_fails_closed_for_meta_path_finder_installed_before_import(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_preimport_meta_path_probe"
     (module_dir / f"{module_name}.py").write_text(
         "def invoke(command):\n    return command\n",
@@ -3320,8 +3420,7 @@ def test_call_graph_keeps_path_extension_modules_analyzable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name = "modelaudit_tp_extension_module_probe"
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not imported")
     monkeypatch.syspath_prepend(str(module_dir))
     _clear_call_graph_caches()
@@ -3535,8 +3634,7 @@ def test_call_graph_does_not_invoke_custom_path_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name = "modelaudit_tp_uncached_path_hook_probe"
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / f"{module_name}.py").write_text("def invoke(command):\n    return command\n", encoding="utf-8")
     marker = tmp_path / "path_hook_called"
 
@@ -3562,8 +3660,7 @@ def test_call_graph_rejects_path_hook_with_spoofed_standard_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name = "modelaudit_tp_spoofed_path_hook_probe"
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / f"{module_name}.py").write_text("def invoke():\n    return None\n", encoding="utf-8")
     marker = tmp_path / "spoofed_path_hook_called"
 
@@ -3640,16 +3737,13 @@ def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_bytecode_only_call_graph_source"
     source_path = module_dir / f"{module_name}.py"
     source_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
     py_compile.compile(str(source_path), cfile=str(module_dir / f"{module_name}.pyc"), doraise=True)
     source_path.unlink()
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         report = scan_bytes(
@@ -3698,17 +3792,14 @@ def test_startup_hook_write_call_graph_refreshes_after_source_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_rewritten_startup_hook_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text(
         "def open_payload(path):\n    return path\n\ndef write_payload(handle, value):\n    return value\n",
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     import_references = (
         {"module": module_name, "name": "open_payload"},
         {"module": module_name, "name": "write_payload"},
@@ -4346,8 +4437,7 @@ def test_trusted_mailbox_constructor_remains_startup_hook_opener(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_mailbox_startup_writer"
     (module_dir / f"{module_name}.py").write_text(
         "def write_payload(handle, value):\n    return handle.write(value)\n",
@@ -4406,16 +4496,13 @@ def test_zero_arg_trusted_mailbox_constructor_is_not_startup_hook_opener(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_mailbox_zero_arg_startup_writer"
     (module_dir / f"{module_name}.py").write_text(
         "def write_payload(handle, value):\n    return handle.write(value)\n",
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     invocations = (
         {
             "opcode": "REDUCE",
@@ -4468,16 +4555,13 @@ def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / "torch.py").write_text(
         "import os\n\ndef device(command):\n    os.system(command)\n    return command\n",
         encoding="utf-8",
     )
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         report = scan_bytes(
@@ -4495,8 +4579,7 @@ def test_scan_bytes_fails_closed_when_shadowed_torch_extension_analysis_hits_ali
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / "torch.py").write_text(
         """\
 import os
@@ -4520,9 +4603,7 @@ else:
         encoding="utf-8",
     )
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         report = scan_bytes(
@@ -4577,9 +4658,7 @@ entry = Final()
 """,
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         report = scan_bytes(
@@ -4601,16 +4680,13 @@ def test_call_graph_analyzes_shadowed_torch_storage_persistent_id_reference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / "torch.py").write_text(
         "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
         encoding="utf-8",
     )
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         findings = call_graph.find_dangerous_call_graphs(
@@ -4636,8 +4712,7 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_unknown_newobj_setstate"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\n"
@@ -4648,9 +4723,7 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
         "        os.system(state)\n",
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
 
     try:
         findings = call_graph.find_dangerous_call_graphs(
@@ -4733,8 +4806,7 @@ def test_scan_bytes_blocks_site_customization_import_execution_rce(
     module_name: str,
     marker_content: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"{module_name}_marker"
     (module_dir / f"{module_name}.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text({marker_content!r})\n",
@@ -4779,9 +4851,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_sitebuiltins_helper_callable_instance_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "sitebuiltins_helper_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "sitebuiltins_helper_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -4794,19 +4864,8 @@ def test_scan_bytes_blocks_sitebuiltins_helper_callable_instance_import_rce(tmp_
 
     report = scan_bytes(payload, source="sitebuiltins-helper-callable-instance-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "_sitebuiltins"
-        and invocation.get("name") == "_Helper.__call__"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "_sitebuiltins", "_Helper.__call__", 0)
 
     assert not marker.exists()
     child_code = """
@@ -4838,9 +4897,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_builtins_help_singleton_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "builtins_help_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "builtins_help_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -4853,19 +4910,8 @@ def test_scan_bytes_blocks_builtins_help_singleton_import_rce(tmp_path: Path) ->
 
     report = scan_bytes(payload, source="builtins-help-singleton-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_zero_arg_help_invocation(report)
     call_graph_finding = next(finding for finding in report.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH")
     assert call_graph_finding.details["invocation_import_reference"] == "builtins.help"
     assert call_graph_finding.details["opcode"] == "REDUCE"
@@ -4937,13 +4983,7 @@ def test_scan_bytes_keeps_callable_invocation_aliases_at_import_reference_budget
 
     report = scan_bytes(payload, source="builtins-help-at-call-graph-reference-budget.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
+    _assert_critical_helper_import(report)
 
 
 def test_scan_bytes_dedupes_callable_invocations_before_metadata_cap() -> None:
@@ -4955,19 +4995,8 @@ def test_scan_bytes_dedupes_callable_invocations_before_metadata_cap() -> None:
         options=ScanOptions(max_opcodes=200_000),
     )
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
 
 def test_scan_bytes_ignores_nested_function_body_sink_when_outer_function_is_imported(
@@ -5122,9 +5151,7 @@ if not marker.exists():
 
 
 def test_scan_bytes_blocks_iter_callable_sentinel_consumption_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "iter_callable_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "iter_callable_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5142,43 +5169,11 @@ def test_scan_bytes_blocks_iter_callable_sentinel_consumption_rce(tmp_path: Path
     payload = _sitebuiltins_helper_call_iterator_payload(consume=True)
     report = scan_bytes(payload, source="iter-callable-list-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "_sitebuiltins"
-        and invocation.get("name") == "_Helper.__call__"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "_sitebuiltins", "_Helper.__call__", 0)
 
     assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != []:
-    raise SystemExit(f"expected empty list result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    child_code = _CHECK_EMPTY_LIST_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -5190,9 +5185,7 @@ def test_scan_bytes_blocks_next_call_iterator_consumption_rce(
     tmp_path: Path,
     with_default: bool,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "next_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "next_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5211,43 +5204,8 @@ def test_scan_bytes_blocks_next_call_iterator_consumption_rce(
     suffix = "default" if with_default else "single"
     report = scan_bytes(payload, source=f"next-call-iterator-{suffix}-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -5259,9 +5217,7 @@ def test_scan_bytes_blocks_deque_call_iterator_consumption_rce(
     tmp_path: Path,
     with_maxlen: bool,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "deque_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "deque_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5280,21 +5236,7 @@ def test_scan_bytes_blocks_deque_call_iterator_consumption_rce(
     suffix = "maxlen" if with_maxlen else "single"
     report = scan_bytes(payload, source=f"deque-call-iterator-{suffix}-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -5357,9 +5299,7 @@ def test_scan_bytes_blocks_builtin_iterable_call_iterator_consumption_rce(
     extra_arg_operands: tuple[bytes, ...],
     expected_repr: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "builtin_iterable_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "builtin_iterable_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5381,21 +5321,7 @@ def test_scan_bytes_blocks_builtin_iterable_call_iterator_consumption_rce(
     )
     report = scan_bytes(payload, source=f"builtin-{consumer}-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -5439,9 +5365,7 @@ def test_scan_bytes_blocks_join_call_iterator_consumption_rce(
     separator_operand: bytes,
     expected_repr: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "join_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "join_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5467,21 +5391,7 @@ def test_scan_bytes_blocks_join_call_iterator_consumption_rce(
     )
     report = scan_bytes(payload, source=f"builtin-{join_name}-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -5515,9 +5425,7 @@ if marker.read_text() != marker_content:
 def test_scan_bytes_blocks_bytearray_join_call_iterator_consumption_rce(
     tmp_path: Path,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "bytearray_join_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "bytearray_join_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5535,21 +5443,7 @@ def test_scan_bytes_blocks_bytearray_join_call_iterator_consumption_rce(
     payload = _builtins_help_call_iterator_bytearray_join_payload(consume=True)
     report = scan_bytes(payload, source="builtin-bytearray-join-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -5583,9 +5477,7 @@ def test_scan_bytes_blocks_min_max_call_iterator_consumption_rce(
     tmp_path: Path,
     consumer: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "min_max_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "min_max_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5598,21 +5490,7 @@ def test_scan_bytes_blocks_min_max_call_iterator_consumption_rce(
     payload = _builtins_help_call_iterator_builtin_consumer_payload(consumer, consume=True)
     report = scan_bytes(payload, source=f"builtin-{consumer}-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -5661,9 +5539,7 @@ def test_scan_bytes_blocks_lazy_wrapper_call_iterator_consumption_rce(
     wrapper: str,
     extra_wrapper_arg_operands: tuple[bytes, ...],
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "lazy_wrapper_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "lazy_wrapper_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5689,43 +5565,8 @@ def test_scan_bytes_blocks_lazy_wrapper_call_iterator_consumption_rce(
     )
     report = scan_bytes(payload, source=f"builtin-{wrapper}-call-iterator-wrapper-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != []:
-    raise SystemExit(f"expected empty list result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_EMPTY_LIST_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -5747,9 +5588,7 @@ def test_scan_bytes_blocks_itertools_lazy_wrapper_call_iterator_consumption_rce(
     first_arg_operand: bytes,
     extra_wrapper_arg_operands: tuple[bytes, ...],
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "itertools_wrapper_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "itertools_wrapper_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -5777,43 +5616,8 @@ def test_scan_bytes_blocks_itertools_lazy_wrapper_call_iterator_consumption_rce(
     )
     report = scan_bytes(payload, source=f"itertools-{wrapper}-call-iterator-wrapper-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != []:
-    raise SystemExit(f"expected empty list result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_EMPTY_LIST_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -5821,30 +5625,14 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_itertools_product_call_iterator_materialization_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "itertools_product_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "itertools_product_call_iterator_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
 
     payload = _builtins_help_call_iterator_itertools_product_payload()
     report = scan_bytes(payload, source="itertools-product-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -5900,29 +5688,13 @@ def test_scan_bytes_blocks_itertools_adapter_next_call_iterator_consumption_rce(
     payload: bytes,
     expected_repr: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "itertools_adapter_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "itertools_adapter_call_iterator_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'b', 'stop']")
 
     report = scan_bytes(payload, source="itertools-adapter-next-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -6328,9 +6100,7 @@ def test_scan_bytes_blocks_weakref_materializer_call_iterator_consumption_rce(
     expected_type: str,
     expected_len: int,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "weakref_materializer_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "weakref_materializer_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -6343,21 +6113,7 @@ def test_scan_bytes_blocks_weakref_materializer_call_iterator_consumption_rce(
 
     report = scan_bytes(payload, source="weakref-materializer-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -6695,9 +6451,7 @@ def test_scan_bytes_blocks_method_descriptor_call_iterator_consumption_rce(
 
 
 def test_scan_bytes_keeps_defaultdict_init_factory_call_iterator_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "defaultdict_init_factory_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "defaultdict_init_factory_call_iterator_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "[('owned-key', 'owned-value'), 'stop']")
     payload = _builtins_help_call_iterator_method_descriptor_payload(
@@ -6710,35 +6464,9 @@ def test_scan_bytes_keeps_defaultdict_init_factory_call_iterator_lazy(tmp_path: 
     report = scan_bytes(payload, source="defaultdict-init-factory-call-iterator.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-try:
-    pickle.loads(payload)
-except TypeError:
-    pass
-else:
-    raise SystemExit("expected TypeError")
-if marker.exists():
-    raise SystemExit("marker was written")
-"""
+    child_code = _CHECK_TYPE_ERROR_WITHOUT_MARKER
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
@@ -6780,9 +6508,7 @@ def test_scan_bytes_blocks_weakref_method_descriptor_call_iterator_consumption_r
     payload: bytes,
     setup_code: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "weakref_method_descriptor_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "weakref_method_descriptor_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -6795,21 +6521,7 @@ def test_scan_bytes_blocks_weakref_method_descriptor_call_iterator_consumption_r
 
     report = scan_bytes(payload, source="weakref-method-descriptor-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -6839,9 +6551,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_keeps_non_consuming_method_descriptor_call_iterator_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "method_descriptor_lazy_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "method_descriptor_lazy_call_iterator_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-key', 'stop']")
     payload = _builtins_help_call_iterator_method_descriptor_payload("builtins", "dict.setdefault", b"}", b"h\x00")
@@ -6849,12 +6559,7 @@ def test_scan_bytes_keeps_non_consuming_method_descriptor_call_iterator_lazy(tmp
     report = scan_bytes(payload, source="method-descriptor-lazy-call-iterator.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
     child_code = """
 import pickle
@@ -6917,9 +6622,7 @@ def test_scan_bytes_blocks_operator_sequence_search_call_iterator_consumption_rc
 
 
 def test_scan_bytes_keeps_operator_length_hint_call_iterator_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "operator_length_hint_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "operator_length_hint_call_iterator_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
     payload = _builtins_help_call_iterator_operator_payload("length_hint", b"h\x00")
@@ -6927,12 +6630,7 @@ def test_scan_bytes_keeps_operator_length_hint_call_iterator_lazy(tmp_path: Path
     report = scan_bytes(payload, source="operator-length-hint-call-iterator.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
     child_code = """
 import pickle
@@ -7097,9 +6795,7 @@ def test_scan_bytes_blocks_operator_protocol_call_iterator_consumption_rce(
 
 
 def test_scan_bytes_keeps_operator_iadd_numeric_receiver_call_iterator_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "operator_iadd_numeric_receiver_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "operator_iadd_numeric_receiver_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
     payload = _builtins_help_call_iterator_operator_payload("iadd", b"K\x01", b"h\x00")
@@ -7107,43 +6803,15 @@ def test_scan_bytes_keeps_operator_iadd_numeric_receiver_call_iterator_lazy(tmp_
     report = scan_bytes(payload, source="operator-iadd-numeric-receiver-call-iterator.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-try:
-    pickle.loads(payload)
-except TypeError:
-    pass
-else:
-    raise SystemExit("expected TypeError")
-if marker.exists():
-    raise SystemExit("marker was written")
-"""
+    child_code = _CHECK_TYPE_ERROR_WITHOUT_MARKER
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
 def test_scan_bytes_keeps_operator_iadd_bytearray_receiver_call_iterator_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "operator_iadd_bytearray_receiver_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "operator_iadd_bytearray_receiver_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "[65, 'stop']")
     payload = _builtins_help_call_iterator_operator_payload(
@@ -7155,43 +6823,15 @@ def test_scan_bytes_keeps_operator_iadd_bytearray_receiver_call_iterator_lazy(tm
     report = scan_bytes(payload, source="operator-iadd-bytearray-receiver-call-iterator.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-try:
-    pickle.loads(payload)
-except TypeError:
-    pass
-else:
-    raise SystemExit("expected TypeError")
-if marker.exists():
-    raise SystemExit("marker was written")
-"""
+    child_code = _CHECK_TYPE_ERROR_WITHOUT_MARKER
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
 def test_scan_bytes_keeps_operator_iconcat_userlist_receiver_call_iterator_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "operator_iconcat_userlist_receiver_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "operator_iconcat_userlist_receiver_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
     payload = _builtins_help_call_iterator_operator_payload(
@@ -7203,43 +6843,15 @@ def test_scan_bytes_keeps_operator_iconcat_userlist_receiver_call_iterator_lazy(
     report = scan_bytes(payload, source="operator-iconcat-userlist-receiver-call-iterator.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-try:
-    pickle.loads(payload)
-except TypeError:
-    pass
-else:
-    raise SystemExit("expected TypeError")
-if marker.exists():
-    raise SystemExit("marker was written")
-"""
+    child_code = _CHECK_TYPE_ERROR_WITHOUT_MARKER
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
 def test_scan_bytes_keeps_operator_ior_counter_receiver_call_iterator_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "operator_ior_counter_receiver_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "operator_ior_counter_receiver_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "[('owned-key', 1), 'stop']")
     payload = _builtins_help_call_iterator_operator_payload(
@@ -7251,12 +6863,7 @@ def test_scan_bytes_keeps_operator_ior_counter_receiver_call_iterator_lazy(tmp_p
     report = scan_bytes(payload, source="operator-ior-counter-receiver-call-iterator.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
     child_code = """
 import pickle
@@ -7285,30 +6892,14 @@ if marker.exists():
 
 
 def test_scan_bytes_blocks_heapq_merge_call_iterator_consumption_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "heapq_merge_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "heapq_merge_call_iterator_marker")
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
 
     payload = _builtins_help_call_iterator_heapq_merge_next_payload()
     report = scan_bytes(payload, source="heapq-merge-call-iterator-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -7339,9 +6930,7 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.parametrize("name", ["nlargest", "nsmallest"])
 def test_scan_bytes_blocks_heapq_key_callback_rce(tmp_path: Path, name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "heapq_key_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "heapq_key_callback_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7357,19 +6946,8 @@ def test_scan_bytes_blocks_heapq_key_callback_rce(tmp_path: Path, name: str) -> 
 
     report = scan_bytes(payload, source=f"heapq-{name}-key-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
     assert not marker.exists()
     child_code = """
@@ -7402,9 +6980,7 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.parametrize("name", ["nlargest", "nsmallest"])
 def test_scan_bytes_keeps_heapq_empty_iterable_key_callback_lazy(tmp_path: Path, name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "heapq_empty_key_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "heapq_empty_key_callback_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7418,12 +6994,7 @@ def test_scan_bytes_keeps_heapq_empty_iterable_key_callback_lazy(tmp_path: Path,
     report = scan_bytes(payload, source=f"heapq-{name}-empty-key-callback.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "builtins", "help", 1)
 
     child_code = """
 import pickle
@@ -7464,9 +7035,7 @@ def test_scan_bytes_blocks_re_sub_replacement_callback_rce(
     value: str,
     extra_arg_operands: tuple[bytes, ...],
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_sub_replacement_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_sub_replacement_callback_marker")
     marker_content = f"pydoc-owned-by-re-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7479,19 +7048,8 @@ def test_scan_bytes_blocks_re_sub_replacement_callback_rce(
 
     report = scan_bytes(payload, source=f"re-{name}-replacement-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
     assert not marker.exists()
     child_code = """
@@ -7540,9 +7098,7 @@ def test_scan_bytes_keeps_re_sub_no_match_callback_lazy(
     value: str,
     expected_value: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_sub_no_match_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_sub_no_match_callback_marker")
     marker_content = f"pydoc-owned-by-re-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7555,12 +7111,7 @@ def test_scan_bytes_keeps_re_sub_no_match_callback_lazy(
 
     report = scan_bytes(payload, source=f"re-{name}-no-match-callback.pkl")
 
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "builtins", "help", 1)
     if report.verdict != SafetyVerdict.CLEAN:
         assert any(
             finding.rule_code == "DANGEROUS_CALL_GRAPH" and finding.details.get("analysis") == "python_call_graph"
@@ -7611,9 +7162,7 @@ def test_scan_bytes_blocks_re_pattern_sub_replacement_callback_rce(
     value: str,
     compile_flags_operand: bytes | None,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_pattern_sub_replacement_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_pattern_sub_replacement_callback_marker")
     marker_content = f"pydoc-owned-by-re-pattern-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7626,19 +7175,8 @@ def test_scan_bytes_blocks_re_pattern_sub_replacement_callback_rce(
 
     report = scan_bytes(payload, source=f"re-pattern-{name}-replacement-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
     assert not marker.exists()
     child_code = """
@@ -7687,9 +7225,7 @@ def test_scan_bytes_keeps_re_pattern_sub_no_match_callback_lazy(
     value: str,
     expected_value: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_pattern_sub_no_match_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_pattern_sub_no_match_callback_marker")
     marker_content = f"pydoc-owned-by-re-pattern-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7703,12 +7239,7 @@ def test_scan_bytes_keeps_re_pattern_sub_no_match_callback_lazy(
     report = scan_bytes(payload, source=f"re-pattern-{name}-no-match-callback.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "builtins", "help", 1)
 
     child_code = """
 import pickle
@@ -7753,9 +7284,7 @@ def test_scan_bytes_blocks_re_scanner_action_callback_rce(
     flags_operand: bytes | None,
     expected_result: tuple[list[str], str],
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_scanner_action_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_scanner_action_callback_marker")
     marker_content = "pydoc-owned-by-re-scanner"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7768,19 +7297,8 @@ def test_scan_bytes_blocks_re_scanner_action_callback_rce(
 
     report = scan_bytes(payload, source="re-scanner-action-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 2
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 2)
 
     assert not marker.exists()
     child_code = """
@@ -7838,9 +7356,7 @@ def test_scan_bytes_keeps_re_scanner_no_match_action_callback_lazy(
     value: str,
     expected_result: tuple[list[str], str],
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_scanner_no_match_action_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_scanner_no_match_action_callback_marker")
     marker_content = "pydoc-owned-by-re-scanner"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7854,12 +7370,7 @@ def test_scan_bytes_keeps_re_scanner_no_match_action_callback_lazy(
     report = scan_bytes(payload, source="re-scanner-no-match-callback.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 2
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "builtins", "help", 2)
 
     child_code = """
 import pickle
@@ -7888,9 +7399,7 @@ if marker.exists():
 
 
 def test_scan_bytes_blocks_future_done_callback_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "future_done_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "future_done_callback_marker")
     marker_content = "pydoc-owned-by-future"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7903,19 +7412,8 @@ def test_scan_bytes_blocks_future_done_callback_rce(tmp_path: Path) -> None:
 
     report = scan_bytes(payload, source="future-done-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
     assert not marker.exists()
     child_code = """
@@ -7947,9 +7445,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_done_future_add_callback_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "done_future_add_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "done_future_add_callback_marker")
     marker_content = "pydoc-owned-by-done-future"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7962,19 +7458,8 @@ def test_scan_bytes_blocks_done_future_add_callback_rce(tmp_path: Path) -> None:
 
     report = scan_bytes(payload, source="done-future-add-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
     assert not marker.exists()
     child_code = """
@@ -8006,9 +7491,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_keeps_future_pending_callback_lazy(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "future_pending_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "future_pending_callback_marker")
     marker_content = "pydoc-owned-by-future"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8081,8 +7564,7 @@ if marker.exists():
 
 @pytest.mark.parametrize("name", ["ref", "proxy"])
 def test_scan_bytes_blocks_weakref_lifetime_callback_rce(tmp_path: Path, name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"weakref_{name}_callback_marker"
     marker_content = f"pydoc-owned-by-weakref-{name}"
     (module_dir / "pydoc.py").write_text(
@@ -8096,19 +7578,8 @@ def test_scan_bytes_blocks_weakref_lifetime_callback_rce(tmp_path: Path, name: s
 
     report = scan_bytes(payload, source=f"weakref-{name}-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
     assert not marker.exists()
     child_code = """
@@ -8144,18 +7615,11 @@ def test_scan_bytes_keeps_weakref_without_callback_clean(name: str) -> None:
     report = scan_bytes(payload, source=f"weakref-{name}-no-callback.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "builtins", "help", 1)
 
 
 def test_scan_bytes_blocks_weakmethod_lifetime_callback_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "weakmethod_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "weakmethod_callback_marker")
     marker_content = "pydoc-owned-by-weakmethod"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8168,19 +7632,8 @@ def test_scan_bytes_blocks_weakmethod_lifetime_callback_rce(tmp_path: Path) -> N
 
     report = scan_bytes(payload, source="weakmethod-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "builtins", "help", 1)
 
     assert not marker.exists()
     child_code = """
@@ -8219,12 +7672,7 @@ def test_scan_bytes_keeps_weakmethod_without_callback_clean() -> None:
     report = scan_bytes(payload, source="weakmethod-no-callback.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "builtins", "help", 1)
 
 
 @pytest.mark.parametrize(
@@ -8241,9 +7689,7 @@ def test_scan_bytes_blocks_tokenize_readline_callback_rce(
     fallback_literal: str,
     expected_len: int,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "tokenize_readline_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "tokenize_readline_callback_marker")
     marker_content = f"pydoc-owned-by-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8257,21 +7703,7 @@ def test_scan_bytes_blocks_tokenize_readline_callback_rce(
 
     report = scan_bytes(payload, source=f"tokenize-{name}-readline-callback-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -8325,9 +7757,7 @@ def test_scan_bytes_keeps_tokenize_readline_callback_lazy(
     line_values_literal: str,
     fallback_literal: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "tokenize_readline_lazy_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "tokenize_readline_lazy_marker")
     marker_content = f"pydoc-owned-by-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8342,12 +7772,7 @@ def test_scan_bytes_keeps_tokenize_readline_callback_lazy(
     report = scan_bytes(payload, source=f"tokenize-{name}-readline-lazy.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
     child_code = """
 import pickle
@@ -8373,9 +7798,7 @@ if marker.exists():
 
 
 def test_scan_bytes_blocks_defaultdict_factory_getitem_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "defaultdict_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "defaultdict_factory_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8393,43 +7816,11 @@ def test_scan_bytes_blocks_defaultdict_factory_getitem_rce(tmp_path: Path) -> No
     payload = _sitebuiltins_helper_defaultdict_payload(lookup=True)
     report = scan_bytes(payload, source="defaultdict-factory-getitem-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "_sitebuiltins"
-        and invocation.get("name") == "_Helper.__call__"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_callable_invocation(report, "_sitebuiltins", "_Helper.__call__", 0)
 
     assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -8449,9 +7840,7 @@ def test_scan_bytes_blocks_defaultdict_method_factory_rce(
     module: str,
     method_name: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "defaultdict_method_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "defaultdict_method_factory_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8469,43 +7858,8 @@ def test_scan_bytes_blocks_defaultdict_method_factory_rce(
     payload = _builtins_help_defaultdict_method_payload(module, method_name, lookup=True)
     report = scan_bytes(payload, source=f"{module}-{method_name}-defaultdict-factory-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -8524,8 +7878,7 @@ def test_scan_bytes_blocks_mapping_wrapper_defaultdict_factory_rce(
     wrapper_module: str,
     wrapper_name: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"{wrapper_name.lower()}_defaultdict_factory_marker"
     marker_content = f"pydoc-owned-{wrapper_name}"
     (module_dir / "pydoc.py").write_text(
@@ -8544,43 +7897,8 @@ def test_scan_bytes_blocks_mapping_wrapper_defaultdict_factory_rce(
 
     report = scan_bytes(payload, source=f"{wrapper_module}-{wrapper_name}-defaultdict-wrapper-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -8608,12 +7926,7 @@ def test_scan_bytes_keeps_mapping_wrapper_defaultdict_constructor_clean(
     report = scan_bytes(payload, source=f"{wrapper_module}-{wrapper_name}-defaultdict-wrapper-constructor.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
 
 @pytest.mark.parametrize(
@@ -8640,9 +7953,7 @@ def test_scan_bytes_keeps_mapping_wrapper_plain_dict_lookup_clean(
 
 
 def test_scan_bytes_keeps_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "chainmap_shadowed_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "chainmap_shadowed_defaultdict_marker")
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
@@ -8655,38 +7966,15 @@ def test_scan_bytes_keeps_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: P
     report = scan_bytes(payload, source="chainmap-shadowed-defaultdict-lookup.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "safe":
-    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
-if marker.exists():
-    raise SystemExit("default factory unexpectedly imported pydoc")
-"""
+    child_code = _CHECK_SHADOWED_CHAINMAP_VALUE
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
 def test_scan_bytes_blocks_deep_mapping_proxy_defaultdict_factory_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "deep_mapping_proxy_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "deep_mapping_proxy_defaultdict_marker")
     marker_content = "pydoc-owned-deep-wrapper"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8699,43 +7987,8 @@ def test_scan_bytes_blocks_deep_mapping_proxy_defaultdict_factory_rce(tmp_path: 
 
     report = scan_bytes(payload, source="deep-mapping-proxy-defaultdict-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -8743,9 +7996,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_format_map_defaultdict_factory_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "format_map_defaultdict_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "format_map_defaultdict_factory_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8763,43 +8014,8 @@ def test_scan_bytes_blocks_format_map_defaultdict_factory_rce(tmp_path: Path) ->
     payload = _builtins_help_defaultdict_format_map_payload(lookup=True)
     report = scan_bytes(payload, source="format-map-defaultdict-factory-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -8841,19 +8057,8 @@ def test_scan_bytes_blocks_str_format_defaultdict_factory_rce(
 
     report = scan_bytes(payload, source="str-format-defaultdict-factory-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    _assert_critical_helper_import(report)
+    assert _has_zero_arg_help_invocation(report)
 
 
 @pytest.mark.parametrize(
@@ -8872,18 +8077,11 @@ def test_scan_bytes_keeps_non_lookup_str_format_defaultdict_cases_clean(
     report = scan_bytes(payload, source="str-format-defaultdict-no-lookup.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
 
 def test_scan_bytes_keeps_str_format_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_chainmap_shadowed_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_chainmap_shadowed_defaultdict_marker")
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
@@ -8896,38 +8094,15 @@ def test_scan_bytes_keeps_str_format_chainmap_shadowed_defaultdict_lookup_clean(
     report = scan_bytes(payload, source="str-format-chainmap-shadowed-defaultdict-lookup.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "safe":
-    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
-if marker.exists():
-    raise SystemExit("default factory unexpectedly imported pydoc")
-"""
+    child_code = _CHECK_SHADOWED_CHAINMAP_VALUE
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
 def test_scan_bytes_blocks_nested_str_format_defaultdict_lookup_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "nested_str_format_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "nested_str_format_defaultdict_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8940,43 +8115,8 @@ def test_scan_bytes_blocks_nested_str_format_defaultdict_lookup_rce(tmp_path: Pa
 
     report = scan_bytes(payload, source="nested-str-format-defaultdict-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -8984,9 +8124,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_nested_setitems_str_format_defaultdict_lookup_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "nested_setitems_str_format_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "nested_setitems_str_format_defaultdict_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8999,43 +8137,8 @@ def test_scan_bytes_blocks_nested_setitems_str_format_defaultdict_lookup_rce(tmp
 
     report = scan_bytes(payload, source="nested-setitems-str-format-defaultdict-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9043,9 +8146,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_nested_format_map_defaultdict_lookup_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "nested_format_map_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "nested_format_map_defaultdict_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -9058,43 +8159,8 @@ def test_scan_bytes_blocks_nested_format_map_defaultdict_lookup_rce(tmp_path: Pa
 
     report = scan_bytes(payload, source="nested-format-map-defaultdict-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9103,8 +8169,7 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.parametrize("method_name", ["vformat", "_vformat"])
 def test_scan_bytes_blocks_nested_formatter_defaultdict_lookup_rce(tmp_path: Path, method_name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"nested_formatter_{method_name}_defaultdict_marker"
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
@@ -9118,21 +8183,7 @@ def test_scan_bytes_blocks_nested_formatter_defaultdict_lookup_rce(tmp_path: Pat
 
     report = scan_bytes(payload, source=f"nested-formatter-{method_name}-defaultdict-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     expected_result = "('factory-value', 0)" if method_name == "_vformat" else "'factory-value'"
     child_code = """
 import pickle
@@ -9182,8 +8233,7 @@ def test_scan_bytes_blocks_nested_wrapped_str_format_defaultdict_lookup_rce(
     wrapper_module: str,
     wrapper_name: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"nested_{wrapper_name.lower()}_str_format_defaultdict_marker"
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
@@ -9197,43 +8247,8 @@ def test_scan_bytes_blocks_nested_wrapped_str_format_defaultdict_lookup_rce(
 
     report = scan_bytes(payload, source=f"nested-{wrapper_name.lower()}-str-format-defaultdict-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9241,9 +8256,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_memoized_nested_str_format_defaultdict_lookup_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "memoized_nested_str_format_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "memoized_nested_str_format_defaultdict_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -9256,43 +8269,8 @@ def test_scan_bytes_blocks_memoized_nested_str_format_defaultdict_lookup_rce(tmp
 
     report = scan_bytes(payload, source="memoized-nested-str-format-defaultdict-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9300,9 +8278,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_str_format_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_unicode_decimal_chainmap_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_unicode_decimal_chainmap_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -9315,43 +8291,8 @@ def test_scan_bytes_blocks_str_format_unicode_decimal_chainmap_lookup_rce(tmp_pa
 
     report = scan_bytes(payload, source="str-format-unicode-decimal-chainmap-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9359,9 +8300,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_keeps_str_format_oversized_decimal_chainmap_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_oversized_decimal_chainmap_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_oversized_decimal_chainmap_marker")
     oversized_decimal_key = str(2**64)
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -9378,12 +8317,7 @@ def test_scan_bytes_keeps_str_format_oversized_decimal_chainmap_lookup_clean(tmp
     report = scan_bytes(payload, source="str-format-oversized-decimal-chainmap-clean.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
     assert not marker.exists()
     child_code = """
@@ -9413,9 +8347,7 @@ if marker.exists():
 
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="newer Unicode decimal digit is unsupported before Python 3.12")
 def test_scan_bytes_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_newer_unicode_decimal_chainmap_marker")
     marker_content = "pydoc-owned"
     newer_decimal_key = "\U00011f50"
     (module_dir / "pydoc.py").write_text(
@@ -9432,28 +8364,12 @@ def test_scan_bytes_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(
 
     report = scan_bytes(payload, source="str-format-newer-unicode-decimal-chainmap-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
 
 
 @pytest.mark.skipif(sys.version_info >= (3, 12), reason="newer Unicode decimal digit is supported from Python 3.12")
 def test_scan_bytes_keeps_str_format_newer_unicode_decimal_chainmap_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_clean_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_newer_unicode_decimal_chainmap_clean_marker")
     newer_decimal_key = "\U00011f50"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -9470,39 +8386,18 @@ def test_scan_bytes_keeps_str_format_newer_unicode_decimal_chainmap_lookup_clean
     report = scan_bytes(payload, source="str-format-newer-unicode-decimal-chainmap-clean.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "safe":
-    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
-if marker.exists():
-    raise SystemExit("default factory unexpectedly imported pydoc")
-"""
+    child_code = _CHECK_SHADOWED_CHAINMAP_VALUE
     _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="newer Unicode decimal digit is unsupported before Python 3.12")
 def test_scan_bytes_runtime_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_runtime_marker"
+    module_dir, marker = _module_dir_and_marker_path(
+        tmp_path, "str_format_newer_unicode_decimal_chainmap_runtime_marker"
+    )
     marker_content = "pydoc-owned"
     newer_decimal_key = "\U00011f50"
     (module_dir / "pydoc.py").write_text(
@@ -9516,28 +8411,7 @@ def test_scan_bytes_runtime_blocks_str_format_newer_unicode_decimal_chainmap_loo
         key=newer_decimal_key,
         format_string=f"{{0[{newer_decimal_key}]}}",
     )
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9553,18 +8427,12 @@ def test_scan_bytes_keeps_format_map_defaultdict_bytes_receiver_clean() -> None:
     report = scan_bytes(payload, source="format-map-defaultdict-bytes-receiver.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
 
 @pytest.mark.parametrize("operator_name", ["mod", "imod"])
 def test_scan_bytes_blocks_operator_percent_defaultdict_factory_rce(tmp_path: Path, operator_name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"operator_{operator_name}_defaultdict_factory_marker"
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
@@ -9583,43 +8451,8 @@ def test_scan_bytes_blocks_operator_percent_defaultdict_factory_rce(tmp_path: Pa
     payload = _builtins_help_defaultdict_operator_mod_payload(lookup=True, operator_name=operator_name)
     report = scan_bytes(payload, source=f"operator-{operator_name}-defaultdict-factory-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9637,12 +8470,7 @@ def test_scan_bytes_keeps_operator_percent_defaultdict_without_mapping_fields_cl
     report = scan_bytes(payload, source=f"operator-{operator_name}-defaultdict-no-mapping-field.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
 
 def _assert_template_raw_unicode_lookup(
@@ -9653,9 +8481,7 @@ def _assert_template_raw_unicode_lookup(
     expected_result: str,
     lookup: bool,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "unicode_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "unicode_factory_marker")
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
@@ -9760,8 +8586,7 @@ def test_template_raw_unicode_surrogate_prefix_keeps_factory_lookup(tmp_path: Pa
 
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 def test_scan_bytes_blocks_template_defaultdict_factory_rce(tmp_path: Path, method_name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"{method_name.replace('.', '_')}_defaultdict_factory_marker"
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
@@ -9775,43 +8600,8 @@ def test_scan_bytes_blocks_template_defaultdict_factory_rce(tmp_path: Path, meth
 
     report = scan_bytes(payload, source=f"string-{method_name}-defaultdict-factory-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -9939,9 +8729,7 @@ assert pickle.loads(payload) == (True if method_name == "Template.is_valid" else
 def test_scan_bytes_detects_uncached_template_pattern_import(
     tmp_path: Path, method_name: str, unknown_mapping: bool, receiver_prefix: bool, alias_module: str
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_import_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_import_marker")
     (module_dir / "re.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
         "raise RuntimeError('shadow-re-imported')\n"
@@ -10283,8 +9071,7 @@ def test_first_matching_path_preserves_later_partial_sink_after_earlier_limit() 
 )
 @pytest.mark.parametrize("shape", ["direct", "wrapped", "deep"])
 def test_template_authentication_error_preserves_sibling_sink(tmp_path: Path, method_name: str, shape: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "template_sibling_fixture"
     template_call = f"string.{method_name}(string.Template(''))"
 
@@ -10606,9 +9393,7 @@ assert any(notice.code == "call_graph_source_unavailable" for notice in report.n
 def test_scan_bytes_rejects_custom_cached_template_pattern(
     tmp_path: Path, method_name: str, warm_after_import: bool
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "custom_pattern_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "custom_pattern_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -10668,9 +9453,7 @@ assert marker.read_text() == "factory-called"
 def test_template_cached_regex_program_and_data_are_authenticated(
     tmp_path: Path, method_name: str, customization: str
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "regex_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "regex_factory_marker")
     scan_marker = tmp_path / "regex_inspection_marker"
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
@@ -10834,9 +9617,7 @@ assert pickle.loads(payload) == "$"
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template cached-program qualification starts in Python 3.14")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 def test_template_group_mutation_does_not_reuse_clean_report(tmp_path: Path, method_name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "mutated_group_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "mutated_group_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -10961,9 +9742,7 @@ def test_template_keyword_wrapper_keeps_import_edge(tmp_path: Path, monkeypatch:
 def test_scan_bytes_rejects_built_template_instance_pattern(
     tmp_path: Path, method_name: str, benign_first: bool
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "instance_pattern_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "instance_pattern_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -11033,9 +9812,7 @@ assert marker.read_text() == "factory-called"
 def test_scan_bytes_rejects_template_mutation_without_build(
     tmp_path: Path, method_name: str, benign_first: bool, mutation: str
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "non_build_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "non_build_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -11119,9 +9896,7 @@ assert marker.read_text() == "factory-called"
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template runtime qualification is Python 3.14-specific")
 @pytest.mark.parametrize("customization", ["constructor", "attribute_lookup", "method"])
 def test_scan_bytes_rejects_template_runtime_replaced_before_import(tmp_path: Path, customization: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "runtime_replacement_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "runtime_replacement_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -11172,9 +9947,7 @@ assert marker.read_text() == "factory-called"
 def test_template_unproven_prefix_retains_coverage_and_known_detections(
     tmp_path: Path, prefix_kind: str, known_placeholder: bool
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "prefix_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "prefix_factory_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -11256,9 +10029,7 @@ assert marker.exists() == known_placeholder
 def test_template_replaced_defaultdict_constructor_is_not_inert(
     tmp_path: Path, method_name: str, before_import: bool, replacement_kind: str
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "constructor_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "constructor_factory_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -11405,9 +10176,7 @@ assert marker.read_text() == "invalid-called"
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="Template default qualification is Python 3.14-specific")
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
 def test_template_custom_mapping_default_cannot_hide_factory(tmp_path: Path, method_name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "default_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "default_factory_marker")
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
         "def help(*args, **kwargs):\n    return 'factory-value'\n"
@@ -11553,9 +10322,7 @@ else:
 
 
 def test_scan_bytes_blocks_formatter_vformat_defaultdict_factory_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "formatter_vformat_defaultdict_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "formatter_vformat_defaultdict_factory_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -11573,43 +10340,8 @@ def test_scan_bytes_blocks_formatter_vformat_defaultdict_factory_rce(tmp_path: P
     payload = _builtins_help_defaultdict_formatter_vformat_payload(lookup=True)
     report = scan_bytes(payload, source="formatter-vformat-defaultdict-factory-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-if result != "factory-value":
-    raise SystemExit(f"expected factory value result, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
+    _assert_zero_arg_help_detected_without_execution(report, marker)
+    child_code = _CHECK_FACTORY_VALUE_AND_MARKER
     _assert_isolated_python(
         tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
@@ -11622,18 +10354,11 @@ def test_scan_bytes_keeps_formatter_vformat_defaultdict_without_live_fields_clea
     report = scan_bytes(payload, source="formatter-vformat-defaultdict-no-live-field.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
 
 def test_scan_bytes_blocks_formatter_private_vformat_defaultdict_factory_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "formatter_private_vformat_defaultdict_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "formatter_private_vformat_defaultdict_factory_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -11651,21 +10376,7 @@ def test_scan_bytes_blocks_formatter_private_vformat_defaultdict_factory_rce(tmp
     payload = _builtins_help_defaultdict_formatter_private_vformat_payload(lookup=True)
     report = scan_bytes(payload, source="formatter-private-vformat-defaultdict-factory-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     child_code = """
 import pickle
 import sys
@@ -11700,18 +10411,11 @@ def test_scan_bytes_keeps_formatter_private_vformat_defaultdict_without_live_fie
     report = scan_bytes(payload, source="formatter-private-vformat-defaultdict-no-live-field.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_zero_arg_help_invocation(report)
 
 
 def test_scan_bytes_blocks_ipaddress_format_protocol_dispatch_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "ipaddress_format_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "ipaddress_format_marker")
     marker_content = "re-owned"
     (module_dir / "re.py").write_text(
         "from pathlib import Path\n"
@@ -11738,12 +10442,7 @@ def test_scan_bytes_blocks_ipaddress_format_protocol_dispatch_import_rce(tmp_pat
         "IPv4Address.__format__",
         "builtins.__import__",
     )
-    assert any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
     assert not marker.exists()
     child_code = """
@@ -11776,9 +10475,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_ipaddress_str_format_protocol_dispatch_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "ipaddress_str_format_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "ipaddress_str_format_marker")
     marker_content = "re-owned"
     (module_dir / "re.py").write_text(
         "from pathlib import Path\n"
@@ -11804,12 +10501,7 @@ def test_scan_bytes_blocks_ipaddress_str_format_protocol_dispatch_import_rce(tmp
         "IPv4Address.__format__",
         "builtins.__import__",
     )
-    assert any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
     assert not marker.exists()
     child_code = """
@@ -11847,12 +10539,7 @@ def test_scan_bytes_keeps_ipaddress_str_format_without_live_fields_clean() -> No
     report = scan_bytes(payload, source="ipaddress-str-format-no-live-field.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
 
 def test_scan_bytes_keeps_ipaddress_str_format_bytes_receiver_clean() -> None:
@@ -11861,18 +10548,11 @@ def test_scan_bytes_keeps_ipaddress_str_format_bytes_receiver_clean() -> None:
     report = scan_bytes(payload, source="ipaddress-str-format-bytes-receiver.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
 
 def test_scan_bytes_blocks_platform_processor_get_dynamic_fallback_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "processor_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "processor_marker")
     marker_content = "processor-owned"
     (module_dir / "subprocess.py").write_text(
         "from pathlib import Path\n"
@@ -11933,9 +10613,7 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="platform.mac_ver proof depends on macOS/POSIX platform hooks")
 def test_scan_bytes_blocks_platform_mac_ver_wrapper_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "mac_ver_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "mac_ver_marker")
     marker_content = "plistlib-owned"
     (module_dir / "plistlib.py").write_text(
         "from pathlib import Path\n"
@@ -12059,9 +10737,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_pyio_open_code_warning_import_side_effect_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "warnings_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "warnings_marker")
     marker_content = "warnings-owned"
     target = tmp_path / "target.py"
     target.write_text("print('opened')\n", encoding="utf-8")
@@ -12083,12 +10759,7 @@ def test_scan_bytes_blocks_pyio_open_code_warning_import_side_effect_rce(tmp_pat
         "_open_code_with_warning",
         "builtins.__import__",
     )
-    assert any(
-        invocation.get("module") == "_pyio"
-        and invocation.get("name") == "_open_code_with_warning"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert _has_callable_invocation(report, "_pyio", "_open_code_with_warning", 1)
 
     no_arg_report = scan_bytes(
         _global_call_payload("_pyio", "_open_code_with_warning"),
@@ -12135,9 +10806,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_base64_main_import_side_effect_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "base64_getopt_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "base64_getopt_marker")
     marker_content = "getopt-owned"
     (module_dir / "getopt.py").write_text(
         "from pathlib import Path\n"
@@ -13535,29 +12204,14 @@ def _assert_eager_call_iterator(
     child_code: str,
     requires_python_3_11_plus: bool = False,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / marker_name
     marker_content = "pydoc-owned"
     _write_iterator_pydoc(module_dir, marker, marker_content, values_literal)
 
     report = scan_bytes(payload, source=source)
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
+    _assert_zero_arg_help_detected_without_execution(report, marker)
     if requires_python_3_11_plus and sys.version_info < (3, 11):
         return
 
@@ -13737,13 +12391,10 @@ def _assert_rewritten_call_graph(
     dangerous_source: str,
     sink: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
 
     try:

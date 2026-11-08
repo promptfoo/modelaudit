@@ -230,6 +230,12 @@ def _record_fresh_importer_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return calls
 
 
+def _zip_directory_cache() -> dict[str, object]:
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    return directory_cache
+
+
 def _zipimporter_directory_files(finder: zipimporter) -> dict[str, tuple[object, ...]]:
     finder_state = object.__getattribute__(finder, "__dict__")
     archive = dict.get(finder_state, "archive")
@@ -253,6 +259,12 @@ def _write_zipimporter_archive(
         archive.writestr("payload.py", "value = 1\n")
         if include_module:
             archive.writestr(f"{prefix}{module}.py", "class Fraction:\n    pass\n")
+
+
+def _create_trusted_zip_importer(archive_path: Path) -> tuple[str, zipimporter]:
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    entry = str(archive_path)
+    return entry, zipimporter(entry)
 
 
 def _write_oversized_zipimporter_archive(
@@ -335,6 +347,12 @@ def _assert_non_allowlisted_global(report: PickleReport, module: str, name: str)
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
         for finding in report.findings
     )
+
+
+def _assert_untrusted_module_source_unavailable(module: str) -> None:
+    assert call_graph._trusted_module_origin_kind(module) is None
+    assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
+    assert call_graph._import_module_can_execute_user_code(module) is True
 
 
 def _has_source_unavailable_notice(report: PickleReport, module: str, name: str) -> bool:
@@ -548,15 +566,9 @@ def test_loaded_trusted_interpreter_module_replacement_fails_closed(
     replacement.__spec__ = ModuleSpec(module, cast(Any, BuiltinImporter), origin="built-in")
     monkeypatch.setitem(sys.modules, module, replacement)
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
         report = package_api.scan_bytes(b"c_io\nBytesIO\n.", source="poisoned-builtin.pkl")
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "_io.BytesIO"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "_io", "BytesIO")
 
 
 def test_cached_interpreter_origin_cannot_hide_module_replacement(
@@ -736,12 +748,7 @@ def test_loaded_interpreter_reference_mutation_cannot_remain_allowlisted(
             b"c_frozen_importlib\nModuleSpec\n.",
             source="mutated-module-spec.pkl",
         )
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "_frozen_importlib.ModuleSpec"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "_frozen_importlib", "ModuleSpec")
 
 
 def test_loaded_parent_package_namespace_hook_is_not_executed(
@@ -865,11 +872,7 @@ def test_forged_loaded_filesystem_reference_is_not_trusted_on_first_use(
     assert call_graph._trusted_module_origin_kind(module) == "stdlib"
     report = package_api.scan_bytes(b"cstatistics\nmean\n.", source="forged-statistics.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "statistics.mean"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, "statistics", "mean")
 
 
 def test_loaded_site_package_reference_after_startup_uses_source_owner() -> None:
@@ -934,12 +937,7 @@ def test_loaded_trusted_function_code_mutation_is_not_allowlisted() -> None:
     _clear_call_graph_caches()
     try:
         report = package_api.scan_bytes(b"ctempfile\ngettempdir\n)R.", source="mutated-gettempdir.pkl")
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "tempfile.gettempdir"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "tempfile", "gettempdir")
     finally:
         function.__code__ = original_code
         _clear_call_graph_caches()
@@ -969,12 +967,7 @@ def test_loaded_trusted_function_global_mutation_is_not_allowlisted(
     monkeypatch.setitem(namespace, "_gettempdir", hostile_gettempdir)
     with _isolated_call_graph_caches():
         report = package_api.scan_bytes(b"ctempfile\ngettempdir\n)R.", source="mutated-gettempdir-global.pkl")
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "tempfile.gettempdir"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "tempfile", "gettempdir")
 
     assert calls == []
 
@@ -1136,12 +1129,7 @@ def test_loaded_trusted_tempdir_rejects_hostile_posixpath_regex_cache(
 
     report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="hostile-posixpath-regex.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "tempfile.gettempdir"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, "tempfile", "gettempdir")
     assert calls == []
 
 
@@ -1186,11 +1174,7 @@ def test_loaded_trusted_class_rejects_hostile_slotnames_cache_without_execution(
 
     report = package_api.scan_bytes(b"ctarfile\nTarInfo\n)R.", source="hostile-slotnames.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "tarfile.TarInfo"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, "tarfile", "TarInfo")
     assert calls == []
 
 
@@ -1307,9 +1291,7 @@ def test_loaded_module_origin_value_cannot_execute_during_resolution(
     loaded_module.__spec__ = ModuleSpec(module, loader=None, origin=cast(Any, HostileOrigin()))
     monkeypatch.setitem(sys.modules, module, loaded_module)
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
 
     assert calls == []
 
@@ -1375,9 +1357,7 @@ def test_added_importlib_shadow_global_blocks_resolution_without_execution(
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
     with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
 
     assert calls == []
 
@@ -1395,9 +1375,7 @@ def test_hostile_meta_path_container_blocks_resolution_without_execution(
 
     monkeypatch.setattr(sys, "meta_path", HostileMetaPath([BuiltinImporter, FrozenImporter, PathFinder]))
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
 
     assert calls == []
 
@@ -1417,9 +1395,7 @@ def test_hostile_import_path_container_blocks_resolution_without_execution(
     original = cast(list[object], getattr(sys, attribute))
     monkeypatch.setattr(sys, attribute, HostilePathState(original))
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind("statistics") is None
-        assert call_graph._call_graph_source_unavailable_reason("statistics") == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code("statistics") is True
+        _assert_untrusted_module_source_unavailable("statistics")
 
     assert calls == []
 
@@ -1437,9 +1413,7 @@ def test_hostile_path_importer_cache_blocks_resolution_without_execution(
 
     monkeypatch.setattr(sys, "path_importer_cache", HostileImporterCache(sys.path_importer_cache))
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind("statistics") is None
-        assert call_graph._call_graph_source_unavailable_reason("statistics") == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code("statistics") is True
+        _assert_untrusted_module_source_unavailable("statistics")
 
     assert calls == []
 
@@ -1712,8 +1686,7 @@ def test_zipimporter_identity_survives_normal_cache_invalidation(
     if relative:
         monkeypatch.chdir(tmp_path)
     root = archive_path.name if relative else str(archive_path)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, root, raising=False)
     entry = f"{root}/{prefix}" if prefix else root
     finder = zipimporter(entry)
@@ -1735,12 +1708,8 @@ def test_zipimporter_cache_restoration_does_not_heal_poison(
     monkeypatch: pytest.MonkeyPatch,
     poison: object,
 ) -> None:
-    archive_path = tmp_path / "poisoned.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    entry, finder = _create_trusted_zip_importer(tmp_path / "poisoned.zip")
+    directory_cache = _zip_directory_cache()
     monkeypatch.setitem(directory_cache, entry, poison)
 
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
@@ -1757,8 +1726,7 @@ def test_zipimporter_rejects_poisoned_finder_before_reading_other_archive(
     _write_zipimporter_archive(requested_archive, "trusted_module", include_module=True)
     finder_entry = str(finder_archive)
     requested_entry = str(requested_archive)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, requested_entry, raising=False)
     finder = zipimporter(finder_entry)
     assert call_graph._zipimporter_resolution_identity(finder, finder_entry) is not None
@@ -1774,14 +1742,10 @@ def test_zipimporter_missing_cache_does_not_heal_legacy_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive_path = tmp_path / "legacy.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
+    entry, finder = _create_trusted_zip_importer(tmp_path / "legacy.zip")
     files = _zipimporter_directory_files(finder)
     object.__getattribute__(finder, "__dict__")["_files"] = files
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
 
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
@@ -1794,14 +1758,10 @@ def test_zipimporter_missing_cache_checks_state_before_reading(
     monkeypatch: pytest.MonkeyPatch,
     mismatch: str,
 ) -> None:
-    archive_path = tmp_path / "mismatched.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
+    entry, finder = _create_trusted_zip_importer(tmp_path / "mismatched.zip")
     state = object.__getattribute__(finder, "__dict__")
     state.pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
     if mismatch == "archive":
         state["archive"] = str(tmp_path / "other.zip")
@@ -1822,15 +1782,11 @@ def test_zipimporter_cache_restoration_preserves_raced_poison(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive_path = tmp_path / "race.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
+    entry, finder = _create_trusted_zip_importer(tmp_path / "race.zip")
     state = object.__getattribute__(finder, "__dict__")
     legacy_files = "_files" in state
     state.pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._zipimport_read_bounded_archive_files
     reader_called = False
@@ -1858,15 +1814,11 @@ def test_zipimporter_cache_restoration_rechecks_importer_after_read(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
 ) -> None:
-    archive_path = tmp_path / "mutated-state.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
+    entry, finder = _create_trusted_zip_importer(tmp_path / "mutated-state.zip")
     state = object.__getattribute__(finder, "__dict__")
     legacy_files = "_files" in state
     state.pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._zipimport_read_bounded_archive_files
     reader_called = False
@@ -1893,14 +1845,11 @@ def test_zipimporter_cache_restoration_rejects_archive_change_during_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     archive_path = tmp_path / "changed-during-read.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
+    entry, finder = _create_trusted_zip_importer(archive_path)
     state = object.__getattribute__(finder, "__dict__")
     legacy_files = "_files" in state
     state.pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._ZIP_READ_DIRECTORY
     assert isinstance(original_reader, FunctionType)
@@ -1939,8 +1888,7 @@ def test_zipimporter_missing_cache_bounds_reader_and_constructor(
     entry = str(archive_path)
     finder = zipimporter(entry)
     object.__getattribute__(finder, "__dict__").pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
     if limit == "archive-bytes":
         monkeypatch.setattr(call_graph, "_MAX_ZIPIMPORT_ARCHIVE_BYTES", archive_path.stat().st_size - 1)
@@ -2307,10 +2255,7 @@ def test_zipimporter_identity_does_not_rebuild_evicted_cache_with_mutated_reader
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive_path = tmp_path / "evicted-mutated-reader.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    path_entry = str(archive_path)
-    finder = zipimporter(path_entry)
+    path_entry, finder = _create_trusted_zip_importer(tmp_path / "evicted-mutated-reader.zip")
     assert call_graph._zipimporter_resolution_identity(finder, path_entry) is not None
 
     finder_state = object.__getattribute__(finder, "__dict__")
@@ -2399,8 +2344,7 @@ def test_uncached_zip_directory_caps_precede_importer_construction(
     )
 
     path_entry = str(archive_path)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, path_entry, raising=False)
     stdlib_path = sysconfig.get_path("stdlib")
     assert stdlib_path is not None
@@ -2542,8 +2486,7 @@ def test_cached_none_population_rejects_directory_to_zip_race_without_materializ
 ) -> None:
     path_entry = tmp_path / "cached-none-race"
     path_entry.mkdir()
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     cache_key = str(path_entry)
     monkeypatch.delitem(directory_cache, cache_key, raising=False)
     original_archive_state = call_graph._zipimport_archive_state_from_entry
@@ -3608,9 +3551,7 @@ def test_in_place_importer_code_mutation_blocks_unloaded_builtin() -> None:
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
     finally:
         function.__code__ = original_code
         _clear_call_graph_caches()
@@ -3633,9 +3574,7 @@ def test_in_place_import_runtime_dependency_mutation_blocks_unloaded_builtin(
     monkeypatch.setitem(thread_namespace, "RLock", hostile_rlock)
     with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
 
     assert calls == []
 
@@ -3656,9 +3595,7 @@ def test_in_place_import_runtime_builtins_mutation_blocks_unloaded_builtin(
     monkeypatch.setitem(builtins_namespace, "hasattr", hostile_hasattr)
     with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
 
     assert calls == []
 
@@ -3683,9 +3620,7 @@ def test_in_place_import_runtime_class_mutation_blocks_unloaded_builtin(
 
     try:
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
     finally:
         monkeypatch.setattr(module_lock, "__init__", original_init)
         _clear_call_graph_caches()
@@ -3737,9 +3672,7 @@ def test_hostile_importer_keyword_defaults_fail_closed_without_execution() -> No
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
     finally:
         function.__kwdefaults__ = original_keyword_defaults
         _clear_call_graph_caches()
@@ -3778,9 +3711,7 @@ def test_poisoned_import_lock_blocks_unloaded_builtin(
     monkeypatch.setitem(module_locks, PoisonedKey(), PoisonedLock())
     calls.clear()
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
 
     assert calls == []
 
@@ -3802,9 +3733,7 @@ def test_unloaded_builtin_with_mutated_importer_fails_closed(
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
     finally:
         type.__setattr__(BuiltinImporter, "find_spec", original_builtin_find_spec)
         _clear_call_graph_caches()
@@ -3842,9 +3771,7 @@ def test_unloaded_frozen_module_with_mutated_importer_fails_closed(
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
     finally:
         type.__setattr__(FrozenImporter, "find_spec", original_frozen_find_spec)
         _clear_call_graph_caches()
@@ -3873,9 +3800,7 @@ def test_in_place_importer_closure_code_mutation_blocks_unloaded_frozen() -> Non
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
     finally:
         inner.__code__ = original_code
         _clear_call_graph_caches()
@@ -3889,9 +3814,7 @@ def test_late_loaded_builtin_with_canonical_spec_fails_closed(
     loaded_module.__spec__ = ModuleSpec(module, cast(Any, BuiltinImporter), origin="built-in")
     monkeypatch.setitem(sys.modules, module, loaded_module)
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source_unavailable(module)
 
 
 def test_loaded_extension_export_does_not_fall_through_module_getattr(
@@ -4465,14 +4388,11 @@ def test_zipimporter_rejected_private_read_does_not_publish_or_remove_shared_sta
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, competing_cache: str
 ) -> None:
     archive_path = tmp_path / "private-read.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
+    entry, finder = _create_trusted_zip_importer(archive_path)
     state = object.__getattribute__(finder, "__dict__")
     legacy_files = "_files" in state
     state.pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._zipimport_read_bounded_archive_files
     replacement: object = None if competing_cache == "poison" else {}
@@ -4521,8 +4441,7 @@ def test_missing_zip_cache_preserves_literal_backslash_constructor_prefix(
     assert before is not None
     legacy_files = "_files" in state
     state.pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, str(archive_path))
     if forged:
         state["prefix"] = "pkg/hidden/"
@@ -4555,8 +4474,7 @@ def test_missing_zip_cache_rejects_unqualified_windows_prefix_roots(
     finder = zipimporter(entry)
     state = object.__getattribute__(finder, "__dict__")
     state.pop("_files", None)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, state["archive"])
 
     assert call_graph._zipimport_constructor_state_without_cache(entry) is None
@@ -4568,15 +4486,11 @@ def test_missing_zip_cache_rejects_unqualified_windows_prefix_roots(
 def test_deleted_legacy_zip_files_cannot_claim_modern_constructor_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    archive_path = tmp_path / "legacy-deleted-files.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
+    entry, finder = _create_trusted_zip_importer(tmp_path / "legacy-deleted-files.zip")
     state = object.__getattribute__(finder, "__dict__")
     assert "_files" in state
     state.pop("_files")
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
 
     assert call_graph._zipimporter_resolution_identity(finder, entry) is None
@@ -4587,12 +4501,8 @@ def test_deleted_legacy_zip_files_cannot_claim_modern_constructor_state(
 def test_private_zip_validation_rechecks_constructor_without_executing_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    archive_path = tmp_path / "changed-constructor.zip"
-    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    entry = str(archive_path)
-    finder = zipimporter(entry)
-    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
-    assert type(directory_cache) is dict
+    entry, finder = _create_trusted_zip_importer(tmp_path / "changed-constructor.zip")
+    directory_cache = _zip_directory_cache()
     monkeypatch.delitem(directory_cache, entry)
     original_reader = call_graph._zipimport_read_bounded_archive_files
 
