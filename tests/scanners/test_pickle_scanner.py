@@ -41,7 +41,6 @@ from modelaudit.scanners.pickle_scanner import (
     _is_legitimate_serialization_file,
     _looks_like_pickle,
     _pickle_opcode_summary,
-    _rebuild_tensor_indicators_are_documentation_literals,
     is_suspicious_global,
 )
 from tests.cache_lifecycle import IsolatedCacheManager
@@ -4948,12 +4947,21 @@ def test_large_non_seekable_truncated_legacy_control_keeps_file_size_limit() -> 
         pickle_scanner._PYTORCH_LEGACY_PROTOCOL_VERSION,
         protocol=2,
     )
-    payload = partial_legacy + b"\x80\x02X" + (4096).to_bytes(4, "little") + (b"A" * 4096)
+    string_header = b"\x80\x02X" + (4096).to_bytes(4, "little")
+    payload = partial_legacy + string_header + (b"A" * 4096)
     stream = NonSeekableBytesIO(payload)
 
-    assert pickle_scanner._legacy_pytorch_control_probe_needs_more_bytes(
-        payload[: pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES]
+    probe_limit = pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES
+    assert len(partial_legacy) + len(string_header) < probe_limit < len(payload)
+    assert pickle_scanner._matches_legacy_pytorch_preamble(payload[:probe_limit])
+    extent, consumed, parsed_opcode = pickle_scanner._probe_pickle_stream(
+        io.BytesIO(payload[:probe_limit]),
+        len(partial_legacy),
+        max_opcodes=pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
     )
+    assert extent is None
+    assert parsed_opcode
+    assert len(partial_legacy) + consumed == probe_limit
 
     result = PickleScanner(
         config={
@@ -6092,18 +6100,26 @@ def test_rebuild_tensor_documentation_literal_detector_behavior() -> None:
         b"\x80\x02S'# _rebuild_tensor\\n# documentation only'\n0ctorch\n_rebuild_tensor_v2\n)RS'key'\nS'value'\ns."
     )
 
-    assert _rebuild_tensor_indicators_are_documentation_literals(doc_only_payload) is True
-    assert _rebuild_tensor_indicators_are_documentation_literals(real_global_payload) is False
+    doc_position = doc_only_payload.index(b"_rebuild_tensor")
+    doc_spans = pickle_scanner._documentation_literal_spans(doc_only_payload)
+    assert any(start <= doc_position < end for start, end in doc_spans)
+    global_position = real_global_payload.index(b"_rebuild_tensor_v2")
+    mixed_spans = pickle_scanner._documentation_literal_spans(real_global_payload)
+    assert not any(start <= global_position < end for start, end in mixed_spans)
+
+    scanner = PickleScanner()
+    doc_only = scanner.scan_stream(io.BytesIO(doc_only_payload), len(doc_only_payload))
+    real_global = scanner.scan_stream(io.BytesIO(real_global_payload), len(real_global_payload))
+    assert doc_only.success
+    assert not any(issue.details.get("cve_id") == "CVE-2026-24747" for issue in doc_only.issues)
+    assert any(issue.details.get("cve_id") == "CVE-2026-24747" for issue in real_global.issues)
 
 
 def test_raw_cve_rebuild_tensor_doc_filter_uses_rust_import_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(
-        "modelaudit.scanners.pickle_scanner._rebuild_tensor_indicators_are_documentation_literals",
-        lambda _data: True,
-    )
+    monkeypatch.setattr(pickle_scanner, "_is_primarily_documentation", lambda _data: True)
     path = tmp_path / "rust-rebuild-tensor-global.pkl"
     path.write_bytes(
         b"\x80\x02S'# _rebuild_tensor\\n# documentation only'\n0ctorch\n_rebuild_tensor_v2\n)RS'key'\nS'value'\ns."

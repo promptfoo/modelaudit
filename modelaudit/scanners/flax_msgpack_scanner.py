@@ -997,147 +997,54 @@ class FlaxMsgpackScanner(BaseScanner):
 
     def _extract_jax_metadata(
         self,
-        obj: Any,
+        obj: _FlaxStreamSummary,
         result: ScanResult,
         *,
         ml_analysis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Extract JAX/Flax specific metadata from the checkpoint."""
-        if isinstance(obj, _FlaxStreamSummary):
-            architecture_hints = sorted(obj.architecture_hints)
-            model_type = "unknown"
-            if any(pattern in architecture_hints for pattern in self.jax_patterns["transformer_patterns"]):
-                model_type = "transformer"
-            elif any(pattern in architecture_hints for pattern in self.jax_patterns["cnn_patterns"]):
-                model_type = "cnn"
-            elif any(pattern in architecture_hints for pattern in self.jax_patterns["embedding_patterns"]):
-                model_type = "embedding"
+        architecture_hints = sorted(obj.architecture_hints)
+        model_type = "unknown"
+        if any(pattern in architecture_hints for pattern in self.jax_patterns["transformer_patterns"]):
+            model_type = "transformer"
+        elif any(pattern in architecture_hints for pattern in self.jax_patterns["cnn_patterns"]):
+            model_type = "cnn"
+        elif any(pattern in architecture_hints for pattern in self.jax_patterns["embedding_patterns"]):
+            model_type = "embedding"
 
-            if ml_analysis is None:
-                ml_analysis = self._analyze_ml_structure(obj, result)
-            stream_metadata: dict[str, Any] = {
-                "model_type": model_type,
-                "architecture_hints": architecture_hints,
-                "parameter_count": obj.parameter_count,
-                "layer_count": obj.layer_count,
-                "has_optimizer_state": obj.has_optimizer_state,
-                "jax_version_hints": [],
-                "orbax_format": obj.orbax_format,
-                "confidence": ml_analysis["confidence"],
-                "is_ml_model": ml_analysis["is_ml_model"],
-                "ml_evidence": ml_analysis["evidence"],
-                "tensor_count": ml_analysis["tensor_count"],
-            }
-            if obj.orbax_format:
-                result.add_check(
-                    name="Checkpoint Format Detection",
-                    passed=True,
-                    message="Orbax checkpoint format detected",
-                    location="root",
-                    details={"checkpoint_format": "orbax"},
-                    rule_code=None,
-                )
-            result.metadata.update(
-                {
-                    "jax_metadata": stream_metadata,
-                    "estimated_parameters": obj.parameter_count,
-                    "model_architecture": model_type,
-                    "layer_count": obj.layer_count,
-                }
-            )
-            return stream_metadata
-
-        metadata: dict[str, Any] = {
-            "model_type": "unknown",
-            "architecture_hints": [],
-            "parameter_count": 0,
-            "layer_count": 0,
-            "has_optimizer_state": False,
+        if ml_analysis is None:
+            ml_analysis = self._analyze_ml_structure(obj, result)
+        stream_metadata: dict[str, Any] = {
+            "model_type": model_type,
+            "architecture_hints": architecture_hints,
+            "parameter_count": obj.parameter_count,
+            "layer_count": obj.layer_count,
+            "has_optimizer_state": obj.has_optimizer_state,
             "jax_version_hints": [],
-            "orbax_format": False,
+            "orbax_format": obj.orbax_format,
+            "confidence": ml_analysis["confidence"],
+            "is_ml_model": ml_analysis["is_ml_model"],
+            "ml_evidence": ml_analysis["evidence"],
+            "tensor_count": ml_analysis["tensor_count"],
         }
-
-        if not isinstance(obj, dict):
-            return metadata
-
-        # Check for Orbax format indicators
-        # Guard against non-string keys (msgpack allows int/bytes keys)
-        if any(isinstance(key, str) and key.startswith("__orbax") for key in obj):
-            metadata["orbax_format"] = True
+        if obj.orbax_format:
             result.add_check(
                 name="Checkpoint Format Detection",
                 passed=True,
                 message="Orbax checkpoint format detected",
                 location="root",
                 details={"checkpoint_format": "orbax"},
-                rule_code=None,  # Passing check
+                rule_code=None,
             )
-
-        # Analyze architecture patterns with a bounded text view.
-        obj_str = self._bounded_structure_text(obj)
-        for _pattern_type, patterns in self.jax_patterns.items():
-            found_patterns = [p for p in patterns if p in obj_str]
-            if found_patterns:
-                metadata["architecture_hints"].extend(found_patterns)
-
-        # Determine likely model type based on patterns
-        if any(p in metadata["architecture_hints"] for p in self.jax_patterns["transformer_patterns"]):
-            metadata["model_type"] = "transformer"
-        elif any(p in metadata["architecture_hints"] for p in self.jax_patterns["cnn_patterns"]):
-            metadata["model_type"] = "cnn"
-        elif any(p in metadata["architecture_hints"] for p in self.jax_patterns["embedding_patterns"]):
-            metadata["model_type"] = "embedding"
-
-        # Check for optimizer state
-        opt_indicators = ["opt_state", "optimizer", "adam", "sgd", "learning_rate"]
-        if any(indicator in obj_str for indicator in opt_indicators):
-            metadata["has_optimizer_state"] = True
-
-        # Estimate parameter count and layer count
-        def count_parameters(data: Any, path: str = "") -> int:
-            count = 0
-            if isinstance(data, dict):
-                # Count layers
-                layer_keys = [
-                    k for k in data if any(layer_word in str(k).lower() for layer_word in ["layer", "block", "level"])
-                ]
-                if layer_keys:
-                    metadata["layer_count"] += len(layer_keys)
-
-                for key, value in data.items():
-                    count += count_parameters(value, f"{path}/{key}" if path else key)
-            elif isinstance(data, list | tuple):
-                for i, value in enumerate(data):
-                    count += count_parameters(value, f"{path}[{i}]")
-            elif isinstance(data, bytes | bytearray):
-                # Estimate parameter count from byte arrays (assuming float32)
-                if len(data) >= 16 and len(data) % 4 == 0:
-                    count += len(data) // 4
-            return count
-
-        metadata["parameter_count"] = count_parameters(obj)
-
-        # Perform ML structure analysis to get confidence score
-        if ml_analysis is None:
-            ml_analysis = self._analyze_ml_structure(obj, result)
-
-        # Add confidence and ML analysis results to metadata
-        metadata["confidence"] = ml_analysis["confidence"]
-        metadata["is_ml_model"] = ml_analysis["is_ml_model"]
-        metadata["ml_evidence"] = ml_analysis["evidence"]
-        metadata["tensor_count"] = ml_analysis["tensor_count"]
-
-        # Add metadata to scan result
         result.metadata.update(
             {
-                "jax_metadata": metadata,
-                "estimated_parameters": metadata["parameter_count"],
-                "model_architecture": metadata["model_type"],
-                "layer_count": metadata["layer_count"],
+                "jax_metadata": stream_metadata,
+                "estimated_parameters": obj.parameter_count,
+                "model_architecture": model_type,
+                "layer_count": obj.layer_count,
             }
         )
-
-        return metadata
+        return stream_metadata
 
     def _check_jax_transform(
         self,
@@ -1636,17 +1543,14 @@ class FlaxMsgpackScanner(BaseScanner):
 
     def _validate_flax_structure(
         self,
-        obj: Any,
+        obj: _FlaxStreamSummary,
         result: ScanResult,
         *,
         ml_analysis: dict[str, Any] | None = None,
     ) -> None:
         """Validate that the msgpack structure looks like a legitimate Flax checkpoint using structural analysis."""
-        is_stream_summary = isinstance(obj, _FlaxStreamSummary)
-        top_level_type = obj.top_level_type if is_stream_summary else type(obj).__name__
-        if (is_stream_summary and obj.top_level_type != "dict") or (
-            not is_stream_summary and not isinstance(obj, dict)
-        ):
+        top_level_type = obj.top_level_type
+        if obj.top_level_type != "dict":
             result.add_check(
                 name="Flax Structure Validation",
                 passed=False,
@@ -1660,66 +1564,12 @@ class FlaxMsgpackScanner(BaseScanner):
 
         # Check for standard Flax checkpoint patterns first
         expected_keys = {"params", "state", "opt_state", "model_state", "step", "epoch"}
-        found_keys = obj.top_level_string_keys if is_stream_summary else set(obj.keys())
-        displayed_found_keys = (
-            obj.top_level_keys if is_stream_summary else [_redact_evidence_key(key) for key in list(found_keys)[:20]]
-        )
+        found_keys = obj.top_level_string_keys
+        displayed_found_keys = obj.top_level_keys
 
         # Also check for common transformer model patterns (BERT, GPT, T5, etc.)
         transformer_keys = {"embeddings", "encoder", "decoder", "pooler", "lm_head", "transformer", "model"}
-        # Common HuggingFace model name keys that wrap transformer substructure
-        model_name_keys = {
-            "bert",
-            "roberta",
-            "distilbert",
-            "albert",
-            "electra",
-            "xlm",
-            "gpt2",
-            "gpt_neo",
-            "gpt_neox",
-            "gptj",
-            "opt",
-            "llama",
-            "t5",
-            "bart",
-            "pegasus",
-            "mbart",
-            "blenderbot",
-            "vit",
-            "clip",
-            "whisper",
-            "wav2vec2",
-            "flax_model",
-            "classifier",
-            "qa_outputs",
-            "lm_head",
-            "score",
-        }
-        has_transformer_keys = any(key in found_keys for key in transformer_keys)
-        if is_stream_summary:
-            has_transformer_keys = has_transformer_keys or obj.has_nested_transformer_keys
-
-        # Check if any top-level key contains transformer sub-keys (nested model structure)
-        if not has_transformer_keys and not is_stream_summary:
-            for key in found_keys:
-                value = obj.get(key)
-                if isinstance(value, dict):
-                    sub_keys = set(value.keys())
-                    if sub_keys & transformer_keys:
-                        has_transformer_keys = True
-                        break
-                    # Also check if the top-level key is a known model name.
-                    # Only check string keys — msgpack allows int/bytes keys which
-                    # are never valid model names and would cause crashes on .lower().
-                    if not isinstance(key, str):
-                        continue
-                    key_lower = key.lower()
-                    # Use exact match only to avoid false positives from substring
-                    # matching (e.g. "opt" matching "optional", "t5" matching "t500").
-                    if key_lower in model_name_keys:
-                        has_transformer_keys = True
-                        break
+        has_transformer_keys = any(key in found_keys for key in transformer_keys) or obj.has_nested_transformer_keys
 
         has_standard_flax_keys = any(key in found_keys for key in expected_keys)
 

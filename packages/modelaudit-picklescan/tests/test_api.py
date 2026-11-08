@@ -8579,18 +8579,20 @@ def test_stream_report_copy_helpers_preserve_private_metadata() -> None:
             bytes_total=None,
             stream_start_offset=0,
         ),
-        package_api._with_unbounded_stream_notice(
+        package_api._with_truncated_stream_notice(
             report,
             source=report.source,
             bytes_scanned=8,
-            max_unbounded_read_bytes=8,
+            bytes_total=None,
+            max_read_bytes=8,
+            stream_start_offset=0,
         ),
-        package_api._with_known_stream_notice(
+        package_api._with_truncated_stream_notice(
             report,
             source=report.source,
             bytes_scanned=8,
             bytes_total=16,
-            max_known_read_bytes=8,
+            max_read_bytes=8,
             stream_start_offset=0,
         ),
         package_api._with_short_read_error(
