@@ -12,13 +12,7 @@ from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import pickle_scanner as pickle_scanner_module
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import ML_SAFE_GLOBALS, PickleScanner, _is_legitimate_serialization_file
-from tests.helpers.file_creators import SystemCommandPayload
-from tests.helpers.file_creators import (
-    joblib_numpy_raw_segment as _joblib_numpy_raw_segment,
-)
-from tests.helpers.file_creators import (
-    pickle_binunicode_text as _binunicode,
-)
+from tests.helpers.file_creators import SystemCommandPayload, joblib_numpy_array_payload
 
 
 def requires_origin_review(module: str, name: str) -> bool:
@@ -51,31 +45,8 @@ def _write_joblib_like_pickle(path: Path, *, padding: int = 0) -> None:
     )
 
 
-def _joblib_numpy_wrapper_control(*, shape: int = 4, dtype: str = "i8") -> bytes:
-    return (
-        b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
-        + _binunicode("subclass")
-        + b"cnumpy\nndarray\n"
-        + _binunicode("shape")
-        + b"K"
-        + bytes([shape])
-        + b"\x85"
-        + _binunicode("order")
-        + _binunicode("C")
-        + _binunicode("dtype")
-        + b"cnumpy\ndtype\n"
-        + _binunicode(dtype)
-        + b"\x89\x88\x87R"
-        + _binunicode("allow_mmap")
-        + b"\x88"
-        + _binunicode("numpy_array_alignment_bytes")
-        + b"K\x10ub"
-    )
-
-
 def _write_joblib_numpy_array_pickle(path: Path) -> None:
-    prefix = b"\x80\x02](" + _joblib_numpy_wrapper_control()
-    path.write_bytes(prefix + _joblib_numpy_raw_segment(len(prefix), b"\x00" * 32) + b"e.")
+    path.write_bytes(joblib_numpy_array_payload())
 
 
 def test_malicious_joblib_extension_cannot_bypass_rust_scan(tmp_path: Path) -> None:

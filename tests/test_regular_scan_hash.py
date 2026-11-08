@@ -23,10 +23,7 @@ from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, cr
 from modelaudit.scanner_results import MAX_MEMBER_FILE_HASH_RECORDS
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
-from tests.helpers.file_creators import EvalPayload
-from tests.helpers.file_creators import (
-    pickle_binunicode as _binunicode,
-)
+from tests.helpers.file_creators import EvalPayload, legacy_pytorch_storage_list_prefix
 from tests.helpers.scanners import fail_onnx_bounded_discovery as fail_bounded_discovery
 
 _MaliciousPicklePayload = partial(EvalPayload, ("__import__('os').system('echo modelaudit-test')",))
@@ -68,24 +65,10 @@ _PYTORCH_LEGACY_MAGIC_NUMBER = 0x1950A86A20F9469CFC6C
 _PYTORCH_LEGACY_PROTOCOL_VERSION = 1001
 
 
-def _legacy_pytorch_object_stream(
-    storage_keys: tuple[str, ...],
-    storage_size: int,
-    *,
-    object_padding: int = 0,
-) -> bytes:
-    object_stream = bytearray(b"\x80\x02]")
-    for key in storage_keys:
-        encoded_key = key.encode("ascii")
-        object_stream += b"(" + _binunicode(b"storage")
-        object_stream += b"ctorch\nByteStorage\n"
-        object_stream += _binunicode(encoded_key) + _binunicode(b"cpu")
-        object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
-        object_stream += b"NtQa"
-    if object_padding:
-        object_stream += pickle.dumps("A" * object_padding, protocol=2)[2:-1] + b"a"
-    object_stream += b"."
-    return bytes(object_stream)
+def _legacy_pytorch_header() -> bytes:
+    return pickle.dumps(_PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2) + pickle.dumps(
+        _PYTORCH_LEGACY_PROTOCOL_VERSION, protocol=2
+    )
 
 
 def _make_legacy_pytorch_container(
@@ -103,46 +86,30 @@ def _make_legacy_pytorch_container(
     if sys_info_padding:
         sys_info["padding"] = "A" * sys_info_padding
 
+    header = _legacy_pytorch_header()
+    sys_info_stream = pickle.dumps(sys_info, protocol=sys_info_protocol)
     storage_keys = ("0",)
-    control_streams = {
-        "magic": pickle.dumps(_PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2),
-        "protocol": pickle.dumps(_PYTORCH_LEGACY_PROTOCOL_VERSION, protocol=2),
-        "sys_info": pickle.dumps(sys_info, protocol=sys_info_protocol),
-        "object": _legacy_pytorch_object_stream(
-            storage_keys,
-            len(storage_payload),
-            object_padding=object_padding,
-        ),
-        "storage_keys": pickle.dumps(list(storage_keys), protocol=2),
-    }
-    offsets: dict[str, int] = {}
-    cursor = 0
-    for name, stream in control_streams.items():
-        offsets[f"{name}_start"] = cursor
-        cursor += len(stream)
-        offsets[f"{name}_end"] = cursor
-    offsets["storage_start"] = cursor
+    object_stream = legacy_pytorch_storage_list_prefix(storage_keys, len(storage_payload))
+    if object_padding:
+        object_stream += pickle.dumps("A" * object_padding, protocol=2)[2:-1] + b"a"
+    object_stream += b"."
+    control = header + sys_info_stream + bytes(object_stream) + pickle.dumps(list(storage_keys), protocol=2)
+    object_start = len(header) + len(sys_info_stream)
     storage_record = len(storage_payload).to_bytes(8, "little") + storage_payload
-    return b"".join(control_streams.values()) + storage_record, offsets
-
-
-def _make_malformed_legacy_pytorch_near_match() -> tuple[bytes, dict[str, int]]:
-    control_streams = {
-        "magic": pickle.dumps(_PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2),
-        "protocol": pickle.dumps(_PYTORCH_LEGACY_PROTOCOL_VERSION, protocol=2),
-        "sys_info": pickle.dumps(
-            {"protocol_version": _PYTORCH_LEGACY_PROTOCOL_VERSION, "little_endian": True},
-            protocol=2,
-        ),
+    return control + storage_record, {
+        "sys_info_start": len(header),
+        "sys_info_end": object_start,
+        "object_start": object_start,
+        "storage_start": len(control),
     }
-    offsets: dict[str, int] = {}
-    cursor = 0
-    for name, stream in control_streams.items():
-        offsets[f"{name}_start"] = cursor
-        cursor += len(stream)
-        offsets[f"{name}_end"] = cursor
-    offsets["object_start"] = cursor
-    return b"".join(control_streams.values()) + b"\x80\x02]" + (b"A" * 2048), offsets
+
+
+def _make_malformed_legacy_pytorch_near_match() -> tuple[bytes, int]:
+    preamble = _legacy_pytorch_header() + pickle.dumps(
+        {"protocol_version": _PYTORCH_LEGACY_PROTOCOL_VERSION, "little_endian": True},
+        protocol=2,
+    )
+    return preamble + b"\x80\x02]" + (b"A" * 2048), len(preamble)
 
 
 def _write_regular_scan_onnx_model(
@@ -1264,10 +1231,10 @@ class TestHashGenerationEdgeCases:
         from modelaudit.utils.helpers.cache_decorator import should_defer_hash_for_pytorch_read_limit
 
         PickleScanner()
-        payload, offsets = _make_malformed_legacy_pytorch_near_match()
+        payload, object_start = _make_malformed_legacy_pytorch_near_match()
         malformed_path = tmp_path / "malformed-near-match.pt"
         malformed_path.write_bytes(payload)
-        read_limit = offsets["object_start"] + 8
+        read_limit = object_start + 8
         trackers = _track_binary_reads_for_path(monkeypatch, malformed_path)
 
         assert (
