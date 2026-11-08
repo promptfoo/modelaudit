@@ -255,6 +255,10 @@ python -c "import torch; torch.save({'model': 'data'}, 'test.pt')"
 python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl', 'wb'))"
 ```
 
+### Release notes for contributors
+
+For a user-visible change, add one new Markdown file per affected package in [ModelAudit fragments](changes/) or [PickleScan fragments](packages/modelaudit-picklescan/changes/). A unique filename lets independent PRs merge in any order. Use a descriptive slug such as `1924-cli-triage.md`. Internal-only changes can skip the fragment. The release PR updates the shared changelogs. See the [fragment format and examples](docs/agents/release-process.md#release-notes).
+
 ### Release Process (Maintainers)
 
 Releases are fully automated via [release-please](https://github.com/googleapis/release-please) and GitHub Actions. When conventional commits land on `main`, release-please opens (or updates) a release PR. Merging that PR triggers the build, publish to PyPI, SBOM generation, and provenance attestation pipeline.

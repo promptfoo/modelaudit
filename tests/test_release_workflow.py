@@ -308,15 +308,14 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
         == "steps.manual.outputs.manual_release != 'true' && github.event_name != 'repository_dispatch'"
     )
 
-    ensure_release_step = _step_by_name(release_steps, "Ensure manual GitHub releases exist")
-    assert ensure_release_step["if"] == (
-        "steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.root_provenance_recovery != 'true'"
-    )
-    ensure_release_run = ensure_release_step["run"]
-    assert 'gh release view "$ROOT_TAG"' in ensure_release_run
-    assert 'gh release view "$PICKLESCAN_TAG"' in ensure_release_run
-    assert 'gh release create "$ROOT_TAG"' in ensure_release_run
-    assert 'gh release create "$PICKLESCAN_TAG"' in ensure_release_run
+    publish_notes = _step_by_name(release_steps, "Publish notes from the tagged changelogs")
+    assert "root_provenance_recovery != 'true'" in publish_notes["if"]
+    notes_run = publish_notes["run"]
+    assert 'extract --package "$package" --version "$version" --ref "$source"' in notes_run
+    assert 'gh release create "$tag" --verify-tag' in notes_run
+    assert 'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"' in notes_run
+    assert 'publish_notes modelaudit "$ROOT_VERSION" v' in notes_run
+    assert 'publish_notes modelaudit-picklescan "$PICKLESCAN_VERSION" modelaudit-picklescan-v' in notes_run
 
     check_pr_step = _step_by_name(release_steps, "Check if PR exists")
     assert check_pr_step["env"] == {
@@ -561,7 +560,7 @@ def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     workflow = _load_release_workflow()
     sync_job = _jobs(workflow)["sync-release-metadata"]
     assert isinstance(sync_job, dict)
-    assert sync_job["permissions"] == {"contents": "read"}
+    assert sync_job["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert sync_job["needs"] == "release-please"
     assert sync_job["if"] == "needs.release-please.outputs.pr_branch != ''"
     assert sync_job["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
@@ -583,6 +582,7 @@ def test_release_changelogs_keep_one_unreleased_section() -> None:
 
     for changelog in changelogs:
         headings = [line for line in changelog.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
+        assert headings[0] == "## [Unreleased]"
         assert headings.count("## [Unreleased]") == 1
 
 

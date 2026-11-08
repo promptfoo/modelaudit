@@ -15,3 +15,4 @@ Describe the change and user impact.
 - [ ] I did not weaken detection behavior.
 - [ ] I added/updated tests when behavior changed.
 - [ ] I updated docs where needed.
+- [ ] For user-visible changes, I added a unique Markdown file under the affected package’s `changes/` directory. [Release note examples](https://github.com/promptfoo/modelaudit/blob/main/docs/agents/release-process.md#release-notes)

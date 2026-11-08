@@ -87,7 +87,7 @@ Driven from the shared `.github/workflows/release-please.yml`. The release PR me
 - **Fail-closed** — truncation, budget exhaustion, and engine errors must never return `SafetyVerdict.CLEAN`. Regressions here usually show up as `ScanStatus.COMPLETE` sneaking through the `_combine_verdict` / `_with_*_notice` paths in `api.py` — verify both `status` and `verdict` in tests.
 - **Standalone first** — when behavior belongs to pickle byte/stream analysis, prove it through the standalone public API and Rust-backed package tests before root adapter/parity checks. If Rust code changed, rebuild or otherwise prove `modelaudit_picklescan._rust` resolves to the current checkout before trusting Python results.
 - **Per-scan isolation** — no mutable global state may leak between scans. Tests that share a `PickleScanner` across calls must still see independent reports.
-- **Bounded resource use** — the `ScanOptions` defaults are a safety contract, not tunables. Adding new bounds: default them conservatively. Relaxing existing bounds: call it out in the changelog.
+- **Bounded resource use** — the `ScanOptions` defaults are a safety contract, not tunables. Adding new bounds: default them conservatively. Relaxing existing bounds: add an upgrade note fragment under `changes/`.
 
 ## README and PyPI
 
@@ -101,4 +101,4 @@ Driven from the shared `.github/workflows/release-please.yml`. The release PR me
 | New rule code                         | `rust/src/state.rs` or `rust/src/nested_surface.rs`, `README.md` "What it detects" table, tests                                     |
 | New `ScanOptions` field               | `src/modelaudit_picklescan/options.py` (+ validation), `rust/src/options.rs`, `README.md` defaults table                            |
 | New `PickleReport` field              | `src/modelaudit_picklescan/report.py`, `src/modelaudit_picklescan/api.py` (`_report_from_native_dict`), `rust/src/report.rs`, tests |
-| Root-to-standalone detector migration | Code move + parity tests + entry in CHANGELOG under `[Unreleased]` on _both_ CHANGELOG files if user-visible in `modelaudit` too    |
+| Root-to-standalone detector migration | Code move + parity tests + one release note fragment per affected package if user-visible in `modelaudit` too                       |

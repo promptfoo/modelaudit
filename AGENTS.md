@@ -81,7 +81,7 @@ gh pr create --title "feat: descriptive title" --body "Brief description"
 - After pushing, confirm the remote branch matches the intended local head before requesting review, resolving threads, or making merge/CI claims.
 - If `.git/index.lock` exists and no git process is running, remove the lock file.
 - Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
-- Keep CHANGELOG entries in `[Unreleased]` when adding user-visible changes (Keep a Changelog format).
+- Add a unique Markdown fragment under the affected package’s `changes/` directory for a user-visible change. The release PR assembles the shared changelogs. See [Release notes](docs/agents/release-process.md#release-notes).
 
 ## CI Compliance Requirements
 
@@ -171,7 +171,7 @@ When adding CVE detections to existing scanners, follow these rules distilled fr
 
 - Add new test files to `allowed_test_files` in `tests/conftest.py` (Python 3.10/3.12/3.13 CI allowlist).
 - Add CVE explanation functions to `modelaudit/config/explanations.py`.
-- Add CHANGELOG entry under the existing `[Unreleased]` section (never create a second one).
+- Add a package-local release note fragment describing the affected format and the change in coverage.
 
 For the full multi-file workflow, see `docs/agents/new-scanner-quickstart.md` § "Adding CVE Detections to Existing Scanners".
 

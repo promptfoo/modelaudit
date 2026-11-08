@@ -15,12 +15,49 @@ The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-pickle
 
 ## Normal flow
 
-1. **Write Conventional Commits** — `feat:`, `fix:`, `docs:`, etc. Release-please uses these to compute the next version and the changelog entry.
-2. **Merge to `main`** — release-please creates or updates a "Release PR" per changed component. Commits that only touch `packages/modelaudit-picklescan/` feed the picklescan component; everything else feeds the root component.
+1. **Write Conventional Commits** — `feat:`, `fix:`, `docs:`, etc. Release Please uses these to compute the next version and build the pull request inventory.
+2. **Merge to `main`** — Release Please creates or updates a grouped release PR for the components being released. Commits that only touch `packages/modelaudit-picklescan/` feed the picklescan component; everything else feeds the root component.
 3. **Review and merge the Release PR** — release-please tags the release and the workflow runs the matching publish jobs:
    - **For `modelaudit`** — `build` produces sdist+wheel → `publish-pypi` uploads via OIDC → `verify-pypi` confirms the published package → `provenance` attests and uploads SBOM.
    - **For `modelaudit-picklescan`** — `build-picklescan-package` matrix builds 5 native wheels (Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows x64) + sdist → `publish-picklescan-pypi` uploads → `picklescan-provenance` attests.
    - **When both release together** — the sibling package is published and verified on PyPI before the dependent root package is uploaded.
+
+## Release notes
+
+Add one file in `changes/` for ModelAudit or `packages/modelaudit-picklescan/changes/` for standalone PickleScan. Use a unique descriptive `.md` filename with lowercase letters, digits, and hyphens. Prefix it with the issue or PR number when known. A change affecting both packages can have different wording in each. Skip internal-only changes. For an open feature PR that already edits a shared changelog, move only that PR’s new bullets into a fragment and restore the shared file from the current base.
+
+For example, this entry belongs in `changes/1924-cli-triage.md`.
+
+```markdown
+### Upgrade notes
+
+- When an OpenAI API key is set, documentation triage can send eligible findings and document text to OpenAI. Use `--no-triage` to keep the scan local.
+```
+
+Use `### Highlights` for the few changes readers should see first, `### Upgrade notes` for changed defaults, compatibility, or required actions, `### Security` for security fixes and advisory links, and `### Other changes` for secondary improvements. Include one or more Markdown bullets and link the originating PR if available. Each shipped filename stays in Git. For a later change, add a new filename.
+
+Run `python scripts/release_notes.py check` to validate the format. From a checkout of main with tags available, run `python scripts/release_notes.py pending --package modelaudit` or use `--package modelaudit-picklescan`. Each package uses its previous tag as the boundary.
+
+### Reviewing the rolling release PR
+
+Inspect the versioned section in each changed changelog. The metadata job renders the fragments beside the generated inventory; later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
+
+```markdown
+<!-- release-note: changes/1924-cli-triage.md -->
+
+### Upgrade notes
+
+- When an OpenAI API key is set, use `--no-triage` to keep documentation findings and document text local.
+```
+
+The most recently updated matching comment from a current writer wins for that filename. Edit that comment to revise the wording, or remove its marker and any earlier overrides for the same file to restore the fragment. New fragments appear independently. To apply edits before the next automatic refresh, run the existing metadata retry and check the resulting changelog diff before merging.
+
+```bash
+gh api repos/promptfoo/modelaudit/dispatches -f event_type=release-metadata-retry \
+  -f 'client_payload[pr_branch]=release-please--branches--main'
+```
+
+The publisher uses the approved versioned section from the matching tag for the public GitHub Release. The comparison link and generated pull request inventory are available under **All changes**. A manual retry of an existing historical release retains its release page.
 
 ## Version scheme (0ver)
 
@@ -57,7 +94,7 @@ gh workflow run release-please.yml -f root_version=<X.Y.Z>
 gh workflow run release-please.yml -f picklescan_version=<X.Y.Z>
 ```
 
-The workflow's `Resolve manual release inputs` step flips `manual_release=true`, skips the release-please action, ensures the GitHub release exists (creating it if not), then feeds `release_created=true` / `picklescan_release_created=true` into the publish jobs. `uv build` always reads from `pyproject.toml` at the current `HEAD`, so the tagged commit must already contain the target version; dispatching a version that does not match what's in `HEAD` will fail the PyPI upload.
+The workflow's `Resolve manual release inputs` step flips `manual_release=true`, skips the release-please action, uses the existing tag and restores a missing GitHub Release from its tagged changelog section. If the tag itself is missing, the workflow verifies that the requested version is in the dispatch commit’s component manifest and changelog and creates the tag at that commit. It then feeds `release_created=true` / `picklescan_release_created=true` into the publish jobs. `uv build` always reads from `pyproject.toml` at the current `HEAD`, so the tagged commit must already contain the target version; dispatching a version that does not match what's in `HEAD` will fail the PyPI upload.
 
 If root publication and PyPI verification succeeded but `provenance` was skipped or failed, do **not** re-run the publish path: PyPI filenames are immutable and a rebuilt artifact may not match the published bytes. Recover provenance from the original verified publish run instead:
 
@@ -87,7 +124,7 @@ Steps:
 
 - **NEVER commit directly to `main` branch** — always create a feature branch and PR.
 - Use Conventional Commit format for ALL commit messages.
-- Add user-visible entries to `CHANGELOG.md` (root) or `packages/modelaudit-picklescan/CHANGELOG.md` under `## [Unreleased]` during feature work. Release-please promotes unreleased entries to a version-tagged section when the Release PR is merged.
+- Add a [release note fragment](#release-notes) for each affected package when the change is user-visible.
 - PR titles must follow Conventional Commits (validated by CI).
 
 Examples:
@@ -102,7 +139,7 @@ fix(modelaudit-picklescan): bound nested pickle expansion
 
 Before merging a Release PR:
 
-1. Release PR version and changelog content look correct for every component bumped.
+1. Review the versioned changelog in **Files changed** for each bumped package. Check upgrade actions, public APIs, exit codes, data sent off-device, toolchain requirements, and scanner coverage or severity changes as applicable. If a root note promises a sibling fix, ensure the published minimum delivers it or state exactly which sibling version users must install.
 2. Required checks green: `CI Success`, `Docker CI Success`, docs checks, CodeQL, and — for picklescan bumps — `Standalone Pickle Package (3.10/3.11/3.12/3.13/3.14)`.
 3. Release-build validation green:
    - `twine check dist/*`

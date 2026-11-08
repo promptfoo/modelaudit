@@ -120,30 +120,69 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Ensure manual GitHub releases exist
-        if: steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.root_provenance_recovery != 'true'
+      - name: Check out the release notes tool
+        if: &publish-notes >-
+          steps.manual.outputs.root_provenance_recovery != 'true' &&
+          (steps.manual.outputs.manual_release == 'true' || steps.release.outputs.release_created == 'true' ||
+          steps.release.outputs['packages/modelaudit-picklescan--release_created'] == 'true')
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Publish notes from the tagged changelogs
+        if: *publish-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ROOT_TAG: ${{ steps.manual.outputs.tag_name }}
-          ROOT_VERSION: ${{ steps.manual.outputs.version }}
-          PICKLESCAN_TAG: ${{ steps.manual.outputs.picklescan_tag_name }}
-          PICKLESCAN_VERSION: ${{ steps.manual.outputs.picklescan_version }}
+          ROOT_VERSION: ${{ steps.manual.outputs.version || steps.release.outputs.version }}
+          PICKLESCAN_VERSION: ${{ steps.manual.outputs.picklescan_version || steps.release.outputs['packages/modelaudit-picklescan--version'] }}
+          MANUAL_RELEASE: ${{ steps.manual.outputs.manual_release }}
         run: |
-          if [[ -n "$ROOT_VERSION" ]] && ! gh release view "$ROOT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$ROOT_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "$ROOT_TAG" \
-              --notes "Manual recovery release for modelaudit $ROOT_VERSION."
-          fi
-
-          if [[ -n "$PICKLESCAN_VERSION" ]] && ! gh release view "$PICKLESCAN_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$PICKLESCAN_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "modelaudit-picklescan: v$PICKLESCAN_VERSION" \
-              --notes "Manual recovery release for modelaudit-picklescan $PICKLESCAN_VERSION."
-          fi
+          set -euo pipefail
+          publish_notes() {
+            local package="$1" version="$2" prefix="$3"
+            [[ -n "$version" ]] || return 0
+            local tag="$prefix$version" notes="$RUNNER_TEMP/$package-notes.md"
+            local source="refs/tags/$tag" missing_tag=false component=.
+            if ! git rev-parse --verify --quiet "$source^{commit}" >/dev/null; then
+              [[ "$MANUAL_RELEASE" == true ]] || { echo "Missing release tag $tag"; return 1; }
+              # Explicit manual publication also supports an already-versioned dispatch commit.
+              source="$GITHUB_SHA"
+              missing_tag=true
+              if [[ "$package" == modelaudit-picklescan ]]; then component="packages/modelaudit-picklescan"; fi
+              git show "$source:.release-please-manifest.json" | jq -e --arg path "$component" --arg v "$version" '.[$path] == $v' >/dev/null
+            fi
+            local published=true reviewed=false title="$tag"
+            if [[ "$MANUAL_RELEASE" == true ]] && ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              published=false
+            fi
+            if git cat-file -e "$source:scripts/release_notes.py" 2>/dev/null; then
+              reviewed=true
+            elif [[ "$MANUAL_RELEASE" == true && "$published" == true ]]; then
+              # A package retry must preserve hand-edited releases that predate fragments.
+              return 0
+            fi
+            python3 scripts/release_notes.py extract --package "$package" --version "$version" --ref "$source" > "$notes"
+            if [[ "$reviewed" == true ]]; then
+              grep -Fxq '<summary>All changes</summary>' "$notes" || { echo "Missing reviewed release notes for $tag"; return 1; }
+            fi
+            if [[ "$missing_tag" == true ]]; then
+              # Never move a tag. Accept a concurrent creation only at the same commit.
+              if ! gh api --silent -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$tag" -f "sha=$source"; then
+                actual=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq '.sha')
+                [[ "$actual" == "$source" ]] || { echo "Tag $tag does not match the dispatch commit"; return 1; }
+              fi
+            fi
+            if [[ "$published" == false ]]; then
+              if [[ "$package" == modelaudit-picklescan ]]; then title="$package: v$version"; fi
+              gh release create "$tag" --verify-tag --repo "$GITHUB_REPOSITORY" --title "$title" --notes-file "$notes"
+            else
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+            fi
+          }
+          publish_notes modelaudit "$ROOT_VERSION" v
+          publish_notes modelaudit-picklescan "$PICKLESCAN_VERSION" modelaudit-picklescan-v
 
       - name: Check if PR exists
         id: check-pr
@@ -175,8 +214,9 @@ jobs:
     if: needs.release-please.outputs.pr_branch != ''
     runs-on: ubuntu-latest
     needs: release-please
-    permissions: &read-contents-permissions
+    permissions:
       contents: read
+      pull-requests: read
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
     steps:
@@ -184,7 +224,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.release-please.outputs.pr_branch }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Record release metadata source
@@ -216,6 +256,29 @@ jobs:
 
       - name: Install Node dependencies
         run: npm ci --ignore-scripts
+
+      - name: Assemble reviewed package notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BRANCH: ${{ needs.release-please.outputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr view "$PR_BRANCH" --repo "$GITHUB_REPOSITORY" --json number,state,isCrossRepository,baseRefName,headRefOid)
+          jq -e --arg head "$(git rev-parse HEAD)" '.state == "OPEN" and .baseRefName == "main" and (.isCrossRepository | not) and .headRefOid == $head' <<< "$pr" >/dev/null
+          number=$(jq -r '.number' <<< "$pr")
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$number/comments?per_page=100" \
+            | jq '[.[][] | select((.body // "") | startswith("<!-- release-note: "))]' > "$RUNNER_TEMP/candidates.json"
+          : > "$RUNNER_TEMP/note-editors"
+          while IFS= read -r author; do
+            permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$author/permission" --jq '.permission')
+            case "$permission" in admin|maintain|write) printf '%s\n' "$author" >> "$RUNNER_TEMP/note-editors" ;; esac
+          done < <(jq -r '[.[] | .user.login // empty] | unique[]' "$RUNNER_TEMP/candidates.json")
+          jq --rawfile editors "$RUNNER_TEMP/note-editors" \
+            '[.[] | select(.user.login as $author | ($editors | split("\n") | index($author)) != null)]' \
+            "$RUNNER_TEMP/candidates.json" > "$RUNNER_TEMP/reviewed-notes.json"
+          unset GH_TOKEN
+          base=$(git merge-base HEAD refs/remotes/origin/main)
+          python3 scripts/release_notes.py render --base "$base" --reviews "$RUNNER_TEMP/reviewed-notes.json"
 
       - name: Format changelogs with Prettier
         run: |
@@ -303,7 +366,8 @@ jobs:
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     needs: release-please
-    permissions: *read-contents-permissions
+    permissions: &read-contents-permissions
+      contents: read
     outputs:
       artifact-name: ${{ steps.upload.outputs.artifact-id }}
     steps:

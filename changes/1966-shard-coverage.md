@@ -1,0 +1,3 @@
+### Other changes
+
+- Correct SafeTensors missing-shard reports for manifest-declared zero-based single-shard files and mixed Hugging Face range and local scans. Report unverified tensor assignments separately from confirmed index mismatches. [#1966](https://github.com/promptfoo/modelaudit/pull/1966)

@@ -1,0 +1,3 @@
+### Highlights
+
+- Avoid incomplete GGUF, GGML, and sharded model scans and skipped file hashes on Windows when an unchanged file reports different creation times through its path and its open handle. [#1971](https://github.com/promptfoo/modelaudit/pull/1971)
