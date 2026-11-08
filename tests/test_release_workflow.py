@@ -1094,7 +1094,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert 'job.get("status") != "completed" or job.get("conclusion") != "success"' in source_run
 
     download_step = _step_by_name(steps, "Download original root build artifacts")
-    assert download_step["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+    assert download_step["uses"] == "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
     assert download_step["with"] == {
         "name": "dist",
         "path": "dist/",
