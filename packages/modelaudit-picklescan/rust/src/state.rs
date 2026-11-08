@@ -8947,15 +8947,7 @@ mod tests {
     #[test]
     fn constructor_provenance_survives_memo_without_blessing_unknown_aliases() {
         let options = default_test_options();
-        let scan = ScanState::new(
-            "constructor-proof".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let scan = new_test_scan("constructor-proof", b"", &options);
         let known = factoryless_defaultdict();
         let StackValue::Constructed { reference, .. } = &known else {
             panic!("constructed fixture")
@@ -9210,15 +9202,7 @@ mod tests {
     #[test]
     fn template_execution_invalidates_before_invocation_dedupe_and_caps() {
         let options = default_test_options();
-        let mut scan = ScanState::new(
-            "template-dedupe".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("template-dedupe", b"", &options);
         let invocation = CallableInvocation {
             reference: GlobalRef {
                 module: "builtins".to_string(),
@@ -9261,15 +9245,7 @@ mod tests {
     #[test]
     fn template_mapping_proof_preserves_unproven_metadata_and_factory_callbacks() {
         let options = default_test_options();
-        let mut scan = ScanState::new(
-            "template-proof".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("template-proof", b"", &options);
         let reference = GlobalRef {
             module: "string".to_string(),
             name: "Template.safe_substitute".to_string(),
@@ -9376,20 +9352,28 @@ mod tests {
         }
     }
 
-    fn run_test_scan<'a>(
-        source: &str,
+    fn new_test_scan<'a>(
+        source: impl Into<String>,
         payload: &'a [u8],
         options: &'a ScanOptions,
     ) -> ScanState<'a> {
-        let mut scan = ScanState::new(
-            source.to_string(),
+        ScanState::new(
+            source.into(),
             payload,
             options,
             Some(payload.len()),
             0,
             0,
             None,
-        );
+        )
+    }
+
+    fn run_test_scan<'a>(
+        source: impl Into<String>,
+        payload: &'a [u8],
+        options: &'a ScanOptions,
+    ) -> ScanState<'a> {
+        let mut scan = new_test_scan(source, payload, options);
         scan.run();
         scan
     }
@@ -9592,15 +9576,7 @@ mod tests {
     fn discarded_stack_local_tracked_dict_entries_release_state_budget() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "discarded-stack-local-dicts.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("discarded-stack-local-dicts.pkl", payload, &options);
         let large_module = "A".repeat(64 * 1024);
 
         for _ in 0..(MAX_TRACKED_STATE_BYTES / large_module.len() + 2) {
@@ -9703,15 +9679,7 @@ mod tests {
     fn repeated_memoized_dict_entry_overwrites_release_previous_state_budget() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "memoized-dict-overwrite-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("memoized-dict-overwrite-budget.pkl", payload, &options);
         scan.push_stack_value(StackValue::TrackedDict {
             entries: Vec::new(),
             unknown_key_values: Vec::new(),
@@ -9764,15 +9732,7 @@ mod tests {
     fn mapping_lookup_budget_exhaustion_fails_closed() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "mapping-traversal-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("mapping-traversal-budget.pkl", payload, &options);
         let mut mappings = (0..MAX_MAPPING_TRAVERSAL_NODES)
             .map(|index| StackValue::TrackedDict {
                 entries: Vec::new(),
@@ -9814,15 +9774,7 @@ mod tests {
     fn dropped_inert_shadow_key_makes_missing_lookup_opaque() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "dropped-inert-shadow.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("dropped-inert-shadow.pkl", payload, &options);
         let entries = (0..MAX_TRACKED_DICT_ENTRIES)
             .map(|index| (format!("key{index:04}"), StackValue::Other))
             .collect();
@@ -9878,15 +9830,7 @@ mod tests {
     fn unknown_key_entry_makes_unresolved_lookup_opaque() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "unknown-key-entry.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("unknown-key-entry.pkl", payload, &options);
         let mapping = StackValue::MappingWrapper {
             reference: GlobalRef {
                 module: "collections".to_string(),
@@ -9927,14 +9871,10 @@ mod tests {
     fn finite_self_referential_mapping_path_does_not_fall_through_chainmap() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "finite-self-referential-mapping-path.pkl".to_string(),
+        let mut scan = new_test_scan(
+            "finite-self-referential-mapping-path.pkl",
             payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
         scan.memo.insert(
             0,
@@ -10008,15 +9948,7 @@ mod tests {
     fn deeply_nested_mapping_wrappers_fail_closed() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "nested-mapping-wrapper-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("nested-mapping-wrapper-budget.pkl", payload, &options);
         let mut value = StackValue::Other;
         for _ in 0..=MAX_TRACKED_VALUE_DEPTH {
             value = StackValue::MappingWrapper {
@@ -10043,15 +9975,7 @@ mod tests {
     fn zero_cost_stack_values_are_entry_bounded() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "stack-entry-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("stack-entry-budget.pkl", payload, &options);
 
         for _ in 0..=MAX_TRACKED_STACK_VALUES {
             scan.push_stack_value(StackValue::Other);
@@ -10066,15 +9990,7 @@ mod tests {
     fn zero_cost_memo_values_are_entry_bounded() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "memo-entry-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("memo-entry-budget.pkl", payload, &options);
         for index in 0..MAX_TRACKED_MEMO_VALUES {
             assert!(scan.can_insert_tracked_memo_value(index as i64));
             scan.memo.insert(index as i64, StackValue::Other);
@@ -10090,15 +10006,7 @@ mod tests {
     fn memoized_future_callbacks_are_entry_bounded() {
         let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "future-callback-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("future-callback-budget.pkl", payload, &options);
         scan.memo.insert(
             0,
             StackValue::FutureCallbacks(FutureCallbacks {
@@ -10156,24 +10064,9 @@ mod tests {
 
     #[test]
     fn str_join_result_counts_separator_bytes_before_appending() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"";
-        let scan = ScanState::new(
-            "str-join-bound.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let scan = new_test_scan("str-join-bound.pkl", payload, &options);
         let callable = StackValue::Global(GlobalRef {
             module: "builtins".to_string(),
             name: "str.join".to_string(),
@@ -10231,24 +10124,9 @@ mod tests {
 
     #[test]
     fn global_reference_dedupe_preserves_malformed_state() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "global-dedupe.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("global-dedupe.pkl", payload, &options);
         let malformed = GlobalRef {
             module: "os".to_string(),
             name: "system".to_string(),
@@ -10280,69 +10158,29 @@ mod tests {
 
     #[test]
     fn large_repeated_literals_skip_expensive_text_and_encoded_probes_only_when_complete() {
-        let mut options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let mut options = default_test_options();
         let payload = b".";
-        let scan = ScanState::new(
-            "large-repeated.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let scan = new_test_scan("large-repeated.pkl", payload, &options);
 
         assert!(scan.is_large_uninteresting_repeated_literal(&"A".repeat(1024 * 1024)));
         assert!(!scan.is_large_uninteresting_repeated_literal(&"A".repeat(1023)));
         assert!(!scan.is_large_uninteresting_repeated_literal("AAAos.system('id')AAA"));
 
         options.max_string_literal_scan_chars = 8;
-        let truncated_scan = ScanState::new(
-            "large-repeated-truncated.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let truncated_scan = new_test_scan("large-repeated-truncated.pkl", payload, &options);
         assert!(!truncated_scan.is_large_uninteresting_repeated_literal(&"A".repeat(1024)));
     }
 
     #[test]
     fn missing_memo_gets_push_opaque_operands() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (name, payload) in [
             ("GET", b"g0\n)R.".as_slice()),
             ("BINGET", b"h\x00)R.".as_slice()),
             ("LONG_BINGET", b"j\x00\x00\x00\x00)R.".as_slice()),
         ] {
-            let mut scan = ScanState::new(
-                format!("missing-memo-{name}.pkl"),
-                payload,
-                &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
-            );
-
-            scan.run();
+            let scan = run_test_scan(format!("missing-memo-{name}.pkl"), payload, &options);
 
             assert_eq!(scan.verdict.as_str(), "clean", "{name} should be opaque");
             assert!(scan.import_references.is_empty(), "{name} import refs");
@@ -10357,14 +10195,7 @@ mod tests {
 
     #[test]
     fn timeout_checks_are_amortized_by_opcode_interval() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
         let mut scan = ScanState::new(
             "timeout-amortized.pkl".to_string(),
@@ -10394,24 +10225,9 @@ mod tests {
 
     #[test]
     fn global_finding_coalesce_uses_structured_positions_only() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "structured-position.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("structured-position.pkl", payload, &options);
         let call_finding = Finding {
             message: "call".to_string(),
             severity: "critical",
@@ -10490,14 +10306,7 @@ mod tests {
 
     #[test]
     fn stack_global_rejects_byte_operands_fail_closed() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (name, payload) in [
             (
@@ -10513,17 +10322,7 @@ mod tests {
                 b"\x80\x04\x8c\x02osC\x06system\x93.".as_slice(),
             ),
         ] {
-            let mut scan = ScanState::new(
-                format!("stack-global-{name}.pkl"),
-                payload,
-                &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
-            );
-
-            scan.run();
+            let scan = run_test_scan(format!("stack-global-{name}.pkl"), payload, &options);
 
             assert_eq!(scan.verdict.as_str(), "malicious", "{name}");
             assert!(
@@ -10543,24 +10342,9 @@ mod tests {
 
     #[test]
     fn notice_dedupe_state_can_be_rebuilt_after_notice_rewrites() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b".";
-        let mut scan = ScanState::new(
-            "notice-dedupe.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("notice-dedupe.pkl", payload, &options);
         let old_notice = Notice {
             message: "old notice".to_string(),
             severity: "info",
@@ -10590,26 +10374,9 @@ mod tests {
 
     #[test]
     fn inst_dispatch_flags_dangerous_global_calls() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"(ios\nsystem\n.";
-        let mut scan = ScanState::new(
-            "inst-dispatch.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("inst-dispatch.pkl", payload, &options);
 
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_CALL")
@@ -10621,26 +10388,9 @@ mod tests {
 
     #[test]
     fn obj_dispatch_uses_first_mark_value_as_callable() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"(cos\nsystem\nU\x04echoo.";
-        let mut scan = ScanState::new(
-            "obj-dispatch.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("obj-dispatch.pkl", payload, &options);
 
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_CALL")
@@ -10652,26 +10402,9 @@ mod tests {
 
     #[test]
     fn newobj_ex_dispatch_consumes_callable_args_and_kwargs() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04cos\nsystem\n)}\x92.";
-        let mut scan = ScanState::new(
-            "newobj-ex-dispatch.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("newobj-ex-dispatch.pkl", payload, &options);
 
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_CALL")
@@ -10683,26 +10416,9 @@ mod tests {
 
     #[test]
     fn newobj_ex_records_complete_bounded_keyword_argument_names() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04cprivate_payload\nGadget\n)}\x8c\x05token\x8c\x01xs\x92.";
-        let mut scan = ScanState::new(
-            "newobj-ex-keywords.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("newobj-ex-keywords.pkl", payload, &options);
 
         let invocation = scan
             .callable_invocations
@@ -10724,26 +10440,9 @@ mod tests {
 
     #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x97\x98\x93.";
-        let mut scan = ScanState::new(
-            "buffer-stack-global.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("buffer-stack-global.pkl", payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "malicious");
         let finding = scan
@@ -10767,26 +10466,9 @@ mod tests {
 
     #[test]
     fn protocol5_buffer_opcode_notices_are_collapsed() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x97\x97\x98\x97\x98.";
-        let mut scan = ScanState::new(
-            "many-buffer-opcodes.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("many-buffer-opcodes.pkl", payload, &options);
 
         let buffer_notices = scan
             .notices
@@ -10815,26 +10497,9 @@ mod tests {
 
     #[test]
     fn in_band_readonly_buffer_preserves_complete_coverage() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x96\x01\x00\x00\x00\x00\x00\x00\x00A\x98.";
-        let mut scan = ScanState::new(
-            "in-band-readonly-buffer.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("in-band-readonly-buffer.pkl", payload, &options);
 
         let notice = scan
             .notices
@@ -10862,26 +10527,9 @@ mod tests {
 
     #[test]
     fn non_buffer_readonly_operand_fails_closed() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05G\x00\x00\x00\x00\x00\x00\x00\x00\x98.";
-        let mut scan = ScanState::new(
-            "non-buffer-readonly.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("non-buffer-readonly.pkl", payload, &options);
 
         let notice = scan
             .notices
@@ -10902,26 +10550,9 @@ mod tests {
 
     #[test]
     fn readonly_buffer_empty_stack_does_not_fabricate_operand() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x05\x98\x93.";
-        let mut scan = ScanState::new(
-            "readonly-empty-stack.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("readonly-empty-stack.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -10960,14 +10591,7 @@ mod tests {
 
     #[test]
     fn empty_collection_operands_report_precise_stack_preview_types() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (opcode, expected_preview) in
             [(b']', "list:[]"), (b'}', "dict:{}"), (b'\x8f', "set:set()")]
@@ -10978,17 +10602,11 @@ mod tests {
                 b"\x8c\x06system\x94\x93.".as_slice(),
             ]
             .concat();
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("empty-operand-{expected_preview}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             let finding = scan
                 .findings
@@ -11005,12 +10623,8 @@ mod tests {
     #[test]
     fn truncated_proto0_nested_payloads_are_not_silently_dropped() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
             max_nested_pickle_bytes: 4,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let inner = b"cos\nsystem\n.";
         let payload = [
@@ -11020,17 +10634,7 @@ mod tests {
             b".".as_slice(),
         ]
         .concat();
-        let mut scan = ScanState::new(
-            "truncated-proto0-nested.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("truncated-proto0-nested.pkl", &payload, &options);
 
         assert_eq!(scan.status.as_str(), "inconclusive");
         assert!(scan.findings.iter().any(|finding| {
@@ -11047,30 +10651,13 @@ mod tests {
 
     #[test]
     fn encoded_nested_probe_limit_fails_closed_after_decoys() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let literal = encoded_probe_limit_decoy_literal();
         let mut payload = b"\x80\x04X".to_vec();
         payload.extend_from_slice(&(literal.len() as u32).to_le_bytes());
         payload.extend_from_slice(literal.as_bytes());
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "encoded-nested-probe-limit.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("encoded-nested-probe-limit.pkl", &payload, &options);
 
         assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert_eq!(scan.verdict.as_str(), "malicious");
@@ -11091,23 +10678,8 @@ mod tests {
 
     #[test]
     fn callable_operand_underflow_does_not_clear_stack_state() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "operand-underflow.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("operand-underflow.pkl", b"", &options);
         scan.stack.push(StackValue::Text {
             value: "survivor".to_string(),
             memo_read: false,
@@ -11122,23 +10694,8 @@ mod tests {
 
     #[test]
     fn tuple_shortcuts_do_not_wrap_mark_sentinels() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "tuple-mark.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("tuple-mark.pkl", b"", &options);
         scan.stack.push(StackValue::Mark);
 
         scan.collapse_top_n(1);
@@ -11151,12 +10708,8 @@ mod tests {
     #[test]
     fn follow_on_streams_do_not_consume_nested_depth_budget() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
             max_nested_depth: 1,
+            ..default_test_options()
         };
         let payload = b"padding\x00\x80\x04cos\nsystem\n)R.";
         let mut scan = ScanState::new(
@@ -11183,23 +10736,8 @@ mod tests {
 
     #[test]
     fn import_reference_metadata_is_capped_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "import-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("import-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             scan.push_import_reference(vec![(
@@ -11221,23 +10759,8 @@ mod tests {
 
     #[test]
     fn non_allowlisted_global_findings_are_capped_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "non-allowlisted-global-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("non-allowlisted-global-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             scan.push_non_allowlisted_global_import((
@@ -11263,23 +10786,8 @@ mod tests {
 
     #[test]
     fn non_allowlisted_global_findings_are_byte_bounded_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "non-allowlisted-global-byte-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("non-allowlisted-global-byte-cap.pkl", b"", &options);
 
         scan.push_non_allowlisted_global_import((
             "x".repeat(MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES + 1),
@@ -11311,23 +10819,8 @@ mod tests {
 
     #[test]
     fn duplicate_import_reference_over_cap_does_not_mark_metadata_truncated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "duplicate-import-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("duplicate-import-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             scan.push_import_reference(vec![
@@ -11355,28 +10848,13 @@ mod tests {
 
     #[test]
     fn security_distinct_import_reference_overflow_marks_metadata_truncated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
 
         for (module, name, overflow_opcode) in [
             ("cmath", "sin", "STACK_GLOBAL"),
             ("torch", "FloatStorage", "GLOBAL"),
         ] {
-            let mut scan = ScanState::new(
-                format!("{module}-{name}-import-cap.pkl"),
-                b"",
-                &options,
-                Some(0),
-                0,
-                0,
-                None,
-            );
+            let mut scan = new_test_scan(format!("{module}-{name}-import-cap.pkl"), b"", &options);
 
             for index in 0..MAX_IMPORT_REFERENCES {
                 scan.push_import_reference(vec![
@@ -11415,23 +10893,8 @@ mod tests {
 
     #[test]
     fn callable_invocation_metadata_is_capped_with_notice() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "callable-invocation-cap.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("callable-invocation-cap.pkl", b"", &options);
 
         for index in 0..=MAX_IMPORT_REFERENCES {
             let invocation = ScanState::callable_invocation(
@@ -11463,23 +10926,8 @@ mod tests {
 
     #[test]
     fn follow_on_callable_invocation_truncation_is_propagated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "follow-on-truncated-invocations.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("follow-on-truncated-invocations.pkl", b"", &options);
 
         scan.merge_follow_on_callable_invocations(Vec::new(), true);
 
@@ -11492,23 +10940,8 @@ mod tests {
 
     #[test]
     fn repeated_callable_invocations_preserve_each_semantic_opcode() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "repeated-invocations.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("repeated-invocations.pkl", b"", &options);
         let first = ScanState::callable_invocation(
             GlobalRef {
                 module: "module".to_string(),
@@ -11559,23 +10992,8 @@ mod tests {
 
     #[test]
     fn follow_on_import_reference_truncation_is_propagated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "follow-on-truncated-imports.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("follow-on-truncated-imports.pkl", b"", &options);
 
         scan.merge_follow_on_import_references(Vec::new(), true);
 
@@ -11589,23 +11007,8 @@ mod tests {
 
     #[test]
     fn follow_on_duplicate_callable_invocations_do_not_mark_metadata_truncated() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut scan = ScanState::new(
-            "follow-on-duplicate-invocation.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let options = default_test_options();
+        let mut scan = new_test_scan("follow-on-duplicate-invocation.pkl", b"", &options);
 
         for index in 0..MAX_IMPORT_REFERENCES {
             let invocation = ScanState::callable_invocation(
@@ -11635,26 +11038,9 @@ mod tests {
 
     #[test]
     fn persistent_id_opcodes_are_flagged() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"Pexternal-storage-key\n.";
-        let mut scan = ScanState::new(
-            "persistent.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("persistent.pkl", payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "suspicious");
         let finding = scan
@@ -11670,26 +11056,9 @@ mod tests {
 
     #[test]
     fn repeated_persistent_id_opcodes_are_summarized() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"Pa\nPb\nPc\n.";
-        let mut scan = ScanState::new(
-            "persistent-many.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("persistent-many.pkl", payload, &options);
 
         assert_eq!(
             scan.findings
@@ -11711,26 +11080,9 @@ mod tests {
 
     #[test]
     fn data_only_nested_payloads_emit_notice_not_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04C\x04\x80\x04}.\x94.";
-        let mut scan = ScanState::new(
-            "data-only-nested.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("data-only-nested.pkl", payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "clean");
         assert!(scan.findings.is_empty());
@@ -11747,30 +11099,13 @@ mod tests {
 
     #[test]
     fn benign_nested_constructor_payloads_emit_notice_not_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_payload = b"ccollections\nOrderedDict\n)R.";
         let mut payload = b"\x80\x04C".to_vec();
         payload.push(nested_payload.len() as u8);
         payload.extend_from_slice(nested_payload);
         payload.extend_from_slice(b"\x94.");
-        let mut scan = ScanState::new(
-            "benign-constructor-nested.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("benign-constructor-nested.pkl", &payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "clean");
         assert!(scan.findings.is_empty());
@@ -11792,30 +11127,13 @@ mod tests {
 
     #[test]
     fn raw_nested_payload_scan_continues_after_data_only_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"AAAAAA\x80\x04}.BBBBBBcos\nsystem\n)R.CCCC";
         let mut payload = b"\x80\x04B".to_vec();
         payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
         payload.extend_from_slice(nested_bytes);
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "raw-nested-benign-before-malicious.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("raw-nested-benign-before-malicious.pkl", &payload, &options);
 
         assert_eq!(scan.verdict.as_str(), "malicious");
         assert!(scan
@@ -11838,12 +11156,8 @@ mod tests {
     fn raw_nested_byte_literal_scan_honors_string_literal_budget() {
         for (label, max_string_literal_scan_chars) in [("zero", 0), ("small", 8)] {
             let options = ScanOptions {
-                timeout_s: DEFAULT_TIMEOUT_S,
-                max_opcodes: DEFAULT_MAX_OPCODES,
-                post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
                 max_string_literal_scan_chars,
-                max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-                max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+                ..default_test_options()
             };
             let mut nested_bytes = vec![b'A'; 64];
             nested_bytes.extend_from_slice(b"cos\nsystem\n)R.");
@@ -11852,17 +11166,11 @@ mod tests {
             payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
             payload.extend_from_slice(&nested_bytes);
             payload.push(b'.');
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("raw-nested-{label}-literal-budget.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert_eq!(
                 scan.status.as_str(),
@@ -11887,14 +11195,7 @@ mod tests {
 
     #[test]
     fn legacy_string_opcodes_scan_raw_nested_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"AAAAAAcos\nsystem\n)R.BBBB";
         let mut binstring_payload = b"\x80\x02T".to_vec();
         binstring_payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
@@ -11914,17 +11215,11 @@ mod tests {
         ];
 
         for (label, payload) in payloads {
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("legacy-string-raw-nested-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert_eq!(scan.verdict.as_str(), "malicious", "missed {label}");
             assert!(scan.findings.iter().any(|finding| {
@@ -11942,14 +11237,7 @@ mod tests {
 
     #[test]
     fn unicode_string_opcodes_scan_raw_nested_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"AAAAAAcos\nsystem\n)R.BBBB";
         let payloads = [
             ("short-binunicode", {
@@ -11979,17 +11267,11 @@ mod tests {
         ];
 
         for (label, payload) in payloads {
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("unicode-raw-nested-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert_eq!(scan.verdict.as_str(), "malicious", "missed {label}");
             assert!(scan.findings.iter().any(|finding| {
@@ -12007,29 +11289,16 @@ mod tests {
 
     #[test]
     fn unicode_string_opcodes_fail_closed_for_malformed_protocol0_container_payloads() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let nested_bytes = b"(cos\nsystem\n)R";
         let mut payload = b"\x80\x04".to_vec();
         payload.extend_from_slice(&short_binunicode(nested_bytes));
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "unicode-malformed-protocol0-container.pkl".to_string(),
+        let scan = run_test_scan(
+            "unicode-malformed-protocol0-container.pkl",
             &payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert_eq!(scan.status.as_str(), "inconclusive");
         assert_eq!(scan.verdict.as_str(), "malicious");
@@ -12045,12 +11314,8 @@ mod tests {
     #[test]
     fn unicode_string_opcodes_scan_large_ascii_literals_without_copying() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
             max_string_literal_scan_chars: 1024,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let mut nested_bytes = vec![b'A'; 128 * 1024];
         nested_bytes.extend_from_slice(b"cos\nsystem\n)R.");
@@ -12058,17 +11323,7 @@ mod tests {
         payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
         payload.extend_from_slice(&nested_bytes);
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "unicode-large-ascii-raw-nested.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("unicode-large-ascii-raw-nested.pkl", &payload, &options);
 
         assert_eq!(scan.status.as_str(), "inconclusive");
         assert_eq!(scan.verdict.as_str(), "malicious");
@@ -12082,22 +11337,11 @@ mod tests {
     #[test]
     fn unicode_raw_nested_scan_detects_payload_across_bounded_conversion_chunks() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
             max_string_literal_scan_chars: 0,
             max_nested_pickle_bytes: 32,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
-        let mut scan = ScanState::new(
-            "unicode-chunk-boundary.pkl".to_string(),
-            b"",
-            &options,
-            Some(0),
-            0,
-            0,
-            None,
-        );
+        let mut scan = new_test_scan("unicode-chunk-boundary.pkl", b"", &options);
         let value = format!("{}{}", "\u{ff}".repeat(60), "cos\nsystem\n)R.");
 
         scan.scan_raw_nested_unicode_text(&value, 0);
@@ -12118,26 +11362,9 @@ mod tests {
 
     #[test]
     fn oversized_frame_lengths_emit_structural_tamper_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.";
-        let mut scan = ScanState::new(
-            "oversized-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("oversized-frame.pkl", payload, &options);
 
         let notice = scan
             .notices
@@ -12167,26 +11394,9 @@ mod tests {
 
     #[test]
     fn slightly_oversized_frame_lengths_emit_structural_tamper_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
-        let mut scan = ScanState::new(
-            "slightly-oversized-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("slightly-oversized-frame.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12205,26 +11415,9 @@ mod tests {
 
     #[test]
     fn frame_crossing_stop_emits_structural_tamper_finding() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\x05\x00\x00\x00\x00\x00\x00\x00}.\x80\x04N.";
-        let mut scan = ScanState::new(
-            "frame-crossing-stop.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("frame-crossing-stop.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12243,26 +11436,9 @@ mod tests {
 
     #[test]
     fn frame_ending_before_stop_is_not_oversized() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
+        let options = default_test_options();
         let payload = b"\x80\x04\x95\x01\x00\x00\x00\x00\x00\x00\x00}.";
-        let mut scan = ScanState::new(
-            "short-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("short-frame.pkl", payload, &options);
 
         assert!(scan.findings.iter().all(|finding| {
             detail_string(&finding.details, "tamper_type").as_deref() != Some("oversized_frame")
@@ -12278,25 +11454,11 @@ mod tests {
     #[test]
     fn post_budget_tail_reports_oversized_frame_tamper() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04N\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
-        let mut scan = ScanState::new(
-            "post-budget-oversized-frame.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-oversized-frame.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12316,25 +11478,11 @@ mod tests {
     #[test]
     fn post_budget_tail_reports_expanded_needles_at_precise_positions() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 1,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04cos\npopen\n.";
-        let mut scan = ScanState::new(
-            "post-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12352,12 +11500,8 @@ mod tests {
     #[test]
     fn post_budget_tail_detects_policy_dangerous_globals() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 1,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
 
         for (module, name) in [
@@ -12374,17 +11518,11 @@ mod tests {
             payload.extend_from_slice(name.as_bytes());
             payload.extend_from_slice(b"\n.");
             let expected_pattern = format!("{module}\n{name}");
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-{expected_pattern}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert!(
                 scan.findings.iter().any(|finding| {
@@ -12400,12 +11538,8 @@ mod tests {
     #[test]
     fn post_budget_tail_detects_modern_stack_global_forms() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let forms = [
             (
@@ -12443,17 +11577,7 @@ mod tests {
         for (label, tail) in forms {
             let mut payload = b"\x80\x04\x88\x88".to_vec();
             payload.extend_from_slice(&tail);
-            let mut scan = ScanState::new(
-                format!("post-budget-{label}.pkl"),
-                &payload,
-                &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
-            );
-
-            scan.run();
+            let scan = run_test_scan(format!("post-budget-{label}.pkl"), &payload, &options);
 
             let finding = scan
                 .findings
@@ -12471,25 +11595,11 @@ mod tests {
     #[test]
     fn post_budget_tail_resynchronizes_after_malformed_bytes_before_modern_globals() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
-        let mut scan = ScanState::new(
-            "post-budget-malformed-modern-global.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-malformed-modern-global.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -12506,25 +11616,15 @@ mod tests {
     #[test]
     fn post_budget_tail_does_not_resolve_tuple_wrapped_globals_after_malformed_bytes() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x86\x93)R.";
-        let mut scan = ScanState::new(
-            "post-budget-malformed-tuple-wrapped-global.pkl".to_string(),
+        let scan = run_test_scan(
+            "post-budget-malformed-tuple-wrapped-global.pkl",
             payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert!(
             !scan.findings.iter().any(|finding| {
@@ -12539,12 +11639,9 @@ mod tests {
     #[test]
     fn post_budget_tail_does_not_resynchronize_inside_truncated_literals() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
             post_budget_scan_bytes: 32,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let inert_inner_bytes = b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
         let mut payload = b"\x80\x04\x88\x88X".to_vec();
@@ -12552,17 +11649,7 @@ mod tests {
         payload.extend_from_slice(inert_inner_bytes);
         payload.resize(4 + 1 + 4 + 64, b'A');
         payload.push(b'.');
-        let mut scan = ScanState::new(
-            "post-budget-truncated-literal.pkl".to_string(),
-            &payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-truncated-literal.pkl", &payload, &options);
 
         assert!(
             !scan.findings.iter().any(|finding| {
@@ -12617,17 +11704,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-prememo-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             let finding = scan
                 .findings
@@ -12675,17 +11756,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(&tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-prememo-mixed-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             let finding = scan
                 .findings
@@ -12711,17 +11786,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-interleaved-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert!(
                 scan.findings.iter().any(|finding| {
@@ -12739,17 +11808,11 @@ mod tests {
     fn post_budget_tail_treats_tuple_wrapped_stack_global_operands_as_malformed() {
         let options = post_budget_prememo_options();
         let payload = pre_memoized_post_budget_stack_global_payload(b"h\x00h\x01\x86\x93)R.");
-        let mut scan = ScanState::new(
-            "post-budget-tuple-wrapped-stack-global.pkl".to_string(),
+        let scan = run_test_scan(
+            "post-budget-tuple-wrapped-stack-global.pkl",
             &payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert!(
             !scan.findings.iter().any(|finding| {
@@ -12769,24 +11832,14 @@ mod tests {
 
     fn assert_post_budget_subprocess_run_finding(payload: &[u8], label: &str) {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
-        let mut scan = ScanState::new(
+        let scan = run_test_scan(
             format!("post-budget-tail-local-{label}.pkl"),
             payload,
             &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
         );
-
-        scan.run();
 
         assert!(
             scan.findings.iter().any(|finding| {
@@ -12858,17 +11911,11 @@ mod tests {
 
         for (label, tail) in variants {
             let payload = pre_memoized_post_budget_stack_global_payload(tail);
-            let mut scan = ScanState::new(
+            let scan = run_test_scan(
                 format!("post-budget-prememo-{label}.pkl"),
                 &payload,
                 &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
             );
-
-            scan.run();
 
             assert!(
                 scan.findings.iter().any(|finding| {
@@ -12939,41 +11986,19 @@ mod tests {
     #[test]
     fn post_budget_tail_detects_inst_and_extension_refs() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 2,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
 
         let inst_payload = b"\x80\x04\x88\x88(isubprocess\nrun\n.".to_vec();
-        let mut inst_scan = ScanState::new(
-            "post-budget-inst.pkl".to_string(),
-            &inst_payload,
-            &options,
-            Some(inst_payload.len()),
-            0,
-            0,
-            None,
-        );
-        inst_scan.run();
+        let inst_scan = run_test_scan("post-budget-inst.pkl", &inst_payload, &options);
         assert!(inst_scan.findings.iter().any(|finding| {
             finding.rule_code == Some("POST_BUDGET_GLOBAL")
                 && detail_string(&finding.details, "pattern").as_deref() == Some("subprocess\nrun")
         }));
 
         let ext_payload = b"\x80\x04\x88\x88\x82\x07R.".to_vec();
-        let mut ext_scan = ScanState::new(
-            "post-budget-ext.pkl".to_string(),
-            &ext_payload,
-            &options,
-            Some(ext_payload.len()),
-            0,
-            0,
-            None,
-        );
-        ext_scan.run();
+        let ext_scan = run_test_scan("post-budget-ext.pkl", &ext_payload, &options);
         let finding = ext_scan
             .findings
             .iter()
@@ -12989,25 +12014,11 @@ mod tests {
     #[test]
     fn post_budget_tail_promotes_reduce_proximate_globals_to_critical() {
         let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 1,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04cos\npopen\n)R.";
-        let mut scan = ScanState::new(
-            "post-budget-critical.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-
-        scan.run();
+        let scan = run_test_scan("post-budget-critical.pkl", payload, &options);
 
         let finding = scan
             .findings
@@ -13025,11 +12036,7 @@ mod tests {
     fn timeout_limit_still_scans_post_budget_tail() {
         let options = ScanOptions {
             timeout_s: 0.001,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         };
         let payload = b"\x80\x04csubprocess\nrun\n)R.";
         let mut scan = ScanState::new(

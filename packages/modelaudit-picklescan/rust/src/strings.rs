@@ -1698,93 +1698,119 @@ fn is_python_word_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
 
+    #[track_caller]
+    fn assert_string_match(literal: &str, pattern: &str) {
+        let matches = suspicious_string_matches(literal);
+        assert!(
+            matches.contains(&pattern.to_string()),
+            "{literal:?}: expected {pattern:?} in {matches:?}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_no_string_matches(literals: &[&str]) {
+        for &literal in literals {
+            let matches = suspicious_string_matches(literal);
+            assert!(
+                matches.is_empty(),
+                "{literal:?}: unexpected matches {matches:?}"
+            );
+        }
+    }
+
     #[test]
     fn suspicious_string_matching_keeps_magic_method_boundaries() {
-        assert!(suspicious_string_matches("__reduce__").contains(&"magic method".to_string()));
-        assert!(
-            suspicious_string_matches("__getnewargs_ex__").contains(&"magic method".to_string())
-        );
-        assert!(suspicious_string_matches("__abs__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__add__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__aiter__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__and__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__anext__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__bool__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__bytes__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ceil__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__contains__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__del__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__delitem__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__enter__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__eq__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__exit__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__floor__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__format__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__fspath__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ge__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__getitem__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__gt__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__hash__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__iadd__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__iand__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ilshift__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__imatmul__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__imod__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__imul__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__index__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__invert__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ior__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ipow__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__irshift__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__iter__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__isub__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__itruediv__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ixor__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__le__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__len__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__length_hint__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__lshift__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__lt__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__matmul__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__mod__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__mul__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ne__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__neg__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__next__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__or__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__pos__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__pow__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__radd__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rand__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rlshift__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rmatmul__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rmod__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rmul__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__ror__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rpow__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__repr__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__reversed__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__round__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rshift__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rrshift__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rsub__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rtruediv__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__rxor__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__setitem__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__set_name__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__str__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__sub__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__trunc__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__truediv__").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__xor__").contains(&"magic method".to_string()));
-        assert!(!suspicious_string_matches("__1__").contains(&"magic method".to_string()));
-        assert!(!suspicious_string_matches("__a__").contains(&"magic method".to_string()));
-        assert!(!suspicious_string_matches("__x_y__").contains(&"magic method".to_string()));
-        assert!(!suspicious_string_matches("a__b__c").contains(&"magic method".to_string()));
-        assert!(suspicious_string_matches("__version__").is_empty());
-        assert!(suspicious_string_matches("__dict__").is_empty());
-        assert!(suspicious_string_matches("['__slots__', '__module__']").is_empty());
-        assert!(suspicious_string_matches("['__version__']").is_empty());
+        for literal in [
+            "__reduce__",
+            "__getnewargs_ex__",
+            "__abs__",
+            "__add__",
+            "__aiter__",
+            "__and__",
+            "__anext__",
+            "__bool__",
+            "__bytes__",
+            "__ceil__",
+            "__contains__",
+            "__del__",
+            "__delitem__",
+            "__enter__",
+            "__eq__",
+            "__exit__",
+            "__floor__",
+            "__format__",
+            "__fspath__",
+            "__ge__",
+            "__getitem__",
+            "__gt__",
+            "__hash__",
+            "__iadd__",
+            "__iand__",
+            "__ilshift__",
+            "__imatmul__",
+            "__imod__",
+            "__imul__",
+            "__index__",
+            "__invert__",
+            "__ior__",
+            "__ipow__",
+            "__irshift__",
+            "__iter__",
+            "__isub__",
+            "__itruediv__",
+            "__ixor__",
+            "__le__",
+            "__len__",
+            "__length_hint__",
+            "__lshift__",
+            "__lt__",
+            "__matmul__",
+            "__mod__",
+            "__mul__",
+            "__ne__",
+            "__neg__",
+            "__next__",
+            "__or__",
+            "__pos__",
+            "__pow__",
+            "__radd__",
+            "__rand__",
+            "__rlshift__",
+            "__rmatmul__",
+            "__rmod__",
+            "__rmul__",
+            "__ror__",
+            "__rpow__",
+            "__repr__",
+            "__reversed__",
+            "__round__",
+            "__rshift__",
+            "__rrshift__",
+            "__rsub__",
+            "__rtruediv__",
+            "__rxor__",
+            "__setitem__",
+            "__set_name__",
+            "__str__",
+            "__sub__",
+            "__trunc__",
+            "__truediv__",
+            "__xor__",
+        ] {
+            assert_string_match(literal, "magic method");
+        }
+        for literal in ["__1__", "__a__", "__x_y__", "a__b__c"] {
+            assert!(
+                !suspicious_string_matches(literal).contains(&"magic method".to_string()),
+                "{literal:?}"
+            );
+        }
+        assert_no_string_matches(&[
+            "__version__",
+            "__dict__",
+            "['__slots__', '__module__']",
+            "['__version__']",
+        ]);
     }
 
     #[test]
@@ -1808,25 +1834,18 @@ mod tests {
 
     #[test]
     fn suspicious_string_matching_keeps_case_insensitive_patterns() {
-        assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
-        assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
-        assert!(suspicious_string_matches("subprocess.\\\rPopen(['id'])")
-            .contains(&"subprocess call".to_string()));
-        assert!(
-            suspicious_string_matches(&format!("{}os.system('id')", "A".repeat(32)))
-                .contains(&"os.system".to_string())
-        );
-        assert!(
-            suspicious_string_matches(&format!("os.system('id'){}", "B".repeat(32)))
-                .contains(&"os.system".to_string())
-        );
-        assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
+        assert_string_match("OS.System('id')", "os.system");
+        assert_string_match("OS . system('id')", "os.system");
+        assert_string_match("subprocess.\\\rPopen(['id'])", "subprocess call");
+        assert_string_match(&format!("{}os.system('id')", "A".repeat(32)), "os.system");
+        assert_string_match(&format!("os.system('id'){}", "B".repeat(32)), "os.system");
+        assert_string_match("Import OS", "import statement");
     }
 
     #[test]
     fn suspicious_string_matching_keeps_word_boundaries() {
-        assert!(suspicious_string_matches("eval(x)").contains(&"eval(".to_string()));
-        assert!(suspicious_string_matches("os.system('id')").contains(&"os.system".to_string()));
+        assert_string_match("eval(x)", "eval(");
+        assert_string_match("os.system('id')", "os.system");
         assert!(suspicious_string_matches("recompile(x)").is_empty());
         assert!(suspicious_string_matches("foos.system('id')").is_empty());
         assert!(suspicious_string_matches("subprocess_eval_guard").is_empty());
@@ -1834,109 +1853,65 @@ mod tests {
 
     #[test]
     fn suspicious_string_matching_ignores_prose_call_mentions() {
-        assert!(
-            suspicious_string_matches("x=1; Do not call os.system(command) from loaders")
-                .is_empty()
-        );
-        assert!(
-            suspicious_string_matches("Documentation: if os.system(command) is referenced")
-                .is_empty()
-        );
-        assert!(suspicious_string_matches("Use eval() function to compute results").is_empty());
-        assert!(suspicious_string_matches("eval(x + 2) where x is input").is_empty());
-        assert!(suspicious_string_matches("eval(x); exec(y)").contains(&"eval(".to_string()));
-        assert!(suspicious_string_matches("eval(payload)\nfoo()").contains(&"eval(".to_string()));
-        assert!(suspicious_string_matches("eval(payload)\nos.system('id')")
-            .contains(&"eval(".to_string()));
-        assert!(suspicious_string_matches("eval(payload)\ncallbacks[0]()")
-            .contains(&"eval(".to_string()));
-        assert!(suspicious_string_matches("eval(payload)\nawait callback()")
-            .contains(&"eval(".to_string()));
-        assert!(
-            suspicious_string_matches("eval(payload)\nawait (callback())")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\nawait callbacks[0]()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\nreturn callback()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\nraise RuntimeError()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\nyield from callbacks[0]()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\n回调[0]()").contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\nregistry['handler]'].run()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\ncallbacks[lookup(0)]()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\ncallbacks[{'key': [0]}['key'][0]]()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(suspicious_string_matches(
-            "eval(payload)\ncallbacks[ # ] closes only in comment\n0\n]()"
-        )
-        .contains(&"eval(".to_string()));
-        assert!(
-            suspicious_string_matches("eval(payload)\na\u{301}()").contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\ncallbacks[\n0\n]()")
-                .contains(&"eval(".to_string())
-        );
-        assert!(
-            suspicious_string_matches("eval(payload)\nfoo \\\n()").contains(&"eval(".to_string())
-        );
-        assert!(suspicious_string_matches("eval(payload)\nfoo \\\r\n.bar()")
-            .contains(&"eval(".to_string()));
-        assert!(suspicious_string_matches("eval(x)\nwhere x is input").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nexample\n(text)").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nexample.\ntext()").is_empty());
-        assert!(suspicious_string_matches("eval(x)\ncallbacks[0] is documented").is_empty());
-        assert!(suspicious_string_matches("eval(x)\ncallbacks[0]\n(text)").is_empty());
-        assert!(suspicious_string_matches("eval(x)\ncallbacks[0").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nresult == expected").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nresult: documented prose").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nawaiting callback completion").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nreturning value documentation").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nreturn value documentation").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nfor example, continue reading").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nif needed, continue reading").is_empty());
-        assert!(suspicious_string_matches("eval(x)\nNote (details follow)").is_empty());
-        assert!(
-            suspicious_string_matches("eval(x)\nR\u{e9}sum\u{e9}\u{2014}details follow").is_empty()
-        );
+        assert_no_string_matches(&[
+            "x=1; Do not call os.system(command) from loaders",
+            "Documentation: if os.system(command) is referenced",
+            "Use eval() function to compute results",
+            "eval(x + 2) where x is input",
+        ]);
+        for literal in [
+            "eval(x); exec(y)",
+            "eval(payload)\nfoo()",
+            "eval(payload)\nos.system('id')",
+            "eval(payload)\ncallbacks[0]()",
+            "eval(payload)\nawait callback()",
+            "eval(payload)\nawait (callback())",
+            "eval(payload)\nawait callbacks[0]()",
+            "eval(payload)\nreturn callback()",
+            "eval(payload)\nraise RuntimeError()",
+            "eval(payload)\nyield from callbacks[0]()",
+            "eval(payload)\n回调[0]()",
+            "eval(payload)\nregistry['handler]'].run()",
+            "eval(payload)\ncallbacks[lookup(0)]()",
+            "eval(payload)\ncallbacks[{'key': [0]}['key'][0]]()",
+            "eval(payload)\ncallbacks[ # ] closes only in comment\n0\n]()",
+            "eval(payload)\na\u{301}()",
+            "eval(payload)\ncallbacks[\n0\n]()",
+            "eval(payload)\nfoo \\\n()",
+            "eval(payload)\nfoo \\\r\n.bar()",
+        ] {
+            assert_string_match(literal, "eval(");
+        }
+        assert_no_string_matches(&[
+            "eval(x)\nwhere x is input",
+            "eval(x)\nexample\n(text)",
+            "eval(x)\nexample.\ntext()",
+            "eval(x)\ncallbacks[0] is documented",
+            "eval(x)\ncallbacks[0]\n(text)",
+            "eval(x)\ncallbacks[0",
+            "eval(x)\nresult == expected",
+            "eval(x)\nresult: documented prose",
+            "eval(x)\nawaiting callback completion",
+            "eval(x)\nreturning value documentation",
+            "eval(x)\nreturn value documentation",
+            "eval(x)\nfor example, continue reading",
+            "eval(x)\nif needed, continue reading",
+            "eval(x)\nNote (details follow)",
+            "eval(x)\nR\u{e9}sum\u{e9}\u{2014}details follow",
+        ]);
         let overlong_identifier = "a".repeat(2 * 1024 * 1024);
         assert!(suffix_starts_with_call_expression(
             &overlong_identifier,
             false
         ));
-        assert!(
-            suspicious_string_matches("Do not call os.system(command) from loaders").is_empty()
-        );
-        assert!(
-            suspicious_string_matches("Do not call os.system(command)\nfrom loaders").is_empty()
-        );
-        assert!(suspicious_string_matches("subprocess.run(args) is documented here").is_empty());
-        assert!(suspicious_string_matches("base64.b64decode(data) decodes text").is_empty());
-        assert!(suspicious_string_matches("importlib.import_module(name) is an API").is_empty());
-        assert!(suspicious_string_matches("An import statement loads a module").is_empty());
-        assert!(suspicious_string_matches(r"The bytes are written as \x80 in docs").is_empty());
-        for literal in [
+        assert_no_string_matches(&[
+            "Do not call os.system(command) from loaders",
+            "Do not call os.system(command)\nfrom loaders",
+            "subprocess.run(args) is documented here",
+            "base64.b64decode(data) decodes text",
+            "importlib.import_module(name) is an API",
+            "An import statement loads a module",
+            r"The bytes are written as \x80 in docs",
             "https://example.invalid/os.system",
             "https://example.invalid/docs/os.system(command)",
             "https://example.invalid/api/subprocess.run(args)",
@@ -1946,10 +1921,8 @@ mod tests {
             "https://example.invalid/a'b/os.system(cmd)",
             "s3://bucket/docs/os.system(cmd)",
             "ftp://example.invalid/docs/subprocess.run(args)",
-        ] {
-            assert!(suspicious_string_matches(literal).is_empty(), "{literal}");
-        }
-        assert!(suspicious_string_matches("__reduce__ is a pickle protocol hook").is_empty());
+            "__reduce__ is a pickle protocol hook",
+        ]);
     }
 
     #[test]
@@ -1972,13 +1945,13 @@ mod tests {
             ("作者r'https://a;eval(x); payload='end'", "eval("),
             ("x=1# \"\"\"\nu='https://a';eval(x)\ny=2# \"\"\"", "eval("),
         ] {
-            assert!(suspicious_string_matches(literal).contains(&pattern.to_string()));
+            assert_string_match(literal, pattern);
         }
         let bounded_quote_run = format!(
             "{}https://a',os.system('id')",
             "'".repeat(MAX_URL_LOCAL_PREFIX_BYTES + 1)
         );
-        assert!(suspicious_string_matches(&bounded_quote_run).contains(&"os.system".to_string()));
+        assert_string_match(&bounded_quote_run, "os.system");
     }
 
     fn scan_two_overlapping_windows(value: &str) -> Vec<String> {
@@ -2067,10 +2040,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn window_continuation_captures_prefixed_quote_starting_at_overlap_boundary() {
+    #[track_caller]
+    fn assert_prefixed_quote_boundaries(prefixes: &[&str], expect_system_call: bool) {
         const BOUNDARY: usize = 64;
-        for prefix in ["f", "F", "fr", "Fr", "fR", "rf", "rF", "RF"] {
+        for &prefix in prefixes {
             for quote in ["'", "\"", "'''", "\"\"\""] {
                 let before_quote = format!("{} {prefix}", "A".repeat(BOUNDARY - prefix.len() - 1));
                 let literal = format!(
@@ -2081,8 +2054,9 @@ mod tests {
                     let matches =
                         scan_windows_split_inside_lexical_unit(&literal, boundary, BOUNDARY + 32);
 
-                    assert!(
+                    assert_eq!(
                         matches.contains(&"os.system".to_string()),
+                        expect_system_call,
                         "prefix={prefix:?} quote={quote:?} boundary={boundary} matches={matches:?}",
                     );
                 }
@@ -2091,28 +2065,18 @@ mod tests {
     }
 
     #[test]
-    fn window_continuation_keeps_nonformatted_prefixed_url_payload_inert() {
-        const BOUNDARY: usize = 64;
-        for prefix in [
-            "r", "R", "b", "B", "u", "U", "br", "Br", "bR", "rb", "rB", "RB",
-        ] {
-            for quote in ["'", "\"", "'''", "\"\"\""] {
-                let before_quote = format!("{} {prefix}", "A".repeat(BOUNDARY - prefix.len() - 1));
-                let literal = format!(
-                    "{before_quote}{quote}{}https://example.invalid/x{{os.system(cmd)}}{quote}",
-                    "B".repeat(128),
-                );
-                for boundary in BOUNDARY..BOUNDARY + quote.len() {
-                    let matches =
-                        scan_windows_split_inside_lexical_unit(&literal, boundary, BOUNDARY + 32);
+    fn window_continuation_captures_prefixed_quote_starting_at_overlap_boundary() {
+        assert_prefixed_quote_boundaries(&["f", "F", "fr", "Fr", "fR", "rf", "rF", "RF"], true);
+    }
 
-                    assert!(
-                        !matches.contains(&"os.system".to_string()),
-                        "prefix={prefix:?} quote={quote:?} boundary={boundary} matches={matches:?}",
-                    );
-                }
-            }
-        }
+    #[test]
+    fn window_continuation_keeps_nonformatted_prefixed_url_payload_inert() {
+        assert_prefixed_quote_boundaries(
+            &[
+                "r", "R", "b", "B", "u", "U", "br", "Br", "bR", "rb", "rB", "RB",
+            ],
+            false,
+        );
     }
 
     #[test]
@@ -2453,7 +2417,7 @@ mod tests {
             "https://example.invalid/a;{}eval(x)",
             " ".repeat(MAX_SUFFIX_CALL_LOOKAHEAD_CHARS - 2)
         );
-        assert!(suspicious_string_matches(&padded_call).contains(&"eval(".to_string()));
+        assert_string_match(&padded_call, "eval(");
 
         let bounded_identifier = format!(
             "https://example.invalid/a;{}(x)",
@@ -2479,22 +2443,20 @@ mod tests {
 
     #[test]
     fn suspicious_string_matching_detects_pickle_loader_literals() {
-        assert!(suspicious_string_matches("joblib.load(path)")
-            .contains(&"pickle loader call".to_string()));
-        assert!(suspicious_string_matches("cloudpickle.loads(blob)")
-            .contains(&"pickle loader call".to_string()));
-        assert!(
-            suspicious_string_matches("copyreg.add_extension(module, name, code)")
-                .contains(&"copyreg extension".to_string())
+        assert_string_match("joblib.load(path)", "pickle loader call");
+        assert_string_match("cloudpickle.loads(blob)", "pickle loader call");
+        assert_string_match(
+            "copyreg.add_extension(module, name, code)",
+            "copyreg extension",
         );
     }
 
     #[test]
     fn suspicious_string_matching_ignores_importlib_comment_text() {
         assert!(suspicious_string_matches("importlib # harmless").is_empty());
-        assert!(
-            suspicious_string_matches("import importlib; importlib.import_module('os')")
-                .contains(&"importlib".to_string())
+        assert_string_match(
+            "import importlib; importlib.import_module('os')",
+            "importlib",
         );
     }
 
@@ -2503,14 +2465,14 @@ mod tests {
         let matches = suspicious_string_matches("b3Muc3lzdGVtKCdpZCcp");
 
         assert!(matches.contains(&"base64 os.system".to_string()));
-        assert!(suspicious_string_matches("ZXZhbCh4KQ==").contains(&"base64 eval(".to_string()));
+        assert_string_match("ZXZhbCh4KQ==", "base64 eval(");
         assert!(
             suspicious_string_matches("https://example.invalid/path?q=b3Muc3lzdGVtKCdpZCcp")
                 .is_empty()
         );
-        assert!(suspicious_string_matches(
-            "loader=b3Muc3lzdGVtKCdpZCcp; docs=https://example.invalid/path"
-        )
-        .contains(&"base64 os.system".to_string()));
+        assert_string_match(
+            "loader=b3Muc3lzdGVtKCdpZCcp; docs=https://example.invalid/path",
+            "base64 os.system",
+        );
     }
 }
