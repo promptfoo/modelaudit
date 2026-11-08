@@ -27,6 +27,7 @@ from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclus
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
+from modelaudit.scanners.text_scanner_support.model_card_policy import model_card_policy_evidence
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
@@ -226,7 +227,11 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
-DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
+DOCUMENTATION_CODE_CALL_PATTERN = re.compile(
+    rb"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$"
+)
+DOCUMENTATION_LINKED_BLOCKQUOTE = re.compile(rb"(?m)^ {0,3}>[ \t]+[^#\r\n\"'`]*?\]\(https?://[^()\s#\"'`]+\)[^\r\n]*$")
+DOCUMENTATION_ISSUE_LABEL_HASH = re.compile(rb"\[#(?=\d+\]\(https?://[^()\s]+\))")
 DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
 DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
 DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
@@ -1136,6 +1141,12 @@ class TextScanner(BaseScanner):
                 raise _DocumentationCallBudgetExceeded
             _DOCUMENTATION_CALL_BUDGET.set(budget - len(prefix))
         source = prefix.strip()
+        if b"[#" in source:
+            # A numbered issue label in linked blockquote prose is not a Python comment.
+            # Keep real comments intact when the preceding text could be Python.
+            source = DOCUMENTATION_LINKED_BLOCKQUOTE.sub(
+                lambda line: DOCUMENTATION_ISSUE_LABEL_HASH.sub(b"[", line[0]), source
+            )
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
@@ -2581,6 +2592,7 @@ class TextScanner(BaseScanner):
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
         routine_spans: tuple[tuple[int, int], ...] = (),
+        prohibited_terms: frozenset[int] = frozenset(),
     ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
         token_bytes_options = cls._documentation_finding_tokens(finding, routine_spans)
@@ -2632,7 +2644,9 @@ class TextScanner(BaseScanner):
             elif finding_type == "suspicious_port":
                 actionable = cls._documentation_finding_is_actionable(payload, candidate)
             else:
-                actionable = not cls._documentation_cc_finding_is_benign_prose(payload, candidate)
+                actionable = position not in prohibited_terms and not cls._documentation_cc_finding_is_benign_prose(
+                    payload, candidate
+                )
             if actionable:
                 candidate.pop("snippet", None)
                 return candidate, False, remaining_occurrences
@@ -3793,13 +3807,20 @@ class TextScanner(BaseScanner):
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         filename = os.path.basename(path).lower()
-        routine_network_spans = (
-            tuple(sorted(routine_documentation_network_spans(payload, payload_complete=payload_complete)))
-            if findings
+        routine_network_spans: tuple[tuple[int, int], ...] = ()
+        prohibited_terms: frozenset[int] = frozenset()
+        if (
+            findings
             and os.path.splitext(filename)[1] in {"", ".md", ".markdown"}
             and (cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename))
-            else ()
-        )
+        ):
+            examples = routine_documentation_network_spans(payload, payload_complete=payload_complete)
+            if payload_complete:
+                references, prohibited_terms = model_card_policy_evidence(
+                    payload, DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN
+                )
+                examples = (*examples, *references)
+            routine_network_spans = tuple(sorted(examples))
         documentation_image_example_spans = (
             official_readme_urlopen_image_example_spans(payload)
             if allow_documentation_image_examples and documentation_sidecar and findings
@@ -3826,6 +3847,7 @@ class TextScanner(BaseScanner):
                         remaining_occurrences,
                         index == last_retargetable_index,
                         routine_network_spans,
+                        prohibited_terms,
                     )
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True
@@ -3862,6 +3884,7 @@ class TextScanner(BaseScanner):
             try:
                 if not retarget_incomplete and (
                     routine_example
+                    or (finding.get("type") == "cc_pattern" and position in prohibited_terms)
                     or cls._sidecar_network_finding_is_informational(
                         path,
                         payload,

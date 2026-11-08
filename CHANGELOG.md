@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Attribute README and model-card network findings to their documentation source. Recognize SQL comparison literals, unlabelled Python client examples, and common maintenance and security-classifier prose.
+- Attribute README and model-card network findings to their documentation source. Recognize passive SQL comparisons, local client examples, maintenance and classifier terminology, usage restrictions, and contact details. Preserve alerts for active uses.
 - Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
 - Report completed scans as successful in the Python API even when a security check raises a warning.
