@@ -4,6 +4,7 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import sys
 import time
@@ -1277,6 +1278,73 @@ def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidenc
         for check in checks
     )
     assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def test_gguf_oversized_chat_template_ignores_inert_injection_examples(tmp_path: Path) -> None:
+    template = (
+        "{% macro format_message(message) %}{{ message }}{% endmacro %}"
+        "{% set instructions %}Follow these commands. Use the standard format (brief answer).{% endset %}"
+        "{{ instructions }}{{ 'This output mentions commands. and format (short).' }}"
+        "{% raw %}{{ format (example) }}{% endraw %}"
+        "{# {{ commands. example }} #}"
+    )
+    path = create_mock_gguf(tmp_path / "instructions.gguf", metadata={"tokenizer.chat_template": template})
+
+    direct = GgufScanner(config={"max_template_size": 64}).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, max_template_size=64)
+
+    assert _failed_metadata_value_checks(direct) == []
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
+
+
+@pytest.mark.parametrize(
+    ("payload", "pattern", "match"),
+    [
+        ("{{ commands.getoutput(command) }}", "critical_injection", "commands."),
+        ("{% macro format_message(x=requests.get(url)) %}{{ x }}{% endmacro %}", "critical_injection", "requests."),
+        ("{{ {'a': {'b': 1}} and os.system(command) }}", "critical_injection", "os.system("),
+        ("{{ commands. handler(value) }}", "critical_injection", "commands."),
+        ("{{ format (value) }}", "obfuscation", "format ("),
+        ("{% set key %}{{ \"{{ '{0[secret]}'. format (data) }}\" }}{% endset %}", "obfuscation", "format ("),
+        (
+            "{% set code %}{% raw %}{{ format (x) }}{% endraw %}{% endset %}{{ env.from_string(code) }}",
+            "obfuscation",
+            "format (",
+        ),
+        ("{% set source %}{{ 'commands.getoutput(x)' }}{% endset %}", "critical_injection", "commands."),
+        (
+            "{% set key %}__class__.__mro__{% endset %}{{ data|map(attribute=key) }}",
+            "object_traversal",
+            "__class__.__mro__",
+        ),
+        (r"{{ obj[prefix ~ '\x5fclass__'] }}", "obfuscation", r"\x5f"),
+        (
+            "{% set code = '{{ os.system(cmd) }}' %}{{ env.from_string(code).render() }}",
+            "critical_injection",
+            "os.system(",
+        ),
+        ("{{ things|map(attribute='__class__.__mro__') }}", "object_traversal", "__class__.__mro__"),
+        ("{{ env.from_string('{{ os.system(cmd) }}').render() }}", "critical_injection", "os.system("),
+        ("{{ ''['__class__'] }}", "obfuscation", "['__class__']"),
+        ("{{ obj['__class__'] }}", "obfuscation", "['__class__']"),
+        (r"{{ obj | attr('\x5f\x5fclass\x5f\x5f') }}", "obfuscation", r"\x5f"),
+    ],
+)
+def test_gguf_oversized_chat_template_reports_late_executable_evidence(
+    tmp_path: Path, payload: str, pattern: str, match: str
+) -> None:
+    prefix = "π" * 190_000 + "Quoted instructions. {# harmless comment #}"
+    path = create_mock_gguf(tmp_path / "late.gguf", metadata={"tokenizer.chat_template": prefix + payload})
+
+    result = GgufScanner().scan(str(path))
+
+    [check] = _failed_metadata_value_checks(result)
+    assert check.details["pattern"] == f"jinja2_{pattern}"
+    assert check.details["match_offset"] == len(prefix) + payload.index(match)
+    assert re.match(check.details["matched_pattern"], match, re.IGNORECASE)
+    assert result.success is False
+    assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
 
 def test_gguf_scanner_propagates_jinja_sandbox_budget_inconclusive(tmp_path: Path) -> None:
