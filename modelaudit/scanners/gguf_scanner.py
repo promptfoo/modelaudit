@@ -246,11 +246,15 @@ _GGUF_DOCUMENTATION_URL_HOSTS = frozenset({"hf.co", "huggingface.co", "www.huggi
 _GGUF_SHELL_IFS_PATTERN = re.compile(r"(?i)\$\{ifs(?:[^}]*)?\}|\$ifs\b")
 _GGUF_SHELL_VARIABLE_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
-_GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = tuple(JINJA2_SSTI_PATTERNS)
-_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (pattern_type, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
-    for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
-    for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
+_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS = tuple(
+    (category, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
+    for category, patterns in JINJA2_SSTI_PATTERNS.items()
+    for pattern in patterns
+    if pattern != r"{% macro .+ %}"  # Declaring a chat formatter is routine. Its default arguments and body still run.
+)
+_GGUF_JINJA_QUOTE = re.compile("""['"]""")
+_GGUF_JINJA_SELECTOR = re.compile(
+    r"""(?:[\w)}\]'"]\s*\[\s*|\b(?:attr|selectattr|rejectattr|groupby|from_string|render_template_string)\s*\(\s*|\battribute\s*=\s*)\Z"""
 )
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
@@ -2382,12 +2386,48 @@ class GgufScanner(BaseScanner):
             return "network_api"
         return None
 
-    @classmethod
-    def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
-        for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-            if pattern.search(value):
-                return [{"evidence_type": "template_injection", "pattern": f"jinja2_{pattern_type}"}]
-        return []
+    @staticmethod
+    def _oversized_chat_template_security_evidence(value: str) -> list[dict[str, Any]]:
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+
+        evidence: list[dict[str, Any]] = []
+        best = len(_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS)
+        for start, end in Jinja2TemplateScanner.iter_executable_tag_bounds(value):
+            tag = value[start:end]
+            # Keep literal arguments used to resolve attributes or compile templates.
+            # Blanking output strings preserves character offsets for the finding.
+            parts: list[str] = []
+            cursor = 0
+            while quote := _GGUF_JINJA_QUOTE.search(tag, cursor):
+                before = tag[cursor : quote.start()]
+                literal_end = Jinja2TemplateScanner.quoted_string_end(tag, quote.start())
+                literal = tag[quote.start() : literal_end]
+                parts.append(before)
+                if _GGUF_JINJA_SELECTOR.search(tag, max(0, cursor - 1), quote.start()):
+                    parts.append(literal)
+                elif len(literal) > 1:
+                    parts.append(literal[0] + " " * (len(literal) - 2) + literal[-1])
+                else:
+                    parts.append(literal)
+                cursor = literal_end
+            code = "".join((*parts, tag[cursor:])) if parts else tag
+            for index, (category, pattern) in enumerate(_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS):
+                if index >= best:
+                    break
+                if match := pattern.search(code):
+                    evidence = [
+                        {
+                            "evidence_type": "template_injection",
+                            "pattern": f"jinja2_{category}",
+                            "matched_pattern": pattern.pattern,
+                            "match_offset": start + match.start(),
+                        }
+                    ]
+                    best = index
+                    if category == "critical_injection":
+                        return evidence
+                    break
+        return evidence
 
     @classmethod
     def _metadata_value_has_only_benign_documentation_urls(cls, key: str, value: str) -> bool:
@@ -2419,7 +2459,7 @@ class GgufScanner(BaseScanner):
         value: str,
         *,
         max_template_size: int = _GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if cls._metadata_value_looks_like_documentation(key, value):
             return []
         if cls._metadata_value_has_only_benign_documentation_urls(key, value):
