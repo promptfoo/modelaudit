@@ -9,6 +9,7 @@ Tests cover various XGBoost model formats and security vulnerabilities:
 - Integration with pickle scanner for .pkl/.joblib files
 """
 
+import base64
 import copy
 import gzip
 import io
@@ -1955,6 +1956,42 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(result) == 2
         _assert_inconclusive_metadata(result, binary_file, "xgboost_read_failed")
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def test_sentencepiece_with_many_user_defined_symbols(self, tmp_path: Path) -> None:
+        tokenizer = tmp_path / "tokenizer.model"
+        symbols = b"".join(_proto_field(31, 2, b"\x04" + f"{i:04x}".encode("ascii")) for i in range(1200))
+        payload = _sentencepiece_model_proto() + _sentencepiece_trainer_spec(vocab_size=100, extra_fields=symbols)
+        tokenizer.write_bytes(payload)
+
+        assert file_detection.is_sentencepiece_model_proto_file(tokenizer)
+        direct = scan_file(str(tokenizer), config={"cache_enabled": False})
+        assert direct.success
+        assert direct.scanner_name == "unknown"
+
+        tokenizer.write_bytes(payload + _unknown_sentencepiece_field(_small_zip_payload()))
+        assert not file_detection.is_sentencepiece_model_proto_file(tokenizer)
+        assert XGBoostScanner.can_handle(str(tokenizer))
+
+    def test_tiktoken_vocab_requires_complete_rank_table(self, tmp_path: Path) -> None:
+        tokenizer = tmp_path / "tokenizer.model"
+        byte_tokens = list(range(33, 256)) + list(range(33))
+        rows = [base64.b64encode(bytes([value])) + f" {rank}\n".encode() for rank, value in enumerate(byte_tokens)]
+        vocab = rows[0] + b"".join(reversed(rows[1:]))
+        tokenizer.write_bytes(vocab)
+        assert not XGBoostScanner.can_handle(str(tokenizer))
+        direct = scan_file(str(tokenizer), config={"cache_enabled": False})
+        assert direct.success
+        assert direct.scanner_name == "unknown"
+
+        for malformed in (vocab + b"cos\nsystem\n.", b"".join(rows[:-1]), vocab + b"IQ== 256\n", vocab + b"YWI= 0\n"):
+            tokenizer.write_bytes(malformed)
+            assert XGBoostScanner.can_handle(str(tokenizer))
+
+        # The first two rows also name a module and global to Python's unpickler.
+        colliding_row = rows.pop(byte_tokens.index(ord("p")))
+        tokenizer.write_bytes(colliding_row + b"".join(rows))
+        assert XGBoostScanner.can_handle(str(tokenizer))
+        assert not scan_file(str(tokenizer), config={"cache_enabled": False}).success
 
     def test_sentencepiece_tokenizer_model_core_is_not_xgboost_false_positive(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"

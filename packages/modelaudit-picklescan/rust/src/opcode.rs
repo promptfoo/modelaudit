@@ -72,6 +72,12 @@ pub(crate) struct ParsedOpcode {
     pub(crate) next: usize,
 }
 
+impl ParsedOpcode {
+    pub(crate) fn has_invalid_persistent_id(&self) -> bool {
+        self.name == "PERSID" && matches!(&self.arg, ArgValue::Text(id) if !id.is_ascii())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ParseError {
     pub(crate) message: String,
