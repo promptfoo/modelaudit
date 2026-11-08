@@ -174,6 +174,9 @@ pip install "modelaudit[all,tensorflow]"
 docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
+The lightweight Docker image runs on Python 3.14 and ships the scanner without pip or ensurepip.
+The full image uses Python 3.13 for stable TensorFlow CPU wheels.
+
 The ONNX extra, including the ONNX portion of `modelaudit[all]`, is packaged for Python 3.10-3.12.
 PyTorch-containing extras require Python 3.10-3.12 or standard (GIL-enabled) CPython 3.13-3.14. Free-threaded CPython
 3.13t/3.14t is not supported by ModelAudit's native pickle scanner. On Apple Silicon, PyTorch-containing extras require

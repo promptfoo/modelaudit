@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Report completed scans as successful in the Python API even when a security check raises a warning.
-- Upgrade APT packages in all Docker runtime images to include Debian security fixes.
+- Run the lightweight Docker image on Python 3.14, with pip confined to the build stage. The full image stays on Python 3.13 for TensorFlow compatibility.
+- Upgrade APT and zlib packages in all Docker runtime images to include Debian security fixes.
 - Distinguish reshape dimensions from activation data when tracing both inputs of an ONNX attention contraction. Dynamically transformed weights retain their coverage gaps.
 
 - Preserve individual pickle coverage notices and member locations in consolidated scan results.

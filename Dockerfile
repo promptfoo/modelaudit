@@ -35,9 +35,14 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade \
         apt bsdutils gzip libapt-pkg7.0 libc-bin libc6 libblkid1 libcap2 liblastlog2-2 libmount1 libpcre2-8-0 libsmartcols1 libsqlite3-0 \
-        libssl3t64 libsystemd0 libudev1 libuuid1 login mount perl-base util-linux \
+        libssl3t64 libsystemd0 libudev1 libuuid1 login mount perl-base util-linux zlib1g \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# The scanner runs from the builder's installed wheels. Keep the installer and
+# its bundled bootstrap wheel out of the lightweight runtime.
+RUN python -m pip uninstall --yes pip \
+    && rm -rf /usr/local/lib/python*/ensurepip
 
 COPY --from=builder /install /usr/local
 
