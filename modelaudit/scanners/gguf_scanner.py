@@ -256,8 +256,9 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS = tuple(
 # Keep unambiguous member references and calls even in captured text or quoted source.
 _GGUF_TEMPLATE_PROSE_PATTERNS = {
     r"commands\.": re.compile(r"commands\.(?=\w|\s*(?:getoutput|getstatusoutput|getstatus|mkarg|mk2arg)\b)", re.I),
-    r"format\s*\(": re.compile(r"format\(|(?<=[.|])format\s*\(", re.I),
+    r"format\s*\(": re.compile(r"format\(|[.|]\s*format\s*\(", re.I),
 }
+_GGUF_TEMPLATE_COMPILER = re.compile(r"\b(?:from_string|render_template_string|compile_expression)\b")
 _GGUF_LITERAL_OUTPUT_START = re.compile(r"""{{[-+]?\s*(?=['"])""")
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
@@ -2398,11 +2399,15 @@ class GgufScanner(BaseScanner):
             if match is None:
                 continue
 
-            if stronger := _GGUF_TEMPLATE_PROSE_PATTERNS.get(pattern.pattern):
+            stronger = _GGUF_TEMPLATE_PROSE_PATTERNS.get(pattern.pattern)
+            # Captured text can be compiled again, including through an aliased method.
+            if stronger is not None and not _GGUF_TEMPLATE_COMPILER.search(value):
                 # Preserve the broad signature in executable expressions, where whitespace
                 # after a dot or before a call is legal. A lone quoted string is output.
-                match = stronger.search(value)
-                if match is None:
+                if strong_match := stronger.search(value):
+                    match = pattern.search(value, strong_match.start(), strong_match.end())
+                else:
+                    match = None
                     for start, end in Jinja2TemplateScanner.iter_executable_tag_bounds(value):
                         match = pattern.search(value, start, end)
                         if match is None:

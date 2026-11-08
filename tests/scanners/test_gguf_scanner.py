@@ -1303,6 +1303,12 @@ def test_gguf_oversized_chat_template_ignores_inert_injection_examples(tmp_path:
         ("{{ {'a': {'b': 1}} and os.system(command) }}", "critical_injection", "os.system("),
         ("{{ commands. handler(value) }}", "critical_injection", "commands."),
         ("{{ format (value) }}", "obfuscation", "format ("),
+        ("{% set key %}{{ \"{{ '{0[secret]}'. format (data) }}\" }}{% endset %}", "obfuscation", "format ("),
+        (
+            "{% set code %}{% raw %}{{ format (x) }}{% endraw %}{% endset %}{{ env.from_string(code) }}",
+            "obfuscation",
+            "format (",
+        ),
         ("{% set source %}{{ 'commands.getoutput(x)' }}{% endset %}", "critical_injection", "commands."),
         (
             "{% set key %}__class__.__mro__{% endset %}{{ data|map(attribute=key) }}",
@@ -1325,7 +1331,7 @@ def test_gguf_oversized_chat_template_ignores_inert_injection_examples(tmp_path:
 def test_gguf_oversized_chat_template_reports_late_executable_evidence(
     tmp_path: Path, payload: str, pattern: str, match: str
 ) -> None:
-    prefix = "π" * 190_000 + "Quoted commands. {{ 'format (abbreviated)' }}{# commands. example #}"
+    prefix = "π" * 190_000 + "Quoted instructions. {# harmless comment #}"
     path = create_mock_gguf(tmp_path / "late.gguf", metadata={"tokenizer.chat_template": prefix + payload})
 
     result = GgufScanner().scan(str(path))
