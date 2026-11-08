@@ -160,6 +160,21 @@ def test_scan_file_uses_open_descriptor_size_after_path_replacement(
     assert report.coverage.bytes_total == len(replacement_payload)
 
 
+def _replace_with_safe_pickle_on_zip_check(monkeypatch: pytest.MonkeyPatch, target: Path, replacement: Path) -> None:
+    replacement.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+    original_is_zipfile = package_api.zipfile.is_zipfile
+
+    def replace_and_check_zipfile(candidate: Any) -> bool:
+        # Windows refuses to replace a file that the scanner holds open; the
+        # scanner keeps reading its original descriptor either way, which is the
+        # property under test.
+        with contextlib.suppress(OSError):
+            replacement.replace(target)
+        return original_is_zipfile(candidate)
+
+    monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_and_check_zipfile)
+
+
 def test_scan_file_keeps_plain_descriptor_after_path_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -168,18 +183,7 @@ def test_scan_file_keeps_plain_descriptor_after_path_replacement(
     replacement_path = tmp_path / "replacement.pkl"
     malicious_payload = pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=4)
     payload_path.write_bytes(malicious_payload)
-    replacement_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
-    original_is_zipfile = package_api.zipfile.is_zipfile
-
-    def replace_and_check_zipfile(candidate: Any) -> bool:
-        # Windows refuses to replace a file that the scanner holds open; the
-        # scanner keeps reading its original descriptor either way, which is the
-        # property under test.
-        with contextlib.suppress(OSError):
-            replacement_path.replace(payload_path)
-        return original_is_zipfile(candidate)
-
-    monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_and_check_zipfile)
+    _replace_with_safe_pickle_on_zip_check(monkeypatch, payload_path, replacement_path)
 
     report = scan_file(payload_path)
 
@@ -200,18 +204,7 @@ def test_scan_file_keeps_zip_descriptor_after_path_replacement(
         archive.writestr("data.pkl", malicious_payload)
         archive.writestr("version", "3\n")
     original_size = archive_path.stat().st_size
-    replacement_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
-    original_is_zipfile = package_api.zipfile.is_zipfile
-
-    def replace_and_check_zipfile(candidate: Any) -> bool:
-        # Windows refuses to replace a file that the scanner holds open; the
-        # scanner keeps reading its original descriptor either way, which is the
-        # property under test.
-        with contextlib.suppress(OSError):
-            replacement_path.replace(archive_path)
-        return original_is_zipfile(candidate)
-
-    monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_and_check_zipfile)
+    _replace_with_safe_pickle_on_zip_check(monkeypatch, archive_path, replacement_path)
 
     report = scan_file(archive_path)
 
