@@ -6459,12 +6459,70 @@ def test_truncated_document_keeps_sql_domain_and_coverage_warning(tmp_path: Path
     assert any("truncated at configured limit" in check.message for check in result.checks)
 
 
-@pytest.mark.parametrize("connector", ["dblink('host=example.net', 'SELECT 1')", "http_get('https://example.net')"])
-def test_documented_sql_like_preserves_repeated_connector_domain(tmp_path: Path, connector: str) -> None:
+@pytest.mark.parametrize("relative_path", ["example.net.csv", "data/example.net"])
+def test_documented_sql_domain_keeps_its_position_before_local_filenames(tmp_path: Path, relative_path: str) -> None:
     path = tmp_path / "README.md"
-    source = (
-        f"~~~sql\nSELECT\n    SUM(CASE WHEN email LIKE '%@example.net%' THEN 1 ELSE 0 END),\n    {connector};\n~~~\n"
+    content = (
+        "~~~sql\nSELECT email LIKE '%@example.net%';\n~~~\n"
+        f"~~~python\npd.read_csv({str(tmp_path / relative_path)!r})\n~~~\n"
+    ).encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("domain") == "example.net"
+        and check.details.get("position") == content.index(b"example.net")
+        and check.severity == IssueSeverity.INFO
+        for check in checks
     )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    ("authority", "host"),
+    [
+        ("api.example.net", "api.example.net"),
+        ("archive-example.net", "archive-example.net"),
+        ("notexample.net", "notexample.net"),
+        ("example.net@other.org", "other.org"),
+    ],
+)
+def test_documented_sql_domain_is_distinct_from_active_hostnames(tmp_path: Path, authority: str, host: str) -> None:
+    path = tmp_path / "README.md"
+    content = (
+        f"~~~sql\nSELECT email LIKE '%@example.net%';\n~~~\n~~~python\nrequests.get('https://{authority}/v1')\n~~~\n"
+    ).encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    observed = {
+        (detail["domain"], detail["position"], check.severity)
+        for check in checks
+        for detail in [check.details, *check.details.get("deduplicated_related_findings", [])]
+        if detail.get("type") == "domain_name"
+    }
+    assert {(offset, severity) for domain, offset, severity in observed if domain == "example.net"} == {
+        (content.index(b"example.net"), IssueSeverity.INFO)
+    }
+    assert any(
+        domain == host
+        and offset == content.rindex(host.encode())
+        and severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for domain, offset, severity in observed
+    )
+
+
+@pytest.mark.parametrize(
+    "use",
+    [
+        "dblink('host=example.net', 'SELECT 1');\n~~~",
+        "http_get('https://example.net');\n~~~",
+        "1;\n~~~\n~~~python\nrequests.get('https://example.net:8443/v1')\n~~~",
+        "1;\n~~~\n~~~python\nrequests.get('https://some@example.net:8443/v1')\n~~~",
+        "1;\n~~~\n~~~python\nfetch(['https://example.net/v1'])\n~~~",
+    ],
+)
+def test_documented_sql_like_preserves_repeated_connector_domain(tmp_path: Path, use: str) -> None:
+    path = tmp_path / "README.md"
+    source = f"~~~sql\nSELECT\n    SUM(CASE WHEN email LIKE '%@example.net%' THEN 1 ELSE 0 END),\n    {use}\n"
     result = _scan_text_content(path, source)
     assert any(
         check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}

@@ -770,6 +770,7 @@ DOCUMENTATION_ACTIONABLE_NETWORK_LABEL_SUFFIX_PATTERN = re.compile(
     rb"\b(?:address|destination|endpoint|host|receiver|server|sink|target|uri|url)\b",
     re.IGNORECASE,
 )
+DOCUMENTATION_URL_PASSWORD_SUFFIX = re.compile(rb":[a-z0-9._~!$&*+,;=:%-]*@")
 GENERIC_CC_BENIGN_TERM_PATTERN = rb"(?:malwares?|backdoors?|trojans?|botnets?|zombies?)"
 BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"(?:"
@@ -2579,6 +2580,35 @@ class TextScanner(BaseScanner):
         return payload.find(token_bytes, start)
 
     @staticmethod
+    def _find_documentation_domain_token(payload: bytes, token_bytes: bytes, start: int) -> int:
+        while (position := payload.find(token_bytes, start)) >= 0:
+            end = position + len(token_bytes)
+            start = end
+            before = payload[max(0, position - 1) : position]
+            after = payload[end : end + 1]
+            if before.isalnum() or before in {b"_", b".", b"-"} or after.isalnum() or after in {b"_", b"-"}:
+                continue
+            # A trailing root dot is valid, but a following DNS label extends the host.
+            if after == b"." and payload[end + 1 : end + 2].isalnum():
+                continue
+            # A DNS-shaped username before a destination is not the host.
+            if after == b"@" or (
+                after == b":"
+                and DOCUMENTATION_URL_PASSWORD_SUFFIX.match(payload, end, end + MAX_TEXT_FINDING_CONTEXT_BYTES)
+            ):
+                continue
+            if before in {b"/", b"\\"}:
+                # A hostname can follow // (including a URL scheme) or a UNC prefix.
+                # A hostname-shaped path component is not the destination.
+                prefix = payload[max(0, position - 3) : position]
+                if not prefix.endswith((b"//", b"\\\\")) or (
+                    len(prefix) == 3 and prefix[:1] not in b": \t\r\n'\"=([{<"
+                ):
+                    continue
+            return position
+        return -1
+
+    @staticmethod
     def _find_documentation_port_token(payload: bytes, token_bytes: bytes, start: int) -> int:
         match = re.compile(re.escape(token_bytes) + rb"(?![0-9])").search(payload, start)
         return match.start() if match is not None else -1
@@ -2610,6 +2640,8 @@ class TextScanner(BaseScanner):
         find_token = cls._find_documentation_token
         if finding_type == "suspicious_port":
             find_token = cls._find_documentation_port_token
+        elif finding_type == "domain_name":
+            find_token = cls._find_documentation_domain_token
         next_positions = {
             token_bytes: find_token(lowered_payload, token_bytes, search_start) for token_bytes in token_bytes_options
         }
