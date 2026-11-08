@@ -37,10 +37,10 @@ from modelaudit.scanners.tar_scanner import (
 from modelaudit.utils.file import detection as file_detection
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import SystemCommandPayload
-from tests.helpers.file_creators import add_tar_bytes as _add_tar_bytes
-from tests.helpers.file_creators import add_tar_link as _add_tar_link
 from tests.helpers.scanners import scan_nested_critical_finding as nested_scan
 from tests.helpers.scanners import scan_nested_unsuccessful
+from tests.helpers.tar import add_tar_bytes as _add_tar_bytes
+from tests.helpers.tar import make_tar_link
 
 
 def _tar_octal_field(value: int, width: int) -> bytes:
@@ -873,12 +873,12 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
-    def test_symlink_outside_extraction_root(self):
+    def test_symlink_outside_extraction_root(self) -> None:
         """Symlinks resolving outside the extraction root should be flagged"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
                 # Create a symlink pointing outside
-                _add_tar_link(t, "link.txt", link_type=tarfile.SYMTYPE, target="../../../etc/passwd")
+                t.addfile(make_tar_link("link.txt", "../../../etc/passwd", tarfile.SYMTYPE))
             tmp_path = tmp.name
 
         try:
@@ -894,7 +894,7 @@ class TestTarScanner:
         """External TAR links must use the dedicated symlink escape rule."""
         archive_path = tmp_path / "external_link.tar"
         with tarfile.open(archive_path, "w") as archive:
-            _add_tar_link(archive, "link.txt", link_type=tarfile.SYMTYPE, target="../../../etc/passwd")
+            archive.addfile(make_tar_link("link.txt", "../../../etc/passwd", tarfile.SYMTYPE))
 
         result = self.scanner.scan(str(archive_path))
 
@@ -919,7 +919,7 @@ class TestTarScanner:
         with tarfile.open(archive_path, "w") as archive:
             _add_tar_bytes(archive, "weights.bin", b"")
 
-            _add_tar_link(archive, "nested/link.bin", link_type=tarfile.SYMTYPE, target="../weights.bin")
+            archive.addfile(make_tar_link("nested/link.bin", "../weights.bin", tarfile.SYMTYPE))
 
         result = self.scanner.scan(str(archive_path))
 
@@ -937,7 +937,7 @@ class TestTarScanner:
         with tarfile.open(archive_path, "w") as archive:
             _add_tar_bytes(archive, "weights.bin", b"")
 
-            _add_tar_link(archive, "nested/link.bin", link_type=tarfile.LNKTYPE, target="weights.bin")
+            archive.addfile(make_tar_link("nested/link.bin", "weights.bin", tarfile.LNKTYPE))
 
         result = self.scanner.scan(str(archive_path))
 
@@ -950,7 +950,7 @@ class TestTarScanner:
         archive_path = tmp_path / "many_safe_links.tar"
         with tarfile.open(archive_path, "w") as archive:
             for index in range(250):
-                _add_tar_link(archive, f"links/link-{index}", link_type=tarfile.SYMTYPE, target="../targets/model.bin")
+                archive.addfile(make_tar_link(f"links/link-{index}", "../targets/model.bin", tarfile.SYMTYPE))
 
         result = self.scanner.scan(str(archive_path))
 
@@ -961,7 +961,7 @@ class TestTarScanner:
         """Suppressing generic structure noise must not suppress TAR hardlink escapes."""
         archive_path = tmp_path / "external_link_suppressed.tar"
         with tarfile.open(archive_path, "w") as archive:
-            _add_tar_link(archive, "nested/link.txt", link_type=tarfile.LNKTYPE, target="../outside")
+            archive.addfile(make_tar_link("nested/link.txt", "../outside", tarfile.LNKTYPE))
 
         reset_config()
         set_config(ModelAuditConfig(suppress={"S902"}))
@@ -990,7 +990,7 @@ class TestTarScanner:
         """Malformed archive links with empty targets must not be reported as safe."""
         archive_path = tmp_path / f"empty_{expected_kind.lower().replace(' ', '_')}.tar"
         with tarfile.open(archive_path, "w") as archive:
-            _add_tar_link(archive, "nested/link.txt", link_type=link_type, target="")
+            archive.addfile(make_tar_link("nested/link.txt", "", link_type))
 
         result = self.scanner.scan(str(archive_path))
 
@@ -1013,7 +1013,7 @@ class TestTarScanner:
         """The dedicated link escape rule remains directly suppressible."""
         archive_path = tmp_path / "external_link_s406_suppressed.tar"
         with tarfile.open(archive_path, "w") as archive:
-            _add_tar_link(archive, "link.txt", link_type=tarfile.SYMTYPE, target="../../../etc/passwd")
+            archive.addfile(make_tar_link("link.txt", "../../../etc/passwd", tarfile.SYMTYPE))
 
         reset_config()
         set_config(ModelAuditConfig(suppress={"S406"}))
@@ -1025,12 +1025,12 @@ class TestTarScanner:
         assert result.success is True
         assert not any(check.rule_code == "S406" for check in result.checks)
 
-    def test_symlink_to_critical_path(self):
+    def test_symlink_to_critical_path(self) -> None:
         """Symlinks targeting critical system paths should be flagged"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
                 # Create a symlink to critical path
-                _add_tar_link(t, "etc_passwd", link_type=tarfile.SYMTYPE, target="/etc/passwd")
+                t.addfile(make_tar_link("etc_passwd", "/etc/passwd", tarfile.SYMTYPE))
             tmp_path = tmp.name
 
         try:
@@ -1529,7 +1529,7 @@ class TestTarScanner:
             first_payload = b"x" * 128
             _add_tar_bytes(archive, "large-weights.bin", first_payload)
 
-            _add_tar_link(archive, "model_config.yaml", link_type=tarfile.SYMTYPE, target="payload.yaml")
+            archive.addfile(make_tar_link("model_config.yaml", "payload.yaml", tarfile.SYMTYPE))
 
             config_payload = f"model:\n  _target_: {target}\n".encode()
             _add_tar_bytes(archive, "payload.yaml", config_payload)
@@ -3271,7 +3271,7 @@ class TestTarScanner:
             payload = b"x" * 128
             _add_tar_bytes(archive, "large.bin", payload)
 
-            _add_tar_link(archive, "alias", link_type=tarfile.SYMTYPE, target=".")
+            archive.addfile(make_tar_link("alias", ".", tarfile.SYMTYPE))
 
             config = b"model:\n  _target_: os.system\n"
             _add_tar_bytes(archive, "alias/model_config.yaml", config)
@@ -3293,11 +3293,11 @@ class TestTarScanner:
             payload = b"x" * 128
             _add_tar_bytes(archive, "large.bin", payload)
 
-            _add_tar_link(archive, "dir", link_type=tarfile.SYMTYPE, target=".")
+            archive.addfile(make_tar_link("dir", ".", tarfile.SYMTYPE))
 
-            _add_tar_link(archive, "dir/seed", link_type=tarfile.SYMTYPE, target=".")
+            archive.addfile(make_tar_link("dir/seed", ".", tarfile.SYMTYPE))
 
-            _add_tar_link(archive, "alias", link_type=tarfile.LNKTYPE, target="dir/seed")
+            archive.addfile(make_tar_link("alias", "dir/seed", tarfile.LNKTYPE))
 
             config = b"model:\n  _target_: os.system\n"
             _add_tar_bytes(archive, "alias/model_config.yaml", config)
@@ -3324,9 +3324,9 @@ class TestTarScanner:
             config = b"model:\n  _target_: os.system\n"
             _add_tar_bytes(archive, "payload.yaml", config)
 
-            _add_tar_link(archive, "alias", link_type=tarfile.SYMTYPE, target=".")
+            archive.addfile(make_tar_link("alias", ".", tarfile.SYMTYPE))
 
-            _add_tar_link(archive, "alias/model_config.yaml", link_type=member_type, target="payload.yaml")
+            archive.addfile(make_tar_link("alias/model_config.yaml", "payload.yaml", member_type))
 
         result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 

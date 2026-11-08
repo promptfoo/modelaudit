@@ -1,6 +1,6 @@
 """Recognize bounded, literal setup and inference examples in Markdown.
 
-The returned spans describe routine documented URLs, not the safety of a model
+The returned spans describe routine documented network references, not the safety of a model
 or of code downloaded by a reader. Other findings in each example stay intact.
 """
 
@@ -454,23 +454,52 @@ def _has_execution_reference(nodes: list[ast.AST]) -> bool:
     )
 
 
-def _python_url_spans(source: bytes) -> list[tuple[int, int]] | None:
+def _imported_client_keywords(tree: ast.Module) -> list[ast.keyword]:
+    """Identify a client constructed directly after importing its SDK in an unlabelled example."""
+    imports: dict[str, str] = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                root = alias.name.split(".")[0]
+                imports[alias.asname or root] = alias.name if alias.asname else root
+        elif isinstance(statement, ast.ImportFrom) and statement.level == 0:
+            for alias in statement.names:
+                if alias.name == "*":
+                    return []
+                imports[alias.asname or alias.name] = f"{statement.module}.{alias.name}"
+        else:
+            if isinstance(statement, (ast.Expr, ast.Assign)) and isinstance(statement.value, ast.Call):
+                constructor = _loader_name(statement.value.func, imports)
+                if constructor and constructor[0] in imports and constructor[1] == "openai.OpenAI":
+                    return statement.value.keywords
+            break
+    return []
+
+
+def _python_url_spans(source: bytes, *, unlabelled: bool) -> list[tuple[int, int]] | None:
     """Return eligible spans, or None when the example cannot establish routine use."""
     try:
         tree = ast.parse(source.decode("utf-8"))
     except (UnicodeDecodeError, SyntaxError, ValueError, RecursionError):
         return None
+    if unlabelled and not any(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in tree.body):
+        return None
     nodes = list(ast.walk(tree))
     if _has_execution_reference(nodes):
         return None
 
+    client_keywords = set(_imported_client_keywords(tree)) if unlabelled else None
     literals: dict[ast.Constant, str] = {}
     for node in nodes:
-        if isinstance(node, ast.keyword) and node.arg == "base_url":
+        if (
+            isinstance(node, ast.keyword)
+            and node.arg == "base_url"
+            and (client_keywords is None or node in client_keywords)
+        ):
             literal = _literal_api_url(node.value)
             if literal is not None:
                 literals[literal] = str(literal.value)
-        elif isinstance(node, ast.Dict):
+        elif not unlabelled and isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values, strict=False):
                 if isinstance(key, ast.Constant) and key.value in {"base_url", "model_server", "api_base"}:
                     literal = _literal_api_url(value)
@@ -909,7 +938,42 @@ def _outside_fence_examples_execute_script(payload: bytes, regions: list[tuple[i
     return _inline_examples_execute_script(payload, inline_regions)
 
 
-def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
+def _sql_documentation_domain_spans(source: bytes) -> list[tuple[int, int]]:
+    """Find hosts in line comments and literal LIKE predicates in a fenced query."""
+    spans: list[tuple[int, int]] = []
+    # Consume standard quoted strings whole; a "--" inside them is data. Stop at
+    # backslash escapes or dialect-specific quoting (including Oracle q'...').
+    for token in re.finditer(
+        rb"""(?P<comment>--[ \t]+[^\r\n]*)|\bN?Q'|(?P<string>'(?:[^'\\]|'')*')|['"`$\\#\[\]]|--|/\*""",
+        source,
+        re.IGNORECASE,
+    ):
+        if token["string"] is not None:
+            continue
+        if token["comment"] is None:
+            break
+        spans.extend(match.span() for match in NetworkCommDetector.DOMAIN_PATTERN.finditer(source, *token.span()))
+    if not re.match(rb"\s*(?:SELECT|WITH)\b", source, re.IGNORECASE):
+        return spans
+    # Dialect-specific quoting and comments can change where a literal begins.
+    if re.search(rb'["`$\\#\[\]]|--|/\*', source):
+        return spans
+    literals = re.finditer(rb"(?:(?P<like>\bI?LIKE)\s*)?'(?P<value>(?:[^']|'')*)'|'", source, re.IGNORECASE)
+    for literal in literals:
+        value = literal["value"]
+        if value is None:
+            return []  # Unclosed string.
+        if literal["like"]:
+            host = re.fullmatch(rb"%?@?([A-Za-z0-9.-]{1,253})%?", value)
+            if host and NetworkCommDetector.DOMAIN_PATTERN.fullmatch(host[1]):
+                start = literal.start("value")
+                spans.append((start + host.start(1), start + host.end(1)))
+    return spans
+
+
+def _routine_documentation_network_spans(
+    payload: bytes, *, payload_complete: bool, sql_regions: list[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
     opening: re.Match[bytes] | None = None
     executes_script = False
@@ -931,30 +995,40 @@ def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], .
         start, end = opening.end() + 1, match.start()
         info = opening.group("language").lower().split()
         language = info[0] if info else b""
+        if language == b"sql":
+            sql_regions.append((start, end))
         if (
             end - start <= MAX_EXAMPLE_BYTES
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
         ):
             source = payload[start:end]
-            if language in PYTHON_LANGUAGES:
-                python_spans = _python_url_spans(source)
-                executes_script |= python_spans is None
-                examples = python_spans or []
+            examples = []
+            if language in PYTHON_LANGUAGES or not language:
+                python_spans = _python_url_spans(source, unlabelled=not language)
+                if python_spans is None:
+                    executes_script |= bool(language) or _example_executes_script(source, language)
+                else:
+                    examples = python_spans
             else:
                 executes_script |= _example_executes_script(source, language)
-                examples = _shell_url_spans(source) if language in SHELL_LANGUAGES else []
+                if language in SHELL_LANGUAGES:
+                    examples = _shell_url_spans(source)
+                elif language == b"sql" and payload_complete:
+                    examples = _sql_documentation_domain_spans(source)
             spans.extend((start + left, start + right) for left, right in examples)
         else:
             executes_script = True
         previous_end = match.end()
         opening = None
     if opening is not None:
+        if opening.group("language").lower().split()[:1] == [b"sql"]:
+            sql_regions.append((opening.end() + 1, len(payload)))
         executes_script = True
     else:
         outside_fences.append((previous_end, len(payload)))
-    if not executes_script:
+    if payload_complete and not executes_script:
         executes_script = _outside_fence_examples_execute_script(payload, outside_fences)
-    if executes_script:
+    if not payload_complete or executes_script:
         spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
     return tuple(spans)
 
@@ -1013,19 +1087,26 @@ def _without_markdown_container_prefixes(payload: bytes) -> tuple[bytes, list[tu
     return bytes(normalized), removals
 
 
-def routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
-    """Return original URL spans only after bounded Markdown example analysis."""
+def routine_documentation_network_spans(
+    payload: bytes, *, payload_complete: bool = True, sql_regions: list[tuple[int, int]] | None = None
+) -> tuple[tuple[int, int], ...]:
+    """Return routine reference spans and optionally collect SQL fence regions in original byte offsets."""
     if len(payload) > MAX_DOCUMENTATION_BYTES:
         return ()
     result = _without_markdown_container_prefixes(payload)
     if result is None:
         return ()
     normalized, removals = result
-    spans = _routine_documentation_url_spans(normalized)
+    normalized_sql: list[tuple[int, int]] = []
+    spans = _routine_documentation_network_spans(
+        normalized, payload_complete=payload_complete, sql_regions=normalized_sql
+    )
     starts = [start for start, _removed in removals]
 
     def original(position: int) -> int:
         index = bisect_right(starts, position) - 1
         return position + (removals[index][1] if index >= 0 else 0)
 
+    if sql_regions is not None:
+        sql_regions.extend((original(start), original(end)) for start, end in normalized_sql)
     return tuple((original(start), original(end)) for start, end in spans)

@@ -5209,24 +5209,6 @@ def _build_onnx_weight_analysis_plan(
             output_shapes_out.update(output_shapes)
         return graph_output_index in promoted_output_indexes
 
-    def graph_outputs_may_reference_tainted(
-        subgraph: Any,
-        graph_input_names: set[str],
-        opset_versions: dict[str, int],
-        attribute_bindings: dict[str, Any] | None = None,
-        *,
-        depth: int = 0,
-    ) -> bool:
-        return bool(
-            graph_tainted_output_indexes(
-                subgraph,
-                graph_input_names,
-                opset_versions,
-                attribute_bindings=attribute_bindings,
-                depth=depth,
-            )
-        )
-
     graph_taint_cache: dict[tuple[Any, ...], set[int]] = {}
     graph_taint_in_progress: set[tuple[Any, ...]] = set()
     graph_taint_nodes_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}

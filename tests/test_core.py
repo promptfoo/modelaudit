@@ -116,6 +116,7 @@ from tests.helpers.file_creators import (
     write_truncated_ordered_hf_tokenizer_json as _write_truncated_ordered_hf_tokenizer_json,
 )
 from tests.helpers.scanners import install_zip_open_failure, scan_with_whitelisted_finding, without_keras_zip_scanner
+from tests.helpers.tar import add_tar_bytes
 from tests.helpers.tensorflow import _build_malicious_tf_savedmodel, _require_tf_protos, build_malicious_tf_metagraph
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
@@ -2678,9 +2679,7 @@ def _write_tar_hdf5_userblock(
     tar_payload = io.BytesIO()
     with tarfile.open(fileobj=tar_payload, mode="w:gz" if compressed else "w") as archive:
         for name, data in members:
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            archive.addfile(info, io.BytesIO(data))
+            add_tar_bytes(archive, name, data)
     assert tar_payload.tell() <= userblock_size
     with path.open("r+b") as handle:
         handle.write(tar_payload.getvalue())
@@ -5968,9 +5967,7 @@ def test_scan_file_routes_nested_protocolless_binary_pickle_with_misleading_suff
         _create_misnamed_zip(archive_path, {entry_name: payload})
     else:
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo(entry_name)
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            add_tar_bytes(archive, entry_name, payload)
 
     result = scan_file(str(archive_path), config={"cache_scan_results": False})
 
@@ -8671,14 +8668,10 @@ def test_embedded_hdf5_member_preserves_outer_tar_analysis(tmp_path: Path) -> No
         archive.addfile(tarfile.TarInfo("spacer.txt"), io.BytesIO())
 
         hdf_payload = embedded_hdf.read_bytes()
-        hdf_info = tarfile.TarInfo("model.h5")
-        hdf_info.size = len(hdf_payload)
-        archive.addfile(hdf_info, io.BytesIO(hdf_payload))
+        add_tar_bytes(archive, "model.h5", hdf_payload)
 
         pickle_payload = _build_malicious_pickle(protocol=0)
-        pickle_info = tarfile.TarInfo("late-payload.pkl")
-        pickle_info.size = len(pickle_payload)
-        archive.addfile(pickle_info, io.BytesIO(pickle_payload))
+        add_tar_bytes(archive, "late-payload.pkl", pickle_payload)
 
     signature_offset = find_hdf5_signature_offset(str(archive_path))
     assert signature_offset == 4 * tarfile.BLOCKSIZE
@@ -9021,9 +9014,7 @@ def test_raw_tar_hdf5_metadata_limit_preserves_early_nemo_finding(tmp_path: Path
     tar_payload = io.BytesIO()
     with tarfile.open(fileobj=tar_payload, mode="w", format=tarfile.PAX_FORMAT) as archive:
         config_payload = b"model:\n  _target_: os.system\n  command: echo pwned\n"
-        config_info = tarfile.TarInfo("model_config.yaml")
-        config_info.size = len(config_payload)
-        archive.addfile(config_info, io.BytesIO(config_payload))
+        add_tar_bytes(archive, "model_config.yaml", config_payload)
         metadata_info = tarfile.TarInfo("weights.bin")
         metadata_info.pax_headers = {"comment": "A" * (80 * 1024)}
         archive.addfile(metadata_info, io.BytesIO(b""))
@@ -9086,9 +9077,7 @@ def test_empty_concatenated_gzip_members_do_not_inflate_hdf5_tar_ratio_denominat
     raw_tar = io.BytesIO()
     with tarfile.open(fileobj=raw_tar, mode="w") as archive:
         payload = b"A" * (12 * 1024 * 1024)
-        info = tarfile.TarInfo("weights.bin")
-        info.size = len(payload)
-        archive.addfile(info, io.BytesIO(payload))
+        add_tar_bytes(archive, "weights.bin", payload)
 
     empty_gzip = bytearray(gzip.compress(b"", mtime=0))
     empty_gzip[3] |= 0x04
@@ -9238,13 +9227,9 @@ def test_scan_file_routes_compressed_tar_when_hdf5_signature_is_inside_gzip_extr
     raw_tar = io.BytesIO()
     with tarfile.open(fileobj=raw_tar, mode="w") as archive:
         filler = b"A" * (128 * 1024)
-        filler_info = tarfile.TarInfo("large-weights.bin")
-        filler_info.size = len(filler)
-        archive.addfile(filler_info, io.BytesIO(filler))
+        add_tar_bytes(archive, "large-weights.bin", filler)
         payload = _build_malicious_pickle(protocol=0)
-        info = tarfile.TarInfo("late-payload.pkl")
-        info.size = len(payload)
-        archive.addfile(info, io.BytesIO(payload))
+        add_tar_bytes(archive, "late-payload.pkl", payload)
 
     signature_offset = _write_gzip_hdf5_extra_collision(model_path, raw_tar.getvalue())
 
@@ -9302,12 +9287,8 @@ def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar
     nested_tar = io.BytesIO()
     with tarfile.open(fileobj=nested_tar, mode="w") as archive:
         filler = b"A" * (1024 * 1024 + tarfile.BLOCKSIZE)
-        filler_info = tarfile.TarInfo("large-nested-weights.bin")
-        filler_info.size = len(filler)
-        archive.addfile(filler_info, io.BytesIO(filler))
-        payload_info = tarfile.TarInfo("late-payload.pkl")
-        payload_info.size = len(pickle_payload)
-        archive.addfile(payload_info, io.BytesIO(pickle_payload))
+        add_tar_bytes(archive, "large-nested-weights.bin", filler)
+        add_tar_bytes(archive, "late-payload.pkl", pickle_payload)
     assert nested_tar.tell() > 1024 * 1024
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
@@ -10708,9 +10689,7 @@ def test_scan_file_routes_nested_confirmed_jax_state_json(tmp_path: Path, archiv
         _create_misnamed_zip(archive_path, {"state.json": payload})
     else:
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("state.json")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            add_tar_bytes(archive, "state.json", payload)
 
     result = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
 

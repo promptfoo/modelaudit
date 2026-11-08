@@ -19,8 +19,8 @@ import pytest
 
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import SystemCommandPayload
-from tests.helpers.file_creators import add_tar_bytes as _add_tar_bytes
-from tests.helpers.file_creators import add_tar_link as _add_tar_link
+from tests.helpers.tar import add_tar_bytes as _add_tar_bytes
+from tests.helpers.tar import make_tar_link
 
 try:
     import yaml
@@ -116,6 +116,10 @@ def _create_renamed_compressed_nemo_after_route_budget(
         _add_tar_bytes(archive, "large-weights.bin", early_payload)
         _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
     return path
+
+
+def _add_tar_link(tar: tarfile.TarFile, name: str, target: str, link_type: bytes) -> None:
+    tar.addfile(make_tar_link(name, target, link_type))
 
 
 @contextmanager

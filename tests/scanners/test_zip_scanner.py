@@ -23,6 +23,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import build_cache_version_context
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.rules import Severity
+from modelaudit.scanner_results import Check
 from modelaudit.scanner_selection import normalize_scanner_selection_config
 from modelaudit.scanners import _registry, archive_dispatch
 from modelaudit.scanners import zip_scanner as zip_scanner_module
@@ -37,7 +38,6 @@ from modelaudit.scanners.archive_member_security import high_risk_python_calls_i
 from modelaudit.scanners.base import (
     INCONCLUSIVE_SCAN_OUTCOME,
     BaseScanner,
-    Check,
     CheckStatus,
     IssueSeverity,
     ScanResult,
@@ -392,7 +392,7 @@ def test_scan_zip_flags_namespace_mapping_dangerous_python_member(tmp_path: Path
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].rule_code == "S101"
@@ -716,9 +716,7 @@ def test_scan_zip_honors_safe_dynamic_member_aliases_and_method_overwrites(tmp_p
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
     assert result.success is True
-    assert not any(
-        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
-    )
+    assert not _has_failed_check(result, "Python Archive Member Security")
 
 
 def test_scan_zip_resolves_final_ctypes_initializer_edges(tmp_path: Path) -> None:
@@ -1027,7 +1025,7 @@ def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> Non
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, "import runpy\nrunpy.run_module('payload')\n", "handler")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S108"
     assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_module"
@@ -1037,9 +1035,7 @@ def test_scan_zip_ignores_extensionless_runpy_near_match(tmp_path: Path) -> None
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, "documentation mentions runpy.run_module('payload')\n", "notes")
 
-    assert not any(
-        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
-    )
+    assert not _has_failed_check(result, "Python Archive Member Security")
 
 
 def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite(tmp_path: Path) -> None:
@@ -1264,7 +1260,7 @@ def test_scan_zip_flags_ctypes_getattr_dynamic_library_name(tmp_path: Path) -> N
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.cdll.<dynamic>" in python_checks[0].details["reason"]
@@ -1287,7 +1283,7 @@ def test_scan_zip_flags_unpacked_getattr_and_unbound_loader_getattr(tmp_path: Pa
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.cdll.msvcrt" in python_checks[0].details["reason"]
@@ -1416,7 +1412,7 @@ def test_scan_zip_restores_loader_method_risk_after_delete(tmp_path: Path) -> No
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.LibraryLoader.loadlibrarypayload" in python_checks[0].details["reason"]
@@ -1503,7 +1499,7 @@ def test_scan_zip_preserves_ctypes_subclass_class_body_and_qualified_init_aliase
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.LibraryLoader.bodyalias" in python_checks[0].details["reason"]
@@ -3594,7 +3590,7 @@ def test_scan_zip_marks_malformed_python_member_incomplete(tmp_path: Path) -> No
     assert result.success is False
     assert result.metadata["analysis_incomplete"] is True
     assert "zip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].details["entry"] == "handler.py"
     assert python_checks[0].details["analysis_incomplete"] is True
@@ -3608,7 +3604,7 @@ def test_scan_npz_flags_dangerous_python_member(tmp_path: Path) -> None:
 
     result = ZipScanner().scan(str(archive_path))
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].details["entry"] == "handler.py"
@@ -3622,11 +3618,7 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
 
     result = ZipScanner().scan(str(archive_path))
 
-    executable_checks = [
-        check
-        for check in result.checks
-        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
-    ]
+    executable_checks = _failed_checks_named(result, "Executable Archive Member Detection")
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
     assert executable_checks[0].details["entry"] == "bin/run.sh"
@@ -3641,11 +3633,7 @@ def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
 
     result = ZipScanner().scan(str(archive_path))
 
-    executable_checks = [
-        check
-        for check in result.checks
-        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
-    ]
+    executable_checks = _failed_checks_named(result, "Executable Archive Member Detection")
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
     assert executable_checks[0].details["entry"] == "bin/runme"
@@ -3674,11 +3662,7 @@ def test_scan_npz_flags_extensionless_pe_member_with_late_header(tmp_path: Path)
 
     result = ZipScanner().scan(str(archive_path))
 
-    executable_checks = [
-        check
-        for check in result.checks
-        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
-    ]
+    executable_checks = _failed_checks_named(result, "Executable Archive Member Detection")
     assert len(executable_checks) == 1
     assert executable_checks[0].details["entry"] == "bin/runme"
 
@@ -3720,11 +3704,7 @@ def test_scan_npz_flags_extensionless_macho_fat64_members(tmp_path: Path, payloa
 
     result = ZipScanner().scan(str(archive_path))
 
-    executable_checks = [
-        check
-        for check in result.checks
-        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
-    ]
+    executable_checks = _failed_checks_named(result, "Executable Archive Member Detection")
     assert len(executable_checks) == 1
     assert executable_checks[0].details["entry"] == "bin/runme"
 
@@ -3774,7 +3754,7 @@ def test_scan_zip_python_member_emits_accurate_rule_code(
     archive_path = tmp_path / "source_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == expected_rule_code
     assert expected_call in python_checks[0].details["reason"]
@@ -4292,7 +4272,7 @@ def test_scan_zip_python_member_detects_operator_accessor_execution(
     archive_path = tmp_path / "source_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert any(
         check.rule_code == expected_rule_code and expected_call in check.details["reason"] for check in python_checks
     )
@@ -4327,7 +4307,7 @@ def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Pat
     source = "import os\nimport subprocess\nos.system('echo a')\nsubprocess.run(['echo', 'b'], check=False)\n"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     rule_codes = [check.rule_code for check in python_checks]
     assert rule_codes == ["S101", "S103"]
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
@@ -4346,7 +4326,7 @@ def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, mo
 
     result = ZipScanner({"max_mar_python_analysis_bytes": 1024}).scan(str(archive_path))
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     details = python_checks[0].details
     assert details["analysis_incomplete"] is True
@@ -5477,10 +5457,7 @@ def test_scan_nested_file_polyglot_manifest_preserves_jinja_analysis(tmp_path: P
 
     assert result.scanner_name == "xgboost"
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def test_scan_nested_file_polyglot_manifest_honors_excluded_jinja_selection(tmp_path: Path) -> None:
@@ -5561,10 +5538,7 @@ def test_scan_nested_file_inconclusive_mxnet_generation_config_runs_selected_jin
     assert result.success is False
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "manifest" in result.metadata["skipped_scanner_ids"]
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def test_scan_nested_file_inconclusive_mxnet_malformed_generation_config_runs_jinja_after_manifest_parse_failure(
@@ -5587,10 +5561,7 @@ def test_scan_nested_file_inconclusive_mxnet_malformed_generation_config_runs_ji
     assert result.success is False
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "manifest_parse_failed" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def test_scan_nested_file_mxnet_shaped_tokenizer_config_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
@@ -5606,10 +5577,7 @@ def test_scan_nested_file_mxnet_shaped_tokenizer_config_preserves_direct_jinja_a
 
     assert result.scanner_name == "mxnet"
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def test_scan_nested_file_mxnet_manifest_honors_excluded_jinja_selection(tmp_path: Path) -> None:
@@ -5648,10 +5616,7 @@ def test_scan_nested_file_mxnet_generation_config_runs_selected_jinja_when_manif
     assert result.scanner_name == "mxnet"
     assert "manifest" in result.metadata["skipped_scanner_ids"]
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def test_scan_nested_file_mxnet_routed_tokenizer_duplicate_override_preserves_direct_jinja_analysis(
@@ -5671,10 +5636,7 @@ def test_scan_nested_file_mxnet_routed_tokenizer_duplicate_override_preserves_di
 
     assert result.scanner_name == "mxnet"
     assert "mxnet_symbol_invalid_structure" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def test_scan_nested_file_xgboost_chat_template_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
@@ -5696,10 +5658,7 @@ def test_scan_nested_file_malformed_xgboost_chat_template_preserves_direct_jinja
 
     assert result.scanner_name == "xgboost"
     assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def test_scan_nested_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route(
@@ -5809,9 +5768,7 @@ def test_scan_nested_file_inconclusive_mxnet_route_composes_jax_analysis(
 
     assert result.scanner_name == "unknown"
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
-    )
+    assert _has_failed_check(result, "JSON Pattern Security Check")
 
 
 def test_scan_nested_file_inconclusive_mxnet_route_composes_escaped_suffix_owned_jax_payload_without_root_marker(
@@ -5836,9 +5793,7 @@ def test_scan_nested_file_inconclusive_mxnet_route_composes_escaped_suffix_owned
 
     assert result.scanner_name == "unknown"
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
-    )
+    assert _has_failed_check(result, "JSON Pattern Security Check")
 
 
 def test_scan_nested_file_inconclusive_mxnet_route_does_not_compose_ambiguous_large_foreign_json(
@@ -6245,11 +6200,7 @@ def test_zip_scanner_does_not_reopen_known_unreadable_symlink(
     assert result.success is False
     assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert not any(check.name == "Symlink Safety Validation" for check in result.checks)
-    coverage_checks = [
-        check
-        for check in result.checks
-        if check.name == "ZIP Member Analysis Coverage" and check.status == CheckStatus.FAILED
-    ]
+    coverage_checks = _failed_checks_named(result, "ZIP Member Analysis Coverage")
     assert len(coverage_checks) == 1
     assert coverage_checks[0].details["entry"] == "symlink.txt"
     assert coverage_checks[0].rule_code == "S902"
@@ -6500,11 +6451,7 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(archive_path))
 
-        failed_symlink_checks = [
-            check
-            for check in result.checks
-            if check.name == "Symlink Safety Validation" and check.status == CheckStatus.FAILED
-        ]
+        failed_symlink_checks = _failed_checks_named(result, "Symlink Safety Validation")
         assert len(failed_symlink_checks) == 1
         assert failed_symlink_checks[0].details == {
             "entry": "link.txt",
@@ -6620,11 +6567,7 @@ class TestZipScanner:
         scanner = ZipScanner(config={"max_zip_depth": 2, "max_tar_depth": 2})
         result = scanner.scan(str(outer_zip))
 
-        depth_checks = [
-            check
-            for check in result.checks
-            if check.name == "ZIP Depth Bomb Protection" and check.status == CheckStatus.FAILED
-        ]
+        depth_checks = _failed_checks_named(result, "ZIP Depth Bomb Protection")
         assert len(depth_checks) == 1
         assert "maximum zip nesting depth (2) exceeded" in depth_checks[0].message.lower()
         assert depth_checks[0].location == f"{outer_zip}:middle.tar:inner.zip"
@@ -6650,11 +6593,7 @@ class TestZipScanner:
         scanner = ZipScanner(config={"max_mar_depth": 1})
         result = scanner.scan(str(outer_zip))
 
-        depth_checks = [
-            check
-            for check in result.checks
-            if check.name == "TorchServe MAR Depth Limit" and check.status == CheckStatus.FAILED
-        ]
+        depth_checks = _failed_checks_named(result, "TorchServe MAR Depth Limit")
         assert len(depth_checks) == 1
         assert "maximum .mar recursion depth (1) exceeded" in depth_checks[0].message.lower()
         assert depth_checks[0].location == f"{outer_zip}:model.mar"
@@ -6673,11 +6612,7 @@ class TestZipScanner:
         assert result.success is False
         assert result.has_errors is True
 
-        handler_failures = [
-            check
-            for check in result.checks
-            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
-        ]
+        handler_failures = _failed_checks_named(result, "TorchServe Handler Static Analysis")
         assert len(handler_failures) == 1
         assert "high-risk execution primitives" in handler_failures[0].message.lower()
         assert handler_failures[0].details.get("entry") == "handler.py"
@@ -6694,11 +6629,7 @@ class TestZipScanner:
         scanner = ZipScanner(config={"max_mar_python_analysis_bytes": 16})
         result = scanner.scan(str(mar_path))
 
-        handler_failures = [
-            check
-            for check in result.checks
-            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
-        ]
+        handler_failures = _failed_checks_named(result, "TorchServe Handler Static Analysis")
         assert len(handler_failures) == 1
         assert handler_failures[0].severity == IssueSeverity.INFO
         assert "oversized entry" in handler_failures[0].message.lower()
@@ -6725,11 +6656,7 @@ class TestZipScanner:
         assert result.has_warnings is False
         assert result.has_errors is False
 
-        handler_failures = [
-            check
-            for check in result.checks
-            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
-        ]
+        handler_failures = _failed_checks_named(result, "TorchServe Handler Static Analysis")
         assert len(handler_failures) == 1
         assert handler_failures[0].severity == IssueSeverity.INFO
         assert "unable to parse python entry for static analysis" in handler_failures[0].message.lower()
@@ -6764,11 +6691,7 @@ class TestZipScanner:
         monkeypatch.setattr(zip_scanner_module, "open", fail_handler_read, raising=False)
 
         result = self.scanner.scan(str(mar_path))
-        handler_failures = [
-            check
-            for check in result.checks
-            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
-        ]
+        handler_failures = _failed_checks_named(result, "TorchServe Handler Static Analysis")
         assert len(handler_failures) == 1
         assert handler_failures[0].severity == IssueSeverity.INFO
         assert "torchserve_handler_read_failed" in result.metadata["scan_outcome_reasons"]
@@ -7113,10 +7036,7 @@ class TestZipScanner:
         ).scan(str(archive_path))
 
         assert nested_scan_paths == []
-        assert not any(
-            check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "Executable Archive Member Detection")
         assert result.metadata["contents"] == [
             {
                 "path": f"{archive_path}:model.weights.h5",
@@ -7436,10 +7356,7 @@ class TestZipScanner:
         result = ZipScanner(config={"max_zip_central_directory_size": 1}).scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "Central Directory Size Limit Check" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert _has_failed_check(result, "Central Directory Size Limit Check")
 
     def test_max_entries_limit_forged_low_eocd_rejects_before_zipfile_open(
         self,
@@ -7516,12 +7433,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_suffix_only_directory_with_corrupted_omitted_record_rejects_before_zipfile_open(
         self,
@@ -7555,12 +7467,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_suffix_only_directory_with_corrupted_omitted_record_metadata_rejects_before_zipfile_open(
         self,
@@ -7595,12 +7502,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_suffix_only_directory_with_deleted_omitted_record_rejects_before_zipfile_open(
         self,
@@ -7638,12 +7540,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_empty_directory_cannot_hide_unreferenced_local_entry(
         self,
@@ -7674,12 +7571,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_deleted_omitted_record_with_local_padding_rejects_before_zipfile_open(
         self,
@@ -7719,12 +7611,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_force_zip64_streamed_entry_uses_local_descriptor_width(self, tmp_path: Path) -> None:
         class NonSeekableBuffer(io.BytesIO):
@@ -7751,10 +7638,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_partial_zip64_streamed_entry_uses_64bit_descriptor_width(self, tmp_path: Path) -> None:
         class NonSeekableBuffer(io.BytesIO):
@@ -7802,10 +7686,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_force_zip64_streamed_entry_rejects_invalid_64bit_descriptor(self, tmp_path: Path) -> None:
         class NonSeekableBuffer(io.BytesIO):
@@ -7835,10 +7716,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_streamed_descriptor_entry_with_padding_rejects_before_zipfile_open(
         self,
@@ -7897,12 +7775,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_streamed_hidden_entry_with_out_of_window_padding_fails_closed(
         self,
@@ -7943,12 +7816,7 @@ class TestZipScanner:
 
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "streamed local entry cannot be bounded" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "streamed local entry cannot be bounded")
 
     @pytest.mark.parametrize(
         "compression",
@@ -8004,12 +7872,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_suffix_only_directory_with_central_record_gap_rejects_before_zipfile_open(
         self,
@@ -8054,12 +7917,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_prefixed_zip_does_not_trigger_preceding_directory_false_positive(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "prefixed.zip"
@@ -8071,10 +7929,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_sfx_local_header_near_match_with_invalid_crc_remains_clean(self, tmp_path: Path) -> None:
         archive_bytes = io.BytesIO()
@@ -8099,10 +7954,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_large_archive_extra_data_record_before_directory_still_scans(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "archive_extra_data.zip"
@@ -8135,10 +7987,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_archive_extra_data_record_count_is_bounded_before_zipfile_open(
         self,
@@ -8171,12 +8020,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "too many ZIP archive extra data records" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "too many ZIP archive extra data records")
 
     def test_optional_zip_guard_ignores_incidental_eocd_in_non_zip_file(self, tmp_path: Path) -> None:
         legacy_path = tmp_path / "legacy.pt"
@@ -8254,10 +8098,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_sfx_with_local_header_shaped_runtime_prefix_still_scans(self, tmp_path: Path) -> None:
         fake_local_header = struct.pack(
@@ -8286,10 +8127,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_sfx_with_deflated_local_header_wrong_crc_still_scans(self, tmp_path: Path) -> None:
         compressor = zlib.compressobj(wbits=-15)
@@ -8325,10 +8163,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_stored_member_ending_with_central_header_near_match_still_scans(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "central_header_near_match.zip"
@@ -8340,10 +8175,7 @@ class TestZipScanner:
         )
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_stored_member_ending_with_foreign_central_directory_fragment_still_scans(self, tmp_path: Path) -> None:
         inner_archive = io.BytesIO()
@@ -8362,10 +8194,7 @@ class TestZipScanner:
         result = ZipScanner(config={ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["blob.bin"]}).scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_stored_nested_zip_with_same_inner_and_outer_name_still_scans(self, tmp_path: Path) -> None:
         inner_archive = io.BytesIO()
@@ -8381,10 +8210,7 @@ class TestZipScanner:
         )
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_nested_routing_rejects_over_entry_zip_before_specialized_probes(
         self,
@@ -8528,12 +8354,7 @@ class TestZipScanner:
 
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "changed between preflight and parsing (1 != 0)" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "changed between preflight and parsing (1 != 0)")
 
     def test_appended_empty_eocd_fails_closed_before_content_is_hidden(
         self,
@@ -8557,12 +8378,7 @@ class TestZipScanner:
 
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "ambiguous" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "ambiguous")
 
     def test_local_entry_appended_after_eocd_fails_closed_before_zipfile_open(
         self,
@@ -8596,12 +8412,7 @@ class TestZipScanner:
 
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "trailing data contains an unreferenced local entry" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "trailing data contains an unreferenced local entry")
 
     def test_local_entry_hidden_in_eocd_comment_fails_closed_before_zipfile_open(
         self,
@@ -8641,12 +8452,7 @@ class TestZipScanner:
 
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "trailing data contains an unreferenced local entry" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "trailing data contains an unreferenced local entry")
 
     def test_trailing_local_header_near_match_remains_clean(self, tmp_path: Path) -> None:
         _assert_zip_trailer_near_match(
@@ -8714,12 +8520,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "ZIP Central Directory Preflight"
-            and check.status == CheckStatus.FAILED
-            and "omits a preceding record" in check.message
-            for check in result.checks
-        )
+        assert _has_failed_preflight_message(result, "omits a preceding record")
 
     def test_eocd_shaped_stored_member_content_is_not_treated_as_ambiguous(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "benign_member_signature.zip"
@@ -8749,10 +8550,7 @@ class TestZipScanner:
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_symlink_local_metadata_mismatch_reports_critical_finding(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "mismatched-symlink-name.zip"
@@ -8796,10 +8594,7 @@ class TestZipScanner:
         )
 
         assert result.success is True
-        assert not any(
-            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
     def test_scan_reuses_preflight_file_handle_for_zipfile(
         self,
@@ -9317,11 +9112,7 @@ class TestZipScanner:
             reset_config()
 
         assert result.success is False
-        symlink_checks = [
-            check
-            for check in result.checks
-            if check.name == "Symlink Safety Validation" and check.status == CheckStatus.FAILED
-        ]
+        symlink_checks = _failed_checks_named(result, "Symlink Safety Validation")
         assert len(symlink_checks) == 1
         assert "symlink target exceeds maximum size" in symlink_checks[0].message.lower()
         assert symlink_checks[0].details.get("entry") == "link.txt"
@@ -9795,19 +9586,28 @@ class TestZipScanner:
         assert len(result.issues) > 0
 
 
-def _failed_python_member_checks(result: ScanResult) -> list[Check]:
-    return [
-        check
+def _failed_checks_named(result: ScanResult, name: str) -> list[Check]:
+    return [check for check in result.checks if check.name == name and check.status == CheckStatus.FAILED]
+
+
+def _has_failed_check(result: ScanResult, name: str) -> bool:
+    return any(check.name == name and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def _has_failed_preflight_message(result: ScanResult, message: str) -> bool:
+    return any(
+        check.name == "ZIP Central Directory Preflight"
+        and check.status == CheckStatus.FAILED
+        and message in check.message
         for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    )
 
 
 def _scan_python_member_checks(tmp_path: Path, source: str) -> dict[str | None, Any]:
     """Scan ``source`` as a Python archive member; return failed checks by rule code."""
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
-    return {check.rule_code: check for check in _failed_python_member_checks(result)}
+    return {check.rule_code: check for check in _failed_checks_named(result, "Python Archive Member Security")}
 
 
 def test_scan_zip_pr1402_resolves_subclass_initializer_bypasses(tmp_path: Path) -> None:
@@ -9920,15 +9720,13 @@ def _assert_zip_python_rule(tmp_path: Path, source: str, rule_code: str) -> None
 def _assert_zip_python_member_safe_at_path(archive_path: Path, source: str) -> None:
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    assert not any(
-        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
-    )
+    assert not _has_failed_check(result, "Python Archive Member Security")
 
 
 def _assert_zip_python_finding_at_path(archive_path: Path, source: str | bytes, rule_code: str, reason: str) -> None:
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == rule_code
     assert python_checks[0].details["reason"] == reason
@@ -9950,7 +9748,7 @@ def _assert_zip_member_subprocess_call(tmp_path: Path, source_text: str) -> None
     source = source_text
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
@@ -9971,9 +9769,7 @@ def _assert_shadowed_member_primitive(tmp_path: Path, source: str, filename: str
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
     assert result.success is True
-    assert not any(
-        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
-    )
+    assert not _has_failed_check(result, "Python Archive Member Security")
 
 
 def _assert_generic_json_owner(tmp_path: Path, prefix: str) -> None:
@@ -9998,10 +9794,7 @@ def _assert_zip_trailer_near_match(tmp_path: Path, filename: str, trailer: bytes
     result = ZipScanner().scan(str(archive_path))
 
     assert result.success is True
-    assert not any(
-        check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert not _has_failed_check(result, "ZIP Central Directory Preflight")
 
 
 def _assert_xgboost_jinja_preserved(tmp_path: Path, filename: str) -> None:
@@ -10015,10 +9808,7 @@ def _assert_xgboost_jinja_preserved(tmp_path: Path, filename: str) -> None:
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def _assert_ctypes_module_replacement(tmp_path: Path, source_text: str) -> None:
@@ -10049,10 +9839,7 @@ def _assert_ambiguous_mxnet_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     assert result.success is False
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    assert _has_failed_check(result, "Jinja2 Template Injection Detection")
 
 
 def _assert_zip_shadowed_import(tmp_path: Path, source_text: str) -> None:
@@ -10070,7 +9857,7 @@ def _assert_zip_subprocess_warning(tmp_path: Path, source_text: str) -> None:
     source = source_text
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
@@ -10095,7 +9882,7 @@ def _assert_zip_system_call(tmp_path: Path, source_text: str) -> None:
     source = source_text
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].rule_code == "S101"
@@ -10138,7 +9925,7 @@ def _assert_zip_python_member_warning(tmp_path: Path, source_text: str, entry_ke
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, source_text, "handler.py")
 
-    python_checks = _failed_python_member_checks(result)
+    python_checks = _failed_checks_named(result, "Python Archive Member Security")
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].details[entry_key] == member_name
