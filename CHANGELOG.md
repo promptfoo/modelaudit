@@ -5,18 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.55](https://github.com/promptfoo/modelaudit/compare/v0.2.54...v0.2.55) (2026-11-06)
+
+### Features
+
+- **metadata:** make directory table display limits configurable ([#1896](https://github.com/promptfoo/modelaudit/issues/1896)) ([df49ca9](https://github.com/promptfoo/modelaudit/commit/df49ca90c5a10095ea405e4d769f0a18eb09210a))
+- **python:** support standard CPython 3.14 in ModelAudit ([#1908](https://github.com/promptfoo/modelaudit/issues/1908)) ([58a6784](https://github.com/promptfoo/modelaudit/commit/58a67841beb8eab124dcfad457bb281597d50e75))
+
+### Bug Fixes
+
+- **ci:** restore Click 8.5 scanning and Windows fixtures ([#1906](https://github.com/promptfoo/modelaudit/issues/1906)) ([f996f12](https://github.com/promptfoo/modelaudit/commit/f996f12c7f3b3f338844a4380639cadc095a9c1f))
+- **ci:** run branch coverage on Python 3.11 ([#1921](https://github.com/promptfoo/modelaudit/issues/1921)) ([8220211](https://github.com/promptfoo/modelaudit/commit/8220211638eca66875f73eb80d7eaa07c976a7eb))
+- **deps:** update rust crate pyo3 to 0.30.0 ([#1914](https://github.com/promptfoo/modelaudit/issues/1914)) ([415819f](https://github.com/promptfoo/modelaudit/commit/415819fa0b58d097dd201c0fa3f41eba33431c78))
+- **gguf:** recognize the remaining ggml tensor types ([#1909](https://github.com/promptfoo/modelaudit/issues/1909)) ([a5cbeca](https://github.com/promptfoo/modelaudit/commit/a5cbeca11d6ad3e2c9a93dd7501eddf339a36dbf))
+- **gguf:** validate interleaved row groups per matrix ([#1920](https://github.com/promptfoo/modelaudit/issues/1920)) ([6a6bdba](https://github.com/promptfoo/modelaudit/commit/6a6bdba5c13def3b3368a1198bbbfde0d6d4b666))
+- improve scanner coverage and preserve per-member diagnostics ([#1942](https://github.com/promptfoo/modelaudit/issues/1942)) ([71aa359](https://github.com/promptfoo/modelaudit/commit/71aa359096c83f84b8fc3831171f63ccb6a60d47))
+- **metadata:** keep YAML fallback warnings out of JSON stdout ([#1895](https://github.com/promptfoo/modelaudit/issues/1895)) ([c25b6ee](https://github.com/promptfoo/modelaudit/commit/c25b6ee3b3640f7707469e930a2b319ee0f61e76))
+- **metadata:** preserve extraction errors in filtered and directory output ([#1888](https://github.com/promptfoo/modelaudit/issues/1888)) ([3873627](https://github.com/promptfoo/modelaudit/commit/3873627dc8644797eb39127e3a859e5f23d6d2e7))
+- **onnx:** preserve bounded control-flow weight coverage ([#1848](https://github.com/promptfoo/modelaudit/issues/1848)) ([3cdd9e0](https://github.com/promptfoo/modelaudit/commit/3cdd9e05c07593c6c68f86f214b192354877d943))
+- **picklescan:** restore Click 8.5 detection and Windows test portability ([#1864](https://github.com/promptfoo/modelaudit/issues/1864)) ([2838c99](https://github.com/promptfoo/modelaudit/commit/2838c9978c2254ae699c63712b311b2491d047a7))
+- **picklescan:** support standard CPython 3.14 ([#1907](https://github.com/promptfoo/modelaudit/issues/1907)) ([5cda52b](https://github.com/promptfoo/modelaudit/commit/5cda52b0698109e479d10394579cf2128bf3d577))
+- **results:** report completed scans with security findings as successful ([#1941](https://github.com/promptfoo/modelaudit/issues/1941)) ([d37d506](https://github.com/promptfoo/modelaudit/commit/d37d506844d3a2107dd4c4a1a4d120a375f2821e))
+- **routing:** avoid pickle false positives on license text ([#1911](https://github.com/promptfoo/modelaudit/issues/1911)) ([6128247](https://github.com/promptfoo/modelaudit/commit/6128247b084f3bb64724706ab037c7de8ab242f5))
+
 ## [Unreleased]
 
 ### Added
 
+- Add advisory API triage for README/model-card findings when `OPENAI_API_KEY` is set, with `--no-triage` to disable it. Advice goes to stderr without changing scanner reports, verdicts, or exit codes.
 - Support standard CPython 3.14 with native pickle and H5 scanner validation across Linux, macOS, and Windows.
 - Add `metadata --table-limit` to control the number of file entries displayed in directory tables.
 
+### Changed
+
+- Require Rust 1.85 or newer for source builds of the native pickle scanner and use Rust 1.85 in Docker builds for PyO3 0.30 compatibility.
+
 ### Fixed
 
+- Recognize one-byte F8_E4M3 tensors in GGUF files and validate their payload bounds.
+- Avoid checkpoint routing errors on logs, JSON Lines datasets, tokenizer vocabularies, PCM audio, and native binaries. Keep inspecting possible serialized payloads in mixed-format files.
+- Attribute README and model-card network findings to their documentation source. Recognize passive SQL comparisons, local client examples, maintenance and classifier terminology, usage restrictions, and contact details. Preserve alerts for active uses.
+- Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
+- Stop flagging licenses as incompatible solely because they lack OSI approval. Distinguish Creative Commons Attribution from ShareAlike and NonCommercial declarations, recognize RAIL names at word boundaries, and count each file once when reporting deprecated identifiers.
+- Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
+- Continue checking README and model-card URLs and credentials after a malformed link.
+- Report completed scans as successful in the Python API even when a security check raises a warning.
+- Validate legacy Bitcoin address checksums before reporting a match, so unrelated identifiers such as notebook IDs do not trigger embedded-secret alerts.
+- Avoid incomplete GGUF, GGML, and sharded model scans and skipped file hashes on Windows when an unchanged file reports different creation times through its path and its open handle.
+- Run the lightweight Docker image on Python 3.14, with pip confined to the build stage. The full image stays on Python 3.13 for TensorFlow compatibility.
+- Upgrade APT and zlib packages in all Docker runtime images to include Debian security fixes.
+- Explain when JSON parsing limits interrupt SafeTensors header validation and when YAML safe loading prevents template extraction.
+- Distinguish reshape dimensions from activation data when tracing both inputs of an ONNX attention contraction. Dynamically transformed weights retain their coverage gaps.
+
+- Keep the highest failed severity and its explanation when combining checks for one asset. Summaries that include informational findings now identify them as findings.
+- Preserve individual pickle coverage notices and member locations in consolidated scan results.
+- Report individual pickle findings in PyTorch ZIP checkpoints without attributing ordinary serialization opcodes to CVE-2025-32434. The runtime advisory now names the affected legacy TAR loader.
+- Validate PyTorch storage references alongside wide RNG state tuples and track up to 2,048 dictionary entries in pickle state analysis.
+- Validate storage IDs in PyTorch tensor batches and legacy TorchScript v1 parameter mappings with a separate allowance of 256,000 metadata opcodes and two million provenance-node visits per archive. Upgrade both `modelaudit` and `modelaudit-picklescan` to receive this fix. Member discovery limits and coverage diagnostics still apply.
+- Recognize standalone Tekken vocabulary JSON without routing token spellings to model checkpoint parsers. Filtered domain-shaped code tokens in model cards no longer consume the network evidence classification budget.
+- Recognize SentencePiece tokenizers with large trainer symbol lists and complete tiktoken rank files sharing the XGBoost model extension.
+
+- Recognize Tekken v7 vocabularies and large SafeTensors weight indexes during JSON routing, preserving manifest security checks and incomplete results for ambiguous files.
 - Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.
 - Resolve bound function attributes during finite ONNX replay and ignore unrelated dead transforms without dropping live weight consumers.
 - Bound duplicate singular fields during ONNX control preflight and preserve findings and explicit incomplete coverage when admission stops.
+- Reject impossible protobuf wire types when probing large non-model files such as native static libraries.
 - Preserve finite-loop vector proofs when ONNX Concat combines carried state with known constant operands, while retaining incomplete coverage for unknown operands.
 
 - Separate physical ONNX weight-storage checks from logical expanded-view admission, preserving per-view and cumulative limits without repeatedly copying source payloads.
@@ -46,16 +99,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound ONNX repeated-state reentry work while preserving local-function, shape, and lineage coverage.
 - Preserve caller-bound ONNX Loop conditions over body initializer defaults and reuse local-function analysis across unused attribute values.
 - Preserve early TAR findings after sparse-file probing and enforce SafeTensors JSON nesting limits consistently across Python versions.
+- Recognize SafeTensors files whose header length resembles a pickle. Preserve warnings for reachable pickle extension lookups.
 - Keep complete streamed pickle analysis available for oversized remote source URLs across Python versions, preserving SBOM findings and source associations.
+- Exclude pinned package versions, clock fields, and CSS dimensions from network findings. Report suspicious port numbers without inferring which service is running.
 - Validate retired interleaved GGUF row groups within each matrix, so incomplete groups cannot pass by combining rows across higher dimensions.
 - Send metadata YAML fallback warnings to stderr so they do not contaminate JSON output.
+- Correct SafeTensors missing-shard reports for manifest-declared zero-based single-shard files and mixed Hugging Face range and local scans. Report unverified tensor assignments separately from confirmed index mismatches.
 - Preserve metadata extraction errors with `--security-only` and display them in directory table output.
+- Recognize model shard indexes, chat templates, added-token maps, Core ML package manifests, Transformers processor configurations, ModelOpt quantization and sparse-attention configurations, and Hugging Face download tree records when reporting datasets with unspecified licenses.
 - Avoid treating ordinary license text such as `Microsoft.` as a pickle stream when its apparent opcodes have an invalid stack. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and completed executable prefixes with malformed trailing data.
+- Avoid routing package requirements such as `torch>=2.10.0` to the pickle scanner.
 - Recognize the remaining GGUF tensor types that ggml defines (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ4_NL, I8, I16, I32, I64, F64, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0, and Q2_0) and the retired Q4_0_4_4, Q4_0_4_8, and Q4_0_8_8 layouts that published files still use, so GGUF files that use them get tensor bounds validation instead of an inconclusive scan. Other retired and unknown type IDs remain inconclusive.
+- Reduce false injection findings from sentence punctuation, formatting instructions, and routine macro declarations in oversized GGUF chat templates. Report the matching signature and source offset alongside incomplete analysis.
 - Check GGUF block alignment per tensor row, as ggml does, so a block-quantized tensor whose first dimension is not a multiple of its block size is flagged even when its total element count is. The retired Q4_0 layouts must also hold whole groups of rows.
+- Avoid template-injection alerts for Jinja chat-template macro declarations. The scanner still checks macro defaults and bodies for injection.
 - Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
+- Reject non-ASCII protocol 0 persistent IDs so bytes inside tensor storage cannot produce a nested persistent-ID finding from an invalid operand.
 - Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit. Continue supplemental stream checks after call-graph coverage gaps, and keep operational failures unsuccessful even with trusted padding.
 - Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
+- Recognize declaration-only compiler output in legacy TorchScript ZIP archives when scanning for embedded Python code.
 - Make the nested archive test fixture portable to Windows.
 
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)

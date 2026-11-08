@@ -53,6 +53,7 @@ jobs:
           filters: |
             python:
               - '**.py'
+              - 'scripts/compile_tensorflow_protos.sh'
               - 'pyproject.toml'
               - 'uv.lock'
             picklescan:
@@ -63,6 +64,7 @@ jobs:
               - '.dockerignore'
             workflows:
               - '.github/workflows/**'
+              - '.github/scripts/fetch-verified-release.sh'
             dependencies:
               - 'pyproject.toml'
               - 'uv.lock'
@@ -373,6 +375,7 @@ jobs:
       - *install-rust-toolchain
 
       - name: Sync dependencies
+        id: windows-dependencies
         run: |
           uv sync --extra all-ci-windows
 
@@ -385,6 +388,13 @@ jobs:
         if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
         run: |
           uv run pytest tests -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
+
+      - name: Capture benign pickle scanner diagnostics
+        if: ${{ !cancelled() && steps.windows-dependencies.outcome == 'success' }}
+        env:
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+        run: |
+          uv run pytest tests/test_pickle_context_filtering.py::test_rust_pickle_scanner_keeps_common_ml_serialization_clean -n 0 -s --tb=short
 
   test:
     name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
@@ -532,15 +542,20 @@ jobs:
 
       - *sync-all-ci-dependencies
 
+      - name: Cache Codecov CLI
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/modelaudit-codecov
+          key: codecov-cli-linux-x64-v11.3.1
+
       - name: Install verified Codecov CLI
         run: |
           set -euo pipefail
           codecov_binary="$RUNNER_TEMP/modelaudit-codecov"
-          curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 \
-            --proto '=https' --proto-redir '=https' --output "$codecov_binary" \
-            https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux
-          printf '%s  %s\n' \
-            'ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d' "$codecov_binary" | sha256sum --check
+          bash .github/scripts/fetch-verified-release.sh "$codecov_binary" \
+            ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d \
+            https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux \
+            https://api.github.com/repos/codecov/codecov-cli/releases/assets/470877726
           chmod +x "$codecov_binary"
 
       - name: Run branch coverage shard
@@ -679,8 +694,8 @@ jobs:
   test-vendored-protos:
     name: Test Vendored TensorFlow Protos
     needs: changes
-    # Run for integration events, or if Python/dependency files changed.
-    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    # Run for integration events, or if Python, dependencies, or CI tooling changed.
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -731,26 +746,30 @@ jobs:
   test-proto-reproducibility:
     name: Verify Vendored Proto Reproducibility
     needs: changes
-    # Run for integration events, or if Python/dependency files changed.
-    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    # Run for integration events, or if Python, dependencies, or CI tooling changed.
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - *checkout-repo
 
+      - name: Cache protoc archive
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/protoc-33.5-linux-x86_64.zip
+          key: protoc-linux-x64-33.5
+
       - name: Install protoc 33.5
         run: |
-          # Pin protoc to the exact version used to generate vendored protos.
-          # The vendored files contain "Protobuf Python Version: 6.33.5"
-          # which corresponds to libprotoc 33.5.
-          PROTOC_VERSION="33.5"
-          PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-          curl -fsSL -o /tmp/protoc.zip \
-            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
-          sudo chmod +x /usr/local/bin/protoc
-          rm /tmp/protoc.zip
-          protoc --version
+          set -euo pipefail
+          archive="$RUNNER_TEMP/protoc-33.5-linux-x86_64.zip"
+          bash .github/scripts/fetch-verified-release.sh "$archive" \
+            24e58fb231d50306ee28491f33a170301e99540f7e29ca461e0e80fd1239f8d1 \
+            https://github.com/protocolbuffers/protobuf/releases/download/v33.5/protoc-33.5-linux-x86_64.zip \
+            https://api.github.com/repos/protocolbuffers/protobuf/releases/assets/347851875
+          unzip -q "$archive" bin/protoc 'include/*' -d "$RUNNER_TEMP/protoc-33.5"
+          echo "$RUNNER_TEMP/protoc-33.5/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/protoc-33.5/bin/protoc" --version
 
       - name: Regenerate protos and compare
         run: |
@@ -881,7 +900,7 @@ jobs:
           )
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist
           path: dist/
@@ -914,7 +933,7 @@ jobs:
           - os: macos-15-intel
             python-version: "3.12"
             timeout-minutes: 45
-          - os: macos-14
+          - os: macos-15
             python-version: "3.14"
             timeout-minutes: 60
           - os: macos-15-intel
@@ -939,7 +958,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.83.0 --profile minimal
+          rustup toolchain install 1.85.0 --profile minimal
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
 
@@ -967,7 +986,7 @@ jobs:
 
       - name: Check Rust scanner MSRV
         run: |
-          cargo +1.83.0 check --manifest-path Cargo.toml --locked
+          cargo +1.85.0 check --manifest-path Cargo.toml --locked
 
       - name: Lint Rust scanner crate
         run: |
@@ -979,11 +998,11 @@ jobs:
 
       - name: Lint standalone package with Ruff
         run: |
-          uv run --with 'ruff==0.17.0' ruff check src tests
+          uv run --with 'ruff==0.17.2' ruff check src tests
 
       - name: Check standalone package formatting with Ruff
         run: |
-          uv run --with 'ruff==0.17.0' ruff format --check src tests
+          uv run --with 'ruff==0.17.2' ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: |
@@ -995,7 +1014,7 @@ jobs:
 
       - name: Preserve Windows standalone test evidence
         if: always() && runner.os == 'Windows'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: picklescan-tests-${{ matrix.os }}-${{ matrix.python-version }}
           path: ${{ runner.temp }}/picklescan-test-results.xml
@@ -1160,7 +1179,7 @@ jobs:
           EXPECT_DEPENDENCY_AUDIT="${{ github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')) }}"
           EXPECT_DEPENDENCY_SURFACE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_OPTIONAL_DEPENDENCY_LANES="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' }}"
-          EXPECT_VENDORED_PROTOS="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' }}"
+          EXPECT_VENDORED_PROTOS="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_BUILD="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_PICKLESCAN="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_COVERAGE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true' }}"

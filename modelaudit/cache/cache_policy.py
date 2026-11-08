@@ -93,6 +93,7 @@ def _metadata_disqualifies_cache(metadata: Any) -> bool:
         return False
     if (
         bool(metadata.get("operational_error"))
+        or metadata.get("relaxed_crc") is True
         or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         or _has_incomplete_coverage_reasons(metadata)
     ):

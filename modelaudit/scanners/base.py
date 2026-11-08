@@ -1375,7 +1375,12 @@ class BaseScanner(ABC):
                 severity=severity,
                 location=finding.get("context", context),
                 details=finding,
-                why="Models should not contain network communication capabilities",
+                why=(
+                    "This indicator appears in documentation. Any network access depends on how the documented "
+                    "code, configuration, or tools are used."
+                    if finding.get("evidence_source") == "documentation"
+                    else "Models should not contain network communication capabilities"
+                ),
             )
 
         if not findings and context and not self._raw_detector_failed(result, "network_communication"):

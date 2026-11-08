@@ -87,8 +87,11 @@ def test_gitpython_lock_stays_on_patched_release_floor() -> None:
     [
         ("aiohttp", (3, 14, 3)),
         ("anyio", PATCHED_ANYIO_FLOOR),
+        ("brotli", (1, 2, 1)),
+        ("certifi", (2026, 10, 19)),
         ("cryptography", (50, 0, 0)),
         ("keras", (3, 15, 0)),
+        ("setuptools", (84, 1, 0)),
         ("sqlparse", (0, 6, 0)),
     ],
 )
@@ -146,6 +149,17 @@ def test_picklescan_build_backend_is_exactly_pinned() -> None:
     assert build_system["build-backend"] == "maturin"
     # PEP 440 `==1.13.3` also accepts local versions such as `1.13.3+local`.
     assert build_system["requires"] == [PINNED_MATURIN_BACKEND]
+
+
+def test_picklescan_msrv_supports_locked_pyo3() -> None:
+    package_dir = PICKLESCAN_PYPROJECT.parent
+    cargo_config = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+    cargo_lock = tomllib.loads((package_dir / "Cargo.lock").read_text(encoding="utf-8"))
+    pyo3 = next(package for package in cargo_lock["package"] if package["name"] == "pyo3")
+
+    # PyO3 0.30 uses Rust 2024: https://github.com/PyO3/pyo3/blob/v0.30.1/Cargo.toml
+    if Version(pyo3["version"]) >= Version("0.30.0"):
+        assert Version(cargo_config["package"]["rust-version"]) >= Version("1.85")
 
 
 def test_root_requires_hardened_picklescan_release() -> None:
@@ -256,6 +270,14 @@ def test_renovate_python_updates_follow_runtime_support() -> None:
 
     for version in versions:
         assert update_policy.contains(version) == runtime_support.contains(version)
+
+    full_index, full_rule = next(
+        (index, rule) for index, rule in python_rules if rule.get("matchFileNames") == ["Dockerfile.full"]
+    )
+    assert full_index > global_index
+    full_policy = SpecifierSet(full_rule["allowedVersions"])
+    assert Version("3.13") in full_policy
+    assert Version("3.14") not in full_policy
 
     tensorflow_rules = [
         (index, rule) for index, rule in python_rules if rule.get("matchFileNames") == ["Dockerfile.tensorflow"]

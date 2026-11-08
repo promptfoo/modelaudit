@@ -5209,24 +5209,6 @@ def _build_onnx_weight_analysis_plan(
             output_shapes_out.update(output_shapes)
         return graph_output_index in promoted_output_indexes
 
-    def graph_outputs_may_reference_tainted(
-        subgraph: Any,
-        graph_input_names: set[str],
-        opset_versions: dict[str, int],
-        attribute_bindings: dict[str, Any] | None = None,
-        *,
-        depth: int = 0,
-    ) -> bool:
-        return bool(
-            graph_tainted_output_indexes(
-                subgraph,
-                graph_input_names,
-                opset_versions,
-                attribute_bindings=attribute_bindings,
-                depth=depth,
-            )
-        )
-
     graph_taint_cache: dict[tuple[Any, ...], set[int]] = {}
     graph_taint_in_progress: set[tuple[Any, ...]] = set()
     graph_taint_nodes_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}
@@ -9478,15 +9460,19 @@ def _build_onnx_weight_analysis_plan(
             lineage_input_indexes = {
                 input_index for input_index, input_name in enumerate(node.input) if value_lineages.get(str(input_name))
             }
-            dynamic_activation_input_indexes = {
-                input_index
-                for input_index, input_name in enumerate(node.input)
-                if value_lineages.get(str(input_name))
-                and all(
-                    lineage.unresolved_reason == "dynamic_activation_lineage"
-                    for lineage in value_lineages[str(input_name)].values()
-                )
-            }
+            dynamic_activation_input_indexes: set[int] = set()
+            for input_index, input_name in enumerate(node.input):
+                input_reasons = {
+                    lineage.unresolved_reason for lineage in value_lineages.get(str(input_name), {}).values()
+                }
+                # Shape-only sources from e.g. a dynamic Reshape do not supply
+                # tensor values to the contraction. Require activation evidence
+                # on each operand and keep unaccounted sources inconclusive.
+                if input_reasons == {"dynamic_activation_lineage"} or (
+                    input_reasons == {"dynamic_activation_lineage", "shape_control_lineage"}
+                    and not value_lineage_limit_gap_counts.get(str(input_name))
+                ):
+                    dynamic_activation_input_indexes.add(input_index)
             batch_normalization_activation_parameter_lineages: set[int] = set()
             if (
                 is_builtin_neural_operator

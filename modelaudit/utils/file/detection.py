@@ -34,6 +34,7 @@ from ..helpers.json_limits import validate_json_structural_limits
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
+from .safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
 
 # Known GGML header variants (older formats like GGMF and GGJT)
 GGML_MAGIC_VARIANTS = {
@@ -123,7 +124,8 @@ _SENTENCEPIECE_MIN_STRONG_PIECES = 8
 _SENTENCEPIECE_MAX_PIECE_FIELDS = 16
 _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
 _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES = 512
-_SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 512
+_SENTENCEPIECE_MAX_METADATA_FIELDS = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 4096
 _SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES = 64 * 1024
 _SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES = 4096
 _SENTENCEPIECE_UNKNOWN_PIECE_TYPE = 2
@@ -339,6 +341,15 @@ _STRUCTURED_JSON_TRAILING_READ_BYTES = 64 * 1024
 FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
 _FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
 _FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
+_FLAX_AUXILIARY_SUFFIXES = frozenset({".a", ".cact", ".dylib", ".jsonl", ".log", ".so", ".vocab", ".wav"})
+_FLAX_AUXILIARY_KEY_SCAN_BYTES = 128 * 1024 * 1024
+# Every supported MessagePack str/bin encoding ends its header with the key length.
+# Fixstr stores the same length in the low five bits of the marker itself.
+_FLAX_ROUTING_KEY_ENDINGS = tuple(
+    bytes([length_prefix | len(key)]) + key.encode("ascii")
+    for key in _FLAX_MSGPACK_ROUTING_KEYS
+    for length_prefix in (0, 0xA0)
+)
 _FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
 _FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
 _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
@@ -1868,6 +1879,15 @@ def _hf_tokenizer_json_digest_matches_identity(key: _HFTokenizerEOFProofKey, exp
     return hasher.digest() == expected_digest
 
 
+_TEKKEN_JSON_FILENAME = re.compile(r"(?:v[0-9]+\.)?tekken\.json")
+_TEKKEN_FIELDS = {
+    (): {"config", "vocab", "special_tokens"},
+    ("config",): {"pattern", "num_vocab_tokens", "default_vocab_size", "default_num_special_tokens", "version"},
+    ("vocab", "[]"): {"rank", "token_bytes", "token_str"},
+    ("special_tokens", "[]"): {"rank", "token_str", "is_control"},
+}
+
+
 def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
     """Return whether bounded streaming JSON proves exact tokenizer ownership."""
     try:
@@ -1925,6 +1945,9 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     except OSError:
         return False
 
+    tekken = _TEKKEN_JSON_FILENAME.fullmatch(file_path.name.lower()) is not None
+    tekken_vocab_seen = False
+    tekken_version: str | None = None
     stack: list[_JSONStreamContext] = []
     root_keys: set[str] = set()
     model_keys: set[str] = set()
@@ -1959,6 +1982,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     def tracked_keys(path: tuple[str, ...]) -> set[str] | None:
         if path == ():
             return root_keys
+        if tekken and path in _TEKKEN_FIELDS:
+            return set()
         if path == ("model",):
             return model_keys
         return None
@@ -1984,7 +2009,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         context.pending_key = None
 
     def finish_container(byte: int) -> None:
-        nonlocal root_complete, saw_model_schema
+        nonlocal root_complete, saw_model_schema, tekken_vocab_seen
         context = stack[-1] if stack else None
         if (
             context is None
@@ -1992,6 +2017,12 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             or (byte == ord("]") and context.kind != "array")
         ):
             raise _JSONProbeInvalid
+        if tekken and context.kind == "object":
+            legacy_root = context.path == () and tekken_version == "v7" and context.seen_keys == {"config", "vocab"}
+            if not legacy_root and context.seen_keys != _TEKKEN_FIELDS.get(context.path):
+                raise _JSONProbeInvalid
+            if context.path == ("vocab", "[]"):
+                tekken_vocab_seen = True
         if context.path == ("model",) and model_type is not None and model_vocab_kind is not None:
             saw_model_schema = model_vocab_kind == ("array" if model_type == "Unigram" else "object")
         stack.pop()
@@ -2012,11 +2043,16 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     def string_needs_capture(path: tuple[str, ...], is_key: bool) -> bool:
         return (
             (is_key and not _hf_tokenizer_stream_path_skips_templates(path))
+            or (tekken and path in {("config", "pattern"), ("config", "version"), ("vocab", "[]", "token_bytes")})
             or path == ("model", "type")
             or (len(path) == 1 and path[0] in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS)
         )
 
     def string_scans_templates(path: tuple[str, ...]) -> bool:
+        if tekken:
+            # Token spellings can contain arbitrary text. Every object key is
+            # checked against the schema; only configuration strings need probing.
+            return not string_is_key and path[:1] == ("config",)
         return bool(path) and not _hf_tokenizer_stream_path_skips_templates(path)
 
     def begin_string(*, is_key: bool) -> None:
@@ -2040,6 +2076,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             context.pending_key = ""
             context.mode = "colon"
             return
+        if tekken and key not in _TEKKEN_FIELDS[context.path]:
+            raise _JSONProbeInvalid
         if context.seen_keys is not None:
             if key in context.seen_keys or len(context.seen_keys) >= _HF_TOKENIZER_STREAM_MAX_TRACKED_KEYS:
                 raise _JSONProbeInvalid
@@ -2055,7 +2093,20 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         context.mode = "colon"
 
     def note_string_value(value: str | None) -> None:
-        nonlocal model_type
+        nonlocal model_type, tekken_version
+        if tekken and value is not None:
+            if string_path == ("vocab", "[]", "token_bytes") and not (
+                len(value) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value)
+            ):
+                raise _JSONProbeInvalid
+            if string_path == ("config", "version"):
+                if not re.fullmatch(r"v[0-9]+", value):
+                    raise _JSONProbeInvalid
+                tekken_version = value
+            if string_path == ("config", "pattern") and any(
+                marker in value for marker in _JSON_PROBE_TEMPLATE_INDICATORS
+            ):
+                raise _JSONProbeInvalid
         if string_path == ("model", "type"):
             model_type = value if value in _HF_TOKENIZER_MODEL_TYPES else None
         if (
@@ -2067,6 +2118,23 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             raise _JSONProbeInvalid
 
     def expected_value_marker(path: tuple[str, ...], byte: int) -> None:
+        if tekken:
+            field = path[-1]
+            if field in {"config", "[]"}:
+                markers = b"{"
+            elif field in {"vocab", "special_tokens"}:
+                markers = b"["
+            elif field == "token_str" and path[0] == "vocab":
+                markers = b'"n'
+            elif field in {"pattern", "version", "token_bytes", "token_str"}:
+                markers = b'"'
+            elif field == "is_control":
+                markers = b"tf"
+            else:
+                markers = b"0123456789"
+            if byte not in markers:
+                raise _JSONProbeInvalid
+            return
         if path in {("model",)} and byte != ord("{"):
             raise _JSONProbeInvalid
         if path in {("added_tokens",)} and byte != ord("["):
@@ -2110,6 +2178,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         if len(token) > _HF_TOKENIZER_STREAM_MAX_PRIMITIVE_BYTES:
             raise _JSONProbeInvalid
         if token not in {b"true", b"false", b"null"} and _JSON_NUMBER_PREFIX_RE.fullmatch(token) is None:
+            raise _JSONProbeInvalid
+        if tekken and token[:1].isdigit() and not token.isdigit():
             raise _JSONProbeInvalid
         if (
             model_vocab_kind == "object"
@@ -2280,8 +2350,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         and current_stat.st_dev == expected_stat.st_dev
         and current_stat.st_ino == expected_stat.st_ino
         and current_change_token == change_token
-        and root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"}
-        and saw_model_schema
+        and (tekken_vocab_seen if tekken else (root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"} and saw_model_schema))
     )
     if not owns_tokenizer:
         return False
@@ -2306,6 +2375,8 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
 def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
     """Return whether bounded filename and schema evidence proves tokenizer JSON ownership."""
     file_path = Path(path)
+    if _TEKKEN_JSON_FILENAME.fullmatch(file_path.name.lower()):
+        return _hf_tokenizer_json_eof_proves_ownership(file_path)
     if not _is_hf_tokenizer_json_schema_path(file_path):
         return False
     if _hf_tokenizer_json_eof_proves_ownership(file_path):
@@ -2689,7 +2760,11 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
         if file_size < 4:
             return None
 
-        read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+        probe_index = (
+            file_path.name.lower() == "model.safetensors.index.json"
+            and MXNET_SYMBOL_SIGNATURE_READ_BYTES < file_size <= INDEX_PROBE_BYTES
+        )
+        read_size = file_size + 1 if probe_index else min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
         with file_path.open("rb") as handle:
             prefix = handle.read(read_size)
             normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
@@ -2697,6 +2772,9 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
             if trimmed_prefix and not trimmed_prefix.startswith(b"{"):
                 return None
     except OSError:
+        return None
+
+    if probe_index and len(prefix) == file_size and is_plain_safetensors_index(prefix):
         return None
 
     is_disguised_non_json = file_path.suffix.lower() != ".json"
@@ -2827,6 +2905,9 @@ class _PickleStructuralArgumentInconclusive(ValueError):
 
 def _canonicalize_cpython_numeric_line(opcode_byte: int, line: bytes) -> bytes | None:
     """Return a pickletools-readable line matching CPython's numeric parser."""
+    # A truncated memo index can still be ruled out by its first byte.
+    if opcode_byte in (ord("p"), ord("g")) and line and line[0] not in b"0123456789+- \t\r\v\f":
+        return _INVALID_PICKLE_NUMERIC_LINE
     if opcode_byte not in b"IFLpg" or not line.endswith(b"\n"):
         return None
 
@@ -3037,6 +3118,11 @@ def _gen_pickle_probe_ops(stream: _PickleProbeStream) -> Iterator[tuple[Any, Any
                 if not global_name:
                     raise ValueError(f"empty global name in {opcode.name} argument")
                 argument = ("global_argument", module_name, global_name)
+            elif opcode.name in {"PUT", "GET"} and opcode.arg is not None:
+                line = stream.readline()
+                if line == _INVALID_PICKLE_NUMERIC_LINE:
+                    raise ValueError(f"at position {position}, opcode {opcode.name} has an invalid memo index")
+                argument = opcode.arg.reader(BytesIO(line))
             elif opcode.name in {"SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
                 length_size = {"SHORT_BINBYTES": 1, "BINBYTES": 4, "BINBYTES8": 8, "BYTEARRAY8": 8}[opcode.name]
                 length_bytes = stream.read(length_size)
@@ -3091,23 +3177,6 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
-_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = frozenset(
-    {
-        "BINPERSID",
-        "BUILD",
-        "EXT1",
-        "EXT2",
-        "EXT4",
-        "GLOBAL",
-        "INST",
-        "NEWOBJ",
-        "NEWOBJ_EX",
-        "OBJ",
-        "PERSID",
-        "REDUCE",
-        "STACK_GLOBAL",
-    }
-)
 _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
     {
         "BINPERSID",
@@ -3121,6 +3190,9 @@ _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
         "REDUCE",
         "STACK_GLOBAL",
     }
+)
+_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.union(
+    {"BUILD", "NEWOBJ", "NEWOBJ_EX"}
 )
 _PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
     {
@@ -3388,7 +3460,7 @@ def _is_well_formed_sentencepiece_submessage_stream(
     end_offset: int,
     *,
     expected_wire_types: dict[int, int] | None = None,
-    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+    max_fields: int = _SENTENCEPIECE_MAX_METADATA_FIELDS,
 ) -> bool:
     fields_seen = 0
     while stream.tell() < end_offset and fields_seen < max_fields:
@@ -4086,7 +4158,7 @@ def _looks_like_coreml_description_proto_prefix(data: bytes, *, sample_is_prefix
         tag, value_offset = tag_result
         field_number = tag >> 3
         wire_type = tag & 0x07
-        if field_number == 0:
+        if field_number == 0 or wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
             return False
 
         if wire_type == 2 and field_number in _COREML_DESCRIPTION_FIELD_HINTS:
@@ -4155,7 +4227,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool
         tag, value_offset = tag_result
         field_number = tag >> 3
         wire_type = tag & 0x07
-        if field_number == 0:
+        if field_number == 0 or wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
             return False
         if field_number == 1 and wire_type != 0:
             return False
@@ -4395,8 +4467,13 @@ def _classify_protocolless_binary_pickle_security_signal(
         for opcode, _arg, position in pickletools.genops(sample):
             opcode_count += 1
             opcode_name = opcode.name
-            if opcode_name == "PROTO" and opcode_count == 1:
-                return False
+            if opcode_count == 1:
+                if opcode_name == "PROTO":
+                    return False
+                # A stack-consuming data opcode cannot start a fresh load. For
+                # example, TUPLE in "torch" fails before the apparent OBJ.
+                if opcode.stack_before and opcode_name not in _BINARY_PICKLE_SECURITY_OPCODES:
+                    return False
             if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_OPCODES:
                 has_binary_opcode = True
             if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
@@ -4556,52 +4633,13 @@ def _pickle_structural_argument(
     if opcode_name in {"BINPUT", "BINGET", "PROTO", "EXT1"}:
         value = _read_pickle_structure_bytes(handle, sample, argument_offset, 1, file_size)
         return (False, None) if value is None else (True, value[0])
-    if opcode_name in {"LONG_BINPUT", "LONG_BINGET", "EXT4"}:
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 4, file_size)
+    if opcode_name in {"LONG_BINPUT", "LONG_BINGET", "EXT2", "EXT4"}:
+        width = 2 if opcode_name == "EXT2" else 4
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, width, file_size)
         return (False, None) if value is None else (True, int.from_bytes(value, "little"))
-    if opcode_name == "EXT2":
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 2, file_size)
-        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
-    if opcode_name in {"GLOBAL", "INST"}:
-        lines = _read_pickle_structure_bytes(
-            handle,
-            sample,
-            argument_offset,
-            argument_end - argument_offset,
-            file_size,
-        )
-        if lines is None:
-            return False, None
-        module_name, separator, remainder = lines.partition(b"\n")
-        global_name, second_separator, trailing = remainder.partition(b"\n")
-        if not module_name or not separator or not global_name or not second_separator or trailing:
-            return False, None
-        try:
-            argument_encoding = "ascii" if opcode_name == "INST" else "utf-8"
-            return True, (
-                "global_argument",
-                module_name.decode(argument_encoding),
-                global_name.decode(argument_encoding),
-            )
-        except UnicodeDecodeError:
-            return False, None
-    if opcode_name in {"PUT", "GET", "INT", "LONG", "FLOAT"}:
-        line = _read_pickle_structure_bytes(
-            handle,
-            sample,
-            argument_offset,
-            argument_end - argument_offset,
-            file_size,
-        )
-        if line is None:
-            return False, None
-        canonical = _canonicalize_cpython_numeric_line(opcode.code.encode("latin-1")[0], line)
-        if canonical is None or canonical == _INVALID_PICKLE_NUMERIC_LINE:
-            return False, None
-        if opcode_name in {"PUT", "GET", "INT", "LONG"}:
-            return True, int(canonical[:-1])
-        return True, float(canonical[:-1])
-    if opcode.arg is not None and opcode.arg.n == -1:
+    if opcode_name in {"GLOBAL", "INST", "PUT", "GET", "INT", "LONG", "FLOAT"} or (
+        opcode.arg is not None and opcode.arg.n == -1
+    ):
         line_argument = _read_pickle_structure_bytes(
             handle,
             sample,
@@ -4611,6 +4649,27 @@ def _pickle_structural_argument(
         )
         if line_argument is None:
             return False, None
+        if opcode_name in {"GLOBAL", "INST"}:
+            module_name, separator, remainder = line_argument.partition(b"\n")
+            global_name, second_separator, trailing = remainder.partition(b"\n")
+            if not module_name or not separator or not global_name or not second_separator or trailing:
+                return False, None
+            try:
+                argument_encoding = "ascii" if opcode_name == "INST" else "utf-8"
+                return True, (
+                    "global_argument",
+                    module_name.decode(argument_encoding),
+                    global_name.decode(argument_encoding),
+                )
+            except UnicodeDecodeError:
+                return False, None
+        if opcode_name in {"PUT", "GET", "INT", "LONG", "FLOAT"}:
+            canonical = _canonicalize_cpython_numeric_line(opcode.code.encode("latin-1")[0], line_argument)
+            if canonical is None or canonical == _INVALID_PICKLE_NUMERIC_LINE:
+                return False, None
+            if opcode_name in {"PUT", "GET", "INT", "LONG"}:
+                return True, int(canonical[:-1])
+            return True, float(canonical[:-1])
         reader = BytesIO(line_argument)
         try:
             parsed_argument = opcode.arg.reader(reader)
@@ -4649,8 +4708,8 @@ def _pickle_structural_argument(
     if opcode_name == "BYTEARRAY8":
         payload_length = argument_end - argument_offset - 8
         return (payload_length >= 0, ("bytearray_length", max(payload_length, 0)))
-    if opcode_name in {"BININT", "BININT1", "BININT2"}:
-        width = {"BININT": 4, "BININT1": 1, "BININT2": 2}[opcode_name]
+    if opcode_name in {"BININT", "BININT1", "BININT2", "FRAME"}:
+        width = {"BININT": 4, "BININT1": 1, "BININT2": 2, "FRAME": 8}[opcode_name]
         value = _read_pickle_structure_bytes(handle, sample, argument_offset, width, file_size)
         if value is None:
             return False, None
@@ -4695,9 +4754,6 @@ def _pickle_structural_argument(
             remaining_offset += len(chunk)
             remaining -= len(chunk)
         return True, int.from_bytes(leading_payload, "little", signed=True)
-    if opcode_name == "FRAME":
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 8, file_size)
-        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
     return True, None
 
 
@@ -4993,15 +5049,38 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
     return _validated_safetensors_routing_header(path, magic8, file_size) is not None
 
 
-def has_safetensors_routing_candidate(path: str) -> bool:
-    """Return whether a local file has bounded plausible SafeTensors framing."""
+def safetensors_length_has_pickle_extension(magic8: bytes) -> bool:
+    """Recognize a reachable registry lookup followed by an invalid opcode in the length field."""
+    stream = BytesIO(magic8)
+    try:
+        for opcode, code, _ in pickletools.genops(stream):
+            if opcode.name in {"NEWTRUE", "NEWFALSE"}:
+                continue
+            return (
+                opcode.name in {"EXT1", "EXT2", "EXT4"}
+                and isinstance(code, int)
+                and code > 0
+                and stream.read(1) == b"\x00"
+            )
+    except (ValueError, OverflowError):
+        # A malformed pickle prefix cannot reach an extension lookup.
+        return False
+    return False
+
+
+def safetensors_routing_prefix(path: str) -> bytes | None:
+    """Return the length prefix for bounded plausible SafeTensors framing."""
     file_path = Path(path)
     try:
         file_size = file_path.stat().st_size
         magic8 = read_magic_bytes(path, 8)
     except OSError:
-        return False
-    return _is_safetensors_routing_candidate(file_path, magic8, file_size)
+        return None
+    return magic8 if _is_safetensors_routing_candidate(file_path, magic8, file_size) else None
+
+
+def has_safetensors_routing_candidate(path: str) -> bool:
+    return safetensors_routing_prefix(path) is not None
 
 
 def _apply_pickle_stack_effect(
@@ -5572,6 +5651,10 @@ def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_siz
         return "safetensors"
 
     header_len, header = validated_header
+    if header is not None and safetensors_length_has_pickle_extension(magic8):
+        # The extension lookup remains independently actionable. Archive dispatch
+        # composes the pickle scanner with the primary SafeTensors scanner.
+        return "safetensors"
     try:
         if header is None:
             with path.open("rb") as handle:
@@ -5863,8 +5946,13 @@ def _looks_like_pytorch_zip_storage_members(member_names: set[str], prefix: str)
     return False
 
 
-def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -> bool:
-    """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
+def _matches_zip_content(
+    path: str,
+    config: dict[str, Any] | None,
+    matches: Callable[[zipfile.ZipFile], bool],
+    *,
+    extra_errors: tuple[type[Exception], ...] = (),
+) -> bool:
     file_path = Path(path)
     if not file_path.is_file():
         return False
@@ -5873,28 +5961,10 @@ def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -
 
     try:
         with open_preflighted_zip(file_path, config) as archive:
-            manifest_info = None
-            manifest_name = _normalize_archive_member_name(_TORCHSERVE_MANIFEST_PATH)
-            for info in archive.infolist():
-                if _normalize_archive_member_name(info.filename) == manifest_name:
-                    manifest_info = info
-                    break
-
-            if manifest_info is None:
-                return False
-
-            manifest_bytes = _read_zip_member_bounded(archive, manifest_info, _TORCHSERVE_MANIFEST_MAX_BYTES)
-            manifest_data = json.loads(manifest_bytes.decode("utf-8"))
-            return _looks_like_torchserve_manifest(manifest_data)
-    except (
-        OSError,
-        RuntimeError,
-        ValueError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        zipfile.BadZipFile,
-        zipfile.LargeZipFile,
-    ):
+            return matches(archive)
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+    except extra_errors:
         return False
     except ZipPreflightRejected:
         if config is not None:
@@ -5902,30 +5972,45 @@ def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -
         return False
 
 
+def _has_torchserve_manifest(archive: zipfile.ZipFile) -> bool:
+    manifest_info = None
+    manifest_name = _normalize_archive_member_name(_TORCHSERVE_MANIFEST_PATH)
+    for info in archive.infolist():
+        if _normalize_archive_member_name(info.filename) == manifest_name:
+            manifest_info = info
+            break
+
+    if manifest_info is None:
+        return False
+
+    manifest_bytes = _read_zip_member_bounded(archive, manifest_info, _TORCHSERVE_MANIFEST_MAX_BYTES)
+    manifest_data = json.loads(manifest_bytes.decode("utf-8"))
+    return _looks_like_torchserve_manifest(manifest_data)
+
+
+def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -> bool:
+    """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
+    return _matches_zip_content(path, config, _has_torchserve_manifest, extra_errors=(ValueError,))
+
+
 def _is_keras_zip_archive_content(archive: zipfile.ZipFile, *, allow_config_only: bool = False) -> bool:
     """Return whether an open ZIP has the minimal Keras archive structure."""
-    member_names: set[str] = set()
+    has_marker = False
     config_info: zipfile.ZipInfo | None = None
     for info in archive.infolist():
         if not info.filename or info.is_dir():
             continue
 
         normalized_name = _normalize_archive_member_name(info.filename)
-        member_names.add(normalized_name)
         if normalized_name == _KERAS_ZIP_REQUIRED_ENTRY:
             config_info = info
-
-    if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
-        return False
-
-    if allow_config_only:
-        return True
-
-    if any(marker in member_names for marker in _KERAS_ZIP_MARKERS):
-        return True
+        elif normalized_name in _KERAS_ZIP_MARKERS:
+            has_marker = True
 
     if config_info is None:
         return False
+    if allow_config_only or has_marker:
+        return True
 
     try:
         config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
@@ -5952,97 +6037,87 @@ def is_keras_zip_archive(
     config: dict[str, Any] | None = None,
 ) -> bool:
     """Return whether a ZIP-backed file has the minimal Keras archive structure."""
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
+    return _matches_zip_content(
+        path, config, lambda archive: _is_keras_zip_archive_content(archive, allow_config_only=allow_config_only)
+    )
 
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
 
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            return _is_keras_zip_archive_content(archive, allow_config_only=allow_config_only)
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
+def _has_pytorch_zip_layout(archive: zipfile.ZipFile) -> bool:
+    member_names = {
+        _normalize_archive_member_name(info.filename)
+        for info in archive.infolist()
+        if info.filename and not info.is_dir()
+    }
+
+    for name in member_names:
+        if name == "data.pkl":
+            prefix = ""
+        elif name.endswith("/data.pkl"):
+            prefix = name[: -len("/data.pkl")]
+        else:
+            continue
+
+        if _looks_like_pytorch_zip_metadata(archive, prefix):
+            return True
+        if _looks_like_pytorch_zip_storage_members(member_names, prefix):
+            return True
+
+    return False
 
 
 def is_pytorch_zip_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed file has a conservative PyTorch archive signature."""
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
+    return _matches_zip_content(path, config, _has_pytorch_zip_layout)
 
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
 
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            member_names = {
-                _normalize_archive_member_name(info.filename)
-                for info in archive.infolist()
-                if info.filename and not info.is_dir()
-            }
+def _has_executorch_zip_layout(archive: zipfile.ZipFile) -> bool:
+    members_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+    for info in archive.infolist():
+        if not info.filename or info.is_dir():
+            continue
+        name = _normalize_archive_member_name(info.filename).casefold()
+        members_by_name.setdefault(name, []).append(info)
 
-            for name in member_names:
-                if name == "data.pkl":
-                    prefix = ""
-                elif name.endswith("/data.pkl"):
-                    prefix = name[: -len("/data.pkl")]
-                else:
-                    continue
+    for name in members_by_name:
+        if name == "bytecode.pkl":
+            prefix = ""
+        elif name.endswith("/bytecode.pkl"):
+            prefix = name[: -len("/bytecode.pkl")]
+        else:
+            continue
 
-                if _looks_like_pytorch_zip_metadata(archive, prefix):
-                    return True
-                if _looks_like_pytorch_zip_storage_members(member_names, prefix):
-                    return True
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
+        version_name = f"{prefix}/version" if prefix else "version"
+        for version_info in members_by_name.get(version_name, []):
+            version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
+            if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
+                return True
 
     return False
 
 
 def is_executorch_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed file matches the mobile/ExecuTorch archive layout."""
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
+    return _matches_zip_content(path, config, _has_executorch_zip_layout)
 
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
 
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            members_by_name: dict[str, list[zipfile.ZipInfo]] = {}
-            for info in archive.infolist():
-                if not info.filename or info.is_dir():
-                    continue
-                name = _normalize_archive_member_name(info.filename).casefold()
-                members_by_name.setdefault(name, []).append(info)
+def _has_skops_schema(archive: zipfile.ZipFile) -> bool:
+    for info in archive.infolist():
+        if not info.filename or info.is_dir():
+            continue
 
-            for name in members_by_name:
-                if name == "bytecode.pkl":
-                    prefix = ""
-                elif name.endswith("/bytecode.pkl"):
-                    prefix = name[: -len("/bytecode.pkl")]
-                else:
-                    continue
+        basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
+        if basename not in _SKOPS_SCHEMA_ENTRIES:
+            continue
+        if info.file_size > _SKOPS_SCHEMA_MAX_BYTES:
+            return True
 
-                version_name = f"{prefix}/version" if prefix else "version"
-                for version_info in members_by_name.get(version_name, []):
-                    version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
-                    if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
-                        return True
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
+        try:
+            schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
+        except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            continue
+
+        if _looks_like_skops_schema(schema_data):
+            return True
 
     return False
 
@@ -6054,39 +6129,7 @@ def is_skops_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     misnamed archives whose schema content cannot be safely parsed within the
     bounded read limit.
     """
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
-
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
-
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            for info in archive.infolist():
-                if not info.filename or info.is_dir():
-                    continue
-
-                basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
-                if basename not in _SKOPS_SCHEMA_ENTRIES:
-                    continue
-                if info.file_size > _SKOPS_SCHEMA_MAX_BYTES:
-                    return True
-
-                try:
-                    schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
-                except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-                    continue
-
-                if _looks_like_skops_schema(schema_data):
-                    return True
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
-
-    return False
+    return _matches_zip_content(path, config, _has_skops_schema)
 
 
 def _is_nemo_root_config_member(member_name: str) -> bool:
@@ -7974,6 +8017,18 @@ def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpoint
             return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
 
+    if file_path.suffix.lower() == ".jsonl":
+        first_line, newline, rest = prefix.lstrip().partition(b"\n")
+        if newline and rest.lstrip().startswith(b"{"):
+            try:
+                first_object = json.loads(first_line)
+            except (ValueError, RecursionError):
+                pass
+            else:
+                if isinstance(first_object, dict):
+                    # Subsequent records cannot add fields to this complete JSON root.
+                    return has_jax_json_checkpoint_structure(first_object)
+
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
     except json.JSONDecodeError:
@@ -8261,7 +8316,30 @@ def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | 
     """Inspect streamed maps, returning None when safe routing cannot complete."""
     try:
         with path.open("rb") as stream:
-            return _probe_flax_msgpack_checkpoint_stream(stream, file_size)
+            outcome = _probe_flax_msgpack_checkpoint_stream(stream, file_size)
+            if outcome is not None or file_size > _FLAX_AUXILIARY_KEY_SCAN_BYTES:
+                return outcome
+            if path.suffix.lower() not in _FLAX_AUXILIARY_SUFFIXES:
+                stream.seek(0)
+                if not stream.read(4).startswith(b"\x7fELF"):
+                    return None
+
+            # A delayed checkpoint root may lie beyond the structural probe budget.
+            # Exclude it only if every byte rules out all supported routing keys.
+            stream.seek(0)
+            remaining = file_size
+            overlap = max(map(len, _FLAX_ROUTING_KEY_ENDINGS)) - 1
+            tail = b""
+            while remaining:
+                chunk = stream.read(min(remaining, FLAX_MSGPACK_STRUCTURE_READ_BYTES))
+                if not chunk:
+                    return None
+                window = tail + chunk
+                if any(ending in window for ending in _FLAX_ROUTING_KEY_ENDINGS):
+                    return None
+                tail = window[-overlap:]
+                remaining -= len(chunk)
+            return None if stream.read(1) else False
     except OSError:
         return None
 
@@ -9005,6 +9083,30 @@ def _detect_complete_media_route_from_trailing(trailing: bytes, *, sample_is_pre
     return VALID_MEDIA_ROUTING_FORMAT
 
 
+def _detect_pcm_wave_route(header: bytes, file_size: int | None, read_at: Callable[[int, int], bytes]) -> str | None:
+    """Inspect trailing bytes on canonical PCM WAVE files without masking overlapping model formats."""
+    if len(header) < 44 or header[:4] != b"RIFF" or header[8:16] != b"WAVEfmt " or header[36:40] != b"data":
+        return None
+    fmt_size, codec, channels, sample_rate, byte_rate, frame_size, bits = struct.unpack_from("<IHHIIHH", header, 16)
+    if fmt_size != 16 or codec != 1 or not channels or not sample_rate or bits not in {8, 16, 24, 32}:
+        return None
+    if frame_size != channels * (bits // 8) or byte_rate != sample_rate * frame_size:
+        return None
+    data_size = int.from_bytes(header[40:44], "little")
+    riff_end = 8 + int.from_bytes(header[4:8], "little")
+    if data_size % frame_size or riff_end != 44 + data_size + (data_size % 2):
+        return None
+    if file_size is None or riff_end >= file_size:
+        return None
+    trailing_size = file_size - riff_end
+    try:
+        trailing = read_at(riff_end, min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1))
+    except (OSError, ValueError):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    route = _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=len(trailing) < trailing_size)
+    return None if route == VALID_MEDIA_ROUTING_FORMAT else route
+
+
 def _could_start_bounded_media_route(file_path: Path, sample: bytes, *, sample_is_prefix: bool = True) -> bool:
     """Return whether bounded bytes plausibly begin a supported media stream."""
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
@@ -9129,6 +9231,17 @@ def _detect_seekable_jpeg_media_route(file_path: Path, file_size: int, sample: b
 
 def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
     """Inspect a bounded complete media sample before serialized fallback routing."""
+    if file_path.suffix.lower() == ".wav":
+        try:
+            header = read_magic_bytes(str(file_path), 44)
+        except OSError:
+            return None
+        wave_route = _detect_pcm_wave_route(
+            header, file_size, lambda offset, size: _read_local_media_range(file_path, header, offset, size)
+        )
+        if wave_route is not None and _probe_flax_msgpack_checkpoint_file(file_path) is not False:
+            return None
+        return wave_route
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
         return None
     try:

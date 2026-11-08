@@ -2,6 +2,16 @@ use std::borrow::Cow;
 
 pub(crate) const MAX_PROTOCOL0_LINE_OPERAND_BYTES: usize = 8 * 1024 * 1024;
 
+pub(crate) const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
+    "BINSTRING",
+    "BINUNICODE",
+    "BINUNICODE8",
+    "SHORT_BINSTRING",
+    "SHORT_BINUNICODE",
+    "STRING",
+    "UNICODE",
+];
+
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum ArgValue {
@@ -72,16 +82,22 @@ pub(crate) struct ParsedOpcode {
     pub(crate) next: usize,
 }
 
+impl ParsedOpcode {
+    pub(crate) fn has_invalid_persistent_id(&self) -> bool {
+        self.name == "PERSID" && matches!(&self.arg, ArgValue::Text(id) if !id.is_ascii())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ParseError {
     pub(crate) message: String,
     pub(crate) exception_type: &'static str,
     pub(crate) report_index: Option<usize>,
-    kind: ParseErrorKind,
+    pub(crate) kind: ParseErrorKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParseErrorKind {
+pub(crate) enum ParseErrorKind {
     Generic,
     Protocol0LineOperandLimit,
 }
@@ -101,15 +117,6 @@ impl ParseError {
         self
     }
 
-    fn not_enough_fixed_width(read_kind: &'static str, index: usize) -> Self {
-        Self {
-            message: format!("not enough data in stream to read {read_kind}"),
-            exception_type: "ValueError",
-            report_index: Some(index),
-            kind: ParseErrorKind::Generic,
-        }
-    }
-
     fn protocol0_line_operand_limit(read_kind: &'static str, index: usize) -> Self {
         Self {
             message: format!(
@@ -119,10 +126,6 @@ impl ParseError {
             report_index: Some(index),
             kind: ParseErrorKind::Protocol0LineOperandLimit,
         }
-    }
-
-    pub(crate) fn is_protocol0_line_operand_limit(&self) -> bool {
-        self.kind == ParseErrorKind::Protocol0LineOperandLimit
     }
 }
 pub(crate) fn parse_opcode(
@@ -409,10 +412,10 @@ fn read_fixed_width_span(
         .checked_add(len)
         .ok_or_else(|| ParseError::new("pickle opcode length overflow").at(*cursor))?;
     if end > limit || end > payload.len() {
-        return Err(ParseError::not_enough_fixed_width(
-            read_kind,
-            limit.min(payload.len()),
-        ));
+        return Err(
+            ParseError::new(format!("not enough data in stream to read {read_kind}"))
+                .at(limit.min(payload.len())),
+        );
     }
     let start = *cursor;
     *cursor = end;
@@ -613,7 +616,7 @@ fn decode_hex_codepoint(value: &[u8]) -> Option<char> {
     char::from_u32(codepoint)
 }
 
-fn decode_hex_byte(high: u8, low: u8) -> Option<u8> {
+pub(crate) fn decode_hex_byte(high: u8, low: u8) -> Option<u8> {
     Some((hex_value(high)? << 4) | hex_value(low)?)
 }
 
@@ -862,7 +865,7 @@ mod tests {
         };
 
         assert_eq!(error.exception_type, "ValueError");
-        assert!(error.is_protocol0_line_operand_limit());
+        assert_eq!(error.kind, ParseErrorKind::Protocol0LineOperandLimit);
         assert!(error.message.contains("protocol 0 line operand exceeds"));
         assert_eq!(
             error.report_index,

@@ -115,14 +115,18 @@ def test_detects_setitem_with_scalar_key_on_rebuild_tensor_target(tmp_path: Path
 def test_helper_tracks_legacy_rebuild_tensor_object_targets(target_opcode: bytes) -> None:
     pickle_bytes = b"\x80\x02" + target_opcode + _binunicode8("key") + _binunicode8("value") + b"s."
 
-    assert pickle_scanner._pickle_has_rebuild_tensor_setitem_abuse(pickle_bytes)
+    assert pickle_scanner._analyze_pickle_setitem_entries(
+        pickle_bytes, global_needles=("_rebuild_tensor",), literal_needles=("_rebuild_tensor",)
+    ).has_abuse
 
 
 @pytest.mark.parametrize("key_opcode", [b"Popaque\n", b"\x82\x01", b"\x97"])
 def test_helper_preserves_rebuild_target_for_opaque_keys(key_opcode: bytes) -> None:
     pickle_bytes = b"\x80\x05" + _rebuild_tensor_probe_target() + key_opcode + _binunicode8("value") + b"s."
 
-    assert pickle_scanner._pickle_has_rebuild_tensor_setitem_abuse(pickle_bytes)
+    assert pickle_scanner._analyze_pickle_setitem_entries(
+        pickle_bytes, global_needles=("_rebuild_tensor",), literal_needles=("_rebuild_tensor",)
+    ).has_abuse
 
 
 def test_helper_preserves_rebuild_target_across_pop_mark() -> None:
@@ -130,7 +134,9 @@ def test_helper_preserves_rebuild_target_across_pop_mark() -> None:
         b"\x80\x04" + _rebuild_tensor_probe_target() + b"(N1" + _binunicode8("key") + _binunicode8("value") + b"s."
     )
 
-    assert pickle_scanner._pickle_has_rebuild_tensor_setitem_abuse(pickle_bytes)
+    assert pickle_scanner._analyze_pickle_setitem_entries(
+        pickle_bytes, global_needles=("_rebuild_tensor",), literal_needles=("_rebuild_tensor",)
+    ).has_abuse
 
 
 def test_detects_setitem_near_binunicode8_dangerous_global(tmp_path: Path) -> None:
@@ -300,10 +306,10 @@ def test_byte_literals_do_not_form_stack_global_names() -> None:
     summary = pickle_scanner._pickle_opcode_summary(pickle_bytes)
 
     assert summary["dangerous_globals"] == []
-    assert not pickle_scanner._pickle_has_setitem_abuse_for_entries(
+    assert not pickle_scanner._analyze_pickle_setitem_entries(
         pickle_bytes,
         global_needles=("os.system",),
-    )
+    ).has_abuse
 
 
 @pytest.mark.parametrize(
@@ -527,7 +533,10 @@ def test_complete_non_result_rebuild_targets_do_not_trigger_setitem_cve(tmp_path
 
     result = PickleScanner().scan(str(path))
 
-    assert pickle_scanner._pickle_has_rebuild_tensor_setitem_abuse(payload) is False
+    analysis = pickle_scanner._analyze_pickle_setitem_entries(
+        payload, global_needles=("_rebuild_tensor",), literal_needles=("_rebuild_tensor",)
+    )
+    assert analysis.has_abuse is False
     assert _cve_2026_24747_issues(result) == []
 
 

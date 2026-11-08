@@ -7,7 +7,7 @@ Scoped agent guide for work inside `packages/modelaudit-picklescan/`. The root [
 `modelaudit-picklescan` is the Rust-backed pickle scanner that ships as an independent PyPI package. The root `modelaudit` wheel depends on it at runtime via a hard `modelaudit-picklescan>=0.1.13,<0.2.0` pin in the root `pyproject.toml`.
 
 - **Public API** — exported from `src/modelaudit_picklescan/__init__.py`: `PickleScanner`, `ScanOptions`, `scan_file`, `scan_bytes`, `scan_stream`, `shared_source_sensitive_caches`, `PickleReport`, `Finding`, `Notice`, `ScanError`, `Severity`, `ScanStatus`, `SafetyVerdict`, `CoverageSummary`. Treat these names as a stable surface.
-- **Rust engine** — `rust/src/` compiled to `modelaudit_picklescan._rust` via maturin + PyO3. Rust 1.83+, edition 2021.
+- **Rust engine** — `rust/src/` compiled to `modelaudit_picklescan._rust` via maturin + PyO3. Rust 1.85+, edition 2021.
 - **Zero Python runtime deps** — the wheel is intentionally self-contained.
 - **Typed** — ships `py.typed`. Public models are frozen dataclasses with `to_dict()`.
 
@@ -40,8 +40,8 @@ Run from `packages/modelaudit-picklescan/`:
 
 ```bash
 uv lock --check
-uv run --with 'ruff==0.17.0' ruff check src tests
-uv run --with 'ruff==0.17.0' ruff format --check src tests
+uv run --with 'ruff==0.17.2' ruff check src tests
+uv run --with 'ruff==0.17.2' ruff format --check src tests
 uv run --with 'mypy>=2.4.0,<2.5.0' --with pytest mypy src tests
 uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
 
