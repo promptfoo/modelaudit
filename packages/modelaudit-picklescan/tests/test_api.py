@@ -10596,6 +10596,10 @@ def test_scan_bytes_warns_on_import_only_custom_global_that_executes_module_init
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and finding.severity == Severity.WARNING
         and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and "import-only global reference" in finding.message
+        and finding.why is not None
+        and "import-time initialization" in finding.why
+        and "invoked" not in finding.details
         for finding in report.findings
     )
     pickle.loads(payload)
@@ -11203,14 +11207,16 @@ def test_scan_bytes_allows_inert_source_with_nonimportable_unchecked_cache(
     assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
 
 
+@pytest.mark.parametrize("opcode", [b"R", b"\x81"], ids=["REDUCE", "NEWOBJ"])
 def test_scan_bytes_warns_on_invoked_global_from_inert_source_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    opcode: bytes,
 ) -> None:
     module_name = f"modelaudit_c095_inert_invoked_payload_{uuid.uuid4().hex}"
     (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
-    payload = f"c{module_name}\nGadget\n)R.".encode()
+    payload = b"\x80\x02" + _global(module_name.encode(), b"Gadget") + b")" + opcode + b"."
 
     report = scan_bytes(payload, source=f"{module_name}.pkl")
 
@@ -11218,6 +11224,10 @@ def test_scan_bytes_warns_on_invoked_global_from_inert_source_module(
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.severity == Severity.WARNING
+        and "used by a pickle invocation" in finding.message
+        and finding.why is not None
+        and "object reconstruction" in finding.why
         and finding.details.get("invoked") is True
         for finding in report.findings
     )
