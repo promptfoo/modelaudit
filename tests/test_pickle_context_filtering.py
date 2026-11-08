@@ -4,6 +4,7 @@ import json
 import os
 import pickle
 import struct
+import sys
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -44,8 +45,24 @@ def test_rust_pickle_scanner_keeps_common_ml_serialization_clean(tmp_path: Path)
 
     result = PickleScanner().scan(str(path))
 
-    assert result.success is True
-    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    diagnostic = json.dumps(
+        {
+            "python": sys.version,
+            "executable": sys.executable,
+            "platform": sys.platform,
+            "modules": {
+                name: getattr(sys.modules.get(name), "__file__", None)
+                for name in ("modelaudit", "modelaudit_picklescan", "modelaudit_picklescan._rust")
+            },
+            "result": result.to_dict(include_private_metadata=True),
+        },
+        indent=2,
+    )
+    print(diagnostic)
+    assert result.success is True, diagnostic
+    assert not [
+        issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ], diagnostic
 
 
 def test_rust_pickle_scanner_does_not_let_ml_context_hide_dangerous_reduce(tmp_path: Path) -> None:
