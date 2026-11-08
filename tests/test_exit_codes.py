@@ -6,7 +6,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.core_results import add_issue_to_model, results_have_inconclusive_outcome
+from modelaudit.core_results import add_issue_to_model, consolidate_checks, results_have_inconclusive_outcome
 
 # Ensure models are rebuilt for forward references
 from modelaudit.models import ModelAuditResultModel, rebuild_models
@@ -779,3 +779,40 @@ def test_directory_total_size_limit_returns_exit_code_2(tmp_path: Path) -> None:
         and issue.details.get("analysis_incomplete") is True
         for issue in results.issues
     )
+
+
+def test_mixed_check_summary_preserves_security_evidence_in_either_order() -> None:
+    passive = Check(
+        name="Network",
+        status=CheckStatus.FAILED,
+        severity=IssueSeverity.INFO,
+        message="Documentation link",
+        why="A link appears in the file",
+        location="model.txt:1",
+        details={"kind": "link"},
+    )
+    active = Check(
+        name="Network",
+        status=CheckStatus.FAILED,
+        severity=IssueSeverity.CRITICAL,
+        message="Network call",
+        why="A call can run",
+        location="model.txt:2",
+        details={"kind": "call"},
+    )
+    for checks in ([passive, active], [active, passive]):
+        result = _create_result_model(checks=checks)
+        consolidate_checks(result)
+        [summary] = result.checks
+        assert (summary.severity, summary.why, summary.location) == (active.severity, active.why, active.location)
+        assert summary.message == "Network reported 2 findings"
+        assert summary.details["findings"] == [check.details for check in checks]
+        assert result.failed_checks == 1
+
+    second_link = passive.model_copy(update={"message": "Source link"})
+    result = _create_result_model(checks=[passive, second_link])
+    consolidate_checks(result)
+    [summary] = result.checks
+    assert summary.severity == IssueSeverity.INFO
+    assert summary.message == "Network reported 2 findings"
+    assert result.failed_checks == 0

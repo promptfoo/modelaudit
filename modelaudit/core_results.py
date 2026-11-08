@@ -577,12 +577,13 @@ def _create_consolidated_message(
             return str(next(iter(messages)))
         return f"{check_name} completed successfully"
 
-    failed_messages = {c.get("message", "") for c in group_checks if c.get("status") == "failed"}
-
+    failed = [check for check in group_checks if check.get("status") == "failed"]
+    failed_messages = {check.get("message", "") for check in failed}
     if len(failed_messages) == 1:
         return str(next(iter(failed_messages)))
-    if failed_count == 1:
-        return f"{check_name} found 1 issue"
+
+    if any(check.get("severity") in ("info", "debug") for check in failed):
+        return f"{check_name} reported {failed_count} findings"
     return f"{check_name} found {failed_count} issues"
 
 
@@ -599,24 +600,6 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
         consolidated_details["findings"] = failed_details
 
     return consolidated_details
-
-
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-    """Extract severity and explanation from failed checks."""
-    consolidated_severity = None
-    consolidated_why = None
-
-    for check in group_checks:
-        if check.get("status") == "failed":
-            if not consolidated_severity and check.get("severity"):
-                consolidated_severity = check["severity"]
-            if not consolidated_why and check.get("why"):
-                consolidated_why = check["why"]
-
-            if consolidated_severity and consolidated_why:
-                break
-
-    return consolidated_severity, consolidated_why
 
 
 def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
@@ -683,11 +666,19 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
             ),
             _create_consolidated_message(raw_check_name, identity_checks, consolidated_status, failed_count),
         )
+        representative = group_checks[0]
+        if failed_count:
+            # Failed checks without a severity still count toward failure statistics.
+            severity_rank = {"debug": 0, "info": 1, "warning": 3, "critical": 4}
+            representative = max(
+                (check for check in group_checks if check.get("status") == "failed"),
+                key=lambda check: (severity_rank.get(check.get("severity", ""), 2), bool(check.get("why"))),
+            )
         consolidated_check = {
             "name": raw_check_name,
             "status": consolidated_status,
             "message": message,
-            "location": group_checks[0].get("location", primary_asset),
+            "location": representative.get("location", primary_asset),
             "details": _collect_consolidated_details(group_checks),
             "timestamp": _get_consolidated_timestamp(group_checks),
         }
@@ -697,13 +688,12 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
             "check_consolidation",
             name=check_name,
             message=identity_message,
-            location=identity_checks[0].get("location", primary_asset),
+            location=finding_identity(representative).get("location", primary_asset),
         )
-        consolidated_severity, consolidated_why = _extract_failure_context(group_checks)
-        if consolidated_severity:
-            consolidated_check["severity"] = consolidated_severity
-        if consolidated_why:
-            consolidated_check["why"] = consolidated_why
+        if failed_count:
+            for field in ("severity", "why"):
+                if representative.get(field):
+                    consolidated_check[field] = representative[field]
 
         consolidated_checks.append(consolidated_check)
 
