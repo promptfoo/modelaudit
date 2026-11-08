@@ -17,6 +17,43 @@ pub(crate) struct GlobalRef {
 }
 
 impl GlobalRef {
+    pub(crate) fn new(module: String, name: String, position: usize) -> Self {
+        Self {
+            module,
+            name,
+            position,
+            malformed: false,
+            memo_index: None,
+            memo_read: false,
+        }
+    }
+
+    pub(crate) fn from_stack_operands(
+        module: Option<&StackValue>,
+        name: Option<&StackValue>,
+        payload: &[u8],
+        position: usize,
+    ) -> Self {
+        let module = resolve_global_operand(module, payload);
+        let name = resolve_global_operand(name, payload);
+        Self {
+            malformed: module.is_none() || name.is_none(),
+            ..Self::new(
+                module.unwrap_or_else(|| "__unknown__".to_owned()),
+                name.unwrap_or_else(|| "__unknown__".to_owned()),
+                position,
+            )
+        }
+    }
+
+    pub(crate) fn extension(code: i64, position: usize) -> Self {
+        let name = format!("code_{code}");
+        Self {
+            malformed: true,
+            ..Self::new("copyreg.extension".to_owned(), name, position)
+        }
+    }
+
     pub(crate) fn symbol(&self) -> String {
         format!("{}.{}", self.module, self.name)
     }
@@ -272,25 +309,6 @@ pub(crate) fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<S
     stack_value_text(value, payload).map(Cow::into_owned)
 }
 
-pub(crate) fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<String> {
-    pytorch_storage_persistent_id_items(value, payload)
-        .and_then(|items| stack_value_string(&items[2], payload))
-}
-
-pub(crate) fn pytorch_storage_descriptor_ref<'a>(
-    value: &'a StackValue,
-    payload: &[u8],
-) -> Option<&'a GlobalRef> {
-    pytorch_storage_persistent_id_items(value, payload)?;
-    let StackValue::Tuple(items) = value else {
-        return None;
-    };
-    let StackValue::Global(reference) = &items[1] else {
-        return None;
-    };
-    Some(reference)
-}
-
 pub(crate) fn stack_value_from_integer_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
     match arg {
         ArgValue::Int(value) => StackValue::Primitive {
@@ -365,27 +383,46 @@ fn stack_value_text<'payload>(
     }
 }
 
-fn pytorch_storage_persistent_id_items<'a>(
+pub(crate) struct PytorchStorageId<'a> {
+    pub(crate) descriptor: Option<&'a GlobalRef>,
+    pub(crate) key: Cow<'a, str>,
+}
+
+pub(crate) fn pytorch_storage_persistent_id<'a>(
     value: &'a StackValue,
-    payload: &[u8],
-) -> Option<&'a Vec<StackValue>> {
+    payload: &'a [u8],
+) -> Option<PytorchStorageId<'a>> {
     let StackValue::Tuple(items) = value else {
         return None;
     };
-    if items.len() != 5 || stack_value_text(&items[0], payload).as_deref() != Some("storage") {
+    let [tag, descriptor, key, location, size] = items.as_slice() else {
+        return None;
+    };
+    if stack_value_text(tag, payload).as_deref() != Some("storage") {
         return None;
     }
-    if !is_pytorch_storage_descriptor(&items[1], payload) {
-        return None;
-    }
-    stack_value_text(&items[2], payload)?;
-    stack_value_text(&items[3], payload)?;
-    match &items[4] {
-        StackValue::Primitive { type_name, repr }
-            if *type_name == "int" && repr.parse::<u64>().is_ok() => {}
+    let descriptor = match descriptor {
+        StackValue::Global(reference)
+            if is_known_pytorch_storage_global(&reference.module, &reference.name) =>
+        {
+            Some(reference)
+        }
+        StackValue::Text { .. } | StackValue::TextSpan { .. }
+            if is_known_pytorch_storage_reference_text(&stack_value_text(descriptor, payload)?) =>
+        {
+            None
+        }
         _ => return None,
+    };
+    let key = stack_value_text(key, payload)?;
+    stack_value_text(location, payload)?;
+    match size {
+        StackValue::Primitive {
+            type_name: "int",
+            repr,
+        } if repr.parse::<u64>().is_ok() => Some(PytorchStorageId { descriptor, key }),
+        _ => None,
     }
-    Some(items)
 }
 
 fn is_known_pytorch_storage_name(name: &str) -> bool {
@@ -420,20 +457,6 @@ fn is_known_pytorch_storage_reference_text(text: &str) -> bool {
     text.strip_prefix("torch.storage.")
         .or_else(|| text.strip_prefix("torch."))
         .is_some_and(is_known_pytorch_storage_name)
-}
-
-fn is_pytorch_storage_descriptor(value: &StackValue, payload: &[u8]) -> bool {
-    match value {
-        StackValue::Global(reference) => {
-            is_known_pytorch_storage_global(&reference.module, &reference.name)
-        }
-        StackValue::Text { value, .. } => is_known_pytorch_storage_reference_text(value),
-        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
-            let text = String::from_utf8_lossy(&payload[*start..*end]);
-            is_known_pytorch_storage_reference_text(&text)
-        }
-        _ => false,
-    }
 }
 
 fn integer_text_repr(value: &str) -> Option<String> {
