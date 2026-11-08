@@ -24,6 +24,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Show the REDUCE byte position and requested spelling when a pickle calls `_codecs.encode` with a Latin-1 text encoding. The warning explains how the consumer selects the encoder.
 - Include bounded changed-context and source-fingerprint details when call-graph analysis fails closed because its source snapshot becomes unstable.
 - Support standard CPython 3.14 with standalone package tests and installed-wheel API checks, preserving Python 3.10 compatibility.
 
