@@ -46,8 +46,19 @@ PYTHON_EXECUTION_NAMES = frozenset(
 )
 UNSAFE_PYTHON_LOADERS = {
     f"{module}.{method}" for module in ("pickle", "_pickle", "dill", "cloudpickle") for method in ("load", "loads")
-} | {"joblib.load", "torch.hub.load"}
+} | {"joblib.load", "torch.hub.load", "yaml.unsafe_load", "yaml.unsafe_load_all"}
 TORCH_LOADERS = {"torch.load", "torch.serialization.load"}
+YAML_LOADERS = {"yaml.load", "yaml.load_all"}
+SAFE_YAML_LOADER_CLASSES = {
+    "yaml.SafeLoader",
+    "yaml.CSafeLoader",
+    "yaml.BaseLoader",
+    "yaml.CBaseLoader",
+    "yaml.loader.SafeLoader",
+    "yaml.loader.BaseLoader",
+    "yaml.cyaml.CSafeLoader",
+    "yaml.cyaml.CBaseLoader",
+}
 URL_RISK_TERMS = (
     NetworkCommDetector.INFORMATIONAL_URL_RISK_TERMS
     + tuple(term.decode("ascii") for term in NetworkCommDetector.CC_PATTERNS)
@@ -254,6 +265,7 @@ def _shell_url_spans(source: bytes) -> list[tuple[int, int]]:
         if not command.strip():
             offset += len(line)
             continue
+        command_offset = offset + len(line) - len(command)
         command = _without_shell_comment(command)
         if any(char in command for char in b"$`;&|<>\\"):
             return []
@@ -265,8 +277,8 @@ def _shell_url_spans(source: bytes) -> list[tuple[int, int]]:
         if urls is None:
             return []
         spans.extend(
-            (offset + match.start(), offset + match.end())
-            for match in URL_PATTERN.finditer(line)
+            (command_offset + match.start(), command_offset + match.end())
+            for match in URL_PATTERN.finditer(command)
             if match.group().decode("utf-8") in urls
         )
         offset += len(line)
@@ -291,6 +303,43 @@ def _literal_api_url(node: ast.expr) -> ast.Constant | None:
     return None
 
 
+def _loader_name(target: ast.expr, imports: dict[str, str]) -> tuple[str, str] | None:
+    parts: list[str] = []
+    while isinstance(target, ast.Attribute):
+        if len(parts) >= 3:
+            return None
+        parts.append(target.attr)
+        target = target.value
+    if not isinstance(target, ast.Name):
+        return None
+    return target.id, ".".join([imports.get(target.id, target.id), *reversed(parts)])
+
+
+def _known_safe_loader_call(name: str, call: ast.Call | None, imports: dict[str, str]) -> bool:
+    # An alias or expanded arguments cannot establish which loader options will run.
+    if (
+        call is None
+        or any(isinstance(arg, ast.Starred) for arg in call.args)
+        or any(kw.arg is None for kw in call.keywords)
+    ):
+        return False
+    if name in TORCH_LOADERS:
+        return all(
+            kw.arg != "weights_only" or (isinstance(kw.value, ast.Constant) and kw.value.value is True)
+            for kw in call.keywords
+        )
+    parameter, position = ("allow_pickle", 2) if name == "numpy.load" else ("Loader", 1)
+    values = [kw.value for kw in call.keywords if kw.arg == parameter]
+    if len(call.args) > position:
+        values.append(call.args[position])
+    if name == "numpy.load":
+        return not values or (len(values) == 1 and isinstance(values[0], ast.Constant) and values[0].value is False)
+    if len(values) != 1:
+        return False
+    loader = _loader_name(values[0], imports)
+    return loader is not None and loader[1] in SAFE_YAML_LOADER_CLASSES
+
+
 def _has_unsafe_loader_reference(nodes: list[ast.AST]) -> bool:
     imports: dict[str, str] = {}
     for node in nodes:
@@ -305,38 +354,29 @@ def _has_unsafe_loader_reference(nodes: list[ast.AST]) -> bool:
                     return True
                 imports[alias.asname or alias.name] = name
 
-    # A reference can be rebound to another name before it is called. Exempt
-    # torch.load only at a direct call site with known options.
+    # A loader reference can be rebound to another name before it is called.
     direct_calls = {node.func: node for node in nodes if isinstance(node, ast.Call)}
     for target in nodes:
         if not isinstance(target, (ast.Attribute, ast.Name)):
             continue
-        if isinstance(target, ast.Attribute) and target.attr not in {"load", "loads"}:
+        if isinstance(target, ast.Attribute) and target.attr not in {
+            "load",
+            "loads",
+            "load_all",
+            "unsafe_load",
+            "unsafe_load_all",
+        }:
             continue
-        parent: ast.expr = target
-        parts: list[str] = []
-        while isinstance(parent, ast.Attribute):
-            if len(parts) >= 3:
-                return True  # Longer loader paths fall outside the supported examples.
-            parts.append(parent.attr)
-            parent = parent.value
-        if not isinstance(parent, ast.Name):
-            continue
-        name = ".".join([imports.get(parent.id, parent.id), *reversed(parts)])
+        resolved = _loader_name(target, imports)
+        if resolved is None:
+            return True
+        root, name = resolved
         if name in UNSAFE_PYTHON_LOADERS:
             return True
-        if name in TORCH_LOADERS:
-            call = direct_calls.get(target)
-            if call is None or any(
-                keyword.arg is None
-                or (
-                    keyword.arg == "weights_only"
-                    and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is True)
-                )
-                for keyword in call.keywords
-            ):
+        if name in TORCH_LOADERS or name in YAML_LOADERS or name == "numpy.load":
+            if not _known_safe_loader_call(name, direct_calls.get(target), imports):
                 return True
-        elif parts and parent.id not in imports and name not in {"json.load", "json.loads"}:
+        elif isinstance(target, ast.Attribute) and root not in imports and name not in {"json.load", "json.loads"}:
             # The receiver may be an alias imported in another Markdown block.
             return True
     return False
@@ -666,6 +706,27 @@ def _ends_with_execution_directive(prefix: str) -> bool:
     return any(match.end() == len(prefix) for match in EXECUTION_DIRECTIVE_PATTERN.finditer(prefix))
 
 
+def _inline_command_context(source: bytes, before: str) -> bool:
+    if source.startswith((b"./", b".\\", b"../")) or _ends_with_execution_directive(before):
+        return True
+    # Model cards commonly present tensor dimensions and precision types as inline data.
+    prose = before.rstrip().casefold()
+    if prose.endswith("shape is") and source.startswith(b"(") and source.endswith(b")"):
+        dimensions = source[1:-1].split(b",")
+        if len(dimensions) > 1 and all(re.fullmatch(rb"[A-Za-z_]\w*|\d+", part.strip()) for part in dimensions):
+            return False
+    if prose.endswith("model supports"):
+        words = source.split()
+        if (
+            len(words) >= 3
+            and len(words) % 2 == 1
+            and all(word in {b"and", b"or"} for word in words[1::2])
+            and all(re.fullmatch(rb"bfloat16|float(?:16|32|64)|u?int(?:8|16|32|64)", word) for word in words[::2])
+        ):
+            return False
+    return re.search(rb"\s|[();|&]", source) is not None
+
+
 def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int]]) -> bool:
     delimiter_count = 0
     html_regions: list[tuple[int, int]] = []
@@ -708,12 +769,9 @@ def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int
                 return True
             source = payload[left.end() : right.start()].replace(b"\r", b" ").replace(b"\n", b" ").strip()
             prefix = payload[max(start, left.start() - 64) : left.start()]
-            command_context = (
-                source.startswith((b"./", b".\\", b"../"))
-                or re.search(rb"\s|[();|&]", source) is not None
-                or _ends_with_execution_directive(prefix.decode("utf-8", errors="replace"))
-            )
-            if command_context and _example_executes_script(source, b""):
+            if _inline_command_context(source, prefix.decode("utf-8", errors="replace")) and _example_executes_script(
+                source, b""
+            ):
                 return True
             html_regions.append((previous_end, left.start()))
             previous_end = right.end()
@@ -788,10 +846,12 @@ class _HTMLCodeExamples(HTMLParser):
                 self.executes_script = True
                 return
             self.tags.append(tag)
-        elif self.tags and tag == "br":
+        elif tag == "br" or (not self.tags and tag in {"p", "div", "li"}):
             self.handle_data("\n")
 
     def handle_endtag(self, tag: str) -> None:
+        if not self.tags and tag in {"p", "div", "li"}:
+            self.handle_data("\n")
         if self.executes_script or tag not in {"pre", "code"}:
             return
         if not self.tags or self.tags.pop() != tag:
@@ -799,7 +859,7 @@ class _HTMLCodeExamples(HTMLParser):
             return
         if not self.tags:
             source = "".join(self.parts).encode().strip()
-            if self.command_context or re.search(rb"\s|[();|&]", source):
+            if self.command_context or _inline_command_context(source, self.before):
                 self.executes_script = _example_executes_script(source, self.language)
             self.parts.clear()
             self.size = 0

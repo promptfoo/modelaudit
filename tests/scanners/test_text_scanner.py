@@ -6223,6 +6223,8 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         "```bash\n'./repo/install'\n```\n",
         "```bash\n'.\\repo\\install'\n```\n",
         "Run `./repo/install` next.\n",
+        "The model supports `python repo/install.py` as a setup command.\n",
+        "The input shape is <code>python repo/install.py</code>.\n",
         "**Run** `./repo/install` next.\n",
         "**Run** python repo/install.py\n",
         "<!-- A hidden `note` -->\nRun `python repo/install.py` next.\n",
@@ -6345,6 +6347,8 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         'Run "python" repo/install.py next.\n',
         "Run python repo/install.py when you're ready.\n",
         "<p>Run <b>python</b> repo/install.py next.</p>\n",
+        "<p>Run</p><p>python repo/install.py</p>\n",
+        "Run<br>python repo/install.py\n",
         "Run runpy.run_path('repo/install.py') next.\n",
         "```bash\n./repo/install.sh\n```\n",
         "```bash\n./repo/install.py --help\n```\n",
@@ -6443,6 +6447,9 @@ def test_documented_clone_fence_on_list_marker(tmp_path: Path, complete: bool) -
         "```bash\ncat repo/install\n```\n",
         "```bash\ncommand -v ./repo/bin/tool\n```\n",
         "The file `repo/bin/tool` contains the installer.\n",
+        "The model supports `float32 and float16` precision.\n",
+        "The default shape is `(batch, sequence, hidden)`.\n",
+        "The input shape is <code>(1, steps, 768)</code>.\n",
         '```python\nprint("ctypes.CDLL(./repo/plugin.so)")\n```\n',
         "```python\nimport ctypes\nvalue = ctypes.c_int(1)\n```\n",
         "```console\nPython.exe --version\n```\n",
@@ -6481,6 +6488,7 @@ def test_documented_clone_fence_on_list_marker(tmp_path: Path, complete: bool) -
         "> ```bash\n> python3 --version\n> ```\n",
         ">     python3 --version\n",
         "Run <b>python3</b> --version\n",
+        "<p>Run</p><p>python3 --version</p>\n",
         "Run the example when you're ready.\n",
         "The source code is available in the cloned repository.\n",
         "<!-- Run python repo/install.py next. -->\n",
@@ -6600,6 +6608,39 @@ def test_routine_clone_with_bibtex_fields(citation: bytes, routine: bool) -> Non
 
     document = b"```sh\ngit clone https://github.com/example/model\n```\n```bibtex\n" + citation + b"\n```\n"
     assert bool(routine_documentation_url_spans(document)) is routine
+
+
+def test_documented_clone_ignores_non_utf8_url_in_shell_comment() -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+
+    url = b"https://github.com/example/model"
+    source = b"```console\n  $ git clone " + url + b" # mirror https://example.org/caf\xe9\n```\n"
+    start = source.index(url)
+    assert routine_documentation_url_spans(source) == ((start, start + len(url)),)
+
+
+@pytest.mark.parametrize(
+    ("example", "routine"),
+    [
+        ("import numpy as np\nnp.load('repo/data.npy')", True),
+        ("from numpy import load as read\nread('repo/data.npy', allow_pickle=False)", True),
+        ("import numpy as np\nnp.load('repo/data.npy', allow_pickle=True)", False),
+        ("import numpy as np\nnp.load('repo/data.npy', None, flag)", False),
+        ("import numpy as np\nnp.load('repo/data.npy', **options)", False),
+        ("import yaml as y\ny.safe_load(stream)", True),
+        ("from yaml import load, SafeLoader as L\nload(stream, Loader=L)", True),
+        ("import yaml as y\ny.load_all(stream, y.CSafeLoader)", True),
+        ("import yaml as y\ny.unsafe_load(stream)", False),
+        ("from yaml import unsafe_load_all as read\nread(stream)", False),
+        ("import yaml as y\ny.load(stream, Loader=y.UnsafeLoader)", False),
+        ("import yaml as y\ny.load_all(stream, **options)", False),
+    ],
+)
+def test_clone_exemption_requires_safe_loader_options(example: str, routine: bool) -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+
+    source = f"```sh\ngit clone https://github.com/example/model\n```\n```python\n{example}\n```\n".encode()
+    assert bool(routine_documentation_url_spans(source)) is routine
 
 
 def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
