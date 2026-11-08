@@ -25,7 +25,7 @@ from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePath, PurePosixPath
-from typing import Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from modelaudit._size_format import _format_size_scaled as _format_size
@@ -47,6 +47,9 @@ from .huggingface_paths import (
     parse_huggingface_url,
     parse_huggingface_url_with_revision,
 )
+
+if TYPE_CHECKING:
+    from ...scanner_results import ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -809,6 +812,44 @@ def _mark_remote_safetensors_overlap_incomplete(
     result.finish(success=False)
 
 
+def _record_remote_shard_coverage(result: "ScanResult", source_path: str, shard_details: dict[str, Any]) -> None:
+    from ...scanners.base import IssueSeverity
+
+    evaluated_shard_details = dict(shard_details)
+    expected_tensor_digest = evaluated_shard_details.get("index_tensor_names_digest")
+    actual_tensor_digest = result.metadata.get("tensor_names_digest")
+    if (
+        evaluated_shard_details.get("index_referenced_by_manifest")
+        and isinstance(expected_tensor_digest, str)
+        and expected_tensor_digest != actual_tensor_digest
+    ):
+        evaluated_shard_details.update(complete=False, index_complete=False)
+        if isinstance(actual_tensor_digest, str):
+            evaluated_shard_details["index_incomplete_reason"] = "index_tensor_assignment_mismatch"
+            evaluated_shard_details["message"] = (
+                "Remote SafeTensors index tensor assignments do not match the shard header."
+            )
+        elif not evaluated_shard_details.get("index_incomplete_reason"):
+            evaluated_shard_details["index_incomplete_reason"] = "shard_tensor_names_digest_unavailable"
+            evaluated_shard_details["message"] = (
+                "Could not verify remote SafeTensors index tensor assignments against the shard header."
+            )
+    result.metadata["remote_shard_family"] = evaluated_shard_details
+    result.add_check(
+        name="Hugging Face SafeTensors Shard Coverage",
+        passed=bool(evaluated_shard_details.get("complete")),
+        message=str(evaluated_shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
+        severity=None if evaluated_shard_details.get("complete") else IssueSeverity.INFO,
+        location=source_path,
+        details=evaluated_shard_details,
+    )
+    if not evaluated_shard_details.get("complete"):
+        from ...scanner_results import mark_inconclusive_scan_result
+
+        mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
+        result.finish(success=False)
+
+
 def _scan_remote_huggingface_safetensors_header(
     repo_id: str,
     filename: str,
@@ -1094,38 +1135,7 @@ def _scan_remote_huggingface_safetensors_header(
                 }
             )
             if shard_details is not None:
-                from ...scanners.base import IssueSeverity
-
-                evaluated_shard_details = dict(shard_details)
-                expected_tensor_digest = evaluated_shard_details.get("index_tensor_names_digest")
-                actual_tensor_digest = result.metadata.get("tensor_names_digest")
-                if (
-                    evaluated_shard_details.get("index_referenced_by_manifest")
-                    and isinstance(expected_tensor_digest, str)
-                    and expected_tensor_digest != actual_tensor_digest
-                ):
-                    evaluated_shard_details.update(
-                        {
-                            "complete": False,
-                            "index_complete": False,
-                            "index_incomplete_reason": "index_tensor_assignment_mismatch",
-                            "message": "Remote SafeTensors index tensor assignments do not match the shard header.",
-                        }
-                    )
-                result.metadata["remote_shard_family"] = evaluated_shard_details
-                result.add_check(
-                    name="Hugging Face SafeTensors Shard Coverage",
-                    passed=bool(evaluated_shard_details.get("complete")),
-                    message=str(evaluated_shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
-                    severity=None if evaluated_shard_details.get("complete") else IssueSeverity.INFO,
-                    location=source_path,
-                    details=evaluated_shard_details,
-                )
-                if not evaluated_shard_details.get("complete"):
-                    from ...scanner_results import mark_inconclusive_scan_result
-
-                    mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
-                    result.finish(success=False)
+                _record_remote_shard_coverage(result, source_path, shard_details)
             if overlap_scanner_ids:
                 result.metadata["remote_overlap_scanner_ids"] = overlap_scanner_ids
                 _mark_remote_safetensors_overlap_incomplete(
@@ -1169,13 +1179,16 @@ def _scan_remote_huggingface_safetensors_header(
 
 
 def _remote_safetensors_filename_shard_details_by_file(
-    model_files: list[str], repo_files: list[str]
+    model_files: list[str], repo_files: list[str], *, selected_filenames: Collection[str] | None = None
 ) -> dict[str, dict[str, Any]]:
     """Return per-shard filename coverage details derived from the immutable repository listing."""
     from modelaudit.utils.file.handlers import _summarize_missing_shard_indices
 
+    if not model_files:
+        return {}
     grouped: dict[tuple[str, int], dict[int, list[str]]] = {}
-    selected = set(model_files)
+    header_files = set(model_files)
+    selected = header_files if selected_filenames is None else set(selected_filenames)
     for filename in repo_files:
         parsed = _parse_hf_safetensors_shard(filename) or _parse_hf_safetensors_shard_shape(filename)
         if parsed is None:
@@ -1203,7 +1216,7 @@ def _remote_safetensors_filename_shard_details_by_file(
             and len(present_filenames) == expected_total
         )
         message = (
-            f"All {expected_total} remote SafeTensors shard headers are selected for inspection."
+            f"All {expected_total} remote SafeTensors shards are selected for inspection."
             if complete
             else "Remote SafeTensors shard coverage is incomplete."
         )
@@ -1224,9 +1237,14 @@ def _remote_safetensors_filename_shard_details_by_file(
             "unselected_shards": unselected[:20],
             "unselected_shards_truncated": len(unselected) > 20,
         }
-        for filename in present_filenames:
-            if filename in selected:
-                details_by_file[filename] = dict(group_details)
+        selected_members = selected.intersection(present_filenames)
+        ranged_members = header_files.intersection(present_filenames)
+        if not ranged_members:
+            continue
+        if len(ranged_members) < len(selected_members):
+            group_details["planned_materialized_shard_count"] = len(selected_members) - len(ranged_members)
+        for filename in selected_members:
+            details_by_file[filename] = dict(group_details)
     return details_by_file
 
 
@@ -1819,12 +1837,15 @@ def _remote_safetensors_shard_details_by_file(
     deadline: float | None,
     max_transferred_bytes: int | None,
     retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
+    selected_filenames: Collection[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
     """Return per-shard remote coverage details from filenames and index manifests."""
-    filename_details = _remote_safetensors_filename_shard_details_by_file(model_files, repo_files)
+    filename_details = _remote_safetensors_filename_shard_details_by_file(
+        model_files, repo_files, selected_filenames=selected_filenames
+    )
     index_details, index_bytes, acquired_index_bytes, unscoped_failures = _remote_safetensors_index_details_by_file(
         repo_id,
-        model_files,
+        sorted(set(model_files).union(filename_details)),
         repo_files,
         revision,
         path_sizes,
@@ -5779,6 +5800,7 @@ def download_model_streaming(
             deadline=deadline,
             max_transferred_bytes=(size_limit - content_probe_bytes_transferred if size_limit is not None else None),
             retain_unscoped_failure=retain_unscoped_index_failure,
+            selected_filenames=model_files,
         )
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
@@ -5859,6 +5881,7 @@ def download_model_streaming(
         ) -> tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]:
             nonlocal pending_pretransferred_bytes
 
+            shard_details = shard_details_by_file.get(filename, {})
             accounting = StreamedSourceByteAccounting(
                 pretransferred_bytes=pending_pretransferred_bytes,
                 source_bytes_preaccounted=(
@@ -5871,9 +5894,21 @@ def download_model_streaming(
                     if precomputed_result is None and filename in preaccounted_acquired_index_bytes
                     else None
                 ),
+                huggingface_shard_source=(
+                    f"hf://{repo_id}@{download_revision}/{filename}"
+                    if shard_details.get("planned_materialized_shard_count")
+                    else None
+                ),
+                materialized_shard_details=(
+                    shard_details if precomputed_result is None and shard_details.get("index_manifest") else None
+                ),
             )
             pending_pretransferred_bytes = 0
-            if accounting.pretransferred_bytes or accounting.source_bytes_preaccounted:
+            if (
+                accounting.pretransferred_bytes
+                or accounting.source_bytes_preaccounted
+                or accounting.huggingface_shard_source
+            ):
                 return (path, is_last, precomputed_result, accounting)
             if precomputed_result is not None:
                 return (path, is_last, precomputed_result)

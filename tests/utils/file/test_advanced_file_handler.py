@@ -1,5 +1,6 @@
 """Tests for advanced file handler."""
 
+import json
 import os
 import sys
 import tempfile
@@ -268,6 +269,125 @@ class TestShardedModelDetector:
         assert shard_info["expected_total_shards"] == 3
         assert shard_info["missing_shard_count"] == 1
         assert shard_info["missing_shard_indices"] == [2]
+
+    @pytest.mark.parametrize(
+        "index_contents",
+        [
+            None,
+            "{",
+            '{"weight_map":{"t":"model-00000-of-00001.safetensors","t":"model-00000-of-00001.safetensors"}}',
+            '{"weight_map":{"t":"../model-00000-of-00001.safetensors"}}',
+            '{"weight_map":{"a":"model-00000-of-00001.safetensors","b":"model-00001-of-00001.safetensors"}}',
+        ],
+    )
+    def test_unverified_zero_based_manifest_retains_incomplete_coverage(
+        self, tmp_path: Path, index_contents: str | None
+    ) -> None:
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"shard")
+        if index_contents is not None:
+            (tmp_path / "model.safetensors.index.json").write_text(index_contents)
+
+        info = ShardedModelDetector.detect_shards(str(shard))
+
+        assert info is not None
+        assert info["missing_shard_indices"] == [1]
+        assert "zero_based_manifest_sha256" not in info
+
+    def test_zero_based_manifest_does_not_follow_symlink(self, tmp_path: Path, requires_symlinks: None) -> None:
+        directory = tmp_path / "scan"
+        directory.mkdir()
+        shard = directory / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"shard")
+        outside = tmp_path / "index.json"
+        outside.write_text(json.dumps({"weight_map": {"t": shard.name}}))
+        (directory / "model.safetensors.index.json").symlink_to(outside)
+
+        info = ShardedModelDetector.detect_shards(str(shard))
+
+        assert info is not None
+        assert info["missing_shard_indices"] == [1]
+
+    def test_zero_based_manifest_allows_snapshot_blob_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requires_symlinks: None
+    ) -> None:
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+        repo = tmp_path / "models--test--model"
+        directory = repo / "snapshots" / "revision"
+        directory.mkdir(parents=True)
+        blobs = repo / "blobs"
+        blobs.mkdir()
+        shard = directory / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"shard")
+        target = blobs / "manifest"
+        target.write_text(json.dumps({"weight_map": {"t": shard.name}}))
+        manifest = directory / "model.safetensors.index.json"
+        manifest.symlink_to(target)
+        info = ShardedModelDetector.detect_shards(str(shard))
+        assert info is not None and "zero_based_manifest_sha256" in info
+        outside = tmp_path / "outside"
+        target.rename(outside)
+        target.symlink_to(outside)
+        info = ShardedModelDetector.detect_shards(str(shard))
+        assert info is not None and info["missing_shard_indices"] == [1]
+
+    def test_multiple_shard_families_do_not_read_singleton_manifest(self, tmp_path: Path) -> None:
+        from modelaudit.utils.file import handlers
+
+        with patch.object(handlers, "_local_safetensors_index_target") as resolve:
+            for total in (2, 3, 15):
+                member = tmp_path / f"model-00000-of-{total:05d}.safetensors"
+                member.write_bytes(b"shard")
+                info = ShardedModelDetector.detect_shards(str(member))
+                assert info is not None and info["missing_shard_count"] == total
+            resolve.assert_not_called()
+
+    @pytest.mark.parametrize("valid_manifest", [True, False])
+    def test_zero_based_streaming_exit_code(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, valid_manifest: bool
+    ) -> None:
+        from modelaudit.core import scan_model_streaming
+        from modelaudit.core_results import determine_exit_code
+        from modelaudit.utils.file.handlers import _pinned_windows_shard_scan_path
+
+        if sys.platform == "darwin":
+            monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", _pinned_windows_shard_scan_path)
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"a": shard.name if valid_manifest else "other.safetensors"}})
+        )
+        header = json.dumps({"a": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
+        shard.write_bytes(len(header).to_bytes(8, "little") + header + b"x")
+        result = scan_model_streaming(
+            iter([(shard, True)]),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["safetensors"],
+        )
+        gaps = [
+            check.details["missing_shard_indices"]
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "missing_model_shards"
+        ]
+        assert gaps == ([] if valid_manifest else [[1]])
+        assert determine_exit_code(result) == (0 if valid_manifest else 2)
+
+    def test_zero_based_single_shard_rechecks_manifest_before_scanning(self, tmp_path: Path) -> None:
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"shard")
+        manifest = tmp_path / "model.safetensors.index.json"
+        manifest.write_text(json.dumps({"weight_map": {"t": shard.name}}))
+        handler = AdvancedFileHandler(str(shard), CompletingShardScanner())
+
+        assert handler.shard_info is not None
+        assert "missing_shard_count" not in handler.shard_info
+        manifest.write_text(json.dumps({"weight_map": {"t": "other.safetensors"}}))
+        result = handler.scan()
+
+        assert result.success is False
+        assert "shard_family_changed" in result.metadata["scan_outcome_reasons"]
+        assert any("manifest changed" in str(check.details.get("error", "")) for check in result.checks)
 
     def test_detect_shards_bounds_missing_expected_indices(self, tmp_path: Path) -> None:
         """Huge declared shard totals should not expand into huge missing-index lists."""

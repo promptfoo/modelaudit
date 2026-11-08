@@ -26,11 +26,13 @@ STREAMING_ANALYSIS_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class StreamedSourceByteAccounting:
-    """Internal exact-once byte accounting for trusted streamed scan items."""
+    """Internal byte accounting and source identity for trusted streamed scan items."""
 
     pretransferred_bytes: int = 0
     source_bytes_preaccounted: int = 0
     source_path: str | None = None
+    huggingface_shard_source: str | None = None
+    materialized_shard_details: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for name, value in (

@@ -7632,6 +7632,136 @@ class TestModelDownloadStreaming:
         mock_named_temp.assert_called_once()
         assert mock_named_temp.call_args.kwargs["suffix"] == ".safetensors"
 
+    @pytest.mark.parametrize(
+        "scenario",
+        [
+            "complete",
+            "other-directory",
+            "header-limit",
+            "range-failed",
+            "index",
+            "index-mismatch",
+            "index-limit",
+            "missing-third",
+        ],
+    )
+    def test_mixed_safetensors_shard_inventory(
+        self, scenario: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        local_limit = scenario in {"header-limit", "index-limit"}
+        range_failure = scenario == "range-failed"
+        has_index = scenario.startswith("index")
+        total = 3 if scenario == "missing-third" else 2
+        local = f"model-00001-of-{total:05d}.safetensors"
+        if sys.platform == "darwin":
+            # macOS cannot expose the descriptor-relative directory used by the POSIX pin.
+            from modelaudit.utils.file.handlers import _pinned_windows_shard_scan_path
+
+            monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", _pinned_windows_shard_scan_path)
+        remote = ("other/" if scenario == "other-directory" else "") + f"model-00002-of-{total:05d}.safetensors"
+        filenames = [local, remote]
+        frame, header_len = _make_safetensors_frame(
+            {"weight": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\x00"
+        )
+        local_frame, _ = _make_safetensors_frame(
+            {"local_w": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"x"
+        )
+        index = json.dumps(
+            {"weight_map": {"wrong" if scenario == "index-mismatch" else "local_w": local, "weight": remote}}
+        ).encode()
+        index_name = "model.safetensors.index.json"
+        repo_files = [*filenames, index_name] if has_index else filenames
+        sizes = {local: len(local_frame), remote: len(frame), index_name: len(index)}
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                namespace="test",
+                repo_name="model",
+                repo_id="test/model",
+                deadline=None,
+                size_limit=None,
+                repo_files=repo_files,
+                repo_revision=_HF_TEST_REVISION,
+                selected_files=filenames,
+                selected_sizes={},
+                download_revision=_HF_TEST_REVISION,
+                content_route_formats={local: "compressed", remote: "safetensors"},
+                probe_bytes_transferred=0,
+            ),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (sizes, _HF_TEST_REVISION),
+        )
+
+        def download(*, filename: str, local_dir: str, **_kwargs: object) -> str:
+            path = Path(local_dir) / filename
+            path.write_bytes(local_frame)
+            return str(path)
+
+        with (
+            patch("huggingface_hub.hf_hub_download", side_effect=download),
+            patch("huggingface_hub.utils.build_hf_headers", return_value={}),
+            patch(
+                "requests.get",
+                side_effect=ValueError("range read failed")
+                if range_failure
+                else [
+                    *([_strict_range_response(index, len(index))] if has_index else []),
+                    _strict_range_response(frame[:8], len(frame)),
+                    _strict_range_response(frame[: 8 + header_len], len(frame)),
+                ],
+            ),
+            _temporary_hf_streaming_staging_root(parent=tmp_path) as staging_root,
+        ):
+            streamed = download_model_streaming(
+                "hf://test/model",
+                cache_dir=tmp_path,
+                scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
+                _staging_root=staging_root,
+            )
+            result = scan_model_streaming(
+                streamed,
+                delete_after_scan=False,
+                cache_enabled=False,
+                max_safetensors_header_bytes=1 if local_limit else max(header_len, len(local_frame)),
+                scanners=["safetensors"],
+            )
+        assert result.files_scanned == 2
+        assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks) == (
+            scenario in {"other-directory", "range-failed", "missing-third"}
+        )
+        assert (
+            any(check.name == "Header Size Limit" and check.status.value == "failed" for check in result.checks)
+            == local_limit
+        )
+        assert (
+            any(
+                check.details.get("scan_outcome_reason") == "remote_safetensors_header_range_failed"
+                for check in result.checks
+            )
+            == range_failure
+        )
+        if has_index:
+            checks = [check for check in result.checks if check.name == "Hugging Face SafeTensors Shard Coverage"]
+            assert len(checks) == 2
+            assert all(check.details["index_unselected_shards"] == [] for check in checks)
+            assert all(check.details["planned_materialized_shard_count"] == 1 for check in checks)
+            assert {check.details.get("index_incomplete_reason") for check in checks} == {
+                "index-mismatch": {None, "index_tensor_assignment_mismatch"},
+                "index-limit": {None, "shard_tensor_names_digest_unavailable"},
+                "index": {None},
+            }[scenario]
+        if scenario == "missing-third":
+            assert all(
+                check.details["missing_shard_indices"] == [3]
+                for check in result.checks
+                if check.details.get("scan_outcome_reason") == "missing_model_shards"
+            )
+        assert result.success is (scenario in {"complete", "index"})
+        assert determine_exit_code(result) == (0 if result.success else 2)
+
     @pytest.mark.parametrize("complete", [False, True], ids=["missing", "complete"])
     def test_download_model_streaming_reconciles_custom_stem_shard_family(
         self,
@@ -9356,12 +9486,25 @@ class TestModelDownloadStreaming:
     @patch("huggingface_hub.utils.build_hf_headers")
     @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
     @patch("requests.get")
-    def test_remote_safetensors_index_tensor_assignment_mismatch_fails_closed(
+    @pytest.mark.parametrize(
+        ("assigned_tensor", "tensor_limit", "expected_reason"),
+        [
+            ("actual", 1, None),
+            ("expected", 1, "index_tensor_assignment_mismatch"),
+            ("actual", 0, "shard_tensor_names_digest_unavailable"),
+        ],
+    )
+    def test_remote_safetensors_index_tensor_assignment_verification(
         self,
         mock_requests_get: MagicMock,
         _mock_hf_hub_url: MagicMock,
         mock_build_headers: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        assigned_tensor: str,
+        tensor_limit: int,
+        expected_reason: str | None,
     ) -> None:
+        monkeypatch.setattr("modelaudit.scanners.safetensors_scanner._MAX_SAFETENSORS_TENSORS", tensor_limit)
         frame, _header_len = _make_safetensors_frame(
             {"actual": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
             b"data",
@@ -9385,14 +9528,21 @@ class TestModelDownloadStreaming:
                 "complete": True,
                 "index_complete": True,
                 "index_referenced_by_manifest": True,
-                "index_tensor_names_digest": _tensor_name_digest(["expected"]),
+                "index_tensor_names_digest": _tensor_name_digest([assigned_tensor]),
             },
             active_scanner_ids={"safetensors"},
         )
 
-        assert result.success is False
-        assert result.metadata["remote_shard_family"]["index_incomplete_reason"] == ("index_tensor_assignment_mismatch")
-        assert "remote_safetensors_shard_coverage_incomplete" in result.metadata["scan_outcome_reasons"]
+        family = result.metadata["remote_shard_family"]
+        assert family.get("index_incomplete_reason") == expected_reason
+        assert family["index_complete"] is (expected_reason is None)
+        assert result.success is (expected_reason is None)
+        if expected_reason:
+            assert "remote_safetensors_shard_coverage_incomplete" in result.metadata["scan_outcome_reasons"]
+        if tensor_limit == 0:
+            assert "tensor_names_digest" not in result.metadata
+            assert any(check.name == "SafeTensors Tensor Cardinality Limit" for check in result.checks)
+            assert "Could not verify" in family["message"]
 
     @patch("huggingface_hub.utils.build_hf_headers", return_value={})
     @patch("huggingface_hub.hf_hub_url")
