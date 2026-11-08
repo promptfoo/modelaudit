@@ -8,6 +8,7 @@ Part of ModelAudit's critical security validation suite.
 
 import base64
 import binascii
+import hashlib
 import logging
 import math
 import re
@@ -27,6 +28,26 @@ BASIC_AUTH_PATTERN = (
     rf"([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
 )
 BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES = BASIC_AUTH_TOKEN_MAX_LENGTH + 64
+BITCOIN_ADDRESS_PATTERN = r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b"
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _is_mainnet_bitcoin_address(address: str) -> bool:
+    """Validate the Base58Check payload of a candidate P2PKH or P2SH address."""
+    value = 0
+    for char in address:
+        digit = BASE58_ALPHABET.find(char)
+        if digit < 0:
+            return False
+        value = value * 58 + digit
+
+    leading_zeros = len(address) - len(address.lstrip("1"))
+    decoded = bytes(leading_zeros) + value.to_bytes((value.bit_length() + 7) // 8, "big")
+    if len(decoded) != 25 or decoded[0] not in (0x00, 0x05):
+        return False
+    checksum = hashlib.sha256(hashlib.sha256(decoded[:-4]).digest()).digest()[:4]
+    return decoded[-4:] == checksum
+
 
 # High-priority secret patterns with descriptions
 SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -82,7 +103,7 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     (r"[0-9]{17,19}\.[a-zA-Z0-9_-]{6}\.[a-zA-Z0-9_-]{27}", "Discord Bot Token"),
     (r"[0-9]{9,10}:[a-zA-Z0-9_-]{35}", "Telegram Bot Token"),
     # Cryptocurrency - with word boundaries to avoid false matches
-    (r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", "Bitcoin Address"),
+    (BITCOIN_ADDRESS_PATTERN, "Bitcoin Address"),
     (r"\b0x[a-fA-F0-9]{40}\b", "Ethereum Address"),
     (r"\b[LM][a-km-zA-HJ-NP-Z1-9]{26,33}\b", "Litecoin Address"),
     (r"seed\s+phrase[:=]\s*['\"]([a-z\s]{20,})['\"]", "Crypto Seed Phrase"),
@@ -1733,6 +1754,13 @@ class SecretsDetector:
                 else:
                     secret_text = match.group(0)  # Get full match
                     position = match.start()  # Position of the full match
+
+                if (
+                    description == "Bitcoin Address"
+                    and pattern.pattern == BITCOIN_ADDRESS_PATTERN
+                    and not _is_mainnet_bitcoin_address(secret_text)
+                ):
+                    continue
 
                 # Skip if too short
                 if len(secret_text) < self.min_secret_length:

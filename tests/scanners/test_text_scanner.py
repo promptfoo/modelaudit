@@ -1205,6 +1205,35 @@ def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Pa
     assert failed_secret_checks[0].details["redacted_value"] == "Basic dXNlcjpwYXNz"
 
 
+def test_readme_bitcoin_addresses_require_a_valid_base58check_payload(tmp_path: Path) -> None:
+    # Synthetic mainnet P2PKH (two leading zero bytes) and P2SH addresses.
+    addresses = ["11aEChfUaGVeaY89Dr4zSRPNM84JLGkcA", "31hb9kC72UasjkEZGKWfR4nKWsQmqGB7FA"]
+    notebook_ids = [
+        "11aEChfUaGVeaY89Dr4zSRPNM84JLGkcB",  # Wrong checksum
+        "11aEChfUaGVeaY89Dr4zSRPNM84JLGkcI",  # Invalid Base58 character
+        "118XddrVuPzhEVMCNwco6Jm37piUGuBn",  # Valid checksum, 19-byte hash
+        "3R3C8rVPjf3kZBNeHjqyuC479NfiWjJj1T",  # Valid checksum, wrong version
+    ]
+    readme = tmp_path / "README.md"
+    links = [f"https://colab.research.google.com/drive/{value}" for value in notebook_ids]
+    content = "\n".join([*links, *addresses, "-----BEGIN RSA PRIVATE KEY-----"])
+    readme.write_text(content, encoding="utf-8")
+
+    result = scan_file(str(readme), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "text"
+    failed_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED
+    ]
+    bitcoin_positions = [
+        check.details["position"] for check in failed_checks if check.details["secret_type"] == "Bitcoin Address"
+    ]
+    assert sorted(bitcoin_positions) == [content.index(address) for address in addresses]
+    assert any(check.details["secret_type"] == "RSA Private Key" for check in failed_checks)
+
+
 @pytest.mark.parametrize(
     ("filename", "content", "token"),
     [
