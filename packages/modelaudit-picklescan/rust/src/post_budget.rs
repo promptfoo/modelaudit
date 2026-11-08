@@ -1,11 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap};
 
-use crate::opcode::{parse_opcode, ParsedOpcode};
+use crate::opcode::{parse_opcode, ArgValue, ParsedOpcode, STACK_GLOBAL_STRING_OPCODES};
 use crate::policy::global_severity;
-use crate::stack::{
-    collapse_tuple_values, resolve_global_operand, stack_value_from_integer_arg,
-    stack_value_from_text_arg, GlobalRef, StackValue,
-};
+use crate::stack::{stack_value_from_text_arg, GlobalRef, StackValue};
 
 const POST_BUDGET_REDUCE_PROXIMITY_BYTES: usize = 64;
 const POST_BUDGET_REDUCE_BYTES: &[u8] = b"Rob\x81\x92";
@@ -24,62 +21,61 @@ impl PostBudgetGlobalMatch {
     }
 }
 
-struct PostBudgetGlobalCandidate<'a> {
-    module: &'a str,
-    name: &'a str,
-    pattern_start: usize,
-    proximity_start: usize,
-    severity: &'static str,
-    force_reduce_proximate: bool,
+#[derive(Default)]
+struct PostBudgetMatches {
+    slots: HashMap<(usize, Box<str>, Box<str>), usize>,
+    matches: Vec<PostBudgetGlobalMatch>,
 }
 
-struct PostBudgetRecordSink<'a> {
-    seen: &'a mut HashSet<(usize, String, String)>,
-    matches: &'a mut Vec<PostBudgetGlobalMatch>,
+impl PostBudgetMatches {
+    fn get_or_insert(
+        &mut self,
+        module: &str,
+        name: &str,
+        position: usize,
+        severity: &'static str,
+    ) -> (&mut PostBudgetGlobalMatch, bool) {
+        let index = match self.slots.entry((position, module.into(), name.into())) {
+            Entry::Occupied(slot) => return (&mut self.matches[*slot.get()], false),
+            Entry::Vacant(slot) => *slot.insert(self.matches.len()),
+        };
+        self.matches.push(PostBudgetGlobalMatch {
+            module: module.to_owned(),
+            name: name.to_owned(),
+            pattern_start: position,
+            reduce_proximate: false,
+            severity,
+        });
+        (&mut self.matches[index], true)
+    }
 }
 
 pub(crate) fn post_budget_global_matches(
     tail: &[u8],
+    payload: &[u8],
     initial_stack: &[StackValue],
-    initial_memo_len: usize,
-    resolve_memo_value: impl Fn(i64) -> Option<StackValue>,
+    initial_memo: &HashMap<i64, StackValue>,
 ) -> Vec<PostBudgetGlobalMatch> {
-    let mut matches = Vec::new();
-    let mut seen = HashSet::new();
+    let mut sink = PostBudgetMatches::default();
+    record_post_budget_opcode_stream(tail, payload, initial_stack, initial_memo, &mut sink);
 
-    record_post_budget_opcode_stream(
-        tail,
-        initial_stack,
-        initial_memo_len,
-        &resolve_memo_value,
-        &mut seen,
-        &mut matches,
-    );
-
-    let mut index = 0;
-    while index < tail.len() {
-        if matches!(tail[index], b'c' | b'i') {
-            record_post_budget_module_name_pair(
-                tail,
-                index + 1,
-                index + 1,
-                &mut seen,
-                &mut matches,
-            );
+    for index in 0..tail.len() {
+        match tail[index..] {
+            [b'c' | b'i', ..] => record_post_budget_module_name_pair(tail, index + 1, &mut sink),
+            [0x82, _, ..] | [0x83, _, _, ..] | [0x84, _, _, _, _, ..] => {
+                record_post_budget_extension_ref(tail, index, &mut sink)
+            }
+            _ => {}
         }
-        record_post_budget_extension_ref(tail, index, &mut seen, &mut matches);
-        index += 1;
     }
 
-    matches
+    sink.matches
 }
 
 fn record_post_budget_module_name_pair(
     tail: &[u8],
     module_start: usize,
-    pattern_start: usize,
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
+    sink: &mut PostBudgetMatches,
 ) {
     let Some(module_end) = find_byte_from(tail, module_start, b'\n') else {
         return;
@@ -100,33 +96,48 @@ fn record_post_budget_module_name_pair(
     let Some(severity) = post_budget_global_severity(module, name) else {
         return;
     };
-    if !seen.insert((pattern_start, module.to_string(), name.to_string())) {
-        return;
+    let (found, inserted) = sink.get_or_insert(module, name, module_start, severity);
+    if inserted {
+        // The raw sweep leaves the structured match's proximity unchanged on a duplicate.
+        found.reduce_proximate = has_reduce_class_byte_nearby(tail, name_end.saturating_add(1));
     }
-    let reduce_proximate = has_reduce_class_byte_nearby(tail, name_end.saturating_add(1));
-    matches.push(PostBudgetGlobalMatch {
-        module: module.to_string(),
-        name: name.to_string(),
-        pattern_start,
-        reduce_proximate,
-        severity,
-    });
+}
+
+fn post_budget_owned_stack_value(value: &StackValue, payload: &[u8]) -> StackValue {
+    match value {
+        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
+            StackValue::Text {
+                value: String::from_utf8_lossy(&payload[*start..*end]).to_string(),
+                memo_read: false,
+            }
+        }
+        StackValue::Global(reference) | StackValue::Constructed { reference, .. } => {
+            StackValue::Global(reference.clone())
+        }
+        StackValue::Text { .. } | StackValue::Mark => value.clone(),
+        _ => StackValue::Other,
+    }
 }
 
 fn record_post_budget_opcode_stream(
     tail: &[u8],
+    payload: &[u8],
     initial_stack: &[StackValue],
-    initial_memo_len: usize,
-    resolve_memo_value: &impl Fn(i64) -> Option<StackValue>,
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
+    initial_memo: &HashMap<i64, StackValue>,
+    sink: &mut PostBudgetMatches,
 ) {
-    let mut stack = initial_stack.to_vec();
+    let mut stack: Vec<_> = initial_stack
+        .iter()
+        .map(|value| post_budget_owned_stack_value(value, payload))
+        .collect();
+    let initial_memo: HashMap<_, _> = initial_memo
+        .iter()
+        .map(|(index, value)| (*index, post_budget_owned_stack_value(value, payload)))
+        .collect();
     let mut memo_overlay: HashMap<i64, StackValue> = HashMap::new();
-    let initial_memo_len = i64::try_from(initial_memo_len).unwrap_or(i64::MAX);
+    let initial_memo_len = i64::try_from(initial_memo.len()).unwrap_or(i64::MAX);
     let mut memo_len = initial_memo_len;
     let mut index = 0;
-    let mut sink = PostBudgetRecordSink { seen, matches };
 
     while index < tail.len() {
         let parsed = match parse_opcode(tail, index, tail.len()) {
@@ -147,8 +158,8 @@ fn record_post_budget_opcode_stream(
             &mut stack,
             &mut memo_overlay,
             &mut memo_len,
-            resolve_memo_value,
-            &mut sink,
+            &initial_memo,
+            sink,
         );
 
         index = parsed.next;
@@ -164,39 +175,19 @@ fn handle_post_budget_opcode(
     stack: &mut Vec<StackValue>,
     memo_overlay: &mut HashMap<i64, StackValue>,
     memo_len: &mut i64,
-    resolve_memo_value: &impl Fn(i64) -> Option<StackValue>,
-    sink: &mut PostBudgetRecordSink<'_>,
+    initial_memo: &HashMap<i64, StackValue>,
+    sink: &mut PostBudgetMatches,
 ) {
     match opcode.name {
         "PROTO" | "FRAME" | "STOP" => {}
-        name if is_post_budget_text_opcode(name) => {
+        name if STACK_GLOBAL_STRING_OPCODES.contains(&name) => {
             stack.push(stack_value_from_text_arg(&opcode.arg, tail));
         }
-        "NONE" => stack.push(StackValue::Primitive {
-            type_name: "NoneType",
-            repr: "None".to_string(),
-        }),
-        "NEWTRUE" => stack.push(StackValue::Primitive {
-            type_name: "bool",
-            repr: "True".to_string(),
-        }),
-        "NEWFALSE" => stack.push(StackValue::Primitive {
-            type_name: "bool",
-            repr: "False".to_string(),
-        }),
-        "BININT" | "BININT1" | "BININT2" | "LONG" | "LONG1" | "LONG4" | "INT" => {
-            stack.push(stack_value_from_integer_arg(&opcode.arg, tail));
-        }
-        "FLOAT" | "BINFLOAT" => stack.push(StackValue::Other),
-        "BINBYTES" | "BINBYTES8" | "SHORT_BINBYTES" | "BYTEARRAY8" => {
-            if let Some((start, end)) = opcode.arg.byte_span(tail.len()) {
-                stack.push(StackValue::Bytes { start, end });
-            } else {
-                stack.push(StackValue::Bytes { start: 0, end: 0 });
-            }
-        }
-        "NEXT_BUFFER" => stack.push(StackValue::Other),
-        "READONLY_BUFFER" => {}
+        // Only text operands and callable references need their values in this pass.
+        "NONE" | "NEWTRUE" | "NEWFALSE" | "BININT" | "BININT1" | "BININT2" | "LONG" | "LONG1"
+        | "LONG4" | "INT" | "FLOAT" | "BINFLOAT" | "BINBYTES" | "BINBYTES8" | "SHORT_BINBYTES"
+        | "BYTEARRAY8" | "NEXT_BUFFER" | "EMPTY_TUPLE" | "EMPTY_LIST" | "EMPTY_DICT"
+        | "EMPTY_SET" => stack.push(StackValue::Other),
         "MARK" => stack.push(StackValue::Mark),
         "POP" => {
             stack.pop();
@@ -209,13 +200,7 @@ fn handle_post_budget_opcode(
         "POP_MARK" => {
             pop_to_mark(stack);
         }
-        "EMPTY_TUPLE" => stack.push(StackValue::Tuple(Vec::new())),
-        "EMPTY_LIST" | "EMPTY_DICT" | "EMPTY_SET" => stack.push(StackValue::Other),
-        "TUPLE" => {
-            let values = pop_to_mark(stack);
-            stack.push(collapse_tuple_values(values));
-        }
-        "LIST" | "DICT" | "SET" | "FROZENSET" => {
+        "TUPLE" | "LIST" | "DICT" | "SET" | "FROZENSET" => {
             pop_to_mark(stack);
             stack.push(StackValue::Other);
         }
@@ -223,9 +208,9 @@ fn handle_post_budget_opcode(
         "TUPLE2" => collapse_top_n(stack, 2),
         "TUPLE3" => collapse_top_n(stack, 3),
         "APPEND" | "SETITEM" => {
-            pop_value_operand_preserving_mark(stack);
+            discard_value_operand_preserving_mark(stack);
             if opcode.name == "SETITEM" {
-                pop_value_operand_preserving_mark(stack);
+                discard_value_operand_preserving_mark(stack);
             }
         }
         "APPENDS" | "SETITEMS" | "ADDITEMS" => {
@@ -233,8 +218,7 @@ fn handle_post_budget_opcode(
         }
         "PUT" | "BINPUT" | "LONG_BINPUT" => {
             if let (Some(index), Some(value)) = (opcode.arg.as_i64(), stack.last().cloned()) {
-                if memo_overlay.insert(index, value).is_none()
-                    && resolve_memo_value(index).is_none()
+                if memo_overlay.insert(index, value).is_none() && !initial_memo.contains_key(&index)
                 {
                     *memo_len = (*memo_len).saturating_add(1);
                 }
@@ -251,7 +235,7 @@ fn handle_post_budget_opcode(
                 let value = memo_overlay
                     .get(&index)
                     .cloned()
-                    .or_else(|| resolve_memo_value(index))
+                    .or_else(|| initial_memo.get(&index).cloned())
                     .unwrap_or(StackValue::Other);
                 stack.push(value);
             }
@@ -262,39 +246,27 @@ fn handle_post_budget_opcode(
                 pop_to_mark(stack);
             }
             let (module, name) = opcode.arg.global_parts();
-            let reference = GlobalRef {
-                module,
-                name,
-                position: opcode.pos,
-                malformed: false,
-                memo_index: None,
-                memo_read: false,
-            };
-            stack.push(if is_inst {
-                StackValue::Constructed(reference.clone())
-            } else {
-                StackValue::Global(reference.clone())
-            });
+            let reference = GlobalRef::new(module, name, opcode.pos);
+            stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, is_inst, opcode.next, tail, sink);
         }
         "STACK_GLOBAL" => {
-            let name_value = stack.pop();
-            let module_value = stack.pop();
-            let reference =
-                resolve_post_budget_stack_global(module_value, name_value, opcode.pos, tail);
+            let reference = {
+                let name_value = stack.pop();
+                let module_value = stack.pop();
+                GlobalRef::from_stack_operands(
+                    module_value.as_ref(),
+                    name_value.as_ref(),
+                    tail,
+                    opcode.pos,
+                )
+            };
             stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, false, opcode.next, tail, sink);
         }
         "EXT1" | "EXT2" | "EXT4" => {
             let extension_code = opcode.arg.as_i64().unwrap_or_default();
-            let reference = GlobalRef {
-                module: "copyreg.extension".to_string(),
-                name: format!("code_{extension_code}"),
-                position: opcode.pos,
-                malformed: true,
-                memo_index: None,
-                memo_read: false,
-            };
+            let reference = GlobalRef::extension(extension_code, opcode.pos);
             stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, false, opcode.next, tail, sink);
         }
@@ -307,8 +279,7 @@ fn handle_post_budget_opcode(
             record_post_budget_callable_value(callable_value, opcode.next, tail, sink);
         }
         "OBJ" => {
-            let values = pop_to_mark(stack);
-            let callable_value = values.into_iter().next();
+            let callable_value = pop_to_mark(stack);
             push_constructed_result(stack, callable_value.as_ref());
             record_post_budget_callable_value(callable_value, opcode.next, tail, sink);
         }
@@ -316,46 +287,13 @@ fn handle_post_budget_opcode(
     }
 }
 
-fn is_post_budget_text_opcode(name: &str) -> bool {
-    matches!(
-        name,
-        "BINSTRING"
-            | "BINUNICODE"
-            | "BINUNICODE8"
-            | "SHORT_BINSTRING"
-            | "SHORT_BINUNICODE"
-            | "STRING"
-            | "UNICODE"
-    )
-}
-
-fn resolve_post_budget_stack_global(
-    module_value: Option<StackValue>,
-    name_value: Option<StackValue>,
-    position: usize,
-    tail: &[u8],
-) -> GlobalRef {
-    let module = resolve_global_operand(module_value.as_ref(), tail);
-    let name = resolve_global_operand(name_value.as_ref(), tail);
-    let malformed = module.is_none() || name.is_none();
-    GlobalRef {
-        module: module.unwrap_or_else(|| "__unknown__".to_string()),
-        name: name.unwrap_or_else(|| "__unknown__".to_string()),
-        position,
-        malformed,
-        memo_index: None,
-        memo_read: false,
-    }
-}
-
 fn record_post_budget_callable_value(
     callable_value: Option<StackValue>,
     proximity_start: usize,
     tail: &[u8],
-    sink: &mut PostBudgetRecordSink<'_>,
+    sink: &mut PostBudgetMatches,
 ) {
-    let Some(StackValue::Global(reference) | StackValue::Constructed(reference)) = callable_value
-    else {
+    let Some(StackValue::Global(reference)) = callable_value else {
         return;
     };
     record_post_budget_global_ref(&reference, true, proximity_start, tail, sink);
@@ -366,7 +304,7 @@ fn record_post_budget_global_ref(
     force_reduce_proximate: bool,
     proximity_start: usize,
     tail: &[u8],
-    sink: &mut PostBudgetRecordSink<'_>,
+    sink: &mut PostBudgetMatches,
 ) {
     if reference.malformed && reference.module != "copyreg.extension" {
         return;
@@ -374,58 +312,46 @@ fn record_post_budget_global_ref(
     let Some(severity) = post_budget_global_severity(&reference.module, &reference.name) else {
         return;
     };
-    record_post_budget_global_with_severity(
-        PostBudgetGlobalCandidate {
-            module: &reference.module,
-            name: &reference.name,
-            pattern_start: reference.position,
-            proximity_start,
-            severity,
-            force_reduce_proximate,
-        },
-        tail,
-        sink.seen,
-        sink.matches,
+    if reference.module.is_empty() || reference.name.is_empty() {
+        return;
+    }
+    let (found, _) = sink.get_or_insert(
+        &reference.module,
+        &reference.name,
+        reference.position,
+        severity,
     );
+    found.reduce_proximate |=
+        force_reduce_proximate || has_reduce_class_byte_nearby(tail, proximity_start);
 }
 
-fn pop_value_operand_preserving_mark(stack: &mut Vec<StackValue>) -> Option<StackValue> {
-    match stack.pop() {
-        Some(StackValue::Mark) => {
-            stack.push(StackValue::Mark);
-            None
-        }
-        value => value,
+fn discard_value_operand_preserving_mark(stack: &mut Vec<StackValue>) {
+    if !matches!(stack.last(), Some(StackValue::Mark)) {
+        stack.pop();
     }
 }
 
-fn pop_to_mark(stack: &mut Vec<StackValue>) -> Vec<StackValue> {
-    let mut values = Vec::new();
+fn pop_to_mark(stack: &mut Vec<StackValue>) -> Option<StackValue> {
+    let mut first = None;
     while let Some(item) = stack.pop() {
         if matches!(item, StackValue::Mark) {
             break;
         }
-        values.push(item);
+        first = Some(item);
     }
-    values.reverse();
-    values
+    first
 }
 
 fn collapse_top_n(stack: &mut Vec<StackValue>, count: usize) {
-    if stack.len() < count {
-        stack.push(StackValue::Other);
-        return;
+    if let Some(start) = stack.len().checked_sub(count) {
+        if !stack[start..]
+            .iter()
+            .any(|value| matches!(value, StackValue::Mark))
+        {
+            stack.truncate(start);
+        }
     }
-    let start = stack.len().saturating_sub(count);
-    if stack[start..]
-        .iter()
-        .any(|value| matches!(value, StackValue::Mark))
-    {
-        stack.push(StackValue::Other);
-        return;
-    }
-    let values = stack.split_off(start);
-    stack.push(collapse_tuple_values(values));
+    stack.push(StackValue::Other);
 }
 
 fn consume_top_operands(stack: &mut Vec<StackValue>, operand_count: usize) -> Option<StackValue> {
@@ -440,100 +366,29 @@ fn consume_top_operands(stack: &mut Vec<StackValue>, operand_count: usize) -> Op
 
 fn push_constructed_result(stack: &mut Vec<StackValue>, callable_value: Option<&StackValue>) {
     match callable_value {
-        Some(StackValue::Global(reference) | StackValue::Constructed(reference))
-            if !reference.malformed =>
-        {
-            stack.push(StackValue::Constructed(reference.clone()));
+        Some(StackValue::Global(reference)) if !reference.malformed => {
+            stack.push(StackValue::Global(reference.clone()));
         }
         _ => stack.push(StackValue::Other),
     }
 }
 
-fn record_post_budget_extension_ref(
-    tail: &[u8],
-    index: usize,
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    let Some((extension_code, next)) = read_post_budget_extension_code(tail, index) else {
+fn record_post_budget_extension_ref(tail: &[u8], index: usize, sink: &mut PostBudgetMatches) {
+    let Ok(ParsedOpcode {
+        arg: ArgValue::Int(extension_code),
+        next,
+        ..
+    }) = parse_opcode(tail, index, tail.len())
+    else {
         return;
     };
-    record_post_budget_global_with_severity(
-        PostBudgetGlobalCandidate {
-            module: "copyreg.extension",
-            name: &format!("code_{extension_code}"),
-            pattern_start: index,
-            proximity_start: next,
-            severity: "warning",
-            force_reduce_proximate: false,
-        },
-        tail,
-        seen,
-        matches,
+    let (found, _) = sink.get_or_insert(
+        "copyreg.extension",
+        &format!("code_{extension_code}"),
+        index,
+        "warning",
     );
-}
-
-fn read_post_budget_extension_code(tail: &[u8], index: usize) -> Option<(u64, usize)> {
-    match *tail.get(index)? {
-        0x82 => Some((
-            *tail.get(index.saturating_add(1))? as u64,
-            index.saturating_add(2),
-        )),
-        0x83 => {
-            let start = index.saturating_add(1);
-            let end = start.checked_add(2)?;
-            Some((
-                u16::from_le_bytes(tail.get(start..end)?.try_into().ok()?) as u64,
-                end,
-            ))
-        }
-        0x84 => {
-            let start = index.saturating_add(1);
-            let end = start.checked_add(4)?;
-            Some((
-                u32::from_le_bytes(tail.get(start..end)?.try_into().ok()?) as u64,
-                end,
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn record_post_budget_global_with_severity(
-    candidate: PostBudgetGlobalCandidate<'_>,
-    tail: &[u8],
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    if candidate.module.is_empty() || candidate.name.is_empty() {
-        return;
-    }
-    let key = (
-        candidate.pattern_start,
-        candidate.module.to_string(),
-        candidate.name.to_string(),
-    );
-    let reduce_proximate = candidate.force_reduce_proximate
-        || has_reduce_class_byte_nearby(tail, candidate.proximity_start);
-    if !seen.insert(key) {
-        if reduce_proximate {
-            if let Some(existing) = matches.iter_mut().find(|existing| {
-                existing.pattern_start == candidate.pattern_start
-                    && existing.module == candidate.module
-                    && existing.name == candidate.name
-            }) {
-                existing.reduce_proximate = true;
-            }
-        }
-        return;
-    }
-    matches.push(PostBudgetGlobalMatch {
-        module: candidate.module.to_string(),
-        name: candidate.name.to_string(),
-        pattern_start: candidate.pattern_start,
-        reduce_proximate,
-        severity: candidate.severity,
-    });
+    found.reduce_proximate |= has_reduce_class_byte_nearby(tail, next);
 }
 
 fn post_budget_global_severity(module: &str, name: &str) -> Option<&'static str> {

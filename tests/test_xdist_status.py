@@ -263,12 +263,13 @@ def test_nightly_correctness_matrix_uses_exhaustive_three_way_shards() -> None:
     matrix = correctness["strategy"]["matrix"]
     assert matrix == {
         "os": ["ubuntu-latest", "windows-latest"],
-        "python-version": ["3.10", "3.11", "3.12", "3.13"],
+        "python-version": ["3.10", "3.11", "3.12", "3.13", "3.14"],
         "shard": [0, 1, 2],
         "exclude": [
             {"os": "windows-latest", "python-version": "3.10"},
             {"os": "windows-latest", "python-version": "3.12"},
             {"os": "windows-latest", "python-version": "3.13"},
+            {"os": "windows-latest", "python-version": "3.14"},
         ],
     }
     assert "3.11" in matrix["python-version"]

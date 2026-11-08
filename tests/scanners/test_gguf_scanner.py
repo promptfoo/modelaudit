@@ -2,12 +2,15 @@
 
 import io
 import json
+import math
 import os
+import re
 import struct
 import sys
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,6 +21,7 @@ from modelaudit.cli import cli
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
+from modelaudit.scanners import gguf_scanner as gguf_scanner_module
 from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
@@ -31,6 +35,7 @@ from modelaudit.scanners.gguf_scanner import (
     GgufScanner,
     _with_container_owned_gguf_trailing,
 )
+from modelaudit.utils import _path_hardening
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_malicious_pickle, create_mock_gguf
@@ -1275,6 +1280,73 @@ def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidenc
     assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
+def test_gguf_oversized_chat_template_ignores_inert_injection_examples(tmp_path: Path) -> None:
+    template = (
+        "{% macro format_message(message) %}{{ message }}{% endmacro %}"
+        "{% set instructions %}Follow these commands. Use the standard format (brief answer).{% endset %}"
+        "{{ instructions }}{{ 'This output mentions commands. and format (short).' }}"
+        "{% raw %}{{ format (example) }}{% endraw %}"
+        "{# {{ commands. example }} #}"
+    )
+    path = create_mock_gguf(tmp_path / "instructions.gguf", metadata={"tokenizer.chat_template": template})
+
+    direct = GgufScanner(config={"max_template_size": 64}).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, max_template_size=64)
+
+    assert _failed_metadata_value_checks(direct) == []
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
+
+
+@pytest.mark.parametrize(
+    ("payload", "pattern", "match"),
+    [
+        ("{{ commands.getoutput(command) }}", "critical_injection", "commands."),
+        ("{% macro format_message(x=requests.get(url)) %}{{ x }}{% endmacro %}", "critical_injection", "requests."),
+        ("{{ {'a': {'b': 1}} and os.system(command) }}", "critical_injection", "os.system("),
+        ("{{ commands. handler(value) }}", "critical_injection", "commands."),
+        ("{{ format (value) }}", "obfuscation", "format ("),
+        ("{% set key %}{{ \"{{ '{0[secret]}'. format (data) }}\" }}{% endset %}", "obfuscation", "format ("),
+        (
+            "{% set code %}{% raw %}{{ format (x) }}{% endraw %}{% endset %}{{ env.from_string(code) }}",
+            "obfuscation",
+            "format (",
+        ),
+        ("{% set source %}{{ 'commands.getoutput(x)' }}{% endset %}", "critical_injection", "commands."),
+        (
+            "{% set key %}__class__.__mro__{% endset %}{{ data|map(attribute=key) }}",
+            "object_traversal",
+            "__class__.__mro__",
+        ),
+        (r"{{ obj[prefix ~ '\x5fclass__'] }}", "obfuscation", r"\x5f"),
+        (
+            "{% set code = '{{ os.system(cmd) }}' %}{{ env.from_string(code).render() }}",
+            "critical_injection",
+            "os.system(",
+        ),
+        ("{{ things|map(attribute='__class__.__mro__') }}", "object_traversal", "__class__.__mro__"),
+        ("{{ env.from_string('{{ os.system(cmd) }}').render() }}", "critical_injection", "os.system("),
+        ("{{ ''['__class__'] }}", "obfuscation", "['__class__']"),
+        ("{{ obj['__class__'] }}", "obfuscation", "['__class__']"),
+        (r"{{ obj | attr('\x5f\x5fclass\x5f\x5f') }}", "obfuscation", r"\x5f"),
+    ],
+)
+def test_gguf_oversized_chat_template_reports_late_executable_evidence(
+    tmp_path: Path, payload: str, pattern: str, match: str
+) -> None:
+    prefix = "π" * 190_000 + "Quoted instructions. {# harmless comment #}"
+    path = create_mock_gguf(tmp_path / "late.gguf", metadata={"tokenizer.chat_template": prefix + payload})
+
+    result = GgufScanner().scan(str(path))
+
+    [check] = _failed_metadata_value_checks(result)
+    assert check.details["pattern"] == f"jinja2_{pattern}"
+    assert check.details["match_offset"] == len(prefix) + payload.index(match)
+    assert re.match(check.details["matched_pattern"], match, re.IGNORECASE)
+    assert result.success is False
+    assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+
 def test_gguf_scanner_propagates_jinja_sandbox_budget_inconclusive(tmp_path: Path) -> None:
     pytest.importorskip("jinja2.sandbox")
     path = create_mock_gguf(
@@ -1653,6 +1725,7 @@ _GGML_SINGLE_BLOCK_TENSOR_TYPES = [
     (40, "nvfp4", 64, 36),
     (41, "q1_0", 128, 18),
     (42, "q2_0", 64, 18),
+    (43, "f8_e4m3", 1, 1),
 ]
 _GGML_SINGLE_BLOCK_TENSOR_TYPE_IDS = [name for _type, name, _block, _size in _GGML_SINGLE_BLOCK_TENSOR_TYPES]
 
@@ -1832,7 +1905,51 @@ def test_gguf_retired_interleaved_q4_0_layouts_hold_whole_row_groups(
         assert partial_exit_code == 1
 
 
-@pytest.mark.parametrize("tensor_type", [4, 5, 36, 37, 38, 43, 142])
+@pytest.mark.parametrize(
+    ("tensor_type", "row_group"),
+    [(31, 4), (32, 4), (33, 8)],
+    ids=["q4_0_4_4", "q4_0_4_8", "q4_0_8_8"],
+)
+@pytest.mark.parametrize("matrix_dims", [(2,), (2, 2)], ids=["3d", "4d"])
+@pytest.mark.parametrize("aligned", [False, True], ids=["partial_matrix", "whole_matrix"])
+def test_gguf_retired_interleaved_row_groups_cannot_span_matrices(
+    tmp_path: Path,
+    tensor_type: int,
+    row_group: int,
+    matrix_dims: tuple[int, ...],
+    aligned: bool,
+) -> None:
+    rows = row_group if aligned else row_group // 2
+    dims = (32, rows, *matrix_dims)
+    path = tmp_path / "matrices.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        dims=dims,
+        tensor_data_size=18 * math.prod(dims[1:]),
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        alignment_checks = [check for check in result.checks if check.name == "Tensor Block Alignment Check"]
+        assert not any(check.name == "Tensor Data Bounds Check" for check in result.checks)
+        if aligned:
+            assert not alignment_checks
+            _assert_no_warning_or_critical_issues(result)
+        else:
+            assert len(alignment_checks) == 1
+            assert alignment_checks[0].status == CheckStatus.FAILED
+            assert alignment_checks[0].details["rows"] == rows
+            assert alignment_checks[0].details["row_group"] == row_group
+            assert f"not aligned to its {row_group}-row block groups" in alignment_checks[0].message
+    assert direct.success is True
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == (0 if aligned else 1)
+
+
+@pytest.mark.parametrize("tensor_type", [4, 5, 36, 37, 38, 44, 142])
 def test_gguf_retired_and_foreign_tensor_types_stay_inconclusive(tmp_path: Path, tensor_type: int) -> None:
     path = tmp_path / f"type{tensor_type}.gguf"
     _write_gguf_with_tensor_type(path, tensor_type=tensor_type)
@@ -2327,6 +2444,19 @@ def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) 
     assert any(issue.rule_code == "S902" and "download" in issue.message for issue in malicious_aggregate.issues)
     assert not any(issue.rule_code == "S902" for issue in benign_aggregate.issues)
     assert determine_exit_code(benign_aggregate) == 0
+
+
+@pytest.mark.parametrize("severity", [Severity.MEDIUM, Severity.CRITICAL])
+def test_completed_gguf_scan_with_findings_reports_success(tmp_path: Path, severity: Severity) -> None:
+    path = create_mock_gguf(tmp_path / "model.gguf", metadata={"download": "curl -fO https://example.org/file"})
+    set_config(ModelAuditConfig(severity={"S902": severity}))
+    try:
+        result = scan_model_directory_or_file(str(path), cache_enabled=False)
+    finally:
+        reset_config()
+
+    assert result.success is True
+    assert determine_exit_code(result) == 1
 
 
 def test_gguf_metadata_curl_short_options_detected_in_directory_scan(tmp_path: Path) -> None:
@@ -2911,6 +3041,36 @@ def test_gguf_ggml_source_stability_fails_closed(
         tmp_path / "source-stability-cache",
         GGUF_SOURCE_CHANGED_REASON,
     )
+
+
+@pytest.mark.parametrize("format_name", ["ggml", "gguf"])
+@pytest.mark.parametrize(
+    ("os_name", "changed_view", "complete"),
+    [("nt", "path", True), ("nt", "handle", False), ("posix", "path", False), ("posix", "handle", False)],
+)
+def test_gguf_ggml_source_stability_ctime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format_name: str, os_name: str, changed_view: str, complete: bool
+) -> None:
+    path = tmp_path / f"model.{format_name}"
+    if format_name == "gguf":
+        path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+    else:
+        _write_ggml_file(path)
+    original = path.stat()
+    changed = os.stat_result(original, {"st_mtime_ns": original.st_mtime_ns, "st_ctime_ns": original.st_ctime_ns + 1})
+    handle_stats = iter([original, changed if changed_view == "handle" else original])
+    path_stat = changed if changed_view == "path" else original
+    scanner_os = SimpleNamespace(**vars(os))
+    scanner_os.name = os_name
+    scanner_os.fstat = lambda fd: next(handle_stats)
+    scanner_os.stat = lambda path: path_stat
+    monkeypatch.setattr(gguf_scanner_module, "os", scanner_os)
+    monkeypatch.setattr(_path_hardening, "os", scanner_os)
+
+    result = GgufScanner().scan(str(path))
+
+    assert result.success is complete
+    assert (GGUF_SOURCE_CHANGED_REASON in result.metadata.get("scan_outcome_reasons", [])) is (not complete)
 
 
 def test_ggml_polyglot_with_post_preflight_bad_zip_fails_closed(tmp_path: Path) -> None:

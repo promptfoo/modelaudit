@@ -3131,3 +3131,169 @@ def _assert_keras_weight_names(path: Path, expected_names: list[str]) -> None:
 
     assert list(weights) == expected_names
     assert scanner.extraction_incomplete is False
+
+
+@pytest.mark.parametrize("budget", ["per_tensor", "total"])
+@pytest.mark.parametrize(("extent", "direct_consumer"), [(32, False), (64, False), (64, True)])
+def test_semantic_onnx_expansion_respects_callback_logical_byte_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: str, extent: int, direct_consumer: bool
+) -> None:
+    import numpy as np
+
+    onnx = pytest.importorskip("onnx")
+    helper = onnx.helper
+    tensor = onnx.TensorProto
+    nodes = [
+        helper.make_node("Expand", ["W", "shape"], ["expanded"]),
+        helper.make_node("MatMul", ["X", "expanded"], ["Y"]),
+    ]
+    inputs = [helper.make_tensor_value_info("X", tensor.FLOAT, [1, extent])]
+    outputs = [helper.make_tensor_value_info("Y", tensor.FLOAT, [1, extent])]
+    if direct_consumer:
+        nodes.insert(0, helper.make_node("MatMul", ["small_X", "W"], ["small_Y"]))
+        inputs.append(helper.make_tensor_value_info("small_X", tensor.FLOAT, [1, 1]))
+        outputs.append(helper.make_tensor_value_info("small_Y", tensor.FLOAT, [1, 1]))
+    graph = helper.make_graph(
+        nodes,
+        "callback_expansion",
+        inputs,
+        outputs,
+        initializer=[
+            onnx.numpy_helper.from_array(np.ones((1, 1), dtype=np.float32), name="W"),
+            onnx.numpy_helper.from_array(np.array([extent, extent], dtype=np.int64), name="shape"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = 8
+    onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / "expanded.onnx"
+    onnx.save(model, str(path))
+    config: dict[str, Any] = {
+        "max_array_size": 4096 if budget == "per_tensor" else 65536,
+        "max_weight_distribution_total_bytes": 65536 if budget == "per_tensor" else 8192,
+    }
+    analyzed_bytes: list[int] = []
+    original_analysis = WeightDistributionScanner._analyze_layer_weights
+
+    def track_analysis(
+        scanner: WeightDistributionScanner, name: str, weights: Any, architecture: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        analyzed_bytes.append(int(weights.nbytes))
+        return original_analysis(scanner, name, weights, architecture)
+
+    monkeypatch.setattr(WeightDistributionScanner, "_analyze_layer_weights", track_analysis)
+    scanner = WeightDistributionScanner(config)
+    result = scanner.scan(str(path))
+    oversized = extent == 64
+    if oversized:
+        assert analyzed_bytes == ([4] if direct_consumer else [])
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+        assert scanner.extraction_incomplete is True
+        assert any("onnx_initializer_size_limit" in reason for reason in scanner.extraction_incomplete_reasons)
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                aggregate = core.scan_model_directory_or_file(
+                    str(path),
+                    scanners=["weight_distribution"],
+                    cache_enabled=True,
+                    cache_dir=str(cache_dir),
+                    min_cache_file_size=0,
+                    **config,
+                )
+                assert aggregate.success is False
+                assert core.determine_exit_code(aggregate) == 2
+                assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+    else:
+        assert analyzed_bytes == [4096]
+        assert result.success is True
+        assert scanner.extraction_incomplete is False
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        aggregate = core.scan_model_directory_or_file(
+            str(path), scanners=["weight_distribution"], cache_enabled=False, **config
+        )
+        assert aggregate.success is True
+        assert core.determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize("total_bytes", [4096, 8192])
+def test_semantic_onnx_expansions_reserve_aggregate_logical_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, total_bytes: int
+) -> None:
+    import numpy as np
+
+    onnx = pytest.importorskip("onnx")
+    helper = onnx.helper
+    tensor = onnx.TensorProto
+    graph = helper.make_graph(
+        [
+            helper.make_node("Expand", ["W0", "shape"], ["expanded0"]),
+            helper.make_node("MatMul", ["X", "expanded0"], ["Y0"]),
+            helper.make_node("Expand", ["W1", "shape"], ["expanded1"]),
+            helper.make_node("MatMul", ["X", "expanded1"], ["Y1"]),
+        ],
+        "aggregate_expansions",
+        [helper.make_tensor_value_info("X", tensor.FLOAT, [1, 32])],
+        [helper.make_tensor_value_info(f"Y{index}", tensor.FLOAT, [1, 32]) for index in range(2)],
+        initializer=[
+            *[onnx.numpy_helper.from_array(np.ones((1, 1), dtype=np.float32), name=f"W{index}") for index in range(2)],
+            onnx.numpy_helper.from_array(np.array([32, 32], dtype=np.int64), name="shape"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = 8
+    onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / "aggregate-expansions.onnx"
+    onnx.save(model, str(path))
+    materialized: list[str] = []
+    original_to_array = onnx.numpy_helper.to_array
+
+    def track_to_array(initializer: Any, *args: Any, **kwargs: Any) -> Any:
+        if initializer.name in {"W0", "W1"}:
+            materialized.append(initializer.name)
+        return original_to_array(initializer, *args, **kwargs)
+
+    monkeypatch.setattr(onnx.numpy_helper, "to_array", track_to_array)
+    config: dict[str, Any] = {"max_array_size": 4096, "max_weight_distribution_total_bytes": total_bytes}
+    scanner = WeightDistributionScanner(config)
+    result = scanner.scan(str(path))
+    expected_layers = total_bytes // 4096
+    assert materialized == [f"W{index}" for index in range(expected_layers)]
+    assert scanner.retained_tensor_bytes == total_bytes
+    assert result.metadata["onnx_weight_distribution_semantics"]["analyzed_layer_count"] == expected_layers
+    if total_bytes == 4096:
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(reason.endswith("_total") for reason in scanner.extraction_incomplete_reasons)
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                aggregate = core.scan_model_directory_or_file(
+                    str(path),
+                    scanners=["weight_distribution"],
+                    cache_enabled=True,
+                    cache_dir=str(cache_dir),
+                    min_cache_file_size=0,
+                    **config,
+                )
+                assert aggregate.success is False
+                assert core.determine_exit_code(aggregate) == 2
+                assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+    else:
+        assert result.success is True
+        assert scanner.extraction_incomplete is False
+        aggregate = core.scan_model_directory_or_file(
+            str(path), scanners=["weight_distribution"], cache_enabled=False, **config
+        )
+        assert aggregate.success is True
+        assert core.determine_exit_code(aggregate) == 0

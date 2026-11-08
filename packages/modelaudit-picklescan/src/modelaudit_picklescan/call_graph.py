@@ -21,7 +21,7 @@ import zipimport
 from _collections import defaultdict as _CANONICAL_COLLECTIONS_DEFAULTDICT
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
@@ -1700,7 +1700,10 @@ _TRUSTED_FRAMEWORK_METADATA_REFERENCES = frozenset(
         ("transformers.training_args", "TrainingArguments"),
     }
 )
-_TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES | _TRUSTED_FRAMEWORK_METADATA_REFERENCES
+_SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES = (
+    _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES | _TRUSTED_FRAMEWORK_METADATA_REFERENCES
+)
+_TRUSTED_IMPORT_ONLY_REFERENCES |= _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
 _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
     {
         ("pathlib._local", "PurePath"),
@@ -1732,10 +1735,6 @@ _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
     *_PICKLE_BUILD_ENTRYPOINT_METHODS,
 )
-_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
-    "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
-    default=0,
-)
 _SHARED_SOURCE_SENSITIVE_SNAPSHOT: ContextVar[_SharedSourceSnapshot | None] = ContextVar(
     "_SHARED_SOURCE_SENSITIVE_SNAPSHOT",
     default=None,
@@ -1763,15 +1762,19 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
         partial_path: tuple[str, ...] | None = None,
         partial_entrypoints: tuple[str, ...] = (),
+        partial_calls: tuple[str, ...] = (),
         stability_reason: str | None = None,
+        stability_details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.partial_findings = partial_findings
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
         self.partial_path = partial_path
         self.partial_entrypoints = partial_entrypoints
+        self.partial_calls = partial_calls
         # Which snapshot gate invalidated the run, reported without changing the message text.
         self.stability_reason = stability_reason
+        self.stability_details = stability_details
 
 
 class _SourceReadTooLargeError(OSError):
@@ -1783,7 +1786,6 @@ class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
     resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
     import_runtime_trusted: bool
-    report_started: bool = False
     resolution_fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
@@ -1799,6 +1801,8 @@ class _SharedSourceSnapshot:
     generation: int = 0
     active_report_generation: int | None = None
     active_report_stability_reason: str | None = None
+    stability_details: tuple[str, dict[str, Any]] | None = None
+    active_report_stability_details: dict[str, Any] | None = None
     stable: bool = True
     stability_reason: str | None = None
     reusable: bool = True
@@ -1907,31 +1911,31 @@ _SHORT_SINK_SECONDARY_PRIORITY_TOKENS = ("exec", "system", "run")
 _CALLABLE_SINGLETON_ALIASES = {
     ("builtins", "help"): (("_sitebuiltins", "_Helper.__call__"),),
 }
-_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
+_PYTORCH_FIXED_STORAGE_ITEM_SIZES = MappingProxyType(
     {
-        "BFloat16Storage",
-        "BoolStorage",
-        "ByteStorage",
-        "CharStorage",
-        "ComplexDoubleStorage",
-        "ComplexFloatStorage",
-        "DoubleStorage",
-        "FloatStorage",
-        "HalfStorage",
-        "IntStorage",
-        "LongStorage",
-        "QInt32Storage",
-        "QInt8Storage",
-        "QUInt8Storage",
-        "QUInt4x2Storage",
-        "QUInt2x4Storage",
-        "ShortStorage",
-        "UntypedStorage",
+        "BFloat16Storage": 2,
+        "BoolStorage": 1,
+        "ByteStorage": 1,
+        "CharStorage": 1,
+        "ComplexDoubleStorage": 16,
+        "ComplexFloatStorage": 8,
+        "DoubleStorage": 8,
+        "FloatStorage": 4,
+        "HalfStorage": 2,
+        "IntStorage": 4,
+        "LongStorage": 8,
+        "QInt32Storage": 4,
+        "QInt8Storage": 1,
+        "QUInt8Storage": 1,
+        "ShortStorage": 2,
+        "UntypedStorage": 1,
     }
 )
-_PYTORCH_STORAGE_GLOBALS = frozenset(
+_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(_PYTORCH_FIXED_STORAGE_ITEM_SIZES) | {"QUInt2x4Storage", "QUInt4x2Storage"}
+_PYTORCH_STORAGE_REFERENCES = frozenset(
     (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
 )
+_PYTORCH_STORAGE_GLOBALS = _PYTORCH_STORAGE_REFERENCES
 _TORCH_EXTENSION_GLOBALS = frozenset(
     {
         "Size",
@@ -2075,19 +2079,13 @@ class _ClassSourceContext:
 
 @dataclass(frozen=True)
 class _InheritedClassMethod:
-    name: str
     node: ast.FunctionDef | ast.AsyncFunctionDef
     module_name: str
     aliases: dict[str, str]
     local_defs: set[str]
 
 
-@dataclass(frozen=True)
-class _ImportCallPath:
-    module: str
-    name: str
-    import_reference: str
-    call_path: tuple[str, ...]
+_ImportCallPath = tuple[str, str, tuple[str, ...]]
 
 
 def find_dangerous_call_graphs(
@@ -2105,6 +2103,19 @@ def find_dangerous_call_graphs(
         if str(reference.get("module", "")) and str(reference.get("name", ""))
     }
 
+    template_execution_complete = bool(callable_references) and all(
+        reference.get("template_execution_complete") is True for reference in callable_references
+    )
+    if not template_execution_complete:
+        # A direct call's argument shape does not cover later memo/opaque uses.
+        for reference in callable_references:
+            module = str(reference.get("module", ""))
+            name = str(reference.get("name", ""))
+            if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+                continue
+            if _reference_may_enter_template_method(module, name, reference):
+                invoked_references.discard((module, name))
+
     analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
         module = str(reference.get("module", ""))
@@ -2115,27 +2126,49 @@ def find_dangerous_call_graphs(
             continue
 
         try:
-            if (
-                module == "string"
-                and name
-                in {"Template.substitute", "Template.safe_substitute", "Template.is_valid", "Template.get_identifiers"}
-                and reference.get("invocation_import_reference")
-                and _template_uses_reviewed_lazy_pattern()
-                and reference.get("template_receiver_state_unmodified") is not True
-            ):
-                raise _CallGraphAnalysisLimitError("string.Template receiver state cannot be proven unchanged")
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
             entrypoints = error.partial_entrypoints
+        template_entrypoints = {f"{module}.{name}", *entrypoints} & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+            "string.Template.is_valid",
+            "string.Template.get_identifiers",
+        }
+        template_mapping_entrypoints = template_entrypoints & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+        }
+        if (
+            template_entrypoints
+            and reference.get("invocation_import_reference")
+            and _template_uses_reviewed_lazy_pattern()
+        ):
+            if reference.get("template_receiver_state_unmodified") is not True and analysis_limit_error is None:
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template receiver state cannot be proven unchanged"
+                )
+            if (
+                template_mapping_entrypoints
+                and reference.get("template_mapping_callbacks_complete") is not True
+                and analysis_limit_error is None
+            ):
+                # Resolved aliases need the same proof; retain their original report identity.
+                # Missing coverage must not hide independent Template sinks.
+                analysis_limit_error = _CallGraphAnalysisLimitError(
+                    "string.Template mapping callbacks cannot be proven covered"
+                )
         if not entrypoints:
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
         try:
             path_for = (
                 partial(_find_sink_path, keyword_arg_names=_complete_keyword_arg_names(reference))
-                if module == "string" and name in {"Template.substitute", "Template.safe_substitute"}
+                if template_mapping_entrypoints
+                and template_execution_complete
+                and reference.get("invocation_import_reference")
                 else _find_sink_path
             )
             sink_path = _first_matching_path(entrypoints, path_for)
@@ -2152,6 +2185,7 @@ def find_dangerous_call_graphs(
                     sink_path = _find_invoked_import_execution_path(
                         entrypoint,
                         entrypoint_arg_count,
+                        None if template_mapping_entrypoints and not template_execution_complete else (),
                         allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                     )
                 except _CallGraphAnalysisLimitError as error:
@@ -2167,7 +2201,9 @@ def find_dangerous_call_graphs(
                         entrypoints,
                         _invoked_import_execution_path_callback(
                             positional_arg_count,
-                            keyword_arg_names,
+                            None
+                            if template_mapping_entrypoints and not template_execution_complete
+                            else keyword_arg_names,
                             allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                         ),
                     )
@@ -2220,8 +2256,8 @@ def find_startup_hook_write_call_graphs(
     _clear_source_sensitive_caches()
     if callable_invocations is not None and not callable_invocations_complete:
         return ()
-    openers: list[_ImportCallPath] = []
-    writers: list[_ImportCallPath] = []
+    openers: dict[str, _ImportCallPath] = {}
+    writers: dict[str, _ImportCallPath] = {}
     seen: set[tuple[str, str]] = set()
     callable_references = _iter_callable_invocation_references(callable_invocations)
     invocations_by_reference: dict[tuple[str, str], list[dict[str, object]]] = {}
@@ -2264,13 +2300,8 @@ def find_startup_hook_write_call_graphs(
             if _trusted_mailbox_constructor_invocation_opens_path(module, name, invocation_reference)
         )
         if trusted_mailbox_constructor_openers:
-            openers.append(
-                _ImportCallPath(
-                    module=module,
-                    name=name,
-                    import_reference=f"{module}.{name}",
-                    call_path=_trusted_mailbox_constructor_file_open_path(module, name),
-                )
+            openers.setdefault(
+                f"{module}.{name}", (module, name, _trusted_mailbox_constructor_file_open_path(module, name))
             )
         if (
             require_invocations
@@ -2311,14 +2342,7 @@ def find_startup_hook_write_call_graphs(
                 analysis_limit_error = error
             open_path = error.partial_path
         if open_path is not None:
-            openers.append(
-                _ImportCallPath(
-                    module=module,
-                    name=name,
-                    import_reference=f"{module}.{name}",
-                    call_path=open_path,
-                )
-            )
+            openers.setdefault(f"{module}.{name}", (module, name, open_path))
         try:
             write_path = _first_matching_path(entrypoints, _find_file_write_path)
         except _CallGraphAnalysisLimitError as error:
@@ -2326,14 +2350,7 @@ def find_startup_hook_write_call_graphs(
                 analysis_limit_error = error
             write_path = error.partial_path
         if write_path is not None:
-            writers.append(
-                _ImportCallPath(
-                    module=module,
-                    name=name,
-                    import_reference=f"{module}.{name}",
-                    call_path=write_path,
-                )
-            )
+            writers.setdefault(f"{module}.{name}", (module, name, write_path))
 
     findings = _materialize_startup_hook_write_findings(openers, writers)
     if analysis_limit_error is not None:
@@ -2345,32 +2362,27 @@ def find_startup_hook_write_call_graphs(
 
 
 def _materialize_startup_hook_write_findings(
-    openers: list[_ImportCallPath],
-    writers: list[_ImportCallPath],
+    openers: dict[str, _ImportCallPath],
+    writers: dict[str, _ImportCallPath],
 ) -> tuple[StartupHookWriteFinding, ...]:
     if not openers or not writers:
         return ()
 
     findings: list[StartupHookWriteFinding] = []
-    seen_pairs: set[tuple[str, str]] = set()
-    for opener in openers:
-        for writer in writers:
-            pair = (opener.import_reference, writer.import_reference)
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
+    for opener_ref, (opener_module, opener_name, open_path) in openers.items():
+        for writer_ref, (writer_module, writer_name, write_path) in writers.items():
             findings.append(
                 StartupHookWriteFinding(
-                    opener_module=opener.module,
-                    opener_name=opener.name,
-                    writer_module=writer.module,
-                    writer_name=writer.name,
-                    opener_import_reference=opener.import_reference,
-                    writer_import_reference=writer.import_reference,
-                    open_sink=opener.call_path[-1],
-                    write_sink=writer.call_path[-1],
-                    opener_call_path=opener.call_path,
-                    writer_call_path=writer.call_path,
+                    opener_module=opener_module,
+                    opener_name=opener_name,
+                    writer_module=writer_module,
+                    writer_name=writer_name,
+                    opener_import_reference=opener_ref,
+                    writer_import_reference=writer_ref,
+                    open_sink=open_path[-1],
+                    write_sink=write_path[-1],
+                    opener_call_path=open_path,
+                    writer_call_path=write_path,
                 )
             )
             if len(findings) >= _MAX_IMPORT_REFERENCES:
@@ -2400,12 +2412,12 @@ def find_unanalyzed_callable_call_graph_references(
             continue
         if (module, name) in seen:
             continue
-        seen.add((module, name))
         if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
             module, name
         ):
             continue
         if (module, name) in incomplete_newobj_ex_references:
+            seen.add((module, name))
             references.append(
                 UnanalyzedCallGraphReference(
                     module=module,
@@ -2423,11 +2435,12 @@ def find_unanalyzed_callable_call_graph_references(
         if reason is None and _interpreter_module_origin_without_import_hooks(module) == "frozen":
             state = _current_loaded_interpreter_reference_state(module, name)
             _track_loaded_interpreter_reference_state(module, name, state)
-            if state[0] and type(state[1]) is FunctionType:
+            if not state[0] or not _frozen_reference_body_is_native(state[1], reference):
                 # Frozen origin authenticates the module, not coverage of its Python body.
                 reason = "source_unavailable"
         if reason is None:
             continue
+        seen.add((module, name))
         references.append(
             UnanalyzedCallGraphReference(
                 module=module,
@@ -2439,6 +2452,42 @@ def find_unanalyzed_callable_call_graph_references(
         if len(references) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(references)
+
+
+def _frozen_reference_body_is_native(value: object, reference: Mapping[str, object]) -> bool:
+    if type(value) is FunctionType:
+        return False
+    mro_descriptor = type.__dict__["__mro__"]
+    namespace_descriptor = type.__dict__["__dict__"]
+    if type(value) is not type:
+        # Custom metaclasses need source coverage; even introspection can run descriptors.
+        return not any(base is type for base in mro_descriptor.__get__(type(value)))
+    class_ = cast(type[object], value)
+    methods, _ = _pickle_owner_proof_for_reference(reference)
+    entrypoints = _class_pickle_entrypoint_methods(methods)
+    for base in mro_descriptor.__get__(class_):
+        namespace = namespace_descriptor.__get__(base)
+        if any(type(name) is not str for name in namespace):
+            return False
+        for name in entrypoints:
+            if name in namespace and (
+                type(base) is not type
+                or not _trusted_owner_bound_builtin_descriptor_matches(base, name, namespace[name])
+            ):
+                return False
+        if "__setattr__" in entrypoints:
+            for name, member in namespace.items():
+                is_data_descriptor = False
+                for member_base in mro_descriptor.__get__(type(member)):
+                    member_namespace = namespace_descriptor.__get__(member_base)
+                    if any(type(member_name) is not str for member_name in member_namespace):
+                        return False
+                    is_data_descriptor |= "__set__" in member_namespace or "__delete__" in member_namespace
+                if is_data_descriptor and (
+                    type(base) is not type or not _trusted_owner_bound_builtin_descriptor_matches(base, name, member)
+                ):
+                    return False
+    return True
 
 
 def find_analyzed_callable_call_graph_global_positions(
@@ -3015,14 +3064,14 @@ def _pickle_executable_member_matches_trusted_source(
         return _function_owner_matches_trusted_source(
             member,
             expected_module=expected_module,
-        ) or _function_owner_matches_trusted_stdlib_source(member)
+        ) or _function_owner_matches_trusted_source(member, expected_module=None)
     if type(member) is property:
         functions = tuple(
             function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
         )
         return bool(functions) and all(
             _function_owner_matches_trusted_source(function, expected_module=expected_module)
-            or _function_owner_matches_trusted_stdlib_source(function)
+            or _function_owner_matches_trusted_source(function, expected_module=None)
             for function in functions
         )
     if _pickle_executable_member_matches_trusted_stdlib_source(owner, name, member):
@@ -3040,13 +3089,13 @@ def _pickle_executable_member_matches_trusted_stdlib_source(
     if isinstance(member, classmethod | staticmethod):
         member = member.__func__
     if isinstance(member, FunctionType):
-        return _function_owner_matches_trusted_stdlib_source(member)
+        return _function_owner_matches_trusted_source(member, expected_module=None)
     if type(member) is property:
         functions = tuple(
             function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
         )
         return bool(functions) and all(
-            _function_owner_matches_trusted_stdlib_source(function) for function in functions
+            _function_owner_matches_trusted_source(function, expected_module=None) for function in functions
         )
     if _trusted_owner_bound_builtin_descriptor_matches(owner, name, member):
         return _trusted_runtime_stdlib_class_owner(owner)
@@ -3124,43 +3173,54 @@ def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
     return tuple(dict.fromkeys(functions))
 
 
-def _function_owner_matches_trusted_source(function: FunctionType, *, expected_module: str) -> bool:
+def _function_owner_matches_trusted_source(
+    function: FunctionType,
+    *,
+    expected_module: str | None,
+    code: CodeType | None = None,
+    expected_qualname: str | None = None,
+) -> bool:
+    """Require a matching named owner, or a standard-library owner when no module is specified."""
     globals_namespace = function.__globals__
     if type(globals_namespace) is not dict:
         return False
     owner_module = globals_namespace.get("__name__")
-    if type(owner_module) is not str or owner_module != expected_module:
+    if type(owner_module) is not str:
+        return False
+    if expected_module is None:
+        if _trusted_module_origin_kind(owner_module) != "stdlib":
+            return False
+    elif owner_module != expected_module:
         return False
     source_path = _trusted_python_module_source_path(owner_module)
     if source_path is None:
         return False
     try:
-        code_path = Path(function.__code__.co_filename).resolve()
+        code_path = Path((function.__code__ if code is None else code).co_filename).resolve()
     except (OSError, RuntimeError, ValueError):
         return False
-    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+    if expected_qualname is not None:
+        return code_path == source_path and _function_code_matches_trusted_source(
+            function, source_path, code=code, expected_qualname=expected_qualname
+        )
+    if code is None:
+        return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+    return code_path == source_path and _function_code_matches_trusted_source(function, source_path, code=code)
 
 
-def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> bool:
-    globals_namespace = function.__globals__
-    if type(globals_namespace) is not dict:
-        return False
-    owner_module = globals_namespace.get("__name__")
-    if type(owner_module) is not str or _trusted_module_origin_kind(owner_module) != "stdlib":
-        return False
-    source_path = _trusted_python_module_source_path(owner_module)
-    if source_path is None:
-        return False
-    try:
-        code_path = Path(function.__code__.co_filename).resolve()
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
-
-
-def _function_code_matches_trusted_source(function: FunctionType, source_path: Path) -> bool:
-    code = function.__code__
-    return any(candidate == code for candidate in _trusted_source_code_objects(str(source_path)))
+def _function_code_matches_trusted_source(
+    function: FunctionType,
+    source_path: Path,
+    *,
+    code: CodeType | None = None,
+    expected_qualname: str | None = None,
+) -> bool:
+    code = function.__code__ if code is None else code
+    return any(
+        candidate == code
+        for candidate in _trusted_source_code_objects(str(source_path))
+        if expected_qualname is None or getattr(candidate, "co_qualname", None) == expected_qualname
+    )
 
 
 @_register_source_sensitive_cache
@@ -3301,6 +3361,114 @@ def _mark_shared_source_snapshot_unreusable() -> None:
             snapshot.reusable = False
 
 
+_MAX_STABILITY_DETAIL_ENTRIES = 8
+_MAX_STABILITY_DETAIL_TEXT = 2048
+
+
+def _bounded_stability_text(value: str) -> dict[str, Any]:
+    details: dict[str, Any] = {"value": value[:_MAX_STABILITY_DETAIL_TEXT]}
+    if len(value) > _MAX_STABILITY_DETAIL_TEXT:
+        details.update(
+            length=len(value),
+            truncated=True,
+            sha256=hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest(),
+        )
+    return details
+
+
+def _record_source_stability_details(snapshot: _SharedSourceSnapshot, reason: str, details: dict[str, Any]) -> None:
+    if snapshot.stability_details is None and snapshot.stability_reason in {None, reason}:
+        snapshot.stability_details = (
+            reason,
+            {
+                "generation": snapshot.generation,
+                "active_report_generation": snapshot.active_report_generation,
+                **details,
+            },
+        )
+
+
+def _matching_source_stability_details(snapshot: _SharedSourceSnapshot, reason: str | None) -> dict[str, Any] | None:
+    observation = snapshot.stability_details
+    return observation[1] if observation is not None and observation[0] == reason else None
+
+
+def _resolution_context_change_details(
+    before: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    after: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> dict[str, Any]:
+    components: list[dict[str, Any]] = []
+    for name, previous, current in zip(("meta_path", "path_hooks", "path_importers"), before, after, strict=True):
+        if previous == current:
+            continue
+        changes: list[dict[str, Any]] = []
+        omitted = 0
+        for index in range(max(len(previous), len(current))):
+            old = previous[index] if index < len(previous) else None
+            new = current[index] if index < len(current) else None
+            if old == new:
+                continue
+            if len(changes) >= _MAX_STABILITY_DETAIL_ENTRIES:
+                omitted += 1
+                continue
+            change: dict[str, Any] = {
+                "index": index,
+                "before": _bounded_stability_text(old) if old is not None else None,
+                "after": _bounded_stability_text(new) if new is not None else None,
+            }
+            if name == "path_importers":
+                change["before_path"] = _bounded_stability_text(old.rpartition("=")[0]) if old is not None else None
+                change["after_path"] = _bounded_stability_text(new.rpartition("=")[0]) if new is not None else None
+            changes.append(change)
+        components.append(
+            {
+                "component": name,
+                "before_count": len(previous),
+                "after_count": len(current),
+                "changes": changes,
+                "omitted_changes": omitted,
+            }
+        )
+    return {"phase": "resolution_context", "components": components}
+
+
+def _stability_fingerprint_details(fingerprint: bytes | str | None) -> dict[str, Any]:
+    if fingerprint is None:
+        return {"kind": "missing"}
+    if isinstance(fingerprint, bytes):
+        return {"kind": "content_sha256", "value": fingerprint.hex()}
+    return {"kind": "file_identity", **_bounded_stability_text(fingerprint)}
+
+
+def _record_resolution_fingerprint_change(
+    snapshot: _SharedSourceSnapshot,
+    *,
+    phase: str,
+    path: str,
+    reusable: bool,
+    fingerprint: bytes | str | None,
+    module_name: str | None = None,
+    loaded: bool | None = None,
+) -> None:
+    expected_recorded = path in snapshot.resolution_fingerprints
+    details: dict[str, Any] = {
+        "phase": phase,
+        "path": _bounded_stability_text(path),
+        "reusable": reusable,
+        "expected_recorded": expected_recorded,
+        "expected": (
+            _stability_fingerprint_details(snapshot.resolution_fingerprints[path])
+            if expected_recorded
+            else {"kind": "untracked"}
+        ),
+        "observed": _stability_fingerprint_details(fingerprint) if reusable else {"kind": "unreadable"},
+    }
+    if module_name is not None:
+        details["module"] = _bounded_stability_text(module_name)
+        details["loaded"] = loaded
+    _record_source_stability_details(snapshot, "resolution_fingerprint_changed", details)
+
+
 def _mark_shared_source_snapshot_unstable(snapshot: _SharedSourceSnapshot, reason: str) -> None:
     """Record the first specific reason that invalidated the current report."""
     with snapshot.lock:
@@ -3308,6 +3476,7 @@ def _mark_shared_source_snapshot_unstable(snapshot: _SharedSourceSnapshot, reaso
             snapshot.stability_reason = reason
         if snapshot.active_report_generation is not None and snapshot.active_report_stability_reason is None:
             snapshot.active_report_stability_reason = reason
+            snapshot.active_report_stability_details = _matching_source_stability_details(snapshot, reason)
         snapshot.stable = False
         snapshot.reusable = False
 
@@ -3330,15 +3499,10 @@ def _bounded_module_name_parts(module_name: str) -> tuple[str, ...] | None:
 @contextmanager
 def shared_source_sensitive_caches() -> Iterator[None]:
     """Share source analysis until a bounded source snapshot changes."""
-    depth = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get()
-    if depth > 0:
-        snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
-        with snapshot.lock if snapshot is not None else nullcontext():
-            token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(depth + 1)
-            try:
-                yield
-            finally:
-                _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        with snapshot.lock:
+            yield
         return
 
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
@@ -3354,11 +3518,9 @@ def shared_source_sensitive_caches() -> Iterator[None]:
                 and all(":unreusable:" not in identity for identities in resolution_context for identity in identities),
             )
         )
-        token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(1)
         try:
             yield
         finally:
-            _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
             _SHARED_SOURCE_SENSITIVE_SNAPSHOT.reset(snapshot_token)
 
 
@@ -3384,7 +3546,7 @@ def _first_matching_path(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            path = error.partial_path
         except Exception:
             continue
         if path is not None:
@@ -3415,6 +3577,26 @@ def _invoked_import_execution_path_callback(
     return path_for
 
 
+def _reference_may_enter_template_method(module: str, name: str, reference: Mapping[str, object]) -> bool:
+    targets = {f"{module}.{name}"}
+    try:
+        targets.update(_call_graph_entrypoints_for_reference(module, name, reference))
+    except _CallGraphAnalysisLimitError as error:
+        targets.update(error.partial_entrypoints)
+    except Exception:
+        # Normal analysis below retains its existing error handling.
+        pass
+    return bool(
+        targets
+        & {
+            "string.Template.substitute",
+            "string.Template.safe_substitute",
+            "string.Template.is_valid",
+            "string.Template.get_identifiers",
+        }
+    )
+
+
 def _iter_call_graph_references(
     import_references: object,
     callable_references: tuple[dict[str, object], ...],
@@ -3422,7 +3604,9 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    seen_invocations: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
+    seen_invocations: set[
+        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None, bool | None]
+    ] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -3438,6 +3622,8 @@ def _iter_call_graph_references(
             _optional_bool_reference_detail(item.get("build_uses_slot_state")),
             _complete_keyword_arg_names(item),
             _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
+            _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
+            _optional_bool_reference_detail(item.get("template_execution_complete")),
         )
         if invocation_key in seen_invocations:
             continue
@@ -3501,7 +3687,9 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None]] = set()
+    seen: set[
+        tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None, bool | None, bool | None, bool | None]
+    ] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -3524,6 +3712,8 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 _optional_bool_reference_detail(item.get("build_uses_slot_state")),
                 _complete_keyword_arg_names(item),
                 _optional_bool_reference_detail(item.get("template_receiver_state_unmodified")),
+                _optional_bool_reference_detail(item.get("template_mapping_callbacks_complete")),
+                _optional_bool_reference_detail(item.get("template_execution_complete")),
             )
             if reference_key in seen:
                 continue
@@ -3857,10 +4047,8 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
 
 
 def _clear_source_sensitive_caches() -> None:
-    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() > 0:
-        snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
-        if snapshot is None:
-            return
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is not None:
         with snapshot.lock:
             reason = _shared_source_snapshot_staleness_reason(snapshot)
             if reason is None:
@@ -4270,10 +4458,6 @@ def _zipimport_bounded_central_directory_names(
         os.close(file_descriptor)
 
 
-def _zipimport_central_directory_is_bounded(archive: str, expected_stat: os.stat_result) -> bool:
-    return _zipimport_bounded_central_directory_names(archive, expected_stat) is not None
-
-
 def _zipimport_runtime_is_trusted() -> bool:
     modules = _runtime_sys_modules_without_hooks()
     if modules is None or dict.get(modules, "zipimport") is not zipimport:
@@ -4516,7 +4700,37 @@ def _zipimport_archive_files_match(archive: str, files: object) -> bool:
     return archive_files is not None and files == archive_files
 
 
-def _zipimport_restore_missing_directory_cache(
+def _zipimport_constructor_state_without_cache(entry: str) -> tuple[str, str] | None:
+    if type(entry) is not str or not entry:
+        return None
+    path = entry.replace(os.path.altsep, os.path.sep) if os.path.altsep else entry
+    prefix_parts: list[str] = []
+    for _ in range(_MAX_ZIPIMPORT_PATH_COMPONENTS + 1):
+        try:
+            archive_stat = os.stat(path)
+        except (OSError, ValueError):
+            separator = path.rfind(os.path.sep)
+            directory = path[:separator] if separator >= 0 else ""
+            basename = path[separator + 1 :] if separator >= 0 else path
+            if directory == path:
+                return None
+            path = directory
+            prefix_parts.append(basename)
+            continue
+        if not stat.S_ISREG(archive_stat.st_mode):
+            return None
+        # CPython's Windows join delegates colon-bearing components to a native
+        # root parser. Do not approximate that parser with ntpath.join.
+        if os.path.sep == "\\" and any(":" in part for part in prefix_parts):
+            return None
+        # Components came from the constructor's last-separator split, so the
+        # remaining join is exact and preserves POSIX literal backslashes.
+        prefix = os.path.sep.join(part for part in reversed(prefix_parts) if part)
+        return path, prefix + os.path.sep if prefix else ""
+    return None
+
+
+def _zipimport_read_missing_directory_files(
     instance_state: dict[str, object],
     archive: str,
     prefix: str,
@@ -4526,11 +4740,20 @@ def _zipimport_restore_missing_directory_cache(
     # retain _files; a missing shared entry cannot authenticate that older state.
     if set(instance_state) != {"archive", "prefix"} or not _zipimport_runtime_is_trusted():
         return None
-    archive_state = _zipimport_archive_state_from_entry(cache_key)
-    if not isinstance(archive_state, tuple):
+    initializer = _type_member_without_hooks(zipimporter, "__init__")[1]
+    if type(initializer) is not FunctionType:
         return None
-    _absolute_archive, expected_prefix, expected_archive = archive_state
-    if archive != expected_archive or prefix != expected_prefix.replace("/", os.path.sep):
+    constructor_names = initializer.__code__.co_names
+    if (
+        type(constructor_names) is not tuple
+        or len(constructor_names) > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        or any(type(name) is not str for name in constructor_names)
+        or "_files" in constructor_names
+    ):
+        # Removing _files from a legacy instance does not make its constructor modern.
+        return None
+    expected_state = _zipimport_constructor_state_without_cache(cache_key)
+    if expected_state is None or (archive, prefix) != expected_state:
         return None
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
     if dict.__contains__(directory_cache, archive):
@@ -4538,8 +4761,9 @@ def _zipimport_restore_missing_directory_cache(
     files = _zipimport_read_bounded_archive_files(archive)
     if files is None:
         return None
-    # Never replace a concurrently populated or poisoned entry.
-    return files if dict.setdefault(directory_cache, archive, files) is files else None
+    # Keep speculative metadata private. Publishing it would leave stale shared
+    # importer state when a subsequent disk or finder check rejects this identity.
+    return files if not dict.__contains__(directory_cache, archive) else None
 
 
 def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | None:
@@ -4561,15 +4785,21 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
     if type(archive) is not str or type(prefix) is not str or not _zipimport_runtime_is_trusted():
         return None
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
-    if dict.__contains__(directory_cache, archive):
-        files = dict.__getitem__(directory_cache, archive)
+    missing_cache = not dict.__contains__(directory_cache, archive)
+    if missing_cache:
+        files = _zipimport_read_missing_directory_files(instance_state, archive, prefix, cache_key)
+        # The private read authenticates the exact modern archive/prefix shape.
+        # Constructing another importer here would populate the shared cache.
+        expected_state = {"archive": archive, "prefix": prefix}
     else:
-        files = _zipimport_restore_missing_directory_cache(instance_state, archive, prefix, cache_key)
+        files = dict.__getitem__(directory_cache, archive)
+        if not _zipimport_files_are_safe(files):
+            return None
+        try:
+            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+        except (AttributeError, ImportError, OSError, TypeError):
+            return None
     if not _zipimport_files_are_safe(files):
-        return None
-    try:
-        expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-    except (AttributeError, ImportError, OSError, TypeError):
         return None
     if not (
         type(expected_state) is dict
@@ -4581,7 +4811,16 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
         and dict.get(instance_state, "_files", files) is files
         and dict.get(expected_state, "_files", files) is files
         and _zipimport_archive_files_match(archive, files)
-        and _zipimport_directory_cache_files(archive) is files
+        and (
+            not dict.__contains__(directory_cache, archive)
+            if missing_cache
+            else _zipimport_directory_cache_files(archive) is files
+        )
+        and _zipimport_runtime_is_trusted()
+        and all(
+            _runtime_value_matches_snapshot(_type_member_without_hooks(zipimporter, name)[1], snapshot)
+            for name, snapshot in _TRUSTED_ZIPIMPORTER_METHODS
+        )
         and object.__getattribute__(finder, "__dict__") is instance_state
         and type(dict.get(instance_state, "archive")) is str
         and dict.get(instance_state, "archive") == archive
@@ -5090,6 +5329,7 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.loaded_interpreter_references.clear()
     snapshot.generation += 1
     snapshot.stability_reason = None
+    snapshot.stability_details = None
     snapshot.stable = True
     snapshot.reusable = snapshot.import_runtime_trusted and all(
         ":unreusable:" not in identity for identities in snapshot.resolution_context for identity in identities
@@ -5144,6 +5384,11 @@ def _snapshot_resolution_context_is_current(snapshot: _SharedSourceSnapshot) -> 
     if snapshot.resolution_context == current:
         return True
     if not _resolution_context_allows_trusted_cache_population(snapshot.resolution_context, current):
+        _record_source_stability_details(
+            snapshot,
+            "resolution_context_changed",
+            _resolution_context_change_details(snapshot.resolution_context, current),
+        )
         return False
     snapshot.resolution_context = current
     snapshot.reusable = snapshot.reusable and all(
@@ -5183,6 +5428,13 @@ def _shared_source_snapshot_staleness_reason(snapshot: _SharedSourceSnapshot) ->
     for path, expected_resolution_fingerprint in snapshot.resolution_fingerprints.items():
         reusable, resolution_fingerprint = _resolution_candidate_fingerprint(Path(path))
         if not reusable or resolution_fingerprint != expected_resolution_fingerprint:
+            _record_resolution_fingerprint_change(
+                snapshot,
+                phase="resolution_revalidation",
+                path=path,
+                reusable=reusable,
+                fingerprint=resolution_fingerprint,
+            )
             return "resolution_fingerprint_changed"
     for module_name, expected_source in snapshot.module_sources.items():
         if _current_module_source_path(module_name) != expected_source:
@@ -5239,13 +5491,14 @@ def _begin_shared_source_report() -> int | None:
     if snapshot is None:
         return None
     with snapshot.lock:
-        # Context creation already validated the runtime immediately before the first report.
-        if snapshot.report_started and (not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot)):
+        if not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot):
             _clear_source_sensitive_caches_now()
             _reset_shared_source_snapshot(snapshot)
         snapshot.active_report_generation = snapshot.generation
         snapshot.active_report_stability_reason = snapshot.stability_reason if not snapshot.stable else None
-        snapshot.report_started = True
+        snapshot.active_report_stability_details = _matching_source_stability_details(
+            snapshot, snapshot.active_report_stability_reason
+        )
         return snapshot.generation
 
 
@@ -5263,17 +5516,24 @@ def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None
             raise _CallGraphAnalysisLimitError(
                 "source changed during shared call-graph analysis",
                 stability_reason=reason or "report_generation_advanced",
+                stability_details=(
+                    snapshot.active_report_stability_details
+                    if snapshot.active_report_generation == report_generation
+                    else None
+                ),
             )
         reason = _shared_source_snapshot_staleness_reason(snapshot)
         if reason is None:
             return
         _mark_shared_source_snapshot_unstable(snapshot, reason)
         reason = snapshot.active_report_stability_reason or reason
+        details = snapshot.active_report_stability_details or _matching_source_stability_details(snapshot, reason)
         _clear_source_sensitive_caches_now()
         _reset_shared_source_snapshot(snapshot)
     raise _CallGraphAnalysisLimitError(
         "source changed during shared call-graph analysis",
         stability_reason=reason,
+        stability_details=details,
     )
 
 
@@ -5603,6 +5863,15 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
             return
         reusable, fingerprint = _resolution_candidate_fingerprint(candidate)
         if not reusable:
+            _record_resolution_fingerprint_change(
+                snapshot,
+                phase="selected_source_read",
+                path=str(candidate),
+                reusable=reusable,
+                fingerprint=fingerprint,
+                module_name=module_name,
+                loaded=loaded,
+            )
             _mark_shared_source_snapshot_unstable(snapshot, "resolution_fingerprint_changed")
             return
         existing_source = snapshot.module_sources.get(module_name)
@@ -6056,12 +6325,7 @@ def _find_invoked_import_execution_path(
     module_name, is_package, function_node = context
     if not allow_non_lifecycle_entrypoint and not _is_pickle_entered_import_execution_entrypoint(resolved):
         return None
-    can_enter = (
-        _can_enter_function_with_unknown_keyword_args(function_node, positional_arg_count)
-        if keyword_arg_names is None
-        else _can_enter_function_with_arguments(function_node, positional_arg_count, keyword_arg_names)
-    )
-    if not can_enter:
+    if not _can_enter_function_with_arguments(function_node, positional_arg_count, keyword_arg_names):
         return None
     ignore_direct_import = _template_import_requires_keywords(resolved, keyword_arg_names)
     if not ignore_direct_import and _IMPORT_EXECUTION_SINK in _direct_import_execution_calls(
@@ -6101,19 +6365,33 @@ def _find_matching_call_path(
     queue: deque[tuple[str, tuple[str, ...]]] = deque([(start, (start,))])
     visited = {start}
     import_execution_fallback_path: tuple[str, ...] | None = None
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path = queue.popleft()
         sink = sink_for(function_name)
         if sink is not None:
+            if analysis_limit_error is not None:
+                raise _CallGraphAnalysisLimitError(
+                    str(analysis_limit_error), partial_path=path
+                ) from analysis_limit_error
             return path
         resolved_function = _resolve_function_target(function_name)
         if resolved_function is not None and resolved_function != function_name:
             sink = sink_for(resolved_function)
             if sink is not None:
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
 
-        calls = _calls_for_function(function_name)
+        try:
+            calls = _calls_for_function(function_name)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            calls = error.partial_calls
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6131,17 +6409,30 @@ def _find_matching_call_path(
                     if import_execution_fallback_allowed and import_execution_fallback_path is None:
                         import_execution_fallback_path = (*path, sink)
                     continue
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
 
         if sink_for is _rce_sink:
             for call in sorted(bounded_calls, key=_short_sink_call_priority):
-                short_sink_path = _find_short_matching_call_path(
-                    call, sink_for, ignored_direct_import_from=ignored_direct_import_from
-                )
+                try:
+                    short_sink_path = _find_short_matching_call_path(
+                        call, sink_for, ignored_direct_import_from=ignored_direct_import_from
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    short_sink_path = error.partial_path
                 if short_sink_path is not None:
                     sink = short_sink_path[-1]
                     if _is_tcl_interpreter_dispatch_call(sink) or _is_import_execution_sink(sink):
                         continue
+                    if analysis_limit_error is not None:
+                        raise _CallGraphAnalysisLimitError(
+                            str(analysis_limit_error), partial_path=(*path, *short_sink_path)
+                        ) from analysis_limit_error
                     return (*path, *short_sink_path)
 
         for call in bounded_calls:
@@ -6152,6 +6443,10 @@ def _find_matching_call_path(
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved)))
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_path=import_execution_fallback_path
+        ) from analysis_limit_error
     return import_execution_fallback_path
 
 
@@ -6172,10 +6467,16 @@ def _find_short_matching_call_path(
 ) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...], int]] = deque([(start, (start,), 0)])
     visited = {start}
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path, depth = queue.popleft()
-        calls = _calls_for_function(function_name)
+        try:
+            calls = _calls_for_function(function_name)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            calls = error.partial_calls
         if calls is None:
             continue
         if function_name == ignored_direct_import_from:
@@ -6185,6 +6486,10 @@ def _find_short_matching_call_path(
             if sink is not None:
                 if _is_import_execution_sink(sink):
                     continue
+                if analysis_limit_error is not None:
+                    raise _CallGraphAnalysisLimitError(
+                        str(analysis_limit_error), partial_path=(*path, sink)
+                    ) from analysis_limit_error
                 return (*path, sink)
             if depth >= _MAX_SHORT_SINK_DEPTH:
                 continue
@@ -6193,6 +6498,8 @@ def _find_short_matching_call_path(
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved), depth + 1))
+    if analysis_limit_error is not None:
+        raise analysis_limit_error
     return None
 
 
@@ -6209,14 +6516,68 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
     calls = analysis.calls_by_function.get(f"{module_name}.{qualified_name}")
     if calls is None:
         return None
-    if (
-        any(call.startswith("string.Template.pattern.") for call in calls)
-        and module_name == "string"
-        and _template_uses_reviewed_lazy_pattern()
-        and not _template_has_trusted_compiled_pattern()
-    ):
-        calls = (*calls, "string.Template._compile_pattern")
+    try:
+        if (
+            any(call.startswith("string.Template.pattern.") for call in calls)
+            and module_name == "string"
+            and _template_uses_reviewed_lazy_pattern()
+            and not _template_has_trusted_compiled_pattern()
+        ):
+            calls = (*calls, "string.Template._compile_pattern")
+        if module_name == "typing" and analysis.aliases.get("_lazy_annotationlib") == "annotationlib":
+            context = _module_source_context(module_name)
+            if context is not None and _typing_uses_reviewed_annotationlib_proxy(context):
+                function = _find_qualified_function_def(context.module_statements, qualified_name)
+                proxy = _find_qualified_function_def(context.module_statements, "_LazyAnnotationLib.__getattr__")
+                if function is not None and proxy is not None and _function_reads_lazy_annotationlib(function):
+                    calls = (*calls, *_direct_import_execution_calls(proxy, module_name, context.is_package))
+    except _CallGraphAnalysisLimitError as error:
+        raise _CallGraphAnalysisLimitError(
+            str(error),
+            partial_calls=calls,
+            stability_reason=error.stability_reason,
+            stability_details=error.stability_details,
+        ) from error
     return calls
+
+
+def _function_reads_lazy_annotationlib(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    class _ProxyReadVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if (
+                isinstance(node.ctx, ast.Load)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "_lazy_annotationlib"
+            ):
+                self.found = True
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            self._visit_defaults(node.args)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self._visit_defaults(node.args)
+
+        def _visit_defaults(self, args: ast.arguments) -> None:
+            for default in (*args.defaults, *args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Lambda):
+                self.visit(node.func.body)
+
+    visitor = _ProxyReadVisitor()
+    for statement in function.body:
+        visitor.visit(statement)
+    return visitor.found
 
 
 def _template_import_requires_keywords(function_name: str, keyword_arg_names: tuple[str, ...] | None) -> bool:
@@ -6463,14 +6824,83 @@ def _template_runtime_matches_trusted_source(module: object) -> bool:
     for name in ("__init__", "_invalid", "substitute", "safe_substitute", "is_valid", "get_identifiers"):
         member = _loaded_reference_state_without_hooks(module, f"Template.{name}")
         _track_loaded_interpreter_reference_state("string", f"Template.{name}", member)
+        if not member[0] or type(member[1]) is not FunctionType:
+            return False
+        function = member[1]
+        code = function.__code__
         if (
-            not member[0]
-            or type(member[1]) is not FunctionType
-            or getattr(member[1].__code__, "co_qualname", None) != f"Template.{name}"
-            or not _function_owner_matches_trusted_source(member[1], expected_module="string")
-            or not _template_function_runtime_is_canonical(member[1], module, name, sentinel)
+            not _template_code_metadata_is_hook_free(code)
+            or code.co_name != name
+            or getattr(code, "co_qualname", None) != f"Template.{name}"
+            or not _function_owner_matches_trusted_source(
+                function, expected_module="string", code=code, expected_qualname=f"Template.{name}"
+            )
+            or not _template_function_runtime_is_canonical(function, module, name, sentinel, code=code)
+            or function.__code__ is not code
         ):
             return False
+    return True
+
+
+def _template_code_metadata_is_hook_free(code: CodeType) -> bool:
+    missing = object()
+    pending: list[tuple[object, int]] = [(code, 0)]
+    checked = 0
+    code_count = 0
+    while pending:
+        value, depth = pending.pop()
+        checked += 1
+        if checked > _MAX_SOURCE_FINGERPRINT_CANDIDATES or depth > _MAX_TRUSTED_REFERENCE_FUNCTIONS:
+            return False
+        value_type = type(value)
+        if (
+            value is None
+            or value is Ellipsis
+            or any(value_type is primitive for primitive in (bool, int, float, complex, str, bytes))
+        ):
+            continue
+        if (
+            value_type is not CodeType
+            and value_type is not tuple
+            and value_type is not frozenset
+            and value_type is not slice
+        ):
+            return False
+        remaining = _MAX_SOURCE_FINGERPRINT_CANDIDATES - checked - len(pending)
+        if value_type is CodeType:
+            current = cast(CodeType, value)
+            code_count += 1
+            if code_count > _MAX_TRUSTED_REFERENCE_FUNCTIONS:
+                return False
+            if type(current.co_name) is not str or type(current.co_filename) is not str:
+                return False
+            # Python 3.10 lacks these fields; present metadata must have exact types.
+            qualified_name = getattr(current, "co_qualname", missing)
+            exception_table = getattr(current, "co_exceptiontable", missing)
+            if qualified_name is not missing and type(qualified_name) is not str:
+                return False
+            if type(current.co_linetable) is not bytes:
+                return False
+            if exception_table is not missing and type(exception_table) is not bytes:
+                return False
+            names = current.co_names
+            constants = current.co_consts
+            if type(names) is not tuple or type(constants) is not tuple or len(names) >= remaining:
+                return False
+            checked += len(names)
+            if any(type(name) is not str for name in names):
+                return False
+            pending.append((constants, depth + 1))
+        elif value_type is slice:
+            if remaining < 3:
+                return False
+            current_slice = cast(slice, value)
+            pending.extend((item, depth + 1) for item in (current_slice.start, current_slice.stop, current_slice.step))
+        else:
+            items = cast(tuple[object, ...] | frozenset[object], value)
+            if len(items) > remaining:
+                return False
+            pending.extend((item, depth + 1) for item in items)
     return True
 
 
@@ -6504,7 +6934,7 @@ def _template_defaultdict_constructor_is_canonical(value: object) -> bool:
 
 
 def _template_function_runtime_is_canonical(
-    function: FunctionType, module: ModuleType, name: str, sentinel: object
+    function: FunctionType, module: ModuleType, name: str, sentinel: object, *, code: CodeType
 ) -> bool:
     namespace = ModuleType.__getattribute__(module, "__dict__")
     if (
@@ -6521,7 +6951,7 @@ def _template_function_runtime_is_canonical(
             return False
     elif defaults is not None:
         return False
-    for dependency in _code_loaded_global_names(function.__code__):
+    for dependency in _code_loaded_global_names(code):
         state = _loaded_reference_state_without_hooks(module, dependency)
         _track_loaded_interpreter_reference_state("string", dependency, state)
         if dependency == "_sentinel_dict":
@@ -8031,7 +8461,7 @@ def _stdlib_import_is_reviewed_inert(module_name: str) -> bool:
     return module_name in _REVIEWED_INERT_STDLIB_IMPORTS and _trusted_module_origin_kind(module_name) == "stdlib"
 
 
-def _module_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+def _statement_binds_name(statement: ast.stmt, name: str, *, class_body: bool = False) -> bool:
     if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
         return statement.name == name
     if isinstance(statement, ast.Import):
@@ -8040,9 +8470,17 @@ def _module_statement_binds_name(statement: ast.stmt, name: str) -> bool:
         return any((alias.asname or alias.name) == name for alias in statement.names)
     if isinstance(statement, ast.Assign):
         return any(_assignment_target_binds_name(target, name) for target in statement.targets)
-    if isinstance(statement, ast.AnnAssign):
+    if class_body:
+        if isinstance(statement, ast.AnnAssign | ast.AugAssign):
+            return _assignment_target_binds_name(statement.target, name)
+        if isinstance(statement, ast.Delete):
+            return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    elif isinstance(statement, ast.AnnAssign):
         return _assignment_target_binds_name(statement.target, name)
     return False
+
+
+_module_statement_binds_name = _statement_binds_name
 
 
 def _assignment_target_binds_name(target: ast.expr, name: str) -> bool:
@@ -8251,12 +8689,7 @@ def _collect_local_class_entrypoints(
         method_names = set(_class_method_nodes(statement))
         inherited_method_names = set(
             _inherited_class_methods(
-                statement,
-                module_name,
-                aliases,
-                local_defs,
-                local_class_nodes,
-                statement_tuple,
+                _ClassSourceContext(module_name, statement, statement_tuple, aliases, local_defs, local_class_nodes)
             )
         )
         entrypoints = tuple(
@@ -8295,7 +8728,7 @@ def _class_has_plain_local_method(class_node: ast.ClassDef, method_name: str) ->
             plain_method_count += 1
             continue
         if any(
-            _class_body_statement_binds_name(candidate, method_name)
+            _statement_binds_name(candidate, method_name, class_body=True)
             for candidate in _definition_scope_statements((child,))
         ):
             return False
@@ -8323,14 +8756,7 @@ def _class_lookup_has_source_backed_plain_metaclass(context: _ClassSourceContext
         if base_targets is None:
             return False
         for base in base_targets:
-            base_context = _class_source_context_for_target(
-                base,
-                current.module_name,
-                current.aliases,
-                current.local_defs,
-                current.local_class_nodes,
-                current.module_statements,
-            )
+            base_context = _class_source_context_for_target(base, current)
             if base_context is None:
                 return False
             pending.append(base_context)
@@ -8352,22 +8778,6 @@ def _class_base_targets_for_static_lookup(
             return None
         targets.append(resolved)
     return tuple(targets)
-
-
-def _class_body_statement_binds_name(statement: ast.stmt, name: str) -> bool:
-    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-        return statement.name == name
-    if isinstance(statement, ast.Import):
-        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
-    if isinstance(statement, ast.ImportFrom):
-        return any((alias.asname or alias.name) == name for alias in statement.names)
-    if isinstance(statement, ast.Assign):
-        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
-    if isinstance(statement, ast.AnnAssign | ast.AugAssign):
-        return _assignment_target_binds_name(statement.target, name)
-    if isinstance(statement, ast.Delete):
-        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
-    return False
 
 
 def _class_attribute_rebound_after_definition(context: _ClassSourceContext, attribute: str) -> bool:
@@ -8496,82 +8906,48 @@ def _statement_contains_runtime_call(statement: ast.stmt) -> bool:
 
 
 def _inherited_class_methods(
-    class_node: ast.ClassDef,
-    module_name: str,
-    aliases: dict[str, str],
-    local_defs: set[str],
-    local_class_nodes: dict[str, ast.ClassDef],
-    module_statements: tuple[ast.stmt, ...],
+    context: _ClassSourceContext,
+    traversal: tuple[set[str], set[str], dict[str, _InheritedClassMethod]] | None = None,
 ) -> dict[str, _InheritedClassMethod]:
-    inherited: dict[str, _InheritedClassMethod] = {}
-    direct_method_names = set(_class_method_nodes(class_node))
-    visited: set[str] = set()
-
-    def visit_base(context: _ClassSourceContext) -> None:
+    if traversal is None:
+        inherited: dict[str, _InheritedClassMethod] = {}
+        direct_method_names = set(_class_method_nodes(context.class_node))
+        visited: set[str] = set()
+        traversal = visited, direct_method_names, inherited
+    else:
+        visited, direct_method_names, inherited = traversal
         base_key = f"{context.module_name}.{context.class_node.name}"
         if base_key in visited or len(inherited) >= _MAX_INHERITED_CLASS_METHODS:
-            return
+            return inherited
         visited.add(base_key)
         for method_name, method_node in _class_method_nodes(context.class_node).items():
             if method_name in direct_method_names or method_name in inherited:
                 continue
             inherited[method_name] = _InheritedClassMethod(
-                name=method_name,
                 node=method_node,
                 module_name=context.module_name,
                 aliases=context.aliases,
                 local_defs=context.local_defs,
             )
             if len(inherited) >= _MAX_INHERITED_CLASS_METHODS:
-                return
-        for nested_base in _class_base_targets(
-            context.class_node,
-            context.module_name,
-            context.aliases,
-            context.local_defs,
-        ):
-            nested_context = _class_source_context_for_target(
-                nested_base,
-                context.module_name,
-                context.aliases,
-                context.local_defs,
-                context.local_class_nodes,
-                context.module_statements,
-            )
-            if nested_context is not None:
-                visit_base(nested_context)
-
-    for base in _class_base_targets(class_node, module_name, aliases, local_defs):
-        base_context = _class_source_context_for_target(
-            base,
-            module_name,
-            aliases,
-            local_defs,
-            local_class_nodes,
-            module_statements,
-        )
+                return inherited
+    for base in _class_base_targets(context.class_node, context.module_name, context.aliases, context.local_defs):
+        base_context = _class_source_context_for_target(base, context)
         if base_context is not None:
-            visit_base(base_context)
+            _inherited_class_methods(base_context, traversal)
     return inherited
 
 
-def _class_source_context_for_target(
-    class_target: str,
-    module_name: str,
-    aliases: dict[str, str],
-    local_defs: set[str],
-    local_class_nodes: dict[str, ast.ClassDef],
-    module_statements: tuple[ast.stmt, ...],
-) -> _ClassSourceContext | None:
-    local_class_node = _local_class_node_from_target(class_target, module_name, local_class_nodes)
+def _class_source_context_for_target(class_target: str, context: _ClassSourceContext) -> _ClassSourceContext | None:
+    local_class_node = _local_class_node_from_target(class_target, context.module_name, context.local_class_nodes)
     if local_class_node is not None:
         return _ClassSourceContext(
-            module_name=module_name,
+            module_name=context.module_name,
             class_node=local_class_node,
-            module_statements=module_statements,
-            aliases=aliases,
-            local_defs=local_defs,
-            local_class_nodes=local_class_nodes,
+            module_statements=context.module_statements,
+            aliases=context.aliases,
+            local_defs=context.local_defs,
+            local_class_nodes=context.local_class_nodes,
         )
     return _source_class_context(class_target)
 
@@ -8616,12 +8992,14 @@ def _inherited_source_function_context(
     aliases = _collect_import_aliases(module_statements, module_name, is_package)
     local_defs = _collect_local_defs(module_statements)
     inherited_method = _inherited_class_methods(
-        class_node,
-        module_name,
-        aliases,
-        local_defs,
-        _local_class_nodes(module_statements),
-        tuple(module_statements),
+        _ClassSourceContext(
+            module_name=module_name,
+            class_node=class_node,
+            aliases=aliases,
+            local_defs=local_defs,
+            local_class_nodes=_local_class_nodes(module_statements),
+            module_statements=tuple(module_statements),
+        )
     ).get(method_name)
     if inherited_method is None:
         return None
@@ -8743,28 +9121,11 @@ def _conditionally_rebound_assignment_nodes(
         branch_bodies: tuple[Iterable[ast.stmt], ...]
         terminating_bodies: tuple[Iterable[ast.stmt], ...]
         deterministic_terminal_bodies: tuple[Iterable[ast.stmt], ...] | None = None
-        if isinstance(node, ast.If):
-            alternate_bodies = _definition_scope_child_bodies(node)
-            terminating_bodies = tuple(
-                branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
-            )
-            branch_bodies = tuple(
-                branch_body for branch_body in alternate_bodies if _can_complete_normally(branch_body)
-            )
-            continuing_targets = set().union(*(_assignment_alias_targets(branch_body) for branch_body in branch_bodies))
-            terminating_targets = set().union(
-                *(_assignment_alias_targets(branch_body) for branch_body in terminating_bodies)
-            )
-            if continuing_targets & terminating_targets:
-                branch_bodies = alternate_bodies
-            if len(branch_bodies) < 2:
-                continue
-            deterministic_terminal_bodies = branch_bodies
-        elif isinstance(node, ast.Try) and node.handlers:
-            alternate_bodies = (
-                (*node.body, *node.orelse),
-                *(handler.body for handler in node.handlers),
-            )
+        if isinstance(node, ast.If) or (isinstance(node, ast.Try) and node.handlers):
+            if isinstance(node, ast.If):
+                alternate_bodies = _definition_scope_child_bodies(node)
+            else:
+                alternate_bodies = ((*node.body, *node.orelse), *(handler.body for handler in node.handlers))
             terminating_bodies = tuple(
                 branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
             )
@@ -9519,12 +9880,7 @@ def _collect_function_calls(
                     ),
                 )
             for method_name, method in _inherited_class_methods(
-                statement,
-                module_name,
-                aliases,
-                local_defs,
-                local_class_nodes,
-                statement_tuple,
+                _ClassSourceContext(module_name, statement, statement_tuple, aliases, local_defs, local_class_nodes)
             ).items():
                 function_name = f"{module_name}.{statement.name}.{method_name}"
                 if function_name in calls_by_function:
@@ -9561,14 +9917,7 @@ def _add_function_calls(
 
 
 def _dedupe_calls(calls: Iterable[str]) -> tuple[str, ...]:
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for call in calls:
-        if call in seen:
-            continue
-        seen.add(call)
-        deduped.append(call)
-    return tuple(deduped)
+    return tuple(dict.fromkeys(calls))
 
 
 def _calls_in_function(
@@ -9666,7 +10015,9 @@ def _calls_in_function(
                 if parameter_controlled_names is None:
                     parameter_controlled_names = _parameter_controlled_names(function_node)
                 if tcl_command_controlled_names is None:
-                    tcl_command_controlled_names = _parameter_controlled_tcl_command_names(function_node)
+                    tcl_command_controlled_names = _propagate_parameter_controlled_names(
+                        function_node, tcl_command=True
+                    )
                 if not _tcl_dispatch_uses_parameter_controlled_command(
                     node,
                     resolved,
@@ -9702,7 +10053,7 @@ def _import_execution_calls(
     is_package: bool,
 ) -> tuple[str, ...]:
     if (
-        _has_required_user_arguments(function_node)
+        not _can_enter_function_with_arguments(function_node, 0, ())
         and function_node.name not in _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET
     ):
         return ()
@@ -9743,13 +10094,6 @@ def _direct_import_execution_calls(
 
     _ExecutedImportVisitor().visit(function_node)
     return (_IMPORT_EXECUTION_SINK,) if imports_user_code else ()
-
-
-def _has_required_user_arguments(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    required_count, _maximum_count, has_required_keyword_only = _user_positional_argument_range(function_node)
-    if required_count:
-        return True
-    return has_required_keyword_only
 
 
 @_register_source_sensitive_cache
@@ -9793,96 +10137,36 @@ def _is_pickle_lifecycle_entrypoint(function_name: str) -> bool:
 def _can_enter_function_with_arguments(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     positional_arg_count: int,
-    keyword_arg_names: tuple[str, ...],
+    keyword_arg_names: tuple[str, ...] | None,
 ) -> bool:
-    positional_parameters = tuple(
-        argument
-        for argument in (*function_node.args.posonlyargs, *function_node.args.args)
-        if argument.arg not in {"self", "cls"}
-    )
-    positional_only_names = {
-        argument.arg for argument in function_node.args.posonlyargs if argument.arg not in {"self", "cls"}
-    }
-    positional_or_keyword_names = {
-        argument.arg for argument in function_node.args.args if argument.arg not in {"self", "cls"}
-    }
-    keyword_only_names = {
-        argument.arg for argument in function_node.args.kwonlyargs if argument.arg not in {"self", "cls"}
-    }
-    if function_node.args.vararg is None and positional_arg_count > len(positional_parameters):
+    args = function_node.args
+    positional = [arg.arg for arg in (*args.posonlyargs, *args.args)]
+    positional_only = positional[: len(args.posonlyargs)]
+    user_positional = [name for name in positional if name not in {"self", "cls"}]
+    if args.vararg is None and positional_arg_count > len(user_positional):
         return False
-    bound_positionally = {argument.arg for argument in positional_parameters[:positional_arg_count]}
-    keyword_names = set(keyword_arg_names)
-    if bound_positionally & keyword_names:
-        return False
-    for keyword_name in keyword_names:
-        if keyword_name in positional_only_names:
-            if function_node.args.kwarg is None:
-                return False
-            continue
-        if (
-            keyword_name not in positional_or_keyword_names
-            and keyword_name not in keyword_only_names
-            and function_node.args.kwarg is None
-        ):
-            return False
 
-    all_positional = (*function_node.args.posonlyargs, *function_node.args.args)
-    required_positional = all_positional[: max(len(all_positional) - len(function_node.args.defaults), 0)]
-    for argument in required_positional:
-        if argument.arg in {"self", "cls"}:
-            continue
-        if argument.arg in positional_only_names:
-            if argument.arg not in bound_positionally:
-                return False
-            continue
-        if argument.arg not in bound_positionally and argument.arg not in keyword_names:
+    bound_positionally = set(user_positional[:positional_arg_count])
+    required_count = max(len(positional) - len(args.defaults), 0)
+    required_unbound = set(positional[:required_count]) - {"self", "cls"} - bound_positionally
+    if required_unbound.intersection(positional_only):
+        return False
+    if keyword_arg_names is None:
+        # Unknown keywords can satisfy any remaining positional-or-keyword and keyword-only parameters.
+        return True
+
+    keywords = set(keyword_arg_names)
+    if bound_positionally & keywords or not required_unbound <= keywords:
+        return False
+    if keywords and args.kwarg is None:
+        allowed_keywords = {arg.arg for arg in (*args.args, *args.kwonlyargs)} - {"self", "cls"} - set(positional_only)
+        if not keywords <= allowed_keywords:
             return False
     return all(
-        argument.arg in keyword_names
-        for argument, default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults, strict=True)
+        argument.arg in keywords
+        for argument, default in zip(args.kwonlyargs, args.kw_defaults, strict=True)
         if argument.arg not in {"self", "cls"} and default is None
     )
-
-
-def _can_enter_function_with_unknown_keyword_args(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
-    positional_arg_count: int,
-) -> bool:
-    positional_parameters = tuple(
-        argument
-        for argument in (*function_node.args.posonlyargs, *function_node.args.args)
-        if argument.arg not in {"self", "cls"}
-    )
-    if function_node.args.vararg is None and positional_arg_count > len(positional_parameters):
-        return False
-    bound_positionally = {argument.arg for argument in positional_parameters[:positional_arg_count]}
-    required_count = max(
-        len(function_node.args.posonlyargs) + len(function_node.args.args) - len(function_node.args.defaults),
-        0,
-    )
-    return all(
-        argument.arg in {"self", "cls"} or argument.arg in bound_positionally
-        for argument in function_node.args.posonlyargs[:required_count]
-    )
-
-
-def _user_positional_argument_range(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> tuple[int, int | None, bool]:
-    positional_args = (*function_node.args.posonlyargs, *function_node.args.args)
-    required_positional_args = positional_args[: max(len(positional_args) - len(function_node.args.defaults), 0)]
-    required_count = sum(1 for argument in required_positional_args if argument.arg not in {"self", "cls"})
-    maximum_count = (
-        None
-        if function_node.args.vararg is not None
-        else sum(1 for argument in positional_args if argument.arg not in {"self", "cls"})
-    )
-    has_required_keyword_only = any(
-        argument.arg not in {"self", "cls"} and default is None
-        for argument, default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults, strict=True)
-    )
-    return required_count, maximum_count, has_required_keyword_only
 
 
 def _import_module_can_execute_user_code(module_name: str) -> bool:
@@ -10171,9 +10455,10 @@ def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> t
     return tuple(calls)
 
 
-@_register_source_sensitive_cache
-@lru_cache(maxsize=4096)
-def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+def _propagate_parameter_controlled_names(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef, *, tcl_command: bool = False
+) -> set[str]:
+    uses_names = _tcl_call_command_uses_names if tcl_command else _expr_uses_names
     controlled = _initial_parameter_controlled_names(function_node)
 
     changed = True
@@ -10182,17 +10467,17 @@ def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFuncti
         for node in ast.walk(function_node):
             target_names: set[str]
             if isinstance(node, ast.Assign):
-                if not _expr_uses_names(node.value, controlled):
+                if not uses_names(node.value, controlled):
                     continue
                 target_names = set()
                 for target in node.targets:
                     target_names.update(_assignment_target_names(target))
             elif isinstance(node, ast.AnnAssign):
-                if node.value is None or not _expr_uses_names(node.value, controlled):
+                if node.value is None or not uses_names(node.value, controlled):
                     continue
                 target_names = _assignment_target_names(node.target)
             elif isinstance(node, ast.For | ast.AsyncFor):
-                if not _expr_uses_names(node.iter, controlled):
+                if not uses_names(node.iter, controlled):
                     continue
                 target_names = _assignment_target_names(node.target)
             else:
@@ -10201,6 +10486,11 @@ def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFuncti
             controlled.update(target_names)
             changed = changed or len(controlled) != before
     return controlled
+
+
+_parameter_controlled_names = _register_source_sensitive_cache(
+    lru_cache(maxsize=4096)(_propagate_parameter_controlled_names)
+)
 
 
 def _initial_parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
@@ -10218,36 +10508,6 @@ def _initial_parameter_controlled_names(function_node: ast.FunctionDef | ast.Asy
     if function_node.args.kwarg is not None:
         controlled.add(function_node.args.kwarg.arg)
 
-    return controlled
-
-
-def _parameter_controlled_tcl_command_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    controlled = _initial_parameter_controlled_names(function_node)
-
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(function_node):
-            target_names: set[str]
-            if isinstance(node, ast.Assign):
-                if not _tcl_call_command_uses_names(node.value, controlled):
-                    continue
-                target_names = set()
-                for target in node.targets:
-                    target_names.update(_assignment_target_names(target))
-            elif isinstance(node, ast.AnnAssign):
-                if node.value is None or not _tcl_call_command_uses_names(node.value, controlled):
-                    continue
-                target_names = _assignment_target_names(node.target)
-            elif isinstance(node, ast.For | ast.AsyncFor):
-                if not _tcl_call_command_uses_names(node.iter, controlled):
-                    continue
-                target_names = _assignment_target_names(node.target)
-            else:
-                continue
-            before = len(controlled)
-            controlled.update(target_names)
-            changed = changed or len(controlled) != before
     return controlled
 
 

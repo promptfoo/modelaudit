@@ -126,6 +126,7 @@ from modelaudit_picklescan.call_graph import (
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
+from modelaudit_picklescan.report import _deep_mutable_copy
 
 
 class _ClearedSourceSensitiveCaches:
@@ -1976,6 +1977,22 @@ def test_scan_bytes_does_not_report_structural_tamper_for_binary_tail() -> None:
     assert all(finding.rule_code != "STRUCTURAL_TAMPER" for finding in report.findings)
 
 
+@pytest.mark.parametrize("entry_count", [1260, 2048, 2049])
+def test_scan_bytes_tracks_large_state_dict_up_to_entry_limit(entry_count: int) -> None:
+    entries = b"".join(f"Vkey{index}\ncbuiltins\nhelp\ns".encode() for index in range(entry_count))
+    report = scan_bytes(b"\x80\x04}" + entries + b".", source="large-state-dict.pkl")
+    notices = [notice for notice in report.notices if notice.code == "tracked_state_budget"]
+
+    if entry_count <= 2048:
+        _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
+        assert not notices
+    else:
+        _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
+        assert len(notices) == 1
+        assert notices[0].details["tracked_dict_entries"] == entry_count
+        assert notices[0].details["max_tracked_dict_entries"] == 2048
+
+
 def test_scan_bytes_warns_on_post_budget_memo_growth_tail() -> None:
     payload = _make_opcode_padding_stream(64) + _make_memo_expansion_pickle(iterations=80)
 
@@ -2120,6 +2137,54 @@ def test_scan_bytes_flags_untrusted_persistent_ids(payload: bytes, opcode: str) 
     assert any(
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == opcode for finding in report.findings
     )
+
+
+@pytest.mark.parametrize("operand", [b"\xff", b"\xc3\xa9"])
+def test_scan_bytes_rejects_non_ascii_protocol0_persistent_id(operand: bytes) -> None:
+    report = scan_bytes(b"P" + operand + b"\n.")
+
+    _assert_report_state(report, ScanStatus.ERROR, SafetyVerdict.UNKNOWN)
+    assert any("persistent ID must be ASCII" in error.message for error in report.errors)
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "rule"),
+    [
+        (b"cbuiltins\nopen\n", "DANGEROUS_GLOBAL"),
+        (b"\x82\x01", "EXTENSION_REF"),
+        (b"U\x03keyQ", "PERSISTENT_ID"),
+    ],
+)
+@pytest.mark.parametrize("encoded", [False, True], ids=["raw", "base64"])
+@pytest.mark.parametrize("tail", [b".", b"!"], ids=["stop", "malformed-tail"])
+def test_scan_bytes_preserves_nested_prefix_before_invalid_persid(
+    prefix: bytes, rule: str, encoded: bool, tail: bytes
+) -> None:
+    inner = b"\x80\x02" + prefix + b"P\xff\n" + tail
+    literal = base64.b64encode(inner) if encoded else inner
+    report = scan_bytes(pickle.dumps(literal, protocol=4))
+
+    assert any(finding.rule_code == rule for finding in report.findings)
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert not any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "PERSID"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_resumes_after_invalid_persid_operand() -> None:
+    report = scan_bytes(b"P\xc3\xa9Project\n." + b"\x80\x02\x82\x01.")
+
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert any(finding.rule_code == "EXTENSION_REF" for finding in report.findings)
+
+
+def test_scan_bytes_preserves_extension_in_malformed_follow_on_stream() -> None:
+    report = scan_bytes(b"!\x80\x02\x82\x01P\xff\n.")
+
+    assert any(finding.rule_code == "EXTENSION_REF" for finding in report.findings)
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
 
 
 def test_scan_bytes_recurses_into_nested_persid_payload() -> None:
@@ -2970,6 +3035,118 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert source_fingerprints["read_fingerprints"] == {}
     assert report.coverage.bytes_total == archive_path.stat().st_size
     assert report.coverage.bytes_scanned > 0
+
+
+def _legacy_torchscript_control() -> bytes:
+    control = b"\x80\x02" + _global(b"__torch__", b"Module") + b"q\x00)\x81}("
+    for key, name in ((b"0", b"weight"), (b"1", b"bias")):
+        storage = (
+            b"("
+            + _binunicode(b"storage")
+            + _global(b"torch", b"FloatStorage")
+            + _binunicode(key)
+            + _binunicode(b"cpu")
+            + b"K\x08NtQ"
+        )
+        tensor = _pytorch_rebuild_tensor_v2_payload(
+            storage_expr=storage, global_memo_expr=b"", element_count=8, size=(8,)
+        )
+        control += _binunicode(name) + tensor.removeprefix(b"\x80\x04").removesuffix(b".")
+    return control + b"ub."
+
+
+def _write_legacy_torchscript_zip(
+    path: Path, control: bytes, *, version: bytes = b"1\n", second_storage: bytes | None = bytes(32)
+) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", version)
+        archive.writestr("model/constants.pkl", b"\x80\x02).")
+        archive.writestr(
+            "model/code/__torch__.py",
+            (
+                'op_version_set = 1\nclass Module(Module):\n  __parameters__ = ["weight", "bias", ]\n'
+                '  __annotations__ = []\n  __annotations__["weight"] = Tensor\n  __annotations__["bias"] = Tensor\n'
+            ),
+        )
+        archive.writestr("model/data.pkl", control)
+        archive.writestr("model/data/0", bytes(32))
+        if second_storage is not None:
+            archive.writestr("model/data/1", second_storage)
+
+
+def test_scan_file_torchscript_v1_suppresses_only_proven_storage_ids(tmp_path: Path) -> None:
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, _legacy_torchscript_control())
+
+    report = scan_file(path)
+
+    assert report.metadata["container_type"] == "pytorch_zip"
+    assert not any(f.rule_code == "PERSISTENT_ID" for f in report.findings)
+    assert any(f.details.get("import_reference") == "__torch__.Module" for f in report.findings)
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        pytest.param(b"NtQ", b"K\x00tQ", id="non-none-view"),
+        pytest.param(b"NtQ", _global(b"builtins", b"print") + b")RtQ", id="computed-view"),
+        pytest.param(b"NtQ", b"NQtQ", id="nested-foreign-pid"),
+        pytest.param(b"NtQ", b"t0" + _binunicode(b"foreign") + b"Q", id="late-foreign-pid"),
+        pytest.param(b")RtR", b"}\x85RtR", id="nonempty-hooks-constructor"),
+        pytest.param(b")RtR", b")Rq\x01" + _binunicode(b"k") + b"Ns" + b"tR", id="mutated-hooks"),
+        pytest.param(b"ub.", b"ub", id="missing-stop"),
+        pytest.param(b"ub.", b"ub.\x80\x02N.", id="second-pickle"),
+    ],
+)
+def test_scan_file_torchscript_v1_keeps_aggregate_pid_for_unproven_control(
+    tmp_path: Path, original: bytes, replacement: bytes
+) -> None:
+    control = _legacy_torchscript_control()
+    prefix, matched, suffix = control.rpartition(original)
+    assert matched and b"tQ" in prefix
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, prefix + replacement + suffix)
+
+    report = scan_file(path)
+
+    first_pid_position = control.index(b"tQ") + 1
+    assert any(
+        f.rule_code == "PERSISTENT_ID" and f.location == f"{path}:model/data.pkl (pos {first_pid_position})"
+        for f in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "second_storage"),
+    [(b"2\n", bytes(32)), (b"1\n", bytes(31)), (b"1\n", None)],
+    ids=["other-version", "size-mismatch", "missing-storage"],
+)
+def test_scan_file_torchscript_v1_checks_archive_evidence(
+    tmp_path: Path, version: bytes, second_storage: bytes | None
+) -> None:
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, _legacy_torchscript_control(), version=version, second_storage=second_storage)
+
+    report = scan_file(path)
+
+    assert any(f.rule_code == "PERSISTENT_ID" for f in report.findings)
+
+
+def test_scan_file_torchscript_v1_still_scans_pickle_inside_storage(tmp_path: Path) -> None:
+    path = tmp_path / "model.ot"
+    malicious_storage = b"\x80\x02cos\nsystem\n)R."
+    _write_legacy_torchscript_zip(
+        path, _legacy_torchscript_control(), second_storage=malicious_storage.ljust(32, b"\x00")
+    )
+
+    report = scan_file(path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        f.details.get("name") == "system" and f.location is not None and "model/data/1" in f.location
+        for f in report.findings
+    )
 
 
 def test_scan_file_suppresses_rebuild_tensor_v2_for_valid_canonical_pytorch_zip(tmp_path: Path) -> None:
@@ -7165,6 +7342,39 @@ def test_scan_file_skips_protocol0_persid_near_match_storage_blob(tmp_path: Path
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
+@pytest.mark.parametrize(
+    ("candidate", "expected_rule"),
+    [
+        (b"P\xff\n!", None),
+        (b"Pkey\n!", "PERSISTENT_ID"),
+        (b"P\xff\n!cposix\nsystem\n)R.", "DANGEROUS_CALL"),
+    ],
+)
+def test_scan_file_checks_persid_operand_inside_referenced_storage(
+    tmp_path: Path, candidate: bytes, expected_rule: str | None
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    literal = b"!" * 211 + candidate
+    literal = literal.ljust(8195, b"!")
+    storage_blob = b"B" + struct.pack("<I", len(literal)) + literal
+    _write_float_storage_zip(archive_path, storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert "archive/data/0" in report.metadata["pickle_files"]
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert any(notice.code == "parse_incomplete" for notice in report.notices)
+    if expected_rule is None:
+        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert not report.findings
+    else:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.rule_code == expected_rule and finding.location is not None and "archive/data/0" in finding.location
+            for finding in report.findings
+        )
+
+
 def test_scan_file_keeps_large_all_nul_storage_padding_clean(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + (b"\x00" * ((5 * 1024 * 1024) + 2))
@@ -7490,6 +7700,96 @@ def test_scan_file_keeps_untrusted_storage_lookalikes_on_hidden_pickle_path(
         assert any(notice.code == expected_notice_code for notice in report.notices)
 
 
+@pytest.mark.parametrize("record_count", [100, 2000])
+def test_large_tensor_batches_validate_all_storage_ids_without_changing_discovery(
+    tmp_path: Path, record_count: int
+) -> None:
+    archive_path = tmp_path / "large-state.pt"
+    records = []
+    for record in range(record_count):
+        fields = []
+        for column in range(3):
+            key = str(3 * record + column)
+            tensor = (
+                _pytorch_rebuild_tensor_v2_payload(key=key)[2:-1]
+                if record == 0 and column == 0
+                else _pytorch_rebuild_tensor_v2_reduce_expr(key=key)
+            )
+            fields.append(_short_binunicode(f"field_{column}".encode("ascii")) + tensor)
+        records.append(b"}(" + b"".join(fields) + b"u")
+    batches = (b"(" + b"".join(records[i : i + 1000]) + b"e" for i in range(0, len(records), 1000))
+    payload = b"\x80\x04]" + b"".join(batches) + b"."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", payload)
+        for i in range(len(records) * 3):
+            archive.writestr(f"archive/data/{i}", bytes(24))
+
+    report = scan_file(archive_path)
+
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "none",
+        "size",
+        "missing",
+        "foreign-pid",
+        "device",
+        "second-stream",
+        "truncated",
+        "budget",
+        "provenance",
+        "bytes-key",
+        "tuple-setitem",
+        "tuple-dict",
+        "spaced-global",
+    ],
+)
+def test_large_storage_pid_proof_requires_complete_archive_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    monkeypatch.setattr(package_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    if defect == "provenance":
+        monkeypatch.setattr(package_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES", 1)
+    first = _pytorch_rebuild_tensor_v2_payload(key="0")[2:-1]
+    last = _pytorch_rebuild_tensor_v2_reduce_expr(key="1", location="custom:0" if defect == "device" else "cpu")
+    if defect == "bytes-key":
+        last = last.replace(_short_binunicode(b"1"), b"C\x011")
+    if defect == "spaced-global":
+        first = first.replace(b"torch._utils\n", b"torch._utils \n")
+    payload = b"\x80\x04}" + _short_binunicode(b"a") + first + b"s" + _short_binunicode(b"b") + last + b"s"
+    if defect == "foreign-pid":
+        payload += b"K\x01Q"
+    if defect in {"tuple-setitem", "tuple-dict"}:
+        repeated_tuple = b"K\x01\x85" + b"2\x86" * 8
+        payload += b"(" + repeated_tuple + b"Nd0" if defect == "tuple-dict" else repeated_tuple + b"Ns"
+    if defect != "truncated":
+        payload += b"."
+    if defect == "second-stream":
+        payload += b"Pexternal\n."
+    archive_path = tmp_path / "checkpoint.pt"
+    hidden_pickle = b"cos\nsystem\n(S'x'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/data/0", hidden_pickle.ljust(24, b"\x00"))
+        if defect != "missing":
+            archive.writestr("archive/data/1", bytes(23 if defect == "size" else 24))
+    options = ScanOptions(max_opcodes=20) if defect == "budget" else ScanOptions()
+
+    report = scan_file(archive_path, options=options)
+
+    assert any(f.rule_code == "PERSISTENT_ID" for f in report.findings) is (defect != "none")
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
+    _assert_storage_dangerous_call(report, archive_path)
+
+
 def test_scan_file_marks_storage_reference_opcode_budget_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -7555,6 +7855,74 @@ def test_scan_file_storage_reference_opcode_budget_is_aggregate(
     assert "archive1/data/0" in report.metadata["pickle_files"]
     assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
     _assert_storage_dangerous_call(report, archive_path, "archive1/data/0")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\n",
+        b"(R not a pickle",
+        b"c\nplain text\n\xff",
+        b"configuration\nReference\nR not a pickle",
+        b"configuration\nReference\nNNR not a pickle",
+    ],
+)
+def test_scan_file_skips_license_opcode_near_matches(tmp_path: Path, payload: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/LICENSE", payload)
+
+    report = scan_file(archive_path)
+
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+@pytest.mark.parametrize("tail", [b".\xff", b"0.Microsoft.\r\n"])
+@pytest.mark.parametrize("prefix", [b"", b"I0\n"])
+def test_scan_file_routes_execution_before_malformed_license_tail(tmp_path: Path, tail: bytes, prefix: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/LICENSE", prefix + b'cbuiltins\neval\n(S"1+1"\ntR' + tail)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/LICENSE" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("import_reference") == "builtins.eval"
+        and finding.location is not None
+        and "archive/LICENSE" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("prefix", [b"I0\n", b"I0\np0\nI1\np0\n"])
+def test_scan_file_discovers_nested_payload_with_residual_stack(tmp_path: Path, prefix: bytes) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/constants", prefix + b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.")
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/constants" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and "archive/constants" in finding.location
+        for finding in report.findings
+    )
 
 
 def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:
@@ -8211,18 +8579,20 @@ def test_stream_report_copy_helpers_preserve_private_metadata() -> None:
             bytes_total=None,
             stream_start_offset=0,
         ),
-        package_api._with_unbounded_stream_notice(
+        package_api._with_truncated_stream_notice(
             report,
             source=report.source,
             bytes_scanned=8,
-            max_unbounded_read_bytes=8,
+            bytes_total=None,
+            max_read_bytes=8,
+            stream_start_offset=0,
         ),
-        package_api._with_known_stream_notice(
+        package_api._with_truncated_stream_notice(
             report,
             source=report.source,
             bytes_scanned=8,
             bytes_total=16,
-            max_known_read_bytes=8,
+            max_read_bytes=8,
             stream_start_offset=0,
         ),
         package_api._with_short_read_error(
@@ -10511,6 +10881,10 @@ def test_scan_bytes_warns_on_import_only_custom_global_that_executes_module_init
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and finding.severity == Severity.WARNING
         and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and "import-only global reference" in finding.message
+        and finding.why is not None
+        and "import-time initialization" in finding.why
+        and "invoked" not in finding.details
         for finding in report.findings
     )
     pickle.loads(payload)
@@ -11118,14 +11492,16 @@ def test_scan_bytes_allows_inert_source_with_nonimportable_unchecked_cache(
     assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
 
 
+@pytest.mark.parametrize("opcode", [b"R", b"\x81"], ids=["REDUCE", "NEWOBJ"])
 def test_scan_bytes_warns_on_invoked_global_from_inert_source_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    opcode: bytes,
 ) -> None:
     module_name = f"modelaudit_c095_inert_invoked_payload_{uuid.uuid4().hex}"
     (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
-    payload = f"c{module_name}\nGadget\n)R.".encode()
+    payload = b"\x80\x02" + _global(module_name.encode(), b"Gadget") + b")" + opcode + b"."
 
     report = scan_bytes(payload, source=f"{module_name}.pkl")
 
@@ -11133,6 +11509,10 @@ def test_scan_bytes_warns_on_invoked_global_from_inert_source_module(
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.severity == Severity.WARNING
+        and "used by a pickle invocation" in finding.message
+        and finding.why is not None
+        and "object reconstruction" in finding.why
         and finding.details.get("invoked") is True
         for finding in report.findings
     )
@@ -13107,6 +13487,60 @@ def test_scan_bytes_warns_on_unreviewed_submodule_of_allowlisted_package() -> No
     )
 
 
+@pytest.mark.parametrize(("text", "encoding"), [(b"abc", b"latin1"), ("☃".encode(), b"latin-1")])
+def test_latin1_reduce_records_the_requested_codec_and_call(text: bytes, encoding: bytes) -> None:
+    prefix = b"\x80\x02" + _global(b"_codecs", b"encode") + _binunicode(text) + _binunicode(encoding) + b"\x86"
+    report = scan_bytes(prefix + b"R.", source="encoding.pkl")
+
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
+    finding = next(f for f in report.findings if f.rule_code == "NON_ALLOWLISTED_GLOBAL")
+    assert finding.severity == Severity.WARNING
+    assert finding.details["requested_encoding"] == encoding.decode("ascii")
+    assert finding.details["latin1_reduce_position"] == len(prefix)
+    assert finding.details["position"] == 2
+    assert "requests Latin-1" in finding.message
+    assert "codec registry" in (finding.why or "")
+
+
+@pytest.mark.parametrize(
+    "operands",
+    [
+        _binunicode(b"data") + _binunicode(b"custom_encoder") + b"\x86",
+        _binunicode(b"latin1") + _binunicode(b"data") + b"\x86",
+        b"]" + _binunicode(b"latin1") + b"\x86",
+        _binunicode(b"data") + _binunicode(b"latin1") + _binunicode(b"replace") + b"\x87",
+        _binunicode(b"data") + _binunicode(b"latin1") + b"q\x000h\x00\x86",
+    ],
+)
+def test_codec_reduce_keeps_other_operands_reviewable(operands: bytes) -> None:
+    report = scan_bytes(b"\x80\x02" + _global(b"_codecs", b"encode") + operands + b"R.")
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
+    finding = next(f for f in report.findings if f.rule_code == "NON_ALLOWLISTED_GLOBAL")
+    assert finding.details.get("invoked") is True
+    assert "requested_encoding" not in finding.details
+    assert "Latin-1" not in finding.message
+
+
+@pytest.mark.parametrize("encodings", [(b"custom_encoder", b"latin1"), (b"latin1", b"custom_encoder")])
+def test_reused_codec_reference_identifies_the_witnessed_call(encodings: tuple[bytes, bytes]) -> None:
+    payload = b"\x80\x02" + _global(b"_codecs", b"encode") + b"q\x00"
+    call_positions = []
+    for index, encoding in enumerate(encodings):
+        if index:
+            payload += b"0h\x00"
+        payload += _binunicode(b"data") + _binunicode(encoding) + b"\x86"
+        call_positions.append(len(payload))
+        payload += b"R"
+    report = scan_bytes(payload + b".")
+
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
+    finding = next(f for f in report.findings if f.rule_code == "NON_ALLOWLISTED_GLOBAL")
+    assert finding.message.startswith("Non-allowlisted pickle invocation of _codecs.encode.")
+    assert finding.details["latin1_reduce_position"] == call_positions[encodings.index(b"latin1")]
+    assert f"One REDUCE at byte {finding.details['latin1_reduce_position']}" in finding.message
+    assert "other uses" in (finding.why or "")
+
+
 def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
     payload = b"ccollections\nOrderedDict\n."
 
@@ -13235,9 +13669,9 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
-def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
+def _source_fingerprint_diagnostics(source_fingerprints: collections.abc.Mapping[str, Any]) -> str:
     diagnostics: dict[str, Any] = {
-        "source_fingerprints": source_fingerprints,
+        "source_fingerprints": _deep_mutable_copy(source_fingerprints),
         "import_runtime_trusted": call_graph._interpreter_import_runtime_is_trusted(),
         "importers": [],
     }
@@ -13300,6 +13734,44 @@ def _source_fingerprint_diagnostics(source_fingerprints: dict[str, Any]) -> str:
         except (OSError, ValueError, struct.error) as error:
             record["diagnostic_error"] = f"{type(error).__name__}: {error}"
     return json.dumps(diagnostics, indent=2)
+
+
+@pytest.mark.parametrize("cache_available", [False, True])
+def test_source_fingerprint_diagnostics_serializes_frozen_metadata(
+    monkeypatch: pytest.MonkeyPatch, cache_available: bool
+) -> None:
+    report = PickleReport(
+        source="fingerprint-diagnostic.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        private_metadata={
+            "call_graph_source_fingerprints": {
+                "reusable": False,
+                "fingerprints": {"safe.py": [1, 2]},
+                "resolution_context": {"meta_path": [["finder", 3]]},
+            }
+        },
+    )
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_is_trusted", lambda: True)
+    monkeypatch.setattr(
+        call_graph, "_runtime_path_importer_cache_without_hooks", lambda: {} if cache_available else None
+    )
+    monkeypatch.setattr(call_graph, "_runtime_search_path_without_hooks", lambda: ())
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+
+    diagnostics = json.loads(_source_fingerprint_diagnostics(source_fingerprints))
+
+    assert diagnostics == {
+        "source_fingerprints": {
+            "reusable": False,
+            "fingerprints": {"safe.py": [1, 2]},
+            "resolution_context": {"meta_path": [["finder", 3]]},
+        },
+        "import_runtime_trusted": True,
+        "importers": [],
+    }
+    assert source_fingerprints["fingerprints"]["safe.py"] == (1, 2)
+    assert source_fingerprints["resolution_context"]["meta_path"] == (("finder", 3),)
 
 
 def test_with_call_graph_findings_records_source_fingerprint_metadata(

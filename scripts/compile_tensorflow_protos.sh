@@ -17,7 +17,6 @@ TEMP_DIR=$(mktemp -d)
 TF_VERSION="${TF_VERSION:-2.18.0}"
 
 # Required protoc version — must match the version used to generate vendored protos.
-# Install from: https://github.com/protocolbuffers/protobuf/releases/tag/v33.4
 REQUIRED_PROTOC="33.5"
 
 echo "=== TensorFlow Protobuf Compiler ==="

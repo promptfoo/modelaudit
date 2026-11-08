@@ -3,10 +3,12 @@
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import HttpUrl
 
+from modelaudit.core import scan_model_directory_or_file
 from modelaudit.integrations import license_checker
 from modelaudit.integrations.license_checker import (
     _LICENSE_HEADER_MAX_BYTES,
@@ -39,10 +41,6 @@ AGPL_HEADER = """# Licensed under the GNU Affero General Public License
 
 CC_BY_NC_HEADER = """Creative Commons Attribution NonCommercial License
 This work is licensed under CC BY-NC 4.0
-"""
-
-RAIL_HEADER = """# Released under the Responsible AI License
-# BigScience Open RAIL-M
 """
 
 BIGSCIENCE_DATASET_NOTICE = """
@@ -131,22 +129,16 @@ Some dataset content here...
         assert licenses[0].spdx_id == "CC-BY-NC-4.0"
         assert licenses[0].commercial_allowed is False
 
-    def test_rail_license_detection(self, tmp_path: Path) -> None:
-        """Test detection of RAIL license."""
-        test_file = tmp_path / "rail_file.py"
-        content = (
-            RAIL_HEADER
-            + """def do_something():
-    pass
-"""
-        )
-        test_file.write_text(content)
+    @pytest.mark.parametrize("notice", ["RAIL License", "Responsible AI License", "OpenRAIL-M"])
+    def test_rail_license_detection(self, tmp_path: Path, notice: str) -> None:
+        path = tmp_path / "LICENSE"
+        path.write_text(notice)
+        assert [lic.spdx_id for lic in scan_for_license_headers(str(path))] == ["RAIL"]
 
-        licenses = scan_for_license_headers(str(test_file))
-
-        assert len(licenses) >= 1
-        spdx_ids = {lic.spdx_id for lic in licenses}
-        assert "RAIL" in spdx_ids or "BigScience-OpenRAIL-M" in spdx_ids
+    def test_rail_inside_words(self, tmp_path: Path) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("notes\ntrailing values from the BigScience railroad dataset\n")
+        assert scan_for_license_headers(str(path)) == []
 
     def test_bigscience_dataset_notice_detection(self, tmp_path: Path) -> None:
         """Test detection of BigScience dataset license notice."""
@@ -409,6 +401,163 @@ class TestUnlicensedDatasetDetection:
         assert unlicensed == files
         assert listing_count == 1
 
+    def test_repository_metadata_and_datasets_together(self, tmp_path: Path) -> None:
+        tree = tmp_path / ".cache" / "huggingface" / "trees" / ("a" * 40 + ".json")
+        tree.parent.mkdir(parents=True)
+        shard = "model-00001-of-00002.safetensors"
+        sidecars = {
+            tmp_path / "model.safetensors.index.json": {"metadata": {"total_size": 32}, "weight_map": {"w": shard}},
+            tmp_path / "pytorch_model.bin.index.json": {"weight_map": {"w": "pytorch_model-00001-of-00002.bin"}},
+            tmp_path / "chat_template.json": {"chat_template": "{% for m in messages %}{{ m.content }}{% endfor %}"},
+            tmp_path / "added_tokens.json": {"<|pad|>": 257, "example": 258},
+            tree: {
+                "format_version": 1,
+                "files": {shard: {"size": 32, "blob_id": "b" * 40, "lfs_sha256": "c" * 64, "lfs_size": 32}},
+            },
+        }
+        for path, document in sidecars.items():
+            path.write_text(json.dumps(document))
+        training_data = tmp_path / "training.jsonl"
+        training_data.write_text('{"prompt":"example"}\n')
+        paths = [str(path) for path in [*sidecars, training_data]]
+        metadata = {path: collect_license_metadata(path) for path in paths}
+
+        assert detect_unlicensed_datasets(paths) == [str(training_data)]
+        assert [path for path in paths if metadata[path]["is_dataset"]] == [str(training_data)]
+        for path in sidecars:
+            path.unlink()  # Streamed artifacts can be gone by the time warnings are aggregated.
+        warnings = check_commercial_use_warnings({"file_metadata": metadata})
+        assert [(w["details"]["files"], w["details"]["total_count"]) for w in warnings] == [([str(training_data)], 1)]
+
+    @pytest.mark.parametrize(
+        ("filename", "contents"),
+        [
+            ("model.safetensors.index.json", '{"weight_map":{"w":"labels.csv"}}'),
+            ("model.safetensors.index.json", '{"weight_map":{"w":"w.safetensors"},"rows":[1,2]}'),
+            ("model.safetensors.index.json", '{"weight_map":{},"weight_map":{"w":"w.safetensors"}}'),
+            ("chat_template.json", '{"chat_template":"{{ x }}","examples":["a","b"]}'),
+            ("chat_template.json", '[{"text":"{{ x }}"}]'),
+            ("added_tokens.json", '{"dogs":1,"cats":2}'),
+            ("added_tokens.json", '{"<|pad|>":0,"examples":["a"]}'),
+            (
+                "video_preprocessor_config.json",
+                '{"processor_class":"MockProcessor","video_processor_type":"MockVideoProcessor","patch_size":NaN}',
+            ),
+            (".cache/huggingface/trees/" + "a" * 40 + ".json", '{"format_version":1,"files":{"x":{"size":3}}}'),
+            ("chat_template.json", '{"chat_template":"{{ x }}"} extra'),
+        ],
+    )
+    def test_ambiguous_json_remains_a_dataset(self, tmp_path: Path, filename: str, contents: str) -> None:
+        path = tmp_path / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+
+        assert collect_license_metadata(str(path))["is_dataset"] is True
+        assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+
+    def test_coreml_package_manifest_dataset_evidence(self, tmp_path: Path) -> None:
+        root_id = "00000000-0000-4000-8000-000000000001"
+        weights_id = "00000000-0000-4000-8000-000000000002"
+        model = {"author": "example", "description": "Model", "name": "model.mlmodel", "path": "example/model.mlmodel"}
+        weights = {"author": "example", "description": "Weights", "name": "weights", "path": "example/weights"}
+        entries = {root_id: model, weights_id: weights}
+        package = tmp_path / "Example.mlpackage"
+        package.mkdir()
+        manifest = package / "Manifest.json"
+        document = {"fileFormatVersion": "1.0.0", "rootModelIdentifier": root_id, "itemInfoEntries": entries}
+        manifest.write_text(json.dumps(document))
+        training = tmp_path / "training.json"
+        training.write_text('[{"text":"example"}]')
+        paths = [str(manifest), str(training)]
+        assert collect_license_metadata(str(manifest))["is_dataset"] is False
+        assert detect_unlicensed_datasets(paths) == [str(training)]
+
+        destination = "https://artifact.exfil.invalid/collect"
+        model["description"] = destination
+        manifest.write_text(json.dumps(document))
+        scan = scan_model_directory_or_file(str(tmp_path), use_cache=False)
+        assert scan.file_metadata[str(manifest)].is_dataset is False
+        assert any(issue.details.get("url") == destination for issue in scan.issues)
+        assert any(issue.details.get("files") == [str(training)] for issue in scan.issues)
+
+        standalone = tmp_path / "Manifest.json"
+        standalone.write_text(json.dumps(document))
+        assert collect_license_metadata(str(standalone))["is_dataset"] is True
+
+        for ambiguous in (
+            {**document, "examples": ["a"]},
+            {**document, "rootModelIdentifier": "missing"},
+            {**document, "rootModelIdentifier": weights_id},
+            {**document, "itemInfoEntries": {root_id: model, weights_id: {**weights, "labels": [0, 1]}}},
+            {**document, "itemInfoEntries": {root_id: {**model, "path": "../model.mlmodel"}}},
+        ):
+            manifest.write_text(json.dumps(ambiguous))
+            assert collect_license_metadata(str(manifest))["is_dataset"] is True
+            assert detect_unlicensed_datasets(paths) == paths
+
+    @pytest.mark.parametrize(
+        ("filename", "component"),
+        [
+            (
+                "processor_config.json",
+                {"image_processor": {"image_processor_type": "ExampleImageProcessor", "do_resize": True}},
+            ),
+            ("video_preprocessor_config.json", {"video_processor_type": "ExampleVideoProcessor", "patch_size": 16}),
+        ],
+    )
+    def test_processor_configuration_preserves_dataset_rows(
+        self, tmp_path: Path, filename: str, component: dict[str, Any]
+    ) -> None:
+        path = tmp_path / filename
+        config = {"processor_class": "ExampleProcessor", **component}
+        path.write_text(json.dumps(config))
+        assert collect_license_metadata(str(path))["is_dataset"] is False
+        path.write_text(json.dumps({**config, "rows": [{"text": "example"}]}))
+        assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+        if filename == "processor_config.json":
+            config["image_processor"]["image_mean"] = [{"text": "example"}]
+        else:
+            config["image_mean"] = [{"text": "example"}]
+        path.write_text(json.dumps(config))
+        assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+
+    def test_sparse_attention_config_dataset_evidence(self, tmp_path: Path) -> None:
+        config = tmp_path / "sparse_attention_config.json"
+        heads = {"0": ["vertical_and_slash", 30, 100, 0.8], "1": ["vertical_and_slash", 60, 120, 1.0001]}
+        config.write_text(json.dumps([heads, heads]))
+        assert collect_license_metadata(str(config))["is_dataset"] is False
+        assert detect_unlicensed_datasets([str(config)]) == []
+
+        for rows in ([heads, {"prompt": "training example"}], [{"9": heads["0"]}], [{"0": ["text", 30, 100, 0.8]}]):
+            config.write_text(json.dumps(rows))
+            assert collect_license_metadata(str(config))["is_dataset"] is True
+            assert detect_unlicensed_datasets([str(config)]) == [str(config)]
+
+    def test_modelopt_quant_config_dataset_evidence(self, tmp_path: Path) -> None:
+        config = tmp_path / "hf_quant_config.json"
+        producer = {"name": "modelopt", "version": "1.2.3"}
+        quant = {
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_quant_algo": "FP8",
+            "quantized_layers": {"model.layers.0.proj": {"quant_algo": "NVFP4", "group_size": 16}},
+            "exclude_modules": ["head*"],
+        }
+        config.write_text(json.dumps({"producer": producer, "quantization": quant}))
+        assert collect_license_metadata(str(config))["is_dataset"] is False
+        assert detect_unlicensed_datasets([str(config)]) == []
+
+        for document in (
+            {"producer": producer, "quantization": quant, "examples": [{"prompt": "training example"}]},
+            {
+                "producer": producer,
+                "quantization": {**quant, "quantized_layers": {"model.proj": {"example": "training text"}}},
+            },
+            {"producer": producer, "quantization": {**quant, "exclude_modules": [{"prompt": "training example"}]}},
+        ):
+            config.write_text(json.dumps(document))
+            assert collect_license_metadata(str(config))["is_dataset"] is True
+            assert detect_unlicensed_datasets([str(config)]) == [str(config)]
+
     def test_ml_model_directory_skip(self, tmp_path: Path) -> None:
         """Test that ML model files in model directories are skipped."""
         # Create ML model directory
@@ -476,14 +625,10 @@ def _license_results(file_path: str, **license_info: object) -> dict[str, object
 class TestCommercialUseWarnings:
     """Test commercial use warnings."""
 
-    def test_agpl_detection(self) -> None:
-        """Test AGPL component detection."""
-        scan_results = _license_results("/path/agpl_file.py", spdx_id="AGPL-3.0", commercial_allowed=True)
-
-        agpl_files = detect_agpl_components(scan_results)
-
-        assert len(agpl_files) == 1
-        assert "/path/agpl_file.py" in agpl_files
+    def test_agpl_detection(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "component.py")
+        metadata = {"license_info": [{"spdx_id": None}, {"spdx_id": "AGPL-1.0"}, {"spdx_id": "AGPL-3.0"}]}
+        assert detect_agpl_components({"file_metadata": {path: metadata}}) == [path]
 
     def test_no_agpl_detection(self) -> None:
         """Test when no AGPL components are present."""
@@ -530,25 +675,47 @@ class TestCommercialUseWarnings:
 
 
 class TestSpdxLicenseChecks:
-    """Test deprecated and incompatible license detection."""
+    @pytest.mark.parametrize("strict", [False, True])
+    @pytest.mark.parametrize(
+        ("header", "expected_ids", "noncommercial"),
+        [
+            ("CC-BY-4.0", ["CC-BY-4.0"], False),
+            ("Creative Commons Attribution 4.0 International", ["CC-BY-4.0"], False),
+            ("Creative Commons Attribution-ShareAlike 4.0", ["CC-BY-SA-4.0"], False),
+            ("Creative Commons Attribution-NonCommercial 4.0", ["CC-BY-NC-4.0"], True),
+            ("CC-BY-NC-4.0", ["CC-BY-NC-4.0"], True),
+            ("Creative Commons Attribution-ShareAlike 4.0 or CC-BY-4.0", ["CC-BY-4.0", "CC-BY-SA-4.0"], False),
+        ],
+    )
+    def test_creative_commons_declarations(
+        self, tmp_path: Path, header: str, expected_ids: list[str], noncommercial: bool, strict: bool
+    ) -> None:
+        path = tmp_path / "LICENSE"
+        path.write_text(header)
+        metadata = collect_license_metadata(str(path))
 
-    def test_deprecated_license_warning(self):
-        scan_results = {"file_metadata": {"/path/old.py": {"license_info": [{"spdx_id": "AGPL-1.0"}]}}}
+        assert [license_info["spdx_id"] for license_info in metadata["license_info"]] == expected_ids
+        warnings = check_commercial_use_warnings({"file_metadata": {str(path): metadata}}, strict=strict)
+        if noncommercial:
+            assert len(warnings) == 1
+            assert "Non-commercial" in warnings[0]["message"]
+            assert warnings[0]["severity"] == ("error" if strict else "warning")
+            assert warnings[0]["details"]["files"] == [str(path)]
+        else:
+            assert warnings == []
 
-        warnings = check_commercial_use_warnings(scan_results)
-        assert any("deprecated" in w["message"].lower() for w in warnings)
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_deprecated_identifiers_count_each_file_once(self, tmp_path: Path, strict: bool) -> None:
+        paths = [str(tmp_path / name) for name in ("first.py", "second.py")]
+        metadata = {"license_info": [{"spdx_id": "GPL-2.0"}, {"spdx_id": "AGPL-1.0"}]}
+        warnings = license_checker.check_spdx_license_issues(
+            {"file_metadata": dict.fromkeys(paths, metadata)}, strict=strict
+        )
 
-    def test_incompatible_license_warning(self):
-        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
-
-        warnings = check_commercial_use_warnings(scan_results)
-        assert any("incompatible" in w["message"].lower() for w in warnings)
-
-    def test_strict_license_errors(self):
-        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
-
-        warnings = check_commercial_use_warnings(scan_results, strict=True)
-        assert any(w["severity"] == "error" for w in warnings)
+        assert len(warnings) == 1
+        assert warnings[0]["message"] == "Deprecated licenses detected (2 files)."
+        assert warnings[0]["details"] == {"files": paths, "total_count": 2}
+        assert warnings[0]["severity"] == ("error" if strict else "warning")
 
 
 class TestLicenseMetadataCollection:
@@ -654,7 +821,7 @@ Bob,30
 class TestIntegration:
     """Integration tests for license checking with core scanning."""
 
-    def test_license_warnings_in_scan_results(self, tmp_path):
+    def test_license_warnings_in_scan_results(self, tmp_path: Path) -> None:
         """Test that license warnings appear in scan results."""
         from modelaudit.core import scan_model_directory_or_file
 
@@ -676,12 +843,8 @@ test,data
             issue for issue in results.get("issues", []) if getattr(issue, "type", None) == "license_warning"
         ]
 
-        assert len(license_issues) > 0
-        # The license detection should find the CC BY-NC (non-commercial) license
-        # Check if it's detected as incompatible licenses (which is correct for non-commercial)
-        assert any(
-            "Incompatible licenses" in issue.message or "Non-commercial" in issue.message for issue in license_issues
-        ), f"Expected license incompatibility detection in messages: {[issue.message for issue in license_issues]}"
+        assert len(license_issues) == 1
+        assert "Non-commercial" in license_issues[0].message
 
     def test_ml_model_directory_no_false_positives(self, tmp_path):
         """Test that ML model directories don't generate false positive license warnings."""

@@ -12,6 +12,7 @@ from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.utils._path_hardening import _file_stat_matches
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -58,6 +59,7 @@ _GGML_TYPE_INFO = {
     40: (64, 36),  # NVFP4
     41: (128, 18),  # Q1_0
     42: (64, 18),  # Q2_0
+    43: (1, 1),  # F8_E4M3
 }
 # Rows that the retired Q4_0 layouts pack into one on-disk block (block_q4_0x4 and
 # block_q4_0x8 in ggml): a tensor of these types holds whole groups of rows.
@@ -246,12 +248,20 @@ _GGUF_DOCUMENTATION_URL_HOSTS = frozenset({"hf.co", "huggingface.co", "www.huggi
 _GGUF_SHELL_IFS_PATTERN = re.compile(r"(?i)\$\{ifs(?:[^}]*)?\}|\$ifs\b")
 _GGUF_SHELL_VARIABLE_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
-_GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = tuple(JINJA2_SSTI_PATTERNS)
-_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (pattern_type, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
-    for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
-    for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
+_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS = tuple(
+    (category, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
+    for category, patterns in JINJA2_SSTI_PATTERNS.items()
+    for pattern in patterns
+    if pattern != r"{% macro .+ %}"  # Declaring a chat formatter is routine. Its default arguments and body still run.
 )
+# These two signatures also match sentence punctuation and prose such as "format (brief)".
+# Keep unambiguous member references and calls even in captured text or quoted source.
+_GGUF_TEMPLATE_PROSE_PATTERNS = {
+    r"commands\.": re.compile(r"commands\.(?=\w|\s*(?:getoutput|getstatusoutput|getstatus|mkarg|mk2arg)\b)", re.I),
+    r"format\s*\(": re.compile(r"format\(|[.|]\s*format\s*\(", re.I),
+}
+_GGUF_TEMPLATE_COMPILER = re.compile(r"\b(?:from_string|render_template_string|compile_expression)\b")
+_GGUF_LITERAL_OUTPUT_START = re.compile(r"""{{[-+]?\s*(?=['"])""")
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
@@ -451,17 +461,14 @@ class GgufScanner(BaseScanner):
                     return result
                 # Nested scanners reopen the path, so coverage requires every view to match this source.
                 try:
-                    final_stats: tuple[os.stat_result, ...] = (os.fstat(f.fileno()), os.stat(path))
+                    final_handle_stat = os.fstat(f.fileno())
+                    final_path_stat = os.stat(path)
+                    source_changed = not _file_stat_matches(opened_stat, final_handle_stat) or not _file_stat_matches(
+                        final_handle_stat, final_path_stat, cross_view=True
+                    )
                 except OSError:
-                    final_stats = ()
-                if not final_stats or any(
-                    not os.path.samestat(opened_stat, final_stat)
-                    or opened_stat.st_mode != final_stat.st_mode
-                    or opened_stat.st_size != final_stat.st_size
-                    or opened_stat.st_mtime_ns != final_stat.st_mtime_ns
-                    or opened_stat.st_ctime_ns != final_stat.st_ctime_ns
-                    for final_stat in final_stats
-                ):
+                    source_changed = True
+                if source_changed:
                     result.add_check(
                         name="GGUF/GGML Source Stability",
                         passed=False,
@@ -1085,7 +1092,8 @@ class GgufScanner(BaseScanner):
                 )
 
             row_group = _GGML_INTERLEAVED_ROW_GROUPS.get(tensor.tensor_type)
-            rows = nelements // row_width
+            # Interleaved groups stay within each matrix, including in batched tensors.
+            rows = tensor.dims[1] if len(tensor.dims) > 1 else 1
             if row_group is not None and rows % row_group != 0:
                 result.add_check(
                     name="Tensor Block Alignment Check",
@@ -2381,11 +2389,45 @@ class GgufScanner(BaseScanner):
             return "network_api"
         return None
 
-    @classmethod
-    def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
-        for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-            if pattern.search(value):
-                return [{"evidence_type": "template_injection", "pattern": f"jinja2_{pattern_type}"}]
+    @staticmethod
+    def _oversized_chat_template_security_evidence(value: str) -> list[dict[str, Any]]:
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+
+        for category, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
+            match = pattern.search(value)
+            if match is None:
+                continue
+
+            stronger = _GGUF_TEMPLATE_PROSE_PATTERNS.get(pattern.pattern)
+            # Captured text can be compiled again, including through an aliased method.
+            if stronger is not None and not _GGUF_TEMPLATE_COMPILER.search(value):
+                # Preserve the broad signature in executable expressions, where whitespace
+                # after a dot or before a call is legal. A lone quoted string is output.
+                if strong_match := stronger.search(value):
+                    match = pattern.search(value, strong_match.start(), strong_match.end())
+                else:
+                    match = None
+                    for start, end in Jinja2TemplateScanner.iter_executable_tag_bounds(value):
+                        match = pattern.search(value, start, end)
+                        if match is None:
+                            continue
+                        opening = _GGUF_LITERAL_OUTPUT_START.match(value, start, end)
+                        if opening is not None:
+                            quote_end = Jinja2TemplateScanner.quoted_string_end(value, opening.end())
+                            if value[quote_end:end].strip() in {"}}", "-}}", "+}}"}:
+                                match = None
+                                continue
+                        break
+
+            if match:
+                return [
+                    {
+                        "evidence_type": "template_injection",
+                        "pattern": f"jinja2_{category}",
+                        "matched_pattern": pattern.pattern,
+                        "match_offset": match.start(),
+                    }
+                ]
         return []
 
     @classmethod
@@ -2418,7 +2460,7 @@ class GgufScanner(BaseScanner):
         value: str,
         *,
         max_template_size: int = _GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if cls._metadata_value_looks_like_documentation(key, value):
             return []
         if cls._metadata_value_has_only_benign_documentation_urls(key, value):

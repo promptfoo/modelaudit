@@ -154,7 +154,6 @@ jobs:
           RETRY_BRANCH: ${{ github.event.client_payload.pr_branch || '' }}
         run: |
           if [[ -n "$PR_OUTPUT" && "$PR_OUTPUT" != "null" ]]; then
-            echo "has_pr=true" >> "$GITHUB_OUTPUT"
             echo "pr_branch=$(jq -r '.headBranchName' <<< "$PR_OUTPUT")" >> "$GITHUB_OUTPUT"
           elif [[ "$RETRY_EVENT" == "release-metadata-retry" && "$RETRY_BRANCH" == "release-please--branches--main" ]]; then
             OPEN_BRANCH=$(gh pr view "$RETRY_BRANCH" --repo "$GITHUB_REPOSITORY" --json state,headRefName --jq 'if .state == "OPEN" then .headRefName else "" end')
@@ -162,13 +161,10 @@ jobs:
               echo "Requested release metadata retry has no matching open release PR."
               exit 1
             fi
-            echo "has_pr=true" >> "$GITHUB_OUTPUT"
             echo "pr_branch=$OPEN_BRANCH" >> "$GITHUB_OUTPUT"
           elif [[ "$RETRY_EVENT" == "release-metadata-retry" ]]; then
             echo "Refusing release metadata retry for an unexpected branch."
             exit 1
-          else
-            echo "has_pr=false" >> "$GITHUB_OUTPUT"
           fi
 
   sync-release-metadata:
@@ -223,7 +219,7 @@ jobs:
           npx prettier --write CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
 
       - name: Upload release metadata
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: modelaudit-release-metadata-${{ github.run_attempt }}
           if-no-files-found: error
@@ -246,7 +242,7 @@ jobs:
       - name: Download release metadata
         id: download-metadata
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: modelaudit-release-metadata-${{ github.run_attempt }}
           path: /tmp/modelaudit-release-metadata
@@ -348,6 +344,44 @@ jobs:
         run: uv build packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
 
       - name: Verify distribution artifacts and version consistency
+        env: &version-reader-env
+          ARTIFACT_VERSION_READER: |
+            import sys
+            import tarfile
+            import zipfile
+            from pathlib import Path
+
+            path = Path(sys.argv[1])
+            root = sys.argv[2] == "root"
+            if path.suffix == ".whl":
+                label = "wheel METADATA"
+                with zipfile.ZipFile(path) as archive:
+                    matches = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+                    if len(matches) != 1:
+                        count = "exactly one" if root else "one"
+                        raise SystemExit(f"Expected {count} wheel METADATA file, found {len(matches)}")
+                    metadata_text = archive.read(matches[0]).decode("utf-8", errors="replace")
+            elif path.name.endswith(".tar.gz"):
+                label = "sdist PKG-INFO"
+                with tarfile.open(path, "r:gz") as archive:
+                    members = [m for m in archive.getmembers() if m.name.endswith("/PKG-INFO")]
+                    if len(members) != 1:
+                        context = "exactly one PKG-INFO file in sdist" if root else "one PKG-INFO file"
+                        raise SystemExit(f"Expected {context}, found {len(members)}")
+                    stream = archive.extractfile(members[0])
+                    if stream is None:
+                        raise SystemExit("Failed to read PKG-INFO from sdist")
+                    metadata_text = stream.read().decode("utf-8", errors="replace")
+            else:
+                raise SystemExit(f"Unsupported artifact type: {path}")
+
+            for line in metadata_text.splitlines():
+                if line.startswith("Version: "):
+                    print(line.split(":", 1)[1].strip())
+                    break
+            else:
+                raise SystemExit("Could not find Version header" + (f" in {label}" if root else ""))
+
         run: |
           set -euo pipefail
           EXPECTED_VERSION="${{ needs.release-please.outputs.version }}"
@@ -375,50 +409,9 @@ jobs:
           SDIST_FILE="$(basename "${SDIST_PATH}")"
 
           # Extract versions from package metadata, not filenames.
-          WHEEL_VERSION="$(
-            python - "${WHEEL_PATH}" <<'PY'
-          import sys
-          import zipfile
+          WHEEL_VERSION="$(python - "${WHEEL_PATH}" root <<< "$ARTIFACT_VERSION_READER")"
 
-          wheel_path = sys.argv[1]
-          with zipfile.ZipFile(wheel_path) as zf:
-              metadata_files = [name for name in zf.namelist() if name.endswith(".dist-info/METADATA")]
-              if len(metadata_files) != 1:
-                  raise SystemExit(f"Expected exactly one wheel METADATA file, found {len(metadata_files)}")
-              metadata_text = zf.read(metadata_files[0]).decode("utf-8", errors="replace")
-
-          for line in metadata_text.splitlines():
-              if line.startswith("Version: "):
-                  print(line.split(":", 1)[1].strip())
-                  break
-          else:
-              raise SystemExit("Could not find Version header in wheel METADATA")
-          PY
-          )"
-
-          SDIST_VERSION="$(
-            python - "${SDIST_PATH}" <<'PY'
-          import sys
-          import tarfile
-
-          sdist_path = sys.argv[1]
-          with tarfile.open(sdist_path, "r:gz") as tf:
-              pkg_info_files = [m for m in tf.getmembers() if m.name.endswith("/PKG-INFO")]
-              if len(pkg_info_files) != 1:
-                  raise SystemExit(f"Expected exactly one PKG-INFO file in sdist, found {len(pkg_info_files)}")
-              file_obj = tf.extractfile(pkg_info_files[0])
-              if file_obj is None:
-                  raise SystemExit("Failed to read PKG-INFO from sdist")
-              pkg_info_text = file_obj.read().decode("utf-8", errors="replace")
-
-          for line in pkg_info_text.splitlines():
-              if line.startswith("Version: "):
-                  print(line.split(":", 1)[1].strip())
-                  break
-          else:
-              raise SystemExit("Could not find Version header in sdist PKG-INFO")
-          PY
-          )"
+          SDIST_VERSION="$(python - "${SDIST_PATH}" root <<< "$ARTIFACT_VERSION_READER")"
 
           if [[ "$WHEEL_VERSION" != "$EXPECTED_VERSION" || "$SDIST_VERSION" != "$EXPECTED_VERSION" ]]; then
             echo "ERROR: Artifact versions do not match expected release version"
@@ -587,7 +580,7 @@ jobs:
 
       - name: Upload build artifacts
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with: &root-dist-artifact
           name: dist
           path: dist/
@@ -605,18 +598,14 @@ jobs:
           - os: ubuntu-latest
             artifact-suffix: linux
             build-sdist: "true"
-          - os: macos-14
+          - os: macos-15
             artifact-suffix: macos-arm64
-            build-sdist: "false"
           - os: macos-15-intel
             artifact-suffix: macos-x86_64
-            build-sdist: "false"
           - os: ubuntu-24.04-arm
             artifact-suffix: linux-aarch64
-            build-sdist: "false"
           - os: windows-latest
             artifact-suffix: windows
-            build-sdist: "false"
     defaults:
       run:
         shell: bash
@@ -664,10 +653,10 @@ jobs:
           cargo test --manifest-path Cargo.toml
 
       - name: Lint standalone package with Ruff
-        run: uv run --with 'ruff==0.17.0' ruff check src tests
+        run: uv run --with 'ruff==0.17.2' ruff check src tests
 
       - name: Check standalone package formatting with Ruff
-        run: uv run --with 'ruff==0.17.0' ruff format --check src tests
+        run: uv run --with 'ruff==0.17.2' ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: uv run --with 'mypy>=2.4.0,<2.5.0' --with pytest mypy src tests
@@ -698,6 +687,7 @@ jobs:
         run: uvx twine check dist/*
 
       - name: Verify standalone artifact version consistency
+        env: *version-reader-env
         run: |
           set -euo pipefail
           EXPECTED_VERSION="${{ needs.release-please.outputs.picklescan_version }}"
@@ -711,40 +701,7 @@ jobs:
           fi
 
           for artifact in "${artifacts[@]}"; do
-            ARTIFACT_VERSION="$(
-              python - "${artifact}" <<'PY'
-          import sys
-          import tarfile
-          import zipfile
-          from pathlib import Path
-
-          artifact_path = Path(sys.argv[1])
-          if artifact_path.suffix == ".whl":
-              with zipfile.ZipFile(artifact_path) as zf:
-                  metadata_files = [name for name in zf.namelist() if name.endswith(".dist-info/METADATA")]
-                  if len(metadata_files) != 1:
-                      raise SystemExit(f"Expected one wheel METADATA file, found {len(metadata_files)}")
-                  metadata_text = zf.read(metadata_files[0]).decode("utf-8", errors="replace")
-          elif artifact_path.name.endswith(".tar.gz"):
-              with tarfile.open(artifact_path, "r:gz") as tf:
-                  pkg_info_files = [member for member in tf.getmembers() if member.name.endswith("/PKG-INFO")]
-                  if len(pkg_info_files) != 1:
-                      raise SystemExit(f"Expected one PKG-INFO file, found {len(pkg_info_files)}")
-                  file_obj = tf.extractfile(pkg_info_files[0])
-                  if file_obj is None:
-                      raise SystemExit("Failed to read PKG-INFO from sdist")
-                  metadata_text = file_obj.read().decode("utf-8", errors="replace")
-          else:
-              raise SystemExit(f"Unsupported artifact type: {artifact_path}")
-
-          for line in metadata_text.splitlines():
-              if line.startswith("Version: "):
-                  print(line.split(":", 1)[1].strip())
-                  break
-          else:
-              raise SystemExit("Could not find Version header")
-          PY
-            )"
+            ARTIFACT_VERSION="$(python - "${artifact}" picklescan <<< "$ARTIFACT_VERSION_READER")"
 
             if [[ "$ARTIFACT_VERSION" != "$EXPECTED_VERSION" ]]; then
               echo "ERROR: Artifact version mismatch for ${artifact}"
@@ -795,7 +752,7 @@ jobs:
           )
 
       - name: Upload standalone package artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: modelaudit-picklescan-dist-${{ matrix.artifact-suffix }}
           path: packages/modelaudit-picklescan/dist/
@@ -822,7 +779,7 @@ jobs:
     steps:
       - &shared-download-build-artifacts
         name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with: *root-dist-artifact
 
       - name: Verify the root picklescan dependency is available on PyPI
@@ -943,7 +900,7 @@ jobs:
     steps:
       - &shared-download-standalone-pickle-package-artifacts
         name: Download standalone pickle package artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: modelaudit-picklescan-dist-*
           path: dist/
@@ -987,12 +944,8 @@ jobs:
                   f"modelaudit-{version}.tar.gz",
               },
           }[project]
-          url_templates = {
-              "modelaudit-picklescan": ("https://pypi.org/pypi/modelaudit-picklescan/{version}/json", "https://pypi.org/simple/modelaudit-picklescan/"),
-              "modelaudit": ("https://pypi.org/pypi/modelaudit/{version}/json", "https://pypi.org/simple/modelaudit/"),
-          }
-          url, simple_url = url_templates[project]
-          url = url.format(version=version)
+          url = f"https://pypi.org/pypi/{project}/{version}/json"
+          simple_url = f"https://pypi.org/simple/{project}/"
           deadline = time.monotonic() + 600
           last_status = "not checked"
 
@@ -1473,7 +1426,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download original root build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dist
           path: dist/
