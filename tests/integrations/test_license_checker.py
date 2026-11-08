@@ -409,6 +409,56 @@ class TestUnlicensedDatasetDetection:
         assert unlicensed == files
         assert listing_count == 1
 
+    def test_repository_metadata_and_datasets_together(self, tmp_path: Path) -> None:
+        tree = tmp_path / ".cache" / "huggingface" / "trees" / ("a" * 40 + ".json")
+        tree.parent.mkdir(parents=True)
+        shard = "model-00001-of-00002.safetensors"
+        sidecars = {
+            tmp_path / "model.safetensors.index.json": {"metadata": {"total_size": 32}, "weight_map": {"w": shard}},
+            tmp_path / "pytorch_model.bin.index.json": {"weight_map": {"w": "pytorch_model-00001-of-00002.bin"}},
+            tmp_path / "chat_template.json": {"chat_template": "{% for m in messages %}{{ m.content }}{% endfor %}"},
+            tmp_path / "added_tokens.json": {"<|pad|>": 257, "example": 258},
+            tree: {
+                "format_version": 1,
+                "files": {shard: {"size": 32, "blob_id": "b" * 40, "lfs_sha256": "c" * 64, "lfs_size": 32}},
+            },
+        }
+        for path, document in sidecars.items():
+            path.write_text(json.dumps(document))
+        training_data = tmp_path / "training.jsonl"
+        training_data.write_text('{"prompt":"example"}\n')
+        paths = [str(path) for path in [*sidecars, training_data]]
+        metadata = {path: collect_license_metadata(path) for path in paths}
+
+        assert detect_unlicensed_datasets(paths) == [str(training_data)]
+        assert [path for path in paths if metadata[path]["is_dataset"]] == [str(training_data)]
+        for path in sidecars:
+            path.unlink()  # Streamed artifacts can be gone by the time warnings are aggregated.
+        warnings = check_commercial_use_warnings({"file_metadata": metadata})
+        assert [(w["details"]["files"], w["details"]["total_count"]) for w in warnings] == [([str(training_data)], 1)]
+
+    @pytest.mark.parametrize(
+        ("filename", "contents"),
+        [
+            ("model.safetensors.index.json", '{"weight_map":{"w":"labels.csv"}}'),
+            ("model.safetensors.index.json", '{"weight_map":{"w":"w.safetensors"},"rows":[1,2]}'),
+            ("model.safetensors.index.json", '{"weight_map":{},"weight_map":{"w":"w.safetensors"}}'),
+            ("chat_template.json", '{"chat_template":"{{ x }}","examples":["a","b"]}'),
+            ("chat_template.json", '[{"text":"{{ x }}"}]'),
+            ("added_tokens.json", '{"dogs":1,"cats":2}'),
+            ("added_tokens.json", '{"<|pad|>":0,"examples":["a"]}'),
+            (".cache/huggingface/trees/" + "a" * 40 + ".json", '{"format_version":1,"files":{"x":{"size":3}}}'),
+            ("chat_template.json", '{"chat_template":"{{ x }}"} extra'),
+        ],
+    )
+    def test_ambiguous_json_remains_a_dataset(self, tmp_path: Path, filename: str, contents: str) -> None:
+        path = tmp_path / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+
+        assert collect_license_metadata(str(path))["is_dataset"] is True
+        assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+
     def test_ml_model_directory_skip(self, tmp_path: Path) -> None:
         """Test that ML model files in model directories are skipped."""
         # Create ML model directory
