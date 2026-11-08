@@ -4172,7 +4172,7 @@ def _looks_like_coreml_description_proto_prefix(data: bytes, *, sample_is_prefix
         tag, value_offset = tag_result
         field_number = tag >> 3
         wire_type = tag & 0x07
-        if field_number == 0:
+        if field_number == 0 or wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
             return False
 
         if wire_type == 2 and field_number in _COREML_DESCRIPTION_FIELD_HINTS:
@@ -4241,7 +4241,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool
         tag, value_offset = tag_result
         field_number = tag >> 3
         wire_type = tag & 0x07
-        if field_number == 0:
+        if field_number == 0 or wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
             return False
         if field_number == 1 and wire_type != 0:
             return False
