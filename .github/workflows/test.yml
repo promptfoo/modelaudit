@@ -70,6 +70,8 @@ jobs:
               - 'uv.lock'
               - 'packages/modelaudit-picklescan/pyproject.toml'
               - 'packages/modelaudit-picklescan/uv.lock'
+              - 'scripts/release-tools/pyproject.toml'
+              - 'scripts/release-tools/uv.lock'
 
   lint:
     name: Lint and Format
@@ -157,6 +159,9 @@ jobs:
           else
             echo "Standalone picklescan package has no Python dependencies to audit."
           fi
+          uv export --project scripts/release-tools --frozen --no-dev --no-hashes --no-emit-project \
+            > /tmp/modelaudit-release-tools-audit-requirements.txt
+          uvx pip-audit --strict --no-deps --disable-pip --desc -r /tmp/modelaudit-release-tools-audit-requirements.txt
 
   license-check:
     name: License Compliance
@@ -559,6 +564,9 @@ jobs:
           chmod +x "$codecov_binary"
 
       - name: Run branch coverage shard
+        env:
+          # Keep worker data files out of the checkout while scans verify its import-directory fingerprint.
+          COVERAGE_FILE: ${{ runner.temp }}/.coverage
         run: |
           uv run pytest tests -n auto \
             -m "not slow and not integration and not performance" \
