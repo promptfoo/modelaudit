@@ -7,7 +7,7 @@ import pickle
 import pytest
 from framework_fixtures import SystemCommandPayload
 
-from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
 
 NESTED_ENCODING_RULES = (
     ("raw", "S213"),
@@ -35,6 +35,14 @@ def _encode_nested_value(payload: bytes, encoding: str) -> bytes | str:
     return payload.hex()
 
 
+def _scan_with_nested_budget(nested_value: bytes | str, *, source: str, budget: int) -> PickleReport:
+    return scan_bytes(
+        pickle.dumps({"outer": nested_value}, protocol=4),
+        source=source,
+        options=ScanOptions(max_nested_pickle_bytes=budget),
+    )
+
+
 @pytest.mark.parametrize(("encoding", "expected_rule"), NESTED_ENCODING_RULES)
 @pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
 def test_minimum_nested_budget_fails_closed(
@@ -45,10 +53,8 @@ def test_minimum_nested_budget_fails_closed(
     nested_payload = pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=protocol)
     nested_value = _encode_nested_value(nested_payload, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"minimum-budget-protocol-{protocol}-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=2),
+    report = _scan_with_nested_budget(
+        nested_value, source=f"minimum-budget-protocol-{protocol}-{encoding}.pkl", budget=2
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
@@ -59,11 +65,7 @@ def test_minimum_nested_budget_fails_closed(
 def test_minimum_nested_budget_fails_closed_for_unknown_protocol0_global() -> None:
     nested_payload = b"cxxx\nxxx\n)R."
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_payload}, protocol=4),
-        source="minimum-budget-unknown-protocol0-global.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=2),
-    )
+    report = _scan_with_nested_budget(nested_payload, source="minimum-budget-unknown-protocol0-global.pkl", budget=2)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
@@ -77,11 +79,7 @@ def test_minimum_nested_budget_fails_closed_for_mark_prefixed_inst(
 ) -> None:
     nested_value = _encode_nested_value(b"(ios\nsystem\n.", encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"minimum-budget-inst-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=2),
-    )
+    report = _scan_with_nested_budget(nested_value, source=f"minimum-budget-inst-{encoding}.pkl", budget=2)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
@@ -96,10 +94,8 @@ def test_minimum_nested_budget_fails_closed_for_explicit_protocol0_header(
     nested_payload = b"\x80\x00X\x08\x00\x00\x00attackerQ."
     nested_value = _encode_nested_value(nested_payload, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"minimum-budget-explicit-protocol0-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=2),
+    report = _scan_with_nested_budget(
+        nested_value, source=f"minimum-budget-explicit-protocol0-{encoding}.pkl", budget=2
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
@@ -118,11 +114,7 @@ def test_minimum_nested_budget_fails_closed_for_explicit_protocol0_header(
 def test_minimum_nested_budget_leaves_protocol0_near_matches_clean(
     nested_value: bytes,
 ) -> None:
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source="minimum-budget-protocol0-near-match.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=2),
-    )
+    report = _scan_with_nested_budget(nested_value, source="minimum-budget-protocol0-near-match.pkl", budget=2)
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
@@ -134,11 +126,7 @@ def test_minimum_nested_budget_leaves_invalid_protocol6_header_clean(encoding: s
     invalid_payload = b"\x80\x06not-a-pickle"
     nested_value = _encode_nested_value(invalid_payload, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"minimum-budget-invalid-protocol6-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=2),
-    )
+    report = _scan_with_nested_budget(nested_value, source=f"minimum-budget-invalid-protocol6-{encoding}.pkl", budget=2)
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
@@ -157,10 +145,8 @@ def test_nested_budget_detects_valid_pickle_after_invalid_protocol_header(
     nested_payload = b"\x80\x06" + (b"!" * filler_len) + b"cos\nsystem\n)R."
     nested_value = _encode_nested_value(nested_payload, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"invalid-protocol-with-valid-suffix-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=budget),
+    report = _scan_with_nested_budget(
+        nested_value, source=f"invalid-protocol-with-valid-suffix-{encoding}.pkl", budget=budget
     )
 
     expected_status = ScanStatus.INCONCLUSIVE if budget < len(b"cos\nsystem\n)R.") else ScanStatus.COMPLETE
@@ -203,11 +189,7 @@ def test_nested_budget_leaves_multiline_opcode_like_prose_clean(
 ) -> None:
     nested_value = _encode_nested_value(prose, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"multiline-prose-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=budget),
-    )
+    report = _scan_with_nested_budget(nested_value, source=f"multiline-prose-{encoding}.pkl", budget=budget)
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
@@ -219,11 +201,7 @@ def test_truncated_opaque_binary_prefix_remains_clean(encoding: str) -> None:
     opaque_value = b"\x80\x04" + (b"A" * 8)
     nested_value = _encode_nested_value(opaque_value, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"opaque-binary-prefix-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=8),
-    )
+    report = _scan_with_nested_budget(nested_value, source=f"opaque-binary-prefix-{encoding}.pkl", budget=8)
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
@@ -240,11 +218,7 @@ def test_minimum_nested_budget_fails_closed_for_long_protocol0_global(
     nested_payload = b"cattacker\nfactory\n(" + (b"N" * 2000) + b"tR."
     nested_value = _encode_nested_value(nested_payload, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"minimum-budget-long-global-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=budget),
-    )
+    report = _scan_with_nested_budget(nested_value, source=f"minimum-budget-long-global-{encoding}.pkl", budget=budget)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
@@ -262,11 +236,7 @@ def test_nested_budget_fails_closed_for_long_protocol0_literal(
 ) -> None:
     nested_value = _encode_nested_value(nested_payload, encoding)
 
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_value}, protocol=4),
-        source=f"minimum-budget-long-literal-{encoding}.pkl",
-        options=ScanOptions(max_nested_pickle_bytes=budget),
-    )
+    report = _scan_with_nested_budget(nested_value, source=f"minimum-budget-long-literal-{encoding}.pkl", budget=budget)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
