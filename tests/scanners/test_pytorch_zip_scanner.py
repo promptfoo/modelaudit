@@ -14820,7 +14820,7 @@ def test_pytorch_zip_legacy_torchscript_source_keeps_pickle_provenance(
     assert any(
         issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
         and issue.details.get("import_reference") == "__torch__.Module"
-        for issue in PickleScanner().scan(str(standalone)).issues
+        for issue in scan_model_directory_or_file(str(standalone), cache_enabled=False).issues
     )
 
 
