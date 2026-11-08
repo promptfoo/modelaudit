@@ -1228,6 +1228,30 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert validate_file_type(str(model_path)) is True
 
 
+@pytest.mark.parametrize("tag", [0x34, 0x36, 0x37], ids=["unmatched-end-group", "reserved-6", "reserved-7"])
+def test_reject_invalid_wire_types_even_with_unread_protobuf_bytes(tag: int) -> None:
+    sample = b"\x08\x01" + bytes([tag])
+    assert file_detection._looks_like_coreml_model_proto_prefix(sample, sample_is_prefix=True) is False
+    assert file_detection._looks_like_coreml_description_proto_prefix(sample, sample_is_prefix=True) is False
+    # A valid length-delimited field with an unread payload remains unresolved.
+    assert file_detection._looks_like_coreml_model_proto_prefix(b"\x08\x01\x32\x08a", sample_is_prefix=True) is None
+
+
+def test_large_static_library_does_not_claim_protobuf_analysis(tmp_path: Path) -> None:
+    archive = tmp_path / "library.a"
+    members = bytearray(b"!<arch>\n")
+    for name, size in (("/", 106780), ("example.o/", 1024 * 1024)):
+        members.extend(f"{name:<16}{0:<12}{0:<6}{0:<6}{0:<8}{size:<10}`\n".encode("ascii"))
+        members.extend(b"\xc1" * size)
+    archive.write_bytes(members)
+    for detect in (detect_file_format, detect_file_format_from_magic, detect_file_format_for_skip_filter):
+        assert detect(str(archive)) == "unknown"
+
+    archive.write_bytes(b"cos\nsystem\n(S'id'\ntR.")
+    for detect in (detect_file_format, detect_file_format_from_magic, detect_file_format_for_skip_filter):
+        assert detect(str(archive)) == "pickle"
+
+
 def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_match(tmp_path: Path) -> None:
     model_path = create_mock_coreml(tmp_path / "model.jpg")
     prefixed_model_path = create_mock_coreml(tmp_path / "prefixed-model.jpg")
