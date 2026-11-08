@@ -367,6 +367,73 @@ def test_detect_large_renamed_flax_msgpack_by_later_root_without_promoting_gener
     assert detect_file_format(str(generic_map)) == "unknown"
 
 
+def test_jsonl_records_cannot_add_identity_to_the_first_jax_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+    records = tmp_path / "samples.jsonl"
+    records.write_bytes(b'{"text":"hello"}\n' * 32)
+
+    assert not file_detection.is_jax_json_checkpoint_file(records)
+    assert detect_file_format(str(records)) != "jax_checkpoint"
+
+    records.write_bytes(b'{"framework":"jax"}\n' + b'{"text":"hello"}\n' * 32)
+    assert file_detection.is_confirmed_jax_json_checkpoint_file(records)
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("training.log", b"INFO step=25 params=100\n" * 128),
+        ("review.jsonl", b'{"record":"example"}\n' * 128),
+        ("tokenizer.vocab", "▁sample\t-2.8\n".encode() * 128),
+        ("example.so", b"\x7fELF" + bytes(4096)),
+        ("example.dylib", b"\xcf\xfa\xed\xfe" + bytes(4096)),
+        ("libweights.a", b"!<arch>\n" + bytes(4096)),
+        ("tool", b"\x7fELF" + bytes(4096)),
+        ("weights.cact", b"\x84\x2a\xe1\x05" + bytes(4096)),
+    ],
+)
+def test_auxiliary_content_without_flax_keys_does_not_claim_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, content: bytes
+) -> None:
+    from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
+
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 16)
+    path = tmp_path / name
+    path.write_bytes(content)
+
+    assert not FlaxMsgpackScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) != "flax_msgpack"
+
+
+@pytest.mark.parametrize(
+    "encoding", [b"\xa6", b"\xd9\x06", b"\xda\0\x06", b"\xdb\0\0\0\x06", b"\xc4\x06", b"\xc5\0\x06", b"\xc6\0\0\0\x06"]
+)
+def test_auxiliary_flax_key_split_across_reads_retains_incomplete_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, encoding: bytes
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "FLAX_MSGPACK_STRUCTURE_READ_BYTES", 32)
+    path = tmp_path / "run.log"
+    # The "params" string in the second object straddles the first chunk boundary.
+    path.write_bytes(b"A" * (29 - len(encoding)) + b"\x81" + encoding + b"params\x81\xa6target\xa9os.system")
+
+    assert file_detection.is_flax_msgpack_checkpoint_file(path)
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+
+def test_auxiliary_flax_search_keeps_incomplete_coverage_when_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    path = tmp_path / "run.log"
+    path.write_bytes(b"A" * 65 + b"\x81\xa6params\x80")
+
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+
 def test_detect_large_json_array_remains_a_fail_closed_flax_candidate(tmp_path: Path) -> None:
     json_array = tmp_path / "metadata.jpg"
     json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
