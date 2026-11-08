@@ -145,7 +145,6 @@ from modelaudit.utils.file.detection import (
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
-    _SAFETENSORS_SHARD_PATTERN,
     _SHARD_ALREADY_PINNED_CONFIG_KEY,
     MAX_RECORDED_MISSING_SHARD_INDICES,
     ShardedModelDetector,
@@ -153,7 +152,7 @@ from modelaudit.utils.file.handlers import (
     _pinned_shard_scan_path,
     _ShardPinUnavailableError,
     _summarize_missing_shard_indices,
-    _zero_based_safetensors_manifest,
+    _zero_based_singleton_manifest,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -1245,12 +1244,12 @@ def _snapshot_validated_shard_target(
         )
         if trusted_family_group:
             target["family_group"] = trusted_family_group
-    if shard_match.get("pattern") == _SAFETENSORS_SHARD_PATTERN:
-        expected_total = shard_match.get("expected_total_shards")
-        if isinstance(expected_total, int):
-            manifest = _zero_based_safetensors_manifest(source.parent, [str(source)], expected_total)
-            if manifest is not None:
-                target["zero_based_manifest_sha256"] = manifest
+    if (
+        shard_match.get("expected_total_shards") == 1
+        and shard_match.get("current_shard_index") == 0
+        and (manifest := _zero_based_singleton_manifest(source)) is not None
+    ):
+        target["zero_based_manifest_sha256"] = manifest
     return {str(source.absolute()): target}
 
 
@@ -1563,6 +1562,7 @@ def _complete_validated_shard_family_sources(
         tuple[str, int, str],
         dict[int, list[tuple[str, dict[str, int | str]]]],
     ] = {}
+    complete_sources: set[str] = set()
     for source_path, target in validated_targets.items():
         shard_match = ShardedModelDetector.match_shard_filename(Path(source_path).name)
         if shard_match is None:
@@ -1570,24 +1570,22 @@ def _complete_validated_shard_family_sources(
         pattern = shard_match.get("pattern")
         shard_index = shard_match.get("current_shard_index")
         expected_total = shard_match.get("expected_total_shards")
-        manifest = target.get("zero_based_manifest_sha256")
-        first_index = 0 if isinstance(manifest, str) else 1
+        if shard_index == 0 and expected_total == 1 and target.get("zero_based_manifest_sha256"):
+            complete_sources.add(os.path.normcase(os.path.normpath(os.path.abspath(source_path))))
+            continue
         if (
             not isinstance(pattern, str)
             or not isinstance(shard_index, int)
             or not isinstance(expected_total, int)
-            or expected_total < 1
-            or not first_index <= shard_index < first_index + expected_total
+            or expected_total <= 1
+            or not 1 <= shard_index <= expected_total
         ):
             continue
         for family_scope in _validated_shard_family_scopes(source_path, target):
-            if isinstance(manifest, str):
-                family_scope = f"{family_scope}:zero-based:{manifest}"
             grouped_targets.setdefault((pattern, expected_total, family_scope), {}).setdefault(shard_index, []).append(
                 (source_path, target)
             )
 
-    complete_sources: set[str] = set()
     for (_pattern, expected_total, family_scope), targets_by_index in grouped_targets.items():
         complete = len(targets_by_index) == expected_total
         if not complete and partial_coverage is None:
@@ -1647,14 +1645,8 @@ def _complete_validated_shard_family_sources(
         sources = [os.path.normcase(os.path.normpath(os.path.abspath(path))) for path, _target in records]
         if complete:
             complete_sources.update(sources)
-        elif partial_coverage is not None and (
-            family_scope.startswith("remote-directory:") or records[0][1].get("zero_based_manifest_sha256")
-        ):
-            missing = _summarize_missing_shard_indices(
-                set(targets_by_index),
-                expected_total,
-                first_index=0 if records[0][1].get("zero_based_manifest_sha256") else 1,
-            )
+        elif partial_coverage is not None and family_scope.startswith("remote-directory:"):
+            missing = _summarize_missing_shard_indices(set(targets_by_index), expected_total)
             partial_coverage.update(dict.fromkeys(sources, missing))
     return complete_sources
 

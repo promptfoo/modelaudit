@@ -231,23 +231,6 @@ class TestShardedModelDetector:
         assert shard_info["missing_shard_count"] == 1
         assert shard_info["missing_shard_indices"] == [2]
 
-    @pytest.mark.parametrize("present, missing", [([0, 1], []), ([0], [1]), ([1], [0])])
-    def test_zero_based_safetensors_manifest_identifies_missing_indices(
-        self, tmp_path: Path, present: list[int], missing: list[int]
-    ) -> None:
-        shards = [tmp_path / f"model-{index:05d}-of-00002.safetensors" for index in range(2)]
-        index_file = tmp_path / "model.safetensors.index.json"
-        index_file.write_text(json.dumps({"weight_map": {f"t{i}": path.name for i, path in enumerate(shards)}}))
-        for index in present:
-            shards[index].write_bytes(b"shard")
-
-        info = ShardedModelDetector.detect_shards(str(shards[present[0]]))
-
-        assert info is not None
-        assert info.get("missing_shard_indices", []) == missing
-        assert info.get("missing_shard_count", 0) == len(missing)
-        assert info["total_shards"] == len(present)
-
     @pytest.mark.parametrize(
         "index_contents",
         [
@@ -309,29 +292,20 @@ class TestShardedModelDetector:
         info = ShardedModelDetector.detect_shards(str(shard))
         assert info is not None and info["missing_shard_indices"] == [1]
 
-    @pytest.mark.skipif(os.name == "nt", reason="Windows has no stable change timestamp")
-    def test_multiple_shard_families_parse_stable_manifest_once(self, tmp_path: Path) -> None:
+    def test_multiple_shard_families_do_not_read_singleton_manifest(self, tmp_path: Path) -> None:
         from modelaudit.utils.file import handlers
 
-        members = [tmp_path / f"model-00000-of-{n:05d}.safetensors" for n in (1, 2, 3)]
-        for member in members:
-            member.write_bytes(b"shard")
-        manifest = tmp_path / "model.safetensors.index.json"
-        manifest.write_text(json.dumps({"weight_map": {"t": members[0].name}}))
-        with patch.object(
-            handlers, "_parse_zero_based_safetensors_manifest", wraps=handlers._parse_zero_based_safetensors_manifest
-        ) as parse:
-            infos = [ShardedModelDetector.detect_shards(str(member)) for member in members]
-            assert all(info is not None for info in infos)
-            assert parse.call_count == 1
-            manifest.write_text("{}")
-            changed = ShardedModelDetector.detect_shards(str(members[0]))
-            assert changed is not None and changed["missing_shard_indices"] == [1]
-            assert parse.call_count == 2
+        with patch.object(handlers, "_local_safetensors_index_target") as resolve:
+            for total in (2, 3, 15):
+                member = tmp_path / f"model-00000-of-{total:05d}.safetensors"
+                member.write_bytes(b"shard")
+                info = ShardedModelDetector.detect_shards(str(member))
+                assert info is not None and info["missing_shard_count"] == total
+            resolve.assert_not_called()
 
-    @pytest.mark.parametrize("present, missing", [([0, 1], []), ([0], [1]), ([1], [0])])
+    @pytest.mark.parametrize("valid_manifest", [True, False])
     def test_zero_based_streaming_exit_code(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, present: list[int], missing: list[int]
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, valid_manifest: bool
     ) -> None:
         from modelaudit.core import scan_model_streaming
         from modelaudit.core_results import determine_exit_code
@@ -339,15 +313,14 @@ class TestShardedModelDetector:
 
         if sys.platform == "darwin":
             monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", _pinned_windows_shard_scan_path)
-        paths = [tmp_path / f"model-{i:05d}-of-00002.safetensors" for i in range(2)]
+        shard = tmp_path / "model-00000-of-00001.safetensors"
         (tmp_path / "model.safetensors.index.json").write_text(
-            json.dumps({"weight_map": {"a": paths[0].name, "b": paths[1].name}})
+            json.dumps({"weight_map": {"a": shard.name if valid_manifest else "other.safetensors"}})
         )
-        for i in present:
-            header = json.dumps({("a", "b")[i]: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
-            paths[i].write_bytes(len(header).to_bytes(8, "little") + header + b"x")
+        header = json.dumps({"a": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
+        shard.write_bytes(len(header).to_bytes(8, "little") + header + b"x")
         result = scan_model_streaming(
-            iter((paths[i], i == present[-1]) for i in present),
+            iter([(shard, True)]),
             scan_root=str(tmp_path),
             delete_after_scan=False,
             cache_enabled=False,
@@ -358,8 +331,8 @@ class TestShardedModelDetector:
             for check in result.checks
             if check.details.get("scan_outcome_reason") == "missing_model_shards"
         ]
-        assert gaps == ([missing] if missing else [])
-        assert determine_exit_code(result) == (2 if missing else 0)
+        assert gaps == ([] if valid_manifest else [[1]])
+        assert determine_exit_code(result) == (0 if valid_manifest else 2)
 
     def test_zero_based_single_shard_rechecks_manifest_before_scanning(self, tmp_path: Path) -> None:
         shard = tmp_path / "model-00000-of-00001.safetensors"

@@ -17,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass
-from functools import lru_cache
 from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -49,7 +48,6 @@ MMAP_MAX_WINDOW = 500 * 1024 * 1024  # 500MB max window size
 MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
-_SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 
 ValidatedShardTargets = dict[str, dict[str, int | str]]
@@ -442,26 +440,17 @@ def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
 def _summarize_missing_shard_indices(
     present_indices: set[int],
     expected_total: int,
-    *,
-    first_index: int = 1,
 ) -> tuple[list[int], int, bool]:
     """Return a bounded sample, total count, and truncation flag for missing shards."""
-    expected_indices = range(first_index, first_index + expected_total)
-    bounded_present_indices = {index for index in present_indices if index in expected_indices}
+    bounded_present_indices = {index for index in present_indices if 1 <= index <= expected_total}
     missing_count = max(expected_total - len(bounded_present_indices), 0)
     if missing_count == 0:
         return [], 0, False
 
-    missing_candidates = (index for index in expected_indices if index not in bounded_present_indices)
+    missing_candidates = (index for index in range(1, expected_total + 1) if index not in bounded_present_indices)
     missing_indices = list(islice(missing_candidates, MAX_RECORDED_MISSING_SHARD_INDICES))
 
     return missing_indices, missing_count, missing_count > len(missing_indices)
-
-
-@dataclass(frozen=True, slots=True)
-class _ZeroBasedShardManifest:
-    digest: str
-    members: frozenset[str]
 
 
 def _local_safetensors_index_target(directory: Path) -> Path | None:
@@ -478,10 +467,36 @@ def _local_safetensors_index_target(directory: Path) -> Path | None:
     return target if blobs_root is not None and target.is_relative_to(blobs_root) else None
 
 
-def _parse_zero_based_safetensors_manifest(raw: bytes) -> _ZeroBasedShardManifest | None:
-    from ..sources.huggingface import _MAX_HF_SAFETENSORS_INDEX_TENSORS, _loads_json_without_duplicate_keys
+def _zero_based_singleton_manifest(shard: Path) -> str | None:
+    """Confirm that the index assigns every tensor to this zero-of-one shard."""
+    from ..sources.huggingface import (
+        _MAX_HF_SAFETENSORS_INDEX_BYTES,
+        _MAX_HF_SAFETENSORS_INDEX_TENSORS,
+        _loads_json_without_duplicate_keys,
+    )
+    from .detection import _same_regular_file_identity
 
+    if not re.fullmatch(r"model-0+-of-0*1\.safetensors", shard.name):
+        return None
     try:
+        path = _local_safetensors_index_target(shard.parent)
+        if path is None:
+            return None
+        expected = path.lstat()
+        if not stat.S_ISREG(expected.st_mode) or not 0 < expected.st_size <= _MAX_HF_SAFETENSORS_INDEX_BYTES:
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(path, flags), "rb") as index_file:
+            if not _same_regular_file_identity(os.fstat(index_file.fileno()), expected):
+                return None
+            raw = index_file.read(expected.st_size + 1)
+            if (
+                len(raw) != expected.st_size
+                or not _same_regular_file_identity(os.fstat(index_file.fileno()), expected)
+                or _local_safetensors_index_target(shard.parent) != path
+                or not _same_regular_file_identity(path.lstat(), expected)
+            ):
+                return None
         manifest, _, duplicate_count, _, _, error = _loads_json_without_duplicate_keys(raw)
         if (
             error
@@ -491,73 +506,13 @@ def _parse_zero_based_safetensors_manifest(raw: bytes) -> _ZeroBasedShardManifes
         ):
             return None
         weights = manifest.get("weight_map")
-        if not isinstance(weights, dict) or not 0 < len(weights) <= _MAX_HF_SAFETENSORS_INDEX_TENSORS:
-            return None
-        if any(not name or not isinstance(member, str) for name, member in weights.items()):
-            return None
-        members = frozenset(weights.values())
-        expected_total = len(members)
-        indices: set[int] = set()
-        for member in members:
-            match = re.fullmatch(_SAFETENSORS_SHARD_PATTERN, member)
-            if match is None or int(match[2]) != expected_total or not 0 <= int(match[1]) < expected_total:
-                return None
-            indices.add(int(match[1]))
-        if len(indices) == expected_total:
-            return _ZeroBasedShardManifest(hashlib.sha256(raw).hexdigest(), members)
-    except (ValueError, RecursionError):
-        pass
-    return None
-
-
-def _load_zero_based_shard_manifest(path: Path, identity: tuple[int, ...]) -> _ZeroBasedShardManifest | None:
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    with os.fdopen(os.open(path, flags), "rb") as index_file:
-        if _manifest_identity(os.fstat(index_file.fileno())) != identity:
-            return None
-        size = identity[3]
-        raw = index_file.read(size + 1)
-        if len(raw) == size and _manifest_identity(os.fstat(index_file.fileno())) == identity:
-            return _parse_zero_based_safetensors_manifest(raw)
-    return None
-
-
-_cached_zero_based_shard_manifest = lru_cache(maxsize=1)(_load_zero_based_shard_manifest)
-
-
-def _manifest_identity(st: os.stat_result) -> tuple[int, ...]:
-    return st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns
-
-
-def _zero_based_safetensors_manifest(directory: Path, shard_paths: list[str], expected_total: int) -> str | None:
-    """Accept zero-based numbering only from a stable map for this exact local family."""
-    from ..sources.huggingface import _MAX_HF_SAFETENSORS_INDEX_BYTES
-
-    if any(Path(shard).parent != directory for shard in shard_paths):
-        return None
-    try:
-        target = _local_safetensors_index_target(directory)
-        if target is None:
-            return None
-        expected = target.lstat()
-        if not stat.S_ISREG(expected.st_mode) or not 0 < expected.st_size <= _MAX_HF_SAFETENSORS_INDEX_BYTES:
-            return None
-        identity = _manifest_identity(expected)
-        loader = (
-            _cached_zero_based_shard_manifest
-            if expected.st_ino and _supports_reliable_shard_cache_identity()
-            else _load_zero_based_shard_manifest
-        )
-        manifest = loader(target, identity)
         if (
-            manifest is not None
-            and len(manifest.members) == expected_total
-            and all(Path(shard).name in manifest.members for shard in shard_paths)
-            and _local_safetensors_index_target(directory) == target
-            and _manifest_identity(target.lstat()) == identity
+            isinstance(weights, dict)
+            and 0 < len(weights) <= _MAX_HF_SAFETENSORS_INDEX_TENSORS
+            and all(name and member == shard.name for name, member in weights.items())
         ):
-            return manifest.digest
-    except (OSError, RuntimeError):
+            return hashlib.sha256(raw).hexdigest()
+    except (OSError, ValueError, RuntimeError):
         pass
     return None
 
@@ -568,7 +523,7 @@ class ShardedModelDetector:
     # Common sharding patterns for large models
     SHARD_PATTERNS: ClassVar[list[str]] = [
         r"pytorch_model-(\d+)-of-(\d+)\.bin",  # HuggingFace PyTorch sharding
-        _SAFETENSORS_SHARD_PATTERN,
+        r"model-(\d+)-of-(\d+)\.safetensors",  # SafeTensors sharding
         r"model\.ckpt-(\d+)\.data-\d+-of-\d+",  # TensorFlow sharding
         r"model_weights_(\d+)\.h5",  # Keras sharding
         r"checkpoint_(\d+)\.pt",  # PyTorch checkpoint sharding
@@ -795,19 +750,18 @@ class ShardedModelDetector:
                     expected_total = max(expected_totals)
                     shard_info["expected_total_shards"] = expected_total
                     if present_indices:
-                        index_base = 1
-                        if pattern == _SAFETENSORS_SHARD_PATTERN and expected_total not in present_indices:
-                            manifest_digest = _zero_based_safetensors_manifest(
-                                dir_path, shard_info["shards"], expected_total
-                            )
+                        missing_indices, missing_count, missing_indices_truncated = _summarize_missing_shard_indices(
+                            present_indices, expected_total
+                        )
+                        if (
+                            expected_total == 1
+                            and present_indices == {0}
+                            and shard_info["shards"] == [str(Path(file_path))]
+                        ):
+                            manifest_digest = _zero_based_singleton_manifest(Path(file_path))
                             if manifest_digest is not None:
                                 shard_info["zero_based_manifest_sha256"] = manifest_digest
-                                index_base = 0
-                        missing_indices, missing_count, missing_indices_truncated = _summarize_missing_shard_indices(
-                            present_indices,
-                            expected_total,
-                            first_index=index_base,
-                        )
+                                missing_count = 0
                         if missing_count:
                             shard_info["missing_shard_count"] = missing_count
                             shard_info["missing_shard_indices"] = missing_indices
@@ -1424,12 +1378,7 @@ class ParallelShardHandler:
         pattern = self.shard_info["pattern"]
         expected_total = self.shard_info.get("expected_total_shards")
         manifest_digest = self.shard_info.get("zero_based_manifest_sha256")
-        if (
-            manifest_digest is not None
-            and isinstance(expected_total, int)
-            and _zero_based_safetensors_manifest(current_file.parent, self.shard_info["shards"], expected_total)
-            != manifest_digest
-        ):
+        if manifest_digest is not None and _zero_based_singleton_manifest(current_file) != manifest_digest:
             raise OSError("SafeTensors shard manifest changed after detecting the zero-based family")
         members: set[str] = set()
         family_directories = {current_file.parent}
