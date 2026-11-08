@@ -533,7 +533,7 @@ class Jinja2TemplateScanner(BaseScanner):
                             else (
                                 "Template analysis incomplete because standalone template could not be read"
                                 if read_failed
-                                else "Template extraction incomplete due to malformed structured config"
+                                else "Template extraction incomplete while processing the configuration"
                             )
                         ),
                         severity=IssueSeverity.INFO,
@@ -752,7 +752,11 @@ class Jinja2TemplateScanner(BaseScanner):
         result.add_check(
             name="Template Config Parsing",
             passed=False,
-            message=f"Failed to parse {failure['format']} config for template extraction",
+            message=(
+                "The YAML safe loader could not construct a value for template extraction"
+                if reason == "jinja2_yaml_construct_failed"
+                else f"Failed to parse {failure['format']} config for template extraction"
+            ),
             severity=IssueSeverity.INFO,
             location=location,
             details=failure,
@@ -1146,7 +1150,12 @@ class Jinja2TemplateScanner(BaseScanner):
 
         except Exception as e:
             logger.debug(f"Error extracting YAML templates: {e}")
-            extraction_failures.append(self._template_extraction_failure("yaml", "jinja2_yaml_parse_failed", e))
+            reason = (
+                "jinja2_yaml_construct_failed"
+                if isinstance(e, yaml.constructor.ConstructorError)
+                else "jinja2_yaml_parse_failed"
+            )
+            extraction_failures.append(self._template_extraction_failure("yaml", reason, e))
             self._extract_raw_template_fallback(path, templates, "raw_yaml_parse_fallback")
 
         return templates, extraction_failures
