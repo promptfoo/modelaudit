@@ -233,6 +233,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: false
 
       - name: Install Rust toolchain for standalone lock refresh
         run: &install-rust-toolchain |
@@ -253,6 +255,7 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
+          package-manager-cache: false
 
       - name: Install Node dependencies
         run: npm ci --ignore-scripts
@@ -278,7 +281,9 @@ jobs:
             "$RUNNER_TEMP/candidates.json" > "$RUNNER_TEMP/reviewed-notes.json"
           unset GH_TOKEN
           base=$(git merge-base HEAD refs/remotes/origin/main)
-          python3 scripts/release_notes.py render --base "$base" --reviews "$RUNNER_TEMP/reviewed-notes.json"
+          # Run the renderer from protected main against the candidate Markdown.
+          git show "$base:scripts/release_notes.py" > "$RUNNER_TEMP/modelaudit-release-notes.py"
+          python3 -I "$RUNNER_TEMP/modelaudit-release-notes.py" render --base "$base" --reviews "$RUNNER_TEMP/reviewed-notes.json"
 
       - name: Format changelogs with Prettier
         run: |

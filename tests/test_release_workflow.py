@@ -591,6 +591,8 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
     sync_steps = _job_steps(workflow, "sync-release-metadata")
     checkout_step = next(step for step in sync_steps if step.get("uses", "").startswith("actions/checkout@"))
     assert checkout_step["with"]["persist-credentials"] is False
+    assert _step_by_name(sync_steps, "Install uv")["with"]["enable-cache"] is False
+    assert _step_by_name(sync_steps, "Setup Node.js")["with"]["package-manager-cache"] is False
 
     source_step = _step_by_name(sync_steps, "Record release metadata source")
     assert source_step["id"] == "source"

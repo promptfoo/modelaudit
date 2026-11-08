@@ -248,6 +248,7 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     fragment(root, notes, "### Upgrade notes\n\n- Draft instructions.\n")
     base = commit(root, "pending change")
     git(root, "update-ref", "refs/remotes/origin/main", base)
+    (root / "scripts" / SCRIPT.name).write_text("raise SystemExit('candidate code was executed')\n")
     write_manifest(root, "0.2.2", "0.1.1")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
     head = commit(root, "release proposal")
