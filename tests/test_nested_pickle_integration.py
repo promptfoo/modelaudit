@@ -14,9 +14,21 @@ from click.testing import CliRunner
 
 from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import Check, Issue, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from tests.cli_output import parse_click_json_output
+
+
+def _has_nested_message(entry: Check | Issue) -> bool:
+    return "nested" in entry.message.lower() or "encoded" in entry.message.lower()
+
+
+def _nested_aggregate_issues(issues: list[Issue]) -> list[Issue]:
+    return [
+        issue
+        for issue in issues
+        if "nested" in getattr(issue, "message", "").lower() or "encoded" in getattr(issue, "message", "").lower()
+    ]
 
 
 class TestNestedPickleIntegration:
@@ -34,27 +46,16 @@ class TestNestedPickleIntegration:
 
     def get_malicious_nested_pickles(self, pickles_dir: Path) -> list[Path]:
         """Get all malicious nested pickle test files."""
-        malicious_files: list[Path] = []
-
         # Look for our generated malicious nested pickle files
-        malicious_patterns = ["nested_pickle_*.pkl", "malicious_model_*.pkl", "decode_exec_*.pkl"]
-
-        for pattern in malicious_patterns:
+        malicious_files: list[Path] = []
+        for pattern in ("nested_pickle_*.pkl", "malicious_model_*.pkl", "decode_exec_*.pkl"):
             malicious_files.extend(pickles_dir.glob(pattern))
-
         return malicious_files
 
     def get_safe_nested_pickles(self, pickles_dir: Path) -> list[Path]:
         """Get all safe nested-like pickle files that should not trigger detection."""
-        safe_files: list[Path] = []
-
         # Look for our safe test files
-        safe_patterns = ["safe_*.pkl"]
-
-        for pattern in safe_patterns:
-            safe_files.extend(pickles_dir.glob(pattern))
-
-        return safe_files
+        return list(pickles_dir.glob("safe_*.pkl"))
 
     def test_malicious_nested_pickle_detection(self, pickles_dir):
         """Test that all malicious nested pickle variants are detected."""
@@ -74,11 +75,7 @@ class TestNestedPickleIntegration:
             assert result.success, f"Scan failed for {malicious_file.name}"
 
             # Should detect nested pickle threats
-            nested_issues = [
-                issue
-                for issue in result.issues
-                if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
-            ]
+            nested_issues = [issue for issue in result.issues if _has_nested_message(issue)]
 
             assert len(nested_issues) > 0, (
                 f"Failed to detect nested pickle threat in {malicious_file.name}. "
@@ -117,11 +114,7 @@ class TestNestedPickleIntegration:
             assert result.success, f"Scan failed for {safe_file.name}"
 
             # Should NOT detect nested pickle threats (false positives)
-            nested_issues = [
-                issue
-                for issue in result.issues
-                if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
-            ]
+            nested_issues = [issue for issue in result.issues if _has_nested_message(issue)]
 
             assert len(nested_issues) == 0, (
                 f"False positive nested pickle detection in {safe_file.name}: {[i.message for i in nested_issues]}"
@@ -172,12 +165,7 @@ class TestNestedPickleIntegration:
             )
 
             # Should have nested pickle issues
-            nested_issues = [
-                issue
-                for issue in results.issues
-                if "nested" in getattr(issue, "message", "").lower()
-                or "encoded" in getattr(issue, "message", "").lower()
-            ]
+            nested_issues = _nested_aggregate_issues(results.issues)
 
             assert len(nested_issues) > 0, f"No nested pickle issues found for {description}"
 
@@ -259,12 +247,7 @@ class TestNestedPickleIntegration:
             assert results.files_scanned >= len(copied_files)
 
             # Should have both safe and malicious results
-            nested_issues = [
-                issue
-                for issue in results.issues
-                if "nested" in getattr(issue, "message", "").lower()
-                or "encoded" in getattr(issue, "message", "").lower()
-            ]
+            nested_issues = _nested_aggregate_issues(results.issues)
 
             # Should detect the malicious files
             assert len(nested_issues) > 0, "Should detect nested pickle threats in mixed directory"
@@ -291,12 +274,7 @@ class TestNestedPickleIntegration:
             result = scan_model_directory_or_file(str(test_file))
             total_issues += len(result.issues)
 
-            nested_issues = [
-                issue
-                for issue in result.issues
-                if "nested" in getattr(issue, "message", "").lower()
-                or "encoded" in getattr(issue, "message", "").lower()
-            ]
+            nested_issues = _nested_aggregate_issues(result.issues)
             total_nested_issues += len(nested_issues)
 
         duration = time.perf_counter() - start_time
@@ -360,16 +338,8 @@ class TestNestedPickleIntegration:
 
                 assert result.success, f"Scan should succeed for {description}"
 
-                nested_issue_messages = [
-                    issue
-                    for issue in result.issues
-                    if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
-                ]
-                nested_check_messages = [
-                    check
-                    for check in result.checks
-                    if "nested" in check.message.lower() or "encoded" in check.message.lower()
-                ]
+                nested_issue_messages = [issue for issue in result.issues if _has_nested_message(issue)]
+                nested_check_messages = [check for check in result.checks if _has_nested_message(check)]
                 nested_detection_count = len(nested_issue_messages) + len(nested_check_messages)
 
                 if should_detect:
@@ -421,9 +391,7 @@ class TestNestedPickleIntegration:
         scanner = PickleScanner()
         result = scanner.scan(str(malicious_file))
 
-        nested_issues = [
-            issue for issue in result.issues if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
-        ]
+        nested_issues = [issue for issue in result.issues if _has_nested_message(issue)]
 
         assert len(nested_issues) > 0, "Should find nested pickle issues"
 

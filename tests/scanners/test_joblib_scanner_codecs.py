@@ -41,7 +41,13 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file.detection import _LZ4_FRAME_MAGIC, validate_file_type_with_formats
 from tests.helpers.file_creators import SystemCommandPayload
 from tests.helpers.file_creators import (
+    joblib_binunicode as _binunicode,
+)
+from tests.helpers.file_creators import (
     joblib_numpy_raw_segment as _joblib_numpy_raw_segment,
+)
+from tests.helpers.file_creators import (
+    joblib_numpy_wrapper_control as _joblib_numpy_wrapper_control,
 )
 
 
@@ -218,39 +224,6 @@ def _scan_payload(
 
 def _joblib_numpy_wrapper_stop_prefix() -> bytes:
     return b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\ncnumpy\nndarray\ncnumpy\ndtype\n."
-
-
-def _binunicode(value: str) -> bytes:
-    encoded = value.encode("utf-8")
-    return b"X" + struct.pack("<I", len(encoded)) + encoded
-
-
-def _joblib_numpy_wrapper_control(
-    *,
-    shape: int = 4,
-    dtype: str = "i8",
-    subclass: tuple[str, str] = ("numpy", "ndarray"),
-) -> bytes:
-    subclass_global = b"c" + subclass[0].encode("ascii") + b"\n" + subclass[1].encode("ascii") + b"\n"
-    return (
-        b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
-        + _binunicode("subclass")
-        + subclass_global
-        + _binunicode("shape")
-        + b"K"
-        + bytes([shape])
-        + b"\x85"
-        + _binunicode("order")
-        + _binunicode("C")
-        + _binunicode("dtype")
-        + b"cnumpy\ndtype\n"
-        + _binunicode(dtype)
-        + b"\x89\x88\x87R"
-        + _binunicode("allow_mmap")
-        + b"\x88"
-        + _binunicode("numpy_array_alignment_bytes")
-        + b"K\x10ub"
-    )
 
 
 def _joblib_structured_object_dtype_control(itemsize: int) -> bytes:

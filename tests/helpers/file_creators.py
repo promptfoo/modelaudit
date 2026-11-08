@@ -518,6 +518,44 @@ def bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def joblib_binunicode(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return b"X" + struct.pack("<I", len(encoded)) + encoded
+
+
+def joblib_numpy_wrapper_control(
+    *,
+    shape: int = 4,
+    dtype: str = "i8",
+    subclass: tuple[str, str] = ("numpy", "ndarray"),
+) -> bytes:
+    subclass_global = b"c" + subclass[0].encode("ascii") + b"\n" + subclass[1].encode("ascii") + b"\n"
+    return (
+        b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
+        + joblib_binunicode("subclass")
+        + subclass_global
+        + joblib_binunicode("shape")
+        + b"K"
+        + bytes([shape])
+        + b"\x85"
+        + joblib_binunicode("order")
+        + joblib_binunicode("C")
+        + joblib_binunicode("dtype")
+        + b"cnumpy\ndtype\n"
+        + joblib_binunicode(dtype)
+        + b"\x89\x88\x87R"
+        + joblib_binunicode("allow_mmap")
+        + b"\x88"
+        + joblib_binunicode("numpy_array_alignment_bytes")
+        + b"K\x10ub"
+    )
+
+
+def joblib_numpy_array_payload() -> bytes:
+    prefix = b"\x80\x02](" + joblib_numpy_wrapper_control()
+    return prefix + joblib_numpy_raw_segment(len(prefix), b"\x00" * 32) + b"e."
+
+
 def joblib_numpy_raw_segment(prefix_length: int, raw_data: bytes) -> bytes:
     padding_length = 16 - ((prefix_length + 1) % 16)
     return bytes([padding_length]) + (b"\xff" * padding_length) + raw_data
@@ -714,3 +752,62 @@ class ReadTrackingBuffer(io.BytesIO):
         data = super().read(size)
         self.bytes_read += len(data)
         return data
+
+
+def legacy_pytorch_storage_pid_tuple(
+    key: str,
+    storage_size: int,
+    *,
+    storage_type: bytes = b"ctorch\nByteStorage\n",
+    element_count: bytes | None = None,
+    extra_fields: bytes = b"",
+    view_metadata: bytes = b"N",
+) -> bytes:
+    encoded_key = key.encode("ascii")
+    encoded_count = element_count if element_count is not None else pickle.dumps(storage_size, protocol=2)[2:-1]
+    return (
+        b"("
+        + pickle_binunicode(b"storage")
+        + storage_type
+        + pickle_binunicode(encoded_key)
+        + pickle_binunicode(b"cpu")
+        + encoded_count
+        + view_metadata
+        + extra_fields
+        + b"t"
+    )
+
+
+def legacy_pytorch_storage_list_prefix(storage_keys: tuple[str, ...], storage_size: int) -> bytearray:
+    stream = bytearray(b"\x80\x02]")
+    for key in storage_keys:
+        stream.extend(legacy_pytorch_storage_pid_tuple(key, storage_size))
+        stream.extend(b"Qa")
+    return stream
+
+
+def legacy_pytorch_container_from_object_stream(
+    storage_payload: bytes,
+    object_stream: bytes,
+    *,
+    storage_keys: tuple[str, ...] = ("0",),
+    declared_storage_size: int | None = None,
+) -> tuple[bytes, int]:
+    storage_size = len(storage_payload) if declared_storage_size is None else declared_storage_size
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        object_stream,
+        pickle.dumps(list(storage_keys), protocol=2),
+    )
+    pickle_end = sum(len(stream) for stream in control_streams)
+    storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
+    return b"".join(control_streams) + storage_record, pickle_end
