@@ -148,6 +148,17 @@ def test_picklescan_build_backend_is_exactly_pinned() -> None:
     assert build_system["requires"] == [PINNED_MATURIN_BACKEND]
 
 
+def test_picklescan_msrv_supports_locked_pyo3() -> None:
+    package_dir = PICKLESCAN_PYPROJECT.parent
+    cargo_config = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+    cargo_lock = tomllib.loads((package_dir / "Cargo.lock").read_text(encoding="utf-8"))
+    pyo3 = next(package for package in cargo_lock["package"] if package["name"] == "pyo3")
+
+    # PyO3 0.30 uses Rust 2024: https://github.com/PyO3/pyo3/blob/v0.30.1/Cargo.toml
+    if Version(pyo3["version"]) >= Version("0.30.0"):
+        assert Version(cargo_config["package"]["rust-version"]) >= Version("1.85")
+
+
 def test_root_requires_hardened_picklescan_release() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
     dependency = next(

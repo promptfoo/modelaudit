@@ -541,6 +541,14 @@ def test_dry_run_never_calls_triage(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     post.assert_not_called()
 
 
+def test_triage_preserves_process_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report = report_for_case(tmp_path)
+    monkeypatch.setattr(triage, "triage_findings", MagicMock(side_effect=SystemExit(17)))
+    with pytest.raises(SystemExit) as stopped:
+        cli_module._emit_triage(report)
+    assert stopped.value.code == 17
+
+
 @pytest.mark.parametrize("error", [BrokenPipeError(), KeyboardInterrupt()])
 def test_triage_output_failure_does_not_abort_scan(
     error: BaseException, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

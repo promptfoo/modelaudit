@@ -24,6 +24,7 @@ from yaspin import yaspin
 from yaspin.spinners import Spinners
 
 from . import __version__
+from ._cli_interrupt import StartupInterrupted
 from .auth.client import auth_client
 from .auth.config import (
     cloud_config,
@@ -3031,11 +3032,10 @@ def _emit_triage(audit_result: ModelAuditResultModel) -> None:
         from .triage import triage_findings
 
         lines = triage_findings(audit_result)
-    except BaseException as exc:
-        # The module entrypoint uses a BaseException subclass for SIGINT.
+    except (Exception, KeyboardInterrupt, StartupInterrupted) as exc:
         lines = [f"AI triage unavailable ({type(exc).__name__}: {exc}); scanner result unchanged."]
     if lines:
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(Exception, KeyboardInterrupt, StartupInterrupted):
             try:
                 click.echo("\n".join(_escape_terminal_text(line) for line in lines), err=True)
             except OSError:

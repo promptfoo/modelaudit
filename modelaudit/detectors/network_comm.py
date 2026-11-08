@@ -5865,11 +5865,9 @@ class NetworkCommDetector:
             # Skip actual layer-name grammar (e.g., layer1.weight), not any
             # attacker-controlled DNS name that happens to contain ML words.
             if _ML_LAYER_DOMAIN_PATTERN.fullmatch(domain):
-                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue
             # Bare method calls such as weight.to(device) are code tokens, not DNS names.
             if _has_call_syntax(data, match.start(), len(match.group())):
-                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue
 
             # Skip very short domain names in binary files (likely false positives)
