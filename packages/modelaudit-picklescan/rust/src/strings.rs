@@ -38,7 +38,7 @@ struct Base64ScanContinuation {
     alignment_prefix: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StringScanContinuation {
     lex_stack: Vec<StringLexFrame>,
     inside_url: bool,
@@ -104,10 +104,8 @@ fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String>
         return Vec::new();
     }
 
-    let normalized_raw_value = strip_python_line_continuations(value);
     let raw_has_plain_seed = has_suspicious_ascii_seed(value.as_bytes())
-        || normalized_raw_value
-            .as_ref()
+        || strip_python_line_continuations(value)
             .is_some_and(|normalized| has_suspicious_ascii_seed(normalized.as_bytes()));
     let raw_has_encoded_seed = scan_base64
         && has_base64_dangerous_seed(
@@ -120,12 +118,6 @@ fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String>
     }
 
     let (plain_value, url_limit_exceeded, url_context_incomplete) = strip_url_spans(value);
-    let normalized_plain_value = strip_python_line_continuations(plain_value.as_ref());
-    let has_plain_seed = raw_has_plain_seed
-        && (has_suspicious_ascii_seed(plain_value.as_bytes())
-            || normalized_plain_value
-                .as_ref()
-                .is_some_and(|normalized| has_suspicious_ascii_seed(normalized.as_bytes())));
     let has_encoded_seed = raw_has_encoded_seed
         && has_base64_dangerous_seed(
             plain_value
@@ -142,10 +134,11 @@ fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String>
     if has_encoded_seed {
         matches.extend(encoded_dangerous_string_matches(plain_value.as_ref()));
     }
-    if !has_plain_seed {
+    if !raw_has_plain_seed {
         return matches;
     }
 
+    let normalized_plain_value = strip_python_line_continuations(plain_value.as_ref());
     for plain in std::iter::once(plain_value.as_ref()).chain(normalized_plain_value.as_deref()) {
         if !has_suspicious_ascii_seed(plain.as_bytes()) {
             continue;
@@ -291,32 +284,28 @@ fn strip_url_spans_with_context(
     let mut url_count = 0usize;
     let mut span_limit_exceeded = false;
     let mut context_incomplete = false;
-    let mut lex_stack = continuation
-        .as_ref()
-        .map_or_else(Vec::new, |continuation| continuation.lex_stack.clone());
-    let lexical_lookbehind = continuation.as_ref().map_or_else(Vec::new, |continuation| {
-        continuation.lexical_lookbehind.clone()
-    });
-    let continuation_trailing_backslash_odd = continuation
-        .as_ref()
-        .is_some_and(|continuation| continuation.trailing_backslash_odd);
-    let mut base64 = continuation
-        .as_ref()
-        .map_or_else(Base64ScanContinuation::default, |continuation| {
-            continuation.base64.clone()
-        });
+    let StringScanContinuation {
+        mut lex_stack,
+        inside_url,
+        reviewed_prefix_bytes,
+        lexical_lookbehind,
+        trailing_backslash_odd: continuation_trailing_backslash_odd,
+        mut base64,
+    } = continuation.unwrap_or_default();
     let next_trailing_backslash_odd = trailing_backslash_odd_at(
         bytes,
         next_window_start,
-        continuation
-            .as_ref()
-            .is_some_and(|continuation| continuation.trailing_backslash_odd),
+        continuation_trailing_backslash_odd,
     );
+    let next_state = |lex_stack, base64| StringScanContinuation {
+        lex_stack,
+        base64,
+        lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+        trailing_backslash_odd: next_trailing_backslash_odd,
+        ..StringScanContinuation::default()
+    };
     let mut next_continuation = None;
-    let reviewed_prefix_bytes = continuation
-        .as_ref()
-        .map_or(0, |continuation| continuation.reviewed_prefix_bytes)
-        .min(bytes.len());
+    let reviewed_prefix_bytes = reviewed_prefix_bytes.min(bytes.len());
 
     if reviewed_prefix_bytes > 0 {
         let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
@@ -328,8 +317,8 @@ fn strip_url_spans_with_context(
         base64 = Base64ScanContinuation::default();
     }
 
-    if let Some(continuation) = continuation.filter(|continuation| continuation.inside_url) {
-        let (end, uncertain) = url_end(bytes, 0, continuation.lex_stack.last().copied());
+    if inside_url {
+        let (end, uncertain) = url_end(bytes, 0, lex_stack.last().copied());
         context_incomplete |= uncertain;
         if end > 0 {
             let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
@@ -339,12 +328,8 @@ fn strip_url_spans_with_context(
             base64 = Base64ScanContinuation::default();
             if next_window_start < end {
                 next_continuation = Some(StringScanContinuation {
-                    lex_stack: continuation.lex_stack,
                     inside_url: true,
-                    reviewed_prefix_bytes: 0,
-                    lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-                    trailing_backslash_odd: next_trailing_backslash_odd,
-                    base64: Base64ScanContinuation::default(),
+                    ..next_state(lex_stack.clone(), Base64ScanContinuation::default())
                 });
             }
         }
@@ -352,27 +337,12 @@ fn strip_url_spans_with_context(
 
     while cursor < bytes.len() {
         if cursor == next_window_start {
-            next_continuation = Some(StringScanContinuation {
-                lex_stack: lex_stack.clone(),
-                inside_url: false,
-                reviewed_prefix_bytes: 0,
-                lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-                trailing_backslash_odd: next_trailing_backslash_odd,
-                base64: base64.clone(),
-            });
+            next_continuation = Some(next_state(lex_stack.clone(), base64.clone()));
         }
         if url_scheme_starts(bytes, cursor) {
             url_count += 1;
             span_limit_exceeded |= url_count > MAX_STRIPPED_URL_SPANS;
-            let continuation = StringScanContinuation {
-                lex_stack: lex_stack.clone(),
-                inside_url: true,
-                reviewed_prefix_bytes: 0,
-                lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-                trailing_backslash_odd: next_trailing_backslash_odd,
-                base64: Base64ScanContinuation::default(),
-            };
-            let (end, uncertain) = url_end(bytes, cursor, continuation.lex_stack.last().copied());
+            let (end, uncertain) = url_end(bytes, cursor, lex_stack.last().copied());
             context_incomplete |= uncertain;
             let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
             stripped.push_str(&value[copied_through..cursor]);
@@ -380,7 +350,10 @@ fn strip_url_spans_with_context(
             // lexical tokens. MIME-Base64 whitespace must not stitch them.
             stripped.push('\0');
             if cursor <= next_window_start && next_window_start < end {
-                next_continuation = Some(continuation);
+                next_continuation = Some(StringScanContinuation {
+                    inside_url: true,
+                    ..next_state(lex_stack.clone(), Base64ScanContinuation::default())
+                });
             }
             if cursor < next_window_start {
                 base64 = Base64ScanContinuation::default();
@@ -513,26 +486,15 @@ fn strip_url_spans_with_context(
                     || boundary_quote_was_reviewed))
         {
             next_continuation = Some(StringScanContinuation {
-                lex_stack: lex_stack.clone(),
-                inside_url: false,
                 reviewed_prefix_bytes: cursor + 1 - next_window_start,
-                lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-                trailing_backslash_odd: next_trailing_backslash_odd,
-                base64: base64.clone(),
+                ..next_state(lex_stack.clone(), base64.clone())
             });
         }
         cursor += 1;
     }
 
     if next_window_start == bytes.len() {
-        next_continuation = Some(StringScanContinuation {
-            lex_stack,
-            inside_url: false,
-            reviewed_prefix_bytes: 0,
-            lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-            trailing_backslash_odd: next_trailing_backslash_odd,
-            base64,
-        });
+        next_continuation = Some(next_state(lex_stack, base64));
     }
 
     match output {
@@ -966,18 +928,15 @@ pub(crate) fn decode_base64(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn has_base64_dangerous_seed(bytes: impl Iterator<Item = u8>) -> bool {
-    let mut quartet = [0u8; 4];
     let mut octet = [0u8; 8];
     let mut seen = 0usize;
     for byte in bytes {
-        quartet.rotate_left(1);
-        quartet[3] = byte;
         octet.rotate_left(1);
         octet[7] = byte;
         seen += 1;
         if BASE64_DANGEROUS_SEEDS
             .iter()
-            .any(|seed| seed.as_bytes() == quartet)
+            .any(|seed| seed.as_bytes() == &octet[4..])
             || seen >= octet.len() && base64_window_has_casefold_seed(&octet)
         {
             return true;

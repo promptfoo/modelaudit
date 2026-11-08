@@ -10,7 +10,7 @@ import token
 import tokenize
 from array import array
 from bisect import bisect_right
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, ClassVar
@@ -18,6 +18,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.network_comm import (
+    iter_port_token_positions,
     official_readme_urlopen_image_example_spans,
     redact_url_for_finding,
 )
@@ -26,7 +27,8 @@ from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FI
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_url_spans
+from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
+from modelaudit.scanners.text_scanner_support.model_card_policy import model_card_policy_evidence
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
@@ -226,7 +228,12 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
-DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
+DOCUMENTATION_CODE_CALL_PATTERN = re.compile(
+    rb"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$"
+)
+DOCUMENTATION_LINKED_BLOCKQUOTE = re.compile(rb"(?m)^ {0,3}>[ \t]+[^#\r\n\"'`]*?\]\(https?://[^()\s#\"'`]+\)[^\r\n]*$")
+DOCUMENTATION_PARENTHESIZED_ISSUE = re.compile(r"#\d+(?:[ \t]+\w+)?\)")
+DOCUMENTATION_ISSUE_LABEL_HASH = re.compile(rb"\[#(?=\d+\]\(https?://[^()\s]+\))")
 DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
 DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
 DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
@@ -765,6 +772,7 @@ DOCUMENTATION_ACTIONABLE_NETWORK_LABEL_SUFFIX_PATTERN = re.compile(
     rb"\b(?:address|destination|endpoint|host|receiver|server|sink|target|uri|url)\b",
     re.IGNORECASE,
 )
+DOCUMENTATION_URL_PASSWORD_SUFFIX = re.compile(rb":[a-z0-9._~!$&*+,;=:%-]*@")
 GENERIC_CC_BENIGN_TERM_PATTERN = rb"(?:malwares?|backdoors?|trojans?|botnets?|zombies?)"
 BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"(?:"
@@ -776,6 +784,13 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\b"
     rb")",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN = re.compile(
+    rb"\b(?:does|do|will)\s+not\s+detect\s+[\w-]+\s+(?:and|or)\s+"
+    + GENERIC_CC_BENIGN_TERM_PATTERN
+    + rb"\b(?=[.!]?\s*$)"
+    rb"|\b(?:kill|reap|terminate)\s+zombie\s+(?:(?:gpu|cpu)\s+)?(?:process(?:es)?|procs?)\b",
     re.IGNORECASE,
 )
 BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
@@ -933,7 +948,7 @@ class TextScanner(BaseScanner):
     @classmethod
     def _is_documentation_sidecar(cls, path: str) -> bool:
         filename = os.path.basename(path).lower()
-        return (
+        return not filename.endswith(".env") and (
             filename in DOCUMENTATION_TEXT_FILENAMES
             or cls._is_readme_documentation_filename(filename)
             or cls._is_model_card_documentation_filename(filename)
@@ -1129,6 +1144,12 @@ class TextScanner(BaseScanner):
                 raise _DocumentationCallBudgetExceeded
             _DOCUMENTATION_CALL_BUDGET.set(budget - len(prefix))
         source = prefix.strip()
+        if b"[#" in source:
+            # A numbered issue label in linked blockquote prose is not a Python comment.
+            # Keep real comments intact when the preceding text could be Python.
+            source = DOCUMENTATION_LINKED_BLOCKQUOTE.sub(
+                lambda line: DOCUMENTATION_ISSUE_LABEL_HASH.sub(b"[", line[0]), source
+            )
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
@@ -1204,6 +1225,14 @@ class TextScanner(BaseScanner):
                         and (previous.string == ")" or (previous.string == "]" and previous_closed_subscript))
                     )
                     is_call = current.string == "(" and (name_starts_call or follows_callable_expression)
+                    if is_call and DOCUMENTATION_PARENTHESIZED_ISSUE.match(current.line, current.end[1]):
+                        # In prose, package.cpp(#123) cites an issue. Python would consume
+                        # the closing parenthesis as a comment and invent an open call.
+                        prose = re.match(r"(\w+)[ \t]+(\w+)\b", current.line)
+                        if prose and all(
+                            not keyword.iskeyword(word) and not keyword.issoftkeyword(word) for word in prose.groups()
+                        ):
+                            is_call = False
                     is_subscript = (
                         current.string == "["
                         and previous is not None
@@ -1862,6 +1891,8 @@ class TextScanner(BaseScanner):
 
     @staticmethod
     def _documentation_suspicious_label_is_actionable(prefix: bytes) -> bool:
+        if re.fullmatch(rb"[ \t]*(?:[-*+]\s+)?command[ -]line(?:[ -]interface)?[ \t]*:\s*", prefix, re.I):
+            return False
         for match in DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.finditer(prefix):
             suffix = match.group("suffix")
             if DOCUMENTATION_ACTIONABLE_NETWORK_LABEL_SUFFIX_PATTERN.search(suffix) is not None:
@@ -2511,8 +2542,28 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_finding_tokens(finding: dict[str, Any]) -> tuple[bytes, ...]:
+    def _routine_span_contains(spans: Sequence[tuple[int, int]], position: int) -> bool:
+        preceding = bisect_right(spans, position, key=lambda span: span[0]) - 1
+        return preceding >= 0 and position < spans[preceding][1]
+
+    @classmethod
+    def _documentation_finding_tokens(
+        cls,
+        finding: dict[str, Any],
+        routine_spans: tuple[tuple[int, int], ...] = (),
+        check_later_domains: bool = False,
+    ) -> tuple[bytes, ...]:
         finding_type = finding.get("type")
+        if finding_type == "domain_name" and isinstance(position := finding.get("position"), int):
+            domain = finding.get("domain")
+            # A domain is emitted only once; generic prose can precede an active reference.
+            if (
+                isinstance(domain, str)
+                and domain
+                and (check_later_domains or cls._routine_span_contains(routine_spans, position))
+            ):
+                return (domain.encode().lower(),)
+
         if finding_type == "network_function":
             function = finding.get("function")
             return (function.encode().lower(),) if isinstance(function, str) and function else ()
@@ -2547,9 +2598,37 @@ class TextScanner(BaseScanner):
         return payload.find(token_bytes, start)
 
     @staticmethod
+    def _find_documentation_domain_token(payload: bytes, token_bytes: bytes, start: int) -> int:
+        while (position := payload.find(token_bytes, start)) >= 0:
+            end = position + len(token_bytes)
+            start = end
+            before = payload[max(0, position - 1) : position]
+            after = payload[end : end + 1]
+            if before.isalnum() or before in {b"_", b".", b"-"} or after.isalnum() or after in {b"_", b"-"}:
+                continue
+            # A trailing root dot is valid, but a following DNS label extends the host.
+            if after == b"." and payload[end + 1 : end + 2].isalnum():
+                continue
+            # A DNS-shaped username before a destination is not the host.
+            if after == b"@" or (
+                after == b":"
+                and DOCUMENTATION_URL_PASSWORD_SUFFIX.match(payload, end, end + MAX_TEXT_FINDING_CONTEXT_BYTES)
+            ):
+                continue
+            if before in {b"/", b"\\"}:
+                # A hostname can follow // (including a URL scheme) or a UNC prefix.
+                # A hostname-shaped path component is not the destination.
+                prefix = payload[max(0, position - 3) : position]
+                if not prefix.endswith((b"//", b"\\\\")) or (
+                    len(prefix) == 3 and prefix[:1] not in b": \t\r\n'\"=([{<"
+                ):
+                    continue
+            return position
+        return -1
+
+    @staticmethod
     def _find_documentation_port_token(payload: bytes, token_bytes: bytes, start: int) -> int:
-        match = re.compile(re.escape(token_bytes) + rb"(?![0-9])").search(payload, start)
-        return match.start() if match is not None else -1
+        return next(iter_port_token_positions(payload, token_bytes, start), -1)
 
     @classmethod
     def _retarget_documentation_finding(
@@ -2559,9 +2638,15 @@ class TextScanner(BaseScanner):
         finding: dict[str, Any],
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
+        routine_spans: tuple[tuple[int, int], ...] = (),
+        prohibited_terms: frozenset[int] = frozenset(),
+        sql_regions: Sequence[tuple[int, int]] = (),
+        active_policy_spans: Sequence[tuple[int, int]] = (),
     ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
-        token_bytes_options = cls._documentation_finding_tokens(finding)
+        token_bytes_options = cls._documentation_finding_tokens(
+            finding, routine_spans, bool(sql_regions or active_policy_spans)
+        )
         if not token_bytes_options:
             return finding, False, remaining_occurrences
 
@@ -2576,6 +2661,8 @@ class TextScanner(BaseScanner):
         find_token = cls._find_documentation_token
         if finding_type == "suspicious_port":
             find_token = cls._find_documentation_port_token
+        elif finding_type == "domain_name":
+            find_token = cls._find_documentation_domain_token
         next_positions = {
             token_bytes: find_token(lowered_payload, token_bytes, search_start) for token_bytes in token_bytes_options
         }
@@ -2602,10 +2689,21 @@ class TextScanner(BaseScanner):
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
             elif finding_type == "network_library":
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
+            elif finding_type == "domain_name":
+                # The detector emits only the first occurrence of a hostname.
+                actionable = cls._routine_span_contains(active_policy_spans, position) or (
+                    not cls._routine_span_contains(routine_spans, position)
+                    and (
+                        cls._routine_span_contains(sql_regions, position)
+                        or cls._documentation_finding_is_actionable(payload, candidate)
+                    )
+                )
             elif finding_type == "suspicious_port":
                 actionable = cls._documentation_finding_is_actionable(payload, candidate)
             else:
-                actionable = not cls._documentation_cc_finding_is_benign_prose(payload, candidate)
+                actionable = position not in prohibited_terms and not cls._documentation_cc_finding_is_benign_prose(
+                    payload, candidate
+                )
             if actionable:
                 candidate.pop("snippet", None)
                 return candidate, False, remaining_occurrences
@@ -2615,7 +2713,7 @@ class TextScanner(BaseScanner):
                     next_positions[option] = find_token(lowered_payload, option, search_start)
             if remaining_occurrences <= 0:
                 if allow_exhaustion_probe and not any(position >= search_start for position in next_positions.values()):
-                    return candidate, False, 0
+                    return (finding if finding_type == "domain_name" else candidate), False, 0
                 return {**finding, "position": None, "severity": "INFO"}, True, 0
 
     @classmethod
@@ -2719,6 +2817,10 @@ class TextScanner(BaseScanner):
         ):
             return False
         absolute_position = finding["position"]
+        for match in DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN.finditer(line):
+            if match.start() <= position < match.end():
+                phrase_start = absolute_position - position + match.start()
+                return cls._documentation_policy_reference_actionability(payload, phrase_start) is False
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         if context_end < len(payload):
             return False
@@ -3697,6 +3799,9 @@ class TextScanner(BaseScanner):
         ordered_items: list[tuple[str, int | tuple[int, int, str, str]]] = []
         standalone: dict[int, dict[str, Any]] = {}
         for index, finding in enumerate(findings):
+            finding = {**finding, "evidence_source": "documentation"}
+            if finding.get("type") == "url_detected" and isinstance(url := finding.get("url"), str):
+                finding["message"] = f"URL detected in documentation: {url[:100]}"
             evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences, line_lookup)
             if evidence is None:
                 ordered_items.append(("standalone", index))
@@ -3743,6 +3848,32 @@ class TextScanner(BaseScanner):
         return deduplicated
 
     @classmethod
+    def _documentation_policy_reference_actionability(cls, body: bytes, position: int) -> bool | None:
+        """Return None when the bounded context cannot establish how the reference is used."""
+        # A bullet match can start before the indentation of a multiline argument.
+        while position < len(body) and body[position] in b" \t":
+            position += 1
+        finding = {"position": position}
+        if cls._finding_line_prefix_is_truncated(body, finding):
+            # A folded paragraph can be longer than the code-context window.
+            # Only extend the lookback for unambiguous words and punctuation.
+            start = body.rfind(b"\n", max(0, position - MAX_DOCUMENTATION_CALL_CONTEXT_BYTES), position) + 1
+            if position - start > MAX_DOCUMENTATION_CALL_CONTEXT_BYTES or re.search(
+                rb"[^\w \t.,'-]|(?<![a-zA-Z])'|'(?![a-zA-Z])", body[start:position]
+            ):
+                return None
+        parts = cls._finding_line_parts(body, finding)
+        if parts is None:
+            return None
+        if (
+            cls._documentation_line_is_code_shaped(*parts)
+            or cls._documentation_multiline_literal_contains_position(body, position)
+            or cls._documentation_multiline_return_contains_position(body, position)
+        ):
+            return True
+        return cls._documentation_open_call_context_status(body, position)
+
+    @classmethod
     def _downgrade_sidecar_network_findings(
         cls,
         path: str,
@@ -3750,6 +3881,7 @@ class TextScanner(BaseScanner):
         findings: list[dict[str, Any]],
         *,
         allow_documentation_image_examples: bool = False,
+        payload_complete: bool = True,
     ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
@@ -3757,13 +3889,30 @@ class TextScanner(BaseScanner):
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         filename = os.path.basename(path).lower()
-        routine_url_spans = (
-            routine_documentation_url_spans(payload)
-            if findings
+        routine_network_spans: tuple[tuple[int, int], ...] = ()
+        sql_regions: list[tuple[int, int]] = []
+        active_policy_spans: list[tuple[int, int]] = []
+        prohibited_terms: frozenset[int] = frozenset()
+        if (
+            findings
             and os.path.splitext(filename)[1] in {"", ".md", ".markdown"}
             and (cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename))
-            else ()
-        )
+        ):
+            examples = routine_documentation_network_spans(
+                payload, payload_complete=payload_complete, sql_regions=sql_regions
+            )
+            if payload_complete:
+                try:
+                    references, active_policy_spans, prohibited_terms = model_card_policy_evidence(
+                        payload,
+                        DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN,
+                        cls._documentation_policy_reference_actionability,
+                    )
+                    examples = (*examples, *references)
+                except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
+                    classification_incomplete = True
+                    classification_limit_sources.add(error.limit_source)
+            routine_network_spans = tuple(sorted(examples))
         documentation_image_example_spans = (
             official_readme_urlopen_image_example_spans(payload)
             if allow_documentation_image_examples and documentation_sidecar and findings
@@ -3772,20 +3921,39 @@ class TextScanner(BaseScanner):
         lowered_payload = payload.lower() if documentation_sidecar else b""
         tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
         last_retargetable_index = max(
-            (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
+            (
+                index
+                for index, finding in enumerate(findings)
+                if cls._documentation_finding_tokens(
+                    finding, routine_network_spans, bool(sql_regions or active_policy_spans)
+                )
+            ),
             default=-1,
         )
         for index, finding in enumerate(findings):
             retarget_incomplete = False
             if documentation_sidecar:
                 try:
+                    original_position = finding.get("position")
                     finding, retarget_incomplete, remaining_occurrences = cls._retarget_documentation_finding(
                         payload,
                         lowered_payload,
                         finding,
                         remaining_occurrences,
                         index == last_retargetable_index,
+                        routine_network_spans,
+                        prohibited_terms,
+                        sql_regions,
+                        active_policy_spans,
                     )
+                    # The first occurrence was routine. Retargeting found an actionable use of the same host.
+                    if (
+                        finding.get("type") == "domain_name"
+                        and not retarget_incomplete
+                        and finding.get("position") != original_position
+                    ):
+                        classified_findings.append(finding)
+                        continue
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True
                     classification_limit_sources.add(error.limit_source)
@@ -3806,9 +3974,18 @@ class TextScanner(BaseScanner):
                     continue
                 finding = retargeted_finding
             position = finding.get("position")
+            # The decoded policy scalar can expose calls hidden by raw YAML escaping.
+            if (
+                isinstance(position, int)
+                and finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES
+                and cls._routine_span_contains(active_policy_spans, position)
+            ):
+                classified_findings.append(finding)
+                continue
             routine_example = (
                 isinstance(position, int)
-                and any(start <= position < end for start, end in routine_url_spans)
+                and cls._routine_span_contains(routine_network_spans, position)
+                and (payload_complete or finding.get("type") != "domain_name")
                 and (
                     cls._documentation_network_command_is_correlatable(finding)
                     or (
@@ -3820,6 +3997,7 @@ class TextScanner(BaseScanner):
             try:
                 if not retarget_incomplete and (
                     routine_example
+                    or (finding.get("type") == "cc_pattern" and position in prohibited_terms)
                     or cls._sidecar_network_finding_is_informational(
                         path,
                         payload,
@@ -4032,6 +4210,7 @@ class TextScanner(BaseScanner):
                         inspected_payload,
                         network_findings,
                         allow_documentation_image_examples=allow_documentation_image_examples,
+                        payload_complete=not truncated,
                     )
                 )
                 network_findings = self._deduplicate_documentation_network_findings(
