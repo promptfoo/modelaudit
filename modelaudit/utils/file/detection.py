@@ -4481,8 +4481,13 @@ def _classify_protocolless_binary_pickle_security_signal(
         for opcode, _arg, position in pickletools.genops(sample):
             opcode_count += 1
             opcode_name = opcode.name
-            if opcode_name == "PROTO" and opcode_count == 1:
-                return False
+            if opcode_count == 1:
+                if opcode_name == "PROTO":
+                    return False
+                # A stack-consuming data opcode cannot start a fresh load. For
+                # example, TUPLE in "torch" fails before the apparent OBJ.
+                if opcode.stack_before and opcode_name not in _BINARY_PICKLE_SECURITY_OPCODES:
+                    return False
             if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_OPCODES:
                 has_binary_opcode = True
             if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:

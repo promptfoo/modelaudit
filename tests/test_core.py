@@ -5734,8 +5734,23 @@ def test_scan_file_merges_safetensors_findings_after_zip_preflight_rejection(tmp
     assert result.success is False
 
 
-def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(tmp_path: Path) -> None:
-    disguised_pickle = tmp_path / "payload.jpg"
+@pytest.mark.parametrize("requirement", ["torch>=2.10.0", "torch==1.9.0"])
+def test_scan_file_does_not_route_requirements_as_pickle(tmp_path: Path, requirement: str) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{requirement}\ntransformers\n")
+
+    assert file_detection.detect_file_format(str(path)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(path)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(path)) == "unknown"
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+    assert result.success
+    assert result.scanner_name == "text"
+
+
+@pytest.mark.parametrize("filename", ["payload.jpg", "requirements.txt"])
+def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(tmp_path: Path, filename: str) -> None:
+    disguised_pickle = tmp_path / filename
     disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle())
 
     assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
