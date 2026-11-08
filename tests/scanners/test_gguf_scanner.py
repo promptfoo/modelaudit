@@ -1654,6 +1654,7 @@ _GGML_SINGLE_BLOCK_TENSOR_TYPES = [
     (40, "nvfp4", 64, 36),
     (41, "q1_0", 128, 18),
     (42, "q2_0", 64, 18),
+    (43, "f8_e4m3", 1, 1),
 ]
 _GGML_SINGLE_BLOCK_TENSOR_TYPE_IDS = [name for _type, name, _block, _size in _GGML_SINGLE_BLOCK_TENSOR_TYPES]
 
@@ -1877,7 +1878,7 @@ def test_gguf_retired_interleaved_row_groups_cannot_span_matrices(
     assert determine_exit_code(aggregate) == (0 if aligned else 1)
 
 
-@pytest.mark.parametrize("tensor_type", [4, 5, 36, 37, 38, 43, 142])
+@pytest.mark.parametrize("tensor_type", [4, 5, 36, 37, 38, 44, 142])
 def test_gguf_retired_and_foreign_tensor_types_stay_inconclusive(tmp_path: Path, tensor_type: int) -> None:
     path = tmp_path / f"type{tensor_type}.gguf"
     _write_gguf_with_tensor_type(path, tensor_type=tensor_type)

@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Recognize one-byte F8_E4M3 tensors in GGUF files and validate their payload bounds.
 - Avoid checkpoint routing errors on logs, JSON Lines datasets, tokenizer vocabularies, PCM audio, and native binaries. Keep inspecting possible serialized payloads in mixed-format files.
 - Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
