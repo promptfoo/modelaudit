@@ -9,6 +9,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,6 +20,7 @@ from modelaudit.cli import cli
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
+from modelaudit.scanners import gguf_scanner as gguf_scanner_module
 from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
@@ -32,6 +34,7 @@ from modelaudit.scanners.gguf_scanner import (
     GgufScanner,
     _with_container_owned_gguf_trailing,
 )
+from modelaudit.utils import _path_hardening
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_malicious_pickle, create_mock_gguf
@@ -2969,6 +2972,36 @@ def test_gguf_ggml_source_stability_fails_closed(
         tmp_path / "source-stability-cache",
         GGUF_SOURCE_CHANGED_REASON,
     )
+
+
+@pytest.mark.parametrize("format_name", ["ggml", "gguf"])
+@pytest.mark.parametrize(
+    ("os_name", "changed_view", "complete"),
+    [("nt", "path", True), ("nt", "handle", False), ("posix", "path", False), ("posix", "handle", False)],
+)
+def test_gguf_ggml_source_stability_ctime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format_name: str, os_name: str, changed_view: str, complete: bool
+) -> None:
+    path = tmp_path / f"model.{format_name}"
+    if format_name == "gguf":
+        path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+    else:
+        _write_ggml_file(path)
+    original = path.stat()
+    changed = os.stat_result(original, {"st_mtime_ns": original.st_mtime_ns, "st_ctime_ns": original.st_ctime_ns + 1})
+    handle_stats = iter([original, changed if changed_view == "handle" else original])
+    path_stat = changed if changed_view == "path" else original
+    scanner_os = SimpleNamespace(**vars(os))
+    scanner_os.name = os_name
+    scanner_os.fstat = lambda fd: next(handle_stats)
+    scanner_os.stat = lambda path: path_stat
+    monkeypatch.setattr(gguf_scanner_module, "os", scanner_os)
+    monkeypatch.setattr(_path_hardening, "os", scanner_os)
+
+    result = GgufScanner().scan(str(path))
+
+    assert result.success is complete
+    assert (GGUF_SOURCE_CHANGED_REASON in result.metadata.get("scan_outcome_reasons", [])) is (not complete)
 
 
 def test_ggml_polyglot_with_post_preflight_bad_zip_fails_closed(tmp_path: Path) -> None:

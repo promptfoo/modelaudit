@@ -107,6 +107,7 @@ from modelaudit.utils import (
     resolve_dvc_file_status,
     should_skip_file,
 )
+from modelaudit.utils._path_hardening import _file_stat_matches
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
@@ -2645,7 +2646,6 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
     Raises:
         Exception: If file cannot be hashed (security: prevents hash collision attacks)
     """
-    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
     path_stat_before = os.stat(file_path, follow_symlinks=False)
     if not stat.S_ISREG(path_stat_before.st_mode):
         raise OSError(f"Refusing to hash non-regular file: {file_path}")
@@ -2661,7 +2661,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
     try:
         with os.fdopen(descriptor, "rb", closefd=False) as source:
             opened_stat = os.fstat(source.fileno())
-            if any(getattr(path_stat_before, field) != getattr(opened_stat, field) for field in identity_fields):
+            if not _file_stat_matches(opened_stat, path_stat_before, cross_view=True):
                 raise OSError(f"File changed before hashing: {file_path}")
 
             hash_sha256 = hashlib.sha256()
@@ -2715,10 +2715,8 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
 
             final_stat = os.fstat(source.fileno())
             path_stat_after = os.stat(file_path, follow_symlinks=False)
-            if any(
-                getattr(opened_stat, field) != getattr(candidate, field)
-                for candidate in (final_stat, path_stat_after)
-                for field in identity_fields
+            if not _file_stat_matches(opened_stat, final_stat) or not _file_stat_matches(
+                path_stat_before, path_stat_after
             ):
                 raise OSError(f"File changed while hashing: {file_path}")
             return hash_sha256.hexdigest()
