@@ -7846,15 +7846,27 @@ impl<'a> ScanState<'a> {
             if called_global_keys.contains(&(symbol.clone(), position)) {
                 continue;
             }
+            let invoked = details
+                .iter()
+                .any(|(key, value)| key == "invoked" && matches!(value, DetailValue::Bool(true)));
+            let (message, why) = if invoked {
+                (
+                    format!("Found non-allowlisted global used by a pickle invocation: {symbol}"),
+                    "Resolving the global can run module initialization code. Using it during object reconstruction can run additional code.",
+                )
+            } else {
+                (
+                    format!("Found non-allowlisted import-only global reference: {symbol}"),
+                    "Unpickling import-only GLOBAL opcodes imports the referenced module, so non-allowlisted custom modules can execute import-time initialization code.",
+                )
+            };
             self.add_finding(Finding {
-                message: format!("Found non-allowlisted import-only global reference: {symbol}"),
+                message,
                 severity: "warning",
                 location: Some(format!("{} (pos {})", self.source, position)),
                 rule_code: Some("NON_ALLOWLISTED_GLOBAL"),
                 details,
-                why: Some(
-                    "Unpickling import-only GLOBAL opcodes imports the referenced module, so non-allowlisted custom modules can execute import-time initialization code.",
-                ),
+                why: Some(why),
             });
         }
         if called_global_keys.is_empty() {
