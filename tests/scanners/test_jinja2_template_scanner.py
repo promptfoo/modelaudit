@@ -552,6 +552,39 @@ model:
         failed_checks = [c for c in result.checks if c.status == CheckStatus.FAILED]
         assert len(failed_checks) > 0
 
+    @pytest.mark.parametrize("has_payload", [False, True])
+    def test_safe_loader_rejection_preserves_incomplete_coverage_and_raw_fallback(
+        self, tmp_path: Path, has_payload: bool
+    ) -> None:
+        pytest.importorskip("yaml")
+        yaml_file = tmp_path / "config.yaml"
+        content = "device: !device [cpu]\n"
+        if has_payload:
+            content += "chat_template: \"{{ lipsum.__globals__.os.popen('id') }}\"\n"
+        yaml_file.write_text(content, encoding="utf-8")
+
+        result = Jinja2TemplateScanner().scan(str(yaml_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_yaml_construct_failed" in result.metadata["scan_outcome_reasons"]
+        parse_check = next(check for check in result.checks if check.name == "Template Config Parsing")
+        assert parse_check.status == CheckStatus.FAILED
+        assert parse_check.details["exception_type"] == "ConstructorError"
+        assert "safe loader" in parse_check.message
+        assert all("malformed" not in check.message for check in result.checks)
+        if has_payload:
+            assert any(
+                check.name == "Jinja2 Template Injection Detection"
+                and check.details.get("template_location") == "raw_yaml_parse_fallback"
+                and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+                for check in result.checks
+            )
+        else:
+            assert result.success is False
+
+        aggregate = scan_model_directory_or_file(str(yaml_file), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == (1 if has_payload else 2)
+
     def test_missing_yaml_dependency_uses_raw_fallback_and_marks_inconclusive(
         self,
         tmp_path: Path,

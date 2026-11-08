@@ -115,6 +115,7 @@ from tests.helpers.file_creators import (
     download_payload_fixture,
     malicious_pickle_bytes,
     valid_jpeg_bytes,
+    valid_pcm_wave_bytes,
     valid_png_bytes,
 )
 from tests.helpers.file_creators import (
@@ -2278,7 +2279,9 @@ class TestModelDownload:
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors", "payload.jpg"]
         assert detect_file_format_for_skip_filter(str(download_path / "payload.jpg")) == "rknn"
 
-    @_mock_content_routed_snapshot({".safetensors"}, ["model.safetensors", "preview.png", "preview.jpg"])
+    @_mock_content_routed_snapshot(
+        {".safetensors"}, ["model.safetensors", "preview.png", "preview.jpg", "preview.wav", "wave-pickle.wav"]
+    )
     def test_download_model_excludes_valid_media_from_content_routing(
         self,
         mock_snapshot_download: MagicMock,
@@ -2290,15 +2293,19 @@ class TestModelDownload:
         download_path = tmp_path / "download"
         download_path.mkdir()
         (download_path / "model.safetensors").write_bytes(b"weights")
+        wave_pickle = valid_pcm_wave_bytes() + malicious_pickle_bytes()
+        (download_path / "wave-pickle.wav").write_bytes(wave_pickle)
         mock_snapshot_download.return_value = str(download_path)
         mock_requests_get.side_effect = [
             _FakeRangeResponse(valid_png_bytes()),
             _FakeRangeResponse(valid_jpeg_bytes()),
+            _FakeRangeResponse(valid_pcm_wave_bytes()),
+            _FakeRangeResponse(wave_pickle),
         ]
 
         download_model("https://huggingface.co/test/model")
 
-        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors"]
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors", "wave-pickle.wav"]
 
     @_mock_content_routed_snapshot({".safetensors"}, ["model.safetensors", "payload.png"])
     def test_download_model_includes_media_pickle_polyglot(

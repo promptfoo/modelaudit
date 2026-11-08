@@ -2858,6 +2858,7 @@ def _detect_huggingface_content_route_format(
         _could_start_bounded_media_route,
         _could_start_proto0_or_1_pickle,
         _detect_bounded_media_route_from_edges,
+        _detect_pcm_wave_route,
         _is_cntk_signature,
         _is_content_routed_lightgbm_signature,
         _looks_like_proto0_or_1_pickle,
@@ -2916,6 +2917,16 @@ def _detect_huggingface_content_route_format(
     mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, revision, budget, prefix)
     if mxnet_route is not None:
         return mxnet_route
+
+    if remote_path.suffix.lower() == ".wav":
+        wave_route = _detect_pcm_wave_route(
+            prefix,
+            budget.file_sizes.get(filename),
+            lambda offset, size: _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, size),
+        )
+        if wave_route is not None:
+            flax_route = _detect_huggingface_flax_msgpack_route(repo_id, filename, revision, budget, prefix)
+            return flax_route or wave_route
 
     if remote_path.suffix.lower() in _MEDIA_ROUTING_SUFFIXES:
         media_route = _detect_huggingface_media_route(repo_id, filename, revision, budget, prefix)
