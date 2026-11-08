@@ -362,7 +362,6 @@ class MLContext:
 
     def __init__(self):
         self.is_tokenizer = False
-        self.is_chat_template = False
         self.framework = None  # 'huggingface', 'pytorch', 'tensorflow', etc.
         self.model_type = None  # 'text-generation', 'vision', etc.
         self.file_type = None  # 'gguf', 'json', 'yaml', 'template'
@@ -590,8 +589,6 @@ class Jinja2TemplateScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
         context = self._determine_context(path)
-        if any("chat_template" in template_location.lower() for template_location in templates):
-            context.is_chat_template = True
         result.metadata["ml_context"] = {
             "framework": context.framework,
             "file_type": context.file_type,
@@ -829,7 +826,6 @@ class Jinja2TemplateScanner(BaseScanner):
             context.confidence += 1
         elif ext in [".jinja", ".j2", ".template"]:
             context.file_type = "template"
-            context.is_chat_template = True
             context.confidence += 1
 
         # Framework detection from path
@@ -1596,9 +1592,6 @@ class Jinja2TemplateScanner(BaseScanner):
     def _is_common_ml_pattern(self, match_text: str, context: MLContext) -> bool:
         """Check if match is a common, benign ML pattern"""
         match_lower = match_text.lower()
-        if context.is_chat_template and match_lower.startswith("{% macro "):
-            return True
-
         if not context.framework:
             return False
 

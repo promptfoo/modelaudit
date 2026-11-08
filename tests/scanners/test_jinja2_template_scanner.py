@@ -1,6 +1,7 @@
 """Tests for Jinja2TemplateScanner covering CVE-2024-34359 and SSTI detection."""
 
 import json
+import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 
 from modelaudit.config.rule_config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 from modelaudit.scanners import jinja2_template_scanner
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
@@ -76,6 +78,12 @@ def test_directory_scan_preserves_path_sensitive_yaml_routing(tmp_path: Path) ->
     assert determine_exit_code(result) == 1
     assert any(issue.location and str(model_file) in issue.location for issue in result.issues)
     assert not any(issue.location and str(misc_file) in issue.location for issue in result.issues)
+
+
+def test_jinja_ssti_patterns_do_not_match_empty_input() -> None:
+    for patterns in JINJA2_SSTI_PATTERNS.values():
+        for pattern in patterns:
+            assert re.search(pattern, "", re.IGNORECASE | re.MULTILINE) is None, pattern
 
 
 def test_jinja_scanner_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
