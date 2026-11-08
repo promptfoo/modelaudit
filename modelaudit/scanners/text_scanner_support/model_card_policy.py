@@ -1,6 +1,7 @@
 """Locate passive references in a model card's displayed license and attribution."""
 
 import re
+from collections.abc import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from .documentation_examples import MAX_DOCUMENTATION_BYTES, _plain_url
@@ -112,7 +113,7 @@ def _same_displayed_destination(label: bytes, target: bytes) -> bool:
 
 
 def model_card_policy_evidence(
-    payload: bytes, harmful_claim: re.Pattern[bytes]
+    payload: bytes, harmful_claim: re.Pattern[bytes], is_passive: Callable[[bytes, int], bool]
 ) -> tuple[list[tuple[int, int]], frozenset[int]]:
     if len(payload) > MAX_DOCUMENTATION_BYTES:
         return [], frozenset()
@@ -134,12 +135,13 @@ def model_card_policy_evidence(
         if match["site"] and not _plain_url("https://" + match["site"].decode("ascii")):
             continue
         left, right = match.span("site" if match["site"] else "domain")
-        spans.append((start + left, start + right))
+        if is_passive(body, match.start()):
+            spans.append((start + left, start + right))
     for match in _PLAIN_REFERENCE.finditer(body):
-        if _plain_url(match["url"].decode("ascii")):
+        if _plain_url(match["url"].decode("ascii")) and is_passive(body, match.start()):
             spans.append((start + match.start("url"), start + match.end("url")))
     for match in _LINK.finditer(body):
-        if _same_displayed_destination(match["label"], match["target"]):
+        if _same_displayed_destination(match["label"], match["target"]) and is_passive(body, match.start()):
             spans.append((start + match.start("label"), start + match.end("target")))
     positions: set[int] = set()
     for heading in _PROHIBITED.finditer(body):

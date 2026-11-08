@@ -959,7 +959,9 @@ def _sql_comparison_domain_spans(source: bytes) -> list[tuple[int, int]]:
     return spans
 
 
-def _routine_documentation_network_spans(payload: bytes, *, payload_complete: bool) -> tuple[tuple[int, int], ...]:
+def _routine_documentation_network_spans(
+    payload: bytes, *, payload_complete: bool, sql_regions: list[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
     opening: re.Match[bytes] | None = None
     executes_script = False
@@ -981,6 +983,8 @@ def _routine_documentation_network_spans(payload: bytes, *, payload_complete: bo
         start, end = opening.end() + 1, match.start()
         info = opening.group("language").lower().split()
         language = info[0] if info else b""
+        if language == b"sql":
+            sql_regions.append((start, end))
         if (
             end - start <= MAX_EXAMPLE_BYTES
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
@@ -1005,6 +1009,8 @@ def _routine_documentation_network_spans(payload: bytes, *, payload_complete: bo
         previous_end = match.end()
         opening = None
     if opening is not None:
+        if opening.group("language").lower().split()[:1] == [b"sql"]:
+            sql_regions.append((opening.end() + 1, len(payload)))
         executes_script = True
     else:
         outside_fences.append((previous_end, len(payload)))
@@ -1070,20 +1076,25 @@ def _without_markdown_container_prefixes(payload: bytes) -> tuple[bytes, list[tu
 
 
 def routine_documentation_network_spans(
-    payload: bytes, *, payload_complete: bool = True
+    payload: bytes, *, payload_complete: bool = True, sql_regions: list[tuple[int, int]] | None = None
 ) -> tuple[tuple[int, int], ...]:
-    """Return original network reference spans only after bounded Markdown example analysis."""
+    """Return routine reference spans and optionally collect SQL fence regions in original byte offsets."""
     if len(payload) > MAX_DOCUMENTATION_BYTES:
         return ()
     result = _without_markdown_container_prefixes(payload)
     if result is None:
         return ()
     normalized, removals = result
-    spans = _routine_documentation_network_spans(normalized, payload_complete=payload_complete)
+    normalized_sql: list[tuple[int, int]] = []
+    spans = _routine_documentation_network_spans(
+        normalized, payload_complete=payload_complete, sql_regions=normalized_sql
+    )
     starts = [start for start, _removed in removals]
 
     def original(position: int) -> int:
         index = bisect_right(starts, position) - 1
         return position + (removals[index][1] if index >= 0 else 0)
 
+    if sql_regions is not None:
+        sql_regions.extend((original(start), original(end)) for start, end in normalized_sql)
     return tuple((original(start), original(end)) for start, end in spans)

@@ -4445,6 +4445,32 @@ def test_gating_policy_links_and_reporting_address_are_passive_references(
     )
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        '|\n  client.fetch("policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])',
+        '|\n  endpoint = "policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1]',
+        '|\n  client.fetch(\n    "policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])',
+        json.dumps('Policy.\nclient.fetch("policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])'),
+        '|\n  client.fetch("guidelines (currently available at https://publisher.dev/model)".split()[-1][:-1])',
+    ],
+    ids=["enclosing-call", "assignment", "multiline-call", "escaped-call", "parenthesized-reference"],
+)
+def test_gating_policy_keeps_active_reference_offsets(tmp_path: Path, field: str) -> None:
+    path = tmp_path / "README.md"
+    content = f"---\nextra_gated_prompt: {field}\n---\n".encode()
+    path.write_bytes(content)
+    checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
+    active = {
+        (detail["type"], detail["position"])
+        for check in checks
+        for detail in [check.details, *check.details.get("deduplicated_related_findings", [])]
+        if detail.get("severity") in {"MEDIUM", "HIGH", "CRITICAL"}
+    }
+    assert ("url_detected", content.index(b"https://publisher.dev/model")) in active
+    assert ("domain_name", content.index(b"publisher.dev")) in active
+
+
 def test_gating_policy_reports_multiline_feedback_and_security_references(tmp_path: Path) -> None:
     content = (
         b"---\nextra_gated_prompt: >-\n  See the project.cpp(#239) release.\n"
@@ -6467,7 +6493,7 @@ def test_documented_sql_like_domains_are_informational(tmp_path: Path) -> None:
         "NULLIF(SUM(CASE WHEN email NOT ILIKE '%@example.net%' THEN 1 ELSE 0 END), 0) AS ratio\n"
         "FROM contacts;\n"
     )
-    result = _scan_text_content(path, f"~~~sql\n{sql}~~~\n")
+    result = _scan_text_content(path, f"~~~sql\n{sql}~~~\n\nThe examples use example.net.\n")
     checks = _failed_network_detection_checks(result)
     assert any(
         check.details.get("domain") == "example.net" and check.severity == IssueSeverity.INFO for check in checks
@@ -6543,6 +6569,9 @@ def test_documented_sql_domain_is_distinct_from_active_hostnames(tmp_path: Path,
     "use",
     [
         "dblink('host=example.net', 'SELECT 1');\n~~~",
+        "1;\nSELECT dblink('host=example.net', 'SELECT 1');\n~~~",
+        "1;\nSELECT custom_function('example.net');\n~~~",
+        "1;\n~~~\n~~~sql\nSELECT custom_function('example.net');\n~~~",
         "http_get('https://example.net');\n~~~",
         "1;\n~~~\n~~~python\nrequests.get('https://example.net:8443/v1')\n~~~",
         "1;\n~~~\n~~~python\nrequests.get('https://some@example.net:8443/v1')\n~~~",

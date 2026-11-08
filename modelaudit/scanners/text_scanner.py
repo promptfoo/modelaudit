@@ -10,7 +10,7 @@ import token
 import tokenize
 from array import array
 from bisect import bisect_right
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, ClassVar
@@ -2532,7 +2532,7 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _routine_span_contains(spans: tuple[tuple[int, int], ...], position: int) -> bool:
+    def _routine_span_contains(spans: Sequence[tuple[int, int]], position: int) -> bool:
         preceding = bisect_right(spans, position, key=lambda span: span[0]) - 1
         return preceding >= 0 and position < spans[preceding][1]
 
@@ -2623,6 +2623,7 @@ class TextScanner(BaseScanner):
         allow_exhaustion_probe: bool,
         routine_spans: tuple[tuple[int, int], ...] = (),
         prohibited_terms: frozenset[int] = frozenset(),
+        sql_regions: Sequence[tuple[int, int]] = (),
     ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
         token_bytes_options = cls._documentation_finding_tokens(finding, routine_spans)
@@ -2670,9 +2671,10 @@ class TextScanner(BaseScanner):
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
             elif finding_type == "domain_name":
                 # The detector emits only the first occurrence of a hostname.
-                actionable = not cls._routine_span_contains(
-                    routine_spans, position
-                ) and cls._documentation_finding_is_actionable(payload, candidate)
+                actionable = not cls._routine_span_contains(routine_spans, position) and (
+                    cls._routine_span_contains(sql_regions, position)
+                    or cls._documentation_finding_is_actionable(payload, candidate)
+                )
             elif finding_type == "suspicious_port":
                 actionable = cls._documentation_finding_is_actionable(payload, candidate)
             else:
@@ -2688,7 +2690,7 @@ class TextScanner(BaseScanner):
                     next_positions[option] = find_token(lowered_payload, option, search_start)
             if remaining_occurrences <= 0:
                 if allow_exhaustion_probe and not any(position >= search_start for position in next_positions.values()):
-                    return candidate, False, 0
+                    return (finding if finding_type == "domain_name" else candidate), False, 0
                 return {**finding, "position": None, "severity": "INFO"}, True, 0
 
     @classmethod
@@ -3824,6 +3826,26 @@ class TextScanner(BaseScanner):
         return deduplicated
 
     @classmethod
+    def _documentation_policy_reference_is_passive(cls, body: bytes, position: int) -> bool:
+        finding = {"position": position}
+        if cls._finding_line_prefix_is_truncated(body, finding):
+            # A folded paragraph can be longer than the code-context window.
+            # Only extend the lookback for unambiguous words and punctuation.
+            start = body.rfind(b"\n", max(0, position - MAX_DOCUMENTATION_CALL_CONTEXT_BYTES), position) + 1
+            if position - start > MAX_DOCUMENTATION_CALL_CONTEXT_BYTES or re.search(
+                rb"[^\w \t.,'-]|(?<![a-zA-Z])'|'(?![a-zA-Z])", body[start:position]
+            ):
+                return False
+        parts = cls._finding_line_parts(body, finding)
+        return (
+            parts is not None
+            and not cls._documentation_line_is_code_shaped(*parts)
+            and cls._documentation_open_call_context_status(body, position) is False
+            and not cls._documentation_multiline_literal_contains_position(body, position)
+            and not cls._documentation_multiline_return_contains_position(body, position)
+        )
+
+    @classmethod
     def _downgrade_sidecar_network_findings(
         cls,
         path: str,
@@ -3840,18 +3862,27 @@ class TextScanner(BaseScanner):
         documentation_sidecar = cls._is_documentation_sidecar(path)
         filename = os.path.basename(path).lower()
         routine_network_spans: tuple[tuple[int, int], ...] = ()
+        sql_regions: list[tuple[int, int]] = []
         prohibited_terms: frozenset[int] = frozenset()
         if (
             findings
             and os.path.splitext(filename)[1] in {"", ".md", ".markdown"}
             and (cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename))
         ):
-            examples = routine_documentation_network_spans(payload, payload_complete=payload_complete)
+            examples = routine_documentation_network_spans(
+                payload, payload_complete=payload_complete, sql_regions=sql_regions
+            )
             if payload_complete:
-                references, prohibited_terms = model_card_policy_evidence(
-                    payload, DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN
-                )
-                examples = (*examples, *references)
+                try:
+                    references, prohibited_terms = model_card_policy_evidence(
+                        payload,
+                        DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN,
+                        cls._documentation_policy_reference_is_passive,
+                    )
+                    examples = (*examples, *references)
+                except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
+                    classification_incomplete = True
+                    classification_limit_sources.add(error.limit_source)
             routine_network_spans = tuple(sorted(examples))
         documentation_image_example_spans = (
             official_readme_urlopen_image_example_spans(payload)
@@ -3872,6 +3903,7 @@ class TextScanner(BaseScanner):
             retarget_incomplete = False
             if documentation_sidecar:
                 try:
+                    original_position = finding.get("position")
                     finding, retarget_incomplete, remaining_occurrences = cls._retarget_documentation_finding(
                         payload,
                         lowered_payload,
@@ -3880,7 +3912,16 @@ class TextScanner(BaseScanner):
                         index == last_retargetable_index,
                         routine_network_spans,
                         prohibited_terms,
+                        sql_regions,
                     )
+                    # The first occurrence was routine. Retargeting found an actionable use of the same host.
+                    if (
+                        finding.get("type") == "domain_name"
+                        and not retarget_incomplete
+                        and finding.get("position") != original_position
+                    ):
+                        classified_findings.append(finding)
+                        continue
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True
                     classification_limit_sources.add(error.limit_source)
