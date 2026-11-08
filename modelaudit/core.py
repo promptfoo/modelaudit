@@ -145,12 +145,15 @@ from modelaudit.utils.file.detection import (
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
+    _SAFETENSORS_SHARD_PATTERN,
     _SHARD_ALREADY_PINNED_CONFIG_KEY,
     MAX_RECORDED_MISSING_SHARD_INDICES,
     ShardedModelDetector,
     ValidatedShardTargets,
     _pinned_shard_scan_path,
     _ShardPinUnavailableError,
+    _summarize_missing_shard_indices,
+    _zero_based_safetensors_manifest,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -1242,6 +1245,12 @@ def _snapshot_validated_shard_target(
         )
         if trusted_family_group:
             target["family_group"] = trusted_family_group
+    if shard_match.get("pattern") == _SAFETENSORS_SHARD_PATTERN:
+        expected_total = shard_match.get("expected_total_shards")
+        if isinstance(expected_total, int):
+            manifest = _zero_based_safetensors_manifest(source.parent, [str(source)], expected_total)
+            if manifest is not None:
+                target["zero_based_manifest_sha256"] = manifest
     return {str(source.absolute()): target}
 
 
@@ -1545,7 +1554,10 @@ def _validated_shard_family_scopes(
     return scopes
 
 
-def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTargets) -> set[str]:
+def _complete_validated_shard_family_sources(
+    validated_targets: ValidatedShardTargets,
+    partial_coverage: dict[str, tuple[list[int], int, bool]] | None = None,
+) -> set[str]:
     """Return source paths belonging to complete, uniquely targeted shard families."""
     grouped_targets: dict[
         tuple[str, int, str],
@@ -1558,25 +1570,27 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
         pattern = shard_match.get("pattern")
         shard_index = shard_match.get("current_shard_index")
         expected_total = shard_match.get("expected_total_shards")
+        manifest = target.get("zero_based_manifest_sha256")
+        first_index = 0 if isinstance(manifest, str) else 1
         if (
             not isinstance(pattern, str)
             or not isinstance(shard_index, int)
             or not isinstance(expected_total, int)
-            or expected_total <= 1
-            or not 1 <= shard_index <= expected_total
+            or expected_total < 1
+            or not first_index <= shard_index < first_index + expected_total
         ):
             continue
         for family_scope in _validated_shard_family_scopes(source_path, target):
+            if isinstance(manifest, str):
+                family_scope = f"{family_scope}:zero-based:{manifest}"
             grouped_targets.setdefault((pattern, expected_total, family_scope), {}).setdefault(shard_index, []).append(
                 (source_path, target)
             )
 
     complete_sources: set[str] = set()
-    for (_pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
-        # Indices are already bounded to [1, expected_total], so matching the
-        # expected cardinality proves the complete range without materializing
-        # an attacker-controlled range.
-        if len(targets_by_index) != expected_total:
+    for (_pattern, expected_total, family_scope), targets_by_index in grouped_targets.items():
+        complete = len(targets_by_index) == expected_total
+        if not complete and partial_coverage is None:
             continue
         if any(len(records) != 1 for records in targets_by_index.values()):
             continue
@@ -1630,9 +1644,18 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
         if duplicate_target:
             continue
 
-        complete_sources.update(
-            os.path.normcase(os.path.normpath(os.path.abspath(source_path))) for source_path, _target in records
-        )
+        sources = [os.path.normcase(os.path.normpath(os.path.abspath(path))) for path, _target in records]
+        if complete:
+            complete_sources.update(sources)
+        elif partial_coverage is not None and (
+            family_scope.startswith("remote-directory:") or records[0][1].get("zero_based_manifest_sha256")
+        ):
+            missing = _summarize_missing_shard_indices(
+                set(targets_by_index),
+                expected_total,
+                first_index=0 if records[0][1].get("zero_based_manifest_sha256") else 1,
+            )
+            partial_coverage.update(dict.fromkeys(sources, missing))
     return complete_sources
 
 
@@ -1789,7 +1812,28 @@ def _reconcile_cross_directory_shard_coverage(
     missing_shard_errors_only: bool = False,
 ) -> bool:
     """Remove missing-shard outcomes, clearing errors only with explicit ownership proof."""
-    complete_sources = _complete_validated_shard_family_sources(validated_targets)
+    partial_coverage: dict[str, tuple[list[int], int, bool]] = {}
+    complete_sources = _complete_validated_shard_family_sources(validated_targets, partial_coverage)
+    if partial_coverage:
+        records: Iterable[Check | Issue] = itertools.chain(results.checks, results.issues)
+        for record in records:
+            details = record.details
+            if (
+                not record.location
+                or not isinstance(details, dict)
+                or details.get("scan_outcome_reason") != "missing_model_shards"
+            ):
+                continue
+            path = os.path.normcase(os.path.normpath(os.path.abspath(record.location)))
+            if path in partial_coverage and path not in complete_sources:
+                indices, count, truncated = partial_coverage[path]
+                details.update(
+                    missing_shard_indices=indices,
+                    missing_shard_count=count,
+                    missing_shard_indices_truncated=truncated,
+                    present_total_shards=details["expected_total_shards"] - count,
+                )
+                record.message = f"Missing {count} expected model shard(s); scan coverage is incomplete."
     if not complete_sources:
         return False
 
@@ -7432,6 +7476,7 @@ def scan_model_streaming(
             pretransferred_bytes = 0
             reported_source_path: str | None = None
             huggingface_shard_source: str | None = None
+            materialized_shard_details: dict[str, Any] | None = None
             if len(streamed_item) == 4:
                 file_path, _is_last, precomputed_result, byte_accounting = streamed_item
                 if not isinstance(byte_accounting, StreamedSourceByteAccounting):
@@ -7440,6 +7485,7 @@ def scan_model_streaming(
                 source_bytes_preaccounted = byte_accounting.source_bytes_preaccounted
                 reported_source_path = byte_accounting.source_path
                 huggingface_shard_source = byte_accounting.huggingface_shard_source
+                materialized_shard_details = byte_accounting.materialized_shard_details
             elif len(streamed_item) == 3:
                 file_path, _is_last, precomputed_result = streamed_item
             elif len(streamed_item) == 2:
@@ -7880,6 +7926,10 @@ def scan_model_streaming(
                         str(openvino_scan_companion_path),
                         config=scan_config,
                     )
+                if materialized_shard_details is not None and huggingface_shard_source is not None:
+                    from modelaudit.utils.sources.huggingface import _record_remote_shard_coverage
+
+                    _record_remote_shard_coverage(scan_result, huggingface_shard_source, materialized_shard_details)
                 if pre_scan_shard_target:
                     _ensure_streamed_shard_coverage_placeholder(scan_result, source_path)
 
@@ -7929,6 +7979,7 @@ def scan_model_streaming(
                                 "mtime_ns",
                                 "nlink",
                                 "family_group",
+                                "zero_based_manifest_sha256",
                             )
                         )
                     if stable_while_scanning and stable_after_unpinning:

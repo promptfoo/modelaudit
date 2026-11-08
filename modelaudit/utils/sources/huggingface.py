@@ -25,7 +25,7 @@ from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePath, PurePosixPath
-from typing import Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from modelaudit._size_format import _format_size_scaled as _format_size
@@ -47,6 +47,9 @@ from .huggingface_paths import (
     parse_huggingface_url,
     parse_huggingface_url_with_revision,
 )
+
+if TYPE_CHECKING:
+    from ...scanner_results import ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -809,6 +812,44 @@ def _mark_remote_safetensors_overlap_incomplete(
     result.finish(success=False)
 
 
+def _record_remote_shard_coverage(result: "ScanResult", source_path: str, shard_details: dict[str, Any]) -> None:
+    from ...scanners.base import IssueSeverity
+
+    evaluated_shard_details = dict(shard_details)
+    expected_tensor_digest = evaluated_shard_details.get("index_tensor_names_digest")
+    actual_tensor_digest = result.metadata.get("tensor_names_digest")
+    if (
+        evaluated_shard_details.get("index_referenced_by_manifest")
+        and isinstance(expected_tensor_digest, str)
+        and expected_tensor_digest != actual_tensor_digest
+    ):
+        evaluated_shard_details.update(complete=False, index_complete=False)
+        if isinstance(actual_tensor_digest, str):
+            evaluated_shard_details["index_incomplete_reason"] = "index_tensor_assignment_mismatch"
+            evaluated_shard_details["message"] = (
+                "Remote SafeTensors index tensor assignments do not match the shard header."
+            )
+        elif not evaluated_shard_details.get("index_incomplete_reason"):
+            evaluated_shard_details["index_incomplete_reason"] = "shard_tensor_names_digest_unavailable"
+            evaluated_shard_details["message"] = (
+                "Could not verify remote SafeTensors index tensor assignments against the shard header."
+            )
+    result.metadata["remote_shard_family"] = evaluated_shard_details
+    result.add_check(
+        name="Hugging Face SafeTensors Shard Coverage",
+        passed=bool(evaluated_shard_details.get("complete")),
+        message=str(evaluated_shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
+        severity=None if evaluated_shard_details.get("complete") else IssueSeverity.INFO,
+        location=source_path,
+        details=evaluated_shard_details,
+    )
+    if not evaluated_shard_details.get("complete"):
+        from ...scanner_results import mark_inconclusive_scan_result
+
+        mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
+        result.finish(success=False)
+
+
 def _scan_remote_huggingface_safetensors_header(
     repo_id: str,
     filename: str,
@@ -1094,41 +1135,7 @@ def _scan_remote_huggingface_safetensors_header(
                 }
             )
             if shard_details is not None:
-                from ...scanners.base import IssueSeverity
-
-                evaluated_shard_details = dict(shard_details)
-                expected_tensor_digest = evaluated_shard_details.get("index_tensor_names_digest")
-                actual_tensor_digest = result.metadata.get("tensor_names_digest")
-                if (
-                    evaluated_shard_details.get("index_referenced_by_manifest")
-                    and isinstance(expected_tensor_digest, str)
-                    and expected_tensor_digest != actual_tensor_digest
-                ):
-                    evaluated_shard_details.update(complete=False, index_complete=False)
-                    if isinstance(actual_tensor_digest, str):
-                        evaluated_shard_details["index_incomplete_reason"] = "index_tensor_assignment_mismatch"
-                        evaluated_shard_details["message"] = (
-                            "Remote SafeTensors index tensor assignments do not match the shard header."
-                        )
-                    elif not evaluated_shard_details.get("index_incomplete_reason"):
-                        evaluated_shard_details["index_incomplete_reason"] = "shard_tensor_names_digest_unavailable"
-                        evaluated_shard_details["message"] = (
-                            "Could not verify remote SafeTensors index tensor assignments against the shard header."
-                        )
-                result.metadata["remote_shard_family"] = evaluated_shard_details
-                result.add_check(
-                    name="Hugging Face SafeTensors Shard Coverage",
-                    passed=bool(evaluated_shard_details.get("complete")),
-                    message=str(evaluated_shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
-                    severity=None if evaluated_shard_details.get("complete") else IssueSeverity.INFO,
-                    location=source_path,
-                    details=evaluated_shard_details,
-                )
-                if not evaluated_shard_details.get("complete"):
-                    from ...scanner_results import mark_inconclusive_scan_result
-
-                    mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
-                    result.finish(success=False)
+                _record_remote_shard_coverage(result, source_path, shard_details)
             if overlap_scanner_ids:
                 result.metadata["remote_overlap_scanner_ids"] = overlap_scanner_ids
                 _mark_remote_safetensors_overlap_incomplete(
@@ -1230,18 +1237,14 @@ def _remote_safetensors_filename_shard_details_by_file(
             "unselected_shards": unselected[:20],
             "unselected_shards_truncated": len(unselected) > 20,
         }
-        materialized_count = sum(name in selected and name not in header_files for name in present_filenames)
-        if materialized_count:
-            group_details["materialized_shard_count"] = materialized_count
-        mixed_complete = complete and 0 < materialized_count < len(present_filenames)
-        for filename in present_filenames:
-            if filename in header_files:
-                details_by_file[filename] = dict(group_details)
-            elif mixed_complete:
-                details_by_file[filename] = {
-                    "materialized_shard_count": materialized_count,
-                    "filename_pattern_complete": True,
-                }
+        selected_members = selected.intersection(present_filenames)
+        ranged_members = header_files.intersection(present_filenames)
+        if not ranged_members:
+            continue
+        if len(ranged_members) < len(selected_members):
+            group_details["planned_materialized_shard_count"] = len(selected_members) - len(ranged_members)
+        for filename in selected_members:
+            details_by_file[filename] = dict(group_details)
     return details_by_file
 
 
@@ -1809,8 +1812,6 @@ def _combine_remote_safetensors_shard_details(
 
         combined = dict(filename_detail)
         combined.update(index_detail)
-        if filename_detail.get("materialized_shard_count"):
-            combined["index_selection_scope"] = "range_scanned_headers"
         filename_complete = bool(filename_detail.get("complete"))
         filename_pattern_authoritative = bool(filename_detail.get("filename_pattern_authoritative", True))
         index_complete = bool(index_detail.get("complete"))
@@ -1844,7 +1845,7 @@ def _remote_safetensors_shard_details_by_file(
     )
     index_details, index_bytes, acquired_index_bytes, unscoped_failures = _remote_safetensors_index_details_by_file(
         repo_id,
-        model_files,
+        sorted(set(model_files).union(filename_details)),
         repo_files,
         revision,
         path_sizes,
@@ -5884,8 +5885,11 @@ def download_model_streaming(
                 ),
                 huggingface_shard_source=(
                     f"hf://{repo_id}@{download_revision}/{filename}"
-                    if shard_details.get("filename_pattern_complete") and shard_details.get("materialized_shard_count")
+                    if shard_details.get("planned_materialized_shard_count")
                     else None
+                ),
+                materialized_shard_details=(
+                    shard_details if precomputed_result is None and shard_details.get("index_manifest") else None
                 ),
             )
             pending_pretransferred_bytes = 0

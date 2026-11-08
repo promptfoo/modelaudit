@@ -286,6 +286,81 @@ class TestShardedModelDetector:
         assert info is not None
         assert info["missing_shard_indices"] == [1]
 
+    def test_zero_based_manifest_allows_snapshot_blob_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requires_symlinks: None
+    ) -> None:
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+        repo = tmp_path / "models--test--model"
+        directory = repo / "snapshots" / "revision"
+        directory.mkdir(parents=True)
+        blobs = repo / "blobs"
+        blobs.mkdir()
+        shard = directory / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"shard")
+        target = blobs / "manifest"
+        target.write_text(json.dumps({"weight_map": {"t": shard.name}}))
+        manifest = directory / "model.safetensors.index.json"
+        manifest.symlink_to(target)
+        info = ShardedModelDetector.detect_shards(str(shard))
+        assert info is not None and "zero_based_manifest_sha256" in info
+        outside = tmp_path / "outside"
+        target.rename(outside)
+        target.symlink_to(outside)
+        info = ShardedModelDetector.detect_shards(str(shard))
+        assert info is not None and info["missing_shard_indices"] == [1]
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows has no stable change timestamp")
+    def test_multiple_shard_families_parse_stable_manifest_once(self, tmp_path: Path) -> None:
+        from modelaudit.utils.file import handlers
+
+        members = [tmp_path / f"model-00000-of-{n:05d}.safetensors" for n in (1, 2, 3)]
+        for member in members:
+            member.write_bytes(b"shard")
+        manifest = tmp_path / "model.safetensors.index.json"
+        manifest.write_text(json.dumps({"weight_map": {"t": members[0].name}}))
+        with patch.object(
+            handlers, "_parse_zero_based_safetensors_manifest", wraps=handlers._parse_zero_based_safetensors_manifest
+        ) as parse:
+            infos = [ShardedModelDetector.detect_shards(str(member)) for member in members]
+            assert all(info is not None for info in infos)
+            assert parse.call_count == 1
+            manifest.write_text("{}")
+            changed = ShardedModelDetector.detect_shards(str(members[0]))
+            assert changed is not None and changed["missing_shard_indices"] == [1]
+            assert parse.call_count == 2
+
+    @pytest.mark.parametrize("present, missing", [([0, 1], []), ([0], [1]), ([1], [0])])
+    def test_zero_based_streaming_exit_code(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, present: list[int], missing: list[int]
+    ) -> None:
+        from modelaudit.core import scan_model_streaming
+        from modelaudit.core_results import determine_exit_code
+        from modelaudit.utils.file.handlers import _pinned_windows_shard_scan_path
+
+        if sys.platform == "darwin":
+            monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", _pinned_windows_shard_scan_path)
+        paths = [tmp_path / f"model-{i:05d}-of-00002.safetensors" for i in range(2)]
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"a": paths[0].name, "b": paths[1].name}})
+        )
+        for i in present:
+            header = json.dumps({("a", "b")[i]: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
+            paths[i].write_bytes(len(header).to_bytes(8, "little") + header + b"x")
+        result = scan_model_streaming(
+            iter((paths[i], i == present[-1]) for i in present),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["safetensors"],
+        )
+        gaps = [
+            check.details["missing_shard_indices"]
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "missing_model_shards"
+        ]
+        assert gaps == ([missing] if missing else [])
+        assert determine_exit_code(result) == (2 if missing else 0)
+
     def test_zero_based_single_shard_rechecks_manifest_before_scanning(self, tmp_path: Path) -> None:
         shard = tmp_path / "model-00000-of-00001.safetensors"
         shard.write_bytes(b"shard")

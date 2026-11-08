@@ -7626,24 +7626,45 @@ class TestModelDownloadStreaming:
         assert mock_named_temp.call_args.kwargs["suffix"] == ".safetensors"
 
     @pytest.mark.parametrize(
-        ("complete", "local_limit", "range_failure"),
-        [(True, False, False), (False, False, False), (True, True, False), (True, False, True)],
-        ids=["mixed-complete", "other-directory", "local-header-limit", "range-failed"],
+        "scenario",
+        [
+            "complete",
+            "other-directory",
+            "header-limit",
+            "range-failed",
+            "index",
+            "index-mismatch",
+            "index-limit",
+            "missing-third",
+        ],
     )
     def test_mixed_safetensors_shard_inventory(
-        self, complete: bool, local_limit: bool, range_failure: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, scenario: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        local = "model-00001-of-00002.safetensors"
+        local_limit = scenario in {"header-limit", "index-limit"}
+        range_failure = scenario == "range-failed"
+        has_index = scenario.startswith("index")
+        total = 3 if scenario == "missing-third" else 2
+        local = f"model-00001-of-{total:05d}.safetensors"
         if sys.platform == "darwin":
             # macOS cannot expose the descriptor-relative directory used by the POSIX pin.
             from modelaudit.utils.file.handlers import _pinned_windows_shard_scan_path
 
             monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", _pinned_windows_shard_scan_path)
-        remote = ("" if complete else "other/") + "model-00002-of-00002.safetensors"
+        remote = ("other/" if scenario == "other-directory" else "") + f"model-00002-of-{total:05d}.safetensors"
         filenames = [local, remote]
         frame, header_len = _make_safetensors_frame(
             {"weight": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\x00"
         )
+        local_frame, _ = _make_safetensors_frame(
+            {"local_w": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"x"
+        )
+        index = json.dumps(
+            {"weight_map": {"wrong" if scenario == "index-mismatch" else "local_w": local, "weight": remote}}
+        ).encode()
+        index_name = "model.safetensors.index.json"
+        repo_files = [*filenames, index_name] if has_index else filenames
+        sizes = {local: len(local_frame), remote: len(frame), index_name: len(index)}
         monkeypatch.setattr(
             "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
             lambda *_args, **_kwargs: SimpleNamespace(
@@ -7652,7 +7673,7 @@ class TestModelDownloadStreaming:
                 repo_id="test/model",
                 deadline=None,
                 size_limit=None,
-                repo_files=filenames,
+                repo_files=repo_files,
                 repo_revision=_HF_TEST_REVISION,
                 selected_files=filenames,
                 selected_sizes={},
@@ -7663,12 +7684,12 @@ class TestModelDownloadStreaming:
         )
         monkeypatch.setattr(
             "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
-            lambda *_args, **_kwargs: (dict.fromkeys(filenames, len(frame)), _HF_TEST_REVISION),
+            lambda *_args, **_kwargs: (sizes, _HF_TEST_REVISION),
         )
 
         def download(*, filename: str, local_dir: str, **_kwargs: object) -> str:
             path = Path(local_dir) / filename
-            path.write_bytes(frame)
+            path.write_bytes(local_frame)
             return str(path)
 
         with (
@@ -7679,6 +7700,7 @@ class TestModelDownloadStreaming:
                 side_effect=ValueError("range read failed")
                 if range_failure
                 else [
+                    *([_strict_range_response(index, len(index))] if has_index else []),
                     _strict_range_response(frame[:8], len(frame)),
                     _strict_range_response(frame[: 8 + header_len], len(frame)),
                 ],
@@ -7696,12 +7718,12 @@ class TestModelDownloadStreaming:
                 streamed,
                 delete_after_scan=False,
                 cache_enabled=False,
-                max_safetensors_header_bytes=1 if local_limit else header_len,
+                max_safetensors_header_bytes=1 if local_limit else max(header_len, len(local_frame)),
                 scanners=["safetensors"],
             )
         assert result.files_scanned == 2
         assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks) == (
-            not complete or range_failure
+            scenario in {"other-directory", "range-failed", "missing-third"}
         )
         assert (
             any(check.name == "Header Size Limit" and check.status.value == "failed" for check in result.checks)
@@ -7714,7 +7736,23 @@ class TestModelDownloadStreaming:
             )
             == range_failure
         )
-        assert result.success is (complete and not local_limit and not range_failure)
+        if has_index:
+            checks = [check for check in result.checks if check.name == "Hugging Face SafeTensors Shard Coverage"]
+            assert len(checks) == 2
+            assert all(check.details["index_unselected_shards"] == [] for check in checks)
+            assert all(check.details["planned_materialized_shard_count"] == 1 for check in checks)
+            assert {check.details.get("index_incomplete_reason") for check in checks} == {
+                "index-mismatch": {None, "index_tensor_assignment_mismatch"},
+                "index-limit": {None, "shard_tensor_names_digest_unavailable"},
+                "index": {None},
+            }[scenario]
+        if scenario == "missing-third":
+            assert all(
+                check.details["missing_shard_indices"] == [3]
+                for check in result.checks
+                if check.details.get("scan_outcome_reason") == "missing_model_shards"
+            )
+        assert result.success is (scenario in {"complete", "index"})
         assert determine_exit_code(result) == (0 if result.success else 2)
 
     @pytest.mark.parametrize("complete", [False, True], ids=["missing", "complete"])

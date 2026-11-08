@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -457,36 +458,29 @@ def _summarize_missing_shard_indices(
     return missing_indices, missing_count, missing_count > len(missing_indices)
 
 
-def _read_local_safetensors_index(directory: Path) -> bytes | None:
-    from ..sources.huggingface import _MAX_HF_SAFETENSORS_INDEX_BYTES
-    from .detection import _same_regular_file_identity
+@dataclass(frozen=True, slots=True)
+class _ZeroBasedShardManifest:
+    digest: str
+    members: frozenset[str]
 
+
+def _local_safetensors_index_target(directory: Path) -> Path | None:
     path = directory / "model.safetensors.index.json"
-    try:
-        expected = path.lstat()
-        if not stat.S_ISREG(expected.st_mode) or not 0 < expected.st_size <= _MAX_HF_SAFETENSORS_INDEX_BYTES:
-            return None
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-        with os.fdopen(os.open(path, flags), "rb") as index_file:
-            if not _same_regular_file_identity(os.fstat(index_file.fileno()), expected):
-                return None
-            raw = index_file.read(expected.st_size + 1)
-            if len(raw) != expected.st_size or not _same_regular_file_identity(path.lstat(), expected):
-                return None
-            return raw
-    except OSError:
+    if not path.is_symlink():
+        return path
+    # Only a snapshot alias inside its own configured Hugging Face blob store
+    # may supply evidence about local shard numbering.
+    cache_root = _find_hf_cache_root(directory)
+    if cache_root is None or not directory.resolve(strict=True).is_relative_to(cache_root / "snapshots"):
         return None
+    blobs_root = _trusted_hf_blobs_root(cache_root)
+    target = path.resolve(strict=True)
+    return target if blobs_root is not None and target.is_relative_to(blobs_root) else None
 
 
-def _zero_based_safetensors_manifest(directory: Path, shard_paths: list[str], expected_total: int) -> str | None:
-    """Accept zero-based numbering only from a complete map for this exact local family."""
+def _parse_zero_based_safetensors_manifest(raw: bytes) -> _ZeroBasedShardManifest | None:
     from ..sources.huggingface import _MAX_HF_SAFETENSORS_INDEX_TENSORS, _loads_json_without_duplicate_keys
 
-    if any(Path(shard).parent != directory for shard in shard_paths):
-        return None
-    raw = _read_local_safetensors_index(directory)
-    if raw is None:
-        return None
     try:
         manifest, _, duplicate_count, _, _, error = _loads_json_without_duplicate_keys(raw)
         if (
@@ -501,18 +495,71 @@ def _zero_based_safetensors_manifest(directory: Path, shard_paths: list[str], ex
             return None
         if any(not name or not isinstance(member, str) for name, member in weights.items()):
             return None
-        members = set(weights.values())
-        if len(members) != expected_total or any(Path(shard).name not in members for shard in shard_paths):
-            return None
+        members = frozenset(weights.values())
+        expected_total = len(members)
         indices: set[int] = set()
         for member in members:
             match = re.fullmatch(_SAFETENSORS_SHARD_PATTERN, member)
             if match is None or int(match[2]) != expected_total or not 0 <= int(match[1]) < expected_total:
                 return None
             indices.add(int(match[1]))
-        return hashlib.sha256(raw).hexdigest() if len(indices) == expected_total else None
+        if len(indices) == expected_total:
+            return _ZeroBasedShardManifest(hashlib.sha256(raw).hexdigest(), members)
     except (ValueError, RecursionError):
+        pass
+    return None
+
+
+def _load_zero_based_shard_manifest(path: Path, identity: tuple[int, ...]) -> _ZeroBasedShardManifest | None:
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as index_file:
+        if _manifest_identity(os.fstat(index_file.fileno())) != identity:
+            return None
+        size = identity[3]
+        raw = index_file.read(size + 1)
+        if len(raw) == size and _manifest_identity(os.fstat(index_file.fileno())) == identity:
+            return _parse_zero_based_safetensors_manifest(raw)
+    return None
+
+
+_cached_zero_based_shard_manifest = lru_cache(maxsize=1)(_load_zero_based_shard_manifest)
+
+
+def _manifest_identity(st: os.stat_result) -> tuple[int, ...]:
+    return st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def _zero_based_safetensors_manifest(directory: Path, shard_paths: list[str], expected_total: int) -> str | None:
+    """Accept zero-based numbering only from a stable map for this exact local family."""
+    from ..sources.huggingface import _MAX_HF_SAFETENSORS_INDEX_BYTES
+
+    if any(Path(shard).parent != directory for shard in shard_paths):
         return None
+    try:
+        target = _local_safetensors_index_target(directory)
+        if target is None:
+            return None
+        expected = target.lstat()
+        if not stat.S_ISREG(expected.st_mode) or not 0 < expected.st_size <= _MAX_HF_SAFETENSORS_INDEX_BYTES:
+            return None
+        identity = _manifest_identity(expected)
+        loader = (
+            _cached_zero_based_shard_manifest
+            if expected.st_ino and _supports_reliable_shard_cache_identity()
+            else _load_zero_based_shard_manifest
+        )
+        manifest = loader(target, identity)
+        if (
+            manifest is not None
+            and len(manifest.members) == expected_total
+            and all(Path(shard).name in manifest.members for shard in shard_paths)
+            and _local_safetensors_index_target(directory) == target
+            and _manifest_identity(target.lstat()) == identity
+        ):
+            return manifest.digest
+    except (OSError, RuntimeError):
+        pass
+    return None
 
 
 class ShardedModelDetector:
@@ -1377,10 +1424,13 @@ class ParallelShardHandler:
         pattern = self.shard_info["pattern"]
         expected_total = self.shard_info.get("expected_total_shards")
         manifest_digest = self.shard_info.get("zero_based_manifest_sha256")
-        if manifest_digest is not None:
-            raw_index = _read_local_safetensors_index(current_file.parent)
-            if raw_index is None or hashlib.sha256(raw_index).hexdigest() != manifest_digest:
-                raise OSError("SafeTensors shard manifest changed after detecting the zero-based family")
+        if (
+            manifest_digest is not None
+            and isinstance(expected_total, int)
+            and _zero_based_safetensors_manifest(current_file.parent, self.shard_info["shards"], expected_total)
+            != manifest_digest
+        ):
+            raise OSError("SafeTensors shard manifest changed after detecting the zero-based family")
         members: set[str] = set()
         family_directories = {current_file.parent}
         shard_targets = self.shard_info.get("shard_targets")
