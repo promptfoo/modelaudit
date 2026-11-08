@@ -9,7 +9,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import pytest
 from click.testing import CliRunner
@@ -40,14 +40,30 @@ from tests.helpers.cache import single_file_metadata as _single_file_metadata
 _RANK_262_TOKENIZER_ITEM_COUNT = 262_144
 
 
+def _write_gguf_v3_header(stream: BinaryIO, *, tensor_count: int, metadata_count: int) -> None:
+    stream.write(b"GGUF")
+    stream.write(struct.pack("<I", 3))
+    stream.write(struct.pack("<Q", tensor_count))
+    stream.write(struct.pack("<Q", metadata_count))
+
+
+def _write_tensor_descriptor(
+    stream: BinaryIO, name: bytes, dimensions: tuple[int, ...], *, tensor_type: int, offset: int
+) -> None:
+    stream.write(struct.pack("<Q", len(name)))
+    stream.write(name)
+    stream.write(struct.pack("<I", len(dimensions)))
+    for dimension in dimensions:
+        stream.write(struct.pack("<Q", dimension))
+    stream.write(struct.pack("<I", tensor_type))  # 0 denotes f32
+    stream.write(struct.pack("<Q", offset))  # Relative to the tensor data section
+
+
 def _write_minimal_gguf(path, n_kv=1, n_tensors=0, kv_key=b"test", kv_value=b"val"):
     """Create a minimal valid GGUF file for testing."""
     with open(path, "wb") as f:
         # Header
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))  # version
-        f.write(struct.pack("<Q", n_tensors))  # tensor count
-        f.write(struct.pack("<Q", n_kv))  # kv count
+        _write_gguf_v3_header(f, tensor_count=n_tensors, metadata_count=n_kv)
 
         # Metadata
         if n_kv > 0:
@@ -62,10 +78,7 @@ def _write_aligned_gguf(path: Path, alignment: int) -> None:
     """Create a single-tensor GGUF with an explicit supported alignment."""
     with path.open("wb") as handle:
         # Header
-        handle.write(b"GGUF")
-        handle.write(struct.pack("<I", 3))  # version
-        handle.write(struct.pack("<Q", 1))  # tensor count
-        handle.write(struct.pack("<Q", 1))  # kv count
+        _write_gguf_v3_header(handle, tensor_count=1, metadata_count=1)
 
         # Metadata
         key = b"general.alignment"
@@ -78,12 +91,7 @@ def _write_aligned_gguf(path: Path, alignment: int) -> None:
 
         # Tensor info
         tensor_name = b"weight"
-        handle.write(struct.pack("<Q", len(tensor_name)))
-        handle.write(tensor_name)
-        handle.write(struct.pack("<I", 1))  # dimensions
-        handle.write(struct.pack("<Q", 8))  # dimension size
-        handle.write(struct.pack("<I", 0))  # f32 tensor type
-        handle.write(struct.pack("<Q", 0))  # tensor offset (relative to tensor data section start)
+        _write_tensor_descriptor(handle, tensor_name, (8,), tensor_type=0, offset=0)
         # Align tensor data section to the requested boundary
         handle.write(b"\0" * ((alignment - (handle.tell() % alignment)) % alignment))
         # Tensor data (8 * 4 bytes for f32)
@@ -121,10 +129,7 @@ def _write_tensor_covered_gguf_zip(
     dimensions = declared_dimensions or (tensor_elements,)
 
     with path.open("wb") as handle:
-        handle.write(b"GGUF")
-        handle.write(struct.pack("<I", 3))
-        handle.write(struct.pack("<Q", 1))
-        handle.write(struct.pack("<Q", 1))
+        _write_gguf_v3_header(handle, tensor_count=1, metadata_count=1)
 
         key = b"general.alignment"
         handle.write(struct.pack("<Q", len(key)))
@@ -134,13 +139,7 @@ def _write_tensor_covered_gguf_zip(
         handle.write(b"\0" * ((32 - (handle.tell() % 32)) % 32))
 
         tensor_name = b"weight"
-        handle.write(struct.pack("<Q", len(tensor_name)))
-        handle.write(tensor_name)
-        handle.write(struct.pack("<I", len(dimensions)))
-        for dimension in dimensions:
-            handle.write(struct.pack("<Q", dimension))
-        handle.write(struct.pack("<I", 0))
-        handle.write(struct.pack("<Q", 0))
+        _write_tensor_descriptor(handle, tensor_name, dimensions, tensor_type=0, offset=0)
         handle.write(b"\0" * ((32 - (handle.tell() % 32)) % 32))
         handle.write(tensor_data.ljust(tensor_elements * 4, b"\0"))
 
@@ -176,13 +175,7 @@ def _write_gguf_with_tensor_records(
 
         offset = 0
         for tensor_name, tensor_type, dims, tensor_data_size in records:
-            f.write(struct.pack("<Q", len(tensor_name)))
-            f.write(tensor_name)
-            f.write(struct.pack("<I", len(dims)))
-            for dimension in dims:
-                f.write(struct.pack("<Q", dimension))
-            f.write(struct.pack("<I", tensor_type))
-            f.write(struct.pack("<Q", offset))
+            _write_tensor_descriptor(f, tensor_name, dims, tensor_type=tensor_type, offset=offset)
             offset += tensor_data_size
 
         pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
@@ -1150,10 +1143,7 @@ def test_gguf_default_tensor_count_limit_blocks_compact_resource_exhaustion(tmp_
 def test_gguf_tensor_metadata_summary_is_capped_without_skipping_validation(tmp_path: Path) -> None:
     path = tmp_path / "capped-tensor-summary.gguf"
     with path.open("wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 3))
-        f.write(struct.pack("<Q", 0))
+        _write_gguf_v3_header(f, tensor_count=3, metadata_count=0)
 
         for index in range(3):
             name = f"tensor{index}".encode()
@@ -1182,10 +1172,7 @@ def test_gguf_tensor_metadata_summary_is_capped_without_skipping_validation(tmp_
 def test_gguf_streaming_tensor_parse_preserves_excessive_dimension_finding(tmp_path: Path) -> None:
     path = tmp_path / "excessive-dimensions-missing-data.gguf"
     with path.open("wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))
-        f.write(struct.pack("<Q", 0))
+        _write_gguf_v3_header(f, tensor_count=1, metadata_count=0)
         name = b"huge_rank"
         f.write(struct.pack("<Q", len(name)))
         f.write(name)
@@ -1352,10 +1339,7 @@ def test_gguf_scanner_invalid_alignment_falls_back_to_default(tmp_path: Path) ->
     """Invalid alignment metadata should warn but still use the GGUF default."""
     path = tmp_path / "invalid_alignment.gguf"
     with path.open("wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
+        _write_gguf_v3_header(f, tensor_count=1, metadata_count=1)
 
         key = b"general.alignment"
         f.write(struct.pack("<Q", len(key)))
@@ -1364,12 +1348,7 @@ def test_gguf_scanner_invalid_alignment_falls_back_to_default(tmp_path: Path) ->
         f.write(struct.pack("<I", 48))  # invalid: not a power of two
 
         name = b"weights8"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 1))
-        f.write(struct.pack("<Q", 8))
-        f.write(struct.pack("<I", 0))
-        f.write(struct.pack("<Q", 0))
+        _write_tensor_descriptor(f, name, (8,), tensor_type=0, offset=0)
 
         pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
         if pad_to_tensor_data:
@@ -1402,10 +1381,7 @@ def test_gguf_scanner_large_tensor_count(tmp_path: Path) -> None:
     """Test detection of suspiciously large tensor counts."""
     path = tmp_path / "bad.gguf"
     with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))  # version
-        f.write(struct.pack("<Q", 2**31))  # huge tensor count
-        f.write(struct.pack("<Q", 0))  # kv count
+        _write_gguf_v3_header(f, tensor_count=2**31, metadata_count=0)  # Huge tensor count
 
     result = GgufScanner().scan(str(path))
     assert result.success is False
@@ -1421,10 +1397,7 @@ def test_gguf_scanner_truncated_file(tmp_path: Path) -> None:
     """Test handling of truncated GGUF files."""
     path = tmp_path / "trunc.gguf"
     with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 0))
-        f.write(struct.pack("<Q", 5))  # Claims 5 KV pairs but file ends
+        _write_gguf_v3_header(f, tensor_count=0, metadata_count=5)  # Claims 5 KV pairs but file ends
 
     result = GgufScanner().scan(str(path))
     assert result.success is False
@@ -1435,10 +1408,7 @@ def test_gguf_scanner_truncated_file(tmp_path: Path) -> None:
 def test_gguf_truncated_metadata_returns_exit2(tmp_path: Path) -> None:
     path = tmp_path / "truncated_metadata.gguf"
     with path.open("wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 0))
-        f.write(struct.pack("<Q", 5))
+        _write_gguf_v3_header(f, tensor_count=0, metadata_count=5)
 
     direct = GgufScanner().scan(str(path))
     aggregate = scan_model_directory_or_file(str(path))
@@ -1459,10 +1429,7 @@ def test_gguf_truncated_metadata_uncached_rerun_preserves_exit2(
 ) -> None:
     path = tmp_path / "truncated_metadata.gguf"
     with path.open("wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 0))
-        f.write(struct.pack("<Q", 5))
+        _write_gguf_v3_header(f, tensor_count=0, metadata_count=5)
 
     _assert_uncached_rerun_preserves_inconclusive_exit2(
         path,
@@ -1920,10 +1887,7 @@ def test_gguf_bf16_truncated_tensor_data_reports_bounds_check(tmp_path: Path) ->
 def test_gguf_truncated_tensor_dimensions_are_parse_inconclusive(tmp_path: Path) -> None:
     path = tmp_path / "truncated_tensor_dimensions.gguf"
     with path.open("wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))
-        f.write(struct.pack("<Q", 0))
+        _write_gguf_v3_header(f, tensor_count=1, metadata_count=0)
         name = b"truncated_dims"
         f.write(struct.pack("<Q", len(name)))
         f.write(name)
@@ -2645,10 +2609,7 @@ def test_gguf_scanner_string_length_security(tmp_path: Path) -> None:
     """Test security checks for string lengths."""
     path = tmp_path / "long_string.gguf"
     with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 0))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
+        _write_gguf_v3_header(f, tensor_count=0, metadata_count=1)
         f.write(struct.pack("<Q", 2**31))  # extremely long key
         # File ends here, should trigger error
 
@@ -3305,10 +3266,7 @@ def test_gguf_scanner_metadata_types(tmp_path):
     """Test handling of different metadata value types."""
     path = tmp_path / "types.gguf"
     with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 0))  # tensor count
-        f.write(struct.pack("<Q", 3))  # kv count
+        _write_gguf_v3_header(f, tensor_count=0, metadata_count=3)
 
         # String value
         key1 = b"string_key"
@@ -3360,10 +3318,7 @@ def test_gguf_scanner_invalid_tensor_dimensions(tmp_path: Path) -> None:
     path = tmp_path / "invalid_dims.gguf"
     with open(path, "wb") as f:
         # Header
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))  # version
-        f.write(struct.pack("<Q", 2))  # tensor count - two tensors to test both cases
-        f.write(struct.pack("<Q", 1))  # kv count
+        _write_gguf_v3_header(f, tensor_count=2, metadata_count=1)  # Two tensors to test both invalid dimensions
 
         # Minimal metadata
         key = b"general.alignment"
@@ -3437,10 +3392,7 @@ def test_gguf_scanner_without_alignment_metadata(tmp_path):
     path = tmp_path / "no_alignment.gguf"
     with open(path, "wb") as f:
         # Header
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))  # version
-        f.write(struct.pack("<Q", 1))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
+        _write_gguf_v3_header(f, tensor_count=1, metadata_count=1)
 
         # Metadata WITHOUT general.alignment (like real llama.cpp files)
         key = b"test.key"
@@ -3483,10 +3435,7 @@ def test_gguf_scanner_tensor_size_validation(tmp_path):
     path = tmp_path / "tensor_sizes.gguf"
     with open(path, "wb") as f:
         # Header
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))  # version
-        f.write(struct.pack("<Q", 2))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
+        _write_gguf_v3_header(f, tensor_count=2, metadata_count=1)
 
         # Metadata with alignment
         key = b"general.alignment"
@@ -3501,22 +3450,12 @@ def test_gguf_scanner_tensor_size_validation(tmp_path):
 
         # Tensor 1: f32 tensor with 8 elements = 32 bytes
         name1 = b"tensor1"
-        f.write(struct.pack("<Q", len(name1)))
-        f.write(name1)
-        f.write(struct.pack("<I", 1))  # dimensions
-        f.write(struct.pack("<Q", 8))  # dimension size
-        f.write(struct.pack("<I", 0))  # f32 tensor type
-        f.write(struct.pack("<Q", 0))  # offset 0
+        _write_tensor_descriptor(f, name1, (8,), tensor_type=0, offset=0)
 
         # Tensor 2: f32 tensor with 16 elements = 64 bytes
         name2 = b"tensor2"
-        f.write(struct.pack("<Q", len(name2)))
-        f.write(name2)
-        f.write(struct.pack("<I", 1))  # dimensions
-        f.write(struct.pack("<Q", 16))  # dimension size
-        f.write(struct.pack("<I", 0))  # f32 tensor type
-        # Offset 32 + 16 bytes padding = 48 (aligned to 32 bytes: next multiple of 32 after 32)
-        f.write(struct.pack("<Q", 32))  # offset 32 (no padding needed as 32 is aligned)
+        # The first tensor ends on a 32-byte boundary, so the second needs no padding.
+        _write_tensor_descriptor(f, name2, (16,), tensor_type=0, offset=32)
 
         # Align tensor data section to 32 bytes
         tensor_info_end = f.tell()
@@ -3542,18 +3481,10 @@ def test_gguf_scanner_tensor_bounds_detects_uint64_wrap(tmp_path: Path) -> None:
     """Tensor offsets must not wrap or point outside the file."""
     path = tmp_path / "tensor_bounds_wrap.gguf"
     with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))
-        f.write(struct.pack("<Q", 0))
+        _write_gguf_v3_header(f, tensor_count=1, metadata_count=0)
 
         name = b"wrap_tensor"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 1))
-        f.write(struct.pack("<Q", 8))
-        f.write(struct.pack("<I", 0))
-        f.write(struct.pack("<Q", 2**64 - 16))
+        _write_tensor_descriptor(f, name, (8,), tensor_type=0, offset=2**64 - 16)
 
         pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
         if pad_to_tensor_data:
@@ -3573,18 +3504,10 @@ def test_gguf_scanner_tensor_bounds_allows_exact_file_end(tmp_path: Path) -> Non
     """A tensor may end exactly at EOF when its offset and expected size fit."""
     path = tmp_path / "tensor_bounds_exact_end.gguf"
     with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))
-        f.write(struct.pack("<Q", 0))
+        _write_gguf_v3_header(f, tensor_count=1, metadata_count=0)
 
         name = b"offset_tensor"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 1))
-        f.write(struct.pack("<Q", 8))
-        f.write(struct.pack("<I", 0))
-        f.write(struct.pack("<Q", 32))
+        _write_tensor_descriptor(f, name, (8,), tensor_type=0, offset=32)
 
         pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
         if pad_to_tensor_data:
@@ -3604,10 +3527,7 @@ def test_gguf_scanner_last_tensor_size(tmp_path):
     path = tmp_path / "last_tensor.gguf"
     with open(path, "wb") as f:
         # Header
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))  # version
-        f.write(struct.pack("<Q", 1))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
+        _write_gguf_v3_header(f, tensor_count=1, metadata_count=1)
 
         # Metadata with alignment
         key = b"general.alignment"
@@ -3622,12 +3542,7 @@ def test_gguf_scanner_last_tensor_size(tmp_path):
 
         # Tensor: f32 tensor with 128 elements = 512 bytes
         name = b"last_tensor"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 1))  # dimensions
-        f.write(struct.pack("<Q", 128))  # dimension size
-        f.write(struct.pack("<I", 0))  # f32 tensor type
-        f.write(struct.pack("<Q", 0))  # offset 0
+        _write_tensor_descriptor(f, name, (128,), tensor_type=0, offset=0)
 
         # Align tensor data section to 32 bytes
         tensor_info_end = f.tell()

@@ -34,7 +34,14 @@ from modelaudit.scanners.archive_dispatch import (
     scan_nested_file,
 )
 from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_source
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    BaseScanner,
+    Check,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.zip_scanner import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
@@ -385,11 +392,7 @@ def test_scan_zip_flags_namespace_mapping_dangerous_python_member(tmp_path: Path
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].rule_code == "S101"
@@ -476,7 +479,6 @@ def test_scan_zip_flags_direct_imported_python_member_primitives(
 
 
 def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "import webbrowser\n"
@@ -561,14 +563,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "    __init__ = ctypes.CDLL.__init__\n"
         "ctypes.LibraryLoader(ClassBodyInitCDLL).classbodyinitlib\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S109", "S110"}
     assert checks_by_rule["S109"].severity == IssueSeverity.CRITICAL
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
@@ -636,7 +631,6 @@ def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path
 
 
 def test_scan_zip_handles_final_dynamic_accessor_edges(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "import webbrowser\n"
@@ -654,14 +648,7 @@ def test_scan_zip_handles_final_dynamic_accessor_edges(tmp_path: Path) -> None:
         "hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattremptykwargs', **{})\n"
         "ctypes.LibraryLoader.__getattr__(ctypes.cdll, 'unboundgetattr')\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S109", "S110"}
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
     s110_reason = checks_by_rule["S110"].details["reason"]
@@ -735,7 +722,6 @@ def test_scan_zip_honors_safe_dynamic_member_aliases_and_method_overwrites(tmp_p
 
 
 def test_scan_zip_resolves_final_ctypes_initializer_edges(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "class Safe:\n"
@@ -754,14 +740,7 @@ def test_scan_zip_resolves_final_ctypes_initializer_edges(tmp_path: Path) -> Non
         "        super(Safe, self).__init__(name)\n"
         "ctypes.LibraryLoader(SuperSkipCDLL).superskiplib\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S110"}
     s110_reason = checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.classbodylib" in s110_reason
@@ -792,7 +771,6 @@ def test_scan_zip_ignores_invalid_ctypes_initializer_delegates(tmp_path: Path) -
 
 
 def test_scan_zip_restores_dynamic_member_defaults_after_namespace_rebinds(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "import webbrowser\n"
@@ -805,14 +783,7 @@ def test_scan_zip_restores_dynamic_member_defaults_after_namespace_rebinds(tmp_p
         "globals().update(browser=webbrowser.get())\n"
         "browser.open('https://example.invalid')\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S109", "S110"}
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
     assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
@@ -836,7 +807,6 @@ def test_scan_zip_keeps_dynamic_member_deletes_child_scope_local(tmp_path: Path)
 
 
 def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "ctypes.LibraryLoader(ctypes.CDLL, **{}).emptykwargs\n"
@@ -854,14 +824,7 @@ def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_pa
         "        super(CurrentSuperCDLL, self).__init__(name)\n"
         "ctypes.LibraryLoader(CurrentSuperCDLL).currentsuperlib\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S110"}
     s110_reason = checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.emptykwargs" in s110_reason
@@ -871,7 +834,6 @@ def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_pa
 
 
 def test_scan_zip_resolves_initializer_delete_before_class_alias_fallback(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "class DeletedShadowCDLL(ctypes.CDLL):\n"
@@ -882,14 +844,7 @@ def test_scan_zip_resolves_initializer_delete_before_class_alias_fallback(tmp_pa
         "        self.init(name)\n"
         "ctypes.LibraryLoader(DeletedShadowCDLL).deletedshadowlib\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S110"}
     assert "ctypes.LibraryLoader.deletedshadowlib" in checks_by_rule["S110"].details["reason"]
 
@@ -916,7 +871,6 @@ def test_scan_zip_resolves_imports_inside_ctypes_subclass_initializers(tmp_path:
 
 
 def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "import os\n"
@@ -1007,20 +961,12 @@ def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(t
         "f = hasattr(os, 'system')\n"
         "f('id')\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S110"}
     assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.LibraryLoader.reachablelib"
 
 
 def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "ctypes.LibraryLoader(**{'dlltype': len, 'dlltype': ctypes.CDLL}).duplicatekwlib\n"
@@ -1064,14 +1010,7 @@ def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) 
         "        return super().__new__(cls)\n"
         "ctypes.LibraryLoader(PartialNewCDLL).partialnewlib\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert set(checks_by_rule) == {"S110"}
     s110_reason = checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.duplicatekwlib" in s110_reason
@@ -1088,11 +1027,7 @@ def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> Non
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, "import runpy\nrunpy.run_module('payload')\n", "handler")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S108"
     assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_module"
@@ -1329,11 +1264,7 @@ def test_scan_zip_flags_ctypes_getattr_dynamic_library_name(tmp_path: Path) -> N
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.cdll.<dynamic>" in python_checks[0].details["reason"]
@@ -1356,11 +1287,7 @@ def test_scan_zip_flags_unpacked_getattr_and_unbound_loader_getattr(tmp_path: Pa
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.cdll.msvcrt" in python_checks[0].details["reason"]
@@ -1429,7 +1356,6 @@ def test_scan_zip_preserves_dynamic_member_risk_after_same_name_reassignment(tmp
 
 
 def test_scan_zip_restores_dynamic_member_risk_after_delete(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "import webbrowser\n"
@@ -1445,21 +1371,13 @@ def test_scan_zip_restores_dynamic_member_risk_after_delete(tmp_path: Path) -> N
         "del ctypes.windll.payload\n"
         "ctypes.windll.payload\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
     assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.payload" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_restores_dynamic_member_risk_after_delattr_and_namespace_rebind(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "import webbrowser\n"
@@ -1476,14 +1394,7 @@ def test_scan_zip_restores_dynamic_member_risk_after_delattr_and_namespace_rebin
         "globals()['loader'] = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader.payload\n"
     )
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source)
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
     assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
 
@@ -1505,11 +1416,7 @@ def test_scan_zip_restores_loader_method_risk_after_delete(tmp_path: Path) -> No
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.LibraryLoader.loadlibrarypayload" in python_checks[0].details["reason"]
@@ -1596,11 +1503,7 @@ def test_scan_zip_preserves_ctypes_subclass_class_body_and_qualified_init_aliase
     )
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
     assert "ctypes.LibraryLoader.bodyalias" in python_checks[0].details["reason"]
@@ -3691,11 +3594,7 @@ def test_scan_zip_marks_malformed_python_member_incomplete(tmp_path: Path) -> No
     assert result.success is False
     assert result.metadata["analysis_incomplete"] is True
     assert "zip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].details["entry"] == "handler.py"
     assert python_checks[0].details["analysis_incomplete"] is True
@@ -3709,11 +3608,7 @@ def test_scan_npz_flags_dangerous_python_member(tmp_path: Path) -> None:
 
     result = ZipScanner().scan(str(archive_path))
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].details["entry"] == "handler.py"
@@ -3879,11 +3774,7 @@ def test_scan_zip_python_member_emits_accurate_rule_code(
     archive_path = tmp_path / "source_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == expected_rule_code
     assert expected_call in python_checks[0].details["reason"]
@@ -4401,11 +4292,7 @@ def test_scan_zip_python_member_detects_operator_accessor_execution(
     archive_path = tmp_path / "source_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert any(
         check.rule_code == expected_rule_code and expected_call in check.details["reason"] for check in python_checks
     )
@@ -4440,11 +4327,7 @@ def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Pat
     source = "import os\nimport subprocess\nos.system('echo a')\nsubprocess.run(['echo', 'b'], check=False)\n"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     rule_codes = [check.rule_code for check in python_checks]
     assert rule_codes == ["S101", "S103"]
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
@@ -4463,11 +4346,7 @@ def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, mo
 
     result = ZipScanner({"max_mar_python_analysis_bytes": 1024}).scan(str(archive_path))
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     details = python_checks[0].details
     assert details["analysis_incomplete"] is True
@@ -9916,15 +9795,19 @@ class TestZipScanner:
         assert len(result.issues) > 0
 
 
+def _failed_python_member_checks(result: ScanResult) -> list[Check]:
+    return [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+
+
 def _scan_python_member_checks(tmp_path: Path, source: str) -> dict[str | None, Any]:
     """Scan ``source`` as a Python archive member; return failed checks by rule code."""
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, source, "handler.py")
-    return {
-        check.rule_code: check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    }
+    return {check.rule_code: check for check in _failed_python_member_checks(result)}
 
 
 def test_scan_zip_pr1402_resolves_subclass_initializer_bypasses(tmp_path: Path) -> None:
@@ -10045,11 +9928,7 @@ def _assert_zip_python_member_safe_at_path(archive_path: Path, source: str) -> N
 def _assert_zip_python_finding_at_path(archive_path: Path, source: str | bytes, rule_code: str, reason: str) -> None:
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == rule_code
     assert python_checks[0].details["reason"] == reason
@@ -10071,11 +9950,7 @@ def _assert_zip_member_subprocess_call(tmp_path: Path, source_text: str) -> None
     source = source_text
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
@@ -10195,42 +10070,20 @@ def _assert_zip_subprocess_warning(tmp_path: Path, source_text: str) -> None:
     source = source_text
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
 def _assert_conditional_member_risk(tmp_path: Path, source_text: str, reason: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = source_text
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source_text)
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
     assert checks_by_rule["S110"].details["reason"] == reason
 
 
 def _assert_loader_accessors(tmp_path: Path, source_text: str, first_call: str, second_call: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = source_text
-    result = _scan_python_zip_member(archive_path, source, "handler.py")
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    checks_by_rule = {check.rule_code: check for check in python_checks}
+    checks_by_rule = _scan_python_member_checks(tmp_path, source_text)
     assert set(checks_by_rule) == {"S110"}
     s110_reason = checks_by_rule["S110"].details["reason"]
     assert first_call in s110_reason
@@ -10242,11 +10095,7 @@ def _assert_zip_system_call(tmp_path: Path, source_text: str) -> None:
     source = source_text
     result = _scan_python_zip_member(archive_path, source, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].rule_code == "S101"
@@ -10289,11 +10138,7 @@ def _assert_zip_python_member_warning(tmp_path: Path, source_text: str, entry_ke
     archive_path = tmp_path / "model_bundle.zip"
     result = _scan_python_zip_member(archive_path, source_text, "handler.py")
 
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
+    python_checks = _failed_python_member_checks(result)
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].details[entry_key] == member_name
