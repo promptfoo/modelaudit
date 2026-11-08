@@ -69,6 +69,7 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 from .pickle_scanner import (
     _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS,
     _PICKLE_LITERAL_URL_TEXT_RE,
+    _PYTORCH_STORAGE_FIXED_WIDTHS,
     PickleScanner,
     _has_active_shell_substitution,
     _has_adjacent_python_string_tokens,
@@ -453,49 +454,40 @@ _PYTORCH_ZIP_INTEGRITY_PREFIX_BYTES = 8 * 1024 * 1024
 _PYTORCH_ZIP_HASH_CHUNK_BYTES = 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _NESTED_ZIP_HEADER_PROBE_BYTES = 4
-_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
-    {
-        "BFloat16Storage",
-        "BoolStorage",
-        "ByteStorage",
-        "CharStorage",
-        "ComplexDoubleStorage",
-        "ComplexFloatStorage",
-        "DoubleStorage",
-        "FloatStorage",
-        "HalfStorage",
-        "IntStorage",
-        "LongStorage",
-        "QInt32Storage",
-        "QInt8Storage",
-        "QUInt8Storage",
-        "QUInt4x2Storage",
-        "QUInt2x4Storage",
-        "ShortStorage",
-        "UntypedStorage",
-    }
-)
+_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(name for name, _ in _PYTORCH_STORAGE_FIXED_WIDTHS)
 _PYTORCH_STORAGE_GLOBALS = frozenset(
     (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
 )
-_PYTORCH_STORAGE_ITEM_SIZES = {
-    "BFloat16Storage": 2,
-    "BoolStorage": 1,
-    "ByteStorage": 1,
-    "CharStorage": 1,
-    "ComplexDoubleStorage": 16,
-    "ComplexFloatStorage": 8,
-    "DoubleStorage": 8,
-    "FloatStorage": 4,
-    "HalfStorage": 2,
-    "IntStorage": 4,
-    "LongStorage": 8,
-    "QInt32Storage": 4,
-    "QInt8Storage": 1,
-    "QUInt8Storage": 1,
-    "ShortStorage": 2,
-    "UntypedStorage": 1,
-}
+_PYTORCH_STORAGE_ITEM_SIZES = {name: width for name, width in _PYTORCH_STORAGE_FIXED_WIDTHS if width is not None}
+# Standard PyTorch imports expected in benign state-dict archives.
+# Keep these as exact callable/class references so lookalikes such as
+# ``torch._utils.evil`` or ``collections.OrderedDictEvil`` are not
+# downgraded by substring matching.
+_PYTORCH_BENIGN_PICKLE_IMPORTS = frozenset(
+    {
+        "collections.OrderedDict",
+        "numpy.dtype",
+        "numpy.ndarray",
+        "numpy.core.multiarray.scalar",
+        "numpy._core.multiarray.scalar",
+        "torch._rebuild_tensor",
+        "torch._rebuild_tensor_v2",
+        "torch.Storage",
+        "torch._tensor._rebuild_from_type_v2",
+        "torch._utils._rebuild_device_tensor_from_numpy",
+        "torch._utils._rebuild_meta_tensor_no_storage",
+        "torch._utils._rebuild_nested_tensor",
+        "torch._utils._rebuild_parameter",
+        "torch._utils._rebuild_parameter_with_state",
+        "torch._utils._rebuild_qtensor",
+        "torch._utils._rebuild_sparse_tensor",
+        "torch._utils._rebuild_tensor",
+        "torch._utils._rebuild_tensor_v2",
+        "torch._utils._rebuild_tensor_v3",
+        "torch._utils._rebuild_wrapper_subclass",
+        *(f"torch.{name}" for name in _PYTORCH_STORAGE_GLOBAL_NAMES),
+    }
+)
 _PYTORCH_STORAGE_REDACTED_BINPERSID_PREVIEW = re.compile(
     r"^tuple\(str_span\(len=7\), global:(?P<module>[A-Za-z_][A-Za-z0-9_.]*)\.(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
     r", str_span\(len=(?P<key_len>[0-9]+)\), str_span\(len=(?P<device_len>[0-9]+)\), int:(?P<size>[0-9]+)\)$"
@@ -1662,27 +1654,19 @@ class PyTorchZipScanner(BaseScanner):
         validated_pytorch_storage_data_pkl_members: _ValidatedPytorchStorageDataPklMembers | None = None,
     ) -> list[zipfile.ZipInfo]:
         """Discover pickle files in the ZIP archive"""
-        pickle_files: list[zipfile.ZipInfo] = []
         # Identity-based dedup: the same ``ZipInfo`` instance can be considered
         # by both the filename pass and the sniff pass, and since both iterate
         # the same ``safe_entries`` list the ``id()`` of each entry is stable
         # for the duration of this discovery. If a future refactor ever feeds
         # these passes from separate ``infolist()`` walks or from reconstructed
         # ``ZipInfo`` objects, fall back to a ``(name, header_offset)`` key.
-        seen_entries: set[int] = set()
-
-        def add_pickle_entry(entry: zipfile.ZipInfo) -> None:
-            entry_key = id(entry)
-            if entry_key in seen_entries:
-                return
-            pickle_files.append(entry)
-            seen_entries.add(entry_key)
+        entries_by_id: dict[int, zipfile.ZipInfo] = {}
 
         # First pass: Look for common pickle file patterns
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
-                add_pickle_entry(entry)
+                entries_by_id[id(entry)] = entry
 
         if validated_pytorch_storage_data_pkl_members is None:
             validated_pytorch_storage_data_pkl_members = (
@@ -1706,7 +1690,7 @@ class PyTorchZipScanner(BaseScanner):
         deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            if id(entry) in seen_entries or entry.is_dir():
+            if id(entry) in entries_by_id or entry.is_dir():
                 continue
             self._check_timeout()
             try:
@@ -1733,7 +1717,7 @@ class PyTorchZipScanner(BaseScanner):
                 else:
                     looks_like_pickle = self._entry_looks_like_pickle(zip_file, entry, result)
                 if looks_like_pickle:
-                    add_pickle_entry(entry)
+                    entries_by_id[id(entry)] = entry
                 elif needs_deferred_padding_probe[0]:
                     deferred_padding_probe_entries.append(entry)
             except Exception as exc:
@@ -1748,7 +1732,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
 
         for entry in deferred_padding_probe_entries:
-            if id(entry) in seen_entries or entry.is_dir():
+            if id(entry) in entries_by_id or entry.is_dir():
                 continue
             self._check_timeout()
             try:
@@ -1760,7 +1744,7 @@ class PyTorchZipScanner(BaseScanner):
                     padding_probe_bytes_remaining=padding_probe_bytes_remaining,
                     nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
                 ):
-                    add_pickle_entry(entry)
+                    entries_by_id[id(entry)] = entry
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
                 probe_failures.append(
@@ -1790,6 +1774,7 @@ class PyTorchZipScanner(BaseScanner):
                 },
             )
 
+        pickle_files = list(entries_by_id.values())
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
 
@@ -2308,16 +2293,13 @@ class PyTorchZipScanner(BaseScanner):
             )
             detection_probe_budget_charge_bytes = 0
 
-        def charge_deferred_probe_budget_before_skip() -> None:
-            nonlocal charge_deferred_probe_budget_on_skip, detection_probe_budget_charge_bytes
-            if not charge_deferred_probe_budget_on_skip or not detection_probe_budget_charge_bytes:
-                return
-            PyTorchZipScanner._charge_padding_probe_budget(
-                padding_probe_bytes_remaining,
-                detection_probe_budget_charge_bytes,
-            )
-            charge_deferred_probe_budget_on_skip = False
-            detection_probe_budget_charge_bytes = 0
+        def charge_deferred_probe_budget_before_skip() -> bool:
+            if charge_deferred_probe_budget_on_skip and detection_probe_budget_charge_bytes:
+                PyTorchZipScanner._charge_padding_probe_budget(
+                    padding_probe_bytes_remaining,
+                    detection_probe_budget_charge_bytes,
+                )
+            return False
 
         def impossible_prefix_tail_decision() -> bool | None:
             nonlocal sample
@@ -2354,8 +2336,7 @@ class PyTorchZipScanner(BaseScanner):
                 context_start=nested_start,
                 work_budget_remaining=work_budget_remaining,
             ):
-                charge_deferred_probe_budget_before_skip()
-                return False
+                return charge_deferred_probe_budget_before_skip()
             raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
 
         if entry.file_size > len(data_start):
@@ -2412,8 +2393,7 @@ class PyTorchZipScanner(BaseScanner):
             if should_scan:
                 charge_detection_probe_budget()
                 return True
-            charge_deferred_probe_budget_before_skip()
-            return False
+            return charge_deferred_probe_budget_before_skip()
         if is_headerless_binary_pickle_candidate:
             short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
             should_scan = (
@@ -2450,16 +2430,14 @@ class PyTorchZipScanner(BaseScanner):
                 and PyTorchZipScanner._complete_headerless_byte_literal_prefix_has_only_padding(sample)
             ):
                 defer_padding_probe[0] = True
-                charge_deferred_probe_budget_before_skip()
-                return False
+                return charge_deferred_probe_budget_before_skip()
             if (
                 max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
                 and entry.file_size > len(sample)
                 and PyTorchZipScanner._complete_headerless_byte_literal_prefix_has_only_padding(sample)
             ):
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
-            charge_deferred_probe_budget_before_skip()
-            return False
+            return charge_deferred_probe_budget_before_skip()
         if is_frame_first_candidate:
             if self._frame_first_trusted_storage_probe_should_scan(
                 sample, work_budget_remaining=work_budget_remaining
@@ -2496,8 +2474,7 @@ class PyTorchZipScanner(BaseScanner):
                 and defer_padding_probe is not None
             ):
                 defer_padding_probe[0] = True
-                charge_deferred_probe_budget_before_skip()
-                return False
+                return charge_deferred_probe_budget_before_skip()
             expanded_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
             PyTorchZipScanner._charge_padding_probe_budget(
                 padding_probe_bytes_remaining,
@@ -2540,8 +2517,7 @@ class PyTorchZipScanner(BaseScanner):
         ):
             if defer_padding_probe is not None:
                 defer_padding_probe[0] = True
-                charge_deferred_probe_budget_before_skip()
-                return False
+                return charge_deferred_probe_budget_before_skip()
             padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
             if padding_probe_bytes > len(sample):
                 PyTorchZipScanner._charge_padding_probe_budget(
@@ -2581,8 +2557,7 @@ class PyTorchZipScanner(BaseScanner):
                             work_budget_remaining=work_budget_remaining,
                         )
                     raise ValueError("trusted PyTorch storage padding probe limit reached")
-                charge_deferred_probe_budget_before_skip()
-                return False
+                return charge_deferred_probe_budget_before_skip()
         if (
             entry.file_size > len(sample)
             and len(sample) >= _PICKLE_DISCOVERY_LONG_PROBE_BYTES
@@ -2608,8 +2583,7 @@ class PyTorchZipScanner(BaseScanner):
                     )
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
             raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
-        charge_deferred_probe_budget_before_skip()
-        return False
+        return charge_deferred_probe_budget_before_skip()
 
     def _verified_nul_padding_storage_probe_should_scan(
         self,
@@ -8419,31 +8393,6 @@ class PyTorchZipScanner(BaseScanner):
             for storage_key in storage_keys
         }
 
-    @classmethod
-    def _trusted_pytorch_storage_blob_members(
-        cls,
-        safe_entries: list[zipfile.ZipInfo],
-        result: ScanResult,
-    ) -> set[str]:
-        """Return only storage blobs referenced by a validated ``data.pkl`` persistent ID."""
-        storage_keys_by_data_pkl = cls._trusted_pytorch_storage_data_pkl_members(safe_entries)
-        trusted_blobs: set[str] = set()
-        referenced_keys_by_data_pkl: dict[str, set[str]] = {}
-        for check in result.checks:
-            details = check.details
-            if details.get("trusted_pytorch_archive_context") is not True:
-                continue
-            data_pkl_member = details.get("pickle_filename")
-            storage_key = details.get("pytorch_storage_key")
-            if isinstance(data_pkl_member, str) and isinstance(storage_key, str):
-                referenced_keys_by_data_pkl.setdefault(data_pkl_member, set()).add(storage_key)
-
-        for data_pkl_member, storage_keys in storage_keys_by_data_pkl.items():
-            prefix = data_pkl_member[: -len("data.pkl")]
-            referenced_keys = referenced_keys_by_data_pkl.get(data_pkl_member, set())
-            trusted_blobs.update(f"{prefix}data/{storage_key}" for storage_key in storage_keys & referenced_keys)
-        return trusted_blobs
-
     @staticmethod
     def _storage_blob_members_from_data_pkl_members(storage_keys_by_data_pkl: dict[str, set[str]]) -> set[str]:
         return {
@@ -8902,9 +8851,12 @@ class PyTorchZipScanner(BaseScanner):
                 elif opcode_name == "DUP":
                     if stack:
                         stack.append(stack[-1])
-                elif opcode_name == "BINPERSID":
-                    pid = stack.pop() if stack else None
-                    storage_ref = storage_ref_from_pid(pid)
+                elif opcode_name in {"BINPERSID", "PERSID"}:
+                    if opcode_name == "BINPERSID":
+                        pid = stack.pop() if stack else None
+                        storage_ref = storage_ref_from_pid(pid)
+                    else:
+                        storage_ref = cls._storage_ref_from_protocol0_persid_text(arg, trusted_storage_keys)
                     if storage_ref is not None:
                         storage_key, ref = storage_ref
                         referenced_keys.add(storage_key)
@@ -8913,25 +8865,13 @@ class PyTorchZipScanner(BaseScanner):
                             all_persistent_ids_are_pytorch_storage = False
                         storage_refs_by_key[storage_key] = ref
                     else:
-                        structural_key = structural_storage_key_from_pid(pid)
-                        if structural_key is not None:
-                            referenced_keys.add(structural_key)
-                        all_persistent_ids_are_pytorch_storage = False
-                    stack.append(None)
-                elif opcode_name == "PERSID":
-                    storage_ref = cls._storage_ref_from_protocol0_persid_text(arg, trusted_storage_keys)
-                    if storage_ref is not None:
-                        storage_key, ref = storage_ref
-                        referenced_keys.add(storage_key)
-                        existing_ref = storage_refs_by_key.get(storage_key)
-                        if existing_ref is not None and existing_ref != ref:
-                            all_persistent_ids_are_pytorch_storage = False
-                        storage_refs_by_key[storage_key] = ref
-                    else:
-                        structural_key = cls._structural_storage_key_from_protocol0_persid_text(
-                            arg,
-                            trusted_storage_keys,
-                        )
+                        if opcode_name == "BINPERSID":
+                            structural_key = structural_storage_key_from_pid(pid)
+                        else:
+                            structural_key = cls._structural_storage_key_from_protocol0_persid_text(
+                                arg,
+                                trusted_storage_keys,
+                            )
                         if structural_key is not None:
                             referenced_keys.add(structural_key)
                         all_persistent_ids_are_pytorch_storage = False
@@ -9280,19 +9220,16 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
         path: str,
         *,
-        non_executable_pytorch_storage_data_pkl_members: dict[str, set[str]] | None = None,
+        non_executable_pytorch_storage_data_pkl_members: dict[str, set[str]],
     ) -> None:
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
         executable_probe_failures: list[dict[str, str]] = []
         member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
-        if non_executable_pytorch_storage_data_pkl_members is None:
-            trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members(safe_entries, result)
-        else:
-            trusted_storage_blob_members = self._storage_blob_members_from_data_pkl_members(
-                non_executable_pytorch_storage_data_pkl_members
-            )
+        trusted_storage_blob_members = self._storage_blob_members_from_data_pkl_members(
+            non_executable_pytorch_storage_data_pkl_members
+        )
         entries_by_normalized_name = {
             self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
         }
@@ -10947,51 +10884,6 @@ class PyTorchZipScanner(BaseScanner):
 
     def _analyze_pickle_imports(self, pickle_result: ScanResult) -> dict[str, Any]:
         """Analyze pickle imports to distinguish legitimate vs malicious patterns"""
-        # Standard PyTorch imports expected in benign state-dict archives.
-        # Keep these as exact callable/class references so lookalikes such as
-        # ``torch._utils.evil`` or ``collections.OrderedDictEvil`` are not
-        # downgraded by substring matching.
-        legitimate_imports = {
-            "collections.OrderedDict",
-            "numpy.dtype",
-            "numpy.ndarray",
-            "numpy.core.multiarray.scalar",
-            "numpy._core.multiarray.scalar",
-            "torch._rebuild_tensor",
-            "torch._rebuild_tensor_v2",
-            "torch.BFloat16Storage",
-            "torch.BoolStorage",
-            "torch.ByteStorage",
-            "torch.CharStorage",
-            "torch.ComplexDoubleStorage",
-            "torch.ComplexFloatStorage",
-            "torch.DoubleStorage",
-            "torch.FloatStorage",
-            "torch.HalfStorage",
-            "torch.IntStorage",
-            "torch.LongStorage",
-            "torch.QInt32Storage",
-            "torch.QInt8Storage",
-            "torch.QUInt2x4Storage",
-            "torch.QUInt4x2Storage",
-            "torch.QUInt8Storage",
-            "torch.ShortStorage",
-            "torch.Storage",
-            "torch.UntypedStorage",
-            "torch._tensor._rebuild_from_type_v2",
-            "torch._utils._rebuild_device_tensor_from_numpy",
-            "torch._utils._rebuild_meta_tensor_no_storage",
-            "torch._utils._rebuild_nested_tensor",
-            "torch._utils._rebuild_parameter",
-            "torch._utils._rebuild_parameter_with_state",
-            "torch._utils._rebuild_qtensor",
-            "torch._utils._rebuild_sparse_tensor",
-            "torch._utils._rebuild_tensor",
-            "torch._utils._rebuild_tensor_v2",
-            "torch._utils._rebuild_tensor_v3",
-            "torch._utils._rebuild_wrapper_subclass",
-        }
-
         # Malicious imports that indicate actual attack. Match exact references
         # or dotted children only; unknown imports are handled as suspicious.
         malicious_imports = {
@@ -11049,7 +10941,7 @@ class PyTorchZipScanner(BaseScanner):
                     found_malicious.add(imp)
 
         # Determine if all imports are legitimate
-        all_legitimate = bool(found_imports) and all(imp in legitimate_imports for imp in found_imports)
+        all_legitimate = bool(found_imports) and all(imp in _PYTORCH_BENIGN_PICKLE_IMPORTS for imp in found_imports)
 
         return {
             "total_imports": len(found_imports),
