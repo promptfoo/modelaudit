@@ -939,11 +939,17 @@ def _outside_fence_examples_execute_script(payload: bytes, regions: list[tuple[i
 
 
 def _sql_documentation_domain_spans(source: bytes) -> list[tuple[int, int]]:
-    """Find hosts in full-line comments and literal LIKE predicates in a fenced query."""
+    """Find hosts in line comments and literal LIKE predicates in a fenced query."""
     spans: list[tuple[int, int]] = []
-    # A comment can contain quotes. Stop at ambiguous SQL syntax outside a comment
-    # so a later line in a multiline literal cannot be mistaken for documentation.
-    for token in re.finditer(rb"""(?m)(?P<comment>^[ \t]*--[ \t]+[^\r\n]*)|['"`$\\#\[\]]|--|/\*""", source):
+    # Consume standard quoted strings whole; a "--" inside them is data. Stop at
+    # backslash escapes or dialect-specific quoting (including Oracle q'...').
+    for token in re.finditer(
+        rb"""(?P<comment>--[ \t]+[^\r\n]*)|\bN?Q'|(?P<string>'(?:[^'\\]|'')*')|['"`$\\#\[\]]|--|/\*""",
+        source,
+        re.IGNORECASE,
+    ):
+        if token["string"] is not None:
+            continue
         if token["comment"] is None:
             break
         spans.extend(match.span() for match in NetworkCommDetector.DOMAIN_PATTERN.finditer(source, *token.span()))

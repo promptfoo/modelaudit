@@ -6620,6 +6620,12 @@ def test_documented_sql_like_domains_are_informational(tmp_path: Path) -> None:
     ("query", "active"),
     [
         ("SELECT 1;\n  -- see publisher.dev for more information", False),
+        ("SELECT 1; -- See publisher.dev for documentation.", False),
+        ("SELECT 'it''s a literal'; -- See publisher.dev for documentation.", False),
+        ("SELECT concat(' -- publisher.dev for documentation', 'other');", True),
+        ("SELECT q'[first quote' -- publisher.dev]' FROM dual;", True),
+        (r"SELECT 'first quote\' -- publisher.dev';", True),
+        ("SELECT 1; -- publisher.dev\nSELECT dblink('host=publisher.dev', 'SELECT 1');", True),
         ("-- see publisher.dev\nSELECT dblink('host=publisher.dev', 'SELECT 1');", True),
         ("SELECT custom_function('first line\n-- publisher.dev\nlast line');", True),
     ],
