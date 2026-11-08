@@ -113,7 +113,7 @@ def _same_displayed_destination(label: bytes, target: bytes) -> bool:
 
 
 def model_card_policy_evidence(
-    payload: bytes, harmful_claim: re.Pattern[bytes], is_passive: Callable[[bytes, int], bool]
+    payload: bytes, harmful_claim: re.Pattern[bytes], actionability: Callable[[bytes, int], bool | None]
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]], frozenset[int]]:
     if len(payload) > MAX_DOCUMENTATION_BYTES:
         return [], [], frozenset()
@@ -121,8 +121,10 @@ def model_card_policy_evidence(
     active_spans: list[tuple[int, int]] = []
 
     def record(source: bytes, offset: int, position: int, left: int, right: int) -> None:
-        destination = spans if is_passive(source, position) else active_spans
-        destination.append((offset + left, offset + right))
+        active = actionability(source, position)
+        if active is not None:
+            destination = active_spans if active else spans
+            destination.append((offset + left, offset + right))
 
     for credit in _CREDIT.finditer(payload):
         if credit.start() == 0 or payload.endswith((b"\n\n", b"\r\n\r\n"), 0, credit.start()):
@@ -155,7 +157,8 @@ def model_card_policy_evidence(
         positions.update(
             start + item.start("term")
             for item in _MALWARE_ITEM.finditer(body, heading.end(), end)
-            if item["negation"] or (lead and lead.end() <= item.start())
+            if (item["negation"] or (lead and lead.end() <= item.start()))
+            and actionability(body, item.start("term")) is False
         )
     if positions and (harmful_claim.search(payload) or harmful_claim.search(body)):
         positions.clear()

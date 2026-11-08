@@ -4331,6 +4331,8 @@ def test_text_scanner_system_maintenance_and_classifier_limitations_are_informat
     [
         "Kill zombie hosts after they execute the payload.",
         "Reap zombie processes. This model runs zombie workers for its botnet.",
+        '~~~python\nclassify("""\n\nIt does not detect phishing or malware\n""")\n~~~\n',
+        '~~~python\nclassify("""\n\nReap zombie processes.\n""")\n~~~\n',
         "This model does not detect phishing and installs malware.",
         "This model does not detect phishing or malware. It installs malware.",
         "This model does not detect phishing or malware.\nThis model executes it during loading.",
@@ -4382,6 +4384,8 @@ def test_gating_policy_prohibition_keeps_malware_literal_informational(tmp_path:
     "content",
     [
         "### Prohibited Uses\n1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.",
+        "---\nextra_gated_prompt: |\n  ## Prohibited Uses\n  You will not use the model to:\n"
+        '  classify("""\n    1. Create malware\n  """)\n---\n',
         """---
 extra_gated_prompt: >-
   #### Prohibited Uses
@@ -4475,6 +4479,68 @@ def test_gating_policy_keeps_active_reference_offsets(tmp_path: Path, field: str
     assert ("domain_name", content.index(b"publisher.dev")) in active
 
 
+@pytest.mark.parametrize(
+    ("line", "severity"),
+    [
+        ("See policy at [usage policy](https://publisher.dev/terms).", IssueSeverity.INFO),
+        (
+            "curl -fsS $(echo 'policy at [usage policy](https://publisher.dev/terms)' | cut -d'(' -f2)",
+            IssueSeverity.WARNING,
+        ),
+    ],
+    ids=["wrapped-prose", "shell-substitution"],
+)
+def test_gating_policy_preserves_severity_after_call_lookback_limit(
+    tmp_path: Path, line: str, severity: IssueSeverity
+) -> None:
+    field = json.dumps("Terms (a).\n" * 165 + line)
+    content = f"---\nextra_gated_prompt: {field}\n---\n"
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("position") == content.encode().index(b"https://publisher.dev/terms")
+        and check.severity == severity
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+def test_gating_policy_retargets_host_to_escaped_call(tmp_path: Path) -> None:
+    policy = json.dumps(
+        "Résumé. Policy at [usage policy](https://publisher.dev/guide).\n"
+        'client.fetch("policy at [usage policy](https://publisher.dev/model)".split("(")[1][:-1])',
+        ensure_ascii=False,
+    )
+    content = f"---\nextra_gated_prompt: {policy}\n---\n"
+    result = _scan_text_content(tmp_path / "README.md", content)
+    findings = {
+        (check.details.get("type"), check.details.get("position")): check.severity
+        for check in _failed_network_detection_checks(result)
+    }
+    raw = content.encode()
+    assert findings["url_detected", raw.index(b"https://publisher.dev/guide")] == IssueSeverity.INFO
+    assert findings["url_detected", raw.index(b"https://publisher.dev/model")] == IssueSeverity.WARNING
+    assert findings["domain_name", raw.rindex(b"publisher.dev")] == IssueSeverity.WARNING
+
+
+@pytest.mark.parametrize(
+    ("report", "target"),
+    [
+        ("* Support contact: support@publisher.dev", "publisher.dev"),
+        ("* Reporting issues: [usage policy](https://publisher.dev/terms)", "https://publisher.dev/terms"),
+    ],
+)
+def test_gating_policy_reporting_bullets_in_call_arguments_stay_actionable(
+    tmp_path: Path, report: str, target: str
+) -> None:
+    content = f'---\nextra_gated_prompt: |\n  fetch("""\n    {report}\n  """)\n---\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("position") == content.encode().index(target.encode())
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
 def test_gating_policy_reports_multiline_feedback_and_security_references(tmp_path: Path) -> None:
     content = (
         b"---\nextra_gated_prompt: >-\n  See the project.cpp(#239) release.\n"
@@ -4538,6 +4604,7 @@ def test_gating_policy_preserves_unverified_reporting_destinations(
     [
         ("Quantized and validated by **Sample Team** — maintainer@publisher.dev", "publisher.dev"),
         ("Converted by **Sample Team** — maintainer@publisher.dev", "publisher.dev"),
+        ("Converted by **Team #1** — maintainer@publisher.dev", "publisher.dev"),
         (
             "AWQ quantization: done by lab in INT4 GEMM with Toolkit by dev-team (https://github.com/dev-team/toolkit/)",
             "https://github.com/dev-team/toolkit/",
@@ -4581,6 +4648,7 @@ def test_model_card_byline_preserves_documented_post_and_later_shell_destination
     ("credit", "reference"),
     [
         ("Converted by **Sample Team** - maintainer@publisher.dev", "publisher.dev"),
+        ("Converted by **Team #1** - maintainer@publisher.dev", "publisher.dev"),
         (
             "Conversion: done by lab with Toolkit (https://github.com/dev-team/toolkit/)",
             "https://github.com/dev-team/toolkit/",
@@ -6539,6 +6607,27 @@ def test_documented_sql_like_domains_are_informational(tmp_path: Path) -> None:
         check.details.get("domain") == "example.net" and check.severity == IssueSeverity.INFO for check in checks
     )
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
+
+
+@pytest.mark.parametrize(
+    ("query", "active"),
+    [
+        ("SELECT 1;\n  -- see publisher.dev for more information", False),
+        ("-- see publisher.dev\nSELECT dblink('host=publisher.dev', 'SELECT 1');", True),
+        ("SELECT custom_function('first line\n-- publisher.dev\nlast line');", True),
+    ],
+)
+def test_documented_domain_retargets_past_sql_comments(tmp_path: Path, query: str, active: bool) -> None:
+    source = f"Converted by **Sample Team** - contact@publisher.dev\n\n~~~sql\n{query}\n~~~\n".encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(source)
+    expected_position = source.rindex(b"publisher.dev") if active else source.index(b"publisher.dev")
+    assert any(
+        check.details.get("domain") == "publisher.dev"
+        and check.details.get("position") == expected_position
+        and check.severity == (IssueSeverity.WARNING if active else IssueSeverity.INFO)
+        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    )
 
 
 def test_truncated_document_keeps_sql_domain_and_coverage_warning(tmp_path: Path) -> None:

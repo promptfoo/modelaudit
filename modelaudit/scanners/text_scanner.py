@@ -231,10 +231,7 @@ DOCUMENTATION_CODE_CALL_PATTERN = re.compile(
     rb"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$"
 )
 DOCUMENTATION_LINKED_BLOCKQUOTE = re.compile(rb"(?m)^ {0,3}>[ \t]+[^#\r\n\"'`]*?\]\(https?://[^()\s#\"'`]+\)[^\r\n]*$")
-# A prose sentence citing an issue as "Use project.cpp(#123) …" is not an open Python call.
-DOCUMENTATION_PROSE_ISSUE_REFERENCE = re.compile(
-    rb"(?im)^((?:see|use|using|refer to) +[\w./-]+\()#(?=\d+\)[ \w.,-]*\r?$)"
-)
+DOCUMENTATION_PARENTHESIZED_ISSUE = re.compile(r"#\d+(?:[ \t]+\w+)?\)")
 DOCUMENTATION_ISSUE_LABEL_HASH = re.compile(rb"\[#(?=\d+\]\(https?://[^()\s]+\))")
 DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
 DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
@@ -1152,8 +1149,6 @@ class TextScanner(BaseScanner):
             source = DOCUMENTATION_LINKED_BLOCKQUOTE.sub(
                 lambda line: DOCUMENTATION_ISSUE_LABEL_HASH.sub(b"[", line[0]), source
             )
-        if b"(#" in source:
-            source = DOCUMENTATION_PROSE_ISSUE_REFERENCE.sub(rb"\1", source)
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
@@ -1229,6 +1224,14 @@ class TextScanner(BaseScanner):
                         and (previous.string == ")" or (previous.string == "]" and previous_closed_subscript))
                     )
                     is_call = current.string == "(" and (name_starts_call or follows_callable_expression)
+                    if is_call and DOCUMENTATION_PARENTHESIZED_ISSUE.match(current.line, current.end[1]):
+                        # In prose, package.cpp(#123) cites an issue. Python would consume
+                        # the closing parenthesis as a comment and invent an open call.
+                        prose = re.match(r"(\w+)[ \t]+(\w+)\b", current.line)
+                        if prose and all(
+                            not keyword.iskeyword(word) and not keyword.issoftkeyword(word) for word in prose.groups()
+                        ):
+                            is_call = False
                     is_subscript = (
                         current.string == "["
                         and previous is not None
@@ -2813,12 +2816,11 @@ class TextScanner(BaseScanner):
             payload
         ):
             return False
-        if any(
-            match.start() <= position < match.end()
-            for match in DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN.finditer(line)
-        ):
-            return True
         absolute_position = finding["position"]
+        for match in DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN.finditer(line):
+            if match.start() <= position < match.end():
+                phrase_start = absolute_position - position + match.start()
+                return cls._documentation_policy_reference_actionability(payload, phrase_start) is False
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         if context_end < len(payload):
             return False
@@ -3846,7 +3848,11 @@ class TextScanner(BaseScanner):
         return deduplicated
 
     @classmethod
-    def _documentation_policy_reference_is_passive(cls, body: bytes, position: int) -> bool:
+    def _documentation_policy_reference_actionability(cls, body: bytes, position: int) -> bool | None:
+        """Return None when the bounded context cannot establish how the reference is used."""
+        # A bullet match can start before the indentation of a multiline argument.
+        while position < len(body) and body[position] in b" \t":
+            position += 1
         finding = {"position": position}
         if cls._finding_line_prefix_is_truncated(body, finding):
             # A folded paragraph can be longer than the code-context window.
@@ -3855,15 +3861,17 @@ class TextScanner(BaseScanner):
             if position - start > MAX_DOCUMENTATION_CALL_CONTEXT_BYTES or re.search(
                 rb"[^\w \t.,'-]|(?<![a-zA-Z])'|'(?![a-zA-Z])", body[start:position]
             ):
-                return False
+                return None
         parts = cls._finding_line_parts(body, finding)
-        return (
-            parts is not None
-            and not cls._documentation_line_is_code_shaped(*parts)
-            and cls._documentation_open_call_context_status(body, position) is False
-            and not cls._documentation_multiline_literal_contains_position(body, position)
-            and not cls._documentation_multiline_return_contains_position(body, position)
-        )
+        if parts is None:
+            return None
+        if (
+            cls._documentation_line_is_code_shaped(*parts)
+            or cls._documentation_multiline_literal_contains_position(body, position)
+            or cls._documentation_multiline_return_contains_position(body, position)
+        ):
+            return True
+        return cls._documentation_open_call_context_status(body, position)
 
     @classmethod
     def _downgrade_sidecar_network_findings(
@@ -3898,7 +3906,7 @@ class TextScanner(BaseScanner):
                     references, active_policy_spans, prohibited_terms = model_card_policy_evidence(
                         payload,
                         DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN,
-                        cls._documentation_policy_reference_is_passive,
+                        cls._documentation_policy_reference_actionability,
                     )
                     examples = (*examples, *references)
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:

@@ -938,14 +938,20 @@ def _outside_fence_examples_execute_script(payload: bytes, regions: list[tuple[i
     return _inline_examples_execute_script(payload, inline_regions)
 
 
-def _sql_comparison_domain_spans(source: bytes) -> list[tuple[int, int]]:
-    """Find domain literals on the right of a LIKE predicate in a fenced query."""
+def _sql_documentation_domain_spans(source: bytes) -> list[tuple[int, int]]:
+    """Find hosts in full-line comments and literal LIKE predicates in a fenced query."""
+    spans: list[tuple[int, int]] = []
+    # A comment can contain quotes. Stop at ambiguous SQL syntax outside a comment
+    # so a later line in a multiline literal cannot be mistaken for documentation.
+    for token in re.finditer(rb"""(?m)(?P<comment>^[ \t]*--[ \t]+[^\r\n]*)|['"`$\\#\[\]]|--|/\*""", source):
+        if token["comment"] is None:
+            break
+        spans.extend(match.span() for match in NetworkCommDetector.DOMAIN_PATTERN.finditer(source, *token.span()))
     if not re.match(rb"\s*(?:SELECT|WITH)\b", source, re.IGNORECASE):
-        return []
+        return spans
     # Dialect-specific quoting and comments can change where a literal begins.
     if re.search(rb'["`$\\#\[\]]|--|/\*', source):
-        return []
-    spans: list[tuple[int, int]] = []
+        return spans
     literals = re.finditer(rb"(?:(?P<like>\bI?LIKE)\s*)?'(?P<value>(?:[^']|'')*)'|'", source, re.IGNORECASE)
     for literal in literals:
         value = literal["value"]
@@ -1002,7 +1008,7 @@ def _routine_documentation_network_spans(
                 if language in SHELL_LANGUAGES:
                     examples = _shell_url_spans(source)
                 elif language == b"sql" and payload_complete:
-                    examples = _sql_comparison_domain_spans(source)
+                    examples = _sql_documentation_domain_spans(source)
             spans.extend((start + left, start + right) for left, right in examples)
         else:
             executes_script = True
