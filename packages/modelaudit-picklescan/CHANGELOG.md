@@ -35,6 +35,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject non-ASCII protocol 0 persistent IDs so bytes inside tensor storage cannot produce a nested persistent-ID finding from an invalid operand.
 - Refresh shared source snapshots before the first pickle report so earlier import-context changes do not cause false incomplete scans.
 - Preserve backslash pairs in protocol 0 Unicode operands so Template callbacks remain detectable.
 - Report incomplete coverage for unmodeled string-template mapping callbacks and unavailable frozen callable bodies, including Python class constructors and metaclass calls, preserving known dangerous callback findings.

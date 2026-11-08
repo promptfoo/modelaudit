@@ -325,10 +325,13 @@ pub(crate) fn parse_opcode(
             let frame_len = read_u64_len(payload, &mut cursor, limit, index, "frame")?;
             ("FRAME", ArgValue::UInt(frame_len))
         }
-        b'P' => (
-            "PERSID",
-            ArgValue::Text(read_line_text(payload, &mut cursor, limit)?),
-        ),
+        b'P' => {
+            let id = read_line_text(payload, &mut cursor, limit)?;
+            if !id.is_ascii() {
+                return Err(ParseError::new("protocol 0 persistent ID must be ASCII").at(index));
+            }
+            ("PERSID", ArgValue::Text(id))
+        }
         b'Q' => ("BINPERSID", ArgValue::None),
         _ => {
             return Err(ParseError::new(format!(

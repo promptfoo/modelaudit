@@ -250,9 +250,8 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
 }
 
 fn has_high_confidence_truncated_execution_prefix(value: &[u8]) -> bool {
-    let first_is_persid = parse_opcode(value, 0, value.len()).is_ok_and(|opcode| {
-        opcode.name == "PERSID" && opcode.arg.text(value).as_bytes().is_ascii()
-    });
+    let first_is_persid =
+        parse_opcode(value, 0, value.len()).is_ok_and(|opcode| opcode.name == "PERSID");
     first_is_persid
         || ((has_binary_pickle_prefix(value)
             || protocol0_global_or_inst_prefix_has_import_reference_lines(value))
