@@ -22,16 +22,6 @@ def malicious_reduce_payload() -> bytes:
     return pickle.dumps(SystemCommandPayload("echo rust parity", lambda: os.system), protocol=4)
 
 
-def raw_os_system_reduce_payload() -> bytes:
-    """Return a compact protocol-4 os.system REDUCE payload used by corpus QA."""
-    return b"\x80\x04cos\nsystem\n\x8c\x0cecho qa-noop\x85R."
-
-
-def raw_stack_global_eval_reduce_payload() -> bytes:
-    """Return a compact STACK_GLOBAL eval REDUCE payload used by corpus QA."""
-    return b"\x80\x04\x8c\x08builtins\x8c\x04eval\x93\x8c\x031+1\x85R."
-
-
 def generated_parity_payloads() -> list[ParityPayload]:
     """Build deterministic payloads that stress Python-vs-Rust report parity."""
     rng = random.Random(1337)

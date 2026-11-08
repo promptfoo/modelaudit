@@ -89,76 +89,57 @@ def _large_protocol0_first_operand_pickle_with_eval(operand_size: int = 70 * 102
     return b"V" + (b"A" * operand_size) + b"\n0cbuiltins\neval\nV" + source + b"\n\x85R."
 
 
-def _corrupt_zip_member_crc(zip_path: Path, member_index: int) -> None:
-    """Patch one ZIP member's local and central-directory CRC fields."""
+def _central_header_for_local_offset(data: bytearray, cursor: int, local_offset: int) -> int:
+    while cursor < len(data) and data[cursor : cursor + 4] == b"PK\x01\x02":
+        member_offset = struct.unpack_from("<I", data, cursor + 42)[0]
+        name_size, extra_size, comment_size = struct.unpack_from("<HHH", data, cursor + 28)
+        if member_offset == local_offset:
+            return cursor
+        cursor += 46 + name_size + extra_size + comment_size
+    raise AssertionError(f"Unable to locate central directory entry at offset {local_offset}")
+
+
+def _indexed_fixture_member(zip_path: Path, member_index: int) -> tuple[bytearray, int, int]:
     with zipfile.ZipFile(zip_path, "r") as zip_file:
         member_info = zip_file.infolist()[member_index]
-        central_directory_offset = zip_file.start_dir
+        directory_offset = zip_file.start_dir
+    return bytearray(zip_path.read_bytes()), member_info.header_offset, directory_offset
 
-    archive_bytes = bytearray(zip_path.read_bytes())
-    local_crc_offset = member_info.header_offset + 14
+
+def _corrupt_zip_member_crc(zip_path: Path, member_index: int) -> None:
+    """Patch one ZIP member's local and central-directory CRC fields."""
+    archive_bytes, local_offset, directory_offset = _indexed_fixture_member(zip_path, member_index)
+    local_crc_offset = local_offset + 14
     original_crc = struct.unpack_from("<I", archive_bytes, local_crc_offset)[0]
     corrupt_crc = (original_crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
     struct.pack_into("<I", archive_bytes, local_crc_offset, corrupt_crc)
 
-    cursor = central_directory_offset
-    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
-        local_header_offset = struct.unpack_from("<I", archive_bytes, cursor + 42)[0]
-        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
-        if local_header_offset == member_info.header_offset:
-            struct.pack_into("<I", archive_bytes, cursor + 16, corrupt_crc)
-            zip_path.write_bytes(archive_bytes)
-            return
-        cursor += 46 + filename_len + extra_len + comment_len
-
-    raise AssertionError(f"Unable to locate central directory entry at offset {member_info.header_offset}")
+    cursor = _central_header_for_local_offset(archive_bytes, directory_offset, local_offset)
+    struct.pack_into("<I", archive_bytes, cursor + 16, corrupt_crc)
+    zip_path.write_bytes(archive_bytes)
 
 
 def _mark_zip_member_encrypted(zip_path: Path, member_index: int) -> None:
     """Set the encrypted flag on one member so ZipFile.open requires a password."""
-    with zipfile.ZipFile(zip_path, "r") as zip_file:
-        member_info = zip_file.infolist()[member_index]
-        central_directory_offset = zip_file.start_dir
-
-    archive_bytes = bytearray(zip_path.read_bytes())
-    local_flags_offset = member_info.header_offset + 6
+    archive_bytes, local_offset, directory_offset = _indexed_fixture_member(zip_path, member_index)
+    local_flags_offset = local_offset + 6
     local_flags = struct.unpack_from("<H", archive_bytes, local_flags_offset)[0]
     struct.pack_into("<H", archive_bytes, local_flags_offset, local_flags | 0x1)
 
-    cursor = central_directory_offset
-    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
-        local_header_offset = struct.unpack_from("<I", archive_bytes, cursor + 42)[0]
-        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
-        if local_header_offset == member_info.header_offset:
-            central_flags = struct.unpack_from("<H", archive_bytes, cursor + 8)[0]
-            struct.pack_into("<H", archive_bytes, cursor + 8, central_flags | 0x1)
-            zip_path.write_bytes(archive_bytes)
-            return
-        cursor += 46 + filename_len + extra_len + comment_len
-
-    raise AssertionError(f"Unable to locate central directory entry at offset {member_info.header_offset}")
+    cursor = _central_header_for_local_offset(archive_bytes, directory_offset, local_offset)
+    central_flags = struct.unpack_from("<H", archive_bytes, cursor + 8)[0]
+    struct.pack_into("<H", archive_bytes, cursor + 8, central_flags | 0x1)
+    zip_path.write_bytes(archive_bytes)
 
 
 def _patch_zip_member_compression_method(zip_path: Path, member_index: int, method: int) -> None:
     """Patch one ZIP member to use an unsupported compression method."""
-    with zipfile.ZipFile(zip_path, "r") as zip_file:
-        member_info = zip_file.infolist()[member_index]
-        central_directory_offset = zip_file.start_dir
+    archive_bytes, local_offset, directory_offset = _indexed_fixture_member(zip_path, member_index)
+    struct.pack_into("<H", archive_bytes, local_offset + 8, method)
 
-    archive_bytes = bytearray(zip_path.read_bytes())
-    struct.pack_into("<H", archive_bytes, member_info.header_offset + 8, method)
-
-    cursor = central_directory_offset
-    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
-        local_header_offset = struct.unpack_from("<I", archive_bytes, cursor + 42)[0]
-        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
-        if local_header_offset == member_info.header_offset:
-            struct.pack_into("<H", archive_bytes, cursor + 10, method)
-            zip_path.write_bytes(archive_bytes)
-            return
-        cursor += 46 + filename_len + extra_len + comment_len
-
-    raise AssertionError(f"Unable to locate central directory entry at offset {member_info.header_offset}")
+    cursor = _central_header_for_local_offset(archive_bytes, directory_offset, local_offset)
+    struct.pack_into("<H", archive_bytes, cursor + 10, method)
+    zip_path.write_bytes(archive_bytes)
 
 
 def _patch_zip_eocd_metadata(zip_path: Path, *, entry_count: int, directory_size: int | None = None) -> None:
