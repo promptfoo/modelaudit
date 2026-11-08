@@ -1181,6 +1181,10 @@ class TextScanner(BaseScanner):
             for current in tokens:
                 if current.type in ignored_token_types:
                     continue
+                # Backtick templates are opaque to the Python tokenizer. A
+                # delimiter in their text cannot prove an enclosing call closed.
+                if current.string == "`" and any(opening == "(" and is_call for opening, is_call in stack):
+                    return True
                 current_closed_subscript = False
                 if current.type == token.OP and current.string in "([{":
                     name_starts_call = (
@@ -1566,6 +1570,8 @@ class TextScanner(BaseScanner):
             if inline_span is not None and position - 1 == inline_span[0]:
                 reset_after_inline = all(opened < 0 and pending < 0 for opened, pending in states.values())
             for quote, (opened, pending) in states.items():
+                if value == ord("\r") and context[position : position + 1] == b"\n":
+                    continue  # Process a CRLF line ending once, at LF.
                 if quote == ord("'"):
                     states[quote] = (
                         pending if value == quote else (-1 if value in b"\r\n" else opened),
@@ -1631,7 +1637,7 @@ class TextScanner(BaseScanner):
             value = source[cursor]
             if escaped:
                 escaped = False
-                cursor += 1
+                cursor += 2 if source.startswith(b"\r\n", cursor) else 1
                 continue
             if value == ord("\\") and quote != ord("'"):
                 escaped = True
@@ -2362,7 +2368,7 @@ class TextScanner(BaseScanner):
             stripped = previous_line.strip()
             if stripped and not stripped.startswith(b"#"):
                 previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
-                if (current_indent == 0 and previous_indent == 0) or previous_indent < current_indent:
+                if previous_indent <= current_indent:
                     prefix = context[previous_line_start:]
                     is_call = False
                     if b"(" in prefix and not cls._documentation_prefix_is_markdown_table_row(prefix):

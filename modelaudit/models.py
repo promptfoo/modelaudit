@@ -201,13 +201,8 @@ def _record_has_security_severity(record: Any) -> bool:
     }
 
 
-def _checks_have_failed_security_findings(checks: list[Any]) -> bool:
-    for check in checks:
-        if _normalized_enum_value(_metadata_value(check, "status")) == CheckStatus.FAILED.value and (
-            _record_has_security_severity(check)
-        ):
-            return True
-    return False
+def _file_metadata_reports_scanner_failure(file_metadata: dict[str, Any]) -> bool:
+    return any(_metadata_value(metadata, "scanner_reported_failure") is True for metadata in file_metadata.values())
 
 
 class DetectorFinding(BaseModel):
@@ -670,6 +665,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         if (
             results_dict.get("has_errors", False)
             or incoming_has_incomplete_coverage
+            or _file_metadata_reports_scanner_failure(results_dict.get("file_metadata") or {})
             or (incoming_unsuccessful and not incoming_has_security_findings)
         ):
             self.success = False
@@ -751,11 +747,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             or _metadata_has_incomplete_coverage(metadata)
             or issues_have_incomplete_coverage
             or checks_have_incomplete_coverage
-            or (
-                scan_result.success is False
-                and _checks_have_failed_security_findings(scan_result.checks)
-                and not scan_result.has_errors
-            )
+            or metadata.get("scanner_reported_failure") is True
         ):
             self.success = False
 

