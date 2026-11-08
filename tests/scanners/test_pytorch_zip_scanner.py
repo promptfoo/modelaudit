@@ -14778,6 +14778,114 @@ def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path
     )
 
 
+# These archives predate __buffers__ and FORMAT_WITH_STRING_TABLE.
+_LEGACY_TORCHSCRIPT_DECLARATION = (
+    b'class Module(Module):\n  __parameters__ = ["weight", "bias", ]\n  __annotations__ = []\n'
+    b'  __annotations__["weight"] = Tensor\n  __annotations__["bias"] = Tensor\n'
+)
+_LEGACY_TORCHSCRIPT_DEBUG = bytes.fromhex("80024b005800000000710068004b008771014b004b0087868571022e")
+
+
+@pytest.mark.parametrize(("version", "compression"), [(1, zipfile.ZIP_STORED), (2, zipfile.ZIP_DEFLATED)])
+def test_pytorch_zip_legacy_torchscript_source_keeps_pickle_provenance(
+    tmp_path: Path, version: int, compression: int
+) -> None:
+    path = tmp_path / "legacy.ot"
+    declaration = (b"op_version_set = 1\n" if version == 1 else b"") + _LEGACY_TORCHSCRIPT_DECLARATION
+    payload = b"\x80\x02" + _metadata_newobj_build_payload("__torch__", "Module") + b"."
+    with zipfile.ZipFile(path, "w", compression=compression) as archive:
+        archive.writestr("model/version", f"{version}\n")
+        archive.writestr("model/data.pkl", payload)
+        archive.writestr("model/other.pkl", payload)
+        archive.writestr("model/code/__torch__.py", declaration)
+        archive.writestr("model/code/__torch__.py.debug_pkl", _LEGACY_TORCHSCRIPT_DEBUG)
+        archive.writestr("model/sidecar.py", b"import os\nos.system('id')\n")
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert {
+        check.details["file"]
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    } == {"model/sidecar.py"}
+    assert {
+        issue.details.get("pickle_filename")
+        for issue in result.issues
+        if issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "__torch__.Module"
+    } == {"model/data.pkl", "model/other.pkl"}
+
+    standalone = tmp_path / "standalone.pkl"
+    standalone.write_bytes(payload)
+    assert any(
+        issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "__torch__.Module"
+        for issue in scan_model_directory_or_file(str(standalone), cache_enabled=False).issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_name", "source", "debug"),
+    [
+        ("model/code/__torch__.py", _LEGACY_TORCHSCRIPT_DECLARATION + b"import os\n", _LEGACY_TORCHSCRIPT_DEBUG),
+        (
+            "model/code/__torch__.py",
+            _LEGACY_TORCHSCRIPT_DECLARATION.replace(b'"weight", "bias"', b'"bias", "weight"'),
+            _LEGACY_TORCHSCRIPT_DEBUG,
+        ),
+        ("model/code/__torch__.py", _LEGACY_TORCHSCRIPT_DECLARATION, _LEGACY_TORCHSCRIPT_DEBUG + b"."),
+        ("model/code/__torch__/other.py", _LEGACY_TORCHSCRIPT_DECLARATION, _LEGACY_TORCHSCRIPT_DEBUG),
+    ],
+    ids=["executable-source", "reordered-parameters", "noncanonical-debug", "noncanonical-path"],
+)
+def test_pytorch_zip_legacy_torchscript_source_requires_matching_declarations(
+    tmp_path: Path, source_name: str, source: bytes, debug: bytes
+) -> None:
+    path = tmp_path / "near-match.ot"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", b"2\n")
+        archive.writestr("model/data.pkl", pickle.dumps({}, protocol=2))
+        archive.writestr(source_name, source)
+        archive.writestr(f"{source_name}.debug_pkl", debug)
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert any(
+        check.name == "Python Code File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["file"] == source_name
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_legacy_torchscript_source_rejects_forged_size_and_crc(tmp_path: Path) -> None:
+    path = tmp_path / "truncated.ot"
+    name = "model/code/__torch__.py"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model/version", b"2\n")
+        archive.writestr("model/data.pkl", pickle.dumps({}, protocol=2))
+        archive.writestr(name, _LEGACY_TORCHSCRIPT_DECLARATION + b"import os\n")
+        archive.writestr(f"{name}.debug_pkl", _LEGACY_TORCHSCRIPT_DEBUG)
+        # Both headers describe the benign prefix, but the full compressed stream includes the import.
+        entry = archive.getinfo(name)
+        entry.file_size = len(_LEGACY_TORCHSCRIPT_DECLARATION)
+        entry.CRC = zlib.crc32(_LEGACY_TORCHSCRIPT_DECLARATION)
+    with path.open("r+b") as stream:
+        stream.seek(entry.header_offset + 14)
+        stream.write(struct.pack("<III", entry.CRC, entry.compress_size, entry.file_size))
+    with zipfile.ZipFile(path) as archive:
+        assert archive.read(name) == _LEGACY_TORCHSCRIPT_DECLARATION
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert any(
+        check.name == "Python Code File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["file"] == name
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "scripted.pt", prefix="archive")
     debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
