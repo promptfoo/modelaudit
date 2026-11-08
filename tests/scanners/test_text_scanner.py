@@ -1821,8 +1821,9 @@ def test_documented_issue_label_does_not_open_a_call_around_later_link(tmp_path:
     "content",
     [
         """client.fetch('see <a href="https://evil.example/payload.sh">download</a>')""",
-        "client.fetch(  # [#12](https://tracker.example.org/issues/12))\n"
-        "    '[download](https://evil.example/payload.sh)'\n)",
+        """client.fetch(  # [#12](https://tracker.example.org/issues/12))
+    '[download](https://evil.example/payload.sh)'
+)""",
     ],
 )
 def test_html_and_issue_citations_preserve_actual_enclosing_calls(tmp_path: Path, content: str) -> None:
@@ -4311,12 +4312,15 @@ def test_text_scanner_classifier_and_process_prose_preserves_actionable_occurren
 @pytest.mark.parametrize(
     "card",
     [
-        "---\nextra_gated_prompt: >-\n"
-        "  #### Prohibited Uses\n\n"
-        "  You agree you will not use, or allow others to use, the package to:\n"
-        "    1. Violate the following restrictions:\n"
-        "       2. Create, generate, or facilitate the creation of malicious code, malware, or computer viruses.\n"
-        "---\n",
+        """---
+extra_gated_prompt: >-
+  #### Prohibited Uses
+
+  You agree you will not use, or allow others to use, the package to:
+    1. Violate the following restrictions:
+       2. Create, generate, or facilitate the creation of malicious code, malware, or computer viruses.
+---
+""",
         r"""---
 extra_gated_prompt: "Usage agreement for the \"Package\".\n\
   #### Prohibited Uses\nYou agree you will not use, or allow others to use, the package to:\n\
@@ -4345,10 +4349,14 @@ def test_gating_policy_prohibition_keeps_malware_literal_informational(tmp_path:
     "content",
     [
         "### Prohibited Uses\n1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.",
-        "---\nextra_gated_prompt: >-\n  #### Prohibited Uses\n"
-        "  You agree you will not use, or allow others to use, this model to:\n"
-        "    1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.\n"
-        "---\nThis model installs malware during initialization.\n",
+        """---
+extra_gated_prompt: >-
+  #### Prohibited Uses
+  You agree you will not use, or allow others to use, this model to:
+    1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.
+---
+This model installs malware during initialization.
+""",
     ],
 )
 def test_gating_policy_prohibition_requires_context_and_preserves_active_claim(tmp_path: Path, content: str) -> None:
