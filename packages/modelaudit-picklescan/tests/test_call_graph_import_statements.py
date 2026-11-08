@@ -52,6 +52,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _create_module_dir(tmp_path: Path) -> Path:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    return module_dir
+
+
+def _module_dir_and_marker_path(tmp_path: Path, marker_name: str) -> tuple[Path, Path]:
+    module_dir = _create_module_dir(tmp_path)
+    return module_dir, tmp_path / marker_name
+
+
+def _prepend_module_dir_and_clear_caches(monkeypatch: pytest.MonkeyPatch, module_dir: Path) -> None:
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+
+def _has_callable_invocation(report: PickleReport, module: str, name: str, positional_arg_count: int) -> bool:
+    return any(
+        invocation.get("module") == module
+        and invocation.get("name") == name
+        and invocation.get("positional_arg_count") == positional_arg_count
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
 def _args_tuple(*arg_operands: bytes) -> bytes:
     if not arg_operands:
         return b")"
@@ -445,14 +471,11 @@ def test_shared_source_sensitive_caches_refreshes_between_outer_scopes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_rewritten_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
 
     try:
@@ -480,14 +503,11 @@ def test_shared_source_sensitive_caches_refreshes_changed_source_within_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_changed_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo changed"))
 
     try:
@@ -512,14 +532,11 @@ def test_shared_source_sensitive_caches_fails_closed_when_final_validation_obser
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_inflight_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo inflight"))
 
     try:
@@ -556,14 +573,11 @@ def test_shared_source_sensitive_caches_fails_closed_after_mid_report_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_scoped_mid_report_call_graph_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo mid-report"))
 
     try:
@@ -1975,9 +1989,7 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
     monkeypatch: pytest.MonkeyPatch,
     function_name: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "nested_body_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "nested_body_marker")
     command_args = (sys.executable, str(marker))
     module_name = "modelaudit_fp_probe_nested_body"
     (module_dir / f"{module_name}.py").write_text(
@@ -2021,9 +2033,7 @@ def test_scan_bytes_does_not_treat_newobj_as_init_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "newobj_init_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "newobj_init_marker")
     command = f"{sys.executable} -c \"from pathlib import Path; Path({str(marker)!r}).write_text('owned')\""
     module_name = "modelaudit_fp_probe_newobj_init"
     (module_dir / f"{module_name}.py").write_text(
@@ -2068,8 +2078,7 @@ def test_scan_bytes_preserves_nested_signature_execution_calls(
     monkeypatch: pytest.MonkeyPatch,
     function_name: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_nested_signature"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\n"
@@ -2149,8 +2158,7 @@ def test_call_graph_keeps_module_dict_dotted_lookup_clean(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_dict_dunder_getattr"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
@@ -2174,8 +2182,7 @@ def test_call_graph_models_missing_dotted_dunder_module_getattr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_missing_dunder_getattr"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
@@ -3122,8 +3129,7 @@ def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_source_available_meta_path_probe"
     (module_dir / f"{module_name}.py").write_text("def invoke(command):\n    return command\n", encoding="utf-8")
     marker = tmp_path / "meta_path_called"
@@ -3151,8 +3157,7 @@ def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
 
 
 def test_call_graph_fails_closed_for_meta_path_finder_installed_before_import(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_preimport_meta_path_probe"
     (module_dir / f"{module_name}.py").write_text(
         "def invoke(command):\n    return command\n",
@@ -3320,8 +3325,7 @@ def test_call_graph_keeps_path_extension_modules_analyzable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name = "modelaudit_tp_extension_module_probe"
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not imported")
     monkeypatch.syspath_prepend(str(module_dir))
     _clear_call_graph_caches()
@@ -3535,8 +3539,7 @@ def test_call_graph_does_not_invoke_custom_path_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name = "modelaudit_tp_uncached_path_hook_probe"
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / f"{module_name}.py").write_text("def invoke(command):\n    return command\n", encoding="utf-8")
     marker = tmp_path / "path_hook_called"
 
@@ -3562,8 +3565,7 @@ def test_call_graph_rejects_path_hook_with_spoofed_standard_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name = "modelaudit_tp_spoofed_path_hook_probe"
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / f"{module_name}.py").write_text("def invoke():\n    return None\n", encoding="utf-8")
     marker = tmp_path / "spoofed_path_hook_called"
 
@@ -3640,8 +3642,7 @@ def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_bytecode_only_call_graph_source"
     source_path = module_dir / f"{module_name}.py"
     source_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
@@ -3698,17 +3699,14 @@ def test_startup_hook_write_call_graph_refreshes_after_source_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_rewritten_startup_hook_source"
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text(
         "def open_payload(path):\n    return path\n\ndef write_payload(handle, value):\n    return value\n",
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     import_references = (
         {"module": module_name, "name": "open_payload"},
         {"module": module_name, "name": "write_payload"},
@@ -4346,8 +4344,7 @@ def test_trusted_mailbox_constructor_remains_startup_hook_opener(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_mailbox_startup_writer"
     (module_dir / f"{module_name}.py").write_text(
         "def write_payload(handle, value):\n    return handle.write(value)\n",
@@ -4406,16 +4403,13 @@ def test_zero_arg_trusted_mailbox_constructor_is_not_startup_hook_opener(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_mailbox_zero_arg_startup_writer"
     (module_dir / f"{module_name}.py").write_text(
         "def write_payload(handle, value):\n    return handle.write(value)\n",
         encoding="utf-8",
     )
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     invocations = (
         {
             "opcode": "REDUCE",
@@ -4468,8 +4462,7 @@ def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / "torch.py").write_text(
         "import os\n\ndef device(command):\n    os.system(command)\n    return command\n",
         encoding="utf-8",
@@ -4495,8 +4488,7 @@ def test_scan_bytes_fails_closed_when_shadowed_torch_extension_analysis_hits_ali
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / "torch.py").write_text(
         """\
 import os
@@ -4601,8 +4593,7 @@ def test_call_graph_analyzes_shadowed_torch_storage_persistent_id_reference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     (module_dir / "torch.py").write_text(
         "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
         encoding="utf-8",
@@ -4636,8 +4627,7 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "modelaudit_tp_probe_unknown_newobj_setstate"
     (module_dir / f"{module_name}.py").write_text(
         "import os\n\n"
@@ -4733,8 +4723,7 @@ def test_scan_bytes_blocks_site_customization_import_execution_rce(
     module_name: str,
     marker_content: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     marker = tmp_path / f"{module_name}_marker"
     (module_dir / f"{module_name}.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text({marker_content!r})\n",
@@ -6328,9 +6317,7 @@ def test_scan_bytes_blocks_weakref_materializer_call_iterator_consumption_rce(
     expected_type: str,
     expected_len: int,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "weakref_materializer_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "weakref_materializer_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -6780,9 +6767,7 @@ def test_scan_bytes_blocks_weakref_method_descriptor_call_iterator_consumption_r
     payload: bytes,
     setup_code: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "weakref_method_descriptor_call_iterator_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "weakref_method_descriptor_call_iterator_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7339,9 +7324,7 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.parametrize("name", ["nlargest", "nsmallest"])
 def test_scan_bytes_blocks_heapq_key_callback_rce(tmp_path: Path, name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "heapq_key_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "heapq_key_callback_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7402,9 +7385,7 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.parametrize("name", ["nlargest", "nsmallest"])
 def test_scan_bytes_keeps_heapq_empty_iterable_key_callback_lazy(tmp_path: Path, name: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "heapq_empty_key_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "heapq_empty_key_callback_marker")
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7753,9 +7734,7 @@ def test_scan_bytes_blocks_re_scanner_action_callback_rce(
     flags_operand: bytes | None,
     expected_result: tuple[list[str], str],
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_scanner_action_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_scanner_action_callback_marker")
     marker_content = "pydoc-owned-by-re-scanner"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -7838,9 +7817,7 @@ def test_scan_bytes_keeps_re_scanner_no_match_action_callback_lazy(
     value: str,
     expected_result: tuple[list[str], str],
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_scanner_no_match_action_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_scanner_no_match_action_callback_marker")
     marker_content = "pydoc-owned-by-re-scanner"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8241,9 +8218,7 @@ def test_scan_bytes_blocks_tokenize_readline_callback_rce(
     fallback_literal: str,
     expected_len: int,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "tokenize_readline_callback_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "tokenize_readline_callback_marker")
     marker_content = f"pydoc-owned-by-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8325,9 +8300,7 @@ def test_scan_bytes_keeps_tokenize_readline_callback_lazy(
     line_values_literal: str,
     fallback_literal: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "tokenize_readline_lazy_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "tokenize_readline_lazy_marker")
     marker_content = f"pydoc-owned-by-{name}"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -8640,9 +8613,7 @@ def test_scan_bytes_keeps_mapping_wrapper_plain_dict_lookup_clean(
 
 
 def test_scan_bytes_keeps_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "chainmap_shadowed_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "chainmap_shadowed_defaultdict_marker")
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
@@ -8881,9 +8852,7 @@ def test_scan_bytes_keeps_non_lookup_str_format_defaultdict_cases_clean(
 
 
 def test_scan_bytes_keeps_str_format_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_chainmap_shadowed_defaultdict_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_chainmap_shadowed_defaultdict_marker")
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
@@ -9359,9 +9328,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_keeps_str_format_oversized_decimal_chainmap_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_oversized_decimal_chainmap_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_oversized_decimal_chainmap_marker")
     oversized_decimal_key = str(2**64)
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -9451,9 +9418,7 @@ def test_scan_bytes_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(
 
 @pytest.mark.skipif(sys.version_info >= (3, 12), reason="newer Unicode decimal digit is supported from Python 3.12")
 def test_scan_bytes_keeps_str_format_newer_unicode_decimal_chainmap_lookup_clean(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_clean_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "str_format_newer_unicode_decimal_chainmap_clean_marker")
     newer_decimal_key = "\U00011f50"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -9653,9 +9618,7 @@ def _assert_template_raw_unicode_lookup(
     expected_result: str,
     lookup: bool,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "unicode_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "unicode_factory_marker")
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
@@ -9939,9 +9902,7 @@ assert pickle.loads(payload) == (True if method_name == "Template.is_valid" else
 def test_scan_bytes_detects_uncached_template_pattern_import(
     tmp_path: Path, method_name: str, unknown_mapping: bool, receiver_prefix: bool, alias_module: str
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "re_import_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "re_import_marker")
     (module_dir / "re.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
         "raise RuntimeError('shadow-re-imported')\n"
@@ -10283,8 +10244,7 @@ def test_first_matching_path_preserves_later_partial_sink_after_earlier_limit() 
 )
 @pytest.mark.parametrize("shape", ["direct", "wrapped", "deep"])
 def test_template_authentication_error_preserves_sibling_sink(tmp_path: Path, method_name: str, shape: str) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_name = "template_sibling_fixture"
     template_call = f"string.{method_name}(string.Template(''))"
 
@@ -10668,9 +10628,7 @@ assert marker.read_text() == "factory-called"
 def test_template_cached_regex_program_and_data_are_authenticated(
     tmp_path: Path, method_name: str, customization: str
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "regex_factory_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "regex_factory_marker")
     scan_marker = tmp_path / "regex_inspection_marker"
     (module_dir / "pydoc.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('factory-called')\n"
@@ -11709,9 +11667,7 @@ def test_scan_bytes_keeps_formatter_private_vformat_defaultdict_without_live_fie
 
 
 def test_scan_bytes_blocks_ipaddress_format_protocol_dispatch_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "ipaddress_format_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "ipaddress_format_marker")
     marker_content = "re-owned"
     (module_dir / "re.py").write_text(
         "from pathlib import Path\n"
@@ -11738,12 +11694,7 @@ def test_scan_bytes_blocks_ipaddress_format_protocol_dispatch_import_rce(tmp_pat
         "IPv4Address.__format__",
         "builtins.__import__",
     )
-    assert any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
     assert not marker.exists()
     child_code = """
@@ -11776,9 +11727,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_ipaddress_str_format_protocol_dispatch_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "ipaddress_str_format_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "ipaddress_str_format_marker")
     marker_content = "re-owned"
     (module_dir / "re.py").write_text(
         "from pathlib import Path\n"
@@ -11804,12 +11753,7 @@ def test_scan_bytes_blocks_ipaddress_str_format_protocol_dispatch_import_rce(tmp
         "IPv4Address.__format__",
         "builtins.__import__",
     )
-    assert any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
     assert not marker.exists()
     child_code = """
@@ -11847,12 +11791,7 @@ def test_scan_bytes_keeps_ipaddress_str_format_without_live_fields_clean() -> No
     report = scan_bytes(payload, source="ipaddress-str-format-no-live-field.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
 
 def test_scan_bytes_keeps_ipaddress_str_format_bytes_receiver_clean() -> None:
@@ -11861,18 +11800,11 @@ def test_scan_bytes_keeps_ipaddress_str_format_bytes_receiver_clean() -> None:
     report = scan_bytes(payload, source="ipaddress-str-format-bytes-receiver.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "ipaddress"
-        and invocation.get("name") == "IPv4Address.__format__"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert not _has_callable_invocation(report, "ipaddress", "IPv4Address.__format__", 1)
 
 
 def test_scan_bytes_blocks_platform_processor_get_dynamic_fallback_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "processor_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "processor_marker")
     marker_content = "processor-owned"
     (module_dir / "subprocess.py").write_text(
         "from pathlib import Path\n"
@@ -11933,9 +11865,7 @@ if marker.read_text() != marker_content:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="platform.mac_ver proof depends on macOS/POSIX platform hooks")
 def test_scan_bytes_blocks_platform_mac_ver_wrapper_import_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "mac_ver_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "mac_ver_marker")
     marker_content = "plistlib-owned"
     (module_dir / "plistlib.py").write_text(
         "from pathlib import Path\n"
@@ -12059,9 +11989,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_pyio_open_code_warning_import_side_effect_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "warnings_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "warnings_marker")
     marker_content = "warnings-owned"
     target = tmp_path / "target.py"
     target.write_text("print('opened')\n", encoding="utf-8")
@@ -12083,12 +12011,7 @@ def test_scan_bytes_blocks_pyio_open_code_warning_import_side_effect_rce(tmp_pat
         "_open_code_with_warning",
         "builtins.__import__",
     )
-    assert any(
-        invocation.get("module") == "_pyio"
-        and invocation.get("name") == "_open_code_with_warning"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
+    assert _has_callable_invocation(report, "_pyio", "_open_code_with_warning", 1)
 
     no_arg_report = scan_bytes(
         _global_call_payload("_pyio", "_open_code_with_warning"),
@@ -12135,9 +12058,7 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_base64_main_import_side_effect_rce(tmp_path: Path) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "base64_getopt_marker"
+    module_dir, marker = _module_dir_and_marker_path(tmp_path, "base64_getopt_marker")
     marker_content = "getopt-owned"
     (module_dir / "getopt.py").write_text(
         "from pathlib import Path\n"
@@ -13737,13 +13658,10 @@ def _assert_rewritten_call_graph(
     dangerous_source: str,
     sink: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
+    module_dir = _create_module_dir(tmp_path)
     module_path = module_dir / f"{module_name}.py"
     module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
+    _prepend_module_dir_and_clear_caches(monkeypatch, module_dir)
     payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
 
     try:
