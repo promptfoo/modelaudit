@@ -4486,6 +4486,25 @@ def test_text_scanner_port_retarget_skips_longer_numbers(tmp_path: Path, later_p
         assert checks[0].details["position"] == (tmp_path / "README.md").read_bytes().rindex(b"23")
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("later_endpoint", [False, True])
+def test_port_findings_skip_css_and_timestamp_fields(tmp_path: Path, later_endpoint: bool, newline: bytes) -> None:
+    lines = [b'<td style="width:22%; font-size:23.5px">example</td>', b'updated = "2025-11-14T19:48:22Z"']
+    if later_endpoint:
+        lines.append(b'endpoint = "ssh://server:22"')
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(newline.join(lines) + newline)
+
+    result = TextScanner().scan(str(text_path))
+    checks = [check for check in result.checks if check.details.get("type") == "suspicious_port"]
+    if later_endpoint:
+        assert [(check.details["position"], check.severity) for check in checks] == [
+            (text_path.read_bytes().rindex(b"22"), IssueSeverity.WARNING)
+        ]
+    else:
+        assert not checks
+
+
 def test_text_scanner_port_retarget_exact_budget_ignores_longer_numbers() -> None:
     payload = b'SSH uses port 23.\nendpoint = "arxiv:2310.06825"\n'
     finding = {"type": "suspicious_port", "port": 23, "position": payload.index(b"23"), "severity": "MEDIUM"}
