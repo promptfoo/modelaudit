@@ -13202,6 +13202,60 @@ def test_scan_bytes_warns_on_unreviewed_submodule_of_allowlisted_package() -> No
     )
 
 
+@pytest.mark.parametrize(("text", "encoding"), [(b"abc", b"latin1"), ("☃".encode(), b"latin-1")])
+def test_latin1_reduce_records_the_requested_codec_and_call(text: bytes, encoding: bytes) -> None:
+    prefix = b"\x80\x02" + _global(b"_codecs", b"encode") + _binunicode(text) + _binunicode(encoding) + b"\x86"
+    report = scan_bytes(prefix + b"R.", source="encoding.pkl")
+
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
+    finding = next(f for f in report.findings if f.rule_code == "NON_ALLOWLISTED_GLOBAL")
+    assert finding.severity == Severity.WARNING
+    assert finding.details["requested_encoding"] == encoding.decode("ascii")
+    assert finding.details["latin1_reduce_position"] == len(prefix)
+    assert finding.details["position"] == 2
+    assert "requests Latin-1" in finding.message
+    assert "codec registry" in (finding.why or "")
+
+
+@pytest.mark.parametrize(
+    "operands",
+    [
+        _binunicode(b"data") + _binunicode(b"custom_encoder") + b"\x86",
+        _binunicode(b"latin1") + _binunicode(b"data") + b"\x86",
+        b"]" + _binunicode(b"latin1") + b"\x86",
+        _binunicode(b"data") + _binunicode(b"latin1") + _binunicode(b"replace") + b"\x87",
+        _binunicode(b"data") + _binunicode(b"latin1") + b"q\x000h\x00\x86",
+    ],
+)
+def test_codec_reduce_keeps_other_operands_reviewable(operands: bytes) -> None:
+    report = scan_bytes(b"\x80\x02" + _global(b"_codecs", b"encode") + operands + b"R.")
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
+    finding = next(f for f in report.findings if f.rule_code == "NON_ALLOWLISTED_GLOBAL")
+    assert finding.details.get("invoked") is True
+    assert "requested_encoding" not in finding.details
+    assert "Latin-1" not in finding.message
+
+
+@pytest.mark.parametrize("encodings", [(b"custom_encoder", b"latin1"), (b"latin1", b"custom_encoder")])
+def test_reused_codec_reference_identifies_the_witnessed_call(encodings: tuple[bytes, bytes]) -> None:
+    payload = b"\x80\x02" + _global(b"_codecs", b"encode") + b"q\x00"
+    call_positions = []
+    for index, encoding in enumerate(encodings):
+        if index:
+            payload += b"0h\x00"
+        payload += _binunicode(b"data") + _binunicode(encoding) + b"\x86"
+        call_positions.append(len(payload))
+        payload += b"R"
+    report = scan_bytes(payload + b".")
+
+    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.SUSPICIOUS)
+    finding = next(f for f in report.findings if f.rule_code == "NON_ALLOWLISTED_GLOBAL")
+    assert finding.message.startswith("Non-allowlisted pickle invocation of _codecs.encode.")
+    assert finding.details["latin1_reduce_position"] == call_positions[encodings.index(b"latin1")]
+    assert f"One REDUCE at byte {finding.details['latin1_reduce_position']}" in finding.message
+    assert "other uses" in (finding.why or "")
+
+
 def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
     payload = b"ccollections\nOrderedDict\n."
 

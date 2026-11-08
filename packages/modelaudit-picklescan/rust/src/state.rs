@@ -671,6 +671,24 @@ struct CallableInvocation {
     args: Vec<StackValue>,
 }
 
+impl CallableInvocation {
+    fn requested_latin1_encoding(&self, payload: &[u8]) -> Option<String> {
+        if self.op_name != "REDUCE" || self.positional_arg_count != Some(2) {
+            return None;
+        }
+        let [StackValue::TextSpan {
+            memo_read: false, ..
+        }, encoding @ StackValue::TextSpan {
+            memo_read: false, ..
+        }] = self.args.as_slice()
+        else {
+            return None;
+        };
+        direct_literal_text(encoding, payload, 7)
+            .filter(|name| matches!(name.as_str(), "latin1" | "latin-1"))
+    }
+}
+
 struct StaticGetattrReconstruction {
     target: GlobalRef,
     attribute_name: String,
@@ -7528,6 +7546,25 @@ impl<'a> ScanState<'a> {
             if !details.iter().any(|(key, _)| key == "invoked") {
                 details.push(("invoked".to_string(), DetailValue::Bool(true)));
             }
+            if symbol == "_codecs.encode"
+                && detail_usize(details, "latin1_reduce_position").is_none()
+            {
+                if let Some(name) = invocation.requested_latin1_encoding(self.payload) {
+                    let extra_bytes =
+                        "requested_encoding".len() + name.len() + "latin1_reduce_position".len();
+                    if self.non_allowlisted_global_import_bytes + extra_bytes
+                        > MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES
+                    {
+                        break;
+                    }
+                    self.non_allowlisted_global_import_bytes += extra_bytes;
+                    details.push(("requested_encoding".to_string(), DetailValue::String(name)));
+                    details.push((
+                        "latin1_reduce_position".to_string(),
+                        DetailValue::UInt(invocation.opcode_position as u64),
+                    ));
+                }
+            }
             break;
         }
     }
@@ -7843,6 +7880,19 @@ impl<'a> ScanState<'a> {
 
         for (symbol, position, details) in std::mem::take(&mut self.non_allowlisted_global_imports)
         {
+            if let Some(call_position) = detail_usize(&details, "latin1_reduce_position") {
+                if !called_global_keys.contains(&(symbol.clone(), position)) {
+                    self.add_finding(Finding {
+                        message: format!("Non-allowlisted pickle invocation of {symbol}. One REDUCE at byte {call_position} requests Latin-1 encoding"),
+                        severity: "warning",
+                        location: Some(format!("{} (pos {})", self.source, position)),
+                        rule_code: Some("NON_ALLOWLISTED_GLOBAL"),
+                        details,
+                        why: Some("Older checkpoints use this call to reconstruct bytes. The consumer's Python codec registry determines which encoder runs and can invoke application-defined code. Review other uses of this global separately."),
+                    });
+                }
+                continue;
+            }
             if called_global_keys.contains(&(symbol.clone(), position)) {
                 continue;
             }
