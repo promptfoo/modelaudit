@@ -28,6 +28,7 @@ MALICIOUS_STANDALONE_FIXTURES = (
 )
 BENIGN_STANDALONE_FIXTURES = (
     JINJA2_ASSETS_DIR / "standalone" / "benign_chat.j2",
+    JINJA2_ASSETS_DIR / "standalone" / "flint_chat_template.jinja",
     JINJA2_ASSETS_DIR / "standalone" / "suspicious_benign.template",
 )
 MALICIOUS_YAML_FIXTURES = (JINJA2_ASSETS_DIR / "yaml" / "malicious_config.yaml",)
