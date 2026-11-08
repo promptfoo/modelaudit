@@ -7507,10 +7507,13 @@ def test_scan_file_keeps_untrusted_storage_lookalikes_on_hidden_pickle_path(
         assert any(notice.code == expected_notice_code for notice in report.notices)
 
 
-def test_large_tensor_batches_validate_all_storage_ids_without_changing_discovery(tmp_path: Path) -> None:
+@pytest.mark.parametrize("record_count", [100, 2000])
+def test_large_tensor_batches_validate_all_storage_ids_without_changing_discovery(
+    tmp_path: Path, record_count: int
+) -> None:
     archive_path = tmp_path / "large-state.pt"
     records = []
-    for record in range(2000):
+    for record in range(record_count):
         fields = []
         for column in range(3):
             key = str(3 * record + column)
@@ -7538,7 +7541,22 @@ def test_large_tensor_batches_validate_all_storage_ids_without_changing_discover
 
 
 @pytest.mark.parametrize(
-    "defect", ["none", "size", "missing", "foreign-pid", "device", "second-stream", "truncated", "budget", "provenance"]
+    "defect",
+    [
+        "none",
+        "size",
+        "missing",
+        "foreign-pid",
+        "device",
+        "second-stream",
+        "truncated",
+        "budget",
+        "provenance",
+        "bytes-key",
+        "tuple-setitem",
+        "tuple-dict",
+        "spaced-global",
+    ],
 )
 def test_large_storage_pid_proof_requires_complete_archive_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
@@ -7548,9 +7566,16 @@ def test_large_storage_pid_proof_requires_complete_archive_evidence(
         monkeypatch.setattr(package_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES", 1)
     first = _pytorch_rebuild_tensor_v2_payload(key="0")[2:-1]
     last = _pytorch_rebuild_tensor_v2_reduce_expr(key="1", location="custom:0" if defect == "device" else "cpu")
+    if defect == "bytes-key":
+        last = last.replace(_short_binunicode(b"1"), b"C\x011")
+    if defect == "spaced-global":
+        first = first.replace(b"torch._utils\n", b"torch._utils \n")
     payload = b"\x80\x04}" + _short_binunicode(b"a") + first + b"s" + _short_binunicode(b"b") + last + b"s"
     if defect == "foreign-pid":
         payload += b"K\x01Q"
+    if defect in {"tuple-setitem", "tuple-dict"}:
+        repeated_tuple = b"K\x01\x85" + b"2\x86" * 8
+        payload += b"(" + repeated_tuple + b"Nd0" if defect == "tuple-dict" else repeated_tuple + b"Ns"
     if defect != "truncated":
         payload += b"."
     if defect == "second-stream":

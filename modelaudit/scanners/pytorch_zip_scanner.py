@@ -8475,14 +8475,12 @@ class PyTorchZipScanner(BaseScanner):
         storage_probe_members: dict[str, set[str]] = {}
         persistent_id_downgrade_members: dict[str, set[str]] = {}
         additional_pid_keys: dict[str, set[str]] = {}
-        large_pid_keys = getattr(_picklescan_api, "_large_pytorch_zip_storage_pid_keys", None)
-        large_pid_budget = [
-            min(
-                getattr(_picklescan_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES", 0),
-                max(0, scan_options_from_config(self.config).max_opcodes - _PYTORCH_STORAGE_TRUST_MAX_OPCODES),
-            )
-        ]
-        large_pid_provenance_budget = [getattr(_picklescan_api, "_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES", 0)]
+        validator_type = getattr(_picklescan_api, "_PytorchZipStoragePidValidator", None)
+        pid_validator = (
+            validator_type(scan_options_from_config(self.config).max_opcodes)
+            if self.pickle_scanner is not None and validator_type is not None
+            else None
+        )
         storage_member_sizes_by_data_pkl: dict[str, dict[str, int]] = {}
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
@@ -8563,12 +8561,10 @@ class PyTorchZipScanner(BaseScanner):
                 opcode_budget_remaining=storage_reference_opcodes_remaining,
             )
             if not reference_parse.parse_complete:
-                if large_pid_keys is not None:
-                    pid_keys = large_pid_keys(
+                if pid_validator is not None:
+                    pid_keys = pid_validator.validated_keys(
                         pickle_data,
                         {key: entry.file_size for key, entry in storage_entries_by_key.items()},
-                        opcode_budget_remaining=large_pid_budget,
-                        provenance_budget_remaining=large_pid_provenance_budget,
                         deadline=time.monotonic() + self._get_remaining_time(),
                     )
                     if pid_keys:

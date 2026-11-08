@@ -35,7 +35,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Validate storage IDs in large PyTorch ZIP checkpoints with a separate archive-wide allowance of 256,000 metadata opcodes. Preserve member discovery limits and incomplete-coverage diagnostics.
+- Validate storage IDs in PyTorch tensor batches with a separate allowance of 256,000 metadata opcodes and two million provenance-node visits per archive. Member discovery limits and coverage diagnostics still apply.
 
 - Refresh shared source snapshots before the first pickle report so earlier import-context changes do not cause false incomplete scans.
 - Preserve backslash pairs in protocol 0 Unicode operands so Template callbacks remain detectable.

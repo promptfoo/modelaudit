@@ -9188,6 +9188,19 @@ def test_pytorch_zip_scanner_trusts_all_validated_tensor_storage_bytes_as_non_ex
     )
 
 
+def test_pid_retry_skips_explicitly_disabled_pickle_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_retry(*_args: Any, **_kwargs: Any) -> set[str]:
+        pytest.fail("PID validation ran without an embedded pickle scanner")
+
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    monkeypatch.setattr(pytorch_zip_scanner_module._picklescan_api, "_PytorchZipStoragePidValidator", unexpected_retry)
+    path = tmp_path / "checkpoint.pt"
+    _write_referenced_float_storage(path, bytes(24))
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(path))
+    assert "pytorch_zip_storage_reference_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.details.get("skipped_scanner_id") == "pickle" for check in result.checks)
+
+
 def test_pytorch_zip_scanner_keeps_tensor_storage_trust_when_pickle_scanner_is_disabled(tmp_path: Path) -> None:
     """Scanner-only PyTorch ZIP scans still need trusted storage IDs to avoid tensor-byte false positives."""
     model_path = create_mock_pytorch_zip(tmp_path / "scanner_only_tensor_bytes.pt", with_pickle=False, prefix="archive")
