@@ -865,6 +865,17 @@ impl<'a> ScanState<'a> {
                     }
                 };
 
+                if parsed.has_invalid_persistent_id() {
+                    self.handle_parse_error(
+                        ParseError::new("protocol 0 persistent ID must be ASCII"),
+                        index,
+                    );
+                    // Recovery excludes the starting byte. The newline ends the invalid operand.
+                    self.scan_follow_on_pickle_streams(parsed.next - 1);
+                    self.finish_analysis();
+                    return;
+                }
+
                 if let Err(limit_error) = self.check_limits(&parsed) {
                     self.status = ScanStatus::Inconclusive;
                     match limit_error {
@@ -6507,7 +6518,7 @@ impl<'a> ScanState<'a> {
                     skip_offsets_before = offset.saturating_add(payload_len);
                     continue;
                 }
-                Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+                Err(error) if error.scan_incomplete_prefix => {
                     self.surface_nested_pickle_findings(probe, "raw", position + offset);
                     return;
                 }
@@ -6565,9 +6576,9 @@ impl<'a> ScanState<'a> {
                 let payload_extent =
                     pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes);
                 let complete_payload = matches!(&payload_extent, Ok(Some(_)));
-                let operand_limit_exceeded = payload_extent
+                let incomplete_prefix = payload_extent
                     .as_ref()
-                    .is_err_and(|error| error.is_structured_protocol0_line_operand_limit());
+                    .is_err_and(|error| error.scan_incomplete_prefix);
                 let malformed_payload = has_execution_opcode(probe)
                     && (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
@@ -6577,7 +6588,7 @@ impl<'a> ScanState<'a> {
                         self.options.max_nested_pickle_bytes,
                     );
                 if !complete_payload
-                    && !operand_limit_exceeded
+                    && !incomplete_prefix
                     && !malformed_payload
                     && !truncated_payload
                 {
@@ -8349,10 +8360,14 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_probe_len = candidate.len().min(self.options.max_nested_pickle_bytes);
-            let Ok(Some(candidate_len)) = pickle_payload_extent_result(
+            let candidate_len = match pickle_payload_extent_result(
                 &candidate[..candidate_probe_len],
                 self.options.max_nested_pickle_bytes,
-            ) else {
+            ) {
+                Ok(extent) => extent,
+                Err(error) => error.invalid_id_end,
+            };
+            let Some(candidate_len) = candidate_len else {
                 continue;
             };
             let candidate = &candidate[..candidate_len];
