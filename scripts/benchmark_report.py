@@ -215,28 +215,18 @@ def _build_summary(
             f"-> {_format_duration(current_total)} ({f'{total_delta_ratio:+.1%}'})."
         )
 
-    top_regressions = [row for row in sorted_rows if row.status == "regression"][:3]
-    if top_regressions:
-        lines.append("")
-        lines.append("Top regressions:")
-        for row in top_regressions:
+    for status, heading in (("regression", "Top regressions:"), ("improved", "Top improvements:")):
+        top_rows = [row for row in sorted_rows if row.status == status][:3]
+        if not top_rows:
+            continue
+        lines.extend(("", heading))
+        for row in top_rows:
             lines.append(
                 f"- `{row.name}` {f'{row.delta_ratio:+.1%}'} "
                 f"({_format_duration(row.baseline_median)} -> {_format_duration(row.current_median)}, "
                 f"{row.workload}, {row.target}, size={row.size}, files={row.files})"
             )
-
     lines.append("")
-    top_improvements = [row for row in sorted_rows if row.status == "improved"][:3]
-    if top_improvements:
-        lines.append("Top improvements:")
-        for row in top_improvements:
-            lines.append(
-                f"- `{row.name}` {f'{row.delta_ratio:+.1%}'} "
-                f"({_format_duration(row.baseline_median)} -> {_format_duration(row.current_median)}, "
-                f"{row.workload}, {row.target}, size={row.size}, files={row.files})"
-            )
-        lines.append("")
 
     lines.append("| Workload | Benchmark | Target | Size | Files | Baseline | Current | Change | Status |")
     lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |")
@@ -248,17 +238,11 @@ def _build_summary(
             f"{f'{row.delta_ratio:+.1%}'} | {row.status} |"
         )
 
-    if new_in_current:
-        lines.append("")
-        lines.append("New benchmarks:")
-        for name in new_in_current:
-            lines.append(f"- `{name}`")
-
-    if missing_from_current:
-        lines.append("")
-        lines.append("Missing benchmarks:")
-        for name in missing_from_current:
-            lines.append(f"- `{name}`")
+    for names, heading in ((new_in_current, "New benchmarks:"), (missing_from_current, "Missing benchmarks:")):
+        if names:
+            lines.extend(("", heading))
+            for name in names:
+                lines.append(f"- `{name}`")
 
     should_fail = (fail_on_regression and regression_count > 0) or (fail_on_missing and bool(missing_from_current))
     return "\n".join(lines), should_fail
