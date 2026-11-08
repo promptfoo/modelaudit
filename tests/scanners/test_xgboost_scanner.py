@@ -27,7 +27,7 @@ from typing import Any, cast
 from unittest.mock import ANY, Mock, patch
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cli import cli
@@ -67,6 +67,7 @@ from tests.helpers.file_creators import (
 from tests.helpers.file_creators import (
     xgboost_ubjson_uncounted_null_array_probe as _xgboost_ubjson_uncounted_null_array_probe,
 )
+from tests.helpers.tar import add_tar_bytes
 from tests.helpers.text import LowerCountingText
 
 
@@ -297,16 +298,12 @@ def _write_sentencepiece_archive(tmp_path: Path, archive_kind: str, member_name:
     if archive_kind == "tar":
         archive_file = tmp_path / "tokenizer-bundle.tar"
         with tarfile.open(archive_file, "w") as archive:
-            info = tarfile.TarInfo(member_name)
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            add_tar_bytes(archive, member_name, payload)
         return archive_file
     if archive_kind == "tar.gz":
         archive_file = tmp_path / "tokenizer-bundle.tar.gz"
         with tarfile.open(archive_file, "w:gz") as archive:
-            info = tarfile.TarInfo(member_name)
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            add_tar_bytes(archive, member_name, payload)
         return archive_file
     if archive_kind == "gz":
         archive_file = tmp_path / f"{Path(member_name).name}.gz"
@@ -418,6 +415,38 @@ def _scan_twice_with_cache(path: Path, cache_dir: Path) -> tuple[ModelAuditResul
         min_cache_file_size=0,
     )
     return first, second
+
+
+def _scan_tokenizer_directory(
+    tokenizer_model: Path, directory: Path
+) -> tuple[ScanResult, ModelAuditResultModel, ModelAuditResultModel, Result, dict[str, Any]]:
+    direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(directory), cache_enabled=False)
+    streaming = scan_model_streaming(
+        file_generator=iterate_files_streaming(directory),
+        scan_root=str(directory),
+        delete_after_scan=False,
+        cache_enabled=False,
+        skip_file_types=True,
+    )
+    cli_result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--no-cache", "--format", "json", str(directory)],
+        env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+    )
+    cli_payload = parse_click_json_output(cli_result.output)
+    return direct, aggregate, streaming, cli_result, cli_payload
+
+
+def _scan_tokenizer_archive(archive_file: Path) -> tuple[ModelAuditResultModel, Result, dict[str, Any]]:
+    result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+    cli_result = CliRunner().invoke(
+        cli,
+        ["scan", "--no-cache", "--format", "json", str(archive_file)],
+        env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+    )
+    cli_payload = parse_click_json_output(cli_result.output)
+    return result, cli_result, cli_payload
 
 
 def _assert_inconclusive_metadata(result: ModelAuditResultModel, path: Path, reason: str) -> None:
@@ -2019,9 +2048,7 @@ class TestXGBoostFailClosedEndToEnd:
             direct_archive = ZipScanner({"cache_enabled": False}).scan(str(archive_file))
         else:
             with tarfile.open(archive_file, "w") as archive:
-                info = tarfile.TarInfo(member_name)
-                info.size = len(payload)
-                archive.addfile(info, io.BytesIO(payload))
+                add_tar_bytes(archive, member_name, payload)
             direct_archive = TarScanner({"cache_enabled": False}).scan(str(archive_file))
 
         aggregate = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
@@ -2093,21 +2120,7 @@ class TestXGBoostFailClosedEndToEnd:
         expected_format = file_detection.SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
         expected_reason = "sentencepiece_model_proto_routing_incomplete"
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert detect_file_format(str(tokenizer_model)) == expected_format
         assert detect_file_format_from_magic(str(tokenizer_model)) == expected_format
@@ -2239,21 +2252,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto_with_default_unknown_metadata())
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is True
         assert direct.scanner_name == "unknown"
@@ -2269,21 +2268,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto_with_split_trainer_spec_metadata())
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is True
         assert direct.scanner_name == "unknown"
@@ -2305,13 +2290,7 @@ class TestXGBoostFailClosedEndToEnd:
             _sentencepiece_model_proto_with_split_trainer_spec_metadata(),
         )
 
-        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--no-cache", "--format", "json", str(archive_file)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        result, cli_result, cli_payload = _scan_tokenizer_archive(archive_file)
 
         assert determine_exit_code(result) == 0
         assert "xgboost" not in result.scanner_names
@@ -2326,21 +2305,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_varint_field_52())
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is True
         assert direct.scanner_name == "unknown"
@@ -2356,21 +2321,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_string_field_54())
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is True
         assert direct.scanner_name == "unknown"
@@ -2388,21 +2339,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "spiece.model"
         tokenizer_model.write_bytes(_large_real_sentencepiece_model_proto_shape())
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert tokenizer_model.stat().st_size > file_detection._SENTENCEPIECE_MODEL_PROTO_READ_BYTES
         assert detect_file_format(str(tokenizer_model)) == "unknown"
@@ -2473,21 +2410,7 @@ class TestXGBoostFailClosedEndToEnd:
     ) -> None:
         tokenizer_model = _write_official_sentencepiece_fixture(tmp_path, fixture_name)
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is True
         assert direct.scanner_name == "unknown"
@@ -2508,13 +2431,7 @@ class TestXGBoostFailClosedEndToEnd:
             _sentencepiece_model_proto(),
         )
 
-        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--no-cache", "--format", "json", str(archive_file)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        result, cli_result, cli_payload = _scan_tokenizer_archive(archive_file)
 
         assert determine_exit_code(result) == 0
         assert "xgboost" not in result.scanner_names
@@ -2533,13 +2450,7 @@ class TestXGBoostFailClosedEndToEnd:
         expected_location = f"{archive_file} -> tokenizer" if archive_kind == "gz" else f"{archive_file}:{member_name}"
         expected_reason = "sentencepiece_model_proto_routing_incomplete"
 
-        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--no-cache", "--format", "json", str(archive_file)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        result, cli_result, cli_payload = _scan_tokenizer_archive(archive_file)
         metadata = result.file_metadata[str(archive_file)]
 
         assert determine_exit_code(result) == 2
@@ -2576,21 +2487,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(payload_factory())
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is False
         assert direct.scanner_name == "xgboost"
@@ -2610,13 +2507,7 @@ class TestXGBoostFailClosedEndToEnd:
         member_name = "models/tokenizer.model"
         archive_file = _write_sentencepiece_archive(tmp_path, archive_kind, member_name, payload_factory())
 
-        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--no-cache", "--format", "json", str(archive_file)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        result, cli_result, cli_payload = _scan_tokenizer_archive(archive_file)
         expected_location = (
             f"{archive_file} -> tokenizer.model" if archive_kind == "gz" else f"{archive_file}:{member_name}"
         )
@@ -2651,13 +2542,7 @@ class TestXGBoostFailClosedEndToEnd:
             f"{archive_file} -> tokenizer.model" if archive_kind == "gz" else f"{archive_file}:{member_name}"
         )
 
-        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--no-cache", "--format", "json", str(archive_file)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        result, cli_result, cli_payload = _scan_tokenizer_archive(archive_file)
 
         assert determine_exit_code(result) == 2
         assert any(issue.rule_code == "S1004" and issue.location == expected_location for issue in result.issues)
@@ -2674,21 +2559,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto() + tail)
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is False
         assert direct.scanner_name == "xgboost"
@@ -2708,21 +2579,7 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model.write_bytes(prefix + b"\x12\x80")
         monkeypatch.setattr(file_detection, "_SENTENCEPIECE_MODEL_PROTO_READ_BYTES", len(prefix))
 
-        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
-        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
-        streaming = scan_model_streaming(
-            file_generator=iterate_files_streaming(tmp_path),
-            scan_root=str(tmp_path),
-            delete_after_scan=False,
-            cache_enabled=False,
-            skip_file_types=True,
-        )
-        cli_result = CliRunner().invoke(
-            cli,
-            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
-            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
-        )
-        cli_payload = parse_click_json_output(cli_result.output)
+        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is False
         assert direct.scanner_name == "xgboost"
@@ -2820,9 +2677,7 @@ class TestXGBoostFailClosedEndToEnd:
                 archive.writestr(member_name, payload)
         else:
             with tarfile.open(archive_file, "w") as archive:
-                info = tarfile.TarInfo(member_name)
-                info.size = len(payload)
-                archive.addfile(info, io.BytesIO(payload))
+                add_tar_bytes(archive, member_name, payload)
 
         result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
 
@@ -2854,9 +2709,7 @@ class TestXGBoostFailClosedEndToEnd:
             result = ZipScanner({"cache_enabled": False}).scan(str(archive_file))
         else:
             with tarfile.open(archive_file, "w") as archive:
-                info = tarfile.TarInfo(member_name)
-                info.size = len(payload)
-                archive.addfile(info, io.BytesIO(payload))
+                add_tar_bytes(archive, member_name, payload)
             result = TarScanner({"cache_enabled": False}).scan(str(archive_file))
 
         assert any(
