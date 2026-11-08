@@ -454,7 +454,7 @@ impl ScanStatus {
         self == Self::Complete
     }
 
-    fn mark_inconclusive(&mut self) {
+    fn mark_inconclusive_if_complete(&mut self) {
         if self.is_complete() {
             *self = Self::Inconclusive;
         }
@@ -749,7 +749,6 @@ pub(crate) struct ScanState<'a> {
     first_pickle_end_pos: Option<usize>,
     stream_start_offset: usize,
     active_frame: Option<ActiveFrame>,
-    stream_opcode_count: usize,
     stream_proto_version: Option<i64>,
     expansion_state: ExpansionHeuristicState,
     expansion_findings: Vec<ExpansionHeuristicFinding>,
@@ -821,7 +820,6 @@ impl<'a> ScanState<'a> {
             first_pickle_end_pos: None,
             stream_start_offset: position_offset,
             active_frame: None,
-            stream_opcode_count: 0,
             stream_proto_version: None,
             expansion_state: ExpansionHeuristicState::new(0),
             expansion_findings: Vec::new(),
@@ -863,17 +861,18 @@ impl<'a> ScanState<'a> {
 
         let mut index = 0usize;
         while index < scan_limit {
-            let stream_start = index;
-            let mut parsed_opcode = false;
-            let mut saw_stop = false;
-            self.stream_start_offset = self.position_offset + stream_start;
+            self.stream_start_offset = self.position_offset + index;
             self.active_frame = None;
-            self.stream_opcode_count = 0;
             self.stream_proto_version = None;
 
             loop {
                 if index >= scan_limit {
-                    break;
+                    self.handle_parse_error(
+                        ParseError::new("pickle exhausted before seeing STOP").at(index),
+                        index,
+                    );
+                    self.finish_analysis();
+                    return;
                 }
                 let parsed = match parse_opcode(self.payload, index, scan_limit) {
                     Ok(opcode) => opcode,
@@ -898,22 +897,22 @@ impl<'a> ScanState<'a> {
 
                 if let Err(limit_error) = self.check_limits() {
                     self.status = ScanStatus::Inconclusive;
-                    let (code, message, limit_key, limit_value) = match limit_error {
+                    let (message, code, limit_key, limit_value) = match limit_error {
                         LimitError::OpcodeBudgetExceeded => (
-                            "opcode_budget",
                             format!(
                                 "Opcode analysis stopped after reaching max_opcodes={}",
                                 self.options.max_opcodes
                             ),
+                            "opcode_budget",
                             "max_opcodes",
                             DetailValue::UInt(self.options.max_opcodes as u64),
                         ),
                         LimitError::Timeout => (
-                            "timeout",
                             format!(
                                 "Opcode analysis timed out after {:.3} seconds",
                                 self.options.timeout_s
                             ),
+                            "timeout",
                             "timeout_s",
                             DetailValue::Float(self.options.timeout_s),
                         ),
@@ -937,7 +936,6 @@ impl<'a> ScanState<'a> {
                     return;
                 }
 
-                parsed_opcode = true;
                 let position = self.position_offset + parsed.pos;
                 self.bytes_scanned = self.bytes_scanned.max(parsed.next);
                 self.opcode_count += 1;
@@ -948,33 +946,12 @@ impl<'a> ScanState<'a> {
                 self.handle_opcode(&parsed, position);
 
                 if parsed.name == "STOP" {
-                    saw_stop = true;
                     if self.first_pickle_end_pos.is_none() {
                         self.first_pickle_end_pos = Some(self.position_offset + index);
                     }
                     self.reset_simulated_pickle_state();
                     break;
                 }
-            }
-
-            if !parsed_opcode {
-                if self.opcode_count == 0 && self.findings.is_empty() {
-                    self.record_empty_input_error();
-                }
-                break;
-            }
-
-            if !saw_stop && index >= scan_limit {
-                self.handle_parse_error(
-                    ParseError::new("pickle exhausted before seeing STOP").at(index),
-                    index,
-                );
-                self.finish_analysis();
-                return;
-            }
-
-            if index <= stream_start {
-                break;
             }
         }
 
@@ -1083,14 +1060,6 @@ impl<'a> ScanState<'a> {
                     .saturating_add(cost),
                 reason,
             )
-    }
-
-    fn reserve_tracked_state_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
-        if !self.can_reserve_tracked_bytes(cost, reason) {
-            return false;
-        }
-        self.tracked_state_bytes += cost;
-        true
     }
 
     fn projected_memo_state_bytes(
@@ -1265,7 +1234,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_tracked_state_budget_exhausted(&mut self, reason: &'static str, observed: usize) {
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         if self.tracked_state_budget_exhausted {
             return;
         }
@@ -2014,7 +1983,7 @@ impl<'a> ScanState<'a> {
         let analysis_incomplete =
             requires_external_buffer_context || self.readonly_buffer_invalid_stack_count > 0;
         if analysis_incomplete {
-            self.status.mark_inconclusive();
+            self.status.mark_inconclusive_if_complete();
         }
         let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
@@ -2394,78 +2363,54 @@ impl<'a> ScanState<'a> {
         opcode: &ParsedOpcode,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        let (
-            callable_value,
-            positional_arg_count,
-            argument_values,
-            build_uses_slot_state,
-            keyword_arg_names,
-        ) = match opcode.name {
-            "REDUCE" | "NEWOBJ" => {
-                let Some(values) = self.consume_top_operand_values(2, opcode.name) else {
-                    return Vec::new();
-                };
-                (
-                    values.first().cloned(),
-                    Self::tuple_positional_arg_count(values.get(1)),
-                    Self::tuple_argument_values(values.get(1)),
-                    None,
-                    None,
-                )
-            }
-            "NEWOBJ_EX" => {
-                let Some(values) = self.consume_top_operand_values(3, opcode.name) else {
-                    return Vec::new();
-                };
-                (
-                    values.first().cloned(),
-                    Self::tuple_positional_arg_count(values.get(1)),
-                    Self::tuple_argument_values(values.get(1)),
-                    None,
-                    self.tracked_keyword_arg_names(values.get(2)),
-                )
-            }
-            "OBJ" => {
-                let values = self.pop_to_mark();
-                let positional_arg_count = values.len().checked_sub(1);
-                let callable_value = values.first().cloned();
-                let argument_values = values.get(1..).map(|items| items.to_vec());
-                self.push_constructed_result(callable_value.as_ref());
-                (
-                    callable_value,
-                    positional_arg_count,
-                    argument_values,
-                    None,
-                    None,
-                )
-            }
-            "INST" => {
-                let values = self.pop_to_mark();
-                let (module, name) = opcode.arg.global_parts();
-                let reference = GlobalRef::new(module, name, position);
-                self.record_global_ref(&reference, opcode.name);
-                self.push_stack_value(StackValue::Constructed {
-                    reference: reference.clone(),
-                    defaultdict_without_factory: false,
-                });
-                (
-                    Some(StackValue::Global(reference)),
-                    Some(values.len()),
-                    Some(values),
-                    None,
-                    None,
-                )
-            }
-            "BUILD" => {
-                let values = self.consume_top_operand_values(2, opcode.name);
-                let callable_value = values.as_ref().and_then(|items| items.first()).cloned();
-                let build_uses_slot_state = values
-                    .as_ref()
-                    .and_then(|items| Self::build_uses_slot_state(items.get(1)));
-                (callable_value, None, None, build_uses_slot_state, None)
-            }
-            _ => (None, None, None, None, None),
-        };
+        let (callable_value, argument_values, build_uses_slot_state, keyword_arg_names) =
+            match opcode.name {
+                "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" => {
+                    let operand_count = if opcode.name == "NEWOBJ_EX" { 3 } else { 2 };
+                    let Some(values) = self.consume_top_operand_values(operand_count, opcode.name)
+                    else {
+                        return Vec::new();
+                    };
+                    (
+                        values.first().cloned(),
+                        Self::tuple_argument_values(values.get(1)),
+                        None,
+                        self.tracked_keyword_arg_names(values.get(2)),
+                    )
+                }
+                "OBJ" => {
+                    let values = self.pop_to_mark();
+                    let callable_value = values.first().cloned();
+                    let argument_values = values.get(1..).map(|items| items.to_vec());
+                    self.push_constructed_result(callable_value.as_ref());
+                    (callable_value, argument_values, None, None)
+                }
+                "INST" => {
+                    let values = self.pop_to_mark();
+                    let (module, name) = opcode.arg.global_parts();
+                    let reference = GlobalRef::new(module, name, position);
+                    self.record_global_ref(&reference, opcode.name);
+                    self.push_stack_value(StackValue::Constructed {
+                        reference: reference.clone(),
+                        defaultdict_without_factory: false,
+                    });
+                    (
+                        Some(StackValue::Global(reference)),
+                        Some(values),
+                        None,
+                        None,
+                    )
+                }
+                "BUILD" => {
+                    let values = self.consume_top_operand_values(2, opcode.name);
+                    let callable_value = values.as_ref().and_then(|items| items.first()).cloned();
+                    let build_uses_slot_state = values
+                        .as_ref()
+                        .and_then(|items| Self::build_uses_slot_state(items.get(1)));
+                    (callable_value, None, build_uses_slot_state, None)
+                }
+                _ => (None, None, None, None),
+            };
 
         self.record_dynamic_type_callable_attribute_finding(
             callable_value.as_ref(),
@@ -2485,16 +2430,16 @@ impl<'a> ScanState<'a> {
         );
 
         let mut invocations = Vec::new();
-        if let Some(mut invocation) = Self::callable_invocation_for_value(
-            callable_value.as_ref(),
-            opcode.name,
-            position,
-            positional_arg_count,
-            argument_values.as_deref(),
-        ) {
-            invocation.build_uses_slot_state = build_uses_slot_state;
-            invocation.keyword_arg_names = keyword_arg_names;
-            invocations.push(invocation);
+        if let Some(reference) = Self::invoked_reference(callable_value.as_ref(), opcode.name) {
+            invocations.push(CallableInvocation {
+                reference,
+                op_name: opcode.name,
+                opcode_position: position,
+                positional_arg_count: argument_values.as_ref().map(Vec::len),
+                build_uses_slot_state,
+                keyword_arg_names,
+                args: argument_values.as_deref().unwrap_or_default().to_vec(),
+            });
         }
         invocations.extend(self.protocol_dispatch_invocations(
             callable_value.as_ref(),
@@ -2529,55 +2474,27 @@ impl<'a> ScanState<'a> {
         invocations
     }
 
-    fn callable_invocation_for_value(
+    fn invoked_reference(
         callable_value: Option<&StackValue>,
         op_name: &'static str,
-        position: usize,
-        positional_arg_count: Option<usize>,
-        args: Option<&[StackValue]>,
-    ) -> Option<CallableInvocation> {
-        match callable_value {
-            Some(StackValue::Global(reference)) if !reference.malformed => {
+    ) -> Option<GlobalRef> {
+        match callable_value? {
+            StackValue::Global(reference) if !reference.malformed => {
                 if Self::suppress_plain_constructor_invocation(reference, op_name) {
                     return None;
                 }
-                Some(CallableInvocation {
-                    reference: reference.clone(),
-                    op_name,
-                    opcode_position: position,
-                    positional_arg_count,
-                    build_uses_slot_state: None,
-                    keyword_arg_names: None,
-                    args: args.unwrap_or_default().to_vec(),
-                })
+                Some(reference.clone())
             }
-            Some(StackValue::Constructed { reference, .. }) if !reference.malformed => {
-                let reference = match op_name {
+            StackValue::Constructed { reference, .. } if !reference.malformed => {
+                Some(match op_name {
                     "REDUCE" | "OBJ" => Self::constructed_callable_reference(reference),
                     _ => reference.clone(),
-                };
-                Some(CallableInvocation {
-                    reference,
-                    op_name,
-                    opcode_position: position,
-                    positional_arg_count,
-                    build_uses_slot_state: None,
-                    keyword_arg_names: None,
-                    args: args.unwrap_or_default().to_vec(),
                 })
             }
-            Some(StackValue::Global(reference) | StackValue::Constructed { reference, .. })
+            StackValue::Global(reference) | StackValue::Constructed { reference, .. }
                 if reference.module == "copyreg.extension" =>
             {
-                Some(CallableInvocation {
-                    reference: reference.clone(),
-                    op_name,
-                    opcode_position: position,
-                    positional_arg_count,
-                    build_uses_slot_state: None,
-                    keyword_arg_names: None,
-                    args: args.unwrap_or_default().to_vec(),
-                })
+                Some(reference.clone())
             }
             _ => None,
         }
@@ -5112,13 +5029,6 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn tuple_positional_arg_count(value: Option<&StackValue>) -> Option<usize> {
-        match value {
-            Some(StackValue::Tuple(values)) => Some(values.len()),
-            _ => None,
-        }
-    }
-
     fn with_memo_index(&self, value: StackValue, index: i64) -> StackValue {
         let value = self.memoized_tracked_dict(&value).cloned().unwrap_or(value);
         Self::set_memo_index(value, index)
@@ -5190,12 +5100,11 @@ impl<'a> ScanState<'a> {
             self.record_tracked_state_budget_exhausted("future_callbacks", callback_count + 1);
             return;
         }
-        if !self.reserve_tracked_state_bytes(
-            callback.module.len().saturating_add(callback.name.len()),
-            "future_callback",
-        ) {
+        let cost = callback.module.len().saturating_add(callback.name.len());
+        if !self.can_reserve_tracked_bytes(cost, "future_callback") {
             return;
         }
+        self.tracked_state_bytes += cost;
         if let Some(StackValue::FutureCallbacks(callbacks)) = self.memo.get_mut(&memo_index) {
             callbacks.callbacks.push(callback);
         }
@@ -6570,7 +6479,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_raw_nested_payload_truncated(&mut self, payload_size: usize, position: usize) {
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         self.add_notice(Notice {
             message: "Nested pickle payload exceeds configured deep-scan byte limit".to_string(),
             severity: "info",
@@ -6600,7 +6509,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
     ) {
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         let details = vec![
             (
                 "encoding".to_string(),
@@ -6702,7 +6611,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
     ) {
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         self.add_notice(Notice {
             message: "Encoded pickle payload exceeds configured deep-scan byte limit".to_string(),
             severity: "info",
@@ -6967,7 +6876,7 @@ impl<'a> ScanState<'a> {
         if self.import_references_truncated {
             return;
         }
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         self.import_references_truncated = true;
         self.add_notice(Notice {
             message: "Import reference metadata exceeded the scanner reporting limit".to_string(),
@@ -6999,7 +6908,7 @@ impl<'a> ScanState<'a> {
         if self.non_allowlisted_global_imports_truncated {
             return;
         }
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         self.non_allowlisted_global_imports_truncated = true;
         self.add_notice(Notice {
             message: "Non-allowlisted global findings exceeded the scanner reporting limit"
@@ -7230,7 +7139,7 @@ impl<'a> ScanState<'a> {
         if self.callable_invocations_truncated {
             return;
         }
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         self.callable_invocations_truncated = true;
         self.add_notice(Notice {
             message: "Callable invocation metadata exceeded the scanner reporting limit"
@@ -7257,17 +7166,13 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_structural_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
-        self.stream_opcode_count += 1;
         self.record_frame_boundary_opcode(opcode, position);
-        if opcode.name == "FRAME" {
-            return;
-        }
         if opcode.name != "PROTO" {
             return;
         }
 
         let protocol = opcode.arg.as_i64();
-        if self.stream_opcode_count > 1 {
+        if position != self.stream_start_offset {
             let mut details = vec![
                 (
                     "tamper_type".to_string(),
@@ -7675,7 +7580,7 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) {
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         self.add_notice(Notice {
             message: format!(
                 "{} literal scan truncated at configured limit",
@@ -7715,7 +7620,7 @@ impl<'a> ScanState<'a> {
         limit_name: &'static str,
         limit: usize,
     ) {
-        self.status.mark_inconclusive();
+        self.status.mark_inconclusive_if_complete();
         self.add_notice(Notice {
             message: message.to_string(),
             severity: "info",
@@ -7743,7 +7648,7 @@ impl<'a> ScanState<'a> {
             self.source, encoding, position
         );
         if self.nested_depth >= self.options.max_nested_depth {
-            self.status.mark_inconclusive();
+            self.status.mark_inconclusive_if_complete();
             let details = vec![
                 (
                     "nested_encoding".to_string(),
@@ -7821,12 +7726,12 @@ impl<'a> ScanState<'a> {
         }
         let nested_incomplete = !nested_scan.status.is_complete();
         let nested_import_references = std::mem::take(&mut nested_scan.import_references);
-        let nested_counts = nested_scan.take_opcode_counts();
+        let child_opcode_counts = nested_scan.take_opcode_counts();
         self.merge_follow_on_import_references(
             nested_import_references,
             nested_scan.import_references_truncated,
         );
-        Self::merge_opcode_counts(&mut self.nested_opcode_counts, nested_counts);
+        Self::merge_opcode_counts(&mut self.nested_opcode_counts, child_opcode_counts);
 
         for nested_finding in nested_scan.findings {
             if nested_finding.severity == "critical" {
@@ -7857,7 +7762,7 @@ impl<'a> ScanState<'a> {
         }
 
         if nested_incomplete {
-            self.status.mark_inconclusive();
+            self.status.mark_inconclusive_if_complete();
             self.add_finding(Finding {
                 message: "Nested pickle analysis did not complete".to_string(),
                 severity: "critical",
@@ -8052,7 +7957,7 @@ impl<'a> ScanState<'a> {
             skip_offsets_before =
                 skip_offsets_before.max(absolute_offset.saturating_add(candidate_len));
             let had_findings = !follow_on_scan.findings.is_empty();
-            let follow_on_counts = follow_on_scan.take_opcode_counts();
+            let child_opcode_counts = follow_on_scan.take_opcode_counts();
             for finding in follow_on_scan.findings {
                 self.add_finding(finding);
             }
@@ -8064,7 +7969,7 @@ impl<'a> ScanState<'a> {
                 follow_on_scan.callable_invocations,
                 follow_on_scan.callable_invocations_truncated,
             );
-            Self::merge_opcode_counts(&mut self.follow_on_opcode_counts, follow_on_counts);
+            Self::merge_opcode_counts(&mut self.follow_on_opcode_counts, child_opcode_counts);
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),

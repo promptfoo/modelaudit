@@ -71,12 +71,12 @@ class _FakeLargeRemoteFileSystem:
         *,
         size: object,
         payload: bytes,
-        read_sizes: list[int],
+        read_sizes: list[int] | None = None,
         first_read_limit: int | None = None,
     ) -> None:
         self._size = size
         self._payload = payload
-        self._read_sizes = read_sizes
+        self.read_sizes: list[int] = [] if read_sizes is None else read_sizes
         self._first_read_limit = first_read_limit
 
     def info(self, path: str) -> dict[str, object]:
@@ -85,7 +85,17 @@ class _FakeLargeRemoteFileSystem:
 
     def open(self, path: str, mode: str = "rb") -> _FakeLargeRemoteFile:
         del path, mode
-        return _FakeLargeRemoteFile(self._payload, self._read_sizes, self._first_read_limit)
+        return _FakeLargeRemoteFile(self._payload, self.read_sizes, self._first_read_limit)
+
+    def patch_s3(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+        monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: self)
+
+
+def _mock_s3_reads(monkeypatch: pytest.MonkeyPatch, *, size: object, payload: bytes) -> list[int]:
+    fs = _FakeLargeRemoteFileSystem(size=size, payload=payload)
+    fs.patch_s3(monkeypatch)
+    return fs.read_sizes
 
 
 def _mock_stream_filesystem(
@@ -227,15 +237,7 @@ def test_stream_analyze_file_default_read_is_bounded_for_large_remote(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = b"model-header-only"
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
-        payload=payload,
-        read_sizes=read_sizes,
-    )
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096, payload=payload)
 
     result, analysis_complete = streaming.stream_analyze_file("s3://bucket/large.joblib", HeaderOnlyScanner())
 
@@ -255,15 +257,7 @@ def test_stream_analyze_file_default_read_is_bounded_for_large_remote(
 def test_stream_analyze_file_bounded_large_remote_still_reports_header_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
-        payload=b"os\nsystem",
-        read_sizes=read_sizes,
-    )
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096, payload=b"os\nsystem")
 
     result, analysis_complete = streaming.stream_analyze_file("s3://bucket/large.pkl", HeaderOnlyScanner())
 
@@ -280,20 +274,14 @@ def test_stream_analyze_file_passes_actual_short_read_size_to_scanner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = b"short-read"
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
-        payload=payload,
-        read_sizes=read_sizes,
-    )
+    fake_fs = _FakeLargeRemoteFileSystem(size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096, payload=payload)
     scanner = RecordingStreamScanner()
 
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    fake_fs.patch_s3(monkeypatch)
 
     result, analysis_complete = streaming.stream_analyze_file("s3://bucket/large.pkl", scanner)
 
-    assert read_sizes == [STREAMING_ANALYSIS_DEFAULT_MAX_BYTES]
+    assert fake_fs.read_sizes == [STREAMING_ANALYSIS_DEFAULT_MAX_BYTES]
     assert scanner.seen_size == len(payload)
     assert analysis_complete is False
     assert result is not None
@@ -305,20 +293,14 @@ def test_stream_analyze_file_detects_remote_growth_after_info(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = b"grew!"
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=len(payload) - 1,
-        payload=payload,
-        read_sizes=read_sizes,
-    )
+    fake_fs = _FakeLargeRemoteFileSystem(size=len(payload) - 1, payload=payload)
     scanner = RecordingStreamScanner()
 
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    fake_fs.patch_s3(monkeypatch)
 
     result, analysis_complete = streaming.stream_analyze_file("s3://bucket/changing.pkl", scanner)
 
-    assert read_sizes == [len(payload)]
+    assert fake_fs.read_sizes == [len(payload)]
     assert scanner.seen_size == len(payload)
     assert analysis_complete is False
     assert result is not None
@@ -332,21 +314,14 @@ def test_stream_analyze_file_probes_after_exact_reported_size_short_read(
 ) -> None:
     reported_size = 4
     payload = b"safeX"
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=reported_size,
-        payload=payload,
-        read_sizes=read_sizes,
-        first_read_limit=reported_size,
-    )
+    fake_fs = _FakeLargeRemoteFileSystem(size=reported_size, payload=payload, first_read_limit=reported_size)
     scanner = RecordingStreamScanner()
 
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    fake_fs.patch_s3(monkeypatch)
 
     result, analysis_complete = streaming.stream_analyze_file("s3://bucket/changing.pkl", scanner)
 
-    assert read_sizes == [reported_size + 1, 1]
+    assert fake_fs.read_sizes == [reported_size + 1, 1]
     assert scanner.seen_size == reported_size
     assert analysis_complete is False
     assert result is not None
@@ -360,16 +335,10 @@ def test_stream_analyze_file_fails_closed_when_reported_size_equals_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = b"safe" + b"os\nsystem"
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=4,
-        payload=payload,
-        read_sizes=read_sizes,
-    )
+    fake_fs = _FakeLargeRemoteFileSystem(size=4, payload=payload)
     scanner = RecordingStreamScanner()
 
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    fake_fs.patch_s3(monkeypatch)
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/changing.pkl",
@@ -377,7 +346,7 @@ def test_stream_analyze_file_fails_closed_when_reported_size_equals_cap(
         max_bytes=4,
     )
 
-    assert read_sizes == [4]
+    assert fake_fs.read_sizes == [4]
     assert scanner.seen_size == 4
     assert analysis_complete is False
     assert result is not None
@@ -392,15 +361,7 @@ def test_stream_analyze_file_bounds_reads_when_remote_size_is_unknown(
     reported_size: object,
 ) -> None:
     payload = b"short-read"
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=reported_size,
-        payload=payload,
-        read_sizes=read_sizes,
-    )
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=reported_size, payload=payload)
 
     result, analysis_complete = streaming.stream_analyze_file("s3://bucket/unknown-size.joblib", HeaderOnlyScanner())
 
@@ -418,20 +379,14 @@ def test_stream_analyze_file_bounds_reads_when_remote_size_is_unknown(
 def test_stream_analyze_file_treats_empty_remote_as_known_and_complete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=0,
-        payload=b"",
-        read_sizes=read_sizes,
-    )
+    fake_fs = _FakeLargeRemoteFileSystem(size=0, payload=b"")
     scanner = RecordingStreamScanner()
 
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    fake_fs.patch_s3(monkeypatch)
 
     result, analysis_complete = streaming.stream_analyze_file("s3://bucket/empty.pkl", scanner)
 
-    assert read_sizes == [1, 1]
+    assert fake_fs.read_sizes == [1, 1]
     assert scanner.seen_size == 0
     assert analysis_complete is True
     assert result is not None
@@ -444,15 +399,7 @@ def test_stream_analyze_file_treats_empty_remote_as_known_and_complete(
 def test_stream_analyze_file_uses_scanner_read_cap_when_file_size_is_unlimited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=100,
-        payload=b"abcdef",
-        read_sizes=read_sizes,
-    )
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=100, payload=b"abcdef")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -470,15 +417,7 @@ def test_stream_analyze_file_uses_scanner_read_cap_when_file_size_is_unlimited(
 def test_stream_analyze_file_does_not_expand_default_cap_to_large_file_size_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
-        payload=b"header",
-        read_sizes=read_sizes,
-    )
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096, payload=b"header")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -495,15 +434,7 @@ def test_stream_analyze_file_does_not_expand_default_cap_to_large_file_size_limi
 def test_stream_analyze_file_uses_scanner_config_cap_for_large_remote(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(
-        size=100,
-        payload=b"abcdef",
-        read_sizes=read_sizes,
-    )
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=100, payload=b"abcdef")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -523,11 +454,7 @@ def test_stream_analyze_file_uses_scanner_config_cap_for_large_remote(
 def test_stream_analyze_file_prefers_streaming_specific_config_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=100, payload=b"abcdef")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -544,11 +471,7 @@ def test_stream_analyze_file_prefers_streaming_specific_config_cap(
 def test_stream_analyze_file_tightens_streaming_specific_cap_with_scanner_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=100, payload=b"abcdef")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -564,11 +487,7 @@ def test_stream_analyze_file_tightens_streaming_specific_cap_with_scanner_limit(
 def test_stream_analyze_file_tightens_explicit_cap_with_scanner_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=100, payload=b"abcdef")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -587,11 +506,7 @@ def test_stream_analyze_file_ignores_invalid_streaming_specific_cap(
     monkeypatch: pytest.MonkeyPatch,
     invalid_streaming_max: object,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=100, payload=b"abcdef")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -609,11 +524,7 @@ def test_stream_analyze_file_ignores_invalid_explicit_cap(
     monkeypatch: pytest.MonkeyPatch,
     invalid_max_bytes: int,
 ) -> None:
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=100, payload=b"abcdef")
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/large.joblib",
@@ -796,11 +707,7 @@ def test_stream_analyze_file_does_not_report_truncation_as_a_security_issue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = pickle.dumps({"weights": list(range(1000))}, protocol=4)
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=len(payload), payload=payload, read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=len(payload), payload=payload)
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/benign.pkl",
@@ -821,11 +728,7 @@ def test_stream_analyze_file_preserves_malicious_findings_from_partial_scan(
 ) -> None:
     malicious_pickle = b"cos\nsystem\n(S'echo hi'\ntR."
     payload = malicious_pickle + (b"padding" * 16)
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=len(payload), payload=payload, read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=len(payload), payload=payload)
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/malicious.pkl",
@@ -846,11 +749,7 @@ def test_stream_analyze_file_preserves_proven_oversized_frame_from_partial_scan(
 ) -> None:
     malformed_pickle = b"\x80\x04\x95" + (1000).to_bytes(8, "little") + b"N."
     payload = malformed_pickle + (b"padding" * 16)
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=len(payload), payload=payload, read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    _mock_s3_reads(monkeypatch, size=len(payload), payload=payload)
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/malformed.pkl",
@@ -868,11 +767,7 @@ def test_stream_analyze_file_does_not_use_stale_size_to_prove_oversized_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
-    read_sizes: list[int] = []
-    fake_fs = _FakeLargeRemoteFileSystem(size=len(payload) - 2, payload=payload, read_sizes=read_sizes)
-
-    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
-    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+    read_sizes = _mock_s3_reads(monkeypatch, size=len(payload) - 2, payload=payload)
 
     result, analysis_complete = streaming.stream_analyze_file(
         "s3://bucket/growing.pkl",
