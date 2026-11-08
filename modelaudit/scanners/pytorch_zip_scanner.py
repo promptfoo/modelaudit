@@ -93,6 +93,8 @@ from .zip_scanner import ZipPreflightRejected
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
 _TORCHSCRIPT_DEBUG_PAYLOAD_MARKER = b"FORMAT_WITH_STRING_TABLE"
+# Empty source-range table emitted by early TorchScript serializers.
+_TORCHSCRIPT_LEGACY_DEBUG = bytes.fromhex("80024b005800000000710068004b008771014b004b0087868571022e")
 _TORCHSCRIPT_DEBUG_PREFIX_BYTES = 256
 _TORCHSCRIPT_SOURCE_MAX_BYTES = 1024 * 1024
 _TORCHSCRIPT_GENERATED_CLASS_PATTERN = re.compile(r"(?m)^class\s+[A-Za-z_][A-Za-z0-9_]*\(Module\):\s*$")
@@ -1038,6 +1040,41 @@ class PyTorchZipScanner(BaseScanner):
                     return False
         return True
 
+    @staticmethod
+    def _is_legacy_torchscript_declaration(source: bytes) -> bool:
+        source = source.removeprefix(b"op_version_set = 1\n")
+        lines = source.split(b"\n")
+        if len(lines) < 5 or lines[0] != b"class Module(Module):" or lines[2] != b"  __annotations__ = []" or lines[-1]:
+            return False
+        names = []
+        for line in lines[3:-1]:
+            match = re.fullmatch(rb'  __annotations__\["((?!__)[A-Za-z0-9_]+(?:[|.][A-Za-z0-9_]+)*)"\] = Tensor', line)
+            if not match:
+                return False
+            names.append(match[1])
+        parameters = b"".join(b'"' + name + b'", ' for name in names)
+        return len(set(names)) == len(names) and lines[1] == b"  __parameters__ = [" + parameters + b"]"
+
+    @classmethod
+    def _read_legacy_torchscript_record(cls, archive: zipfile.ZipFile, entry: zipfile.ZipInfo, limit: int) -> bytes:
+        if (
+            entry.orig_filename != entry.filename
+            or entry.file_size > limit
+            or entry.compress_size > limit + 1024
+            or entry.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+            or not cls._zip_payload_bounds_match(archive, entry)
+        ):
+            raise ValueError("Invalid legacy TorchScript record bounds")
+        # ZipExtFile truncates at the declared size. Probe past it so a forged
+        # harmless prefix and matching CRC cannot hide appended code.
+        probe = copy(entry)
+        probe.file_size += 1
+        with archive.open(probe) as stream:
+            payload = stream.read(probe.file_size)
+        if len(payload) != entry.file_size:
+            raise ValueError("Legacy TorchScript record size mismatch")
+        return payload
+
     def _is_torchscript_generated_python(
         self,
         zip_file: zipfile.ZipFile,
@@ -1054,6 +1091,23 @@ class PyTorchZipScanner(BaseScanner):
                 phase="torchscript generated source validation",
                 result=result,
             )
+            if debug_prefix == _TORCHSCRIPT_LEGACY_DEBUG:
+                parts = entry.filename.split("/")
+                if (
+                    len(parts) != 3
+                    or parts[0] in {"", ".", ".."}
+                    or "\\" in parts[0]
+                    or parts[1:] != ["code", "__torch__.py"]
+                    or debug_entry.filename != entry.filename + ".debug_pkl"
+                ):
+                    return False
+                if (
+                    self._read_legacy_torchscript_record(zip_file, debug_entry, len(_TORCHSCRIPT_LEGACY_DEBUG))
+                    != debug_prefix
+                ):
+                    return False
+                source = self._read_legacy_torchscript_record(zip_file, entry, _TORCHSCRIPT_SOURCE_MAX_BYTES)
+                return self._is_legacy_torchscript_declaration(source)
             if _TORCHSCRIPT_DEBUG_PAYLOAD_MARKER not in debug_prefix:
                 return False
 
@@ -1133,7 +1187,7 @@ class PyTorchZipScanner(BaseScanner):
         return bounded_target.decode("utf-8", errors="surrogateescape"), target_complete
 
     @staticmethod
-    def _symlink_payload_bounds_match(zip_file: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
+    def _zip_payload_bounds_match(zip_file: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
         """Return whether local ZIP metadata bounds the same payload as the central entry."""
         archive = zip_file.fp
         end_offset = getattr(info, "_end_offset", None)
@@ -1454,7 +1508,7 @@ class PyTorchZipScanner(BaseScanner):
                         },
                     )
                     scan_symlink_content = False
-                elif not self._symlink_payload_bounds_match(zip_file, info):
+                elif not self._zip_payload_bounds_match(zip_file, info):
                     result.add_check(
                         name="Symlink Safety Validation",
                         passed=False,
