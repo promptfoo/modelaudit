@@ -32,6 +32,58 @@ def _assert_clean_report(report: PickleReport) -> None:
     assert report.findings == ()
 
 
+def _scan_overlong_nested_operand(nested_payload: bytes, as_unicode: bool, source: str) -> PickleReport:
+    nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
+    payload = pickle.dumps(nested_value, protocol=4)
+
+    return scan_bytes(
+        payload,
+        source=source,
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
+            max_string_literal_scan_chars=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
+        ),
+    )
+
+
+def _assert_overlong_parse_notice(report: PickleReport) -> None:
+    incomplete_notice = next(notice for notice in report.notices if notice.code == "nested_pickle_incomplete")
+    nested_notices = incomplete_notice.details.get("nested_notices")
+    assert isinstance(nested_notices, (list, tuple))
+    assert any(
+        isinstance(notice, Mapping)
+        and notice.get("code") == "parse_incomplete"
+        and isinstance(notice.get("details"), Mapping)
+        and "protocol 0 line operand exceeds" in str(notice["details"].get("exception"))
+        for notice in nested_notices
+    )
+
+
+def _assert_encoded_finding(report: PickleReport, rule_code: str, encoding: str, flag: str) -> None:
+    assert any(
+        finding.rule_code == rule_code
+        and finding.details.get("encoding") == encoding
+        and finding.details.get(flag) is True
+        for finding in report.findings
+    )
+
+
+def _assert_incomplete_finding(report: PickleReport, rule_code: str) -> None:
+    assert any(
+        finding.rule_code == rule_code and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+def _assert_os_system_finding(report: PickleReport, rule_code: str) -> None:
+    assert any(
+        finding.rule_code == rule_code
+        and finding.details.get("module") == "os"
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
 def _overlong_protocol0_operand_body() -> bytes:
     # Protocol 0 line operand length includes the surrounding single quotes.
     overlong_line_operand_bytes = MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1
@@ -43,7 +95,7 @@ def _nested_overlong_protocol0_line_operand() -> bytes:
     return b"cos\nsystem\n(S'" + _overlong_protocol0_operand_body() + b"'\ntR."
 
 
-def _long_scalar_before_reduce_protocol0_pickle(opcode: bytes) -> bytes:
+def _long_protocol0_scalar(opcode: bytes) -> bytes:
     if opcode == b"F":
         scalar = b"F" + (b"1" * 257) + b"\n"
     elif opcode == b"I":
@@ -60,14 +112,15 @@ def _long_scalar_before_reduce_protocol0_pickle(opcode: bytes) -> bytes:
         scalar = b"Np" + (b"0" * 257) + b"\n"
     else:
         scalar = b"V" + (b"A" * 257) + b"\n"
-    return scalar + b"0cos\nsystem\n(S'id'\ntR."
+    return scalar
+
+
+def _long_scalar_before_reduce_protocol0_pickle(opcode: bytes) -> bytes:
+    return _long_protocol0_scalar(opcode) + b"0cos\nsystem\n(S'id'\ntR."
 
 
 def _benign_long_scalar_protocol0_pickle(opcode: bytes) -> bytes:
-    prefix = _long_scalar_before_reduce_protocol0_pickle(opcode).split(b"cos\nsystem\n", maxsplit=1)[0]
-    if prefix.endswith(b"0"):
-        prefix = prefix[:-1]
-    return prefix + b"."
+    return _long_protocol0_scalar(opcode) + b"."
 
 
 def _binbytes_literal_pickle(value: bytes) -> bytes:
@@ -126,39 +179,12 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand(
     as_unicode: bool,
 ) -> None:
     nested_payload = _nested_overlong_protocol0_line_operand()
-    nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
-    payload = pickle.dumps(nested_value, protocol=4)
-
-    report = scan_bytes(
-        payload,
-        source="nested-overlong-protocol0-string.pkl",
-        options=ScanOptions(
-            max_nested_pickle_bytes=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
-            max_string_literal_scan_chars=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
-        ),
-    )
+    report = _scan_overlong_nested_operand(nested_payload, as_unicode, "nested-overlong-protocol0-string.pkl")
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_GLOBAL"
-        and finding.details.get("module") == "os"
-        and finding.details.get("name") == "system"
-        for finding in report.findings
-    )
-    assert any(
-        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
-    incomplete_notice = next(notice for notice in report.notices if notice.code == "nested_pickle_incomplete")
-    nested_notices = incomplete_notice.details.get("nested_notices")
-    assert isinstance(nested_notices, (list, tuple))
-    assert any(
-        isinstance(notice, Mapping)
-        and notice.get("code") == "parse_incomplete"
-        and isinstance(notice.get("details"), Mapping)
-        and "protocol 0 line operand exceeds" in str(notice["details"].get("exception"))
-        for notice in nested_notices
-    )
+    _assert_os_system_finding(report, "DANGEROUS_GLOBAL")
+    _assert_incomplete_finding(report, "S213")
+    _assert_overlong_parse_notice(report)
 
 
 def test_scan_bytes_fails_closed_for_base64_nested_overlong_protocol0_line_operand() -> None:
@@ -175,10 +201,7 @@ def test_scan_bytes_fails_closed_for_base64_nested_overlong_protocol0_line_opera
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_incomplete_finding(report, "S601")
     assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
 
 
@@ -276,12 +299,7 @@ def test_scan_bytes_detects_inline_encoded_protocol0_pickle_before_suffix(
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == expected_rule_code
-        and finding.details.get("encoding") == encoding
-        and finding.details.get("nested_has_execution_opcode") is True
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, expected_rule_code, encoding, "nested_has_execution_opcode")
 
 
 @pytest.mark.parametrize("opcode", [b"I", b"S", b"V"])
@@ -295,18 +313,8 @@ def test_scan_bytes_detects_base64_pickle_after_long_protocol0_scalar(opcode: by
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "S601"
-        and finding.details.get("encoding") == "base64"
-        and finding.details.get("nested_has_execution_opcode") is True
-        for finding in report.findings
-    )
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.details.get("module") == "os"
-        and finding.details.get("name") == "system"
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, "S601", "base64", "nested_has_execution_opcode")
+    _assert_os_system_finding(report, "DANGEROUS_CALL")
 
 
 @pytest.mark.parametrize("opcode", [b"I", b"S", b"V"])
@@ -358,12 +366,7 @@ def test_scan_bytes_detects_base64_long_protocol0_pickle_in_byte_literals(
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.details.get("module") == "os"
-        and finding.details.get("name") == "system"
-        for finding in report.findings
-    )
+    _assert_os_system_finding(report, "DANGEROUS_CALL")
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -382,12 +385,7 @@ def test_scan_bytes_detects_base64_byte_literals_with_invalid_utf8_wrappers(
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.details.get("module") == "os"
-        and finding.details.get("name") == "system"
-        for finding in report.findings
-    )
+    _assert_os_system_finding(report, "DANGEROUS_CALL")
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -500,12 +498,7 @@ def test_scan_bytes_keeps_raw_nested_scan_for_mixed_encoded_byte_literals(
     )
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.details.get("module") == "os"
-        and finding.details.get("name") == "system"
-        for finding in report.findings
-    )
+    _assert_os_system_finding(report, "DANGEROUS_CALL")
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -592,19 +585,7 @@ def test_scan_bytes_preserves_raw_execution_inside_strict_base64_token(
     container: type[bytes] | type[bytearray],
     raw_payload: bytes,
 ) -> None:
-    payload = container(raw_payload)
-
-    report = scan_bytes(
-        pickle.dumps(payload, protocol=5),
-        source=f"strict-base64-with-raw-persid-{container.__name__}.pkl",
-    )
-
-    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
-    assert any(
-        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_encoded_raw_scan(container, raw_payload, f"strict-base64-with-raw-persid-{container.__name__}.pkl")
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -722,10 +703,7 @@ def test_scan_bytes_fails_closed_for_encoded_truncated_execution_prefixes(
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
-    assert any(
-        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_incomplete_finding(report, "S601")
     assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
     assert not any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
 
@@ -1156,7 +1134,7 @@ def test_scan_bytes_ignores_large_unterminated_protocol0_base64_scalar() -> None
 
 @pytest.mark.parametrize("opcode", [b"F", b"I", b"L", b"S", b"V", b"g", b"p"])
 def test_scan_bytes_keeps_wrapped_benign_long_scalar_base64_pickle_clean(opcode: bytes) -> None:
-    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode).split(b"0cos", maxsplit=1)[0] + b"."
+    nested_payload = _benign_long_scalar_protocol0_pickle(opcode)
     encoded = base64.b64encode(nested_payload).decode("ascii")
 
     report = scan_bytes(
@@ -1178,10 +1156,7 @@ def test_scan_bytes_fails_closed_for_long_scalar_base64_pickle_beyond_mid_scan_b
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_incomplete_finding(report, "S601")
 
 
 def test_scan_bytes_detects_later_base64_pickle_after_lenient_benign_prefix() -> None:
@@ -1194,12 +1169,7 @@ def test_scan_bytes_detects_later_base64_pickle_after_lenient_benign_prefix() ->
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "S601"
-        and finding.details.get("encoding") == "base64"
-        and finding.details.get("nested_has_execution_opcode") is True
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, "S601", "base64", "nested_has_execution_opcode")
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
@@ -1233,12 +1203,7 @@ def test_scan_bytes_fails_closed_for_oversized_inline_encoded_protocol0_pickle(
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == expected_rule_code
-        and finding.details.get("encoding") == encoding
-        and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, expected_rule_code, encoding, "analysis_incomplete")
 
 
 @pytest.mark.parametrize(
@@ -1306,12 +1271,7 @@ def test_scan_bytes_detects_leniently_decodable_inline_protocol0_pickle(
     )
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == expected_rule_code
-        and finding.details.get("encoding") == encoding
-        and finding.details.get("nested_has_execution_opcode") is True
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, expected_rule_code, encoding, "nested_has_execution_opcode")
 
 
 def test_scan_bytes_fails_closed_for_base64_pickle_across_probe_cap_gap() -> None:
@@ -1324,12 +1284,7 @@ def test_scan_bytes_fails_closed_for_base64_pickle_across_probe_cap_gap() -> Non
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "S601"
-        and finding.details.get("encoding") == "base64"
-        and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, "S601", "base64", "analysis_incomplete")
 
 
 def test_scan_bytes_detects_base64_pickle_beyond_probe_cap() -> None:
@@ -1344,12 +1299,7 @@ def test_scan_bytes_detects_base64_pickle_beyond_probe_cap() -> None:
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "S601"
-        and finding.details.get("encoding") == "base64"
-        and finding.details.get("nested_has_execution_opcode") is True
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, "S601", "base64", "nested_has_execution_opcode")
 
 
 @pytest.mark.parametrize("encoding", ["base64", "hex"])
@@ -1417,12 +1367,7 @@ def test_scan_bytes_fails_closed_when_encoded_prefix_hides_later_pickle_beyond_b
     )
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
-    assert any(
-        finding.rule_code == "S601"
-        and finding.details.get("encoding") == "base64"
-        and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_encoded_finding(report, "S601", "base64", "analysis_incomplete")
     assert any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
 
 
@@ -1470,17 +1415,7 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand_afte
     as_unicode: bool,
 ) -> None:
     nested_payload = b"(ios\nsystem\n(S'" + _overlong_protocol0_operand_body() + b"'\ntR."
-    nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
-    payload = pickle.dumps(nested_value, protocol=4)
-
-    report = scan_bytes(
-        payload,
-        source="nested-inst-overlong-protocol0-string.pkl",
-        options=ScanOptions(
-            max_nested_pickle_bytes=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
-            max_string_literal_scan_chars=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
-        ),
-    )
+    report = _scan_overlong_nested_operand(nested_payload, as_unicode, "nested-inst-overlong-protocol0-string.pkl")
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(
@@ -1489,20 +1424,8 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand_afte
         and finding.details.get("import_reference") == "os.system"
         for finding in report.findings
     )
-    assert any(
-        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
-    incomplete_notice = next(notice for notice in report.notices if notice.code == "nested_pickle_incomplete")
-    nested_notices = incomplete_notice.details.get("nested_notices")
-    assert isinstance(nested_notices, (list, tuple))
-    assert any(
-        isinstance(notice, Mapping)
-        and notice.get("code") == "parse_incomplete"
-        and isinstance(notice.get("details"), Mapping)
-        and "protocol 0 line operand exceeds" in str(notice["details"].get("exception"))
-        for notice in nested_notices
-    )
+    _assert_incomplete_finding(report, "S213")
+    _assert_overlong_parse_notice(report)
 
 
 @pytest.mark.parametrize("as_unicode", [False, True])
@@ -1535,7 +1458,4 @@ def _assert_encoded_raw_scan(container: type[bytes] | type[bytearray], payload: 
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
     assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
-    assert any(
-        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_incomplete_finding(report, "S213")

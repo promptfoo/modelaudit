@@ -55,6 +55,14 @@ def _clear_call_graph_caches() -> None:
         function.cache_clear()
 
 
+class _ClearedCallGraphCaches:
+    def __enter__(self) -> None:
+        _clear_call_graph_caches()
+
+    def __exit__(self, *_exc_info: object) -> None:
+        _clear_call_graph_caches()
+
+
 def _shell_command(marker: Path, marker_content: str) -> str:
     return f"printf {shlex.quote(marker_content)} > {shlex.quote(str(marker))}"
 
