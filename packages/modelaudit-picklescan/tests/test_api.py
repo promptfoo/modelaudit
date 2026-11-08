@@ -2989,6 +2989,118 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.coverage.bytes_scanned > 0
 
 
+def _legacy_torchscript_control() -> bytes:
+    control = b"\x80\x02" + _global(b"__torch__", b"Module") + b"q\x00)\x81}("
+    for key, name in ((b"0", b"weight"), (b"1", b"bias")):
+        storage = (
+            b"("
+            + _binunicode(b"storage")
+            + _global(b"torch", b"FloatStorage")
+            + _binunicode(key)
+            + _binunicode(b"cpu")
+            + b"K\x08NtQ"
+        )
+        tensor = _pytorch_rebuild_tensor_v2_payload(
+            storage_expr=storage, global_memo_expr=b"", element_count=8, size=(8,)
+        )
+        control += _binunicode(name) + tensor.removeprefix(b"\x80\x04").removesuffix(b".")
+    return control + b"ub."
+
+
+def _write_legacy_torchscript_zip(
+    path: Path, control: bytes, *, version: bytes = b"1\n", second_storage: bytes | None = bytes(32)
+) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", version)
+        archive.writestr("model/constants.pkl", b"\x80\x02).")
+        archive.writestr(
+            "model/code/__torch__.py",
+            (
+                'op_version_set = 1\nclass Module(Module):\n  __parameters__ = ["weight", "bias", ]\n'
+                '  __annotations__ = []\n  __annotations__["weight"] = Tensor\n  __annotations__["bias"] = Tensor\n'
+            ),
+        )
+        archive.writestr("model/data.pkl", control)
+        archive.writestr("model/data/0", bytes(32))
+        if second_storage is not None:
+            archive.writestr("model/data/1", second_storage)
+
+
+def test_scan_file_torchscript_v1_suppresses_only_proven_storage_ids(tmp_path: Path) -> None:
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, _legacy_torchscript_control())
+
+    report = scan_file(path)
+
+    assert report.metadata["container_type"] == "pytorch_zip"
+    assert not any(f.rule_code == "PERSISTENT_ID" for f in report.findings)
+    assert any(f.details.get("import_reference") == "__torch__.Module" for f in report.findings)
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        pytest.param(b"NtQ", b"K\x00tQ", id="non-none-view"),
+        pytest.param(b"NtQ", _global(b"builtins", b"print") + b")RtQ", id="computed-view"),
+        pytest.param(b"NtQ", b"NQtQ", id="nested-foreign-pid"),
+        pytest.param(b"NtQ", b"t0" + _binunicode(b"foreign") + b"Q", id="late-foreign-pid"),
+        pytest.param(b")RtR", b"}\x85RtR", id="nonempty-hooks-constructor"),
+        pytest.param(b")RtR", b")Rq\x01" + _binunicode(b"k") + b"Ns" + b"tR", id="mutated-hooks"),
+        pytest.param(b"ub.", b"ub", id="missing-stop"),
+        pytest.param(b"ub.", b"ub.\x80\x02N.", id="second-pickle"),
+    ],
+)
+def test_scan_file_torchscript_v1_keeps_aggregate_pid_for_unproven_control(
+    tmp_path: Path, original: bytes, replacement: bytes
+) -> None:
+    control = _legacy_torchscript_control()
+    prefix, matched, suffix = control.rpartition(original)
+    assert matched and b"tQ" in prefix
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, prefix + replacement + suffix)
+
+    report = scan_file(path)
+
+    first_pid_position = control.index(b"tQ") + 1
+    assert any(
+        f.rule_code == "PERSISTENT_ID" and f.location == f"{path}:model/data.pkl (pos {first_pid_position})"
+        for f in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "second_storage"),
+    [(b"2\n", bytes(32)), (b"1\n", bytes(31)), (b"1\n", None)],
+    ids=["other-version", "size-mismatch", "missing-storage"],
+)
+def test_scan_file_torchscript_v1_checks_archive_evidence(
+    tmp_path: Path, version: bytes, second_storage: bytes | None
+) -> None:
+    path = tmp_path / "model.ot"
+    _write_legacy_torchscript_zip(path, _legacy_torchscript_control(), version=version, second_storage=second_storage)
+
+    report = scan_file(path)
+
+    assert any(f.rule_code == "PERSISTENT_ID" for f in report.findings)
+
+
+def test_scan_file_torchscript_v1_still_scans_pickle_inside_storage(tmp_path: Path) -> None:
+    path = tmp_path / "model.ot"
+    malicious_storage = b"\x80\x02cos\nsystem\n)R."
+    _write_legacy_torchscript_zip(
+        path, _legacy_torchscript_control(), second_storage=malicious_storage.ljust(32, b"\x00")
+    )
+
+    report = scan_file(path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        f.details.get("name") == "system" and f.location is not None and "model/data/1" in f.location
+        for f in report.findings
+    )
+
+
 def test_scan_file_suppresses_rebuild_tensor_v2_for_valid_canonical_pytorch_zip(tmp_path: Path) -> None:
     _require_torch_distribution()
     archive_path = tmp_path / "model.pt"

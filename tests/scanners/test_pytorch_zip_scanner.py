@@ -8766,6 +8766,65 @@ def test_pytorch_zip_data_pkl_keeps_unvalidated_storage_pid_warning(tmp_path: Pa
     )
 
 
+def _legacy_torchscript_v1_tensor_state(*, foreign_second_id: bool) -> bytes:
+    payload = b"\x80\x02" + _pickle_global("__torch__", "Module") + b"q\x00)\x81}("
+    for key, parameter in ((b"0", b"weight"), (b"1", b"bias")):
+        storage_tag = b"foreign" if foreign_second_id and key == b"1" else b"storage"
+        payload += (
+            _pickle_binunicode(parameter)
+            + _pickle_global("torch._utils", "_rebuild_tensor_v2")
+            + b"(("
+            + _pickle_binunicode(storage_tag)
+            + _pickle_global("torch", "FloatStorage")
+            + _pickle_binunicode(key)
+            + _pickle_binunicode(b"cpu")
+            + b"K\x08NtQ"  # eight floats with no legacy view metadata
+            + b"K\x00"
+            + _pickle_int_tuple((8,))
+            + _pickle_int_tuple((1,))
+            + b"\x89"
+            + _pytorch_empty_ordered_dict_reduce_expr()
+            + b"tR"
+        )
+    return payload + b"ubq\x01."
+
+
+@pytest.mark.parametrize("case", ["canonical", "size", "foreign-second-id", "version"])
+def test_legacy_torchscript_v1_storage_ids_require_the_whole_archive_proof(tmp_path: Path, case: str) -> None:
+    path = tmp_path / "module.ot"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("model/version", b"2\n" if case == "version" else b"1\n")
+        archive.writestr(
+            "model/code/__torch__.py",
+            "class Module(Module):\n  __parameters__ = ['weight', 'bias']\n",
+        )
+        archive.writestr(
+            "model/data.pkl",
+            _legacy_torchscript_v1_tensor_state(foreign_second_id=case == "foreign-second-id"),
+        )
+        archive.writestr("model/data/0", b"cos\nsystem\n(S'test'\ntR.".ljust(32, b"\x00"))
+        archive.writestr("model/data/1", bytes(31 if case == "size" else 32))
+
+    result = PyTorchZipScanner().scan(str(path))
+
+    assert any(issue.details.get("associated_global") == "__torch__.Module" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "model/data/0"
+        for issue in result.issues
+    )
+    assert any(
+        issue.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        and issue.details.get("pickle_filename") == "model/data.pkl"
+        for issue in result.issues
+    ) is (case != "canonical")
+    assert any(
+        check.status == CheckStatus.PASSED
+        and check.details.get("trusted_pytorch_archive_context") is True
+        and check.details.get("pytorch_storage_key") == "0"
+        for check in result.checks
+    ) is (case == "canonical")
+
+
 @pytest.mark.parametrize("storage_size", [24, 23])
 def test_large_state_pid_validation_keeps_hidden_member_and_coverage_checks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_size: int

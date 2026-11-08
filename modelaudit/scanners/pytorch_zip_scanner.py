@@ -8560,15 +8560,18 @@ class PyTorchZipScanner(BaseScanner):
                 pickle_data,
                 opcode_budget_remaining=storage_reference_opcodes_remaining,
             )
-            if not reference_parse.parse_complete:
-                if pid_validator is not None:
-                    pid_keys = pid_validator.validated_keys(
+            if pid_validator is not None:
+                legacy_module = pid_validator.is_legacy_module(pickle_data, zip_file, entries_by_name, prefix)
+                if not reference_parse.parse_complete or legacy_module:
+                    pid_trust = pid_validator.validate(
                         pickle_data,
                         {key: entry.file_size for key, entry in storage_entries_by_key.items()},
+                        legacy_module=legacy_module,
                         deadline=time.monotonic() + self._get_remaining_time(),
                     )
-                    if pid_keys:
-                        additional_pid_keys[data_pkl_member] = pid_keys
+                    if pid_trust is not None:
+                        additional_pid_keys[data_pkl_member] = pid_trust.storage_keys
+            if not reference_parse.parse_complete:
                 self._record_storage_reference_validation_incomplete(
                     result,
                     data_pkl_member=data_pkl_member,
@@ -9066,7 +9069,7 @@ class PyTorchZipScanner(BaseScanner):
 
     @classmethod
     def _is_pytorch_storage_persistent_id_record(cls, details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
-        if details.get("pickle_rule_code") != "PERSISTENT_ID":
+        if details.get("pickle_rule_code") != "PERSISTENT_ID" or "nested_details" in details:
             return False
         storage_key = details.get("pytorch_storage_key")
         if (
