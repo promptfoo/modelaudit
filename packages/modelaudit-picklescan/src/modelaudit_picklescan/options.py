@@ -43,23 +43,10 @@ class ScanOptions:
             raise ValueError(f"timeout_s must be greater than 0 and finite, got {timeout_s!r}")
         object.__setattr__(self, "timeout_s", min(float(timeout_s), MAX_TIMEOUT_S))
 
-        max_opcodes: object = self.max_opcodes
-        _validate_integer(max_opcodes, "max_opcodes", 1)
-
-        post_budget_scan_bytes: object = self.post_budget_scan_bytes
-        _validate_integer(post_budget_scan_bytes, "post_budget_scan_bytes", 0)
-
-        max_known_stream_read_bytes: object = self.max_known_stream_read_bytes
-        _validate_integer(max_known_stream_read_bytes, "max_known_stream_read_bytes", 1)
-
-        max_unbounded_stream_read_bytes: object = self.max_unbounded_stream_read_bytes
-        _validate_integer(max_unbounded_stream_read_bytes, "max_unbounded_stream_read_bytes", 1)
-
-        max_string_literal_scan_chars: object = self.max_string_literal_scan_chars
-        _validate_integer(max_string_literal_scan_chars, "max_string_literal_scan_chars", 0)
-
-        max_nested_pickle_bytes: object = self.max_nested_pickle_bytes
-        _validate_integer(max_nested_pickle_bytes, "max_nested_pickle_bytes", 2)
-
-        max_nested_depth: object = self.max_nested_depth
-        _validate_integer(max_nested_depth, "max_nested_depth", 0)
+        _validate_integer(self.max_opcodes, "max_opcodes", 1)
+        _validate_integer(self.post_budget_scan_bytes, "post_budget_scan_bytes", 0)
+        _validate_integer(self.max_known_stream_read_bytes, "max_known_stream_read_bytes", 1)
+        _validate_integer(self.max_unbounded_stream_read_bytes, "max_unbounded_stream_read_bytes", 1)
+        _validate_integer(self.max_string_literal_scan_chars, "max_string_literal_scan_chars", 0)
+        _validate_integer(self.max_nested_pickle_bytes, "max_nested_pickle_bytes", 2)
+        _validate_integer(self.max_nested_depth, "max_nested_depth", 0)
