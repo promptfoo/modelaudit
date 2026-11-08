@@ -5655,22 +5655,28 @@ def _assert_tokenizer_route_evidence(tmp_path: Path, case_late_fields: str, case
     assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is case_expected_jax
 
 
-@pytest.mark.parametrize("filename", ["tekken.json", "v13.tekken.json"])
-def test_tekken_vocabulary_owns_only_complete_tokenizer_schema(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize(
+    ("filename", "version", "has_special_tokens"),
+    [("tekken.json", "v7", False), ("tekken.json", "v13", True), ("v13.tekken.json", "v13", True)],
+)
+def test_tekken_vocabulary_owns_only_complete_tokenizer_schema(
+    tmp_path: Path, filename: str, version: str, has_special_tokens: bool
+) -> None:
     path = tmp_path / filename
     config = {
-        "version": "v13",
+        "version": version,
         "pattern": ".",
         "num_vocab_tokens": 1,
         "default_vocab_size": 1,
         "default_num_special_tokens": 1,
     }
     vocab = [{"rank": 0, "token_str": "{{jax}}", "token_bytes": "e3tqYXh9fQ=="}]
-    document = {
+    document: dict[str, object] = {
         "config": config,
         "vocab": vocab,
-        "special_tokens": [{"rank": 0, "token_str": "<s>", "is_control": True}],
     }
+    if has_special_tokens:
+        document["special_tokens"] = [{"rank": 0, "token_str": "<s>", "is_control": True}]
     path.write_text(json.dumps(document))
     assert is_huggingface_tokenizer_json_file(path)
     assert detect_file_format(str(path)) == "unknown"

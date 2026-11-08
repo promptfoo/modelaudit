@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recognize standalone Tekken vocabulary JSON without routing token spellings to model checkpoint parsers. Filtered domain-shaped code tokens in model cards no longer consume the network evidence classification budget.
 - Recognize SentencePiece tokenizers with large trainer symbol lists and complete tiktoken rank files sharing the XGBoost model extension.
 
+- Recognize Tekken v7 vocabularies and large SafeTensors weight indexes during JSON routing, preserving manifest security checks and incomplete results for ambiguous files.
 - Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.
 - Resolve bound function attributes during finite ONNX replay and ignore unrelated dead transforms without dropping live weight consumers.
 - Bound duplicate singular fields during ONNX control preflight and preserve findings and explicit incomplete coverage when admission stops.
