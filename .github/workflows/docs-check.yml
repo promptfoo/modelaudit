@@ -14,6 +14,8 @@ jobs:
     name: Check Documentation Formatting
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      any_changed: ${{ steps.changed-files.outputs.any_changed }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -143,8 +145,17 @@ jobs:
         if: steps.changed-files.outputs.any_changed == 'false'
         run: echo "No documentation files changed, skipping formatting check"
 
+  link-check:
+    name: Check Markdown Links
+    needs: format-check
+    if: needs.format-check.outputs.any_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
       - name: Check for broken links in markdown
-        if: steps.changed-files.outputs.any_changed == 'true'
         uses: gaurav-nelson/github-action-markdown-link-check@5c5dfc0ac2e225883c0e5f03a85311ec2830d368 # v1
         with:
           use-quiet-mode: "yes"
