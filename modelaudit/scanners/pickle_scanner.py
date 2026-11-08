@@ -4548,11 +4548,8 @@ class PickleScanner(BaseScanner):
                 if (
                     not skipped_limit_reported
                     and unprefixed_seedless_token_count
-                    and (
-                        (skip_unprefixed and unprefixed_seedless_token_count > _MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS)
-                        or unprefixed_seedless_token_count + decoded_token_count + additional_token_count
-                        > _MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS
-                    )
+                    and unprefixed_seedless_token_count + decoded_token_count + additional_token_count
+                    > _MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS
                 ):
                     self._mark_encoded_text_scan_limit(
                         result,
