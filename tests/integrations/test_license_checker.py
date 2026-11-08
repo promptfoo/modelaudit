@@ -41,10 +41,6 @@ CC_BY_NC_HEADER = """Creative Commons Attribution NonCommercial License
 This work is licensed under CC BY-NC 4.0
 """
 
-RAIL_HEADER = """# Released under the Responsible AI License
-# BigScience Open RAIL-M
-"""
-
 BIGSCIENCE_DATASET_NOTICE = """
 {
   "_license": "BigScience Open RAIL-M",
@@ -131,22 +127,16 @@ Some dataset content here...
         assert licenses[0].spdx_id == "CC-BY-NC-4.0"
         assert licenses[0].commercial_allowed is False
 
-    def test_rail_license_detection(self, tmp_path: Path) -> None:
-        """Test detection of RAIL license."""
-        test_file = tmp_path / "rail_file.py"
-        content = (
-            RAIL_HEADER
-            + """def do_something():
-    pass
-"""
-        )
-        test_file.write_text(content)
+    @pytest.mark.parametrize("notice", ["RAIL License", "Responsible AI License", "OpenRAIL-M"])
+    def test_rail_license_detection(self, tmp_path: Path, notice: str) -> None:
+        path = tmp_path / "LICENSE"
+        path.write_text(notice)
+        assert [lic.spdx_id for lic in scan_for_license_headers(str(path))] == ["RAIL"]
 
-        licenses = scan_for_license_headers(str(test_file))
-
-        assert len(licenses) >= 1
-        spdx_ids = {lic.spdx_id for lic in licenses}
-        assert "RAIL" in spdx_ids or "BigScience-OpenRAIL-M" in spdx_ids
+    def test_rail_inside_words(self, tmp_path: Path) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("notes\ntrailing values from the BigScience railroad dataset\n")
+        assert scan_for_license_headers(str(path)) == []
 
     def test_bigscience_dataset_notice_detection(self, tmp_path: Path) -> None:
         """Test detection of BigScience dataset license notice."""
@@ -476,14 +466,10 @@ def _license_results(file_path: str, **license_info: object) -> dict[str, object
 class TestCommercialUseWarnings:
     """Test commercial use warnings."""
 
-    def test_agpl_detection(self) -> None:
-        """Test AGPL component detection."""
-        scan_results = _license_results("/path/agpl_file.py", spdx_id="AGPL-3.0", commercial_allowed=True)
-
-        agpl_files = detect_agpl_components(scan_results)
-
-        assert len(agpl_files) == 1
-        assert "/path/agpl_file.py" in agpl_files
+    def test_agpl_detection(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "component.py")
+        metadata = {"license_info": [{"spdx_id": None}, {"spdx_id": "AGPL-1.0"}, {"spdx_id": "AGPL-3.0"}]}
+        assert detect_agpl_components({"file_metadata": {path: metadata}}) == [path]
 
     def test_no_agpl_detection(self) -> None:
         """Test when no AGPL components are present."""
@@ -530,25 +516,47 @@ class TestCommercialUseWarnings:
 
 
 class TestSpdxLicenseChecks:
-    """Test deprecated and incompatible license detection."""
+    @pytest.mark.parametrize("strict", [False, True])
+    @pytest.mark.parametrize(
+        ("header", "expected_ids", "noncommercial"),
+        [
+            ("CC-BY-4.0", ["CC-BY-4.0"], False),
+            ("Creative Commons Attribution 4.0 International", ["CC-BY-4.0"], False),
+            ("Creative Commons Attribution-ShareAlike 4.0", ["CC-BY-SA-4.0"], False),
+            ("Creative Commons Attribution-NonCommercial 4.0", ["CC-BY-NC-4.0"], True),
+            ("CC-BY-NC-4.0", ["CC-BY-NC-4.0"], True),
+            ("Creative Commons Attribution-ShareAlike 4.0 or CC-BY-4.0", ["CC-BY-4.0", "CC-BY-SA-4.0"], False),
+        ],
+    )
+    def test_creative_commons_declarations(
+        self, tmp_path: Path, header: str, expected_ids: list[str], noncommercial: bool, strict: bool
+    ) -> None:
+        path = tmp_path / "LICENSE"
+        path.write_text(header)
+        metadata = collect_license_metadata(str(path))
 
-    def test_deprecated_license_warning(self):
-        scan_results = {"file_metadata": {"/path/old.py": {"license_info": [{"spdx_id": "AGPL-1.0"}]}}}
+        assert [license_info["spdx_id"] for license_info in metadata["license_info"]] == expected_ids
+        warnings = check_commercial_use_warnings({"file_metadata": {str(path): metadata}}, strict=strict)
+        if noncommercial:
+            assert len(warnings) == 1
+            assert "Non-commercial" in warnings[0]["message"]
+            assert warnings[0]["severity"] == ("error" if strict else "warning")
+            assert warnings[0]["details"]["files"] == [str(path)]
+        else:
+            assert warnings == []
 
-        warnings = check_commercial_use_warnings(scan_results)
-        assert any("deprecated" in w["message"].lower() for w in warnings)
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_deprecated_identifiers_count_each_file_once(self, tmp_path: Path, strict: bool) -> None:
+        paths = [str(tmp_path / name) for name in ("first.py", "second.py")]
+        metadata = {"license_info": [{"spdx_id": "GPL-2.0"}, {"spdx_id": "AGPL-1.0"}]}
+        warnings = license_checker.check_spdx_license_issues(
+            {"file_metadata": dict.fromkeys(paths, metadata)}, strict=strict
+        )
 
-    def test_incompatible_license_warning(self):
-        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
-
-        warnings = check_commercial_use_warnings(scan_results)
-        assert any("incompatible" in w["message"].lower() for w in warnings)
-
-    def test_strict_license_errors(self):
-        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
-
-        warnings = check_commercial_use_warnings(scan_results, strict=True)
-        assert any(w["severity"] == "error" for w in warnings)
+        assert len(warnings) == 1
+        assert warnings[0]["message"] == "Deprecated licenses detected (2 files)."
+        assert warnings[0]["details"] == {"files": paths, "total_count": 2}
+        assert warnings[0]["severity"] == ("error" if strict else "warning")
 
 
 class TestLicenseMetadataCollection:
@@ -654,7 +662,7 @@ Bob,30
 class TestIntegration:
     """Integration tests for license checking with core scanning."""
 
-    def test_license_warnings_in_scan_results(self, tmp_path):
+    def test_license_warnings_in_scan_results(self, tmp_path: Path) -> None:
         """Test that license warnings appear in scan results."""
         from modelaudit.core import scan_model_directory_or_file
 
@@ -676,12 +684,8 @@ test,data
             issue for issue in results.get("issues", []) if getattr(issue, "type", None) == "license_warning"
         ]
 
-        assert len(license_issues) > 0
-        # The license detection should find the CC BY-NC (non-commercial) license
-        # Check if it's detected as incompatible licenses (which is correct for non-commercial)
-        assert any(
-            "Incompatible licenses" in issue.message or "Non-commercial" in issue.message for issue in license_issues
-        ), f"Expected license incompatibility detection in messages: {[issue.message for issue in license_issues]}"
+        assert len(license_issues) == 1
+        assert "Non-commercial" in license_issues[0].message
 
     def test_ml_model_directory_no_false_positives(self, tmp_path):
         """Test that ML model directories don't generate false positive license warnings."""

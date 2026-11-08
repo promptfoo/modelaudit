@@ -3222,7 +3222,7 @@ def scan_model_directory_or_file(
         timeout: Scan timeout in seconds
         max_file_size: Maximum file size to scan in bytes
         max_total_size: Maximum total bytes to scan across all files
-        strict_license: Fail scan if incompatible licenses are found
+        strict_license: Report non-commercial licenses and deprecated SPDX identifiers as errors
         progress_callback: Optional callback function to report progress
                           (message, percentage)
         skip_file_types: Whether to skip non-model file types during directory scans
