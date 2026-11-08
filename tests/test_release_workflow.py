@@ -534,6 +534,44 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
     }
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash execution requires POSIX filesystem semantics")
+@pytest.mark.parametrize(
+    ("job", "step_name", "version_output"),
+    [
+        ("build", "Verify distribution artifacts and version consistency", "version"),
+        ("build-picklescan-package", "Verify standalone artifact version consistency", "picklescan_version"),
+    ],
+)
+@pytest.mark.parametrize("missing_version", [None, "wheel", "sdist"])
+def test_release_workflow_reads_artifact_metadata(
+    tmp_path: Path, job: str, step_name: str, version_output: str, missing_version: str | None
+) -> None:
+    step = _step_by_name(_job_steps(_load_release_workflow(), job), step_name)
+    version = "1.2.3"
+    metadata = f"Version: {version}\n".encode()
+    package = "modelaudit" if job == "build" else "modelaudit_picklescan"
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    # A different filename version makes the metadata check observable.
+    with zipfile.ZipFile(dist / f"{package}-9.9.9-py3-none-any.whl", "w") as wheel:
+        wheel.writestr(f"{package}-9.9.9.dist-info/METADATA", b"" if missing_version == "wheel" else metadata)
+    pkg_info = tmp_path / "PKG-INFO"
+    pkg_info.write_bytes(b"" if missing_version == "sdist" else metadata)
+    with tarfile.open(dist / f"{package}-9.9.9.tar.gz", "w:gz") as sdist:
+        sdist.add(pkg_info, arcname=f"{package}-9.9.9/PKG-INFO")
+
+    command = step["run"].replace("${{ needs.release-please.outputs." + version_output + " }}", version)
+    result = subprocess.run(
+        ["bash", "-c", command], cwd=tmp_path, env={**os.environ, **step["env"]}, capture_output=True, text=True
+    )
+    if missing_version is None:
+        assert result.returncode == 0, result.stderr
+        assert f"validation passed for version {version}" in result.stdout
+    else:
+        assert result.returncode == 1
+        assert "Could not find Version header" in result.stderr
+
+
 def test_release_workflow_restores_root_runtime_python_after_type_check() -> None:
     workflow = _load_release_workflow()
     steps = _job_steps(workflow, "build")
