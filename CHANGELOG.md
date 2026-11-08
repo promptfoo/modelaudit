@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
 - Stop flagging licenses as incompatible solely because they lack OSI approval. Distinguish Creative Commons Attribution from ShareAlike and NonCommercial declarations, recognize RAIL names at word boundaries, and count each file once when reporting deprecated identifiers.
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
+- Continue checking README and model-card URLs and credentials after a malformed link.
 - Report completed scans as successful in the Python API even when a security check raises a warning.
 - Validate legacy Bitcoin address checksums before reporting a match, so unrelated identifiers such as notebook IDs do not trigger embedded-secret alerts.
 - Avoid incomplete GGUF, GGML, and sharded model scans and skipped file hashes on Windows when an unchanged file reports different creation times through its path and its open handle.
