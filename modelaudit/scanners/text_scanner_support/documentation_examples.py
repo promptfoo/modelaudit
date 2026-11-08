@@ -17,14 +17,20 @@ from modelaudit.detectors.network_comm import NetworkCommDetector
 MAX_EXAMPLE_BYTES = 16 * 1024
 MAX_DOCUMENTATION_BYTES = 256 * 1024
 MAX_FENCES = 128
-PARSED_FENCE_LANGUAGES = frozenset({b"", b"sh", b"bash", b"shell", b"console", b"terminal", b"py", b"python"})
-FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r\n]*?)[ \t]*\r?$")
+SHELL_LANGUAGES = {b"sh", b"bash", b"shell", b"console", b"terminal"}
+PYTHON_LANGUAGES = {b"py", b"python"}
+PARSED_FENCE_LANGUAGES = SHELL_LANGUAGES | PYTHON_LANGUAGES | {b""}
+FENCE_PATTERN = re.compile(rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<language>[^\r\n]*)\r?$")
 INDENTED_CODE_BLOCK_PATTERN = re.compile(rb"(?m)^(?: {4}|\t)[^\n]*\n?(?:(?: {4}|\t)[^\n]*\n?|[ \t]*\n)*")
 BACKTICK_PATTERN = re.compile(rb"`+")
+STANDALONE_HTML_COMMENT = re.compile(rb"(?m)^ {0,3}<!--[^<>\r\n]*-->[ \t]*\r?$")
 QUOTE_PREFIX_PATTERN = re.compile(rb" {0,3}>[ \t]?")
 LIST_PREFIX_PATTERN = re.compile(rb" {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}(?=\S|$)")
 EXECUTION_DIRECTIVE_PATTERN = re.compile(
-    r"\b(?:run|execute|invoke|launch|source)(?:[ \t]*[:\uff1a\u2014\u2013-][ \t\r\n]*|[ \t\r\n]+)", re.IGNORECASE
+    r"(?<!\w)(?:\*{1,3}|_{1,3})?(?:run|execute|invoke|launch|source)(?:\*{1,3}|_{1,3})?"
+    r"(?:[ \t]+the[ \t]+following[ \t]+(?:command|script)(?=[ \t]*[:\uff1a]))?"
+    r"(?:[ \t]*[:\uff1a\u2014\u2013-][ \t\r\n]*|[ \t\r\n]+)",
+    re.IGNORECASE,
 )
 URL_PATTERN = re.compile(rb"https?://[^\s\"'<>`]+")
 INDEX_HOSTS = frozenset({"pypi.org", "pypi.python.org", "download.pytorch.org", "wheels.vllm.ai"})
@@ -34,8 +40,12 @@ PYTHON_EXECUTION_NAMES = frozenset(
     | {"posix_spawn", "posix_spawnp", "startfile"}
     | {"CDLL", "PyDLL", "WinDLL", "OleDLL", "cdll", "pydll", "windll", "oledll", "LoadLibrary", "dlopen"}
     | {"Unpickler", "_Unpickler"}
-    | {"import_module", "spec_from_file_location", "module_from_spec", "exec_module"}
+    | {"import_module", "spec_from_file_location", "module_from_spec", "exec_module", "load_module", "addsitedir"}
 )
+UNSAFE_PYTHON_LOADERS = {
+    f"{module}.{method}" for module in ("pickle", "_pickle", "dill", "cloudpickle") for method in ("load", "loads")
+} | {"joblib.load", "torch.hub.load"}
+TORCH_LOADERS = {"torch.load", "torch.serialization.load"}
 URL_RISK_TERMS = (
     NetworkCommDetector.INFORMATIONAL_URL_RISK_TERMS
     + tuple(term.decode("ascii") for term in NetworkCommDetector.CC_PATTERNS)
@@ -279,7 +289,7 @@ def _literal_api_url(node: ast.expr) -> ast.Constant | None:
     return None
 
 
-def _has_unsafe_deserialization_call(nodes: list[ast.AST]) -> bool:
+def _has_unsafe_loader_reference(nodes: list[ast.AST]) -> bool:
     imports: dict[str, str] = {}
     for node in nodes:
         if isinstance(node, ast.Import):
@@ -288,31 +298,50 @@ def _has_unsafe_deserialization_call(nodes: list[ast.AST]) -> bool:
                 imports[alias.asname or root] = alias.name if alias.asname else root
         elif isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
-                imports[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-    for node in nodes:
-        if not isinstance(node, ast.Call):
+                name = f"{node.module}.{alias.name}"
+                if name in UNSAFE_PYTHON_LOADERS:
+                    return True
+                imports[alias.asname or alias.name] = name
+
+    # A reference can be rebound to another name before it is called. Exempt
+    # torch.load only at a direct call site with known options.
+    direct_calls = {node.func: node for node in nodes if isinstance(node, ast.Call)}
+    for target in nodes:
+        if not isinstance(target, (ast.Attribute, ast.Name)):
             continue
-        target = node.func
+        if isinstance(target, ast.Attribute) and target.attr not in {"load", "loads"}:
+            continue
+        parent: ast.expr = target
         parts: list[str] = []
-        while isinstance(target, ast.Attribute):
-            parts.append(target.attr)
-            target = target.value
-        if not isinstance(target, ast.Name):
+        while isinstance(parent, ast.Attribute):
+            if len(parts) >= 3:
+                return True  # Longer loader paths fall outside the supported examples.
+            parts.append(parent.attr)
+            parent = parent.value
+        if not isinstance(parent, ast.Name):
             continue
-        name = ".".join([imports.get(target.id, target.id), *reversed(parts)])
-        if name in {"pickle.load", "pickle.loads", "dill.load", "dill.loads", "joblib.load", "cloudpickle.loads"}:
+        name = ".".join([imports.get(parent.id, parent.id), *reversed(parts)])
+        if name in UNSAFE_PYTHON_LOADERS:
             return True
-        if name in {"torch.load", "torch.serialization.load"} and any(
-            keyword.arg == "weights_only"
-            and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is True)
-            for keyword in node.keywords
-        ):
+        if name in TORCH_LOADERS:
+            call = direct_calls.get(target)
+            if call is None or any(
+                keyword.arg is None
+                or (
+                    keyword.arg == "weights_only"
+                    and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is True)
+                )
+                for keyword in call.keywords
+            ):
+                return True
+        elif parts and parent.id not in imports and name not in {"json.load", "json.loads"}:
+            # The receiver may be an alias imported in another Markdown block.
             return True
     return False
 
 
 def _has_execution_reference(nodes: list[ast.AST]) -> bool:
-    if _has_unsafe_deserialization_call(nodes):
+    if _has_unsafe_loader_reference(nodes):
         return True
     for node in nodes:
         if isinstance(node, ast.Call):
@@ -383,14 +412,15 @@ def _has_execution_reference(nodes: list[ast.AST]) -> bool:
     )
 
 
-def _python_url_spans(source: bytes) -> list[tuple[int, int]]:
+def _python_url_spans(source: bytes) -> list[tuple[int, int]] | None:
+    """Return eligible spans, or None when the example cannot establish routine use."""
     try:
         tree = ast.parse(source.decode("utf-8"))
     except (UnicodeDecodeError, SyntaxError, ValueError, RecursionError):
-        return []
+        return None
     nodes = list(ast.walk(tree))
     if _has_execution_reference(nodes):
-        return []
+        return None
 
     literals: dict[ast.Constant, str] = {}
     for node in nodes:
@@ -506,6 +536,8 @@ def _command_executes_script(words: list[str]) -> bool:
         "bash",
         "sh",
     }
+    if command in {"bash", "sh"} and words[1:] in (["-h"], ["-V"]):
+        return True
     # Unknown commands, wrappers, and direct program paths cannot prove a clone
     # is routine setup. Keep their clone findings rather than enumerating launchers.
     return not (not wrapped and version_command and words[1:] in (["--version"], ["-V"], ["--help"], ["-h"]))
@@ -644,6 +676,8 @@ def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int
             if opening_width in next_by_length:
                 closing[index] = next_by_length[opening_width]
             next_by_length[width] = index
+        comments = STANDALONE_HTML_COMMENT.finditer(payload, start, end)
+        comment = next(comments, None)
         index = 0
         while index < len(delimiters):
             close = closing.get(index)
@@ -651,12 +685,19 @@ def _inline_examples_execute_script(payload: bytes, regions: list[tuple[int, int
                 index += 1
                 continue
             left, right = delimiters[index], delimiters[close]
+            while comment is not None and comment.end() <= left.start():
+                comment = next(comments, None)
+            if comment is not None and comment.start() <= left.start() and right.end() <= comment.end():
+                index = close + 1  # Leave the complete comment for HTMLParser.
+                continue
             if right.start() - left.end() > MAX_EXAMPLE_BYTES:
                 return True
             source = payload[left.end() : right.start()].replace(b"\r", b" ").replace(b"\n", b" ").strip()
             prefix = payload[max(start, left.start() - 64) : left.start()]
-            command_context = re.search(rb"\s|[();|&]", source) is not None or _ends_with_execution_directive(
-                prefix.decode("utf-8", errors="replace")
+            command_context = (
+                source.startswith((b"./", b".\\", b"../"))
+                or re.search(rb"\s|[();|&]", source) is not None
+                or _ends_with_execution_directive(prefix.decode("utf-8", errors="replace"))
             )
             if command_context and _example_executes_script(source, b""):
                 return True
@@ -808,7 +849,7 @@ def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], .
             opening = match
             continue
         if (
-            match.group("language")
+            match.group("language").strip(b" \t")
             or match.group("fence")[:1] != opening.group("fence")[:1]
             or len(match.group("fence")) < len(opening.group("fence"))
         ):
@@ -821,14 +862,13 @@ def _routine_documentation_url_spans(payload: bytes) -> tuple[tuple[int, int], .
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
         ):
             source = payload[start:end]
-            executes_script |= _example_executes_script(source, language)
-            examples = (
-                _shell_url_spans(source)
-                if language in {b"sh", b"bash", b"shell", b"console", b"terminal"}
-                else _python_url_spans(source)
-                if language in {b"py", b"python"}
-                else []
-            )
+            if language in PYTHON_LANGUAGES:
+                python_spans = _python_url_spans(source)
+                executes_script |= python_spans is None
+                examples = python_spans or []
+            else:
+                executes_script |= _example_executes_script(source, language)
+                examples = _shell_url_spans(source) if language in SHELL_LANGUAGES else []
             spans.extend((start + left, start + right) for left, right in examples)
         else:
             executes_script = True
@@ -890,7 +930,7 @@ def _without_markdown_container_prefixes(payload: bytes) -> tuple[bytes, list[tu
                 opening, opening_depth = fence, depth
                 opening_list_indent = list_indents[-1] if list_indents else 0
             elif (
-                not fence.group("language")
+                not fence.group("language").strip(b" \t")
                 and fence.group("fence")[:1] == opening.group("fence")[:1]
                 and len(fence.group("fence")) >= len(opening.group("fence"))
             ):
