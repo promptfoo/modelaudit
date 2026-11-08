@@ -3365,6 +3365,21 @@ def test_cached_scan_invalidates_on_rule_config_change(tmp_path: Path) -> None:
     assert calls["count"] == 2
 
 
+def _pickle_cache_context(tmp_path: Path) -> tuple[Path, ScanResultsCache, dict[str, Any]]:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    return file_path, cache, version_context
+
+
+def _assert_pickle_result_stored(
+    cache: ScanResultsCache, file_path: Path, scan_result: dict[str, Any], version_context: dict[str, Any]
+) -> None:
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+
+
 def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3375,9 +3390,7 @@ def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     source_path.write_text("def entrypoint():\n    return 1\n")
     monkeypatch.syspath_prepend(str(source_root))
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     source_fingerprint = hashlib.sha256(source_path.read_bytes()).hexdigest()
     fingerprint_metadata = _call_graph_fingerprint_metadata(
         {
@@ -3393,9 +3406,7 @@ def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     }
     expected_cached_result: dict[str, Any] = {"checks": [], "issues": [], "metadata": {}}
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
     internal_cached_result = cache.get_cached_result(
         str(file_path),
@@ -3441,9 +3452,7 @@ def test_scan_cache_invalidates_symlink_sensitive_parent_search_context(
     original_search_path = list(sys.path)
     monkeypatch.setattr(sys, "path", [str(clean_entry), *original_search_path])
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     clean_source_path = str(clean_source.absolute())
     fingerprint_metadata = _call_graph_fingerprint_metadata(
         {clean_source_path: hashlib.sha256(clean_source.read_bytes()).hexdigest()},
@@ -3452,9 +3461,7 @@ def test_scan_cache_invalidates_symlink_sensitive_parent_search_context(
     fingerprint_metadata["search_context"] = cache._source_search_context()
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     monkeypatch.setattr(sys, "path", [str(poisoned_entry), *original_search_path])
@@ -3474,9 +3481,7 @@ def test_scan_cache_invalidates_when_loaded_module_override_appears(
     second_source.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
     monkeypatch.syspath_prepend(str(first_source.parent))
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
             {str(first_source.absolute()): hashlib.sha256(first_source.read_bytes()).hexdigest()},
@@ -3484,9 +3489,7 @@ def test_scan_cache_invalidates_when_loaded_module_override_appears(
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     replacement_module = ModuleType("cache_switch_module")
@@ -3508,9 +3511,7 @@ def test_scan_cache_invalidates_when_loaded_parent_package_can_redirect_child(
     second_source.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
     monkeypatch.syspath_prepend(str(first_source.parents[1]))
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     first_source_path = str(first_source.absolute())
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -3519,9 +3520,7 @@ def test_scan_cache_invalidates_when_loaded_parent_package_can_redirect_child(
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     loaded_parent = ModuleType("cache_pkg")
@@ -3555,9 +3554,7 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
     )
     monkeypatch.setitem(sys.path_importer_cache, package_path, standard_finder)
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     first_source_path = str(first_source.absolute())
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -3567,9 +3564,7 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     loaded_parent.__path__ = [str(second_source.parent)]
@@ -3604,9 +3599,7 @@ def test_scan_cache_invalidates_loaded_package_importer_semantics_change(
         standard_finder if transition == "finder-to-none" else None,
     )
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     source = str(source_path.absolute())
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -3616,9 +3609,7 @@ def test_scan_cache_invalidates_loaded_package_importer_semantics_change(
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     monkeypatch.setitem(
@@ -3643,9 +3634,7 @@ def test_scan_cache_rejects_custom_importer_on_matching_loaded_parent_package_pa
     loaded_parent.__spec__ = ModuleSpec("cache_pkg", loader=None, is_package=True)
     monkeypatch.setitem(sys.modules, "cache_pkg", loaded_parent)
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     source = str(source_path.absolute())
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -3655,9 +3644,7 @@ def test_scan_cache_rejects_custom_importer_on_matching_loaded_parent_package_pa
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     class CustomFinder:
@@ -3679,9 +3666,7 @@ def test_scan_cache_invalidates_when_loaded_module_disappears(
     loaded_module.__spec__ = ModuleSpec("loaded_then_removed", loader=None, origin=str(source_path))
     monkeypatch.setitem(sys.modules, "loaded_then_removed", loaded_module)
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     source = str(source_path.absolute())
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -3691,9 +3676,7 @@ def test_scan_cache_invalidates_when_loaded_module_disappears(
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     monkeypatch.delitem(sys.modules, "loaded_then_removed")
@@ -3834,16 +3817,12 @@ def test_scan_cache_rejects_file_finder_subclass_importer(
     monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
     monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     fingerprint_metadata = _call_graph_fingerprint_metadata()
     assert any(path_entry in identity for identity in fingerprint_metadata["resolution_context"]["path_importers"])
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     finder.state = "malicious"
 
@@ -3867,16 +3846,12 @@ def test_scan_cache_rejects_custom_file_finder_loader_change(
     monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
     monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     fingerprint_metadata = _call_graph_fingerprint_metadata()
     assert any(path_entry in identity for identity in fingerprint_metadata["resolution_context"]["path_importers"])
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     object.__getattribute__(finder, "__dict__")["_loaders"] = [(suffix, MaliciousLoader) for suffix in SOURCE_SUFFIXES]
 
@@ -3914,14 +3889,10 @@ def test_scan_cache_rejects_resolution_metadata_without_current_picklescan_helpe
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata())
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     monkeypatch.setattr(
@@ -3943,9 +3914,7 @@ def test_scan_cache_revalidates_sources_after_standard_importer_cache_population
     monkeypatch.syspath_prepend(path_entry)
     monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     source = str(source_path.absolute())
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -3953,9 +3922,7 @@ def test_scan_cache_revalidates_sources_after_standard_importer_cache_population
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     finder = FileFinder(
@@ -4031,9 +3998,7 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
         }
 
     scan_result = _private_fingerprint_result(fingerprint_metadata)
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     finder = FileFinder(
@@ -4129,14 +4094,10 @@ def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
             "path_importers": list(_path_importer_resolution_context([path_entry])),
         }
     }
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     monkeypatch.setitem(sys.path_importer_cache, path_entry, None)
@@ -4182,9 +4143,7 @@ def test_scan_cache_revalidates_sources_when_namespace_precedence_changes(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     scan_result = _private_fingerprint_result(fingerprint_metadata)
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     earlier_package = earlier_root / parent_module
@@ -4217,9 +4176,7 @@ def test_cache_module_validation_does_not_execute_custom_path_hooks(
             raise AssertionError("cache validation executed a custom path hook")
 
     path_hook = ExplodingPathHook()
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     source = str(source_path.absolute())
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -4227,9 +4184,7 @@ def test_cache_module_validation_does_not_execute_custom_path_hooks(
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     monkeypatch.setattr(sys, "path_hooks", [path_hook])
     cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
@@ -4248,14 +4203,10 @@ def test_scan_cache_invalidates_when_import_resolution_hooks_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     missing_source = tmp_path / "hook_resolved_module.py"
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata({str(missing_source.absolute()): None}))
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     class NoopFinder(MetaPathFinder):
@@ -4275,9 +4226,7 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
     missing_path = source_root / "helper.py"
     monkeypatch.syspath_prepend(str(source_root))
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = {
         "checks": [],
         "issues": [],
@@ -4287,9 +4236,7 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
     }
     expected_cached_result: dict[str, Any] = {"checks": [], "issues": [], "metadata": {}}
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
 
     missing_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
@@ -4300,9 +4247,7 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
 def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Path) -> None:
     extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
     extension_path.write_bytes(b"x" * (1024 * 1024 + 1))
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     extension_fingerprint = cache._bounded_source_fingerprint(extension_path)
     reusable, picklescan_fingerprint = _picklescan_resolution_candidate_fingerprint(extension_path)
     assert reusable is True
@@ -4313,9 +4258,7 @@ def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Pat
         _call_graph_fingerprint_metadata({str(extension_path.absolute()): extension_fingerprint})
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
@@ -4489,9 +4432,7 @@ def test_scan_cache_invalidates_when_read_fingerprint_directory_changes(tmp_path
     bytecode_dir = tmp_path / "__pycache__"
     bytecode_dir.mkdir()
     (bytecode_dir / "helper.cpython-312.pyc").write_bytes(b"first")
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     expected_fingerprint = cache._bounded_read_fingerprint(bytecode_dir, 64 * 1024, True)
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
@@ -4505,9 +4446,7 @@ def test_scan_cache_invalidates_when_read_fingerprint_directory_changes(tmp_path
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     (bytecode_dir / "helper.cpython-312.opt-1.pyc").write_bytes(b"second")
@@ -4516,36 +4455,26 @@ def test_scan_cache_invalidates_when_read_fingerprint_directory_changes(tmp_path
 
 
 def test_scan_cache_rejects_legacy_fingerprint_metadata_without_read_records(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     fingerprint_metadata = _call_graph_fingerprint_metadata()
     fingerprint_metadata.pop("read_fingerprints")
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
 def test_scan_cache_rejects_oversized_source_fingerprint_sets(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     fingerprints: dict[str, str | None] = {str(tmp_path / f"candidate-{index}.py"): None for index in range(4097)}
     scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata(fingerprints))
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
 def test_scan_cache_invalidates_legacy_pickle_call_graph_metadata_without_fingerprints(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = {
         "checks": [],
         "issues": [],
@@ -4557,9 +4486,7 @@ def test_scan_cache_invalidates_legacy_pickle_call_graph_metadata_without_finger
         },
     }
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
@@ -4580,9 +4507,7 @@ def test_scan_cache_invalidates_legacy_pytorch_zip_metadata_without_fingerprints
         },
     }
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
@@ -4592,9 +4517,7 @@ def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.syspath_prepend(str(tmp_path))
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = {
         "checks": [],
         "issues": [],
@@ -4617,9 +4540,7 @@ def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
         },
     }
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
 
@@ -4645,9 +4566,7 @@ def test_scan_cache_accepts_source_independent_call_graph_metadata_under_unreusa
             raise ImportError
 
     monkeypatch.setattr(sys, "path_hooks", [StatefulPathHook()])
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     metadata = {
         "pickle_report_status": "complete",
         "pickle_verdict": "clean",
@@ -4657,9 +4576,7 @@ def test_scan_cache_accepts_source_independent_call_graph_metadata_under_unreusa
     }
     scan_result = _result_with_fingerprints(metadata, _source_independent_call_graph_fingerprint_metadata())
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) == {
         "checks": [],
@@ -4673,9 +4590,7 @@ def test_scan_cache_rejects_malformed_source_independent_call_graph_metadata(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     fingerprint_metadata: dict[str, object] = _source_independent_call_graph_fingerprint_metadata()
     if mutation == "fingerprints":
         fingerprint_metadata["fingerprints"] = {str(tmp_path / "helper.py"): None}
@@ -4693,9 +4608,7 @@ def test_scan_cache_rejects_malformed_source_independent_call_graph_metadata(
         fingerprint_metadata,
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
@@ -4729,9 +4642,7 @@ def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
     }
     scan_result = _result_with_fingerprints(metadata, _source_independent_call_graph_fingerprint_metadata())
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
@@ -4746,9 +4657,7 @@ def test_scan_cache_requires_all_critical_source_inputs_to_be_covered(
     check_name: str,
     expected_hit: bool,
 ) -> None:
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = {
         "checks": [
             {
@@ -4775,9 +4684,7 @@ def test_scan_cache_requires_all_critical_source_inputs_to_be_covered(
         },
     }
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
     assert (cached_result is not None) is expected_hit
 
@@ -4792,9 +4699,7 @@ def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returnin
     source_path.write_text("def entrypoint():\n    return 1\n")
     monkeypatch.syspath_prepend(str(source_root))
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     source_fingerprint = hashlib.sha256(source_path.read_bytes()).hexdigest()
     scan_result = _result_with_fingerprints(
         {
@@ -4810,9 +4715,7 @@ def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returnin
     )
     expected_cached_result = {key: value for key, value in scan_result.items() if key != "_private_metadata"}
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
 
     cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
     assert cached_result is not None
@@ -4829,18 +4732,14 @@ def test_scan_cache_validates_private_fingerprints_without_public_metadata(tmp_p
     source_path = tmp_path / "helper.py"
     source_path.write_text("def entrypoint():\n    return 1\n")
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata(
             {str(source_path.absolute()): hashlib.sha256(source_path.read_bytes()).hexdigest()}
         )
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
@@ -4852,9 +4751,7 @@ def test_scan_cache_by_key_invalidates_private_call_graph_source_fingerprint_cha
     source_path = tmp_path / "helper.py"
     source_path.write_text("def entrypoint():\n    return 1\n")
 
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _result_with_fingerprints(
         {
             "pickle_report_status": "complete",
@@ -4867,9 +4764,7 @@ def test_scan_cache_by_key_invalidates_private_call_graph_source_fingerprint_cha
         ),
     )
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
     assert cache_key is not None
     assert cache.get_cached_result_by_key(cache_key) is not None
