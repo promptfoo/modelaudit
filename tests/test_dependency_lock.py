@@ -271,6 +271,14 @@ def test_renovate_python_updates_follow_runtime_support() -> None:
     for version in versions:
         assert update_policy.contains(version) == runtime_support.contains(version)
 
+    full_index, full_rule = next(
+        (index, rule) for index, rule in python_rules if rule.get("matchFileNames") == ["Dockerfile.full"]
+    )
+    assert full_index > global_index
+    full_policy = SpecifierSet(full_rule["allowedVersions"])
+    assert Version("3.13") in full_policy
+    assert Version("3.14") not in full_policy
+
     tensorflow_rules = [
         (index, rule) for index, rule in python_rules if rule.get("matchFileNames") == ["Dockerfile.tensorflow"]
     ]

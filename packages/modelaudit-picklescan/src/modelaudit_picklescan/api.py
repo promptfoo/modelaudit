@@ -252,6 +252,8 @@ _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES = 64 * 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES = 256_000
+_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES = 2_000_000
 _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
@@ -531,12 +533,14 @@ class _PytorchStorageReferenceParse:
     discarded_tracked_storage_references: bool = False
     used_streaming_batch_compaction: bool = False
     accepted_oversized_state_batch: bool = False
+    first_legacy_pid_position: int | None = None
 
 
 @dataclass(frozen=True)
 class _PytorchZipDataPickleTrust:
     storage_keys: set[str]
     canonical_tensor_rebuild_invocations: frozenset[tuple[int, int]]
+    first_legacy_pid_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1176,6 +1180,7 @@ def _validated_pytorch_storage_entry_ids(
     notices: list[Notice] = []
     storage_reference_bytes_read = 0
     storage_reference_opcodes_remaining = [min(_PYTORCH_STORAGE_TRUST_MAX_OPCODES, options.max_opcodes)]
+    pid_validator = _PytorchZipStoragePidValidator(options.max_opcodes)
     for data_pkl_name, data_pkl_entries in entries_by_name.items():
         _check_pytorch_zip_deadline(deadline)
         if data_pkl_name.rsplit("/", 1)[-1] != "data.pkl":
@@ -1255,6 +1260,18 @@ def _validated_pytorch_storage_entry_ids(
             opcode_budget_remaining=storage_reference_opcodes_remaining,
             deadline=deadline,
         )
+        pid_trust = pid_validator.validate(
+            pickle_data,
+            archive,
+            entries_by_name,
+            prefix,
+            storage_entries_by_key,
+            discovery_complete=reference_parse.parse_complete,
+            deadline=deadline,
+        )
+        if pid_trust is not None:
+            # Only the PID finding receives this proof. Preserve storage probing and its coverage diagnostics.
+            trusted_data_pkl_by_name[data_pkl_name] = pid_trust
         if not reference_parse.parse_complete:
             notices.append(
                 _pytorch_zip_storage_reference_validation_notice(
@@ -1357,6 +1374,80 @@ def _trusted_pytorch_data_pkl_from_storage_member_sizes(
     storage_member_sizes: Mapping[str, int],
 ) -> _PytorchZipDataPickleTrust | None:
     reference_parse = _pytorch_storage_keys_from_pickle_bytes(pickle_data)
+    return _trusted_pytorch_storage_member_sizes(reference_parse, storage_member_sizes)
+
+
+class _PytorchZipStoragePidValidator:
+    """Validate aggregate PID findings with one work allowance per archive."""
+
+    def __init__(self, max_opcodes: int) -> None:
+        available = max(0, max_opcodes - _PYTORCH_STORAGE_TRUST_MAX_OPCODES)
+        self._opcodes_remaining = [min(available, _PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES)]
+        self._provenance_remaining = [_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES]
+
+    @staticmethod
+    def _is_legacy_module(
+        pickle_data: bytes, archive: zipfile.ZipFile, entries_by_name: Mapping[str, list[zipfile.ZipInfo]], prefix: str
+    ) -> bool:
+        if (
+            not pickle_data.startswith(b"\x80\x02c__torch__\nModule\n")
+            or len(entries_by_name.get(f"{prefix}code/__torch__.py", [])) != 1
+        ):
+            return False
+        versions = entries_by_name.get(f"{prefix}version", [])
+        if (
+            len(versions) != 1
+            or versions[0].file_size != 2
+            or versions[0].compress_type != zipfile.ZIP_STORED
+            or versions[0].compress_size != 2
+        ):
+            return False
+        try:
+            return archive.read(versions[0]) == b"1\n"
+        except Exception:
+            return False
+
+    def validate(
+        self,
+        pickle_data: bytes,
+        archive: zipfile.ZipFile,
+        entries_by_name: Mapping[str, list[zipfile.ZipInfo]],
+        prefix: str,
+        storage_entries_by_key: Mapping[str, zipfile.ZipInfo],
+        *,
+        discovery_complete: bool,
+        deadline: float,
+    ) -> _PytorchZipDataPickleTrust | None:
+        if self._opcodes_remaining[0] <= 0 or self._provenance_remaining[0] <= 0:
+            return None
+        legacy_module = self._is_legacy_module(pickle_data, archive, entries_by_name, prefix)
+        if discovery_complete and not legacy_module:
+            return None
+        parsed = _parse_single_pytorch_storage_stream(
+            pickle_data,
+            opcode_budget_remaining=self._opcodes_remaining,
+            max_opcodes=_PYTORCH_LARGE_STORAGE_PID_MAX_OPCODES,
+            large_pid_provenance_remaining=self._provenance_remaining,
+            legacy_module=legacy_module,
+            deadline=deadline,
+            position_offset=0,
+        )
+        if not parsed.canonical_tensor_rebuild_invocations or not all(
+            _pytorch_storage_ref_has_zip_size_proof(ref) for ref in parsed.storage_refs_by_key.values()
+        ):
+            return None
+        trust = _trusted_pytorch_storage_member_sizes(
+            parsed, {key: entry.file_size for key, entry in storage_entries_by_key.items()}
+        )
+        if trust is None:
+            return None
+        return _PytorchZipDataPickleTrust(trust.storage_keys, frozenset(), parsed.first_legacy_pid_position)
+
+
+def _trusted_pytorch_storage_member_sizes(
+    reference_parse: _PytorchStorageReferenceParse,
+    storage_member_sizes: Mapping[str, int],
+) -> _PytorchZipDataPickleTrust | None:
     if (
         not reference_parse.parse_complete
         or not reference_parse.referenced_keys
@@ -3721,7 +3812,7 @@ def _is_trusted_pytorch_storage_persistent_id_finding(
     finding: Finding,
     trusted_storage_keys: set[str],
 ) -> bool:
-    if finding.rule_code != "PERSISTENT_ID":
+    if finding.rule_code != "PERSISTENT_ID" or "nested_details" in finding.details:
         return False
     details = finding.details
     storage_key = details.get("pytorch_storage_key")
@@ -3752,7 +3843,15 @@ def _without_trusted_pytorch_data_pkl_findings(
         for finding in report.findings
         if not (
             remove_persistent_ids
-            and _is_trusted_pytorch_storage_persistent_id_finding(finding, trusted_data_pkl.storage_keys)
+            and (
+                _is_trusted_pytorch_storage_persistent_id_finding(finding, trusted_data_pkl.storage_keys)
+                or (
+                    trusted_data_pkl.first_legacy_pid_position is not None
+                    and finding.rule_code == "PERSISTENT_ID"
+                    and finding.details.get("opcode") == "BINPERSID"
+                    and finding.location == f"{report.source} (pos {trusted_data_pkl.first_legacy_pid_position})"
+                )
+            )
         )
         and not _is_trusted_canonical_pytorch_tensor_rebuild_finding(report, finding, trusted_data_pkl)
     )
@@ -3963,8 +4062,31 @@ def _pytorch_storage_keys_from_pickle_bytes(
             )
         )
 
+    return _parse_single_pytorch_storage_stream(
+        pickle_data,
+        opcode_budget_remaining=opcode_budget_remaining,
+        max_opcodes=_PYTORCH_STORAGE_TRUST_MAX_OPCODES,
+        deadline=deadline,
+        position_offset=position_offset,
+    )
+
+
+def _parse_single_pytorch_storage_stream(
+    pickle_data: bytes,
+    *,
+    opcode_budget_remaining: list[int] | None,
+    max_opcodes: int,
+    large_pid_provenance_remaining: list[int] | None = None,
+    legacy_module: bool = False,
+    deadline: float | None,
+    position_offset: int,
+) -> _PytorchStorageReferenceParse:
     marker = object()
     canonical_tensor = object()
+    legacy_instance = object()
+    legacy_built = object()
+    literal_none = object()
+    first_legacy_pid_position: int | None = None
     canonical_batch_placeholder = object()
     canonical_batch_entries: list[tuple[str, object]] = []
     canonical_batch_target: object | None = None
@@ -4031,7 +4153,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
         nonlocal provenance_nodes_inspected
 
         provenance_nodes_inspected += 1
-        if provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
+        if large_pid_provenance_remaining is not None:
+            if large_pid_provenance_remaining[0] <= 0:
+                raise ValueError("PyTorch storage ID validation exhausted its archive provenance budget")
+            large_pid_provenance_remaining[0] -= 1
+        elif provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
             raise ValueError("PyTorch storage trust parser exceeded its bounded provenance workload")
         if deadline is not None and provenance_nodes_inspected % 1024 == 0:
             _check_pytorch_zip_deadline(deadline)
@@ -4083,6 +4209,10 @@ def _pytorch_storage_keys_from_pickle_bytes(
     def apply_setitems_to_target(items: tuple[tuple[Any, Any], ...]) -> None:
         nonlocal discarded_tracked_storage_references
 
+        # Tuple keys may share nested tuples exponentially. Hashing them in
+        # Python would bypass the retry's opcode, provenance, and time limits.
+        if large_pid_provenance_remaining is not None and any(type(key) is not str for key, _value in items):
+            raise ValueError("PyTorch tensor batch contains a non-text dictionary key")
         canonical_storage_context = (
             trusted_canonical_batch_seen
             or bool(canonical_batch_entries)
@@ -4218,7 +4348,10 @@ def _pytorch_storage_keys_from_pickle_bytes(
         return key if key >= 0 else None
 
     def storage_ref_from_pid(pid: Any) -> _PytorchStorageRef | None:
-        if not isinstance(pid, tuple) or len(pid) != 5:
+        # PyTorch's v1 JIT writer appends a literal NONE for view metadata.
+        if not isinstance(pid, tuple) or len(pid) != (6 if legacy_module else 5):
+            return None
+        if legacy_module and pid[5] is not literal_none:
             return None
         if pid[0] != "storage":
             return None
@@ -4293,6 +4426,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
             "collections",
             "OrderedDict",
         ):
+            if legacy_module and args != ():
+                raise ValueError("Unexpected TorchScript hook constructor arguments")
             if args != () and value_contains_tracked_provenance(args):
                 discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
@@ -4310,6 +4445,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
             return None
+        if legacy_module:
+            raise ValueError("Unrecognized TorchScript reducer")
         if value_contains_tracked_provenance(function) or value_contains_tracked_provenance(args):
             discarded_tracked_storage_references = True
             invalidate_tensor_rebuild_proof()
@@ -4323,13 +4460,15 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if opcode_budget_remaining[0] <= 0:
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 opcode_budget_remaining[0] -= 1
-            if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
+            if opcode_count > max_opcodes:
                 return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
             position = position_offset + (_pos if type(_pos) is int else 0)
             opcode_name = opcode.name
             if opcode_name in {"PROTO", "FRAME"}:
                 continue
             if opcode_name == "STOP":
+                if legacy_module and (len(stack) != 1 or stack[0] is not legacy_built):
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 if canonical_batch_entries or (pending_uncanonical_metadata_batch and not trusted_canonical_batch_seen):
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 if (
@@ -4344,7 +4483,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                 if not isinstance(_pos, int) or _pos + 1 != len(pickle_data):
-                    invalidate_tensor_rebuild_proof()
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 continue
             if opcode_name == "MARK":
                 stack.append(marker)
@@ -4357,6 +4496,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 "BINBYTES",
                 "SHORT_BINBYTES",
             }:
+                if large_pid_provenance_remaining is not None and opcode_name not in {
+                    "BINUNICODE",
+                    "SHORT_BINUNICODE",
+                    "UNICODE",
+                }:
+                    # PyTorch formats the original key into the member name.
+                    # A bytes key b'0' does not address the text key's data/0.
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 stack.append(_coerce_pickle_string_arg(arg))
             elif opcode_name == "GLOBAL":
                 global_name = _coerce_pickle_string_arg(arg)
@@ -4364,6 +4511,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     stack.append(None)
                 else:
                     parts = global_name.split()
+                    if large_pid_provenance_remaining is not None and global_name != " ".join(parts):
+                        return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                     stack.append(_PickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else None)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
@@ -4417,6 +4566,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     for index in range(0, len(dict_items), 2):
                         key = dict_items[index]
                         value = dict_items[index + 1]
+                        if large_pid_provenance_remaining is not None and type(key) is not str:
+                            raise ValueError("PyTorch tensor batch contains a non-text dictionary key")
                         if key in built_dict and value_contains_tracked_provenance(built_dict[key]):
                             discarded_tracked_storage_references = True
                             invalidate_tensor_rebuild_proof()
@@ -4430,7 +4581,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
             elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT", "FLOAT", "BINFLOAT"}:
                 stack.append(arg)
             elif opcode_name == "NONE":
-                stack.append(None)
+                stack.append(literal_none if legacy_module else None)
             elif opcode_name == "NEWTRUE":
                 stack.append(True)
             elif opcode_name == "NEWFALSE":
@@ -4488,7 +4639,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     poison_stack_top()
             elif opcode_name == "APPENDS":
                 unmarked_items = []
-                appended_items = pop_marked_tuple(unmarked_items=unmarked_items)
+                appended_items = pop_marked_tuple(
+                    max_width=(
+                        _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+                        if large_pid_provenance_remaining is not None
+                        else _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH
+                    ),
+                    unmarked_items=unmarked_items,
+                )
                 if appended_items is None or not stack:
                     clear_stack_after_malformed_provenance(
                         *(unmarked_items if appended_items is None else appended_items)
@@ -4567,6 +4725,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     trusted_canonical_batch_seen = True
                     pending_uncanonical_metadata_batch = False
             elif opcode_name == "BINPERSID":
+                if legacy_module and first_legacy_pid_position is None:
+                    first_legacy_pid_position = position
                 pid = stack.pop() if stack else None
                 storage_ref = storage_ref_from_pid(pid)
                 if storage_ref is not None:
@@ -4605,13 +4765,34 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 args = stack.pop()
                 function = stack.pop()
                 stack.append(reduce_result(function, args, position))
+            elif opcode_name == "NEWOBJ" and legacy_module:
+                if (
+                    len(stack) != 2
+                    or stack[-1] != ()
+                    or not isinstance(stack[0], _PickleGlobalRef)
+                    or (stack[0].module, stack[0].name) != ("__torch__", "Module")
+                ):
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                stack[:] = [legacy_instance]
             elif opcode_name == "BUILD":
                 if len(stack) < 2:
                     clear_stack_after_malformed_provenance()
                     continue
                 state = stack.pop()
                 obj = stack.pop()
-                if isinstance(obj, _PytorchStorageRef):
+                if legacy_module:
+                    # Accept only the serialized parameter mapping for the PID proof.
+                    # The module constructor, BUILD handler and their findings stay untrusted.
+                    if (
+                        stack
+                        or obj is not legacy_instance
+                        or type(state) is not _PytorchDictionaryState
+                        or not state
+                        or not all(type(k) is str and v is canonical_tensor for k, v in state.items())
+                    ):
+                        return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                    stack.append(legacy_built)
+                elif isinstance(obj, _PytorchStorageRef):
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                     stack.append(None)
@@ -4649,6 +4830,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         discarded_tracked_storage_references=discarded_tracked_storage_references,
         used_streaming_batch_compaction=used_streaming_batch_compaction,
         accepted_oversized_state_batch=accepted_oversized_state_batch,
+        first_legacy_pid_position=first_legacy_pid_position,
     )
 
 

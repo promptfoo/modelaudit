@@ -52,13 +52,14 @@ from ..utils.file.detection import (
     detect_xgboost_ubjson_content_route,
     has_inconclusive_renamed_flax_msgpack_routing,
     has_safetensors_gzip_nonmember_trailing_overlap,
-    has_safetensors_routing_candidate,
     has_structural_torch7_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
     is_skops_archive,
     is_torchserve_mar_archive,
+    safetensors_length_has_pickle_extension,
+    safetensors_routing_prefix,
 )
 from ..utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
 from .base import FORMAT_VALIDATION_CONFIG_KEY
@@ -256,9 +257,12 @@ def _merge_pytorch_binary_supplemental_analysis(
 
 def detect_safetensors_overlap_scanner_ids(path: str) -> frozenset[str]:
     """Return non-HDF5 scanners that own a validated SafeTensors overlap."""
-    if not has_safetensors_routing_candidate(path):
+    prefix = safetensors_routing_prefix(path)
+    if prefix is None:
         return frozenset()
     scanner_ids = {"safetensors"}
+    if safetensors_length_has_pickle_extension(prefix):
+        scanner_ids.add("pickle")
     hdf5_signature_offset = find_hdf5_signature_offset(path)
     try:
         if zipfile.is_zipfile(path):
@@ -336,6 +340,8 @@ def merge_safetensors_overlap_analysis(
 
         primary_bytes_scanned = result.bytes_scanned
         result.merge(supplemental_result)
+        if scanner_id == "pickle" and result.scanner_name == "safetensors":
+            result.metadata["file_type"] = "safetensors"
         result.bytes_scanned = max(primary_bytes_scanned, supplemental_result.bytes_scanned)
         if scanner_id != result.scanner_name:
             supplemental_scanners = result.metadata.setdefault("supplemental_scanners", [])
