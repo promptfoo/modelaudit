@@ -3273,33 +3273,20 @@ mod tests {
 
     #[test]
     fn short_base64_payload_evidence_distinguishes_prefixes_from_security_signals() {
-        assert!(!base64_nested_payload_has_sufficient_evidence(
-            "grouped",
-            b"\x82\xba.",
-            false,
-            false,
-        ));
-        assert!(!base64_nested_payload_has_sufficient_evidence(
-            "grou",
-            b"\x82\xba.",
-            false,
-            false,
-        ));
-        assert!(base64_nested_payload_has_sufficient_evidence(
-            "TlEu", b"NQ.", false, false,
-        ));
-        assert!(base64_nested_payload_has_sufficient_evidence(
-            "ly4=", b"\x97.", false, false,
-        ));
-        assert!(!base64_nested_payload_has_sufficient_evidence(
-            "grouped",
-            b"\x82\xba.",
-            true,
-            false,
-        ));
-        assert!(base64_nested_payload_has_sufficient_evidence(
-            "UApY", b"P\nX", true, false,
-        ));
+        let has_evidence = |encoded: &str, payload: &[u8], analysis_incomplete| {
+            base64_nested_payload_has_sufficient_evidence(
+                encoded,
+                payload,
+                analysis_incomplete,
+                false,
+            )
+        };
+        assert!(!has_evidence("grouped", b"\x82\xba.", false));
+        assert!(!has_evidence("grou", b"\x82\xba.", false));
+        assert!(has_evidence("TlEu", b"NQ.", false));
+        assert!(has_evidence("ly4=", b"\x97.", false));
+        assert!(!has_evidence("grouped", b"\x82\xba.", true));
+        assert!(has_evidence("UApY", b"P\nX", true));
         assert!(has_high_confidence_truncated_execution_prefix(b"P\nX"));
         assert!(!has_high_confidence_truncated_execution_prefix(b"P\x80\nX"));
 
@@ -3400,61 +3387,35 @@ mod tests {
         assert!(!is_strict_base64_literal(b"=gAR9Lg="));
         assert!(!is_strict_base64_literal(b"g=AR9Lg="));
         assert!(!is_strict_base64_literal(b"gAR9Lg===="));
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            b"NQAAAAAAgAROLg==",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            b"NNQAgAROLgAAAAAA",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            b"N0NQgAROLgAAAAAA",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            b"AAAANQAAAAAAgAROLg==",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
+        let has_raw_execution_probe = |encoded: &[u8]| {
+            strict_base64_literal_has_raw_execution_probe(encoded, TEST_MAX_NESTED_PICKLE_BYTES)
+        };
+        assert!(has_raw_execution_probe(b"NQAAAAAAgAROLg=="));
+        assert!(has_raw_execution_probe(b"NNQAgAROLgAAAAAA"));
+        assert!(has_raw_execution_probe(b"N0NQgAROLgAAAAAA"));
+        assert!(has_raw_execution_probe(b"AAAANQAAAAAAgAROLg=="));
         let mut separated_raw_probe = b"NQ".to_vec();
         separated_raw_probe.extend_from_slice(&[b'A'; 18]);
         separated_raw_probe.extend_from_slice(b"VkFBQUFBQUFBQUFBQUFBQUEKLg==");
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            &separated_raw_probe,
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
+        assert!(has_raw_execution_probe(&separated_raw_probe));
         let mut long_raw_probe = Vec::new();
         for _ in 0..6 {
             long_raw_probe.extend_from_slice(b"C+");
             long_raw_probe.extend_from_slice(&[b'A'; 43]);
         }
         long_raw_probe.extend_from_slice(b"QgAROLgAAAAAA");
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            &long_raw_probe,
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
+        assert!(has_raw_execution_probe(&long_raw_probe));
         let mut opcode_budget_raw_probe = b"N".to_vec();
         opcode_budget_raw_probe.extend_from_slice(&[b'2'; 80]);
         opcode_budget_raw_probe.extend_from_slice(b"QgAROLgAAAAAA");
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            &opcode_budget_raw_probe,
-            TEST_MAX_NESTED_PICKLE_BYTES,
+        assert!(has_raw_execution_probe(&opcode_budget_raw_probe));
+        assert!(!has_raw_execution_probe(
+            b"KFJFQURNRSBpcyBvcmRpbmFyeSB0ZXh0"
         ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            b"KFJFQURNRSBpcyBvcmRpbmFyeSB0ZXh0",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            b"ordinaryCNQHtext",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            &vec![b'V'; 500_000],
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            &[b"junk".repeat(25_000), b"Q".to_vec()].concat(),
-            TEST_MAX_NESTED_PICKLE_BYTES,
+        assert!(!has_raw_execution_probe(b"ordinaryCNQHtext"));
+        assert!(!has_raw_execution_probe(&vec![b'V'; 500_000]));
+        assert!(!has_raw_execution_probe(
+            &[b"junk".repeat(25_000), b"Q".to_vec()].concat()
         ));
         assert_eq!(
             confirmed_base64_pickle_spans(b"!VkFBQUFBQUFBQUFBQUFBQUEKLg==ab", 64),
@@ -3546,82 +3507,54 @@ mod tests {
 
     #[test]
     fn truncated_prefix_fail_closed_handles_minimum_evidence_and_near_matches() {
-        assert!(truncated_pickle_prefix_requires_fail_closed(b"\x80\x00"));
-        assert!(truncated_pickle_prefix_requires_fail_closed(b"\x80\x04"));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(b"\x80\x06"));
-        assert!(truncated_pickle_prefix_requires_fail_closed(b"cp"));
-        assert!(truncated_pickle_prefix_requires_fail_closed(b"cposix\n"));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(b"c"));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(b"c\xff"));
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04]K\x01aK\x02aK\x03a"
-        ));
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04\x95\x1f\x00\x00\x00\x00"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04AAAAAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04\xff\xff\xff\xff"
-        ));
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"cos\nsystem\nAAAAAAAA"
-        ));
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"ios\nsystem\nAAAAAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"inner\x94\x8c\x04data\x94s.BBBBB"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"S'not-a-full-pickle'\nAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"Vnot-a-full-pickle\nAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"}q\x00BBBBBBBB"
-        ));
+        for (payload, expected) in [
+            (b"\x80\x00".as_slice(), true),
+            (b"\x80\x04", true),
+            (b"\x80\x06", false),
+            (b"cp", true),
+            (b"cposix\n", true),
+            (b"c", false),
+            (b"c\xff", false),
+            (b"\x80\x04]K\x01aK\x02aK\x03a", true),
+            (b"\x80\x04\x95\x1f\x00\x00\x00\x00", true),
+            (b"\x80\x04AAAAAAAA", false),
+            (b"\x80\x04\xff\xff\xff\xff", false),
+            (b"cos\nsystem\nAAAAAAAA", true),
+            (b"ios\nsystem\nAAAAAAAA", true),
+            (
+                b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77",
+                false,
+            ),
+            (b"inner\x94\x8c\x04data\x94s.BBBBB", false),
+            (b"S'not-a-full-pickle'\nAAAA", false),
+            (b"Vnot-a-full-pickle\nAAAA", false),
+            (b"}q\x00BBBBBBBB", false),
+        ] {
+            assert_eq!(
+                truncated_pickle_prefix_requires_fail_closed(payload),
+                expected,
+                "{}",
+                payload.escape_ascii()
+            );
+        }
         assert_eq!(
             nested_pickle_probe_offsets_unbounded(b"cxxx\nxxx\n)R."),
             vec![0]
         );
-        assert!(nested_pickle_probe_offsets_unbounded(b"config\nvalue\nplain prose").is_empty());
-        assert!(nested_pickle_probe_offsets_unbounded(b"config\nvalue\nplain prose\n").is_empty());
-        assert!(nested_pickle_probe_offsets_unbounded(b"instance\nvalue\nplain prose").is_empty());
-        assert!(
-            nested_pickle_probe_offsets_unbounded(b"instance\nvalue\nplain prose\n").is_empty()
-        );
-        assert!(
-            nested_pickle_probe_offsets_unbounded(
-                b"instance prose instance instance audit\nlist status prose nested config nested list\nclient budget value\nstatus audit audit audit nested plain client\n",
-            )
-            .is_empty()
-        );
-        assert!(
-            nested_pickle_probe_offsets_unbounded(
-                b"client config instance\nvalue list budget client\nclient nested model\naudit instance plain config budget client report\n",
-            )
-            .is_empty()
-        );
-        assert!(
-            nested_pickle_probe_offsets_unbounded(
-                b"client plain config report instance list client instance\nstatus\nconfig\ninstance budget report value\n",
-            )
-            .is_empty()
-        );
-        assert!(nested_pickle_probe_offsets_unbounded(
+        for payload in [
+            b"config\nvalue\nplain prose".as_slice(),
+            b"config\nvalue\nplain prose\n",
+            b"instance\nvalue\nplain prose",
+            b"instance\nvalue\nplain prose\n",
+            b"instance prose instance instance audit\nlist status prose nested config nested list\nclient budget value\nstatus audit audit audit nested plain client\n",
+            b"client config instance\nvalue list budget client\nclient nested model\naudit instance plain config budget client report\n",
+            b"client plain config report instance list client instance\nstatus\nconfig\ninstance budget report value\n",
             b"audit client\nbudget instance instance budget instance\nplain\nprose client status\n",
-        )
-        .is_empty());
-        assert!(
-            nested_pickle_probe_offsets_unbounded(b"client\nstatus\njust plain prose\nget\n")
-                .is_empty()
-        );
+            b"client\nstatus\njust plain prose\nget\n",
+        ] {
+            let offsets = nested_pickle_probe_offsets_unbounded(payload);
+            assert!(offsets.is_empty(), "{}: unexpected offsets {offsets:?}", payload.escape_ascii());
+        }
         let mut long_global = b"cattacker\nfactory\n(".to_vec();
         long_global.extend_from_slice(&vec![b'N'; 2000]);
         long_global.extend_from_slice(b"tR.");
