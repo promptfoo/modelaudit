@@ -1804,20 +1804,6 @@ class ScanResultsCache:
         config_str = json.dumps(config_data, sort_keys=True)
         return hashlib.blake2b(config_str.encode(), digest_size=16).hexdigest()
 
-    def _is_cache_entry_valid(self, cache_entry: dict[str, Any], file_path: str) -> bool:
-        """
-        Validate that cache entry is still valid.
-
-        Args:
-            cache_entry: Cache entry dictionary
-            file_path: Current file path
-
-        Returns:
-            True if entry is valid, False otherwise
-        """
-        current_stat = os.stat(file_path)
-        return self._is_cache_entry_valid_with_stat(cache_entry, file_path, current_stat)
-
     def _is_cache_entry_valid_with_stat(
         self,
         cache_entry: dict[str, Any],
