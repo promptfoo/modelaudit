@@ -3961,6 +3961,8 @@ class TextScanner(BaseScanner):
             return 0
 
         truncated = len(payload) > read_limit
+        if not truncated:
+            result.metadata["text_content_sha256"] = hashlib.sha256(payload).hexdigest()
         inspected_payload = payload[:read_limit]
         inspected_bytes = len(inspected_payload)
         _DOCUMENTATION_QUOTE_WINDOWS.set((inspected_payload, {}))

@@ -373,6 +373,7 @@ jobs:
       - *install-rust-toolchain
 
       - name: Sync dependencies
+        id: windows-dependencies
         run: |
           uv sync --extra all-ci-windows
 
@@ -385,6 +386,13 @@ jobs:
         if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
         run: |
           uv run pytest tests -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
+
+      - name: Capture benign pickle scanner diagnostics
+        if: ${{ !cancelled() && steps.windows-dependencies.outcome == 'success' }}
+        env:
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+        run: |
+          uv run pytest tests/test_pickle_context_filtering.py::test_rust_pickle_scanner_keeps_common_ml_serialization_clean -n 0 -s --tb=short
 
   test:
     name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
@@ -881,7 +889,7 @@ jobs:
           )
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist
           path: dist/
@@ -979,11 +987,11 @@ jobs:
 
       - name: Lint standalone package with Ruff
         run: |
-          uv run --with 'ruff==0.17.1' ruff check src tests
+          uv run --with 'ruff==0.17.2' ruff check src tests
 
       - name: Check standalone package formatting with Ruff
         run: |
-          uv run --with 'ruff==0.17.1' ruff format --check src tests
+          uv run --with 'ruff==0.17.2' ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: |
@@ -995,7 +1003,7 @@ jobs:
 
       - name: Preserve Windows standalone test evidence
         if: always() && runner.os == 'Windows'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: picklescan-tests-${{ matrix.os }}-${{ matrix.python-version }}
           path: ${{ runner.temp }}/picklescan-test-results.xml

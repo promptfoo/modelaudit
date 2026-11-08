@@ -6828,6 +6828,8 @@ def _call_graph_enrichment_error_details(analysis: str, error: Exception) -> dic
         stability_reason = error.stability_reason
         if isinstance(stability_reason, str) and stability_reason:
             details["source_stability_reason"] = stability_reason
+        if error.stability_details is not None:
+            details["source_stability_details"] = error.stability_details
     return details
 
 
