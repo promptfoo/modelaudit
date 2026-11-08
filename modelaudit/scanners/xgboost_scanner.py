@@ -18,6 +18,8 @@ Security Focus:
 - Known CVE patterns and exploit signatures
 """
 
+import base64
+import binascii
 import importlib.util
 import json
 import logging
@@ -27,10 +29,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+from io import BytesIO
 from typing import Any, ClassVar, cast
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
+    _classify_initial_pickle_security_signal,
     has_jax_json_checkpoint_structure,
     huggingface_tokenizer_json_has_jax_route_evidence,
     is_huggingface_tokenizer_json_file,
@@ -58,6 +62,9 @@ XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY = "_xgboost_content_routed_json"
 XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY = "_xgboost_content_routed_ubjson"
 XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY = "_xgboost_skip_jax_json_overlap"
 XGBOOST_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY = "_xgboost_skip_jinja_json_overlap"
+_TIKTOKEN_MAX_BYTES = 16 * 1024 * 1024
+_TIKTOKEN_MAX_RANKS = 256 * 1024
+_TIKTOKEN_MAX_LINE_BYTES = 4096
 _JSON_KEY_MAX_BYTES = 256
 _JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
 _JSON_ROUTING_MAX_DEPTH = 64
@@ -497,6 +504,52 @@ class XGBoostScanner(BaseScanner):
         lowered_header = header_text.lower()
         return [pattern for pattern in cls._LEGACY_HEADER_PATTERNS if pattern in lowered_header]
 
+    @staticmethod
+    def _is_tiktoken_rank_file(path: str) -> bool:
+        """Recognize a complete byte-pair vocabulary sharing the .model extension."""
+        try:
+            with open(path, "rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size > _TIKTOKEN_MAX_BYTES:
+                    return False
+                # Most binary models can be ruled out without reading their full payload.
+                first_row = handle.readline(_TIKTOKEN_MAX_LINE_BYTES + 1)
+                if not re.fullmatch(rb"[A-Za-z0-9+/]+=* [0-9]{1,6}\r?\n", first_row):
+                    return False
+                handle.seek(0)
+                payload = handle.read(size + 1)
+        except OSError:
+            return False
+        if len(payload) != size:
+            return False
+
+        tokens: set[bytes] = set()
+        ranks: set[int] = set()
+        single_bytes = 0
+        for line in BytesIO(payload):
+            if len(line) > _TIKTOKEN_MAX_LINE_BYTES:
+                return False
+            encoded, _, rank_text = line.rstrip(b"\r\n").partition(b" ")
+            if not rank_text.isdigit() or len(rank_text) > 6:
+                return False
+            rank = int(rank_text)
+            if rank >= _TIKTOKEN_MAX_RANKS or rank in ranks:
+                return False
+            try:
+                token = base64.b64decode(encoded, validate=True)
+            except binascii.Error:
+                return False
+            if not token or token in tokens or base64.b64encode(token) != encoded:
+                return False
+            ranks.add(rank)
+            tokens.add(token)
+            single_bytes += len(token) == 1
+
+        # A base64 token starting with 'c' can introduce a protocol-0 GLOBAL.
+        return (
+            single_bytes == 256 and _classify_initial_pickle_security_signal(payload, sample_is_prefix=False) is False
+        )
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
@@ -515,10 +568,8 @@ class XGBoostScanner(BaseScanner):
                 return False
             return cls._is_xgboost_json(path) or cls._is_probable_xgboost_json_candidate(path)
 
-        # For .model files, keep ambiguous inputs on the XGBoost route but do
-        # not claim strongly identified SentencePiece tokenizer ModelProto files.
         if file_ext == ".model":
-            return not is_sentencepiece_model_proto_file(path)
+            return not (is_sentencepiece_model_proto_file(path) or cls._is_tiktoken_rank_file(path))
 
         # Check for XGBoost files without extension
         if file_ext == "":
