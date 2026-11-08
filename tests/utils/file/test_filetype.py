@@ -5586,3 +5586,38 @@ def _assert_tokenizer_route_evidence(tmp_path: Path, case_late_fields: str, case
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
     assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is case_expected_jax
+
+
+@pytest.mark.parametrize("filename", ["tekken.json", "v13.tekken.json"])
+def test_tekken_vocabulary_owns_only_complete_tokenizer_schema(tmp_path: Path, filename: str) -> None:
+    path = tmp_path / filename
+    config = {
+        "version": "v13",
+        "pattern": ".",
+        "num_vocab_tokens": 1,
+        "default_vocab_size": 1,
+        "default_num_special_tokens": 1,
+    }
+    vocab = [{"rank": 0, "token_str": "{{jax}}", "token_bytes": "e3tqYXh9fQ=="}]
+    document = {
+        "config": config,
+        "vocab": vocab,
+        "special_tokens": [{"rank": 0, "token_str": "<s>", "is_control": True}],
+    }
+    path.write_text(json.dumps(document))
+    assert is_huggingface_tokenizer_json_file(path)
+    assert detect_file_format(str(path)) == "unknown"
+
+    extra_fields: list[dict[str, object]] = [
+        {"nodes": [], "heads": []},
+        {"chat_template": "{{ unsafe() }}"},
+        {"orbax": "jax"},
+    ]
+    for extra in extra_fields:
+        path.write_text(json.dumps({**document, **extra}))
+        assert not is_huggingface_tokenizer_json_file(path)
+    path.write_text(json.dumps(document)[:-1])
+    assert not is_huggingface_tokenizer_json_file(path)
+    vocab[0]["chat_template"] = "{{ unsafe() }}"
+    path.write_text(json.dumps(document))
+    assert not is_huggingface_tokenizer_json_file(path)

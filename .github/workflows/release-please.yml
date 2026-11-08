@@ -605,7 +605,7 @@ jobs:
           - os: ubuntu-latest
             artifact-suffix: linux
             build-sdist: "true"
-          - os: macos-14
+          - os: macos-15
             artifact-suffix: macos-arm64
             build-sdist: "false"
           - os: macos-15-intel

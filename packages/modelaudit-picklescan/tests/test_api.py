@@ -1977,6 +1977,22 @@ def test_scan_bytes_does_not_report_structural_tamper_for_binary_tail() -> None:
     assert all(finding.rule_code != "STRUCTURAL_TAMPER" for finding in report.findings)
 
 
+@pytest.mark.parametrize("entry_count", [1260, 2048, 2049])
+def test_scan_bytes_tracks_large_state_dict_up_to_entry_limit(entry_count: int) -> None:
+    entries = b"".join(f"Vkey{index}\ncbuiltins\nhelp\ns".encode() for index in range(entry_count))
+    report = scan_bytes(b"\x80\x04}" + entries + b".", source="large-state-dict.pkl")
+    notices = [notice for notice in report.notices if notice.code == "tracked_state_budget"]
+
+    if entry_count <= 2048:
+        _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
+        assert not notices
+    else:
+        _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
+        assert len(notices) == 1
+        assert notices[0].details["tracked_dict_entries"] == entry_count
+        assert notices[0].details["max_tracked_dict_entries"] == 2048
+
+
 def test_scan_bytes_warns_on_post_budget_memo_growth_tail() -> None:
     payload = _make_opcode_padding_stream(64) + _make_memo_expansion_pickle(iterations=80)
 

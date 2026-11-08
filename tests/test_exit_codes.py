@@ -627,6 +627,11 @@ def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(
     assert results.success is False
     assert determine_exit_code(results) == 1
 
+    combined = _create_result_model()
+    combined.aggregate_scan_result(results.model_dump())
+    assert combined.success is False
+    assert determine_exit_code(combined) == 1
+
 
 def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path: Path) -> None:
     """Explicit operational-error metadata should drive exit code 2 without message parsing."""
