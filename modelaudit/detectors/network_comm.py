@@ -6144,6 +6144,9 @@ class NetworkCommDetector:
             for pattern_bytes in self.PORT_PATTERNS[port]:
                 for pattern_start in _iter_pattern_matches(data, pattern_bytes):
                     port_start = pattern_start + pattern_bytes.rfind(port_bytes)
+                    port_end = port_start + len(port_bytes)
+                    if data[port_end : port_end + 1].isdigit():
+                        continue
                     if self._is_redacted_url_value(data, port_start, str(port)):
                         continue
                     matched = True
@@ -6160,6 +6163,7 @@ class NetworkCommDetector:
                         "message": f"Suspicious port detected: {port} ({port_name})",
                         "port": port,
                         "service": port_name,
+                        "position": port_start,
                         "context": context,
                     }
                 ):
@@ -6175,6 +6179,9 @@ class NetworkCommDetector:
                     if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[line_start:pattern_start]) is None:
                         continue
                     port_start = pattern_start + pattern_bytes.rfind(port_bytes)
+                    port_end = port_start + len(port_bytes)
+                    if data[port_end : port_end + 1].isdigit():
+                        continue
                     if self._is_redacted_url_value(data, port_start, str(port)):
                         continue
                     matched = True
@@ -6191,6 +6198,9 @@ class NetworkCommDetector:
             for pattern_bytes in self.PORT_PATTERNS[port]:
                 for pattern_start in _iter_pattern_matches(value, pattern_bytes):
                     port_start = pattern_start + pattern_bytes.rfind(port_bytes)
+                    port_end = port_start + len(port_bytes)
+                    if value[port_end : port_end + 1].isdigit():
+                        continue
                     if self._is_redacted_url_value(value, port_start, str(port)):
                         continue
                     matched = True
