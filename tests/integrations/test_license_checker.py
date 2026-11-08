@@ -3,10 +3,12 @@
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import HttpUrl
 
+from modelaudit.core import scan_model_directory_or_file
 from modelaudit.integrations import license_checker
 from modelaudit.integrations.license_checker import (
     _LICENSE_HEADER_MAX_BYTES,
@@ -447,6 +449,10 @@ class TestUnlicensedDatasetDetection:
             ("chat_template.json", '[{"text":"{{ x }}"}]'),
             ("added_tokens.json", '{"dogs":1,"cats":2}'),
             ("added_tokens.json", '{"<|pad|>":0,"examples":["a"]}'),
+            (
+                "video_preprocessor_config.json",
+                '{"processor_class":"MockProcessor","video_processor_type":"MockVideoProcessor","patch_size":NaN}',
+            ),
             (".cache/huggingface/trees/" + "a" * 40 + ".json", '{"format_version":1,"files":{"x":{"size":3}}}'),
             ("chat_template.json", '{"chat_template":"{{ x }}"} extra'),
         ],
@@ -458,6 +464,109 @@ class TestUnlicensedDatasetDetection:
 
         assert collect_license_metadata(str(path))["is_dataset"] is True
         assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+
+    def test_coreml_package_manifest_dataset_evidence(self, tmp_path: Path) -> None:
+        root_id = "00000000-0000-4000-8000-000000000001"
+        weights_id = "00000000-0000-4000-8000-000000000002"
+        model = {"author": "example", "description": "Model", "name": "model.mlmodel", "path": "example/model.mlmodel"}
+        weights = {"author": "example", "description": "Weights", "name": "weights", "path": "example/weights"}
+        entries = {root_id: model, weights_id: weights}
+        package = tmp_path / "Example.mlpackage"
+        package.mkdir()
+        manifest = package / "Manifest.json"
+        document = {"fileFormatVersion": "1.0.0", "rootModelIdentifier": root_id, "itemInfoEntries": entries}
+        manifest.write_text(json.dumps(document))
+        training = tmp_path / "training.json"
+        training.write_text('[{"text":"example"}]')
+        paths = [str(manifest), str(training)]
+        assert collect_license_metadata(str(manifest))["is_dataset"] is False
+        assert detect_unlicensed_datasets(paths) == [str(training)]
+
+        destination = "https://artifact.exfil.invalid/collect"
+        model["description"] = destination
+        manifest.write_text(json.dumps(document))
+        scan = scan_model_directory_or_file(str(tmp_path), use_cache=False)
+        assert scan.file_metadata[str(manifest)].is_dataset is False
+        assert any(issue.details.get("url") == destination for issue in scan.issues)
+        assert any(issue.details.get("files") == [str(training)] for issue in scan.issues)
+
+        standalone = tmp_path / "Manifest.json"
+        standalone.write_text(json.dumps(document))
+        assert collect_license_metadata(str(standalone))["is_dataset"] is True
+
+        for ambiguous in (
+            {**document, "examples": ["a"]},
+            {**document, "rootModelIdentifier": "missing"},
+            {**document, "rootModelIdentifier": weights_id},
+            {**document, "itemInfoEntries": {root_id: model, weights_id: {**weights, "labels": [0, 1]}}},
+            {**document, "itemInfoEntries": {root_id: {**model, "path": "../model.mlmodel"}}},
+        ):
+            manifest.write_text(json.dumps(ambiguous))
+            assert collect_license_metadata(str(manifest))["is_dataset"] is True
+            assert detect_unlicensed_datasets(paths) == paths
+
+    @pytest.mark.parametrize(
+        ("filename", "component"),
+        [
+            (
+                "processor_config.json",
+                {"image_processor": {"image_processor_type": "ExampleImageProcessor", "do_resize": True}},
+            ),
+            ("video_preprocessor_config.json", {"video_processor_type": "ExampleVideoProcessor", "patch_size": 16}),
+        ],
+    )
+    def test_processor_configuration_preserves_dataset_rows(
+        self, tmp_path: Path, filename: str, component: dict[str, Any]
+    ) -> None:
+        path = tmp_path / filename
+        config = {"processor_class": "ExampleProcessor", **component}
+        path.write_text(json.dumps(config))
+        assert collect_license_metadata(str(path))["is_dataset"] is False
+        path.write_text(json.dumps({**config, "rows": [{"text": "example"}]}))
+        assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+        if filename == "processor_config.json":
+            config["image_processor"]["image_mean"] = [{"text": "example"}]
+        else:
+            config["image_mean"] = [{"text": "example"}]
+        path.write_text(json.dumps(config))
+        assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+
+    def test_sparse_attention_config_dataset_evidence(self, tmp_path: Path) -> None:
+        config = tmp_path / "sparse_attention_config.json"
+        heads = {"0": ["vertical_and_slash", 30, 100, 0.8], "1": ["vertical_and_slash", 60, 120, 1.0001]}
+        config.write_text(json.dumps([heads, heads]))
+        assert collect_license_metadata(str(config))["is_dataset"] is False
+        assert detect_unlicensed_datasets([str(config)]) == []
+
+        for rows in ([heads, {"prompt": "training example"}], [{"9": heads["0"]}], [{"0": ["text", 30, 100, 0.8]}]):
+            config.write_text(json.dumps(rows))
+            assert collect_license_metadata(str(config))["is_dataset"] is True
+            assert detect_unlicensed_datasets([str(config)]) == [str(config)]
+
+    def test_modelopt_quant_config_dataset_evidence(self, tmp_path: Path) -> None:
+        config = tmp_path / "hf_quant_config.json"
+        producer = {"name": "modelopt", "version": "1.2.3"}
+        quant = {
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_quant_algo": "FP8",
+            "quantized_layers": {"model.layers.0.proj": {"quant_algo": "NVFP4", "group_size": 16}},
+            "exclude_modules": ["head*"],
+        }
+        config.write_text(json.dumps({"producer": producer, "quantization": quant}))
+        assert collect_license_metadata(str(config))["is_dataset"] is False
+        assert detect_unlicensed_datasets([str(config)]) == []
+
+        for document in (
+            {"producer": producer, "quantization": quant, "examples": [{"prompt": "training example"}]},
+            {
+                "producer": producer,
+                "quantization": {**quant, "quantized_layers": {"model.proj": {"example": "training text"}}},
+            },
+            {"producer": producer, "quantization": {**quant, "exclude_modules": [{"prompt": "training example"}]}},
+        ):
+            config.write_text(json.dumps(document))
+            assert collect_license_metadata(str(config))["is_dataset"] is True
+            assert detect_unlicensed_datasets([str(config)]) == [str(config)]
 
     def test_ml_model_directory_skip(self, tmp_path: Path) -> None:
         """Test that ML model files in model directories are skipped."""
