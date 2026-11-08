@@ -135,6 +135,7 @@ def pytest_runtest_setup(item):
 
         # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
         allowed_test_files = [
+            "test_triage.py",  # Optional API triage preserves scanner evidence and exits
             "test_python_compatibility.py",
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
@@ -301,6 +302,13 @@ def pytest_runtest_setup(item):
         marker = item.get_closest_marker(marker_name)
         if marker is not None and not _check_framework(module_name):
             pytest.skip(f"{marker_name} is not installed")
+
+
+@pytest.fixture(autouse=True)
+def disable_live_triage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ordinary tests must never use a developer's API credentials."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MODELAUDIT_TRIAGE_MODEL", raising=False)
 
 
 @pytest.fixture(autouse=True)
