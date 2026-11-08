@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Recognize one-byte F8_E4M3 tensors in GGUF files and validate their payload bounds.
 - Avoid checkpoint routing errors on logs, JSON Lines datasets, tokenizer vocabularies, PCM audio, and native binaries. Keep inspecting possible serialized payloads in mixed-format files.
+- Attribute README and model-card network findings to their documentation source. Recognize passive SQL comparisons, local client examples, maintenance and classifier terminology, usage restrictions, and contact details. Preserve alerts for active uses.
 - Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
 - Stop flagging licenses as incompatible solely because they lack OSI approval. Distinguish Creative Commons Attribution from ShareAlike and NonCommercial declarations, recognize RAIL names at word boundaries, and count each file once when reporting deprecated identifiers.
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.

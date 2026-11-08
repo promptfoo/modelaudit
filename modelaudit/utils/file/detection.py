@@ -3177,23 +3177,6 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
-_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = frozenset(
-    {
-        "BINPERSID",
-        "BUILD",
-        "EXT1",
-        "EXT2",
-        "EXT4",
-        "GLOBAL",
-        "INST",
-        "NEWOBJ",
-        "NEWOBJ_EX",
-        "OBJ",
-        "PERSID",
-        "REDUCE",
-        "STACK_GLOBAL",
-    }
-)
 _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
     {
         "BINPERSID",
@@ -3207,6 +3190,9 @@ _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
         "REDUCE",
         "STACK_GLOBAL",
     }
+)
+_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.union(
+    {"BUILD", "NEWOBJ", "NEWOBJ_EX"}
 )
 _PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
     {
@@ -4647,52 +4633,13 @@ def _pickle_structural_argument(
     if opcode_name in {"BINPUT", "BINGET", "PROTO", "EXT1"}:
         value = _read_pickle_structure_bytes(handle, sample, argument_offset, 1, file_size)
         return (False, None) if value is None else (True, value[0])
-    if opcode_name in {"LONG_BINPUT", "LONG_BINGET", "EXT4"}:
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 4, file_size)
+    if opcode_name in {"LONG_BINPUT", "LONG_BINGET", "EXT2", "EXT4"}:
+        width = 2 if opcode_name == "EXT2" else 4
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, width, file_size)
         return (False, None) if value is None else (True, int.from_bytes(value, "little"))
-    if opcode_name == "EXT2":
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 2, file_size)
-        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
-    if opcode_name in {"GLOBAL", "INST"}:
-        lines = _read_pickle_structure_bytes(
-            handle,
-            sample,
-            argument_offset,
-            argument_end - argument_offset,
-            file_size,
-        )
-        if lines is None:
-            return False, None
-        module_name, separator, remainder = lines.partition(b"\n")
-        global_name, second_separator, trailing = remainder.partition(b"\n")
-        if not module_name or not separator or not global_name or not second_separator or trailing:
-            return False, None
-        try:
-            argument_encoding = "ascii" if opcode_name == "INST" else "utf-8"
-            return True, (
-                "global_argument",
-                module_name.decode(argument_encoding),
-                global_name.decode(argument_encoding),
-            )
-        except UnicodeDecodeError:
-            return False, None
-    if opcode_name in {"PUT", "GET", "INT", "LONG", "FLOAT"}:
-        line = _read_pickle_structure_bytes(
-            handle,
-            sample,
-            argument_offset,
-            argument_end - argument_offset,
-            file_size,
-        )
-        if line is None:
-            return False, None
-        canonical = _canonicalize_cpython_numeric_line(opcode.code.encode("latin-1")[0], line)
-        if canonical is None or canonical == _INVALID_PICKLE_NUMERIC_LINE:
-            return False, None
-        if opcode_name in {"PUT", "GET", "INT", "LONG"}:
-            return True, int(canonical[:-1])
-        return True, float(canonical[:-1])
-    if opcode.arg is not None and opcode.arg.n == -1:
+    if opcode_name in {"GLOBAL", "INST", "PUT", "GET", "INT", "LONG", "FLOAT"} or (
+        opcode.arg is not None and opcode.arg.n == -1
+    ):
         line_argument = _read_pickle_structure_bytes(
             handle,
             sample,
@@ -4702,6 +4649,27 @@ def _pickle_structural_argument(
         )
         if line_argument is None:
             return False, None
+        if opcode_name in {"GLOBAL", "INST"}:
+            module_name, separator, remainder = line_argument.partition(b"\n")
+            global_name, second_separator, trailing = remainder.partition(b"\n")
+            if not module_name or not separator or not global_name or not second_separator or trailing:
+                return False, None
+            try:
+                argument_encoding = "ascii" if opcode_name == "INST" else "utf-8"
+                return True, (
+                    "global_argument",
+                    module_name.decode(argument_encoding),
+                    global_name.decode(argument_encoding),
+                )
+            except UnicodeDecodeError:
+                return False, None
+        if opcode_name in {"PUT", "GET", "INT", "LONG", "FLOAT"}:
+            canonical = _canonicalize_cpython_numeric_line(opcode.code.encode("latin-1")[0], line_argument)
+            if canonical is None or canonical == _INVALID_PICKLE_NUMERIC_LINE:
+                return False, None
+            if opcode_name in {"PUT", "GET", "INT", "LONG"}:
+                return True, int(canonical[:-1])
+            return True, float(canonical[:-1])
         reader = BytesIO(line_argument)
         try:
             parsed_argument = opcode.arg.reader(reader)
@@ -4740,8 +4708,8 @@ def _pickle_structural_argument(
     if opcode_name == "BYTEARRAY8":
         payload_length = argument_end - argument_offset - 8
         return (payload_length >= 0, ("bytearray_length", max(payload_length, 0)))
-    if opcode_name in {"BININT", "BININT1", "BININT2"}:
-        width = {"BININT": 4, "BININT1": 1, "BININT2": 2}[opcode_name]
+    if opcode_name in {"BININT", "BININT1", "BININT2", "FRAME"}:
+        width = {"BININT": 4, "BININT1": 1, "BININT2": 2, "FRAME": 8}[opcode_name]
         value = _read_pickle_structure_bytes(handle, sample, argument_offset, width, file_size)
         if value is None:
             return False, None
@@ -4786,9 +4754,6 @@ def _pickle_structural_argument(
             remaining_offset += len(chunk)
             remaining -= len(chunk)
         return True, int.from_bytes(leading_payload, "little", signed=True)
-    if opcode_name == "FRAME":
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 8, file_size)
-        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
     return True, None
 
 
@@ -5981,8 +5946,13 @@ def _looks_like_pytorch_zip_storage_members(member_names: set[str], prefix: str)
     return False
 
 
-def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -> bool:
-    """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
+def _matches_zip_content(
+    path: str,
+    config: dict[str, Any] | None,
+    matches: Callable[[zipfile.ZipFile], bool],
+    *,
+    extra_errors: tuple[type[Exception], ...] = (),
+) -> bool:
     file_path = Path(path)
     if not file_path.is_file():
         return False
@@ -5991,28 +5961,10 @@ def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -
 
     try:
         with open_preflighted_zip(file_path, config) as archive:
-            manifest_info = None
-            manifest_name = _normalize_archive_member_name(_TORCHSERVE_MANIFEST_PATH)
-            for info in archive.infolist():
-                if _normalize_archive_member_name(info.filename) == manifest_name:
-                    manifest_info = info
-                    break
-
-            if manifest_info is None:
-                return False
-
-            manifest_bytes = _read_zip_member_bounded(archive, manifest_info, _TORCHSERVE_MANIFEST_MAX_BYTES)
-            manifest_data = json.loads(manifest_bytes.decode("utf-8"))
-            return _looks_like_torchserve_manifest(manifest_data)
-    except (
-        OSError,
-        RuntimeError,
-        ValueError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        zipfile.BadZipFile,
-        zipfile.LargeZipFile,
-    ):
+            return matches(archive)
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+    except extra_errors:
         return False
     except ZipPreflightRejected:
         if config is not None:
@@ -6020,30 +5972,45 @@ def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -
         return False
 
 
+def _has_torchserve_manifest(archive: zipfile.ZipFile) -> bool:
+    manifest_info = None
+    manifest_name = _normalize_archive_member_name(_TORCHSERVE_MANIFEST_PATH)
+    for info in archive.infolist():
+        if _normalize_archive_member_name(info.filename) == manifest_name:
+            manifest_info = info
+            break
+
+    if manifest_info is None:
+        return False
+
+    manifest_bytes = _read_zip_member_bounded(archive, manifest_info, _TORCHSERVE_MANIFEST_MAX_BYTES)
+    manifest_data = json.loads(manifest_bytes.decode("utf-8"))
+    return _looks_like_torchserve_manifest(manifest_data)
+
+
+def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -> bool:
+    """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
+    return _matches_zip_content(path, config, _has_torchserve_manifest, extra_errors=(ValueError,))
+
+
 def _is_keras_zip_archive_content(archive: zipfile.ZipFile, *, allow_config_only: bool = False) -> bool:
     """Return whether an open ZIP has the minimal Keras archive structure."""
-    member_names: set[str] = set()
+    has_marker = False
     config_info: zipfile.ZipInfo | None = None
     for info in archive.infolist():
         if not info.filename or info.is_dir():
             continue
 
         normalized_name = _normalize_archive_member_name(info.filename)
-        member_names.add(normalized_name)
         if normalized_name == _KERAS_ZIP_REQUIRED_ENTRY:
             config_info = info
-
-    if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
-        return False
-
-    if allow_config_only:
-        return True
-
-    if any(marker in member_names for marker in _KERAS_ZIP_MARKERS):
-        return True
+        elif normalized_name in _KERAS_ZIP_MARKERS:
+            has_marker = True
 
     if config_info is None:
         return False
+    if allow_config_only or has_marker:
+        return True
 
     try:
         config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
@@ -6070,97 +6037,87 @@ def is_keras_zip_archive(
     config: dict[str, Any] | None = None,
 ) -> bool:
     """Return whether a ZIP-backed file has the minimal Keras archive structure."""
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
+    return _matches_zip_content(
+        path, config, lambda archive: _is_keras_zip_archive_content(archive, allow_config_only=allow_config_only)
+    )
 
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
 
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            return _is_keras_zip_archive_content(archive, allow_config_only=allow_config_only)
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
+def _has_pytorch_zip_layout(archive: zipfile.ZipFile) -> bool:
+    member_names = {
+        _normalize_archive_member_name(info.filename)
+        for info in archive.infolist()
+        if info.filename and not info.is_dir()
+    }
+
+    for name in member_names:
+        if name == "data.pkl":
+            prefix = ""
+        elif name.endswith("/data.pkl"):
+            prefix = name[: -len("/data.pkl")]
+        else:
+            continue
+
+        if _looks_like_pytorch_zip_metadata(archive, prefix):
+            return True
+        if _looks_like_pytorch_zip_storage_members(member_names, prefix):
+            return True
+
+    return False
 
 
 def is_pytorch_zip_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed file has a conservative PyTorch archive signature."""
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
+    return _matches_zip_content(path, config, _has_pytorch_zip_layout)
 
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
 
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            member_names = {
-                _normalize_archive_member_name(info.filename)
-                for info in archive.infolist()
-                if info.filename and not info.is_dir()
-            }
+def _has_executorch_zip_layout(archive: zipfile.ZipFile) -> bool:
+    members_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+    for info in archive.infolist():
+        if not info.filename or info.is_dir():
+            continue
+        name = _normalize_archive_member_name(info.filename).casefold()
+        members_by_name.setdefault(name, []).append(info)
 
-            for name in member_names:
-                if name == "data.pkl":
-                    prefix = ""
-                elif name.endswith("/data.pkl"):
-                    prefix = name[: -len("/data.pkl")]
-                else:
-                    continue
+    for name in members_by_name:
+        if name == "bytecode.pkl":
+            prefix = ""
+        elif name.endswith("/bytecode.pkl"):
+            prefix = name[: -len("/bytecode.pkl")]
+        else:
+            continue
 
-                if _looks_like_pytorch_zip_metadata(archive, prefix):
-                    return True
-                if _looks_like_pytorch_zip_storage_members(member_names, prefix):
-                    return True
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
+        version_name = f"{prefix}/version" if prefix else "version"
+        for version_info in members_by_name.get(version_name, []):
+            version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
+            if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
+                return True
 
     return False
 
 
 def is_executorch_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed file matches the mobile/ExecuTorch archive layout."""
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
+    return _matches_zip_content(path, config, _has_executorch_zip_layout)
 
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
 
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            members_by_name: dict[str, list[zipfile.ZipInfo]] = {}
-            for info in archive.infolist():
-                if not info.filename or info.is_dir():
-                    continue
-                name = _normalize_archive_member_name(info.filename).casefold()
-                members_by_name.setdefault(name, []).append(info)
+def _has_skops_schema(archive: zipfile.ZipFile) -> bool:
+    for info in archive.infolist():
+        if not info.filename or info.is_dir():
+            continue
 
-            for name in members_by_name:
-                if name == "bytecode.pkl":
-                    prefix = ""
-                elif name.endswith("/bytecode.pkl"):
-                    prefix = name[: -len("/bytecode.pkl")]
-                else:
-                    continue
+        basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
+        if basename not in _SKOPS_SCHEMA_ENTRIES:
+            continue
+        if info.file_size > _SKOPS_SCHEMA_MAX_BYTES:
+            return True
 
-                version_name = f"{prefix}/version" if prefix else "version"
-                for version_info in members_by_name.get(version_name, []):
-                    version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
-                    if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
-                        return True
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
+        try:
+            schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
+        except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            continue
+
+        if _looks_like_skops_schema(schema_data):
+            return True
 
     return False
 
@@ -6172,39 +6129,7 @@ def is_skops_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     misnamed archives whose schema content cannot be safely parsed within the
     bounded read limit.
     """
-    file_path = Path(path)
-    if not file_path.is_file():
-        return False
-
-    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
-
-    try:
-        with open_preflighted_zip(file_path, config) as archive:
-            for info in archive.infolist():
-                if not info.filename or info.is_dir():
-                    continue
-
-                basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
-                if basename not in _SKOPS_SCHEMA_ENTRIES:
-                    continue
-                if info.file_size > _SKOPS_SCHEMA_MAX_BYTES:
-                    return True
-
-                try:
-                    schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
-                except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-                    continue
-
-                if _looks_like_skops_schema(schema_data):
-                    return True
-    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        return False
-    except ZipPreflightRejected:
-        if config is not None:
-            raise
-        return False
-
-    return False
+    return _matches_zip_content(path, config, _has_skops_schema)
 
 
 def _is_nemo_root_config_member(member_name: str) -> bool:
