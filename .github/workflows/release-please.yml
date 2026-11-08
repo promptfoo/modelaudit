@@ -145,12 +145,12 @@ jobs:
             [[ -n "$version" ]] || return 0
             local tag="$prefix$version" notes="$RUNNER_TEMP/$package-notes.md"
             local source="refs/tags/$tag" missing_tag=false component=.
+            if [[ "$package" == modelaudit-picklescan ]]; then component="packages/modelaudit-picklescan"; fi
             if ! git rev-parse --verify --quiet "$source^{commit}" >/dev/null; then
               [[ "$MANUAL_RELEASE" == true ]] || { echo "Missing release tag $tag"; return 1; }
               # Explicit manual publication also supports an already-versioned dispatch commit.
               source="$GITHUB_SHA"
               missing_tag=true
-              if [[ "$package" == modelaudit-picklescan ]]; then component="packages/modelaudit-picklescan"; fi
               git show "$source:.release-please-manifest.json" | jq -e --arg path "$component" --arg v "$version" '.[$path] == $v' >/dev/null
             fi
             local published=true reviewed=false title="$tag"
@@ -163,7 +163,12 @@ jobs:
               # A package retry must preserve hand-edited releases that predate fragments.
               return 0
             fi
-            python3 scripts/release_notes.py extract --package "$package" --version "$version" --ref "$source" > "$notes"
+            if [[ "$published" == false && "$reviewed" == false && "$missing_tag" == false ]] && ! git cat-file -e "$source:$component/CHANGELOG.md" 2>/dev/null; then
+              # Historical tags such as v0.1.5 predate the project changelog.
+              printf 'Manual recovery release for %s %s.\n' "$package" "$version" > "$notes"
+            else
+              python3 scripts/release_notes.py extract --package "$package" --version "$version" --ref "$source" > "$notes"
+            fi
             if [[ "$reviewed" == true ]]; then
               grep -Fxq '<summary>All changes</summary>' "$notes" || { echo "Missing reviewed release notes for $tag"; return 1; }
             fi

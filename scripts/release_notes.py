@@ -25,11 +25,13 @@ def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], encoding="utf-8")
 
 
-def versioned_sections(text: str) -> dict[str, str]:
+def versioned_sections(text: str, only: str | None = None) -> dict[str, str]:
     headers = list(RELEASE.finditer(text))
     sections = {}
     for index, header in enumerate(headers):
         version = header[1]
+        if only is not None and version != only:
+            continue
         if version in sections:
             raise ValueError(f"Duplicate changelog section {version}")
         end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
@@ -216,7 +218,7 @@ def main() -> None:
         else:
             file = Path(path) / "CHANGELOG.md"
             text = git("show", f"{args.ref}:{file.as_posix()}") if args.ref else file.read_text(encoding="utf-8")
-            print(versioned_sections(text)[args.version], end="")
+            print(versioned_sections(text, only=args.version)[args.version], end="")
 
 
 if __name__ == "__main__":

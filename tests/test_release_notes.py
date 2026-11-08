@@ -178,13 +178,39 @@ def test_shipped_fragment_paths_cannot_be_silently_reused(repository: Path) -> N
     assert "new fragment filename" in rejected.stderr
 
 
+def test_extract_from_historical_tags_with_repeated_unreleased_headings(repository: Path) -> None:
+    # Older tags such as v0.2.49 contain multiple Unreleased sections.
+    changelog = repository / "CHANGELOG.md"
+    section = "## [0.2.1] - 2026-10-01\n\n- Earlier fix.\n"
+    with changelog.open("a", encoding="utf-8") as stream:
+        stream.write("\n## [Unreleased]\n")
+    ref = commit(repository, "older layout")
+    assert run(repository, "extract", "--package", "modelaudit", "--version", "0.2.1", "--ref", ref).stdout == section
+    with changelog.open("a", encoding="utf-8") as stream:
+        stream.write("\n" + section)
+    result = run(repository, "extract", "--package", "modelaudit", "--version", "0.2.1", check=False)
+    assert result.returncode != 0
+    assert "Duplicate changelog section 0.2.1" in result.stderr
+
+
 @pytest.mark.skipif(os.name == "nt", reason="release publication runs in Bash on Ubuntu")
 @pytest.mark.parametrize(
-    ("manual", "exists", "tagged", "expected"),
-    [(False, True, True, "edit"), (True, False, True, "create"), (True, False, False, "create")],
+    ("manual", "exists", "tagged", "predates_changelog", "expected"),
+    [
+        (False, True, True, False, "edit"),
+        (True, False, True, False, "create"),
+        (True, False, False, False, "create"),
+        (True, False, True, True, "create"),
+    ],
 )
 def test_publication_sends_the_exact_tagged_section(
-    repository: Path, tmp_path_factory: pytest.TempPathFactory, manual: bool, exists: bool, tagged: bool, expected: str
+    repository: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    manual: bool,
+    exists: bool,
+    tagged: bool,
+    predates_changelog: bool,
+    expected: str,
 ) -> None:
     root = repository
     scratch = tmp_path_factory.mktemp("publish")
@@ -195,10 +221,15 @@ def test_publication_sends_the_exact_tagged_section(
     write_manifest(root, "0.2.2", "0.1.1")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
     run(root, "render", "--base", base)
+    expected_notes = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2").stdout
+    if predates_changelog:
+        (root / "CHANGELOG.md").unlink()
+        (root / "scripts" / SCRIPT.name).unlink()
+        expected_notes = "Manual recovery release for modelaudit 0.2.2.\n"
     dispatch = commit(root, "release")
     if tagged:
         git(root, "tag", "v0.2.2")
-    expected_notes = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2").stdout
+    shutil.copyfile(SCRIPT, root / "scripts" / SCRIPT.name)
     (root / "CHANGELOG.md").write_text("Notes changed on main after tagging.\n")
     gh = scratch / "gh"
     gh.write_text(
