@@ -2544,12 +2544,20 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_finding_tokens(
-        cls, finding: dict[str, Any], routine_spans: tuple[tuple[int, int], ...] = ()
+        cls,
+        finding: dict[str, Any],
+        routine_spans: tuple[tuple[int, int], ...] = (),
+        check_later_domains: bool = False,
     ) -> tuple[bytes, ...]:
         finding_type = finding.get("type")
         if finding_type == "domain_name" and isinstance(position := finding.get("position"), int):
             domain = finding.get("domain")
-            if isinstance(domain, str) and domain and cls._routine_span_contains(routine_spans, position):
+            # A domain is emitted only once; generic prose can precede an active reference.
+            if (
+                isinstance(domain, str)
+                and domain
+                and (check_later_domains or cls._routine_span_contains(routine_spans, position))
+            ):
                 return (domain.encode().lower(),)
 
         if finding_type == "network_function":
@@ -2633,7 +2641,9 @@ class TextScanner(BaseScanner):
         active_policy_spans: Sequence[tuple[int, int]] = (),
     ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
-        token_bytes_options = cls._documentation_finding_tokens(finding, routine_spans)
+        token_bytes_options = cls._documentation_finding_tokens(
+            finding, routine_spans, bool(sql_regions or active_policy_spans)
+        )
         if not token_bytes_options:
             return finding, False, remaining_occurrences
 
@@ -3906,7 +3916,9 @@ class TextScanner(BaseScanner):
             (
                 index
                 for index, finding in enumerate(findings)
-                if cls._documentation_finding_tokens(finding, routine_network_spans)
+                if cls._documentation_finding_tokens(
+                    finding, routine_network_spans, bool(sql_regions or active_policy_spans)
+                )
             ),
             default=-1,
         )

@@ -4597,6 +4597,22 @@ def test_model_card_byline_inside_multiline_call_keeps_warning(tmp_path: Path, c
     )
 
 
+def test_model_card_repeated_domain_in_active_credit_keeps_later_offset(tmp_path: Path) -> None:
+    content = (
+        "See publisher.dev for information.\n\n"
+        '~~~python\nfetch("""\n\n'
+        "Converted by **Sample Team** - maintainer@publisher.dev\n"
+        '""".split("@")[1].strip())\n~~~\n'
+    )
+    result = _scan_text_content(tmp_path / "README.md", content)
+    assert any(
+        check.details.get("type") == "domain_name"
+        and check.details.get("position") == content.rindex("publisher.dev")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
+
+
 def test_text_scanner_documentation_possible_misuse_is_informational(tmp_path: Path) -> None:
     result = _scan_text_content(
         tmp_path / "README.md", "* **Misuse:** Malware production may be possible; review generated outputs.\n"
@@ -6625,14 +6641,15 @@ def test_documented_sql_like_preserves_repeated_connector_domain(tmp_path: Path,
         "SELECT\n    dblink('host=example.net', $$SELECT email LIKE '%@example.net%'$$);",
     ],
 )
-def test_documented_sql_connector_keeps_its_domain_position(tmp_path: Path, query: str) -> None:
+@pytest.mark.parametrize("intro", ["", "See example.net for documentation.\n\n"])
+def test_documented_sql_connector_keeps_its_domain_position(tmp_path: Path, query: str, intro: str) -> None:
     path = tmp_path / "README.md"
-    source = f"~~~sql\n{query}\n~~~\n"
+    source = f"{intro}~~~sql\n{query}\n~~~\n"
     result = _scan_text_content(path, source)
     assert any(
         check.severity == IssueSeverity.WARNING
         and check.details.get("domain") == "example.net"
-        and check.details.get("position") == path.read_bytes().index(b"example.net")
+        and check.details.get("position") == source.index("example.net", len(intro))
         for check in _failed_network_detection_checks(result)
     )
 
