@@ -1945,13 +1945,16 @@ _REQUIREMENT_PIN_PREFIX = re.compile(
     rb"^[ \t]*[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._, -]+\])?[ \t]*==[ \t]*\Z",
     re.MULTILINE,
 )
-_REQUIREMENT_PIN_END = re.compile(rb"[ \t]*(?:\r?$|[;#])", re.MULTILINE)
+_REQUIREMENT_PIN_END = re.compile(rb"[ \t]*(?:\\?\r?$|[;#]|--hash(?:=|[ \t]))", re.MULTILINE)
 _CLOCK_PORT_PREFIX = re.compile(
-    rb"(?:^|[\s\"'(\[=])(?P<date>\d{4}-\d{2}-\d{2}[Tt ])?(?:[01]?\d|2[0-3])(?P<minutes>:[0-5]\d)?:\Z"
+    rb"(?<![a-zA-Z0-9_:/@.-])(?P<date>\d{4}-\d{2}-\d{2}[Tt ])?(?:[01]?\d|2[0-3])(?P<minutes>:[0-5]\d)?:\Z"
 )
 _CLOCK_PORT_SUFFIX = re.compile(rb"(?::[0-5]\d|Z\b|[ \t]?[AP]M\b)", re.IGNORECASE)
+_CSS_PROPERTY_BEFORE_COLON = re.compile(
+    rb"(?:^|[\s;{'\"`])(?:[A-Za-z-]*(?:width|height|size|radius|gap)|(?:margin|padding)(?:-[A-Za-z-]+)?|top|right|bottom|left)\Z"
+)
 _CSS_DIMENSION_UNIT = re.compile(
-    rb"(?:%|px|em|rem|ex|ch|vw|vh|vmin|vmax|pt|pc|cm|mm|in)(?=$|[\s;\"'!})>])", re.IGNORECASE
+    rb"(?:\.\d+)?(?:%|px|em|rem|ex|ch|vw|vh|vmin|vmax|pt|pc|cm|mm|in)(?=$|[\s;\"'!})>])", re.IGNORECASE
 )
 _ML_LAYER_DOMAIN_PATTERN = re.compile(
     r"^(?:layer\d+|conv\d*d?|bn\d+|norm\d+|fc\d+|dense\d+)\.(?:weight|bias)$",
@@ -1990,7 +1993,9 @@ def iter_port_token_positions(data: bytes, token: bytes, start: int = 0) -> Iter
         if data[end : end + 1].isdigit():
             continue
         if token.startswith(b":"):
-            if _CSS_DIMENSION_UNIT.match(data, end):
+            if _CSS_DIMENSION_UNIT.match(data, end) and _CSS_PROPERTY_BEFORE_COLON.search(
+                data, max(0, position - 128), position
+            ):
                 continue
             if len(token) == 3:
                 clock = _CLOCK_PORT_PREFIX.search(data, max(0, position - 20), position + 1)
@@ -6159,7 +6164,7 @@ class NetworkCommDetector:
                 for start in iter_port_token_positions(data, token):
                     if require_active_key:
                         line_start = data.rfind(b"\n", 0, start) + 1
-                        if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data, line_start, start) is None:
+                        if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[line_start:start]) is None:
                             continue
                     port_start = start + len(token) - len(str(port))
                     if self._is_redacted_url_value(data, port_start, str(port)):

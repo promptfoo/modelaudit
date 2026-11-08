@@ -1289,6 +1289,8 @@ class TestNetworkCommDetector:
         data = (
             b"example-package==0.70.12.2\n"
             b"package[extra] == 3.10.0.0 ; python_version < '3.12'\n"
+            b"example==2.3.4.5 --hash=sha256:abababababababababababababababababababababababababababababababab\n"
+            b"locked==2.3.4.5 \\\n    --hash=sha256:abababababababababababababababababababababababababababababababab\n"
             b"--index-url http://3.10.0.0/simple\n"
             b"remote @ http://0.70.12.2/pkg.whl\n"
         )
@@ -8257,7 +8259,9 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
 
-    @pytest.mark.parametrize("clock", [b"10:22:30", b"10:23 PM", b"2025-11-14T19:22Z", b"10:30:22"])
+    @pytest.mark.parametrize(
+        "clock", [b"10:22:30", b"10:23 PM", b"2025-11-14T19:22Z", b"10:30:22", b"`10:22:30`", b"<time>10:22:30</time>"]
+    )
     def test_clock_fields_are_not_ports(self, clock: bytes) -> None:
         findings = NetworkCommDetector().scan(clock, "notes.txt")
 
@@ -8268,6 +8272,17 @@ class TestNetworkCommDetector:
         findings = NetworkCommDetector().scan(data, "config.txt")
 
         assert any(f.get("port") == 22 and f.get("position") == data.index(b"22") for f in findings)
+
+    def test_percent_delimited_endpoint_still_reports_port(self) -> None:
+        data = b"sed -i 's%old%worker:4444%' config"
+        findings = NetworkCommDetector().scan(data, "setup.sh")
+        assert any(f.get("port") == 4444 and f.get("position") == data.index(b"4444") for f in findings)
+
+    def test_onnx_text_fallback_recognizes_second_line_endpoint(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"notes: plain text\nendpoint=server:4444"
+        findings = detector.scan(data, "model.onnx", onnx_metadata_context=True)
+        assert any(f.get("port") == 4444 for f in findings)
 
     def test_suspicious_port_after_decimal_near_match_keeps_actual_position(self) -> None:
         data = b"arxiv:2310.06825\nserver:23\n"
