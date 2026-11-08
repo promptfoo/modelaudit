@@ -101,17 +101,6 @@ _EXECUTABLE_MEMBER_PROBE_BYTES = 1024
 _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
     r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
 )
-_PICKLE_CODE_EXECUTION_OPCODE_RISKS = (
-    ("REDUCE", "__reduce__ method exploitation"),
-    ("INST", "Class instantiation code execution"),
-    ("OBJ", "Object creation code execution"),
-    ("NEWOBJ", "New-style object creation"),
-    ("NEWOBJ_EX", "Extended new-style object creation"),
-    ("STACK_GLOBAL", "Dynamic import and attribute access"),
-    ("GLOBAL", "Module import and attribute access"),
-    ("BUILD", "__setstate__ method exploitation"),
-)
-_PICKLE_NESTED_EXECUTION_OPCODES = frozenset({"REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "BUILD"})
 _PICKLE_MEMBER_SEVERITY_RANK = {
     "debug": 0,
     "info": 1,
@@ -597,7 +586,9 @@ class PyTorchZipScanner(BaseScanner):
     CVE_2025_32434_ID: ClassVar[str] = "CVE-2025-32434"
     CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
     CVE_2025_32434_FIX_VERSION_PARTS: ClassVar[tuple[int, int, int]] = (2, 6, 0)
-    CVE_2025_32434_DESCRIPTION: ClassVar[str] = "RCE when loading models with torch.load(weights_only=True)"
+    CVE_2025_32434_DESCRIPTION: ClassVar[str] = (
+        "RCE when torch.load(weights_only=True) opens a legacy PyTorch TAR archive"
+    )
 
     # CVE-2026-24747 constants
     CVE_2026_24747_ID: ClassVar[str] = "CVE-2026-24747"
@@ -796,6 +787,9 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Extract version info and check for CVE vulnerabilities
                 self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
+
+                if pickle_files:
+                    result.metadata["safetensors_available"] = self._check_safetensors_available(path)
 
                 # Scan all discovered pickle files
                 bytes_scanned, clean_pickle_entry_ids = self._scan_pickle_files(
@@ -7819,8 +7813,6 @@ class PyTorchZipScanner(BaseScanner):
         bytes_scanned = 0
         clean_pickle_entry_ids: set[int] = set()
 
-        # Get the original ZIP file size for proper density calculations
-        # This is crucial for CVE-2025-32434 detection to avoid false positives
         original_file_size = int(result.metadata.get("file_size") or 0)
         if original_file_size <= 0:
             try:
@@ -7934,8 +7926,6 @@ class PyTorchZipScanner(BaseScanner):
             ):
                 clean_pickle_entry_ids.add(id(info))
 
-            # Add CVE-2025-32434 specific warnings
-            self._add_weights_only_safety_warnings(sub_result, result, path, name)
             result.merge_member_result(sub_result, name)
             self._record_pickle_member_outcome(
                 result,
@@ -10417,9 +10407,7 @@ class PyTorchZipScanner(BaseScanner):
                 cve_id=self.CVE_2025_32434_ID,
                 fix_version=self.CVE_2025_32434_FIX_VERSION,
                 description=self.CVE_2025_32434_DESCRIPTION,
-                remediation=(
-                    "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
-                ),
+                remediation=("Upgrade to PyTorch 2.6.0 or later before loading untrusted legacy TAR checkpoints."),
                 fail_closed=producer_version is not None,
                 producer_version=producer_version,
                 producer_source=producer_source,
@@ -10436,7 +10424,7 @@ class PyTorchZipScanner(BaseScanner):
                 name="CVE-2025-32434 PyTorch Version Check",
                 passed=False,
                 message=(
-                    f"{source_prefix} {detected_version} is vulnerable to CVE-2025-32434 RCE. "
+                    f"{source_prefix} {detected_version} is vulnerable to CVE-2025-32434 in the legacy TAR loader. "
                     f"Upgrade to PyTorch 2.6.0 or later."
                 ),
                 severity=IssueSeverity.CRITICAL,
@@ -10447,7 +10435,7 @@ class PyTorchZipScanner(BaseScanner):
                     "cwe": "CWE-502",
                     "description": self.CVE_2025_32434_DESCRIPTION,
                     "remediation": (
-                        "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
+                        "Upgrade to PyTorch 2.6.0 or later before loading untrusted legacy TAR checkpoints."
                     ),
                     "detected_pytorch_version": detected_version,
                     "pytorch_version_source": version_source,
@@ -10455,10 +10443,10 @@ class PyTorchZipScanner(BaseScanner):
                     "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
                     "runtime_version_known": True,
                     "runtime_cve_applicability": "vulnerable",
-                    "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
+                    "vulnerability_description": self.CVE_2025_32434_DESCRIPTION,
                     "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                     "recommendation": (
-                        "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
+                        "Upgrade to PyTorch 2.6.0 or later before loading untrusted legacy TAR checkpoints."
                     ),
                 },
                 rule_code="S902",
@@ -10944,410 +10932,6 @@ class PyTorchZipScanner(BaseScanner):
             return isinstance(json.loads(header.decode("utf-8")), dict)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return False
-
-    def _analyze_pickle_imports(self, pickle_result: ScanResult) -> dict[str, Any]:
-        """Analyze pickle imports to distinguish legitimate vs malicious patterns"""
-        # Standard PyTorch imports expected in benign state-dict archives.
-        # Keep these as exact callable/class references so lookalikes such as
-        # ``torch._utils.evil`` or ``collections.OrderedDictEvil`` are not
-        # downgraded by substring matching.
-        legitimate_imports = {
-            "collections.OrderedDict",
-            "numpy.dtype",
-            "numpy.ndarray",
-            "numpy.core.multiarray.scalar",
-            "numpy._core.multiarray.scalar",
-            "torch._rebuild_tensor",
-            "torch._rebuild_tensor_v2",
-            "torch.BFloat16Storage",
-            "torch.BoolStorage",
-            "torch.ByteStorage",
-            "torch.CharStorage",
-            "torch.ComplexDoubleStorage",
-            "torch.ComplexFloatStorage",
-            "torch.DoubleStorage",
-            "torch.FloatStorage",
-            "torch.HalfStorage",
-            "torch.IntStorage",
-            "torch.LongStorage",
-            "torch.QInt32Storage",
-            "torch.QInt8Storage",
-            "torch.QUInt2x4Storage",
-            "torch.QUInt4x2Storage",
-            "torch.QUInt8Storage",
-            "torch.ShortStorage",
-            "torch.Storage",
-            "torch.UntypedStorage",
-            "torch._tensor._rebuild_from_type_v2",
-            "torch._utils._rebuild_device_tensor_from_numpy",
-            "torch._utils._rebuild_meta_tensor_no_storage",
-            "torch._utils._rebuild_nested_tensor",
-            "torch._utils._rebuild_parameter",
-            "torch._utils._rebuild_parameter_with_state",
-            "torch._utils._rebuild_qtensor",
-            "torch._utils._rebuild_sparse_tensor",
-            "torch._utils._rebuild_tensor",
-            "torch._utils._rebuild_tensor_v2",
-            "torch._utils._rebuild_tensor_v3",
-            "torch._utils._rebuild_wrapper_subclass",
-        }
-
-        # Malicious imports that indicate actual attack. Match exact references
-        # or dotted children only; unknown imports are handled as suspicious.
-        malicious_imports = {
-            "__builtin__.eval",
-            "__builtin__.exec",
-            "__builtin__.compile",
-            "__builtin__.__import__",
-            "__builtins__.eval",
-            "__builtins__.exec",
-            "__builtins__.compile",
-            "__builtins__.__import__",
-            "asyncio.subprocess",
-            "builtins.eval",
-            "builtins.exec",
-            "builtins.compile",
-            "builtins.__import__",
-            "compile",
-            "eval",
-            "exec",
-            "nt.system",
-            "os.system",
-            "posix.system",
-            "runpy.run_module",
-            "socket",
-            "subprocess",
-            "urllib",
-            "urllib2",
-            "urllib3",
-            "webbrowser",
-        }
-        malicious_import_prefixes = (
-            "asyncio.subprocess.",
-            "os.",
-            "subprocess.",
-            "socket.",
-            "urllib.",
-            "urllib2.",
-            "urllib3.",
-            "webbrowser.",
-        )
-
-        found_imports = set()
-        found_malicious = set()
-
-        # Extract GLOBAL opcodes from ALL checks (both passed and failed)
-        # This is important because legitimate imports are recorded as passed checks
-        all_checks = pickle_result.issues + getattr(pickle_result, "checks", [])
-        for check in all_checks:
-            check_details = check.details or {}
-            if "import_reference" in check_details:
-                imp = check_details["import_reference"]
-                found_imports.add(imp)
-                # Check if this is a malicious import
-                if imp in malicious_imports or any(imp.startswith(prefix) for prefix in malicious_import_prefixes):
-                    found_malicious.add(imp)
-
-        # Determine if all imports are legitimate
-        all_legitimate = bool(found_imports) and all(imp in legitimate_imports for imp in found_imports)
-
-        return {
-            "total_imports": len(found_imports),
-            "all_legitimate": all_legitimate,
-            "found_malicious": list(found_malicious),
-            "found_imports": list(found_imports),
-        }
-
-    def _add_weights_only_safety_warnings(
-        self, pickle_result: ScanResult, pytorch_result: ScanResult, model_path: str, pickle_name: str
-    ) -> None:
-        """Add CVE-2025-32434 specific warnings with context-aware severity"""
-
-        # Check for SafeTensors availability
-        has_safetensors = self._check_safetensors_available(model_path)
-
-        # Analyze imports to distinguish legitimate vs malicious
-        import_analysis = self._analyze_pickle_imports(pickle_result)
-
-        # Check if the pickle scan found any dangerous opcodes
-        opcode_counts = self._pickle_code_execution_opcode_counts(pickle_result)
-        dangerous_opcodes_found = list(opcode_counts)
-        code_execution_risks = [risk for opcode, risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS if opcode in opcode_counts]
-        nested_execution_opcode_evidence = self._has_nested_pickle_execution_opcode_evidence(pickle_result)
-        nested_execution_rule_code = next(
-            (
-                issue.rule_code
-                for issue in pickle_result.issues
-                if (issue.details or {}).get("nested_has_execution_opcode") is True and issue.rule_code is not None
-            ),
-            None,
-        )
-        if nested_execution_opcode_evidence:
-            code_execution_risks.append("Nested pickle code execution opcodes")
-
-        # Analyze the pickle scan results for dangerous patterns
-        for issue in pickle_result.issues:
-            issue_msg = issue.message.lower()
-
-            # Look for any code execution patterns
-            if any(pattern in issue_msg for pattern in ["exec", "eval", "import", "subprocess", "__import__"]):
-                code_execution_risks.append("Direct code execution patterns")
-
-        # If dangerous opcodes were found, determine appropriate severity
-        if dangerous_opcodes_found or code_execution_risks:
-            # Determine severity based on context
-            if import_analysis["found_malicious"]:
-                # Malicious imports found - this is CRITICAL
-                severity = IssueSeverity.CRITICAL
-                message_prefix = "CRITICAL: Malicious code detected"
-                recommendation = (
-                    "DO NOT USE THIS MODEL - it contains malicious imports "
-                    f"({', '.join(import_analysis['found_malicious'])}). "
-                    "This is likely a supply chain attack."
-                )
-            elif has_safetensors and import_analysis["all_legitimate"]:
-                # Legitimate opcodes using safe ML framework functions - this is INFO
-                severity = IssueSeverity.INFO
-                message_prefix = "Pickle serialization with safe ML framework operations (SafeTensors available)"
-                # Handle all supported PyTorch extensions (.pt, .pth, .bin)
-                base_name = os.path.splitext(os.path.basename(model_path))[0]
-                safetensors_name = f"{base_name}.safetensors"
-                recommendation = (
-                    f"This model uses pickle format with legitimate ML framework operations. "
-                    f"All REDUCE opcodes call safe functions from allowlisted ML frameworks. "
-                    f"A safer SafeTensors version is available: {safetensors_name}. "
-                    f"While current operations are safe, consider using SafeTensors for defense-in-depth "
-                    f"(protects against environment tampering/supply chain attacks)."
-                )
-            elif import_analysis["all_legitimate"]:
-                # Legitimate opcodes but no SafeTensors - this is INFO with recommendation
-                severity = IssueSeverity.INFO
-                message_prefix = "Pickle serialization format detected"
-                recommendation = (
-                    "This model uses pickle serialization format which allows code execution by design "
-                    "(CVE-2025-32434). While the current opcodes appear legitimate, consider requesting "
-                    "a SafeTensors version from the publisher for improved supply chain security."
-                )
-            else:
-                # Suspicious but not definitively malicious - this is WARNING
-                severity = IssueSeverity.WARNING
-                message_prefix = "Suspicious patterns detected"
-                recommendation = (
-                    "Model contains unusual pickle patterns that require manual review. "
-                    "Consider using SafeTensors format or verifying model source before deployment."
-                )
-
-            # Create opcode summary for evidence
-            opcode_summary = ", ".join(f"{op}({count})" for op, count in opcode_counts.items())
-            evidence_summary = (
-                f"{opcode_summary} opcodes detected"
-                if opcode_summary
-                else (
-                    "nested pickle code-execution opcodes detected"
-                    if nested_execution_opcode_evidence
-                    else "code-execution patterns detected without attributable opcode metadata"
-                )
-            )
-
-            pytorch_result.add_check(
-                name="CVE-2025-32434 Pickle Format Security Analysis",
-                passed=False,
-                message=f"{message_prefix}: {evidence_summary}",
-                severity=severity,
-                location=f"{model_path}:{pickle_name}",
-                details={
-                    "cve_id": self.CVE_2025_32434_ID,
-                    "pickle_filename": pickle_name,
-                    "opcode_counts": opcode_counts,
-                    "total_dangerous_opcodes": sum(opcode_counts.values()),
-                    "unique_opcode_types": dangerous_opcodes_found,
-                    "code_execution_risks": list(set(code_execution_risks)),
-                    "nested_execution_opcode_evidence": nested_execution_opcode_evidence,
-                    "import_analysis": import_analysis,
-                    "safetensors_available": has_safetensors,
-                    "assessment": (
-                        "malicious"
-                        if import_analysis["found_malicious"]
-                        else ("legitimate_but_risky_format" if import_analysis["all_legitimate"] else "suspicious")
-                    ),
-                    "vulnerability_description": (
-                        "The weights_only=True parameter in torch.load() does not prevent code execution "
-                        "from pickle files, contrary to common security assumptions."
-                    ),
-                    "recommendation": recommendation,
-                    "affected_pytorch_versions": "All versions ≤2.5.1",
-                    "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
-                },
-                rule_code=nested_execution_rule_code
-                if not opcode_counts and nested_execution_opcode_evidence
-                else None,
-            )
-
-        else:
-            # No dangerous opcodes found - add informational check
-            pytorch_result.add_check(
-                name="CVE-2025-32434 Pickle Format Security Analysis",
-                passed=True,
-                message=(
-                    f"No dangerous pickle opcodes detected in {pickle_name}. However, pickle format "
-                    f"should not be relied upon for security with untrusted models."
-                ),
-                severity=IssueSeverity.INFO,
-                location=f"{model_path}:{pickle_name}",
-                details={
-                    "cve_id": self.CVE_2025_32434_ID,
-                    "pickle_filename": pickle_name,
-                    "dangerous_opcodes_found": False,
-                    "safetensors_available": has_safetensors,
-                    "recommendation": (
-                        "Use SafeTensors format for better security. "
-                        + (
-                            "A SafeTensors version is available in the same directory."
-                            if has_safetensors
-                            else "Consider requesting a SafeTensors version from the publisher."
-                        )
-                    ),
-                },
-            )
-
-    @staticmethod
-    def _has_nested_pickle_execution_opcode_evidence(pickle_result: ScanResult) -> bool:
-        return any((issue.details or {}).get("nested_has_execution_opcode") is True for issue in pickle_result.issues)
-
-    @staticmethod
-    def _metadata_pickle_opcode_count(opcode: str, *raw_count_maps: object) -> int | None:
-        total = 0
-        found = False
-        for raw_counts in raw_count_maps:
-            if not isinstance(raw_counts, dict):
-                continue
-            for key, value in raw_counts.items():
-                if (
-                    isinstance(key, str)
-                    and key.upper() == opcode
-                    and isinstance(value, int)
-                    and not isinstance(value, bool)
-                    and value > 0
-                ):
-                    total += value
-                    found = True
-        return total if found else None
-
-    @classmethod
-    def _pickle_code_execution_opcode_counts(cls, pickle_result: ScanResult) -> dict[str, int]:
-        """Return exact counts for dangerous opcode types backed by findings."""
-        evidence_counts: dict[str, int] = {}
-        supporting_evidence_counts: dict[str, int] = {}
-        raw_metadata_counts = pickle_result.metadata.get("opcode_counts")
-        raw_nested_counts = pickle_result.metadata.get("nested_opcode_counts")
-        raw_follow_on_counts = pickle_result.metadata.get("follow_on_opcode_counts")
-        has_metadata_build = (
-            cls._metadata_pickle_opcode_count(
-                "BUILD",
-                raw_metadata_counts,
-                raw_nested_counts,
-                raw_follow_on_counts,
-            )
-            is not None
-        )
-        for issue in pickle_result.issues:
-            issue_details = issue.details or {}
-            target_counts = (
-                supporting_evidence_counts if issue_details.get("supporting_rule_code") is True else evidence_counts
-            )
-            for opcode, _risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS:
-                count = cls._issue_pickle_opcode_count(issue.message, issue_details, opcode)
-                if count > 0:
-                    target_counts[opcode] = target_counts.get(opcode, 0) + count
-
-            if issue.rule_code == "S207" and has_metadata_build:
-                target_counts.setdefault("BUILD", 1)
-
-        for opcode, count in supporting_evidence_counts.items():
-            evidence_counts.setdefault(opcode, count)
-
-        issue_import_references: set[str] = set()
-        for issue in pickle_result.issues:
-            issue_details = issue.details or {}
-            for reference_key in (
-                "import_reference",
-                "invocation_import_reference",
-                "opener_import_reference",
-                "writer_import_reference",
-            ):
-                import_reference = issue_details.get(reference_key)
-                if isinstance(import_reference, str) and import_reference:
-                    issue_import_references.add(import_reference)
-
-        raw_callable_invocations = pickle_result.metadata.get("callable_invocations")
-        if issue_import_references and isinstance(raw_callable_invocations, list):
-            dangerous_opcodes = {opcode for opcode, _risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS}
-            for invocation in raw_callable_invocations:
-                if not isinstance(invocation, dict):
-                    continue
-                invocation_reference = invocation.get("import_reference")
-                if invocation_reference not in issue_import_references:
-                    continue
-                invocation_opcode = invocation.get("opcode")
-                if isinstance(invocation_opcode, str) and invocation_opcode.upper() in dangerous_opcodes:
-                    evidence_counts.setdefault(invocation_opcode.upper(), 1)
-
-        if cls._has_nested_pickle_execution_opcode_evidence(pickle_result):
-            for opcode, _risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS:
-                if opcode not in _PICKLE_NESTED_EXECUTION_OPCODES:
-                    continue
-                metadata_count = cls._metadata_pickle_opcode_count(opcode, raw_nested_counts)
-                if metadata_count is not None:
-                    evidence_counts.setdefault(opcode, metadata_count)
-
-        opcode_counts: dict[str, int] = {}
-        for opcode, evidence_count in evidence_counts.items():
-            metadata_count = cls._metadata_pickle_opcode_count(
-                opcode,
-                raw_metadata_counts,
-                raw_nested_counts,
-                raw_follow_on_counts,
-            )
-            opcode_counts[opcode] = metadata_count if metadata_count is not None else evidence_count
-        return opcode_counts
-
-    @staticmethod
-    def _issue_pickle_opcode_count(issue_message: str, issue_details: dict[str, Any], opcode: str) -> int:
-        """Read structured opcode evidence, with a narrow legacy-message fallback."""
-        has_structured_evidence = False
-
-        raw_opcode_counts = issue_details.get("opcode_counts")
-        if isinstance(raw_opcode_counts, dict):
-            for key, value in raw_opcode_counts.items():
-                if not isinstance(key, str) or not key:
-                    continue
-                has_structured_evidence = True
-                if key.upper() == opcode and isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                    return value
-
-        for key in ("opcode", "opcode_name"):
-            value = issue_details.get(key)
-            if isinstance(value, str) and value:
-                has_structured_evidence = True
-                if value.upper() == opcode:
-                    return 1
-
-        raw_opcodes = issue_details.get("opcodes")
-        if isinstance(raw_opcodes, (list, tuple, set)):
-            opcode_values = [value for value in raw_opcodes if isinstance(value, str) and value]
-            has_structured_evidence = has_structured_evidence or bool(opcode_values)
-            count = sum(value.upper() == opcode for value in opcode_values)
-            if count > 0:
-                return count
-
-        if has_structured_evidence:
-            return 0
-
-        escaped_opcode = re.escape(opcode)
-        explicit_opcode_pattern = (
-            rf"(?<![A-Z0-9_])(?:{escaped_opcode}\s+OPCODES?|OPCODES?\s*[:=]?\s*{escaped_opcode})(?![A-Z0-9_])"
-        )
-        return int(re.search(explicit_opcode_pattern, issue_message.upper()) is not None)
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract PyTorch ZIP (torch.save format) metadata."""
