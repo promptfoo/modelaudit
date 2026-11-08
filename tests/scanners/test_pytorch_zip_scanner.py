@@ -1048,6 +1048,33 @@ def _forbid_torch_import(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return import_calls
 
 
+def _scan_pytorch_zip_with_binary_payload(zip_path: Path, payload: bytes) -> ScanResult:
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    return PyTorchZipScanner().scan(str(zip_path))
+
+
+_SCAN_AND_UNPICKLE_REPORT_SCRIPT = (
+    "print(json.dumps({\n"
+    "    'success': result.success,\n"
+    "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
+    "    'marker_before_unpickle': marker_before_unpickle,\n"
+    "    'marker_after_unpickle': marker.exists(),\n"
+    "    'issues': [\n"
+    "        {\n"
+    "            'rule_code': issue.rule_code,\n"
+    "            'severity': issue.severity.value,\n"
+    "            'import_reference': (issue.details or {}).get('import_reference'),\n"
+    "        }\n"
+    "        for issue in result.issues\n"
+    "    ],\n"
+    "}))\n"
+)
+
+
 def test_pytorch_zip_scanner_can_handle(tmp_path):
     """Test the can_handle method of PyTorchZipScanner."""
     # Test with actual PyTorch file
@@ -1260,21 +1287,8 @@ def test_pytorch_zip_warns_when_trusted_framework_reference_is_rebound_before_sc
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
@@ -1307,21 +1321,8 @@ def test_pytorch_zip_warns_when_framework_metadata_rebound_to_buildable_instance
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
@@ -1346,21 +1347,8 @@ def test_pytorch_zip_warns_when_unloaded_source_backed_metadata_import_is_not_in
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
@@ -1385,21 +1373,8 @@ def test_pytorch_zip_warns_when_source_backed_framework_reference_is_unloaded_be
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
@@ -1672,21 +1647,8 @@ def test_pytorch_zip_warns_when_rebound_framework_class_uses_descriptor_new_befo
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
@@ -1722,21 +1684,8 @@ def test_pytorch_zip_warns_when_rebound_framework_class_uses_data_descriptor_bef
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
@@ -1773,21 +1722,8 @@ def test_pytorch_zip_warns_when_rebound_framework_class_uses_metaclass_call_befo
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
@@ -1824,21 +1760,8 @@ def test_pytorch_zip_warns_when_rebound_framework_function_forges_trusted_filena
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     completed = subprocess.run(
         [sys.executable, "-c", script, str(model_path), str(marker)],
@@ -1884,21 +1807,8 @@ def test_pytorch_zip_warns_when_framework_metadata_rebound_to_cross_module_sourc
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
@@ -1930,21 +1840,8 @@ def test_pytorch_zip_warns_when_framework_function_default_mutated_before_scanne
         "marker_before_unpickle = marker.exists()\n"
         "with zipfile.ZipFile(model_path) as zip_file:\n"
         "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
-        "print(json.dumps({\n"
-        "    'success': result.success,\n"
-        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
-        "    'marker_before_unpickle': marker_before_unpickle,\n"
-        "    'marker_after_unpickle': marker.exists(),\n"
-        "    'issues': [\n"
-        "        {\n"
-        "            'rule_code': issue.rule_code,\n"
-        "            'severity': issue.severity.value,\n"
-        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
-        "        }\n"
-        "        for issue in result.issues\n"
-        "    ],\n"
-        "}))\n"
     )
+    script += _SCAN_AND_UNPICKLE_REPORT_SCRIPT
 
     _assert_rebound_framework_subprocess(
         tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
@@ -10833,12 +10730,7 @@ def test_pytorch_zip_preserves_secret_bearing_jit_code_snippets(tmp_path: Path) 
         os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
         return eval("1 + 1")
     """.encode()
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     serialized = result.to_json()
     jit_failures = [
@@ -11012,12 +10904,7 @@ def test_pytorch_zip_scans_asyncio_subprocess_launch_source_conservatively(tmp_p
 )
 def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Path, payload: bytes) -> None:
     zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     jit_failures = [
         check
@@ -11054,12 +10941,7 @@ def test_pytorch_zip_scans_late_continued_runpy_alias_in_archive_data(tmp_path: 
     import_line = b"import runpy as rp\n" if call.startswith(b"rp ") else b"from runpy import run_path as runner\n"
     payload = b"\x00\xff" + leading_blocks + import_line + padding
     payload += call + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11084,12 +10966,7 @@ def test_pytorch_zip_preserves_visible_safe_rebind_before_late_continued_alias_c
     padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
     payload = b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n" + padding
     payload += b"runner = print\n" + call + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11130,12 +11007,7 @@ def test_pytorch_zip_scans_late_derived_runpy_alias_in_archive_data(
     padding_line = b"# pad\n"
     padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
     payload = b"\x00\xff" + leading_blocks + b"import runpy as rp\n" + padding + late_bindings + call + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11155,12 +11027,7 @@ def test_pytorch_zip_scans_long_late_derived_runpy_alias_chain_with_bounded_repl
         f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000)
     )
     payload = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_1999)('payload.py')\n" + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11195,12 +11062,7 @@ def test_pytorch_zip_detects_long_explicit_runpy_dunder_call_with_bounded_replay
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = b"\x00\xff" + priority_import + padding + call_line + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11220,12 +11082,7 @@ def test_pytorch_zip_ignores_long_passive_runpy_reference_chain_with_bounded_rep
         f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000)
     )
     payload = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_1999)('safe')\n" + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11256,12 +11113,7 @@ def test_pytorch_zip_preserves_multiline_safe_rebind_before_late_parenthesized_a
         + b"(runner)('safe')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11290,12 +11142,7 @@ def test_pytorch_zip_scans_parenthesized_runpy_alias_after_passive_member_budget
         + b"((rp).run_path)('payload.py')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11321,12 +11168,7 @@ def test_pytorch_zip_preserves_safe_member_overwrite_after_passive_alias_members
         + b"((rp).run_path)('safe')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11359,12 +11201,7 @@ def test_pytorch_zip_handles_constant_guarded_late_runpy_alias_binding(
     if b"original" in late_state:
         prefix += b"original = runner\nrunner = print\n"
     payload = prefix + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
     has_dynamic_failure = any(
         check.name == "JIT/Script Code Execution Detection"
         and check.status == CheckStatus.FAILED
@@ -11382,12 +11219,7 @@ def test_pytorch_zip_preserves_definite_late_runpy_alias_shadow(tmp_path: Path, 
     padding_line = b"# pad\n"
     padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
     payload = b"\x00\xfffrom runpy import run_path as runner\n" + padding + shadow + b"(runner)('safe')\n" + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11417,12 +11249,7 @@ def test_pytorch_zip_detects_compound_late_runpy_alias_restore(tmp_path: Path, r
         + b"(runner)('payload.py')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11457,12 +11284,7 @@ def test_pytorch_zip_preserves_definitely_safe_late_conditional_alias_state(tmp_
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = b"\x00\xffimport runpy as rp\nfrom runpy import run_path as runner\n" + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11530,12 +11352,7 @@ def test_pytorch_zip_detects_retained_alias_after_raising_late_with_shadow(tmp_p
         b"except RuntimeError:\n    pass\n(runner)('payload.py')\n"
     )
     payload = b"\x00\xfffrom runpy import run_path as runner\n" + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -11642,12 +11459,7 @@ def test_pytorch_zip_preserves_safe_boolean_fallback_after_builtin_restore(
         b"vars(builtins)['print'] = False\nvars(builtins).update({'print': original})\n"
     )
     payload = b"\x00\xff" + prefix + padding + state + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -12102,12 +11914,7 @@ def test_pytorch_zip_preserves_safe_late_typed_member_overwrite(
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = b"\x00\xff" + prefix + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -13319,12 +13126,7 @@ def test_pytorch_zip_detects_typed_member_restore_after_state_overflow(tmp_path:
         + b"opener = wb.open\nopener('https://example.invalid')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -13358,12 +13160,7 @@ def test_pytorch_zip_preserves_late_rule_identity_beyond_replay_budget(
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     bindings = initial_binding + b"".join(f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000))
     payload = b"\x00\xff" + prefix + padding + bindings + endpoint + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     relevant = [
         check
@@ -14171,12 +13968,7 @@ def test_pytorch_zip_preserves_latest_late_runpy_member_state(
         + b"((rp).run_path)('payload.py')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
     has_dynamic_failure = any(
         check.name == "JIT/Script Code Execution Detection"
         and check.status == CheckStatus.FAILED
@@ -14368,12 +14160,7 @@ def test_pytorch_zip_detects_possible_late_runpy_member_restore(
         + call_line
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14393,12 +14180,7 @@ def test_pytorch_zip_preserves_postponed_late_annotated_runpy_restore(tmp_path: 
         + b"original = rp.run_path\nrp.run_path = print\nharmless = None\n"
         + b"field: setattr(rp, 'run_path', original) = harmless\nrp.run_path('safe')\n"
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14430,12 +14212,7 @@ def test_pytorch_zip_preserves_noncanonical_postponed_late_annotated_runpy_resto
         + b"original = rp.run_path\nrp.run_path = print\nharmless = None\n"
         + b"field: setattr(rp, 'run_path', original) = harmless\nrp.run_path('safe')\n"
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14466,12 +14243,7 @@ def test_pytorch_zip_detects_noncanonical_postponed_late_annotated_runpy_mutatio
         + padding
         + b"field: setattr(rp, 'run_path', print) = None\nrp.run_path('payload.py')\n"
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14506,12 +14278,7 @@ def test_pytorch_zip_detects_saved_builtin_helper_runpy_action_across_padding(
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = b"\x00\xffimport runpy as rp\n" + prefix_state + padding + tail_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14530,12 +14297,7 @@ def test_pytorch_zip_detects_tail_framed_runpy_member_restore_with_prefix_contex
         + filler
         + b"\x00\xffrp.run_path = original\n\x00\xff((rp).run_path)('payload.py')\n"
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14558,12 +14320,7 @@ def test_pytorch_zip_detects_deep_folded_framed_runpy_getattr_without_recursion(
         + b")('payload.py')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14586,12 +14343,7 @@ def test_pytorch_zip_detects_deep_nested_inert_forwarding_suffix_without_recursi
         + b"\n(runner)('payload.py')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14614,12 +14366,7 @@ def test_pytorch_zip_detects_late_runpy_call_after_unreachable_member_overwrite(
         + b"rp.run_path('payload.py')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14645,12 +14392,7 @@ def test_pytorch_zip_ignores_shadowed_dict_update_before_dangerous_runpy_call(
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = b"\x00\xffimport runpy as rp\n" + padding + shadow_state + b"((rp).run_path)('payload.py')\n" + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14669,12 +14411,7 @@ def test_pytorch_zip_ignores_shadowed_getattr_execution_endpoint(tmp_path: Path,
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = b"\x00\xffimport runpy as rp\n" + padding + b"getattr = lambda obj, name: print\n" + call_line + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14695,12 +14432,7 @@ def test_pytorch_zip_preserves_forwarded_late_runpy_class_shadow(tmp_path: Path)
         + b"runner = rp.run_path\nclass runner:\n    pass\nforward = runner\n(forward)('safe')\n"
         + padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14733,12 +14465,7 @@ def test_pytorch_zip_scans_parenthesized_runpy_alias_across_retained_boundary(tm
         + b"(\n runner\n)('payload.py')\n"
         + trailing_padding
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14765,12 +14492,7 @@ def test_pytorch_zip_scans_webbrowser_and_ctypes_execution_in_archive_data(tmp_p
         b"    return loader.msvcrt.printf(b'x')\n"
         b"\x00MODEL-FRAMING"
     )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     matching_failures = [
         check
@@ -14798,12 +14520,7 @@ def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tm
 def test_pytorch_zip_ignores_framed_runpy_call_inside_multiline_literal(tmp_path: Path) -> None:
     zip_path = tmp_path / "model.pt"
     payload = b"\x00\xffimport runpy as rp\npayload = '''\n\x00\xff((rp).run_path)('safe')\n'''\n"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -14849,12 +14566,7 @@ def test_pytorch_zip_ignores_string_literal_asyncio_subprocess_launch_with_unrel
 )
 def test_pytorch_zip_ignores_uninvoked_os_process_reference_with_unrelated_risk(tmp_path: Path, payload: bytes) -> None:
     zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
@@ -19724,12 +19436,7 @@ def _assert_pytorch_late_typed_rule(tmp_path: Path, prefix: bytes, late_state: b
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = b"\x00\xff" + prefix + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -19891,12 +19598,7 @@ def _assert_headerless_byte_near_match(tmp_path: Path, filename: str, payload: b
 
 def _assert_conservative_process_source(tmp_path: Path, payload: bytes, pattern: str) -> None:
     zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     jit_failures = [
         check
@@ -19926,12 +19628,7 @@ def _assert_forwarded_native_load(tmp_path: Path, prefix: bytes, suffix: bytes) 
     zip_path = tmp_path / "model.pt"
     padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
     payload = prefix + padding + suffix + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert any(
         check.name == "JIT/Script Code Execution Detection"
@@ -20030,12 +19727,7 @@ def _assert_inexact_torchscript_pair(tmp_path: Path, filename: str, case_source_
 def _assert_framed_pickle_without_pattern(tmp_path: Path, payload_source: bytes, pattern: str) -> None:
     zip_path = tmp_path / "model.pt"
     payload = payload_source
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
+    result = _scan_pytorch_zip_with_binary_payload(zip_path, payload)
 
     assert not any(
         check.name == "JIT/Script Code Execution Detection"
