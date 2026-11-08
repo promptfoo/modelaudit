@@ -42,7 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Recognize declaration-only compiler output in legacy TorchScript ZIP archives when scanning for embedded Python code.
 - Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
 - Report completed scans as successful in the Python API even when a security check raises a warning.
@@ -96,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
 - Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit. Continue supplemental stream checks after call-graph coverage gaps, and keep operational failures unsuccessful even with trusted padding.
 - Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
+- Recognize declaration-only compiler output in legacy TorchScript ZIP archives when scanning for embedded Python code.
 - Make the nested archive test fixture portable to Windows.
 
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
