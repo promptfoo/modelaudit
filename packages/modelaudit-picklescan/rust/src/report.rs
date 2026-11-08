@@ -1,6 +1,7 @@
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use std::borrow::Cow;
 
 #[derive(Clone)]
 pub(crate) enum DetailValue {
@@ -15,9 +16,9 @@ pub(crate) enum DetailValue {
 }
 
 impl DetailValue {
-    pub(crate) fn to_py_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn to_py_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self {
-            DetailValue::String(value) => value.clone().into_py_any(py),
+            DetailValue::String(value) => value.into_py_any(py),
             DetailValue::Int(value) => (*value).into_py_any(py),
             DetailValue::UInt(value) => (*value).into_py_any(py),
             DetailValue::Float(value) => (*value).into_py_any(py),
@@ -30,17 +31,18 @@ impl DetailValue {
                 }
                 Ok(list.into_any().unbind())
             }
-            DetailValue::Dict(values) => Ok(detail_dict_to_py(py, values)?.into_any()),
+            DetailValue::Dict(values) => Ok(detail_dict_to_py(py, values)?.into_any().unbind()),
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, IntoPyObjectRef)]
 pub(crate) struct Finding {
     pub(crate) message: String,
     pub(crate) severity: &'static str,
     pub(crate) location: Option<String>,
     pub(crate) rule_code: Option<&'static str>,
+    #[pyo3(into_py_with = detail_field_to_py)]
     pub(crate) details: Vec<(String, DetailValue)>,
     pub(crate) why: Option<&'static str>,
 }
@@ -51,25 +53,15 @@ impl Finding {
     pub(crate) fn dedupe_key(&self) -> FindingDedupeKey {
         (self.message.clone(), self.location.clone(), self.rule_code)
     }
-
-    pub(crate) fn to_py_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("message", &self.message)?;
-        dict.set_item("severity", self.severity)?;
-        dict.set_item("location", self.location.clone())?;
-        dict.set_item("rule_code", self.rule_code)?;
-        dict.set_item("details", detail_dict_to_py(py, &self.details)?)?;
-        dict.set_item("why", self.why)?;
-        Ok(dict.into_any().unbind())
-    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, IntoPyObjectRef)]
 pub(crate) struct Notice {
     pub(crate) message: String,
     pub(crate) severity: &'static str,
     pub(crate) location: Option<String>,
     pub(crate) code: Option<&'static str>,
+    #[pyo3(into_py_with = detail_field_to_py)]
     pub(crate) details: Vec<(String, DetailValue)>,
 }
 
@@ -79,37 +71,16 @@ impl Notice {
     pub(crate) fn dedupe_key(&self) -> NoticeDedupeKey {
         (self.code, self.location.clone(), self.message.clone())
     }
-
-    pub(crate) fn to_py_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("message", &self.message)?;
-        dict.set_item("severity", self.severity)?;
-        dict.set_item("location", self.location.clone())?;
-        dict.set_item("code", self.code)?;
-        dict.set_item("details", detail_dict_to_py(py, &self.details)?)?;
-        Ok(dict.into_any().unbind())
-    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, IntoPyObjectRef)]
 pub(crate) struct ScanError {
     pub(crate) message: String,
     pub(crate) category: &'static str,
     pub(crate) location: Option<String>,
     pub(crate) exception_type: Option<&'static str>,
+    #[pyo3(into_py_with = detail_field_to_py)]
     pub(crate) details: Vec<(String, DetailValue)>,
-}
-
-impl ScanError {
-    pub(crate) fn to_py_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("message", &self.message)?;
-        dict.set_item("category", self.category)?;
-        dict.set_item("location", self.location.clone())?;
-        dict.set_item("exception_type", self.exception_type)?;
-        dict.set_item("details", detail_dict_to_py(py, &self.details)?)?;
-        Ok(dict.into_any().unbind())
-    }
 }
 
 pub(crate) fn detail_string(details: &[(String, DetailValue)], key: &str) -> Option<String> {
@@ -136,76 +107,49 @@ pub(crate) fn detail_usize(details: &[(String, DetailValue)], key: &str) -> Opti
     })
 }
 
-pub(crate) fn scan_error_to_detail_value(error: &ScanError) -> DetailValue {
+pub(crate) fn text_field(key: &str, value: Option<impl Into<String>>) -> (String, DetailValue) {
+    (
+        key.to_string(),
+        value.map_or(DetailValue::None, |s| DetailValue::String(s.into())),
+    )
+}
+
+pub(crate) fn scan_error_to_detail_value(error: ScanError) -> DetailValue {
     DetailValue::Dict(vec![
-        (
-            "message".to_string(),
-            DetailValue::String(error.message.clone()),
-        ),
-        (
-            "category".to_string(),
-            DetailValue::String(error.category.to_string()),
-        ),
-        (
-            "location".to_string(),
-            error
-                .location
-                .clone()
-                .map(DetailValue::String)
-                .unwrap_or(DetailValue::None),
-        ),
-        (
-            "exception_type".to_string(),
-            error
-                .exception_type
-                .map(|value| DetailValue::String(value.to_string()))
-                .unwrap_or(DetailValue::None),
-        ),
-        (
-            "details".to_string(),
-            DetailValue::Dict(error.details.clone()),
-        ),
+        text_field("message", Some(error.message)),
+        text_field("category", Some(error.category)),
+        text_field("location", error.location),
+        text_field("exception_type", error.exception_type),
+        ("details".to_string(), DetailValue::Dict(error.details)),
     ])
 }
 
-pub(crate) fn notice_to_detail_value(notice: &Notice) -> DetailValue {
+pub(crate) fn notice_to_detail_value(notice: Notice) -> DetailValue {
     DetailValue::Dict(vec![
-        (
-            "message".to_string(),
-            DetailValue::String(notice.message.clone()),
-        ),
-        (
-            "severity".to_string(),
-            DetailValue::String(notice.severity.to_string()),
-        ),
-        (
-            "location".to_string(),
-            notice
-                .location
-                .clone()
-                .map(DetailValue::String)
-                .unwrap_or(DetailValue::None),
-        ),
-        (
-            "code".to_string(),
-            notice
-                .code
-                .map(|value| DetailValue::String(value.to_string()))
-                .unwrap_or(DetailValue::None),
-        ),
-        (
-            "details".to_string(),
-            DetailValue::Dict(notice.details.clone()),
-        ),
+        text_field("message", Some(notice.message)),
+        text_field("severity", Some(notice.severity)),
+        text_field("location", notice.location),
+        text_field("code", notice.code),
+        ("details".to_string(), DetailValue::Dict(notice.details)),
     ])
 }
 
-fn detail_dict_to_py(py: Python<'_>, details: &[(String, DetailValue)]) -> PyResult<Py<PyDict>> {
+fn detail_field_to_py<'py>(
+    details: Cow<'_, [(String, DetailValue)]>,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    Ok(detail_dict_to_py(py, &details)?.into_any())
+}
+
+pub(crate) fn detail_dict_to_py<'py>(
+    py: Python<'py>,
+    details: &[(String, DetailValue)],
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     for (key, value) in details {
         dict.set_item(key, value.to_py_object(py)?)?;
     }
-    Ok(dict.unbind())
+    Ok(dict)
 }
 
 #[cfg(test)]
@@ -250,7 +194,7 @@ mod tests {
             details: vec![("position".to_string(), DetailValue::UInt(3))],
         };
 
-        match notice_to_detail_value(&notice) {
+        match notice_to_detail_value(notice) {
             DetailValue::Dict(details) => {
                 assert_eq!(
                     detail_string(&details, "message").as_deref(),
@@ -263,7 +207,7 @@ mod tests {
             }
             _ => panic!("notice detail should be a dict"),
         }
-        match scan_error_to_detail_value(&error) {
+        match scan_error_to_detail_value(error) {
             DetailValue::Dict(details) => {
                 assert_eq!(
                     detail_string(&details, "message").as_deref(),

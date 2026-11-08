@@ -40,6 +40,11 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
 )
 _NESTED_PAYLOAD_NOTICE_CODES = frozenset({"nested_payload_detected", "encoded_nested_payload_detected"})
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
+_PARSE_FAILURE_METADATA = {
+    "file_type": "pickle",
+    "parsing_failed": True,
+    "failure_reason": "unknown_opcode_or_format_error",
+}
 _CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY = "call_graph_source_fingerprints"
 _IMPORT_MODULE_ALIASES = {
     "nt": "os",
@@ -50,24 +55,10 @@ _LEGACY_NOTICE_RULE_CODES = {
     "nested_payload_detected": "S213",
 }
 _LEGACY_SCAN_OUTCOME_REASONS = {
-    "encoded_nested_payload_truncated": "encoded_nested_payload_truncated",
-    "literal_scan_truncated": "literal_scan_truncated",
-    "nested_payload_truncated": "nested_payload_truncated",
-    "nested_probe_limit": "nested_probe_limit",
-    "nested_pickle_incomplete": "nested_pickle_incomplete",
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
-    "known_stream_truncated": "known_stream_truncated",
     "buffer_opcode": "protocol5_external_buffer_context",
-    "import_references_truncated": "import_references_truncated",
-    "callable_invocations_truncated": "callable_invocations_truncated",
     "timeout": "scan_timeout",
-    "unbounded_stream_truncated": "unbounded_stream_truncated",
-    "url_scan_limit_exceeded": "url_scan_limit_exceeded",
-    "url_context_proof_incomplete": "url_context_proof_incomplete",
-    "base64_text_scan_limit_exceeded": "base64_text_scan_limit_exceeded",
-    "base64_text_work_limit_exceeded": "base64_text_work_limit_exceeded",
-    "base64_text_alignment_ambiguous": "base64_text_alignment_ambiguous",
 }
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
@@ -235,9 +226,7 @@ def pickle_report_to_scan_result(
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
         result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
         result.metadata["analysis_incomplete"] = True
-        result.metadata["file_type"] = "pickle"
-        result.metadata["parsing_failed"] = True
-        result.metadata["failure_reason"] = "unknown_opcode_or_format_error"
+        result.metadata.update(_PARSE_FAILURE_METADATA)
 
     for finding in report.findings:
         details = _add_legacy_detail_aliases(
@@ -299,13 +288,7 @@ def pickle_report_to_scan_result(
                 "failure_reason": "unknown_opcode_or_format_error",
                 "analysis_incomplete": True,
             }
-            result.metadata.update(
-                {
-                    "file_type": "pickle",
-                    "parsing_failed": True,
-                    "failure_reason": "unknown_opcode_or_format_error",
-                }
-            )
+            result.metadata.update(_PARSE_FAILURE_METADATA)
             result.add_check(
                 name="Pickle Format Check",
                 passed=False,
@@ -371,15 +354,7 @@ def pickle_report_to_scan_result(
                 "category": error.category,
                 "exception_type": error.exception_type,
                 "analysis_incomplete": True,
-                **(
-                    {
-                        "file_type": "pickle",
-                        "parsing_failed": True,
-                        "failure_reason": "unknown_opcode_or_format_error",
-                    }
-                    if is_parse_error
-                    else {}
-                ),
+                **(_PARSE_FAILURE_METADATA if is_parse_error else {}),
                 **error.to_dict()["details"],
             },
             rule_code="S901" if is_parse_error else "S902",
@@ -463,15 +438,7 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
             return True
 
         if (
-            source_ext == ".joblib"
-            and "opcode b'" in exception_message
-            and exception_message.endswith(" unknown")
-            and _has_only_benign_serialization_tail_imports(report)
-        ):
-            return True
-
-        if (
-            source_ext in {".dill", ".bin"}
+            source_ext in {".joblib", ".dill", ".bin"}
             and "opcode b'" in exception_message
             and exception_message.endswith(" unknown")
             and _has_only_benign_serialization_tail_imports(report)
