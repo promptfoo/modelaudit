@@ -120,6 +120,7 @@ def test_docker_runtime_images_upgrade_vulnerable_debian_packages(dockerfile: st
         "mount",
         "perl-base",
         "util-linux",
+        "zlib1g",
     } <= upgraded_packages
 
 
