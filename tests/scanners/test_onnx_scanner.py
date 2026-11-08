@@ -7,6 +7,7 @@ import struct
 import sys
 import time
 import tracemalloc
+from collections.abc import Sequence
 from inspect import getclosurevars
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +30,13 @@ from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import onnx_scanner as onnx_scanner_module
-from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import (
+    FORMAT_VALIDATION_CONFIG_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanners.onnx_scanner import (
     ONNX_SCHEMA_INCONCLUSIVE_REASON,
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
@@ -152,11 +159,82 @@ def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
     assert result.success is False
 
 
-def _checked_onnx_model(graph: onnx.GraphProto) -> onnx.ModelProto:
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+def _onnx_model(graph: onnx.GraphProto, *, opset: int = 13, ir_version: int = 8) -> onnx.ModelProto:
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
+    model.ir_version = ir_version
+    return model
+
+
+def _local_function_model(
+    graph: onnx.GraphProto, functions: list[onnx.FunctionProto], *, opset: int = 13, ir_version: int = 8
+) -> onnx.ModelProto:
+    model = helper.make_model(
+        graph, functions=functions, opset_imports=[helper.make_opsetid("", opset), helper.make_opsetid("local", 1)]
+    )
+    model.ir_version = ir_version
+    return model
+
+
+def _checked_onnx_model(graph: onnx.GraphProto, *, opset: int = 13, ir_version: int = 8) -> onnx.ModelProto:
+    model = _onnx_model(graph, opset=opset, ir_version=ir_version)
     onnx.checker.check_model(model)
     return model
+
+
+def _float_state_loop_body(
+    nodes: list[onnx.NodeProto],
+    name: str,
+    *,
+    state_shape: Sequence[str | int | None] | None,
+    next_state_shape: Sequence[str | int | None] | None,
+    initializer: list[onnx.TensorProto] | None = None,
+) -> onnx.GraphProto:
+    return helper.make_graph(
+        nodes,
+        name,
+        [
+            helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+            helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("state", TensorProto.FLOAT, state_shape),
+        ],
+        [
+            helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("next_state", TensorProto.FLOAT, next_state_shape),
+        ],
+        initializer=initializer,
+    )
+
+
+def _balanced_if_graph(leaves: list[onnx.GraphProto]) -> tuple[onnx.GraphProto, int]:
+    """Build a binary If graph and count its generated condition inputs."""
+    condition_counter = 0
+
+    def combine_branches(branches: list[onnx.GraphProto]) -> onnx.GraphProto:
+        nonlocal condition_counter
+        if len(branches) == 1:
+            return branches[0]
+        midpoint = len(branches) // 2
+        left = combine_branches(branches[:midpoint])
+        right = combine_branches(branches[midpoint:])
+        condition_index = condition_counter
+        condition_counter += 1
+        output_name = f"branch_out_{condition_index}"
+        node = helper.make_node(
+            "If",
+            [f"C{condition_index}"],
+            [output_name],
+            then_branch=left,
+            else_branch=right,
+        )
+        return helper.make_graph(
+            [node],
+            f"branch_{condition_index}",
+            [],
+            [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, None)],
+        )
+
+    branch = combine_branches(leaves)
+    return branch, condition_counter
 
 
 def _save_onnx_model(model: onnx.ModelProto, path: Path) -> Path:
@@ -267,8 +345,7 @@ def create_onnx_weight_model(
         raise AssertionError(f"unsupported test operator: {op_type}")
 
     graph = helper.make_graph([node], "weighted_graph", [X], [Y], initializer=[weight_tensor])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+    model = _onnx_model(graph)
     return _save_onnx_model(model, tmp_path / filename)
 
 
@@ -621,13 +698,10 @@ def create_training_initializer_shadow_gap_model(tmp_path: Path) -> Path:
     )
     training_info = onnx.TrainingInfoProto()
     training_info.algorithm.CopyFrom(algorithm)
-    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+    model = _onnx_model(main_graph)
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
-    path = tmp_path / "training-initializer-shadow-gap.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "training-initializer-shadow-gap.onnx")
 
 
 def create_training_initialization_reset_model(tmp_path: Path) -> Path:
@@ -657,8 +731,7 @@ def create_training_initialization_reset_model(tmp_path: Path) -> Path:
     binding.key = "W"
     binding.value = "W_reset"
 
-    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+    model = _onnx_model(main_graph)
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
     return _save_onnx_model(model, tmp_path / "training-initialization-reset.onnx")
@@ -683,8 +756,7 @@ def create_read_only_main_initializer_training_model(tmp_path: Path) -> Path:
     )
     training_info = onnx.TrainingInfoProto()
     training_info.algorithm.CopyFrom(algorithm)
-    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+    model = _onnx_model(main_graph)
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
     return _save_onnx_model(model, tmp_path / "read-only-main-initializer-training.onnx")
@@ -748,8 +820,7 @@ def create_non_weight_training_update_model(
     binding = training_info.update_binding.add()
     binding.key = "state"
     binding.value = "state_new"
-    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", opset_version)])
-    model.ir_version = 8
+    model = _onnx_model(main_graph, opset=opset_version)
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
     return _save_onnx_model(model, tmp_path / f"non-weight-{op_type.lower()}-training-update.onnx")
@@ -786,8 +857,7 @@ def create_flat_training_initialization_reset_model(tmp_path: Path) -> Path:
     binding = training_info.initialization_binding.add()
     binding.key = "W"
     binding.value = "reset"
-    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+    model = _onnx_model(main_graph)
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
     return _save_onnx_model(model, tmp_path / "flat-training-initialization-reset.onnx")
@@ -829,9 +899,7 @@ def create_recurrent_weight_model(
         hidden_size=hidden_size,
     )
     graph = helper.make_graph([node], f"{op_type.lower()}_weight_graph", [X], [Y], initializer=initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
+    model = _checked_onnx_model(graph, opset=14)
     return _save_onnx_model(model, tmp_path / f"{op_type.lower()}-{target_input_index}-{distributed_near_match}.onnx")
 
 
@@ -980,9 +1048,7 @@ def create_recurrent_dynamic_weight_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(
         nodes, "recurrent_dynamic_weight_graph", [X, seed], [Y], initializer=[projection, recurrent]
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
+    model = _checked_onnx_model(graph, opset=14)
     return _save_onnx_model(model, tmp_path / "recurrent-dynamic-weight.onnx")
 
 
@@ -1125,8 +1191,7 @@ def create_invalid_initializer_name_model(tmp_path: Path, *, duplicate: bool) ->
     if duplicate:
         initializers.append(onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="W"))
     graph = helper.make_graph([node], "invalid_initializer_names", [X], [Y], initializer=initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+    model = _onnx_model(graph)
     return _save_onnx_model(
         model, tmp_path / ("duplicate-initializers.onnx" if duplicate else "empty-initializer.onnx")
     )
@@ -1787,10 +1852,8 @@ def create_onnx_model_with_nested_external_initializer(
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
         initializer=[condition],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / "nested_external.onnx"
-    onnx.save(model, str(path))
+    model = _onnx_model(graph)
+    path = _save_onnx_model(model, tmp_path / "nested_external.onnx")
 
     if not missing_external:
         external_file = tmp_path / external_path
@@ -1842,10 +1905,8 @@ def create_onnx_model_with_nested_external_sparse_initializer(
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
         initializer=[condition, input_value],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / "nested_sparse_external.onnx"
-    onnx.save(model, str(path))
+    model = _onnx_model(graph)
+    path = _save_onnx_model(model, tmp_path / "nested_sparse_external.onnx")
 
     if not missing_external:
         external_file = tmp_path / external_path
@@ -1904,10 +1965,8 @@ def create_onnx_model_with_nested_external_tensor_attribute(
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
         initializer=[condition, input_value],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / f"nested_{attribute_kind}_attribute_external.onnx"
-    onnx.save(model, str(path))
+    model = _onnx_model(graph)
+    path = _save_onnx_model(model, tmp_path / f"nested_{attribute_kind}_attribute_external.onnx")
 
     if not missing_external:
         external_file = tmp_path / external_path
@@ -1980,8 +2039,7 @@ def create_onnx_model_with_function_default_external_tensor_attribute(
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(function_domain, 1)],
     )
     model.ir_version = 9
-    path = tmp_path / f"function_default_{attribute_kind}_external.onnx"
-    onnx.save(model, str(path))
+    path = _save_onnx_model(model, tmp_path / f"function_default_{attribute_kind}_external.onnx")
 
     if not missing_external:
         external_file = tmp_path / external_path
@@ -2014,12 +2072,7 @@ def create_onnx_model_with_function_overload(
         [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
     )
-    model = helper.make_model(
-        graph,
-        functions=[function],
-        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-    )
-    model.ir_version = 10
+    model = _local_function_model(graph, [function], ir_version=10)
     return _save_onnx_model(model, tmp_path / f"function_overload_{function_overload}_{call_overload}.onnx")
 
 
@@ -2047,12 +2100,7 @@ def create_onnx_model_with_function_preview_operator(
         [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
         [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, [1])],
     )
-    model = helper.make_model(
-        graph,
-        functions=[function],
-        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-    )
-    model.ir_version = 10
+    model = _local_function_model(graph, [function], ir_version=10)
     return _save_onnx_model(model, tmp_path / "function_preview_operator.onnx")
 
 
@@ -2109,14 +2157,8 @@ def create_onnx_model_with_function_body_external_initializer(
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
         initializer=[condition, input_value],
     )
-    model = helper.make_model(
-        graph,
-        functions=[function],
-        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-    )
-    model.ir_version = 9
-    path = tmp_path / "function_body_external.onnx"
-    onnx.save(model, str(path))
+    model = _local_function_model(graph, [function], ir_version=9)
+    path = _save_onnx_model(model, tmp_path / "function_body_external.onnx")
 
     if not missing_external:
         external_file = tmp_path / external_path
@@ -2266,12 +2308,7 @@ def create_onnx_model_with_function_microsoft_operator(tmp_path: Path, *, op_typ
         [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
     )
-    model = helper.make_model(
-        graph,
-        functions=[function],
-        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-    )
-    model.ir_version = 10
+    model = _local_function_model(graph, [function], ir_version=10)
     return _save_onnx_model(model, tmp_path / f"function_microsoft_{op_type}.onnx")
 
 
@@ -2528,8 +2565,7 @@ def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Pat
         ],
     )
     model.ir_version = 8
-    model_path = tmp_path / "model.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "model.onnx")
 
     result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
     assert len(custom_domain_checks) == 0, (
@@ -3322,8 +3358,7 @@ def test_onnx_scanner_registered_onnx_ml_static_data_stays_clean(tmp_path: Path)
     )
     model.ir_version = 8
     onnx.checker.check_model(model)
-    model_path = tmp_path / "onnx-ml-static-data.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "onnx-ml-static-data.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3353,8 +3388,7 @@ def test_onnx_scanner_static_onnx_ml_output_used_as_weight_fails_closed(tmp_path
     )
     model.ir_version = 8
     onnx.checker.check_model(model)
-    model_path = tmp_path / "onnx-ml-static-weight-path.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "onnx-ml-static-weight-path.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3384,8 +3418,7 @@ def test_onnx_scanner_onnx_ml_bookkeeping_initializer_stays_clean(tmp_path: Path
     )
     model.ir_version = 8
     onnx.checker.check_model(model)
-    model_path = tmp_path / "array-feature-extractor.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "array-feature-extractor.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3426,8 +3459,7 @@ def test_onnx_scanner_transformed_onnx_ml_bookkeeping_initializer_stays_clean(
     )
     model.ir_version = 8
     onnx.checker.check_model(model)
-    model_path = tmp_path / "transformed-array-feature-extractor.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "transformed-array-feature-extractor.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3459,8 +3491,7 @@ def test_onnx_scanner_onnx_ml_selector_does_not_taint_downstream_weights(tmp_pat
     )
     model.ir_version = 8
     onnx.checker.check_model(model)
-    model_path = tmp_path / "feature-selection-matmul.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "feature-selection-matmul.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3613,11 +3644,8 @@ def test_onnx_scanner_dynamic_prelu_slope_stays_clean(
         [output],
         [parameter, weights],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    model_path = tmp_path / "dynamic-prelu-slope.onnx"
-    onnx.save(model, str(model_path))
+    model = _checked_onnx_model(graph)
+    model_path = _save_onnx_model(model, tmp_path / "dynamic-prelu-slope.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3655,11 +3683,8 @@ def test_onnx_scanner_malicious_matrix_prelu_slope_remains_detected(
         [output],
         [slope, weights],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    model_path = tmp_path / "malicious-matrix-prelu-slope.onnx"
-    onnx.save(model, str(model_path))
+    model = _checked_onnx_model(graph)
+    model_path = _save_onnx_model(model, tmp_path / "malicious-matrix-prelu-slope.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3698,11 +3723,8 @@ def test_onnx_scanner_prelu_singleton_axes_do_not_duplicate_findings(
         [output],
         [slope],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    model_path = tmp_path / "prelu-singleton-axes.onnx"
-    onnx.save(model, str(model_path))
+    model = _checked_onnx_model(graph)
+    model_path = _save_onnx_model(model, tmp_path / "prelu-singleton-axes.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3730,11 +3752,8 @@ def test_onnx_scanner_matrix_clip_bound_fails_closed(tmp_path: Path) -> None:
         [output],
         [matrix_bound],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    model_path = tmp_path / "matrix-clip-bound.onnx"
-    onnx.save(model, str(model_path))
+    model = _checked_onnx_model(graph)
+    model_path = _save_onnx_model(model, tmp_path / "matrix-clip-bound.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3761,11 +3780,8 @@ def test_onnx_scanner_transformed_non_scalar_clip_bound_fails_closed(tmp_path: P
         [output],
         [matrix_bound, vector_shape],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    model_path = tmp_path / "transformed-non-scalar-clip-bound.onnx"
-    onnx.save(model, str(model_path))
+    model = _checked_onnx_model(graph)
+    model_path = _save_onnx_model(model, tmp_path / "transformed-non-scalar-clip-bound.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -3803,9 +3819,7 @@ def test_onnx_scanner_static_matrix_unary_output_used_as_weight_fails_closed(
         [output],
         [data, weights],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset_version)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
+    model = _checked_onnx_model(graph, opset=opset_version)
     model_path = tmp_path / f"static-{op_type.lower()}-weight-path.onnx"
     onnx.save(model, str(model_path))
 
@@ -3835,9 +3849,7 @@ def test_onnx_scanner_random_like_dtype_override_used_as_weight_fails_closed(
         [output],
         [shape_seed],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 22)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
+    model = _checked_onnx_model(graph, opset=22)
     model_path = tmp_path / f"{op_type.lower()}-weight-path.onnx"
     onnx.save(model, str(model_path))
 
@@ -3864,11 +3876,8 @@ def test_onnx_scanner_pow_exponent_dtype_override_used_as_weight_fails_closed(tm
         [output],
         [exponent],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    model_path = tmp_path / "pow-exponent-weight-path.onnx"
-    onnx.save(model, str(model_path))
+    model = _checked_onnx_model(graph)
+    model_path = _save_onnx_model(model, tmp_path / "pow-exponent-weight-path.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -4154,29 +4163,11 @@ def test_onnx_scanner_custom_operator_emits_one_domain_rule(tmp_path: Path) -> N
 
 
 def test_onnx_scanner_ai_onnx_ml_subdomain_still_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="ai.onnx.ml.malicious",
-        custom_op_type="BackdoorOp",
-    )
-    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
-    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.ml subdomain to be flagged"
-    assert any(c.details.get("domain") == "ai.onnx.ml.malicious" for c in custom_domain_checks)
-    assert "ai.onnx.ml.malicious" in metadata_custom_domains
+    _assert_onnx_domain(tmp_path, "ai.onnx.ml.malicious", "Expected non-standard ai.onnx.ml subdomain to be flagged")
 
 
 def test_onnx_scanner_ai_onnx_training_domain_still_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="ai.onnx.training",
-        custom_op_type="BackdoorOp",
-    )
-    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
-    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.training domain to be flagged"
-    assert any(c.details.get("domain") == "ai.onnx.training" for c in custom_domain_checks)
-    assert "ai.onnx.training" in metadata_custom_domains
+    _assert_onnx_domain(tmp_path, "ai.onnx.training", "Expected non-standard ai.onnx.training domain to be flagged")
 
 
 def test_onnx_scanner_external_data_missing(tmp_path: Path) -> None:
@@ -4302,19 +4293,7 @@ def test_onnx_scanner_uppercase_snake_python_op_wrapper_flagged(tmp_path: Path, 
 
 
 def test_onnx_scanner_python_substring_near_match_not_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="",
-        custom_op_type="MyPythonOptimizer",
-    )
-
-    result = OnnxScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
-    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
+    _assert_onnx_python_near_match_clean(tmp_path, "MyPythonOptimizer")
 
 
 def test_onnx_scanner_python_doc_string_metadata_not_flagged_as_python_operator(tmp_path: Path) -> None:
@@ -4335,19 +4314,7 @@ def test_onnx_scanner_python_doc_string_metadata_not_flagged_as_python_operator(
 
 
 def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="",
-        custom_op_type="MY_PYTHON_OPTIMIZER",
-    )
-
-    result = OnnxScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
-    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
+    _assert_onnx_python_near_match_clean(tmp_path, "MY_PYTHON_OPTIMIZER")
 
 
 def _save_model_with_int8_weight(tmp_path: Path, weight_bytes: bytes, *, extra_node: Any = None) -> Path:
@@ -4366,9 +4333,7 @@ def _save_model_with_int8_weight(tmp_path: Path, weight_bytes: bytes, *, extra_n
         initializer=[weight, scale, zero_point],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "model.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "model.onnx")
 
 
 def _python_operator_issues(result: Any) -> list[Any]:
@@ -4501,8 +4466,7 @@ def test_onnx_scanner_subgraph_pyop_still_flagged(tmp_path: Path) -> None:
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.attacker", 1)],
     )
     model.ir_version = 8
-    model_path = tmp_path / "subgraph.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "subgraph.onnx")
 
     scanner = OnnxScanner()
     result = scanner.scan(str(model_path))
@@ -4540,10 +4504,8 @@ def test_onnx_scanner_subgraph_snake_python_op_still_flagged(tmp_path: Path) -> 
         ],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    model_path = tmp_path / "subgraph_snake_python_op.onnx"
-    onnx.save(model, str(model_path))
+    model = _onnx_model(graph)
+    model_path = _save_onnx_model(model, tmp_path / "subgraph_snake_python_op.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -4606,15 +4568,9 @@ def test_onnx_scanner_function_default_graph_python_op_still_flagged(tmp_path: P
         ],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
     )
-    model = helper.make_model(
-        graph,
-        functions=[function],
-        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-    )
-    model.ir_version = 9
+    model = _local_function_model(graph, [function], ir_version=9)
     onnx.checker.check_model(model)
-    model_path = tmp_path / "function_default_graph_python_op.onnx"
-    onnx.save(model, str(model_path))
+    model_path = _save_onnx_model(model, tmp_path / "function_default_graph_python_op.onnx")
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5630,40 +5586,10 @@ class TestExternalDataSizeValidation:
         assert determine_exit_code(aggregate) == 1
 
     def test_invalid_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(
-            tmp_path,
-            external=True,
-            external_path="weights.bin",
-            external_metadata={"offset": "NaN"},
-        )
-
-        result = OnnxScanner().scan(str(model_path))
-
-        assert result.success is False
-        size_checks = [
-            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
-        ]
-        assert len(size_checks) > 0
-        assert size_checks[0].severity == IssueSeverity.CRITICAL
-        assert "invalid" in size_checks[0].message.lower()
+        _assert_onnx_invalid_external_offset(tmp_path, "NaN", "invalid")
 
     def test_negative_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(
-            tmp_path,
-            external=True,
-            external_path="weights.bin",
-            external_metadata={"offset": "-1"},
-        )
-
-        result = OnnxScanner().scan(str(model_path))
-
-        assert result.success is False
-        size_checks = [
-            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
-        ]
-        assert len(size_checks) > 0
-        assert size_checks[0].severity == IssueSeverity.CRITICAL
-        assert "non-negative" in size_checks[0].message.lower()
+        _assert_onnx_invalid_external_offset(tmp_path, "-1", "non-negative")
 
 
 class TestWeightDistributionCoverage:
@@ -5944,8 +5870,7 @@ class TestWeightDistributionCoverage:
         Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])
         node = helper.make_node("MatMul", ["X", "W"], ["Y"])
         model = helper.make_model(helper.make_graph([node], "oversized_inline", [X], [Y], initializer=[tensor]))
-        model_path = tmp_path / "oversized-inline.onnx"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "oversized-inline.onnx")
         original_to_array = onnx.numpy_helper.to_array
 
         def guarded_to_array(initializer: Any, *args: Any, **kwargs: Any) -> Any:
@@ -5985,8 +5910,7 @@ class TestWeightDistributionCoverage:
             opset_imports=[helper.make_opsetid("", 13)],
         )
         model.ir_version = 8
-        model_path = tmp_path / "invalid-array-limit.onnx"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "invalid-array-limit.onnx")
         original_to_array = onnx.numpy_helper.to_array
 
         def guarded_to_array(initializer: Any, *args: Any, **kwargs: Any) -> Any:
@@ -6037,8 +5961,7 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(target_shape, dtype=np.int64), name="shape"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         if max_array_size is not None:
 
@@ -6049,8 +5972,7 @@ class TestWeightDistributionSemantics:
         plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=max_array_size)
 
         assert plan.extraction_failures == 0
-        path = tmp_path / "expand-weight.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "expand-weight.onnx")
         result = OnnxScanner({"max_array_size": max_array_size} if max_array_size is not None else {}).scan(str(path))
         if max_array_size is not None:
             assert plan.oversized_initializers_skipped == 1
@@ -6084,8 +6006,7 @@ class TestWeightDistributionSemantics:
         model.graph.node[0].input[1] = "expanded"
         model.graph.node.insert(0, helper.make_node("Expand", ["W", "shape"], ["expanded"]))
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "expanded.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "expanded.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -6133,11 +6054,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((extent, 1), dtype=np.float32), name="scan_values"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"scan-extent-{extent}-{overridable}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"scan-extent-{extent}-{overridable}.onnx")
 
         result = OnnxScanner().scan(str(path))
         semantics = result.metadata["onnx_weight_distribution_semantics"]
@@ -6147,6 +6066,27 @@ class TestWeightDistributionSemantics:
         else:
             assert result.success is True
             assert semantics["coverage_gaps"] == {}
+
+    @staticmethod
+    def _assert_lineage_limit_coverage(result: ScanResult, *, expected_gap: bool) -> None:
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
+    @staticmethod
+    def _assert_unanalyzed_lineage_gap_count(result: ScanResult, *, expected_count: int) -> None:
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == expected_count
+        assert semantics["analyzed_layer_count"] == 0
 
     @staticmethod
     def _extreme_checks(result: Any) -> list[Any]:
@@ -6243,14 +6183,10 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info(weight_source, TensorProto.FLOAT, value_info_shape)],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         if full_check:
             onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"onehot-{'vector' if vector_reshape else 'matrix'}-{alias}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"onehot-{'vector' if vector_reshape else 'matrix'}-{alias}.onnx")
 
     @staticmethod
     def _write_balanced_if_squeeze_model(
@@ -6288,33 +6224,7 @@ class TestWeightDistributionSemantics:
         squeeze_axes = np.array([1 if transpose_before_squeeze else 0], dtype=np.int64)
         initializers.append(onnx.numpy_helper.from_array(squeeze_axes, name="axes"))
 
-        condition_counter = 0
-
-        def combine_branches(branches: list[Any]) -> Any:
-            nonlocal condition_counter
-            if len(branches) == 1:
-                return branches[0]
-            midpoint = len(branches) // 2
-            left = combine_branches(branches[:midpoint])
-            right = combine_branches(branches[midpoint:])
-            condition_index = condition_counter
-            condition_counter += 1
-            output_name = f"branch_out_{condition_index}"
-            node = helper.make_node(
-                "If",
-                [f"C{condition_index}"],
-                [output_name],
-                then_branch=left,
-                else_branch=right,
-            )
-            return helper.make_graph(
-                [node],
-                f"branch_{condition_index}",
-                [],
-                [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, None)],
-            )
-
-        branch = combine_branches(leaves)
+        branch, condition_count = _balanced_if_graph(leaves)
         selected = branch.output[0].name
         selected_for_squeeze = selected
         nodes = [*branch.node]
@@ -6330,7 +6240,7 @@ class TestWeightDistributionSemantics:
         )
         inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [100])]
         inputs.extend(
-            helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, []) for index in range(condition_counter)
+            helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, []) for index in range(condition_count)
         )
         graph = helper.make_graph(
             nodes,
@@ -6339,13 +6249,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / filename
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / filename)
 
     def test_gemm_transposed_weight_uses_the_real_output_axis(self, tmp_path: Path) -> None:
         weights = np.linspace(-0.1, 0.1, 384, dtype=np.float32).reshape(1, 384)
@@ -6796,12 +6702,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        model_path = tmp_path / "loop-carried-state-skip-gap.onnx"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "loop-carried-state-skip-gap.onnx")
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -6866,9 +6769,7 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         events: list[dict[str, Any]] = []
 
@@ -6942,12 +6843,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        model_path = tmp_path / "loop-carried-state-overridable-controls-gap.onnx"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "loop-carried-state-overridable-controls-gap.onnx")
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -6997,12 +6895,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "loop-carried-repeated-rank-growth-gap.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "loop-carried-repeated-rank-growth-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7069,12 +6964,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1] if rank == 1 else [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"if-rank-{rank}-dims-{left_length}-{right_length}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"if-rank-{rank}-dims-{left_length}-{right_length}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7139,12 +7031,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1] if rank == 1 else [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"loop-identity-rank-{rank}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"loop-identity-rank-{rank}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7185,8 +7074,7 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("alias", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         path = tmp_path / f"unknown-rank-{transform.lower()}-alias.onnx"
         onnx.save(model, str(path))
 
@@ -7224,9 +7112,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1] if len(target_shape) == 1 else [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"unknown-gap-rank-{len(target_shape)}.onnx"
         onnx.save(model, str(path))
@@ -7290,11 +7176,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "scan-carried-repeated-rank-growth-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "scan-carried-repeated-rank-growth-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7351,11 +7234,8 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [None, None, 1]),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "scan-opset8-sequence-lens-offset-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=8)
+        path = _save_onnx_model(model, tmp_path / "scan-opset8-sequence-lens-offset-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7448,13 +7328,12 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [batch_size, scan_length, 1]),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph, opset=8)
         onnx.checker.check_model(model, full_check=True)
         length_label = "unknown" if scan_length is None else str(scan_length)
-        path = tmp_path / f"scan-opset8-zero-length-{sequence_lens_mode}-{batch_size}-{length_label}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(
+            model, tmp_path / f"scan-opset8-zero-length-{sequence_lens_mode}-{batch_size}-{length_label}.onnx"
+        )
 
         result = OnnxScanner().scan(str(path))
 
@@ -7543,12 +7422,9 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, scan_output_shape),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph, opset=8)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"scan-opset8-constant-rank-increase-{kind}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"scan-opset8-constant-rank-increase-{kind}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7641,8 +7517,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("values", TensorProto.FLOAT, scan_shape)],
             [helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, scan_shape)],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
+        model = _onnx_model(graph, opset=8)
         inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
         onnx.checker.check_model(inferred, full_check=True)
         inferred_body = next(attribute.g for attribute in inferred.graph.node[0].attribute if attribute.name == "body")
@@ -7683,12 +7558,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 5), dtype=np.float32), name="W"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph, opset=8)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "scan-opset8-body-binding-weight-analysis.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "scan-opset8-body-binding-weight-analysis.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7736,8 +7608,7 @@ class TestWeightDistributionSemantics:
             ],
             initializer=[onnx.numpy_helper.from_array(np.zeros((2, 5), dtype=np.float32), name="initial")],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
+        model = _onnx_model(graph, opset=8)
         inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
         onnx.checker.check_model(inferred)
         onnx.checker.check_model(inferred, full_check=True)
@@ -7872,12 +7743,9 @@ class TestWeightDistributionSemantics:
                 ),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph, opset=8)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"scan8-{kind}-{source_count}-body-local-gap.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"scan8-{kind}-{source_count}-body-local-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -7944,12 +7812,9 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("data_out", TensorProto.FLOAT, None)],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "repeated-loop-mutable-constant-shape-state.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "repeated-loop-mutable-constant-shape-state.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -8009,11 +7874,8 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("data_out", TensorProto.FLOAT, None)],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "repeated-scan-mutable-constant-shape-state.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "repeated-scan-mutable-constant-shape-state.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -8045,22 +7907,15 @@ class TestWeightDistributionSemantics:
                     onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 ]
             )
-            body = helper.make_graph(
+            body = _float_state_loop_body(
                 [
                     helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                     helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
                     helper.make_node("Identity", ["condition_in"], ["condition_out"]),
                 ],
                 "repeated_loop_promotes_carried_rank_gap_body",
-                [
-                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                    helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-                ],
-                [
-                    helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-                ],
+                state_shape=None,
+                next_state_shape=None,
             )
             nodes.append(
                 helper.make_node(
@@ -8105,9 +7960,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"repeated-{control_flow_op.lower()}-promotes-carried-gap.onnx"
         onnx.save(model, str(path))
 
@@ -8139,21 +7992,14 @@ class TestWeightDistributionSemantics:
             if body_redeclares_state_initializer
             else []
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "initializer_backed_loop_control_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
             initializer=body_initializers,
         )
         graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])]
@@ -8175,13 +8021,10 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         mode = "overridable" if trip_count_is_graph_input else "constant"
         redeclared = "body-default" if body_redeclares_state_initializer else "plain"
-        path = tmp_path / f"initializer-backed-loop-control-{mode}-{redeclared}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"initializer-backed-loop-control-{mode}-{redeclared}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -8228,22 +8071,15 @@ class TestWeightDistributionSemantics:
                     onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 ]
             )
-            body = helper.make_graph(
+            body = _float_state_loop_body(
                 [
                     helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                     body_state_node,
                     helper.make_node("Identity", ["condition_in"], ["condition_out"]),
                 ],
                 "retained_loop_vector_reentry_body",
-                [
-                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                    helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-                ],
-                [
-                    helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-                ],
+                state_shape=None,
+                next_state_shape=None,
             )
             nodes.append(
                 helper.make_node(
@@ -8289,24 +8125,13 @@ class TestWeightDistributionSemantics:
             graph_outputs,
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"retained-{control_flow_op.lower()}-vector-reentry-{rank_promotes}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("op_type", "index_values", "x_shape", "expected_gap"),
@@ -8339,22 +8164,15 @@ class TestWeightDistributionSemantics:
             gather_node = helper.make_node("GatherElements", ["state", "indices"], ["next_state"], axis=0)
         else:
             gather_node = helper.make_node("GatherND", ["state", "indices"], ["next_state"])
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 gather_node,
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             f"retained_loop_{op_type.lower()}_reentry_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -8371,24 +8189,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"retained-loop-{op_type.lower()}-initializer-index-{expected_gap}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("target_shape", "x_shape", "expected_gap"), [([4], [1, 4], False), ([1, 4], [1, 1], True)]
@@ -8408,7 +8215,7 @@ class TestWeightDistributionSemantics:
             [helper.make_node("Reshape", ["state", "target_shape"], ["function_output"])],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("ProjectState", ["state", "state_shape"], ["function_state"], domain="local"),
@@ -8416,15 +8223,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_local_function_formal_constant_reentry_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -8447,28 +8247,13 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-local-function-formal-constant-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-local-function-formal-constant-{expected_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("first_shape", "second_shape", "x_shape", "expected_gap"),
@@ -8502,7 +8287,7 @@ class TestWeightDistributionSemantics:
             [helper.make_node("InnerProjectState", ["state", "outer_shape"], ["outer_output"], domain="local")],
             opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("OuterProjectState", ["state", "first_shape"], ["first_state"], domain="local"),
@@ -8510,15 +8295,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_nested_local_function_formal_constant_reentry_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -8542,28 +8320,15 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[inner, outer],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [inner, outer])
         onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-nested-local-function-formal-constant-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(
+            model, tmp_path / f"retained-loop-nested-local-function-formal-constant-{expected_gap}.onnx"
+        )
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("use_dependent_output", "function_uses_state", "expected_gap"),
@@ -8601,7 +8366,7 @@ class TestWeightDistributionSemantics:
             opset_imports=[helper.make_opsetid("", 13)],
         )
         promoted_source = "dependent" if use_dependent_output else "independent"
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("SplitState", ["state"], ["dependent", "independent"], domain="local"),
@@ -8609,15 +8374,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_local_function_output_taint_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -8640,12 +8398,7 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model, full_check=True)
         scanned_bytes = model.SerializeToString()
         actual: Any = ReferenceEvaluator(model).run(["control_flow_state"], {"X": np.ones((1, 4), dtype=np.float32)})
@@ -8657,21 +8410,11 @@ class TestWeightDistributionSemantics:
         assert actual[0].shape == expected_state.shape
         np.testing.assert_array_equal(actual[0], expected_state)
         assert model.SerializeToString() == scanned_bytes
-        path = tmp_path / f"retained-loop-local-function-output-taint-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-local-function-output-taint-{expected_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("other_shape", "x_shape", "expected_gap", "other_from_constant"),
@@ -8701,18 +8444,11 @@ class TestWeightDistributionSemantics:
             body_nodes.insert(1, helper.make_node("Constant", [], ["other"], value=other_tensor))
         else:
             body_initializers.append(other_tensor)
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             body_nodes,
             "retained_loop_broadcast_rank_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
             initializer=body_initializers,
         )
         graph = helper.make_graph(
@@ -8735,24 +8471,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-broadcast-rank-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-broadcast-rank-{expected_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("case", "expected_gap"),
@@ -8789,22 +8513,15 @@ class TestWeightDistributionSemantics:
                 helper.make_node("BroadcastState", ["state", "vector_other"], ["unused_vector"], domain="local"),
             ],
         }
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 *broadcast_calls[case],
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_function_broadcast_rank_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -8828,28 +8545,13 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-function-broadcast-rank-{case}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-function-broadcast-rank-{case}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("case", "source", "matrix_operand_or_condition", "state_second", "use_where", "expected_gap"),
@@ -8953,18 +8655,11 @@ class TestWeightDistributionSemantics:
             add_inputs = [other_name, state_name] if state_second else [state_name, other_name]
             body_nodes.append(helper.make_node("Add", add_inputs, ["next_state"]))
         body_nodes.append(helper.make_node("Identity", ["condition_in"], ["condition_out"]))
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             body_nodes,
             "retained_loop_reentry_broadcast_shape_context_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -8981,24 +8676,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-reentry-broadcast-shape-context-{case}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-broadcast-shape-context-{case}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("case", "carried_operand", "other_shape", "loop_trips", "expected_gap"),
@@ -9020,7 +8703,7 @@ class TestWeightDistributionSemantics:
         loop_trips: int,
         expected_gap: bool,
     ) -> None:
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["probe", "state"], ["body_y"]),
                 helper.make_node(
@@ -9031,15 +8714,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_matmul_rank_promotion_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -9064,24 +8740,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-reentry-matmul-rank-promotion-{case}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-matmul-rank-promotion-{case}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("case", "matrix_state_shape", "matrix_update", "trip_count", "expected_gap"),
@@ -9171,24 +8835,12 @@ class TestWeightDistributionSemantics:
                 ),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-reentry-matmul-sibling-shape-{case}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-matmul-sibling-shape-{case}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("case", "promote_third_state", "expected_gap"),
@@ -9267,24 +8919,13 @@ class TestWeightDistributionSemantics:
                 ),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"retained-loop-reentry-dependent-sibling-shape-{case}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-dependent-sibling-shape-{case}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("case", "trip_count", "expected_gap"),
@@ -9360,24 +9001,13 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("indices", TensorProto.INT64, [2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"retained-loop-reentry-onehot-values-rank-promotion-{case}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-onehot-values-rank-promotion-{case}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("clean_part_shape", "state_shape", "probe_shape", "expected_gap"),
@@ -9395,7 +9025,7 @@ class TestWeightDistributionSemantics:
         expected_gap: bool,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["probe", "state"], ["body_y"]),
                 helper.make_node("Concat", ["left_clean", "right_clean"], ["clean_vector"], axis=0),
@@ -9403,15 +9033,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_clean_concat_shape_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
             initializer=[
                 onnx.numpy_helper.from_array(np.zeros(clean_part_shape, dtype=np.float32), name="left_clean"),
                 onnx.numpy_helper.from_array(np.zeros(clean_part_shape, dtype=np.float32), name="right_clean"),
@@ -9442,46 +9065,28 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, state_shape)],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"retained-loop-reentry-clean-concat-shape-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-clean-concat-shape-{expected_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     def test_repeated_loop_reentry_einsum_rank_promotion_preserves_weight_coverage(
         self,
         tmp_path: Path,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["probe", "state"], ["body_y"]),
                 helper.make_node("Einsum", ["state", "other"], ["next_state"], equation="i,j->ij"),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_einsum_rank_promotion_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -9508,19 +9113,12 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "retained-loop-reentry-einsum-rank-promotion.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-einsum-rank-promotion.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     @pytest.mark.parametrize(("trip_count", "expected_gap"), [(2, False), (3, True)])
     def test_repeated_loop_reentry_respects_finite_scalar_rank_promotion_before_consumer(
@@ -9530,22 +9128,15 @@ class TestWeightDistributionSemantics:
         expected_gap: bool,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
                 helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_finite_scalar_rank_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -9570,24 +9161,12 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-reentry-finite-scalar-rank-{trip_count}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-finite-scalar-rank-{trip_count}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(("trip_count", "expected_gap"), [(1, False), (2, True)])
     def test_repeated_loop_reentry_keeps_dead_local_function_weight_consumer_live(
@@ -9597,22 +9176,15 @@ class TestWeightDistributionSemantics:
         expected_gap: bool,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("UseWeight", ["activation", "state"], ["unused_consumer"], domain="local"),
                 helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_dead_local_function_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -9645,28 +9217,13 @@ class TestWeightDistributionSemantics:
             [helper.make_node("PRelu", ["function_activation", "function_state"], ["function_y"])],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"retained-loop-reentry-dead-local-function-{trip_count}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-dead-local-function-{trip_count}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("transform", "trip_count", "before_gap", "after_gap"),
@@ -9703,21 +9260,14 @@ class TestWeightDistributionSemantics:
             ["", "next_state"] if omit_first_output else ["next_state"],
             domain="local",
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 *([update, consumer] if consume_after else [consumer, update]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "live_function_replay_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -9760,13 +9310,9 @@ class TestWeightDistributionSemantics:
             ],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        model = helper.make_model(
-            graph, functions=[function], opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)]
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "live-function-replay.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "live-function-replay.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -9784,22 +9330,15 @@ class TestWeightDistributionSemantics:
 
     def test_repeated_loop_reentry_replays_dead_local_function_weight_transform(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("UseSqueezedWeight", ["activation", "state"], ["unused_consumer"], domain="local"),
                 helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_dead_local_function_transform_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -9841,23 +9380,13 @@ class TestWeightDistributionSemantics:
             ],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "retained-loop-reentry-dead-local-function-transform.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-dead-local-function-transform.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     @pytest.mark.parametrize(
         ("consumer_depends_on_sibling", "trip_count", "expected_gap"),
@@ -9928,32 +9457,21 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [1])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         dependency = "dependent" if consumer_depends_on_sibling else "independent"
-        path = tmp_path / f"retained-loop-reentry-sibling-rank-{dependency}-{trip_count}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-sibling-rank-{dependency}-{trip_count}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     def test_repeated_loop_reentry_traces_transitive_alias_into_dead_weight_consumer(
         self,
         tmp_path: Path,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Identity", ["state"], ["state_alias0"]),
                 helper.make_node("Identity", ["state_alias0"], ["state_alias1"]),
@@ -9962,15 +9480,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_transitive_alias_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -9995,38 +9506,25 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [1])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "retained-loop-reentry-transitive-alias.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-transitive-alias.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_reentry_replays_saturating_reshape_rank(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
                 helper.make_node("Reshape", ["state", "target_shape"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_saturating_reshape_rank_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -10051,20 +9549,13 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "retained-loop-reentry-saturating-reshape-rank.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-saturating-reshape-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     @pytest.mark.parametrize(("consumer_shape", "expected_gap"), [((4,), False), ((2, 2, 1), True)])
     def test_repeated_loop_reentry_uses_rank_at_actual_weight_consumer(
@@ -10074,7 +9565,7 @@ class TestWeightDistributionSemantics:
         expected_gap: bool,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Reshape", ["state", "consumer_shape"], ["consumer_slope"]),
                 helper.make_node("PRelu", ["activation", "consumer_slope"], ["body_y"]),
@@ -10082,15 +9573,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_actual_consumer_rank_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -10116,26 +9600,14 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2, 2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         mode = "matrix" if expected_gap else "vector"
-        path = tmp_path / f"retained-loop-actual-consumer-rank-{mode}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-actual-consumer-rank-{mode}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(("trip_count", "expected_gap"), [(2, False), (3, True)])
     def test_repeated_loop_reentry_traces_alias_into_dead_weight_consumer(
@@ -10145,7 +9617,7 @@ class TestWeightDistributionSemantics:
         expected_gap: bool,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Identity", ["state"], ["state_alias"]),
                 helper.make_node("PRelu", ["activation", "state_alias"], ["body_y"]),
@@ -10153,15 +9625,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_alias_finite_scalar_rank_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -10186,24 +9651,12 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-reentry-alias-finite-scalar-rank-{trip_count}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-reentry-alias-finite-scalar-rank-{trip_count}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("optional_condition", "trip_count", "expected_gap"),
@@ -10234,7 +9687,7 @@ class TestWeightDistributionSemantics:
             ],
             initializer=[onnx.numpy_helper.from_array(np.array(False, dtype=np.bool_), name="nested_false")],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Identity", ["state"], ["state_alias"]),
                 helper.make_node("Loop", ["", optional_condition], ["unused_nested_scan"], body=nested_body),
@@ -10242,15 +9695,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_inputless_nested_alias_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -10275,30 +9721,21 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         suffix = "empty-condition" if not optional_condition else "outer-condition"
-        path = tmp_path / f"retained-loop-reentry-inputless-nested-alias-{suffix}-{trip_count}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(
+            model, tmp_path / f"retained-loop-reentry-inputless-nested-alias-{suffix}-{trip_count}.onnx"
+        )
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     def test_repeated_loop_reentry_liveness_uses_per_node_flags(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
         chain_length = 64
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
                 *[
@@ -10313,15 +9750,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_liveness_chain_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -10346,11 +9776,8 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "retained-loop-reentry-liveness-chain.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-liveness-chain.onnx")
 
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         retained_snapshot_entries = 0
@@ -10392,7 +9819,7 @@ class TestWeightDistributionSemantics:
     ) -> None:
         value_count = onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK + 1
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "Constant",
@@ -10403,15 +9830,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_oversized_constant_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [value_count]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [value_count]),
-            ],
+            state_shape=[value_count],
+            next_state_shape=[value_count],
         )
         graph = helper.make_graph(
             [
@@ -10437,11 +9857,9 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [value_count])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "retained-loop-reentry-oversized-constant.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-oversized-constant.onnx")
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         oversized_returns: list[Any] = []
 
@@ -10521,11 +9939,8 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "exact-rank-replay-budget.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "exact-rank-replay-budget.onnx")
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         exact_replay_results: list[Any] = []
 
@@ -10569,7 +9984,7 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("nested_next_state", TensorProto.FLOAT, [2, 2]),
             ],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "Loop",
@@ -10581,15 +9996,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "outer_optional_slot_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2, 2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2]),
-            ],
+            state_shape=[2, 2],
+            next_state_shape=[2, 2],
         )
         graph = helper.make_graph(
             [
@@ -10613,11 +10021,9 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2, 2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "nested-loop-optional-input-slot-reachability.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "nested-loop-optional-input-slot-reachability.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -10639,22 +10045,15 @@ class TestWeightDistributionSemantics:
             summed = f"initial_state_{index}"
             nodes.append(helper.make_node("Add", [previous, source_name], [summed]))
             previous = summed
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["probe", "state"], ["body_y"]),
                 helper.make_node("Identity", ["state"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_mixed_lineage_shape_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         nodes.extend(
             [
@@ -10672,11 +10071,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "retained-loop-reentry-mixed-lineage-shape.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-mixed-lineage-shape.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -10688,22 +10084,15 @@ class TestWeightDistributionSemantics:
 
     def test_repeated_loop_reentry_treats_overridable_trip_count_as_dynamic(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
                 helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_overridable_finite_rank_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -10728,19 +10117,12 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "retained-loop-reentry-overridable-finite-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-overridable-finite-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     @pytest.mark.parametrize("promotion_budget", [1, 20])
     def test_repeated_loop_nested_reentry_preserves_clean_context_when_bounding_work(
@@ -10788,18 +10170,11 @@ class TestWeightDistributionSemantics:
             ),
             helper.make_node("Identity", ["condition_in"], ["condition_out"]),
         ]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             body_nodes,
             "retained_loop_nested_clean_context_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -10826,12 +10201,9 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "retained-loop-nested-clean-context.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "retained-loop-nested-clean-context.onnx")
 
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         work_by_context: dict[tuple[FrameType, str], int] = {}
@@ -10898,7 +10270,7 @@ class TestWeightDistributionSemantics:
             [],
             [helper.make_tensor_value_info(output, TensorProto.FLOAT, [2]) for output in branch_outputs],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "If",
@@ -10910,15 +10282,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_nested_dead_output_rank_work_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[2],
         )
         graph = helper.make_graph(
             [
@@ -10942,12 +10307,9 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "retained-loop-nested-dead-output-rank-work.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "retained-loop-nested-dead-output-rank-work.onnx")
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         nested_promotion_calls = 0
 
@@ -10994,7 +10356,7 @@ class TestWeightDistributionSemantics:
             [],
             [helper.make_tensor_value_info("branch_out", TensorProto.FLOAT, [])],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "If",
@@ -11007,15 +10369,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["state"], ["next_state"]),
             ],
             "unused_nested_output_internal_consumer_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -11036,20 +10391,13 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2, 2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "unused-nested-output-internal-consumer.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "unused-nested-output-internal-consumer.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_nested_lexical_capture_dependency_preserves_gap(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
@@ -11065,7 +10413,7 @@ class TestWeightDistributionSemantics:
             [],
             [helper.make_tensor_value_info("branch_state", TensorProto.FLOAT, [2, 2])],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Identity", ["state"], ["state_alias"]),
                 helper.make_node(
@@ -11074,15 +10422,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "nested_lexical_capture_dependency_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2, 2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2]),
-            ],
+            state_shape=[2, 2],
+            next_state_shape=[2, 2],
         )
         graph = helper.make_graph(
             [
@@ -11103,20 +10444,13 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2, 2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "nested-lexical-capture-dependency.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "nested-lexical-capture-dependency.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_function_graph_attribute_dependency_preserves_gap(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
@@ -11163,7 +10497,7 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("clean_state", TensorProto.FLOAT, [2, 2]),
             ],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Identity", ["state"], ["state_alias"]),
                 helper.make_node(
@@ -11175,15 +10509,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "function_graph_attribute_dependency_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2, 2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2]),
-            ],
+            state_shape=[2, 2],
+            next_state_shape=[2, 2],
         )
         graph = helper.make_graph(
             [
@@ -11204,23 +10531,13 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2, 2])],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 9
+        model = _local_function_model(graph, [function], ir_version=9)
         onnx.checker.check_model(model)
-        path = tmp_path / "function-graph-attribute-dependency.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-graph-attribute-dependency.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     @pytest.mark.parametrize(
         ("scan_input_shape", "expected_gap"),
@@ -11272,24 +10589,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-scan-explicit-body-input-shape-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-scan-explicit-body-input-shape-{expected_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("target_shape", "x_shape", "expected_gap"), [([4], [4, 4], False), ([4, 4], [4, 4], True)]
@@ -11320,7 +10625,7 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("next_shape", TensorProto.INT64, [len(target_shape)]),
             ],
         )
-        outer_body = helper.make_graph(
+        outer_body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node(
@@ -11344,15 +10649,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_nested_loop_constant_shape_outer_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -11375,24 +10673,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-nested-loop-constant-shape-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-nested-loop-constant-shape-{expected_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     def test_repeated_loop_nested_repeating_loop_keeps_mutable_shape_control_failed(
         self,
@@ -11422,7 +10708,7 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("next_shape", TensorProto.INT64, None),
             ],
         )
-        outer_body = helper.make_graph(
+        outer_body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node(
@@ -11446,15 +10732,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_nested_repeating_loop_shape_outer_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -11477,19 +10756,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "retained-loop-nested-repeating-loop-shape.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "retained-loop-nested-repeating-loop-shape.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_nested_loop_captured_false_condition_binds_constant_shape_control(
         self,
@@ -11514,7 +10786,7 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("next_shape", TensorProto.INT64, [1]),
             ],
         )
-        outer_body = helper.make_graph(
+        outer_body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node(
@@ -11544,15 +10816,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_nested_loop_captured_false_condition_outer_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -11575,19 +10840,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "retained-loop-nested-loop-captured-false-condition.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "retained-loop-nested-loop-captured-false-condition.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     @pytest.mark.parametrize(
         ("second_shape", "x_shape", "expected_gap"), [([4], [1, 4], False), ([1, 4], [1, 1], True)]
@@ -11599,7 +10857,7 @@ class TestWeightDistributionSemantics:
         x_shape: list[int],
         expected_gap: bool,
     ) -> None:
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("Reshape", ["state", "vector_shape"], ["state_vector"]),
@@ -11607,15 +10865,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_chained_reshape_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -11639,24 +10890,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-chained-reshape-{expected_gap}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"retained-loop-chained-reshape-{expected_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize(
         ("control_flow_op", "body_state_op", "expected_gap"),
@@ -11698,7 +10937,7 @@ class TestWeightDistributionSemantics:
                     onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 ]
             )
-            body = helper.make_graph(
+            body = _float_state_loop_body(
                 [
                     helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                     helper.make_node("Sum", source_names, ["capped"]),
@@ -11706,15 +10945,8 @@ class TestWeightDistributionSemantics:
                     helper.make_node("Identity", ["condition_in"], ["condition_out"]),
                 ],
                 "body_created_loop_gap_reentry_body",
-                [
-                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                    helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-                ],
-                [
-                    helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, next_state_shape),
-                ],
+                state_shape=None,
+                next_state_shape=next_state_shape,
             )
             nodes.append(
                 helper.make_node(
@@ -11761,24 +10993,13 @@ class TestWeightDistributionSemantics:
             graph_outputs,
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"body-created-{control_flow_op.lower()}-gap-reentry-{body_state_op}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
     def test_repeated_control_flow_fails_closed_on_same_rank_body_created_matrix_gap(
@@ -11801,22 +11022,15 @@ class TestWeightDistributionSemantics:
                     onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 ]
             )
-            body = helper.make_graph(
+            body = _float_state_loop_body(
                 [
                     helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                     helper.make_node("Sum", source_names, ["next_state"]),
                     helper.make_node("Identity", ["condition_in"], ["condition_out"]),
                 ],
                 "same_rank_loop_body_created_matrix_gap_body",
-                [
-                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                    helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
-                ],
-                [
-                    helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
-                ],
+                state_shape=[4, 4],
+                next_state_shape=[4, 4],
             )
             nodes = [
                 helper.make_node(
@@ -11862,19 +11076,13 @@ class TestWeightDistributionSemantics:
             graph_outputs,
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"same-rank-{control_flow_op.lower()}-body-created-gap.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
     def test_repeated_control_flow_keeps_same_rank_vector_state_gap_clean(
@@ -11897,22 +11105,15 @@ class TestWeightDistributionSemantics:
                     onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 ]
             )
-            body = helper.make_graph(
+            body = _float_state_loop_body(
                 [
                     helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                     helper.make_node("Sum", source_names, ["next_state"]),
                     helper.make_node("Identity", ["condition_in"], ["condition_out"]),
                 ],
                 "same_rank_loop_body_created_vector_gap_body",
-                [
-                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                    helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-                ],
-                [
-                    helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4]),
-                ],
+                state_shape=[4],
+                next_state_shape=[4],
             )
             nodes = [
                 helper.make_node(
@@ -11958,19 +11159,13 @@ class TestWeightDistributionSemantics:
             graph_outputs,
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"same-rank-{control_flow_op.lower()}-body-created-vector-gap.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     @pytest.mark.parametrize("wide_node_is_live", [False, True])
     def test_repeated_loop_reentry_work_budget_counts_live_node_inputs(
@@ -12022,12 +11217,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         mode = "live" if wide_node_is_live else "dead"
-        path = tmp_path / f"wide-input-reentry-budget-{mode}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"wide-input-reentry-budget-{mode}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -12081,19 +11273,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, None, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "scan8-repeated-state-reentry.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=8)
+        path = _save_onnx_model(model, tmp_path / "scan8-repeated-state-reentry.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_finds_weight_reentry_inside_nested_if_capture(
         self,
@@ -12126,7 +11311,7 @@ class TestWeightDistributionSemantics:
             [],
             [helper.make_tensor_value_info("branch_y", TensorProto.FLOAT, [1, 4])],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "If",
@@ -12139,15 +11324,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "nested_if_loop_body_created_gap_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
-            ],
+            state_shape=[4, 4],
+            next_state_shape=[4, 4],
         )
         graph = helper.make_graph(
             [
@@ -12163,19 +11341,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("control_flow_state", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "nested-if-loop-body-created-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "nested-if-loop-body-created-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_defers_body_created_gap_when_state_never_reenters_weight_consumer(
         self,
@@ -12190,22 +11361,15 @@ class TestWeightDistributionSemantics:
             onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="trip_count"),
             onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
         ]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Sum", source_names, ["capped"]),
                 helper.make_node("Unsqueeze", ["capped", "axes"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "ignored_loop_body_created_gap_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[1, 4],
         )
         graph = helper.make_graph(
             [
@@ -12222,19 +11386,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "ignored-loop-body-created-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "ignored-loop-body-created-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     def test_repeated_loop_defers_body_created_gap_when_state_loses_weight_rank(
         self,
@@ -12248,22 +11405,15 @@ class TestWeightDistributionSemantics:
             onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="trip_count"),
             onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
         ]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("Sum", source_names, ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "rank_decrease_loop_body_created_gap_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -12280,19 +11430,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "rank-decrease-loop-body-created-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "rank-decrease-loop-body-created-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     def test_repeated_loop_detects_rank_reentry_through_nested_if_capture(
         self,
@@ -12313,7 +11456,7 @@ class TestWeightDistributionSemantics:
             [],
             [helper.make_tensor_value_info("branch_state", TensorProto.FLOAT, [4, 1])],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node(
@@ -12326,15 +11469,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "nested_if_rank_reentry_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 1]),
-            ],
+            state_shape=[4],
+            next_state_shape=[4, 1],
         )
         graph = helper.make_graph(
             [
@@ -12352,19 +11488,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "nested-if-rank-reentry.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "nested-if-rank-reentry.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_detects_rank_reentry_through_explicit_nested_loop_state(
         self,
@@ -12435,19 +11564,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("control_flow_state", TensorProto.FLOAT, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "explicit-nested-loop-rank-reentry.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "explicit-nested-loop-rank-reentry.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_detects_rank_reentry_through_nested_scan_stack(
         self,
@@ -12467,7 +11589,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("element", TensorProto.FLOAT, [1])],
             [helper.make_tensor_value_info("scan_state_output", TensorProto.FLOAT, [4])],
         )
-        loop_body = helper.make_graph(
+        loop_body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node(
@@ -12480,15 +11602,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "nested_scan_stack_rank_reentry_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [None, 4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[None, 4],
         )
         graph = helper.make_graph(
             [
@@ -12506,19 +11621,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "nested-scan-stack-rank-reentry.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "nested-scan-stack-rank-reentry.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_repeated_loop_nested_if_taints_only_referenced_output(
         self,
@@ -12551,7 +11659,7 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("clean_weight", TensorProto.FLOAT, [4, 1]),
             ],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "If",
@@ -12566,15 +11674,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "nested_if_precise_taint_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 1]),
-            ],
+            state_shape=[4],
+            next_state_shape=[4, 1],
         )
         graph = helper.make_graph(
             [
@@ -12591,19 +11692,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "nested-if-precise-taint.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "nested-if-precise-taint.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     def test_repeated_loop_retained_noop_squeeze_vector_state_stays_clean(
         self,
@@ -12615,22 +11709,15 @@ class TestWeightDistributionSemantics:
             onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="trip_count"),
             onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
         ]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("Squeeze", ["state"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_noop_squeeze_vector_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[4],
         )
         graph = helper.make_graph(
             [
@@ -12647,19 +11734,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "retained-loop-noop-squeeze-vector.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "retained-loop-noop-squeeze-vector.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     def test_loop_constant_false_body_condition_does_not_repeat_state_gap(
         self,
@@ -12674,7 +11754,7 @@ class TestWeightDistributionSemantics:
             onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="trip_count"),
             onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
         ]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("Sum", source_names, ["capped"]),
@@ -12682,15 +11762,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["body_false"], ["condition_out"]),
             ],
             "constant_false_loop_body_created_gap_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[1, 4],
             initializer=[onnx.numpy_helper.from_array(np.array(False, dtype=np.bool_), name="body_false")],
         )
         graph = helper.make_graph(
@@ -12708,19 +11781,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "constant-false-loop-body-created-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "constant-false-loop-body-created-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     @pytest.mark.parametrize(
         ("condition_mode", "expected_gap"),
@@ -12784,22 +11850,15 @@ class TestWeightDistributionSemantics:
                 if condition_mode == "body_input_default"
                 else []
             )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node("Sum", source_names, ["next_state"]),
                 *condition_nodes,
             ],
             f"{condition_mode}_loop_body_created_gap_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
-            ],
+            state_shape=[4, 4],
+            next_state_shape=[4, 4],
             initializer=body_initializers,
         )
         graph = helper.make_graph(
@@ -12817,24 +11876,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"{condition_mode}-loop-body-created-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"{condition_mode}-loop-body-created-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     @pytest.mark.parametrize("kind", ["state_vector", "stacked_scalar"])
     def test_scan_opset8_direct_body_local_initializer_after_batch_axis_is_accounted(
@@ -12895,12 +11942,9 @@ class TestWeightDistributionSemantics:
                 ),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph, opset=8)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"scan8-{kind}-direct-body-local-accounted.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"scan8-{kind}-direct-body-local-accounted.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -12963,11 +12007,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"scan-fixed-extent-{scan_length}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"scan-fixed-extent-{scan_length}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -13029,11 +12070,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "scan-symbolic-default-extent.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "scan-symbolic-default-extent.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -13101,19 +12139,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "scan-initializer-stacked-extent.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "scan-initializer-stacked-extent.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     def test_scan_repeat_ignores_stale_intermediate_extent_metadata(self, tmp_path: Path) -> None:
         nodes, initializers, scalar = self._capped_scalar_expression()
@@ -13164,11 +12195,8 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [1])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "scan-stale-intermediate-extent.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "scan-stale-intermediate-extent.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -13245,19 +12273,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "large-repeated-scan-reentry-output-bound.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "large-repeated-scan-reentry-output-bound.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     @pytest.mark.parametrize(
         ("case", "include_body_consumer", "expected_gap"),
@@ -13342,24 +12363,12 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"large-repeated-loop-weight-reachability-bound-{case}.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"large-repeated-loop-weight-reachability-bound-{case}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if expected_gap:
-            assert result.success is False
-            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
-        else:
-            assert result.success is True
-            assert coverage == []
-            assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=expected_gap)
 
     def test_repeated_loop_nested_capture_reference_walk_stays_clean(
         self,
@@ -13435,19 +12444,13 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "nested-capture-reference-work.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "nested-capture-reference-work.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     def test_repeated_loop_output_dead_clean_nested_captures_do_not_repeat_per_state(
         self,
@@ -13518,8 +12521,7 @@ class TestWeightDistributionSemantics:
         )
         model.ir_version = 8
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "output-dead-clean-nested-capture.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "output-dead-clean-nested-capture.onnx")
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         clean_capture_reference_calls = 0
 
@@ -13609,11 +12611,9 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "live-producer-dependency-bound.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "live-producer-dependency-bound.onnx")
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         shared_dependency_results: list[frozenset[str]] = []
 
@@ -13688,12 +12688,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "repeated-loop-non-shape-rank-growth-cast.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "repeated-loop-non-shape-rank-growth-cast.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -13768,11 +12765,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        model_path = tmp_path / "scan-state-skip-gap.onnx"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "scan-state-skip-gap.onnx")
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -13844,11 +12839,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        model_path = tmp_path / "scan-state-skip-axis-gap.onnx"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "scan-state-skip-axis-gap.onnx")
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -13926,12 +12919,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        model_path = tmp_path / "scan-state-fixed-default.onnx"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "scan-state-fixed-default.onnx")
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -13962,11 +12952,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "overridable-shape-initializer-rank-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "overridable-shape-initializer-rank-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -13992,11 +12979,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "overridable-squeeze-axes-rank-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "overridable-squeeze-axes-rank-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14024,11 +13008,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "unsqueeze-dropped-vector-rank-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "unsqueeze-dropped-vector-rank-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14055,11 +13036,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "float-cast-integer-vector-rank-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "float-cast-integer-vector-rank-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14109,11 +13087,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((1, 1), dtype=np.float32), name="scan_input"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "unknown-overridable-scan-input-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "unknown-overridable-scan-input-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14172,11 +13147,8 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             sparse_initializer=[sparse_scan_input],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "overridable-sparse-scan-input-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "overridable-sparse-scan-input-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14225,11 +13197,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="clean_weight"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "fixed-graph-scan-extent-no-skip-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "fixed-graph-scan-extent-no-skip-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14291,12 +13260,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="clean_weight"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "fixed-stacked-scan-extent-bounds-nested-scan.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "fixed-stacked-scan-extent-bounds-nested-scan.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14349,11 +13315,8 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("scan_input", TensorProto.FLOAT, [1, 1])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "computed-empty-scan-input-stale-value-info.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "computed-empty-scan-input-stale-value-info.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14379,11 +13342,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((1, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "overridable-unsqueeze-axes-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "overridable-unsqueeze-axes-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14423,11 +13383,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "float-cast-dropped-integer-matrix-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "float-cast-dropped-integer-matrix-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14470,11 +13427,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "loop-scan-output-stacked-weight-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "loop-scan-output-stacked-weight-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14502,11 +13456,8 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("generated_weight", TensorProto.FLOAT, ["M"])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "symbolic-broadcast-scalar-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "symbolic-broadcast-scalar-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14532,11 +13483,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((2,), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "gathernd-batch-dims-rank-one-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "gathernd-batch-dims-rank-one-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14559,11 +13507,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array([[0], [0]], dtype=np.int64), name="indices"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "gathernd-selection-lineage-fails-closed.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "gathernd-selection-lineage-fails-closed.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14591,10 +13536,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        path = tmp_path / "gathernd-graph-input-indices-fail-closed.onnx"
-        onnx.save(model, str(path))
+        model = _onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "gathernd-graph-input-indices-fail-closed.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14650,11 +13593,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "runtime-activation-lineage-fanout.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "runtime-activation-lineage-fanout.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14689,11 +13629,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 32])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "mixed-shape-activation-fanout.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "mixed-shape-activation-fanout.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14723,11 +13660,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "dropped-weight-lineage-behind-shapes.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "dropped-weight-lineage-behind-shapes.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14772,24 +13706,14 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-output-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-output-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=8)
 
     def test_function_cast_ref_attr_target_promotes_integer_gap(self, tmp_path: Path) -> None:
         source_names = [f"integer_matrix{index}" for index in range(40)]
@@ -14831,15 +13755,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-cast-ref-attr-target-gap.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-cast-ref-attr-target-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14880,15 +13798,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=[initializer],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-cast-ref-attr-target-retained.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-cast-ref-attr-target-retained.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -14960,15 +13872,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-scan-ref-attr-input-axis-gap.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-scan-ref-attr-input-axis-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15036,15 +13942,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-scan-ref-attr-num-scan-inputs-gap.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-scan-ref-attr-num-scan-inputs-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15117,15 +14017,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-scan-ref-attr-num-scan-inputs-body-partition.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-scan-ref-attr-num-scan-inputs-body-partition.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15170,15 +14064,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array([[0], [1]], dtype=np.int64), name="indices"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-gathernd-ref-attr-batch-dims.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-gathernd-ref-attr-batch-dims.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15290,12 +14178,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
         path = tmp_path / f"function-{transform.lower()}-ref-attr-scan-extent.onnx"
         onnx.save(model, str(path))
@@ -15346,15 +14229,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 12), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function], opset=12)
         onnx.checker.check_model(model)
-        path = tmp_path / "function-squeeze-ref-attr-axes-matrix-rank.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-squeeze-ref-attr-axes-matrix-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15404,15 +14281,9 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-runtime-rank-overrides-stale-output.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-runtime-rank-overrides-stale-output.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15449,11 +14320,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "alias-fanout-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "alias-fanout-deferred-lineage-gap.onnx")
 
         previous_digit_limit = get_int_max_str_digits()
         set_int_max_str_digits(640)
@@ -15493,11 +14361,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "rank-transform-promotes-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "rank-transform-promotes-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15522,33 +14387,7 @@ class TestWeightDistributionSemantics:
             )
             for source_name in source_names
         ]
-        condition_counter = 0
-
-        def combine_branches(branches: list[Any]) -> Any:
-            nonlocal condition_counter
-            if len(branches) == 1:
-                return branches[0]
-            midpoint = len(branches) // 2
-            left = combine_branches(branches[:midpoint])
-            right = combine_branches(branches[midpoint:])
-            condition_index = condition_counter
-            condition_counter += 1
-            output_name = f"branch_out_{condition_index}"
-            node = helper.make_node(
-                "If",
-                [f"C{condition_index}"],
-                [output_name],
-                then_branch=left,
-                else_branch=right,
-            )
-            return helper.make_graph(
-                [node],
-                f"branch_{condition_index}",
-                [],
-                [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, None)],
-            )
-
-        branch = combine_branches(leaves)
+        branch, condition_count = _balanced_if_graph(leaves)
         selected = branch.output[0].name
         graph = helper.make_graph(
             [
@@ -15560,19 +14399,13 @@ class TestWeightDistributionSemantics:
             "unsqueeze_then_squeeze_keeps_promoted_vector_gap_nonweight",
             [
                 helper.make_tensor_value_info("X", TensorProto.FLOAT, [4]),
-                *[
-                    helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, [])
-                    for index in range(condition_counter)
-                ],
+                *[helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, []) for index in range(condition_count)],
             ],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "unsqueeze-squeeze-keeps-promoted-vector-gap-nonweight.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "unsqueeze-squeeze-keeps-promoted-vector-gap-nonweight.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15611,20 +14444,13 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [16])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "flatten-preserves-broadcast-rank-for-deferred-scalar-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "flatten-preserves-broadcast-rank-for-deferred-scalar-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_unsqueeze_alias_preserves_broadcast_rank_for_deferred_scalar_gap(self, tmp_path: Path) -> None:
         scalar_names = [f"scalar_source{index}" for index in range(40)]
@@ -15647,20 +14473,13 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("runtime_matrix", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "unsqueeze-preserves-broadcast-rank-for-deferred-scalar-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "unsqueeze-preserves-broadcast-rank-for-deferred-scalar-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=8)
 
     def test_unsqueeze_alias_rank_one_near_match_stays_clean(self, tmp_path: Path) -> None:
         scalar_names = [f"scalar_source{index}" for index in range(40)]
@@ -15683,11 +14502,8 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("runtime_vector", TensorProto.FLOAT, [1])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "unsqueeze-rank-one-near-match-stays-clean.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "unsqueeze-rank-one-near-match-stays-clean.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15750,9 +14566,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"{op_type.lower()}-runtime-rank-transform-broadcast-rank-{len(runtime_dims)}.onnx"
         onnx.save(model, str(path))
@@ -15810,11 +14624,8 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "reshape-runtime-activation-broadcast-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "reshape-runtime-activation-broadcast-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15856,10 +14667,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        path = tmp_path / "overridable-initializer-input-default-rank.onnx"
-        onnx.save(model, str(path))
+        model = _onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "overridable-initializer-input-default-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15916,12 +14725,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_shape)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"overridable-symbolic-rank-{expect_success}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"overridable-symbolic-rank-{expect_success}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -15957,11 +14763,8 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "root-input-rank-metadata-collision.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "root-input-rank-metadata-collision.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16065,33 +14868,7 @@ class TestWeightDistributionSemantics:
                 )
             )
 
-        condition_counter = 0
-
-        def combine_branches(branches: list[Any]) -> Any:
-            nonlocal condition_counter
-            if len(branches) == 1:
-                return branches[0]
-            midpoint = len(branches) // 2
-            left = combine_branches(branches[:midpoint])
-            right = combine_branches(branches[midpoint:])
-            condition_index = condition_counter
-            condition_counter += 1
-            output_name = f"branch_out_{condition_index}"
-            node = helper.make_node(
-                "If",
-                [f"C{condition_index}"],
-                [output_name],
-                then_branch=left,
-                else_branch=right,
-            )
-            return helper.make_graph(
-                [node],
-                f"branch_{condition_index}",
-                [],
-                [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, None)],
-            )
-
-        branch = combine_branches(leaves)
+        branch, condition_count = _balanced_if_graph(leaves)
         selected = branch.output[0].name
         graph = helper.make_graph(
             [
@@ -16103,19 +14880,13 @@ class TestWeightDistributionSemantics:
             [
                 helper.make_tensor_value_info("runtime_matrix", TensorProto.FLOAT, [1, 4]),
                 helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
-                *[
-                    helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, [])
-                    for index in range(condition_counter)
-                ],
+                *[helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, []) for index in range(condition_count)],
             ],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "broadcast-promotion-adds-existing-weight-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "broadcast-promotion-adds-existing-weight-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16139,11 +14910,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-rank-transform-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-rank-transform-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16171,11 +14939,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "rank-reducing-transform-demotes-deferred-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "rank-reducing-transform-demotes-deferred-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16282,20 +15047,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "rank-reducing-restoring-transform-promotes-deferred-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "rank-reducing-restoring-transform-promotes-deferred-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=8)
 
     def test_expand_promotes_deferred_vector_lineage_gap_to_weight_gap(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -16325,20 +15083,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "expand-promotes-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "expand-promotes-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_integer_expand_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -16368,11 +15119,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-expand-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-expand-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16411,20 +15159,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "gather-promotes-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "gather-promotes-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_integer_gather_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -16454,11 +15195,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-gather-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-gather-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16497,20 +15235,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "gathernd-promotes-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "gathernd-promotes-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_integer_gathernd_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -16540,11 +15271,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-gathernd-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-gathernd-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16581,20 +15309,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "broadcast-promotes-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "broadcast-promotes-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     @pytest.mark.parametrize("op_type", ["Add", "PRelu"])
     @pytest.mark.parametrize(
@@ -16641,9 +15362,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"{op_type.lower()}-runtime-alias-broadcast-rank-{len(runtime_dims)}.onnx"
         onnx.save(model, str(path))
@@ -16705,12 +15424,10 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("generated_weight", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         if runtime_shape is not None:
             onnx.checker.check_model(model)
-        path = tmp_path / f"unknown-rank-elementwise-output-gap-{expect_gap}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"unknown-rank-elementwise-output-gap-{expect_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16760,19 +15477,12 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("dynamic_alias", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "lineage-free-dynamic-rank-untrusted.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "lineage-free-dynamic-rank-untrusted.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     @pytest.mark.parametrize(
         ("runtime_shape", "x_dims", "y_dims", "expect_gap"),
@@ -16807,13 +15517,11 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         if runtime_shape is not None:
             onnx.checker.check_model(model)
             onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"unknown-rank-new-scalar-gap-{expect_gap}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"unknown-rank-new-scalar-gap-{expect_gap}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -16898,9 +15606,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"{transform.lower()}-broadcast-rank-{len(runtime_dims)}.onnx"
         onnx.save(model, str(path))
 
@@ -16973,11 +15679,10 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"clip-{bound_count + 1}-input-initializer-bounds-broadcast-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(
+            model, tmp_path / f"clip-{bound_count + 1}-input-initializer-bounds-broadcast-rank.onnx"
+        )
 
         result = OnnxScanner().scan(str(path))
 
@@ -17033,20 +15738,13 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("mask_float", TensorProto.FLOAT, [4]),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "dropout-mask-broadcast-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "dropout-mask-broadcast-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_expand_uses_broadcast_shape_for_weight_lineage_rank(self, tmp_path: Path) -> None:
         initializers = [
@@ -17064,20 +15762,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 3])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "expand-broadcast-weight-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "expand-broadcast-weight-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_concat_preserves_rank_for_deferred_scalar_gap(self, tmp_path: Path) -> None:
         initializers = [
@@ -17104,20 +15795,13 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [8])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "concat-broadcast-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "concat-broadcast-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_integer_broadcast_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -17145,11 +15829,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-broadcast-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-broadcast-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -17202,20 +15883,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "loop-scan-output-promotes-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "loop-scan-output-promotes-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
     def test_loop_scan_output_keeps_deferred_scalar_lineage_gap_nonweight(
@@ -17279,9 +15953,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         path = tmp_path / f"{control_flow_op.lower()}-scalar-output-deferred-gap.onnx"
         onnx.save(model, str(path))
 
@@ -17397,9 +16069,7 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info(previous, TensorProto.FLOAT, [])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"{control_flow_op.lower()}-size-unknown-rank-scalar-gap.onnx"
         onnx.save(model, str(path))
@@ -17455,11 +16125,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-loop-scan-output-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-loop-scan-output-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -17533,9 +16200,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"{control_flow_op.lower()}-cast-stacked-non-shape-summary.onnx"
         onnx.save(model, str(path))
@@ -17543,11 +16208,7 @@ class TestWeightDistributionSemantics:
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_scan_output_promotes_deferred_vector_lineage_gap_to_weight_gap(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -17583,20 +16244,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "scan-output-promotes-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "scan-output-promotes-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     @pytest.mark.parametrize("scan_output_axes", [(1,), (-1,)])
     def test_scan_output_axes_promote_deferred_vector_lineage_gap_to_weight_gap(
@@ -17642,20 +16296,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"scan-output-axis-{scan_output_axes[0]}-deferred-vector-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / f"scan-output-axis-{scan_output_axes[0]}-deferred-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     def test_integer_scan_output_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -17691,11 +16338,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-scan-output-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-scan-output-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -17729,20 +16373,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "dynamic-expand-deferred-matrix-weight-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "dynamic-expand-deferred-matrix-weight-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     @pytest.mark.parametrize("op_type", ["Expand", "Gather"])
     @pytest.mark.parametrize("overridable_control", [False, True])
@@ -17785,9 +16422,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"{op_type.lower()}-overridable-rank-control-{overridable_control}.onnx"
         onnx.save(model, str(path))
@@ -17836,11 +16471,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-dynamic-expand-deferred-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-dynamic-expand-deferred-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -17874,11 +16506,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "dropped-activation-lineage-gap-used-as-weight.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "dropped-activation-lineage-gap-used-as-weight.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -17940,11 +16569,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "dropped-raw-gap-retained-activation-lineages.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "dropped-raw-gap-retained-activation-lineages.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -17985,11 +16611,8 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("squeezed", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "symbolic-no-axes-squeeze-stale-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "symbolic-no-axes-squeeze-stale-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18071,11 +16694,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / f"if-output-rank-conflict-then-{then_rank}-else-{else_rank}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"if-output-rank-conflict-then-{then_rank}-else-{else_rank}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18139,11 +16760,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "if-output-rank-conflict-clears-stale-rank.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "if-output-rank-conflict-clears-stale-rank.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18182,11 +16800,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "lexical-subgraph-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "lexical-subgraph-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18215,20 +16830,13 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "cast-promotes-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "cast-promotes-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
         assert result.success is False
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
-        assert semantics["analyzed_layer_count"] == 0
+        self._assert_unanalyzed_lineage_gap_count(result, expected_count=1)
 
     @pytest.mark.parametrize(
         ("output_dims", "x_dims", "y_dims", "expect_gap"),
@@ -18270,9 +16878,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"float-cast-transformed-non-shape-gap-rank-{len(output_dims)}.onnx"
         onnx.save(model, str(path))
@@ -18330,9 +16936,7 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.ones(source_dims, dtype=np.int64), name=name) for name in source_names
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"float-cast-integer-gap-rank-{len(source_dims)}.onnx"
         onnx.save(model, str(path))
@@ -18371,11 +16975,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [None, None])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-cast-deferred-lineage-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-cast-deferred-lineage-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18404,11 +17005,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-cast-clears-float-rank-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-cast-clears-float-rank-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18435,11 +17033,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.INT64, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "integer-cast-clears-existing-weight-gap.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "integer-cast-clears-existing-weight-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18474,15 +17069,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "custom-scan-function-output-vector-gap.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "custom-scan-function-output-vector-gap.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18523,15 +17112,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "function-independent-output-gap-scope.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "function-independent-output-gap-scope.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18561,7 +17144,7 @@ class TestWeightDistributionSemantics:
             opset_imports=[helper.make_opsetid("", 13)],
         )
         weight_input = "state_from_function" if state_output_feeds_weight else "clean_from_function"
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "StateAndClean",
@@ -18575,15 +17158,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "local_function_precise_loop_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[1, 4],
         )
         graph = helper.make_graph(
             [
@@ -18606,15 +17182,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / f"local-function-precise-loop-taint-{state_output_feeds_weight}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"local-function-precise-loop-taint-{state_output_feeds_weight}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -18652,7 +17222,7 @@ class TestWeightDistributionSemantics:
                 helper.make_tensor_value_info("inner_next_clean", TensorProto.FLOAT, [4, 1]),
             ],
         )
-        outer_body = helper.make_graph(
+        outer_body = _float_state_loop_body(
             [
                 helper.make_node(
                     "Loop",
@@ -18666,15 +17236,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "nested_loop_precise_taint_outer_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[1, 4],
         )
         graph = helper.make_graph(
             [
@@ -18698,19 +17261,12 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "nested-loop-precise-taint.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "nested-loop-precise-taint.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is True
-        assert coverage == []
-        assert semantics["coverage_gaps"] == {}
+        self._assert_lineage_limit_coverage(result, expected_gap=False)
 
     def _write_local_function_rank_reentry_fanout_model(
         self,
@@ -18780,7 +17336,7 @@ class TestWeightDistributionSemantics:
                     attributes=[tag_attribute],
                 )
             )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
                 helper.make_node(
@@ -18794,15 +17350,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "local_function_rank_reentry_fanout_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[4],
         )
         graph = helper.make_graph(
             [
@@ -18822,17 +17371,10 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=functions,
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, functions)
         onnx.checker.check_model(model)
         suffix = "distinct" if distinct_cache_tags else "same"
-        path = tmp_path / f"local-function-rank-reentry-fanout-{suffix}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"local-function-rank-reentry-fanout-{suffix}.onnx")
 
     @pytest.mark.parametrize("distinct_cache_tags", [False, True])
     @pytest.mark.parametrize(("width", "depth"), [(6, 5), (10, 2)])
@@ -18941,17 +17483,10 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="unsqueeze_axis"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model, full_check=True)
         mode = "shared" if shared_dependency else "direct"
-        path = tmp_path / f"local-function-repeated-alias-{mode}-{matrix_output}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"local-function-repeated-alias-{mode}-{matrix_output}.onnx")
 
     def test_repeated_local_function_alias_taint_is_grouped(self, tmp_path: Path) -> None:
         width = 16
@@ -19088,7 +17623,7 @@ class TestWeightDistributionSemantics:
         assert fanout_promotion_calls <= width
 
     def _write_conditional_loop_single_iteration_slope_model(self, tmp_path: Path) -> Path:
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("PRelu", ["activation", "state"], ["unused_activation"]),
                 helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
@@ -19100,15 +17635,8 @@ class TestWeightDistributionSemantics:
                 ),
             ],
             "conditional_loop_single_iteration_slope_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[1, 2],
             initializer=[
                 onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="activation"),
                 onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
@@ -19137,12 +17665,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "conditional-loop-single-iteration-slope.onnx"
-        onnx.save(model, str(path))
-        return path
+        model = _checked_onnx_model(graph)
+        return _save_onnx_model(model, tmp_path / "conditional-loop-single-iteration-slope.onnx")
 
     def test_repeated_loop_treats_body_condition_as_trip_count_bound(self, tmp_path: Path) -> None:
         result = OnnxScanner().scan(str(self._write_conditional_loop_single_iteration_slope_model(tmp_path)))
@@ -19195,12 +17719,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "repeated-loop-evolving-sibling-shape.onnx"
-        onnx.save(model, str(path))
-        return path
+        model = _checked_onnx_model(graph)
+        return _save_onnx_model(model, tmp_path / "repeated-loop-evolving-sibling-shape.onnx")
 
     def test_repeated_loop_replays_current_sibling_shapes(self, tmp_path: Path) -> None:
         result = OnnxScanner().scan(str(self._write_repeated_loop_evolving_sibling_shape_model(tmp_path)))
@@ -19229,22 +17749,15 @@ class TestWeightDistributionSemantics:
             [helper.make_node("Identity", [clean_inputs[0]], ["out"])],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("NoConsumer", clean_inputs, ["dead_out"], domain="local"),
                 helper.make_node("Identity", ["state"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "dead_local_function_inputs_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[2],
         )
         graph = helper.make_graph(
             [
@@ -19266,15 +17779,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "dead-local-function-inputs.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "dead-local-function-inputs.onnx")
 
         original_potential_weight_input = onnx_scanner_module._onnx_potential_weight_input
         local_function_helper_input_checks = 0
@@ -19351,7 +17858,7 @@ class TestWeightDistributionSemantics:
             ],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Pair", ["state"], ["first_left", "first_right"], domain="local"),
                 helper.make_node("Pair", ["state"], ["second_left", "second_right"], domain="local"),
@@ -19359,15 +17866,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "local_function_cached_shape_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[2],
         )
         graph = helper.make_graph(
             [
@@ -19388,16 +17888,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "local-function-cached-shape.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / "local-function-cached-shape.onnx")
 
     def test_repeated_local_function_cache_hit_restores_all_output_shapes(self, tmp_path: Path) -> None:
         result = OnnxScanner().scan(str(self._write_repeated_local_function_cached_shape_model(tmp_path)))
@@ -19427,7 +17920,7 @@ class TestWeightDistributionSemantics:
             opset_imports=[helper.make_opsetid("", 13)],
         )
         second_clean_name = "clean_matrix" if matrix_clean_output else "clean_vector"
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Pair", ["state", "clean_vector"], ["first_state", "first_clean"], domain="local"),
                 helper.make_node(
@@ -19437,15 +17930,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "local_function_clean_output_shape_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2] if matrix_clean_output else [2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[2, 2] if matrix_clean_output else [2],
         )
         graph_nodes = [helper.make_node("Sum", source_names, ["initial_state"])] if capped_initial_state else []
         graph_nodes.append(
@@ -19477,17 +17963,10 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="clean_matrix"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
         mode = "matrix" if matrix_clean_output else "vector"
-        path = tmp_path / f"local-function-clean-output-shape-{mode}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"local-function-clean-output-shape-{mode}.onnx")
 
     def test_repeated_local_function_cache_restores_only_dependency_covered_shapes(self, tmp_path: Path) -> None:
         benign_result = OnnxScanner().scan(
@@ -19555,22 +18034,15 @@ class TestWeightDistributionSemantics:
             [helper.make_node("Identity", ["clean_input"], ["clean_output"])],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("CleanOnly", function_actuals, ["clean_output"], domain="local"),
                 helper.make_node("Add", ["state", "clean_output"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "local_function_clean_only_output_shape_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2] if matrix_clean_output else [2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[2, 2] if matrix_clean_output else [2],
         )
         graph = helper.make_graph(
             [
@@ -19594,17 +18066,10 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="clean_matrix"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
         mode = "matrix" if matrix_clean_output else "vector"
-        path = tmp_path / f"local-function-clean-only-output-shape-{mode}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"local-function-clean-only-output-shape-{mode}.onnx")
 
     def test_repeated_local_function_cache_restores_downstream_clean_only_output_shape(self, tmp_path: Path) -> None:
         benign_result = OnnxScanner().scan(
@@ -19686,21 +18151,14 @@ class TestWeightDistributionSemantics:
                     opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
                 )
             )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Nested0", ["state"], ["next_state"], domain="local"),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "recursive_local_function_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 4]),
-            ],
+            state_shape=[4],
+            next_state_shape=[1, 4],
         )
         graph = helper.make_graph(
             [
@@ -19721,16 +18179,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=functions,
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, functions)
         onnx.checker.check_model(model)
-        path = tmp_path / "recursive-local-function-promotion.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / "recursive-local-function-promotion.onnx")
 
     def test_recursive_local_function_rank_promotion_fails_closed(self, tmp_path: Path) -> None:
         result = OnnxScanner().scan(str(self._write_recursive_local_function_promotion_model(tmp_path, depth=8)))
@@ -19765,7 +18216,7 @@ class TestWeightDistributionSemantics:
             ],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node("Unsqueeze", ["state", "axes"], ["matrix_state"]),
                 helper.make_node(
@@ -19777,15 +18228,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "promoted_local_function_identity_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[1, 2],
         )
         graph_nodes = []
         if capped_initial_state:
@@ -19822,17 +18266,10 @@ class TestWeightDistributionSemantics:
             outputs,
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
         mode = "capped" if capped_initial_state else "clean"
-        path = tmp_path / f"promoted-local-function-identity-{mode}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"promoted-local-function-identity-{mode}.onnx")
 
     def test_promoted_local_function_input_preserves_all_tainted_outputs(self, tmp_path: Path) -> None:
         benign_result = OnnxScanner().scan(
@@ -19893,12 +18330,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "context-prefix-loop.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / "context-prefix-loop.onnx")
 
     def test_trusted_context_shape_keys_are_scoped_to_dependencies(self, tmp_path: Path) -> None:
         width = 32
@@ -20022,7 +18456,7 @@ class TestWeightDistributionSemantics:
             [helper.make_node("Identity", ["clean_input"], ["clean_output"])],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "Size",
@@ -20034,15 +18468,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "local_size_function_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2] if matrix_clean_output else [2]),
-            ],
+            state_shape=[2],
+            next_state_shape=[2, 2] if matrix_clean_output else [2],
         )
         graph = helper.make_graph(
             [
@@ -20066,17 +18493,10 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="clean_matrix"),
             ],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model, full_check=True)
         mode = "matrix" if matrix_clean_output else "vector"
-        path = tmp_path / f"local-size-function-output-shape-{mode}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"local-size-function-output-shape-{mode}.onnx")
 
     def test_local_size_function_does_not_impersonate_standard_size(self, tmp_path: Path) -> None:
         benign_result = OnnxScanner().scan(
@@ -20114,7 +18534,7 @@ class TestWeightDistributionSemantics:
             ],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             [
                 helper.make_node(
                     "Add",
@@ -20126,15 +18546,8 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "local_add_function_output_shape_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
-            ],
+            state_shape=None,
+            next_state_shape=None,
         )
         graph = helper.make_graph(
             [
@@ -20158,24 +18571,14 @@ class TestWeightDistributionSemantics:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2])],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "local-add-function-output-shape.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "local-add-function-output-shape.onnx")
 
         result = OnnxScanner().scan(str(path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        self._assert_lineage_limit_coverage(result, expected_gap=True)
 
     def test_dead_reentry_nodes_are_skipped_before_input_walk(self, tmp_path: Path) -> None:
         state_count = 80
@@ -20246,11 +18649,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.ones((split_width,), dtype=np.float32), name="dead_vector"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "dead-wide-reentry.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "dead-wide-reentry.onnx")
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         comprehension_fields: dict[int, str] = {}
         for syntax_node in ast.walk(ast.parse(scanner_path.read_text())):
@@ -20362,15 +18763,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, [function])
         onnx.checker.check_model(model)
-        path = tmp_path / "local-function-scan-preserves-proven-input-extent.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "local-function-scan-preserves-proven-input-extent.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20420,11 +18815,8 @@ class TestWeightDistributionSemantics:
             initializer=initializers,
             value_info=[helper.make_tensor_value_info("state_vector", TensorProto.FLOAT, [4])],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "runtime-bookkeeping-recurrent-marker-compaction.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / "runtime-bookkeeping-recurrent-marker-compaction.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20491,11 +18883,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((10, 5), dtype=np.float32), name="W2"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "slice-bounds-control-lineage.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / "slice-bounds-control-lineage.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20526,11 +18915,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 100])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "generated-table.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "generated-table.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20573,11 +18959,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "dimension-weights.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "dimension-weights.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20635,11 +19018,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "shape-dimension-lineage-fanout.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "shape-dimension-lineage-fanout.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20737,11 +19117,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "dimension-roles.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "dimension-roles.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20790,11 +19167,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros(opposite_shape, dtype=np.float32), name="X"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "runtime-adjusted-weights.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "runtime-adjusted-weights.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20832,12 +19206,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="target_shape"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph)
         mode = "overridable" if overridable_shape else "constant"
-        path = tmp_path / f"initializer-backed-shape-control-{mode}.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / f"initializer-backed-shape-control-{mode}.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20916,11 +19287,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "shape-control-ownership.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "shape-control-ownership.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -20975,11 +19343,9 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", value_dtype, [1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
+        model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "shape-size-integer-summary.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "shape-size-integer-summary.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21014,11 +19380,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
             initializer=[onnx.numpy_helper.from_array(np.ones((2, 4), dtype=np.float32), name="source")],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "expanded-shape-and-values.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "expanded-shape-and-values.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21064,8 +19427,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=opsets)
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / "shape-control-data-operations.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "shape-control-data-operations.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21209,9 +19571,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
+        model = _checked_onnx_model(graph, opset=14)
         path = tmp_path / f"{op_type.lower()}-state-generated-weight.onnx"
         onnx.save(model, str(path))
 
@@ -21262,11 +19622,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((hidden_size, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "recurrent-sequence-left-operand.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / "recurrent-sequence-left-operand.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21322,11 +19679,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((hidden_size, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"recurrent-{generated_source}-vector-left-operand.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / f"recurrent-{generated_source}-vector-left-operand.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21374,11 +19728,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((hidden_size, 1), dtype=np.float32), name="projection"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "merged-recurrent-final-state-vector-left-operand.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / "merged-recurrent-final-state-vector-left-operand.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21436,11 +19787,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array([hidden_size, 1], dtype=np.int64), name="weight_shape"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "chained-recurrent-final-state-marker.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / "chained-recurrent-final-state-marker.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21485,11 +19833,8 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((1, 1, hidden_size), dtype=np.float32), name="initial_h"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / f"direct-recurrent-{generated_source}-weight.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / f"direct-recurrent-{generated_source}-weight.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21543,11 +19888,8 @@ class TestWeightDistributionSemantics:
         if combination == "where_runtime":
             graph.input.append(helper.make_tensor_value_info("condition", TensorProto.BOOL, [2]))
             del graph.initializer[1]
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "mixed-dimension-weights.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "mixed-dimension-weights.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21606,11 +19948,8 @@ class TestWeightDistributionSemantics:
         if mask_operator != "input":
             graph.input[1].CopyFrom(helper.make_tensor_value_info("mask_values", TensorProto.FLOAT, [1, 10]))
             graph.node.insert(3, helper.make_node(mask_operator, ["hidden", "mask_values"], ["mask"]))
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "runtime-mask.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph)
+        path = _save_onnx_model(model, tmp_path / "runtime-mask.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21944,11 +20283,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "batchnorm-activation-side-gemm.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / "batchnorm-activation-side-gemm.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -21995,11 +20331,8 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
             initializer=initializers,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        path = tmp_path / "reshape-shape-controls-stay-layout.onnx"
-        onnx.save(model, str(path))
+        model = _checked_onnx_model(graph, opset=14)
+        path = _save_onnx_model(model, tmp_path / "reshape-shape-controls-stay-layout.onnx")
 
         result = OnnxScanner().scan(str(path))
 
@@ -22563,16 +20896,9 @@ def _write_safe_external_data_then_failure_onnx(
 class TestOnnxReviewShapeRegressions:
     @staticmethod
     def _save(graph: Any, tmp_path: Path, *, opset: int = 18, functions: Any = ()) -> Path:
-        model = helper.make_model(
-            graph,
-            opset_imports=[helper.make_opsetid("", opset), helper.make_opsetid("local", 1)],
-            functions=functions,
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, functions, opset=opset)
         onnx.checker.check_model(model)
-        path = tmp_path / f"{graph.name}.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / f"{graph.name}.onnx")
 
     @staticmethod
     def _assert_clean(path: Path) -> None:
@@ -24779,10 +23105,8 @@ class TestRawDetectorCoverage:
         output = helper.make_tensor_value_info("output", TensorProto.UINT8, [len(payload)])
         node = helper.make_node("Identity", ["W"], ["output"], name="identity")
         graph = helper.make_graph([node], "raw_tensor_graph", [], [output], initializer=[tensor])
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        model_path = tmp_path / "raw-tensor-ip.onnx"
-        onnx.save(model, str(model_path))
+        model = _onnx_model(graph)
+        model_path = _save_onnx_model(model, tmp_path / "raw-tensor-ip.onnx")
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
@@ -24807,11 +23131,8 @@ class TestRawDetectorCoverage:
         output = helper.make_tensor_value_info("output", TensorProto.STRING, [1])
         node = helper.make_node("Identity", ["S"], ["output"], name="identity")
         graph = helper.make_graph([node], "string_initializer_graph", [], [output], initializer=[tensor])
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        model_path = tmp_path / "string-initializer-url.onnx"
-        onnx.save(model, str(model_path))
+        model = _checked_onnx_model(graph)
+        model_path = _save_onnx_model(model, tmp_path / "string-initializer-url.onnx")
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
@@ -24835,11 +23156,8 @@ class TestRawDetectorCoverage:
         output = helper.make_tensor_value_info("output", TensorProto.STRING, [1])
         node = helper.make_node("Constant", [], ["output"], name="constant", value=tensor)
         graph = helper.make_graph([node], "constant_string_graph", [], [output])
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-        model.ir_version = 8
-        onnx.checker.check_model(model)
-        model_path = tmp_path / "constant-string-url.onnx"
-        onnx.save(model, str(model_path))
+        model = _checked_onnx_model(graph)
+        model_path = _save_onnx_model(model, tmp_path / "constant-string-url.onnx")
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
@@ -25158,20 +23476,7 @@ class TestRawDetectorCoverage:
         )
 
     def test_network_detector_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(model_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "contact"
-        metadata.value = "owner@company.com"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert not failed_network_checks
-        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+        self._assert_onnx_metadata_network_clean(tmp_path, "contact", "owner@company.com")
 
     def test_network_detector_extensionless_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
         source_path = create_onnx_model(tmp_path, include_initializer=False)
@@ -25179,8 +23484,7 @@ class TestRawDetectorCoverage:
         metadata = model.metadata_props.add()
         metadata.key = "contact"
         metadata.value = "owner@company.com"
-        model_path = tmp_path / "metadata-contact"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "metadata-contact")
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
@@ -25191,22 +23495,8 @@ class TestRawDetectorCoverage:
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_extensionless_metadata_callback_domain_remains_actionable(self, tmp_path: Path) -> None:
-        source_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(source_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "callback"
-        metadata.value = "host evil.com"
-        model_path = tmp_path / "metadata-callback"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert any(
-            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
-            for check in failed_network_checks
+        self._assert_onnx_metadata_network_actionable(
+            tmp_path, "host evil.com", "metadata-callback", "domain", "evil.com"
         )
 
     def test_network_detector_extensionless_metadata_callback_domain_uses_full_value(self, tmp_path: Path) -> None:
@@ -25215,8 +23505,7 @@ class TestRawDetectorCoverage:
         metadata = model.metadata_props.add()
         metadata.key = "callback"
         metadata.value = ("A" * 129) + " evil.com"
-        model_path = tmp_path / "metadata-callback-padded"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "metadata-callback-padded")
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
@@ -25229,20 +23518,9 @@ class TestRawDetectorCoverage:
         )
 
     def test_network_detector_metadata_prose_import_requests_stays_clean(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(model_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "documentation"
-        metadata.value = "This documentation shows how to import requests for the example"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert not failed_network_checks
-        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+        self._assert_onnx_metadata_network_clean(
+            tmp_path, "documentation", "This documentation shows how to import requests for the example"
+        )
 
     def test_network_detector_metadata_documentation_port_stays_clean(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
@@ -25266,8 +23544,7 @@ class TestRawDetectorCoverage:
         metadata = model.metadata_props.add()
         metadata.key = "documentation"
         metadata.value = "The local example uses localhost:8080"
-        model_path = tmp_path / "metadata-doc-port"
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / "metadata-doc-port")
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
@@ -25278,41 +23555,13 @@ class TestRawDetectorCoverage:
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_extensionless_metadata_callback_port_remains_actionable(self, tmp_path: Path) -> None:
-        source_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(source_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "callback"
-        metadata.value = "connect port=6379"
-        model_path = tmp_path / "metadata-callback-port"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert any(
-            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
-            for check in failed_network_checks
+        self._assert_onnx_metadata_network_actionable(
+            tmp_path, "connect port=6379", "metadata-callback-port", "type", "suspicious_port"
         )
 
     def test_network_detector_pb_metadata_port_remains_actionable(self, tmp_path: Path) -> None:
-        source_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(source_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "callback"
-        metadata.value = "connect port=6379"
-        model_path = tmp_path / "model.pb"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert any(
-            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
-            for check in failed_network_checks
+        self._assert_onnx_metadata_network_actionable(
+            tmp_path, "connect port=6379", "model.pb", "type", "suspicious_port"
         )
 
     def test_network_detector_nonmetadata_url_remains_actionable(self, tmp_path: Path) -> None:
@@ -25606,8 +23855,7 @@ class TestRawDetectorCoverage:
         metadata = model.metadata_props.add()
         metadata.key = "callback"
         metadata.value = metadata_value
-        model_path = tmp_path / filename
-        onnx.save(model, str(model_path))
+        model_path = _save_onnx_model(model, tmp_path / filename)
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
@@ -28391,10 +26639,7 @@ class TestOnnxRecurrentConsumerReviewRegressions:
                 self._tensor("shape", [64, 64], np.int64),
             ],
         )
-        model = helper.make_model(
-            graph, functions=[function], opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)]
-        )
-        model.ir_version = 10
+        model = _local_function_model(graph, [function], opset=18, ir_version=10)
         onnx.checker.check_model(model, full_check=True)
         path = tmp_path / "bound_capture.onnx"
         onnx.save(model, path)
@@ -30469,8 +28714,7 @@ class TestOnnxBindingAndTerminationProofs:
 
         model = self._attribute_loop_model(width, attributes, referenced)
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "attributes.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "attributes.onnx")
         actual: Any = ReferenceEvaluator(model).run(None, {})
         assert len(actual) == width
         assert all(np.array_equal(array, np.ones(1, np.float32)) for array in actual)
@@ -30515,8 +28759,7 @@ class TestOnnxBindingAndTerminationProofs:
         assert len(actual) == width + 1
         assert all(np.array_equal(array, np.ones(1, np.float32)) for array in actual[:-1])
         np.testing.assert_array_equal(actual[-1], np.ones((1, 64), np.float32) @ weights)
-        path = tmp_path / "exhausted_attributes.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "exhausted_attributes.onnx")
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 8)
         node_visits = 0
 
@@ -30555,9 +28798,7 @@ class TestOnnxLoopControlProofs:
     def _save(model: Any, tmp_path: Path, *, validate: bool = True) -> Path:
         if validate:
             onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "loop_controls.onnx"
-        onnx.save(model, str(path))
-        return path
+        return _save_onnx_model(model, tmp_path / "loop_controls.onnx")
 
     @staticmethod
     def _inline_with_defaults(model: Any) -> Any:
@@ -31632,8 +29873,7 @@ class TestOnnxProvenShapesAndScanExtents:
         onnx.checker.check_model(model)
         actual: Any = ReferenceEvaluator(model).run(None, feeds)
         np.testing.assert_array_equal(actual[0], feeds["X"] @ weights)
-        path = tmp_path / "unproven-gathernd-dimensions.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "unproven-gathernd-dimensions.onnx")
         plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
         assert plan.coverage_gaps
         if capped:
@@ -37175,8 +35415,7 @@ class TestOnnxEmptyScan8BatchRegressions:
             [helper.make_tensor_value_info("scores", TensorProto.FLOAT, [batch_size, 1, 1, 1])],
             initializer=tensors,
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
+        model = _onnx_model(graph, opset=8)
         onnx.checker.check_model(model, full_check=True)
         return model
 
@@ -37274,8 +35513,7 @@ class TestOnnxEmptyScan8BatchRegressions:
                 onnx.numpy_helper.from_array(np.zeros((batch_size, 1, 1, 64), np.float32), name="sequence"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-        model.ir_version = 8
+        model = _onnx_model(graph, opset=8)
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "unused-body-weight.onnx")
         result = scanner_type().scan(str(path))
@@ -37595,8 +35833,7 @@ class TestOnnxPrimaryConstantBudgets:
             [],
             [helper.make_tensor_value_info(f"value_{index}", data_type, [count]) for index, count in enumerate(counts)],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-        model.ir_version = 9
+        model = _onnx_model(graph, opset=18, ir_version=9)
         onnx.checker.check_model(model, full_check=True)
         return model
 
@@ -37627,12 +35864,7 @@ class TestOnnxPrimaryConstantBudgets:
             [],
             [helper.make_tensor_value_info(name, TensorProto.FLOAT, [4]) for name in ("a", "b", "c", "d")],
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 9
+        model = _local_function_model(graph, [function], opset=18, ir_version=9)
         onnx.checker.check_model(model, full_check=True)
         return model
 
@@ -37755,8 +35987,7 @@ class TestOnnxPrimaryConstantBudgets:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
             initializer=[onnx.numpy_helper.from_array(np.array([2, 2], np.int64), name="shape")],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-        model.ir_version = 9
+        model = _onnx_model(graph, opset=18, ir_version=9)
         onnx.checker.check_model(model, full_check=True)
         analyzer = WeightDistributionScanner(config={"max_array_size": 0, "max_weight_distribution_total_bytes": 32})
         plan = _build_fixture_weight_plan(
@@ -37818,8 +36049,7 @@ class TestOnnxPrimaryConstantBudgets:
                 onnx.numpy_helper.from_array(np.array([100, 100], np.int64), name="shape"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-        model.ir_version = 9
+        model = _onnx_model(graph, opset=18, ir_version=9)
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "constant-budget.onnx")
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE", 32 * 1024)
@@ -37910,12 +36140,7 @@ class TestOnnxBoundWeightTransformAttributes:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, output_shape[1]])],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=functions,
-            opset_imports=[helper.make_opsetid("", opset), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 9
+        model = _local_function_model(graph, functions, opset=opset, ir_version=9)
         onnx.checker.check_model(model, full_check=True)
         return model
 
@@ -38379,12 +36604,7 @@ class TestOnnxFullPrCoverageReview:
             ],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=[function],
-            opset_imports=[helper.make_opsetid("", opset), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 9
+        model = _local_function_model(graph, [function], opset=opset, ir_version=9)
         onnx.checker.check_model(model, full_check=True)
         if binding_kind not in {"valid", "int64"}:
             malformed = onnx.AttributeProto(name="parameter")
@@ -39627,18 +37847,11 @@ class TestOnnxEinsumEquationBudgets:
             helper.make_node("Concat", [previous, "append"], ["next_state"], axis=0),
             helper.make_node("Identity", ["condition_in"], ["condition_out"]),
         ]
-        body = helper.make_graph(
+        body = _float_state_loop_body(
             body_nodes,
             "growing_vector_body",
-            [
-                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
-                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("state", TensorProto.FLOAT, [None]),
-            ],
-            [
-                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [None]),
-            ],
+            state_shape=[None],
+            next_state_shape=[None],
         )
         graph = helper.make_graph(
             [
@@ -39666,12 +37879,7 @@ class TestOnnxEinsumEquationBudgets:
             ],
             value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [1])],
         )
-        model = helper.make_model(
-            graph,
-            functions=functions,
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, functions)
         onnx.checker.check_model(model)
         values: Any = ReferenceEvaluator(model).run(None, {"known_X": np.ones((1, 64), np.float32)})
         np.testing.assert_array_equal(values[1], np.array([0, 1, 1, 1], np.float32))
@@ -40390,12 +38598,7 @@ class TestOnnxPrimaryEinsumEquationBudgets:
             [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 64]) for name in ["known", *result_names]],
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=functions,
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 8
+        model = _local_function_model(graph, functions)
         onnx.checker.check_model(model, full_check=True)
         values: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
         for value in values[1:]:
@@ -45184,8 +43387,7 @@ class TestOnnxFingerprintPrecopyAdmission:
         # This valid fixture is test-owned; construction/check/save are outside
         # observation. No ReferenceEvaluator executes the large tensor graph.
         onnx.checker.check_model(model, full_check=True)
-        path = tmp_path / "fingerprint-payload.onnx"
-        onnx.save(model, str(path))
+        path = _save_onnx_model(model, tmp_path / "fingerprint-payload.onnx")
         # Captured Add-only W must remain non-weight even above this array cap.
         # Attribute Constants use the existing default primary-copy allowance.
         config = {"max_array_size": 64 * 1024} if payload_kind == "captured_tensor" else {}
@@ -46645,12 +44847,7 @@ class TestOnnxConsumerInventoryAdmission:
             outputs,
             initializer=initializers,
         )
-        model = helper.make_model(
-            graph,
-            functions=local_functions,
-            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
-        )
-        model.ir_version = 9
+        model = _local_function_model(graph, local_functions, ir_version=9)
         onnx.checker.check_model(model)
         return model
 
