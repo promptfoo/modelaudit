@@ -1193,7 +1193,7 @@ def test_scan_preserves_unrelated_codec_global_before_validated_dtype_use(tmp_pa
 
     parser = _SafeJoblibUnpickler(io.BytesIO(payload))
     parser.load()
-    assert len(parser.codec_encode_global_ids) == 2
+    assert parser.control_reference_counts["_codecs.encode"] == 2
     assert len(parser.dtype_validation_context.validated_codec_encode_global_ids) == 1
 
     result = _scan_payload(tmp_path, payload, "unrelated_codec_global.joblib")
@@ -1210,7 +1210,7 @@ def test_scan_preserves_unvalidated_codec_when_python_object_ids_collide(
     parser = _SafeJoblibUnpickler(io.BytesIO(payload))
     parser.load()
 
-    assert len(parser.codec_encode_reduction_ids) == 2
+    assert parser.codec_encode_reductions == 2
     assert len(parser.dtype_validation_context.validated_codec_encode_reduction_ids) == 1
 
     monkeypatch.setattr("modelaudit.scanners.joblib_scanner.id", lambda _value: 7, raising=False)

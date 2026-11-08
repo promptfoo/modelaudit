@@ -3177,23 +3177,6 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
-_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = frozenset(
-    {
-        "BINPERSID",
-        "BUILD",
-        "EXT1",
-        "EXT2",
-        "EXT4",
-        "GLOBAL",
-        "INST",
-        "NEWOBJ",
-        "NEWOBJ_EX",
-        "OBJ",
-        "PERSID",
-        "REDUCE",
-        "STACK_GLOBAL",
-    }
-)
 _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
     {
         "BINPERSID",
@@ -3207,6 +3190,9 @@ _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
         "REDUCE",
         "STACK_GLOBAL",
     }
+)
+_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.union(
+    {"BUILD", "NEWOBJ", "NEWOBJ_EX"}
 )
 _PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
     {
@@ -4647,52 +4633,13 @@ def _pickle_structural_argument(
     if opcode_name in {"BINPUT", "BINGET", "PROTO", "EXT1"}:
         value = _read_pickle_structure_bytes(handle, sample, argument_offset, 1, file_size)
         return (False, None) if value is None else (True, value[0])
-    if opcode_name in {"LONG_BINPUT", "LONG_BINGET", "EXT4"}:
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 4, file_size)
+    if opcode_name in {"LONG_BINPUT", "LONG_BINGET", "EXT2", "EXT4"}:
+        width = 2 if opcode_name == "EXT2" else 4
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, width, file_size)
         return (False, None) if value is None else (True, int.from_bytes(value, "little"))
-    if opcode_name == "EXT2":
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 2, file_size)
-        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
-    if opcode_name in {"GLOBAL", "INST"}:
-        lines = _read_pickle_structure_bytes(
-            handle,
-            sample,
-            argument_offset,
-            argument_end - argument_offset,
-            file_size,
-        )
-        if lines is None:
-            return False, None
-        module_name, separator, remainder = lines.partition(b"\n")
-        global_name, second_separator, trailing = remainder.partition(b"\n")
-        if not module_name or not separator or not global_name or not second_separator or trailing:
-            return False, None
-        try:
-            argument_encoding = "ascii" if opcode_name == "INST" else "utf-8"
-            return True, (
-                "global_argument",
-                module_name.decode(argument_encoding),
-                global_name.decode(argument_encoding),
-            )
-        except UnicodeDecodeError:
-            return False, None
-    if opcode_name in {"PUT", "GET", "INT", "LONG", "FLOAT"}:
-        line = _read_pickle_structure_bytes(
-            handle,
-            sample,
-            argument_offset,
-            argument_end - argument_offset,
-            file_size,
-        )
-        if line is None:
-            return False, None
-        canonical = _canonicalize_cpython_numeric_line(opcode.code.encode("latin-1")[0], line)
-        if canonical is None or canonical == _INVALID_PICKLE_NUMERIC_LINE:
-            return False, None
-        if opcode_name in {"PUT", "GET", "INT", "LONG"}:
-            return True, int(canonical[:-1])
-        return True, float(canonical[:-1])
-    if opcode.arg is not None and opcode.arg.n == -1:
+    if opcode_name in {"GLOBAL", "INST", "PUT", "GET", "INT", "LONG", "FLOAT"} or (
+        opcode.arg is not None and opcode.arg.n == -1
+    ):
         line_argument = _read_pickle_structure_bytes(
             handle,
             sample,
@@ -4702,6 +4649,27 @@ def _pickle_structural_argument(
         )
         if line_argument is None:
             return False, None
+        if opcode_name in {"GLOBAL", "INST"}:
+            module_name, separator, remainder = line_argument.partition(b"\n")
+            global_name, second_separator, trailing = remainder.partition(b"\n")
+            if not module_name or not separator or not global_name or not second_separator or trailing:
+                return False, None
+            try:
+                argument_encoding = "ascii" if opcode_name == "INST" else "utf-8"
+                return True, (
+                    "global_argument",
+                    module_name.decode(argument_encoding),
+                    global_name.decode(argument_encoding),
+                )
+            except UnicodeDecodeError:
+                return False, None
+        if opcode_name in {"PUT", "GET", "INT", "LONG", "FLOAT"}:
+            canonical = _canonicalize_cpython_numeric_line(opcode.code.encode("latin-1")[0], line_argument)
+            if canonical is None or canonical == _INVALID_PICKLE_NUMERIC_LINE:
+                return False, None
+            if opcode_name in {"PUT", "GET", "INT", "LONG"}:
+                return True, int(canonical[:-1])
+            return True, float(canonical[:-1])
         reader = BytesIO(line_argument)
         try:
             parsed_argument = opcode.arg.reader(reader)
@@ -4740,8 +4708,8 @@ def _pickle_structural_argument(
     if opcode_name == "BYTEARRAY8":
         payload_length = argument_end - argument_offset - 8
         return (payload_length >= 0, ("bytearray_length", max(payload_length, 0)))
-    if opcode_name in {"BININT", "BININT1", "BININT2"}:
-        width = {"BININT": 4, "BININT1": 1, "BININT2": 2}[opcode_name]
+    if opcode_name in {"BININT", "BININT1", "BININT2", "FRAME"}:
+        width = {"BININT": 4, "BININT1": 1, "BININT2": 2, "FRAME": 8}[opcode_name]
         value = _read_pickle_structure_bytes(handle, sample, argument_offset, width, file_size)
         if value is None:
             return False, None
@@ -4786,9 +4754,6 @@ def _pickle_structural_argument(
             remaining_offset += len(chunk)
             remaining -= len(chunk)
         return True, int.from_bytes(leading_payload, "little", signed=True)
-    if opcode_name == "FRAME":
-        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 8, file_size)
-        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
     return True, None
 
 

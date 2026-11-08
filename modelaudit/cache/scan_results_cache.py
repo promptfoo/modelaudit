@@ -48,6 +48,7 @@ _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
+_ResolutionContext = tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
 _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT = (
     "modelaudit_picklescan.call_graph:unreusable:resolution-context-unavailable",
 )
@@ -65,30 +66,6 @@ def _file_stat_identity(file_stat: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _unavailable_source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    unavailable = _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
-    return unavailable, unavailable, unavailable
-
-
-def _unavailable_path_importer_resolution_context(_search_path: Iterable[str]) -> tuple[str, ...]:
-    return _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
-
-
-def _unavailable_current_module_source_path(_module_name: str) -> str | None:
-    return None
-
-
-def _unavailable_search_path_has_untrusted_importer(_search_path: Iterable[str]) -> bool:
-    return True
-
-
-def _unavailable_resolution_context_allows_trusted_cache_population(
-    _before: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
-    _after: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
-) -> bool:
-    return False
-
-
 # Older independent picklescan releases must fail closed as a group instead of
 # binding an earlier, incomplete subset of the resolution helpers.
 _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE = all(
@@ -101,32 +78,39 @@ _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE = all(
         "_source_resolution_context",
     )
 )
-_current_module_source_path: Callable[[str], str | None]
-_path_importer_resolution_context: Callable[[Iterable[str]], tuple[str, ...]]
-_resolution_context_allows_trusted_cache_population: Callable[
-    [
-        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
-        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
-    ],
-    bool,
-]
-_search_path_has_untrusted_importer: Callable[[Iterable[str]], bool]
 if _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE:
-    _current_module_source_path = _picklescan_call_graph._current_module_source_path
-    _path_importer_resolution_context = _picklescan_call_graph._path_importer_resolution_context
-    _resolution_context_allows_trusted_cache_population = (
+    _current_module_source_path: Callable[[str], str | None] = _picklescan_call_graph._current_module_source_path
+    _path_importer_resolution_context: Callable[[Iterable[str]], tuple[str, ...]] = (
+        _picklescan_call_graph._path_importer_resolution_context
+    )
+    _resolution_context_allows_trusted_cache_population: Callable[[_ResolutionContext, _ResolutionContext], bool] = (
         _picklescan_call_graph._resolution_context_allows_trusted_cache_population
     )
-    _search_path_has_untrusted_importer = _picklescan_call_graph._search_path_has_untrusted_importer
+    _search_path_has_untrusted_importer: Callable[[Iterable[str]], bool] = (
+        _picklescan_call_graph._search_path_has_untrusted_importer
+    )
     _picklescan_source_resolution_context = _picklescan_call_graph._source_resolution_context
 else:
-    _current_module_source_path = _unavailable_current_module_source_path
-    _path_importer_resolution_context = _unavailable_path_importer_resolution_context
-    _resolution_context_allows_trusted_cache_population = (
-        _unavailable_resolution_context_allows_trusted_cache_population
-    )
-    _search_path_has_untrusted_importer = _unavailable_search_path_has_untrusted_importer
-    _picklescan_source_resolution_context = _unavailable_source_resolution_context
+
+    def _picklescan_source_resolution_context() -> _ResolutionContext:
+        unavailable = _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
+        return unavailable, unavailable, unavailable
+
+    def _path_importer_resolution_context(_search_path: Iterable[str]) -> tuple[str, ...]:
+        return _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
+
+    def _current_module_source_path(_module_name: str) -> str | None:
+        return None
+
+    def _search_path_has_untrusted_importer(_search_path: Iterable[str]) -> bool:
+        return True
+
+    def _resolution_context_allows_trusted_cache_population(
+        _before: _ResolutionContext,
+        _after: _ResolutionContext,
+    ) -> bool:
+        return False
+
 
 AncestorEntry = tuple[str, int, int, int, int, int]
 _DARWIN_STABLE_SYMLINK_ALIASES = {
@@ -433,7 +417,7 @@ def _source_resolution_context() -> dict[str, list[str]]:
 
 def _parse_resolution_context(
     value: object,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None:
+) -> _ResolutionContext | None:
     if not isinstance(value, dict):
         return None
     parts: list[tuple[str, ...]] = []
@@ -2210,11 +2194,8 @@ class ScanResultsCache:
             )
         ):
             return False
-        if metadata.get("container_type") == "pytorch_zip":
-            return not critical_references_covered or ScanResultsCache._critical_call_graph_inputs_are_covered(
-                scan_result,
-                metadata,
-            )
+        if metadata.get("container_type") == "pytorch_zip" and not critical_references_covered:
+            return True
         if critical_references_covered:
             return ScanResultsCache._critical_call_graph_inputs_are_covered(scan_result, metadata)
         return not any(metadata.get(key) for key in _PICKLE_CALL_GRAPH_INPUT_KEYS)
