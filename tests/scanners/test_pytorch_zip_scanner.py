@@ -18215,9 +18215,8 @@ def test_pytorch_zip_hf_snapshot_symlink_uses_snapshot_inventory_member(
         **repository_config,
     )
 
-    metadata = next(value for key, value in result.file_metadata.items() if key.endswith("pytorch_model.bin"))
     assert result.files_scanned == 1
-    assert metadata["safetensors_available"] is True
+    assert result.file_metadata[str(blob_path.resolve())]["safetensors_available"] is True
 
 
 def test_pytorch_zip_directory_inventory_rejects_malformed_local_safetensors(
