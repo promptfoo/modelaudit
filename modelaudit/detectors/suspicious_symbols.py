@@ -919,8 +919,6 @@ JINJA2_SSTI_PATTERNS = {
         # Variable assignment for payload staging
         r"{% set .+ = .*__",  # Set variable to dangerous object
         r"{% set .+ = .*\.__class__",  # Set variable to class
-        # Macro definition for code reuse
-        r"{% macro .+ %}",  # Define reusable code block
     ],
     # Environment and configuration access
     # These patterns detect attempts to access system information

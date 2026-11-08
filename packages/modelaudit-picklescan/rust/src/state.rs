@@ -677,6 +677,24 @@ struct CallableInvocation {
     args: Vec<StackValue>,
 }
 
+impl CallableInvocation {
+    fn requested_latin1_encoding(&self, payload: &[u8]) -> Option<String> {
+        if self.op_name != "REDUCE" || self.positional_arg_count != Some(2) {
+            return None;
+        }
+        let [StackValue::TextSpan {
+            memo_read: false, ..
+        }, encoding @ StackValue::TextSpan {
+            memo_read: false, ..
+        }] = self.args.as_slice()
+        else {
+            return None;
+        };
+        direct_literal_text(encoding, payload, 7)
+            .filter(|name| matches!(name.as_str(), "latin1" | "latin-1"))
+    }
+}
+
 struct StaticGetattrReconstruction {
     target: GlobalRef,
     attribute_name: String,
@@ -869,6 +887,17 @@ impl<'a> ScanState<'a> {
                         return;
                     }
                 };
+
+                if parsed.has_invalid_persistent_id() {
+                    self.handle_parse_error(
+                        ParseError::new("protocol 0 persistent ID must be ASCII"),
+                        index,
+                    );
+                    // Recovery excludes the starting byte. The newline ends the invalid operand.
+                    self.scan_follow_on_pickle_streams(parsed.next - 1);
+                    self.finish_analysis();
+                    return;
+                }
 
                 if let Err(limit_error) = self.check_limits() {
                     self.status = ScanStatus::Inconclusive;
@@ -6385,7 +6414,7 @@ impl<'a> ScanState<'a> {
                     skip_offsets_before = offset.saturating_add(payload_len);
                     continue;
                 }
-                Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+                Err(error) if error.scan_incomplete_prefix => {
                     self.surface_nested_pickle_findings(probe, "raw", position + offset);
                     return;
                 }
@@ -6443,9 +6472,9 @@ impl<'a> ScanState<'a> {
                 let payload_extent =
                     pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes);
                 let complete_payload = matches!(&payload_extent, Ok(Some(_)));
-                let operand_limit_exceeded = payload_extent
+                let incomplete_prefix = payload_extent
                     .as_ref()
-                    .is_err_and(|error| error.is_structured_protocol0_line_operand_limit());
+                    .is_err_and(|error| error.scan_incomplete_prefix);
                 let malformed_payload = has_execution_opcode(probe)
                     && (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
@@ -6455,7 +6484,7 @@ impl<'a> ScanState<'a> {
                         self.options.max_nested_pickle_bytes,
                     );
                 if !complete_payload
-                    && !operand_limit_exceeded
+                    && !incomplete_prefix
                     && !malformed_payload
                     && !truncated_payload
                 {
@@ -7396,6 +7425,25 @@ impl<'a> ScanState<'a> {
             if !details.iter().any(|(key, _)| key == "invoked") {
                 details.push(("invoked".to_string(), DetailValue::Bool(true)));
             }
+            if symbol == "_codecs.encode"
+                && detail_usize(details, "latin1_reduce_position").is_none()
+            {
+                if let Some(name) = invocation.requested_latin1_encoding(self.payload) {
+                    let extra_bytes =
+                        "requested_encoding".len() + name.len() + "latin1_reduce_position".len();
+                    if self.non_allowlisted_global_import_bytes + extra_bytes
+                        > MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES
+                    {
+                        break;
+                    }
+                    self.non_allowlisted_global_import_bytes += extra_bytes;
+                    details.push(("requested_encoding".to_string(), DetailValue::String(name)));
+                    details.push((
+                        "latin1_reduce_position".to_string(),
+                        DetailValue::UInt(invocation.opcode_position as u64),
+                    ));
+                }
+            }
             break;
         }
     }
@@ -7705,6 +7753,19 @@ impl<'a> ScanState<'a> {
 
         for (symbol, position, details) in std::mem::take(&mut self.non_allowlisted_global_imports)
         {
+            if let Some(call_position) = detail_usize(&details, "latin1_reduce_position") {
+                if !called_global_keys.contains(&(symbol.clone(), position)) {
+                    self.add_finding(Finding {
+                        message: format!("Non-allowlisted pickle invocation of {symbol}. One REDUCE at byte {call_position} requests Latin-1 encoding"),
+                        severity: "warning",
+                        location: Some(format!("{} (pos {})", self.source, position)),
+                        rule_code: Some("NON_ALLOWLISTED_GLOBAL"),
+                        details,
+                        why: Some("Older checkpoints use this call to reconstruct bytes. The consumer's Python codec registry determines which encoder runs and can invoke application-defined code. Review other uses of this global separately."),
+                    });
+                }
+                continue;
+            }
             if called_global_keys.contains(&(symbol.clone(), position)) {
                 continue;
             }
@@ -8204,10 +8265,14 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_probe_len = candidate.len().min(self.options.max_nested_pickle_bytes);
-            let Ok(Some(candidate_len)) = pickle_payload_extent_result(
+            let candidate_len = match pickle_payload_extent_result(
                 &candidate[..candidate_probe_len],
                 self.options.max_nested_pickle_bytes,
-            ) else {
+            ) {
+                Ok(extent) => extent,
+                Err(error) => error.invalid_id_end,
+            };
+            let Some(candidate_len) = candidate_len else {
                 continue;
             };
             let candidate = &candidate[..candidate_len];

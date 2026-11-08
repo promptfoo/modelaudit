@@ -2,7 +2,7 @@ import itertools
 import json
 import os
 import re
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Container, Mapping, MutableMapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -14,6 +14,7 @@ from modelaudit.models import CopyrightNoticeModel as CopyrightInfo
 from modelaudit.models import LicenseInfoModel as LicenseInfo
 
 from ..config.constants import COMMON_MODEL_EXTENSIONS
+from .dataset_license import is_model_repository_metadata
 
 _CC_VERSION_4 = r"[\s,]+(?:(?:International|License|Version)[\s,]+)*4\.0"
 
@@ -389,6 +390,7 @@ def detect_unlicensed_datasets(
     file_paths: list[str],
     *,
     license_info_by_path: Mapping[str, object] | None = None,
+    known_non_dataset_paths: Container[str] = (),
 ) -> list[str]:
     """
     Detect dataset files that may lack proper licensing.
@@ -410,6 +412,11 @@ def detect_unlicensed_datasets(
         filename = Path(file_path).name.lower()
 
         if ext in DATASET_EXTENSIONS:
+            if ext == ".json" and (
+                file_path in known_non_dataset_paths or is_model_repository_metadata(Path(file_path))
+            ):
+                continue
+
             # Skip model files in ML model directories
             if is_ml_model_dir and ext in MODEL_EXTENSIONS:
                 continue
@@ -617,11 +624,16 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
     file_metadata = scan_results.get("file_metadata", {})
     all_files = list(file_metadata.keys())
     license_info_by_path = {}
+    known_non_dataset_paths = set()
     for file_path, metadata in file_metadata.items():
+        if metadata.get("is_dataset") is False:
+            known_non_dataset_paths.add(file_path)
         license_info = _get_license_info_from_metadata(metadata)
         if license_info is not None:
             license_info_by_path[file_path] = license_info
-    unlicensed_datasets = detect_unlicensed_datasets(all_files, license_info_by_path=license_info_by_path)
+    unlicensed_datasets = detect_unlicensed_datasets(
+        all_files, license_info_by_path=license_info_by_path, known_non_dataset_paths=known_non_dataset_paths
+    )
 
     # Filter out single files that might be tests or simple examples
     significant_unlicensed_datasets = []
@@ -736,7 +748,9 @@ def collect_license_metadata(
 
     # Detect file type
     ext = Path(file_path).suffix.lower()
-    metadata["is_dataset"] = ext in DATASET_EXTENSIONS
+    metadata["is_dataset"] = ext in DATASET_EXTENSIONS and not (
+        ext == ".json" and is_model_repository_metadata(Path(file_path))
+    )
     metadata["is_model"] = ext in MODEL_EXTENSIONS
 
     content = _read_header_text(file_path, max_lines=50)

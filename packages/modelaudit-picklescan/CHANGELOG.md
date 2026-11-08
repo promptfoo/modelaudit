@@ -24,6 +24,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Show the REDUCE byte position and requested spelling when a pickle calls `_codecs.encode` with a Latin-1 text encoding. The warning explains how the consumer selects the encoder.
 - Include bounded changed-context and source-fingerprint details when call-graph analysis fails closed because its source snapshot becomes unstable.
 - Support standard CPython 3.14 with standalone package tests and installed-wheel API checks, preserving Python 3.10 compatibility.
 
@@ -38,6 +39,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distinguish non-allowlisted globals used in pickle invocations from import-only references in warning messages and explanations.
 - Refresh shared source snapshots before the first pickle report so earlier import-context changes do not cause false incomplete scans.
 - Preserve backslash pairs in protocol 0 Unicode operands so Template callbacks remain detectable.
+- Reject non-ASCII protocol 0 persistent IDs so bytes inside tensor storage cannot produce a nested persistent-ID finding from an invalid operand.
 - Report incomplete coverage for unmodeled string-template mapping callbacks and unavailable frozen callable bodies, including Python class constructors and metaclass calls, preserving known dangerous callback findings.
 - Keep speculative ZIP directory metadata private so a rejected importer check cannot leave stale shared cache state.
 
@@ -45,6 +47,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Follow Python 3.14's lazy annotation helpers to retain detection of annotation evaluation and imports triggered by proxy attribute reads.
 - Distinguish cached, benign string-template calls from deferred pattern imports, without treating an unreachable keyword-only import as executed; fail closed for customized patterns and unproven receiver state.
 - Avoid discovering ordinary license text as pickle data in archives. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and completed executable prefixes with malformed trailing data.
+- Validate storage IDs in PyTorch tensor batches and legacy TorchScript v1 parameter mappings with a separate allowance of 256,000 metadata opcodes and two million provenance-node visits per archive. Member discovery limits and coverage diagnostics still apply.
 - Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
 - Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit.
 - Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.

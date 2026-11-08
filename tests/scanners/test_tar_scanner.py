@@ -1196,6 +1196,22 @@ class TestTarScanner:
         )
         assert any(issue.location == f"{archive_path}:payload.txt" for issue in critical_issues)
 
+    def test_scan_legacy_pytorch_tar_preserves_pickle_execution_finding(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "legacy.pt"
+        with tarfile.open(archive_path, "w") as archive:
+            _add_tar_bytes(archive, "storages", pickle.dumps(0) + pickle.dumps([]))
+            _add_tar_bytes(archive, "tensors", pickle.dumps(0))
+            _add_tar_bytes(archive, "pickle", b"cos\nsystem\n(S'id'\ntR.")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("tar_entry") == "pickle"
+            and "os.system" in issue.message
+            for issue in result.issues
+        )
+
     def test_scan_extensionless_nested_gzip_recurses_by_header(self, tmp_path: Path) -> None:
         """Extensionless gzip members should route through CompressedScanner by header."""
         archive_path = tmp_path / "outer.tar"
