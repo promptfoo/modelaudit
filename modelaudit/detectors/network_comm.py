@@ -1940,6 +1940,19 @@ _PLAIN_VERSION_LITERAL_CONTEXT_PATTERN = re.compile(
     rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))[\"']?",
     re.IGNORECASE,
 )
+_REQUIREMENTS_FILENAME = re.compile(r"(?:requirements|constraints)(?:[-_.][\w.-]+)?\.txt", re.IGNORECASE)
+_REQUIREMENT_PIN_PREFIX = re.compile(
+    rb"^[ \t]*[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._, -]+\])?[ \t]*==[ \t]*\Z",
+    re.MULTILINE,
+)
+_REQUIREMENT_PIN_END = re.compile(rb"[ \t]*(?:\r?$|[;#])", re.MULTILINE)
+_CLOCK_PORT_PREFIX = re.compile(
+    rb"(?:^|[\s\"'(\[=])(?P<date>\d{4}-\d{2}-\d{2}[Tt ])?(?:[01]?\d|2[0-3])(?P<minutes>:[0-5]\d)?:\Z"
+)
+_CLOCK_PORT_SUFFIX = re.compile(rb"(?::[0-5]\d|Z\b|[ \t]?[AP]M\b)", re.IGNORECASE)
+_CSS_DIMENSION_UNIT = re.compile(
+    rb"(?:%|px|em|rem|ex|ch|vw|vh|vmin|vmax|pt|pc|cm|mm|in)(?=$|[\s;\"'!})>])", re.IGNORECASE
+)
 _ML_LAYER_DOMAIN_PATTERN = re.compile(
     r"^(?:layer\d+|conv\d*d?|bn\d+|norm\d+|fc\d+|dense\d+)\.(?:weight|bias)$",
     re.IGNORECASE,
@@ -1960,15 +1973,30 @@ def _is_metadata_context(context: str) -> bool:
     return any(segment in _DOC_CONTEXT_SEGMENTS for segment in context_segments[:-1])
 
 
-def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
+def _iter_pattern_matches(data: bytes, pattern: bytes, start: int = 0) -> Iterator[int]:
     """Yield non-overlapping match positions for a byte pattern."""
-    start = 0
     while True:
         match_index = data.find(pattern, start)
         if match_index < 0:
             break
         yield match_index
         start = match_index + max(1, len(pattern))
+
+
+def iter_port_token_positions(data: bytes, token: bytes, start: int = 0) -> Iterator[int]:
+    """Yield port tokens, excluding numeric prefixes, clock fields and CSS dimensions."""
+    for position in _iter_pattern_matches(data, token, start):
+        end = position + len(token)
+        if data[end : end + 1].isdigit():
+            continue
+        if token.startswith(b":"):
+            if _CSS_DIMENSION_UNIT.match(data, end):
+                continue
+            if len(token) == 3:
+                clock = _CLOCK_PORT_PREFIX.search(data, max(0, position - 20), position + 1)
+                if clock and (clock["date"] or clock["minutes"] or _CLOCK_PORT_SUFFIX.match(data, end)):
+                    continue
+        yield position
 
 
 def _is_check_input_dim_near_match(data: bytes, match_index: int, token_len: int) -> bool:
@@ -5024,28 +5052,6 @@ class NetworkCommDetector:
         ]
         for port in SUSPICIOUS_PORTS
     }
-    PORT_NAMES: ClassVar[dict[int, str]] = {
-        22: "SSH",
-        23: "Telnet",
-        135: "RPC",
-        139: "NetBIOS",
-        445: "SMB",
-        1337: "Common Backdoor",
-        1433: "MSSQL",
-        3128: "Proxy",
-        3306: "MySQL",
-        3389: "RDP",
-        4444: "Metasploit",
-        5432: "PostgreSQL",
-        5900: "VNC",
-        6379: "Redis",
-        8080: "HTTP Proxy",
-        8443: "HTTPS Alt",
-        9200: "Elasticsearch",
-        27017: "MongoDB",
-        31337: "Back Orifice",
-    }
-
     EXPLICIT_PORT_PATTERNS: ClassVar[dict[int, list[re.Pattern]]] = {
         port: [
             re.compile(pattern, re.IGNORECASE | re.DOTALL)
@@ -5685,11 +5691,19 @@ class NetworkCommDetector:
 
     def _scan_ip_addresses(self, data: bytes, context: str) -> None:
         """Scan for IP address patterns."""
+        is_requirements = _REQUIREMENTS_FILENAME.fullmatch(context.replace("\\", "/").rsplit("/", 1)[-1])
         # IPv4
         for match in self.IPV4_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
 
             if self._is_redacted_url_value(data, match.start(), ip):
+                continue
+
+            if (
+                is_requirements
+                and _REQUIREMENT_PIN_PREFIX.search(data, max(0, match.start() - 512), match.start())
+                and _REQUIREMENT_PIN_END.match(data, match.end(), min(len(data), match.end() + 512))
+            ):
                 continue
 
             # Check for common false positives (version numbers) only when the
@@ -6124,12 +6138,12 @@ class NetworkCommDetector:
             metadata_entries = list(_iter_onnx_metadata_entries(data))
             for key, value, _value_start in metadata_entries:
                 if _is_active_onnx_metadata_key(key):
-                    self._scan_suspicious_ports_in_active_metadata_value(value, context)
+                    self._scan_port_tokens(value, context)
                     if self.findings_truncated:
                         return
             if metadata_entries:
                 return
-            self._scan_suspicious_ports_in_active_metadata_text(data, context)
+            self._scan_port_tokens(data, context, require_active_key=True)
             return
         if is_ml_model and not self._onnx_metadata_context:
             # Only scan for very explicit network patterns in ML models
@@ -6137,92 +6151,35 @@ class NetworkCommDetector:
             self._scan_explicit_network_patterns_in_ml_models(data, context)
             return
 
-        # For non-ML files, use the original port detection logic
-        for port in self.SUSPICIOUS_PORTS:
-            port_bytes = str(port).encode()
-            matched = False
-            for pattern_bytes in self.PORT_PATTERNS[port]:
-                for pattern_start in _iter_pattern_matches(data, pattern_bytes):
-                    port_start = pattern_start + pattern_bytes.rfind(port_bytes)
-                    port_end = port_start + len(port_bytes)
-                    if data[port_end : port_end + 1].isdigit():
-                        continue
+        self._scan_port_tokens(data, context)
+
+    def _scan_port_tokens(self, data: bytes, context: str, *, require_active_key: bool = False) -> None:
+        for port, tokens in self.PORT_PATTERNS.items():
+            for token in tokens:
+                for start in iter_port_token_positions(data, token):
+                    if require_active_key:
+                        line_start = data.rfind(b"\n", 0, start) + 1
+                        if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data, line_start, start) is None:
+                            continue
+                    port_start = start + len(token) - len(str(port))
                     if self._is_redacted_url_value(data, port_start, str(port)):
                         continue
-                    matched = True
-                    break
-                if matched:
-                    break
-            if matched:
-                port_name = self._get_port_name(port)
-                if not self._record_finding(
-                    {
+                    finding: dict[str, Any] = {
                         "type": "suspicious_port",
                         "severity": "MEDIUM",
                         "confidence": 0.6,
-                        "message": f"Suspicious port detected: {port} ({port_name})",
+                        "message": f"Suspicious port detected: {port}",
                         "port": port,
-                        "service": port_name,
-                        "position": port_start,
                         "context": context,
                     }
-                ):
-                    return
-
-    def _scan_suspicious_ports_in_active_metadata_text(self, data: bytes, context: str) -> None:
-        for port in self.SUSPICIOUS_PORTS:
-            port_bytes = str(port).encode()
-            matched = False
-            for pattern_bytes in self.PORT_PATTERNS[port]:
-                for pattern_start in _iter_pattern_matches(data, pattern_bytes):
-                    line_start = data.rfind(b"\n", 0, pattern_start) + 1
-                    if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[line_start:pattern_start]) is None:
-                        continue
-                    port_start = pattern_start + pattern_bytes.rfind(port_bytes)
-                    port_end = port_start + len(port_bytes)
-                    if data[port_end : port_end + 1].isdigit():
-                        continue
-                    if self._is_redacted_url_value(data, port_start, str(port)):
-                        continue
-                    matched = True
+                    if not self._onnx_metadata_context:
+                        finding["position"] = port_start
+                    if not self._record_finding(finding):
+                        return
                     break
-                if matched:
-                    break
-            if matched and not self._record_suspicious_port(port, context):
-                return
-
-    def _scan_suspicious_ports_in_active_metadata_value(self, value: bytes, context: str) -> None:
-        for port in self.SUSPICIOUS_PORTS:
-            port_bytes = str(port).encode()
-            matched = False
-            for pattern_bytes in self.PORT_PATTERNS[port]:
-                for pattern_start in _iter_pattern_matches(value, pattern_bytes):
-                    port_start = pattern_start + pattern_bytes.rfind(port_bytes)
-                    port_end = port_start + len(port_bytes)
-                    if value[port_end : port_end + 1].isdigit():
-                        continue
-                    if self._is_redacted_url_value(value, port_start, str(port)):
-                        continue
-                    matched = True
-                    break
-                if matched:
-                    break
-            if matched and not self._record_suspicious_port(port, context):
-                return
-
-    def _record_suspicious_port(self, port: int, context: str) -> bool:
-        port_name = self._get_port_name(port)
-        return self._record_finding(
-            {
-                "type": "suspicious_port",
-                "severity": "MEDIUM",
-                "confidence": 0.6,
-                "message": f"Suspicious port detected: {port} ({port_name})",
-                "port": port,
-                "service": port_name,
-                "context": context,
-            }
-        )
+                else:
+                    continue
+                break
 
     def _scan_explicit_network_patterns_in_ml_models(self, data: bytes, context: str) -> None:
         """Scan for very explicit network patterns in ML models with high confidence."""
@@ -6311,10 +6268,6 @@ class NetworkCommDetector:
                 }
             ):
                 return
-
-    def _get_port_name(self, port: int) -> str:
-        """Get common service name for a port."""
-        return self.PORT_NAMES.get(port, "Unknown")
 
 
 def detect_network_communication(file_path: str, config: dict[str, Any] | None = None) -> list[dict[str, Any]]:

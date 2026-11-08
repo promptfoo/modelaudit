@@ -4457,6 +4457,21 @@ def test_text_scanner_port_retarget_skips_longer_numbers(tmp_path: Path, later_p
         assert checks[0].details["position"] == (tmp_path / "README.md").read_bytes().rindex(b"23")
 
 
+@pytest.mark.parametrize("later_endpoint", [False, True])
+def test_port_findings_skip_css_and_timestamp_fields(tmp_path: Path, later_endpoint: bool) -> None:
+    content = '<td style="width:22%; font-size:23px">example</td>\nupdated = "2025-11-14T19:48:22Z"\n'
+    if later_endpoint:
+        content += 'endpoint = "ssh://server:22"\n'
+    result = _scan_text_content(tmp_path / "README.md", content)
+    checks = [check for check in result.checks if check.details.get("type") == "suspicious_port"]
+    if later_endpoint:
+        assert [(check.details["position"], check.severity) for check in checks] == [
+            (content.rindex("22"), IssueSeverity.WARNING)
+        ]
+    else:
+        assert not checks
+
+
 def test_text_scanner_port_retarget_exact_budget_ignores_longer_numbers() -> None:
     payload = b'SSH uses port 23.\nendpoint = "arxiv:2310.06825"\n'
     finding = {"type": "suspicious_port", "port": 23, "position": payload.index(b"23"), "severity": "MEDIUM"}

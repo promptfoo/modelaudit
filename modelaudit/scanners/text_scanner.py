@@ -18,6 +18,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.network_comm import (
+    iter_port_token_positions,
     official_readme_urlopen_image_example_spans,
     redact_url_for_finding,
 )
@@ -2548,8 +2549,7 @@ class TextScanner(BaseScanner):
 
     @staticmethod
     def _find_documentation_port_token(payload: bytes, token_bytes: bytes, start: int) -> int:
-        match = re.compile(re.escape(token_bytes) + rb"(?![0-9])").search(payload, start)
-        return match.start() if match is not None else -1
+        return next(iter_port_token_positions(payload, token_bytes, start), -1)
 
     @classmethod
     def _retarget_documentation_finding(
