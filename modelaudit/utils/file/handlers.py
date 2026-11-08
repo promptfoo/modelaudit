@@ -506,15 +506,15 @@ def _zero_based_singleton_manifest(shard: Path) -> str | None:
         ):
             return None
         weights = manifest.get("weight_map")
-        if (
+        if not (
             isinstance(weights, dict)
             and 0 < len(weights) <= _MAX_HF_SAFETENSORS_INDEX_TENSORS
             and all(name and member == shard.name for name, member in weights.items())
         ):
-            return hashlib.sha256(raw).hexdigest()
+            return None
+        return hashlib.sha256(raw).hexdigest()
     except (OSError, ValueError, RuntimeError):
-        pass
-    return None
+        return None
 
 
 class ShardedModelDetector:
