@@ -51,199 +51,143 @@ def _assert_shadow_framework_unpickle_executes(
     assert marker.exists(), f"Missing execution marker: {marker}"
 
 
-def _write_shadow_transformers_package(package_root: Path, marker: Path) -> None:
-    package_dir = package_root / "transformers"
+def _write_fixture_source(path: Path, *source_lines: str) -> None:
+    path.write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+
+
+def _create_fixture_package(package_dir: Path) -> Path:
     package_dir.mkdir(parents=True, exist_ok=True)
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "from pathlib import Path",
-                f"_MARKER = Path({str(marker)!r})",
-                "class TrainingArguments:",
-                "    __slots__ = ('payload',)",
-                "    def __new__(cls, *args, **kwargs):",
-                "        return object.__new__(cls)",
-                "    def __setstate__(self, state):",
-                "        _MARKER.write_text('setstate', encoding='utf-8')",
-                "    def __setattr__(self, name, value):",
-                "        _MARKER.write_text(f'setattr:{name}', encoding='utf-8')",
-                "        object.__setattr__(self, name, value)",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    return package_dir
+
+
+def _write_shadow_transformers_package(package_root: Path, marker: Path) -> None:
+    package_dir = _create_fixture_package(package_root / "transformers")
+    _write_fixture_source(
+        package_dir / "training_args.py",
+        "from pathlib import Path",
+        f"_MARKER = Path({str(marker)!r})",
+        "class TrainingArguments:",
+        "    __slots__ = ('payload',)",
+        "    def __new__(cls, *args, **kwargs):",
+        "        return object.__new__(cls)",
+        "    def __setstate__(self, state):",
+        "        _MARKER.write_text('setstate', encoding='utf-8')",
+        "    def __setattr__(self, name, value):",
+        "        _MARKER.write_text(f'setattr:{name}', encoding='utf-8')",
+        "        object.__setattr__(self, name, value)",
     )
 
 
 def _write_init_heavy_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "HELPER = object()",
-                "class TrainingArguments:",
-                "    def __new__(cls):",
-                "        return object.__new__(cls)",
-                "    def __init__(self):",
-                "        self.helper = HELPER",
-                "    def __setstate__(self, state):",
-                "        self.__dict__.update(state)",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    package_dir = _create_fixture_package(site_packages / "transformers")
+    _write_fixture_source(
+        package_dir / "training_args.py",
+        "HELPER = object()",
+        "class TrainingArguments:",
+        "    def __new__(cls):",
+        "        return object.__new__(cls)",
+        "    def __init__(self):",
+        "        self.helper = HELPER",
+        "    def __setstate__(self, state):",
+        "        self.__dict__.update(state)",
     )
 
 
 def _write_sitecustomize_trusting_site_packages(customize_dir: Path, site_packages: Path) -> None:
     customize_dir.mkdir(parents=True, exist_ok=True)
-    (customize_dir / "sitecustomize.py").write_text(
-        "\n".join(
-            [
-                "import sysconfig",
-                f"_TRUSTED_SITE_PACKAGES = {str(site_packages)!r}",
-                "_ORIGINAL_GET_PATH = sysconfig.get_path",
-                "def _patched_get_path(name, scheme=None, vars=None, expand=True):",
-                "    if name in {'purelib', 'platlib'}:",
-                "        return _TRUSTED_SITE_PACKAGES",
-                "    if scheme is None and vars is None and expand is True:",
-                "        return _ORIGINAL_GET_PATH(name)",
-                "    return _ORIGINAL_GET_PATH(name, scheme=scheme, vars=vars, expand=expand)",
-                "sysconfig.get_path = _patched_get_path",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    _write_fixture_source(
+        customize_dir / "sitecustomize.py",
+        "import sysconfig",
+        f"_TRUSTED_SITE_PACKAGES = {str(site_packages)!r}",
+        "_ORIGINAL_GET_PATH = sysconfig.get_path",
+        "def _patched_get_path(name, scheme=None, vars=None, expand=True):",
+        "    if name in {'purelib', 'platlib'}:",
+        "        return _TRUSTED_SITE_PACKAGES",
+        "    if scheme is None and vars is None and expand is True:",
+        "        return _ORIGINAL_GET_PATH(name)",
+        "    return _ORIGINAL_GET_PATH(name, scheme=scheme, vars=vars, expand=expand)",
+        "sysconfig.get_path = _patched_get_path",
     )
 
 
 def _write_init_inert_setstate_transformers_package(site_packages: Path, marker: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                f"MARKER = {str(marker)!r}",
-                "class TrainingArguments:",
-                "    def __new__(cls, *args, **kwargs):",
-                "        return object.__new__(cls)",
-                "    def __setstate__(self, state):",
-                "        with open(MARKER, 'w', encoding='utf-8') as handle:",
-                "            handle.write('setstate')",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    package_dir = _create_fixture_package(site_packages / "transformers")
+    _write_fixture_source(
+        package_dir / "training_args.py",
+        f"MARKER = {str(marker)!r}",
+        "class TrainingArguments:",
+        "    def __new__(cls, *args, **kwargs):",
+        "        return object.__new__(cls)",
+        "    def __setstate__(self, state):",
+        "        with open(MARKER, 'w', encoding='utf-8') as handle:",
+        "            handle.write('setstate')",
     )
 
 
 def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "class TrainingArguments:",
-                "    def __new__(cls):",
-                "        return object.__new__(cls)",
-                "",
-                "class OptimizerNames:",
-                "    def __new__(cls, value=''):",
-                "        return object.__new__(cls)",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    package_dir = _create_fixture_package(site_packages / "transformers")
+    _write_fixture_source(
+        package_dir / "training_args.py",
+        "class TrainingArguments:",
+        "    def __new__(cls):",
+        "        return object.__new__(cls)",
+        "",
+        "class OptimizerNames:",
+        "    def __new__(cls, value=''):",
+        "        return object.__new__(cls)",
     )
 
 
 def _write_import_side_effect_transformers_package(site_packages: Path, marker: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                f"MARKER = {str(marker)!r}",
-                "with open(MARKER, 'w', encoding='utf-8') as handle:",
-                "    handle.write('import')",
-                "class OptimizerNames:",
-                "    pass",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    package_dir = _create_fixture_package(site_packages / "transformers")
+    _write_fixture_source(
+        package_dir / "training_args.py",
+        f"MARKER = {str(marker)!r}",
+        "with open(MARKER, 'w', encoding='utf-8') as handle:",
+        "    handle.write('import')",
+        "class OptimizerNames:",
+        "    pass",
     )
 
 
 def _write_runtime_mutable_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "def OptimizerNames(value, callback=None):",
-                "    if callback is not None:",
-                "        return callback(value)",
-                "    return None",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    package_dir = _create_fixture_package(site_packages / "transformers")
+    _write_fixture_source(
+        package_dir / "training_args.py",
+        "def OptimizerNames(value, callback=None):",
+        "    if callback is not None:",
+        "        return callback(value)",
+        "    return None",
     )
 
 
 def _write_enum_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "trainer_utils.py").write_text(
-        "\n".join(
-            [
-                "from enum import Enum",
-                "class IntervalStrategy(str, Enum):",
-                "    STEPS = 'steps'",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    package_dir = _create_fixture_package(site_packages / "transformers")
+    _write_fixture_source(
+        package_dir / "trainer_utils.py",
+        "from enum import Enum",
+        "class IntervalStrategy(str, Enum):",
+        "    STEPS = 'steps'",
     )
 
 
 def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
-    package_dir = site_packages / "torch"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "_utils.py").write_text(
-        "\n".join(
-            [
-                "def _rebuild_tensor(arg):",
-                "    return None",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    package_dir = _create_fixture_package(site_packages / "torch")
+    _write_fixture_source(
+        package_dir / "_utils.py",
+        "def _rebuild_tensor(arg):",
+        "    return None",
     )
 
 
 def _write_cross_module_rebind_target_package(site_packages: Path) -> None:
-    (site_packages / "trusted_target.py").write_text(
-        "\n".join(
-            [
-                "from pathlib import Path",
-                "def rebound_optimizer(path):",
-                "    Path(path).write_text('cross-module', encoding='utf-8')",
-                "    return None",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    _write_fixture_source(
+        site_packages / "trusted_target.py",
+        "from pathlib import Path",
+        "def rebound_optimizer(path):",
+        "    Path(path).write_text('cross-module', encoding='utf-8')",
+        "    return None",
     )
 
 

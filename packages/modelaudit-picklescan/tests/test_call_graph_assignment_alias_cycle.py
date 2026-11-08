@@ -63,15 +63,14 @@ class Final:
 
 """
 
-_OSCILLATING_MODULE_SOURCE = (
-    _CLASS_A_B_SOURCE
-    + """\
+_CONDITIONAL_REBIND_SOURCE = """\
 if cond:
     m = A()
 else:
     m = B()
 """
-)
+
+_OSCILLATING_MODULE_SOURCE = _CLASS_A_B_SOURCE + _CONDITIONAL_REBIND_SOURCE
 
 _DEPENDENT_CYCLE_SOURCE = (
     _CLASS_A_B_SOURCE
@@ -152,39 +151,14 @@ exposed = m
 """
 )
 
-_UNCONDITIONAL_OVERWRITE_SOURCE = (
-    _CLASS_A_B_FINAL_SOURCE
-    + """\
-if cond:
-    m = A()
-else:
-    m = B()
-m = Final()
-"""
-)
+_UNCONDITIONAL_OVERWRITE_SOURCE = _CLASS_A_B_FINAL_SOURCE + _CONDITIONAL_REBIND_SOURCE + "m = Final()\n"
 
 _READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = (
-    _CLASS_A_B_FINAL_SOURCE
-    + """\
-if cond:
-    m = A()
-else:
-    m = B()
-exposed = m
-m = Final()
-"""
+    _CLASS_A_B_FINAL_SOURCE + _CONDITIONAL_REBIND_SOURCE + "exposed = m\nm = Final()\n"
 )
 
 _CALL_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = (
-    _CLASS_A_B_FINAL_SOURCE
-    + """\
-if cond:
-    m = A()
-else:
-    m = B()
-exposed = m()
-m = Final()
-"""
+    _CLASS_A_B_FINAL_SOURCE + _CONDITIONAL_REBIND_SOURCE + "exposed = m()\nm = Final()\n"
 )
 
 _TERMINATING_ALIAS_BRANCH_SOURCE = (
@@ -200,17 +174,7 @@ exposed = m
 """
 )
 
-_OVERWRITE_BEFORE_READ_SOURCE = (
-    _CLASS_A_B_FINAL_SOURCE
-    + """\
-if cond:
-    m = A()
-else:
-    m = B()
-m = Final()
-exposed = m
-"""
-)
+_OVERWRITE_BEFORE_READ_SOURCE = _UNCONDITIONAL_OVERWRITE_SOURCE + "exposed = m\n"
 
 _ONE_SIDED_REBIND_SOURCE = (
     _CLASS_A_B_SOURCE
@@ -466,6 +430,20 @@ def _reference_callback(
     return _iter_references
 
 
+def _collect_source_aliases(source: str) -> dict[str, str]:
+    tree = ast.parse(source)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
+    local_defs = _collect_local_defs(statements)
+
+    return _collect_assignment_aliases(
+        statements,
+        "testmod",
+        {},
+        local_defs,
+        {"testmod.A", "testmod.B", "testmod.Final"},
+    )
+
+
 def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
     thread = threading.Thread(target=target)  # type: ignore[arg-type]
     thread.daemon = True
@@ -527,34 +505,13 @@ def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
     source: str,
     expected_target: str,
 ) -> None:
-    tree = ast.parse(source)
-    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
-    local_defs = _collect_local_defs(statements)
-    local_class_targets = {"testmod.A", "testmod.B", "testmod.Final"}
-
-    aliases = _collect_assignment_aliases(
-        statements,
-        "testmod",
-        {},
-        local_defs,
-        local_class_targets,
-    )
+    aliases = _collect_source_aliases(source)
 
     assert aliases["m"] == expected_target
 
 
 def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwrite() -> None:
-    tree = ast.parse(_OVERWRITE_BEFORE_READ_SOURCE)
-    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
-    local_defs = _collect_local_defs(statements)
-
-    aliases = _collect_assignment_aliases(
-        statements,
-        "testmod",
-        {},
-        local_defs,
-        {"testmod.A", "testmod.B", "testmod.Final"},
-    )
+    aliases = _collect_source_aliases(_OVERWRITE_BEFORE_READ_SOURCE)
 
     assert aliases["m"] == "testmod.Final"
     assert aliases["exposed"] == "testmod.Final"
@@ -598,17 +555,7 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
     ),
 )
 def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites(source: str) -> None:
-    tree = ast.parse(source)
-    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
-    local_defs = _collect_local_defs(statements)
-
-    aliases = _collect_assignment_aliases(
-        statements,
-        "testmod",
-        {},
-        local_defs,
-        {"testmod.A", "testmod.B", "testmod.Final"},
-    )
+    aliases = _collect_source_aliases(source)
 
     assert aliases["m"] == "testmod.Final"
     assert aliases["exposed"] == "testmod.Final"
