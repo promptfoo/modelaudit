@@ -173,7 +173,7 @@ def render(base: str, reviews: dict[str, str]) -> None:
         preamble = original[:start] + unreleased_section(package, prefix + after).rstrip()
         writes[changelog] = preamble + "\n\n" + next_section + "\n\n" + original[position:].lstrip("\n")
     for changelog, text in writes.items():
-        changelog.write_text(text, encoding="utf-8")
+        changelog.write_text(text, encoding="utf-8", newline="\n")
 
 
 def main() -> None:
