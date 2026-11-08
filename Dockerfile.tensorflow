@@ -37,7 +37,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade \
         apt bsdutils gzip libapt-pkg7.0 libc-bin libc6 libblkid1 liblastlog2-2 libmount1 libpcre2-8-0 libsmartcols1 libsqlite3-0 libssl3t64 \
-        libuuid1 login mount perl-base util-linux \
+        libuuid1 login mount perl-base util-linux zlib1g \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
