@@ -53,6 +53,7 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.utils import _path_hardening
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
@@ -1932,6 +1933,33 @@ def test_directory_scan_late_checkpoint_child_scans_without_owner_context(
         for issue in result.issues
     )
     assert determine_exit_code(result) == 1
+
+
+@pytest.mark.parametrize("changed_view", [None, "handle", "path"])
+def test_windows_file_hash_checks_each_view_for_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_view: str | None
+) -> None:
+    path = tmp_path / "weights"
+    path.write_bytes(b"weights")
+    base = path.stat()
+
+    def with_ctime(delta: int) -> os.stat_result:
+        return os.stat_result(base, {"st_mtime_ns": base.st_mtime_ns, "st_ctime_ns": base.st_ctime_ns + delta})
+
+    handles = iter([with_ctime(1), with_ctime(2 if changed_view == "handle" else 1)])
+    paths = iter([base, with_ctime(1) if changed_view == "path" else base])
+    windows_os = SimpleNamespace(**vars(os))
+    windows_os.name = "nt"
+    windows_os.fstat = lambda fd: next(handles)
+    windows_os.stat = lambda path, **kwargs: next(paths)
+    monkeypatch.setattr(_path_hardening, "os", windows_os)
+    monkeypatch.setattr(core_module, "os", windows_os)
+
+    if changed_view is None:
+        assert core_module._calculate_file_hash(str(path)) == hashlib.sha256(b"weights").hexdigest()
+    else:
+        with pytest.raises(OSError, match="changed while hashing"):
+            core_module._calculate_file_hash(str(path))
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")

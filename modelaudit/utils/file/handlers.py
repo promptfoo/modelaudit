@@ -20,6 +20,7 @@ from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from .._path_hardening import _cross_view_ctime_matches
 from ..helpers.cache_decorator import (
     add_optional_dependency_availability_to_version_context,
     should_bypass_cache_for_safetensors_header_limit,
@@ -71,8 +72,10 @@ def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str
         ("inode", opened_stat.st_ino),
         ("size", opened_stat.st_size),
         ("mtime_ns", opened_stat.st_mtime_ns),
-        ("ctime_ns", opened_stat.st_ctime_ns),
     )
+    path_ctime = target.get("ctime_ns")
+    if isinstance(path_ctime, int) and not _cross_view_ctime_matches(opened_stat.st_ctime_ns, path_ctime):
+        return False
     return stat.S_ISREG(opened_stat.st_mode) and all(
         not isinstance(target.get(key), int) or target[key] == current_value for key, current_value in expected_values
     )

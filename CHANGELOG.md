@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
 - Report completed scans as successful in the Python API even when a security check raises a warning.
 - Validate legacy Bitcoin address checksums before reporting a match, so unrelated identifiers such as notebook IDs do not trigger embedded-secret alerts.
+- Avoid incomplete GGUF, GGML, and sharded model scans and skipped file hashes on Windows when an unchanged file reports different creation times through its path and its open handle.
 - Run the lightweight Docker image on Python 3.14, with pip confined to the build stage. The full image stays on Python 3.13 for TensorFlow compatibility.
 - Upgrade APT and zlib packages in all Docker runtime images to include Debian security fixes.
 - Explain when JSON parsing limits interrupt SafeTensors header validation and when YAML safe loading prevents template extraction.

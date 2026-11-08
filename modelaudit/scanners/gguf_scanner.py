@@ -12,6 +12,7 @@ from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.utils._path_hardening import _file_stat_matches
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -451,17 +452,14 @@ class GgufScanner(BaseScanner):
                     return result
                 # Nested scanners reopen the path, so coverage requires every view to match this source.
                 try:
-                    final_stats: tuple[os.stat_result, ...] = (os.fstat(f.fileno()), os.stat(path))
+                    final_handle_stat = os.fstat(f.fileno())
+                    final_path_stat = os.stat(path)
+                    source_changed = not _file_stat_matches(opened_stat, final_handle_stat) or not _file_stat_matches(
+                        final_handle_stat, final_path_stat, cross_view=True
+                    )
                 except OSError:
-                    final_stats = ()
-                if not final_stats or any(
-                    not os.path.samestat(opened_stat, final_stat)
-                    or opened_stat.st_mode != final_stat.st_mode
-                    or opened_stat.st_size != final_stat.st_size
-                    or opened_stat.st_mtime_ns != final_stat.st_mtime_ns
-                    or opened_stat.st_ctime_ns != final_stat.st_ctime_ns
-                    for final_stat in final_stats
-                ):
+                    source_changed = True
+                if source_changed:
                     result.add_check(
                         name="GGUF/GGML Source Stability",
                         passed=False,

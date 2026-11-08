@@ -6,6 +6,7 @@ import tempfile
 from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,8 @@ import pytest
 from modelaudit.cache.cache_manager import get_cache_manager, reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.base import BaseScanner
+from modelaudit.utils import _path_hardening
+from modelaudit.utils.file import handlers
 from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
     AdvancedFileHandler,
@@ -42,6 +45,42 @@ def _assert_suspect_shard_family_not_cacheable(tmp_path: Path, field: str, value
 
     assert fingerprint is None
     assert cacheable is False
+
+
+@pytest.mark.parametrize(
+    ("field", "expect_pin"),
+    [("ctime_ns", True), ("mtime_ns", False), ("size", False), ("device", False), ("inode", False)],
+)
+def test_windows_shard_pinning_compares_path_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, expect_pin: bool
+) -> None:
+    shard = tmp_path / "model-00001-of-00002.safetensors"
+    shard.write_bytes(b"fixture")
+    with shard.open("rb") as source:
+        observed = os.fstat(source.fileno())
+    snapshot = {
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+        "size": observed.st_size,
+        "mtime_ns": observed.st_mtime_ns,
+        "ctime_ns": observed.st_ctime_ns,
+    }
+    snapshot[field] += 1
+    windows_os = SimpleNamespace(**vars(os))
+    windows_os.name = "nt"
+    monkeypatch.setattr(_path_hardening, "os", windows_os)
+    target: dict[str, int | str] = dict(snapshot)
+
+    if expect_pin:
+        with handlers._pinned_windows_shard_scan_path(str(shard), target) as pinned:
+            assert Path(pinned.path).read_bytes() == b"fixture"
+        assert not pinned.changed_during_scan
+    else:
+        with (
+            pytest.raises(handlers._ShardPinUnavailableError, match="changed before pinning"),
+            handlers._pinned_windows_shard_scan_path(str(shard), target),
+        ):
+            pytest.fail("A changed shard was pinned")
 
 
 class CompletingShardScanner:
