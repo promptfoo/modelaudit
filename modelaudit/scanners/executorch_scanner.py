@@ -695,21 +695,13 @@ class ExecuTorchScanner(BaseScanner):
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
     ) -> list[zipfile.ZipInfo]:
-        pickle_entries: list[zipfile.ZipInfo] = []
-        seen_entries: set[int] = set()
-
-        def add_entry(entry: zipfile.ZipInfo) -> None:
-            entry_key = id(entry)
-            if entry_key in seen_entries:
-                return
-            pickle_entries.append(entry)
-            seen_entries.add(entry_key)
+        entries_by_id: dict[int, zipfile.ZipInfo] = {}
 
         for entry in safe_entries:
             if entry.filename.casefold().endswith(".pkl"):
-                add_entry(entry)
+                entries_by_id[id(entry)] = entry
 
-        candidates = [entry for entry in safe_entries if id(entry) not in seen_entries and not entry.is_dir()]
+        candidates = [entry for entry in safe_entries if id(entry) not in entries_by_id and not entry.is_dir()]
         entries_to_probe = candidates[: self.max_pickle_discovery_entries]
         failed_count = len(candidates) - len(entries_to_probe)
         probe_failures: list[dict[str, Any]] = []
@@ -726,7 +718,7 @@ class ExecuTorchScanner(BaseScanner):
         for entry in entries_to_probe:
             try:
                 if self._entry_looks_like_pickle(zip_file, entry, probe_bytes_remaining):
-                    add_entry(entry)
+                    entries_by_id[id(entry)] = entry
             except Exception as exc:
                 failed_count += 1
                 if len(probe_failures) < _PICKLE_DISCOVERY_MAX_FAILURE_SAMPLES:
@@ -760,7 +752,7 @@ class ExecuTorchScanner(BaseScanner):
                 },
             )
 
-        return pickle_entries
+        return list(entries_by_id.values())
 
     @staticmethod
     def _finish_read_failure(result: ScanResult, path: str, exc: OSError) -> ScanResult:

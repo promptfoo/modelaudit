@@ -26,21 +26,24 @@ use crate::nested_surface::{
     nested_rule_code_for_encoding, raw_nested_payload_finding, NestedPayloadFinding,
     NestedSurfaceOutcome,
 };
-use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
+use crate::opcode::{
+    parse_opcode, ArgValue, ParseError, ParsedOpcode, STACK_GLOBAL_STRING_OPCODES,
+};
 use crate::options::{deadline_from_timeout, ScanOptions};
 use crate::policy::{
     callable_severity, global_import_is_allowlisted, global_import_requires_review, global_severity,
 };
 use crate::post_budget::post_budget_global_matches;
 use crate::report::{
-    detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
-    Finding, FindingDedupeKey, Notice, NoticeDedupeKey, ScanError,
+    detail_dict_to_py, detail_string, detail_usize, notice_to_detail_value,
+    scan_error_to_detail_value, text_field, DetailValue, Finding, FindingDedupeKey, Notice,
+    NoticeDedupeKey, ScanError,
 };
 use crate::stack::{
     collapse_tuple_values, is_known_pytorch_storage_global, operand_preview,
-    pytorch_storage_descriptor_ref, pytorch_storage_key, resolve_global_operand,
-    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
-    stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule, StackValue,
+    pytorch_storage_persistent_id, resolve_global_operand, stack_value_from_integer_arg,
+    stack_value_from_text_arg, stack_value_preview, stack_value_string, FutureCallbacks, GlobalRef,
+    RegexScannerRule, StackValue,
 };
 use crate::strings::{
     is_repeated_single_byte, is_suspicious_magic_method, suspicious_string_matches,
@@ -101,15 +104,6 @@ const MAX_TRACKED_VALUE_DEPTH: usize = 64;
 const MAX_MAPPING_TRAVERSAL_NODES: usize = 2048;
 const MAX_TRACKED_STR_JOIN_RESULT_BYTES: usize = 4096;
 
-const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
-    "BINSTRING",
-    "BINUNICODE",
-    "BINUNICODE8",
-    "SHORT_BINSTRING",
-    "SHORT_BINUNICODE",
-    "STRING",
-    "UNICODE",
-];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
 // Receiver-state proof is deliberately limited to passive construction prefixes.
@@ -459,6 +453,12 @@ impl ScanStatus {
     fn is_complete(self) -> bool {
         self == Self::Complete
     }
+
+    fn mark_inconclusive(&mut self) {
+        if self.is_complete() {
+            *self = Self::Inconclusive;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,6 +717,8 @@ enum MappingLookup<'a> {
     BudgetExceeded,
 }
 
+type OpcodeCounts = HashMap<&'static str, usize>;
+
 pub(crate) struct ScanState<'a> {
     source: String,
     payload: &'a [u8],
@@ -739,9 +741,9 @@ pub(crate) struct ScanState<'a> {
     template_execution_may_be_unmodeled: bool,
     non_allowlisted_global_imports: Vec<PendingGlobalImportFinding>,
     opcode_count: usize,
-    opcode_counts: HashMap<&'static str, usize>,
-    nested_opcode_counts: HashMap<&'static str, usize>,
-    follow_on_opcode_counts: HashMap<&'static str, usize>,
+    opcode_counts: OpcodeCounts,
+    nested_opcode_counts: OpcodeCounts,
+    follow_on_opcode_counts: OpcodeCounts,
     global_count: usize,
     bytes_scanned: usize,
     first_pickle_end_pos: Option<usize>,
@@ -894,56 +896,43 @@ impl<'a> ScanState<'a> {
                     return;
                 }
 
-                if let Err(limit_error) = self.check_limits(&parsed) {
+                if let Err(limit_error) = self.check_limits() {
                     self.status = ScanStatus::Inconclusive;
-                    match limit_error {
-                        LimitError::OpcodeBudgetExceeded => {
-                            self.add_notice(Notice {
-                                message: format!(
-                                    "Opcode analysis stopped after reaching max_opcodes={}",
-                                    self.options.max_opcodes
-                                ),
-                                severity: "info",
-                                location: Some(self.source.clone()),
-                                code: Some("opcode_budget"),
-                                details: vec![
-                                    (
-                                        "opcode_count".to_string(),
-                                        DetailValue::UInt(self.opcode_count as u64),
-                                    ),
-                                    (
-                                        "max_opcodes".to_string(),
-                                        DetailValue::UInt(self.options.max_opcodes as u64),
-                                    ),
-                                    ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
-                                ],
-                            });
-                            self.scan_post_budget_tail(parsed.pos);
-                        }
-                        LimitError::Timeout => {
-                            self.add_notice(Notice {
-                                message: format!(
-                                    "Opcode analysis timed out after {:.3} seconds",
-                                    self.options.timeout_s
-                                ),
-                                severity: "info",
-                                location: Some(self.source.clone()),
-                                code: Some("timeout"),
-                                details: vec![
-                                    (
-                                        "opcode_count".to_string(),
-                                        DetailValue::UInt(self.opcode_count as u64),
-                                    ),
-                                    (
-                                        "timeout_s".to_string(),
-                                        DetailValue::Float(self.options.timeout_s),
-                                    ),
-                                    ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
-                                ],
-                            });
-                            self.scan_post_budget_tail(parsed.pos);
-                        }
-                    }
+                    let (code, message, limit_key, limit_value) = match limit_error {
+                        LimitError::OpcodeBudgetExceeded => (
+                            "opcode_budget",
+                            format!(
+                                "Opcode analysis stopped after reaching max_opcodes={}",
+                                self.options.max_opcodes
+                            ),
+                            "max_opcodes",
+                            DetailValue::UInt(self.options.max_opcodes as u64),
+                        ),
+                        LimitError::Timeout => (
+                            "timeout",
+                            format!(
+                                "Opcode analysis timed out after {:.3} seconds",
+                                self.options.timeout_s
+                            ),
+                            "timeout_s",
+                            DetailValue::Float(self.options.timeout_s),
+                        ),
+                    };
+                    self.add_notice(Notice {
+                        message,
+                        severity: "info",
+                        location: Some(self.source.clone()),
+                        code: Some(code),
+                        details: vec![
+                            (
+                                "opcode_count".to_string(),
+                                DetailValue::UInt(self.opcode_count as u64),
+                            ),
+                            (limit_key.to_string(), limit_value),
+                            ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+                        ],
+                    });
+                    self.scan_post_budget_tail(parsed.pos);
                     self.finish_analysis();
                     return;
                 }
@@ -1005,7 +994,7 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn check_limits(&self, _opcode: &ParsedOpcode) -> Result<(), LimitError> {
+    fn check_limits(&self) -> Result<(), LimitError> {
         if self.opcode_count >= self.options.max_opcodes {
             return Err(LimitError::OpcodeBudgetExceeded);
         }
@@ -1025,23 +1014,21 @@ impl<'a> ScanState<'a> {
         value: StackValue,
         cost: usize,
         reason: &'static str,
-    ) -> bool {
+    ) {
         if self.stack.len() >= MAX_TRACKED_STACK_VALUES {
             self.record_tracked_state_budget_exhausted("stack_entries", self.stack.len() + 1);
             self.clear_stack_values();
             self.stack.push(StackValue::Other);
             self.tracked_stack_value_bytes.push(0);
-            return false;
+            return;
         }
-        if self.can_reserve_tracked_stack_bytes(cost, reason) {
+        if self.can_reserve_tracked_bytes(cost, reason) {
             self.stack.push(value);
             self.tracked_stack_value_bytes.push(cost);
             self.tracked_stack_bytes += cost;
-            true
         } else {
             self.stack.push(StackValue::Other);
             self.tracked_stack_value_bytes.push(0);
-            false
         }
     }
 
@@ -1080,79 +1067,65 @@ impl<'a> ScanState<'a> {
         self.tracked_state_bytes = 0;
     }
 
-    fn can_reserve_tracked_stack_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
-        if cost == 0 {
-            return true;
+    fn within_tracked_state_budget(&mut self, total: usize, reason: &'static str) -> bool {
+        if total > MAX_TRACKED_STATE_BYTES {
+            self.record_tracked_state_budget_exhausted(reason, total);
+            return false;
         }
-        match self
-            .tracked_state_bytes
-            .checked_add(self.tracked_stack_bytes)
-            .and_then(|total| total.checked_add(cost))
-        {
-            Some(total) if total <= MAX_TRACKED_STATE_BYTES => true,
-            Some(total) => {
-                self.record_tracked_state_budget_exhausted(reason, total);
-                false
-            }
-            None => {
-                self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-                false
-            }
-        }
+        true
+    }
+
+    fn can_reserve_tracked_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
+        cost == 0
+            || self.within_tracked_state_budget(
+                self.tracked_state_bytes
+                    .saturating_add(self.tracked_stack_bytes)
+                    .saturating_add(cost),
+                reason,
+            )
     }
 
     fn reserve_tracked_state_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
-        if cost == 0 {
-            return true;
+        if !self.can_reserve_tracked_bytes(cost, reason) {
+            return false;
         }
-        match self
-            .tracked_state_bytes
-            .checked_add(self.tracked_stack_bytes)
-            .and_then(|total| total.checked_add(cost))
-        {
-            Some(total) if total <= MAX_TRACKED_STATE_BYTES => {
-                self.tracked_state_bytes += cost;
-                true
-            }
-            Some(total) => {
-                self.record_tracked_state_budget_exhausted(reason, total);
-                false
-            }
-            None => {
-                self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-                false
-            }
-        }
+        self.tracked_state_bytes += cost;
+        true
     }
 
-    fn replace_memo_value(&mut self, index: i64, value: StackValue, reason: &'static str) -> bool {
+    fn projected_memo_state_bytes(
+        &mut self,
+        index: i64,
+        value: &StackValue,
+        retained_stack_bytes: usize,
+        reason: &'static str,
+    ) -> Option<usize> {
         if !self.can_insert_tracked_memo_value(index) {
-            return false;
+            return None;
         }
         let old_cost = self
             .memo
             .get(&index)
             .map(Self::stack_value_state_cost)
             .unwrap_or_default();
-        let new_cost = Self::stack_value_state_cost(&value);
-        let retained_state_bytes = self.tracked_state_bytes.saturating_sub(old_cost);
-        let Some(projected_state_bytes) = retained_state_bytes.checked_add(new_cost) else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-            return false;
-        };
-        let Some(projected_total_bytes) =
-            projected_state_bytes.checked_add(self.tracked_stack_bytes)
-        else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-            return false;
-        };
-        if projected_total_bytes > MAX_TRACKED_STATE_BYTES {
-            self.record_tracked_state_budget_exhausted(reason, projected_total_bytes);
-            return false;
+        let projected_state_bytes = self
+            .tracked_state_bytes
+            .saturating_sub(old_cost)
+            .saturating_add(Self::stack_value_state_cost(value));
+        self.within_tracked_state_budget(
+            projected_state_bytes.saturating_add(retained_stack_bytes),
+            reason,
+        )
+        .then_some(projected_state_bytes)
+    }
+
+    fn replace_memo_value(&mut self, index: i64, value: StackValue, reason: &'static str) {
+        if let Some(projected_state_bytes) =
+            self.projected_memo_state_bytes(index, &value, self.tracked_stack_bytes, reason)
+        {
+            self.tracked_state_bytes = projected_state_bytes;
+            self.memo.insert(index, value);
         }
-        self.tracked_state_bytes = projected_state_bytes;
-        self.memo.insert(index, value);
-        true
     }
 
     fn store_top_stack_value_in_memo(
@@ -1161,36 +1134,17 @@ impl<'a> ScanState<'a> {
         value: StackValue,
         reason: &'static str,
     ) -> bool {
-        if !self.can_insert_tracked_memo_value(index) {
-            return false;
-        }
-        let old_cost = self
-            .memo
-            .get(&index)
-            .map(Self::stack_value_state_cost)
-            .unwrap_or_default();
         let top_stack_cost = self
             .tracked_stack_value_bytes
             .last()
             .copied()
             .unwrap_or_default();
-        let new_cost = Self::stack_value_state_cost(&value);
-        let retained_state_bytes = self.tracked_state_bytes.saturating_sub(old_cost);
         let retained_stack_bytes = self.tracked_stack_bytes.saturating_sub(top_stack_cost);
-        let Some(projected_state_bytes) = retained_state_bytes.checked_add(new_cost) else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
-            return false;
-        };
-        let Some(projected_total_bytes) = projected_state_bytes.checked_add(retained_stack_bytes)
+        let Some(projected_state_bytes) =
+            self.projected_memo_state_bytes(index, &value, retained_stack_bytes, reason)
         else {
-            self.record_tracked_state_budget_exhausted(reason, usize::MAX);
             return false;
         };
-        if projected_total_bytes > MAX_TRACKED_STATE_BYTES {
-            self.record_tracked_state_budget_exhausted(reason, projected_total_bytes);
-            return false;
-        }
-
         let stack_value = Self::memo_value_for_stack(index, &value, false);
         self.tracked_state_bytes = projected_state_bytes;
         self.replace_top_stack_value_with_tracked_cost(stack_value, 0, "memo_stack_reference");
@@ -1311,9 +1265,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_tracked_state_budget_exhausted(&mut self, reason: &'static str, observed: usize) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         if self.tracked_state_budget_exhausted {
             return;
         }
@@ -1740,7 +1692,8 @@ impl<'a> ScanState<'a> {
             }
             "DICT" => {
                 let values = self.pop_to_mark();
-                let tracked_dict = self.tracked_dict_from_values(&values);
+                let pairs = values.chunks_exact(2).map(|pair| (&pair[0], &pair[1]));
+                let tracked_dict = self.tracked_dict_from_pairs(pairs);
                 self.push_stack_value(tracked_dict);
             }
             "LIST" | "SET" | "FROZENSET" => {
@@ -1757,7 +1710,7 @@ impl<'a> ScanState<'a> {
             "APPENDS" | "SETITEMS" | "ADDITEMS" => {
                 let values = self.pop_to_mark();
                 if opcode.name == "SETITEMS" {
-                    self.apply_setitems(&values);
+                    self.apply_setitems(values);
                 }
             }
             "PUT" | "BINPUT" | "LONG_BINPUT" => {
@@ -1795,14 +1748,7 @@ impl<'a> ScanState<'a> {
             }
             "GLOBAL" => {
                 let (module, name) = opcode.arg.global_parts();
-                let reference = GlobalRef {
-                    module,
-                    name,
-                    position,
-                    malformed: false,
-                    memo_index: None,
-                    memo_read: false,
-                };
+                let reference = GlobalRef::new(module, name, position);
                 self.push_stack_value(StackValue::Global(reference.clone()));
                 self.record_global_ref(&reference, opcode.name);
             }
@@ -1815,14 +1761,7 @@ impl<'a> ScanState<'a> {
             }
             "EXT1" | "EXT2" | "EXT4" => {
                 let extension_code = opcode.arg.as_i64().unwrap_or_default();
-                let reference = GlobalRef {
-                    module: "copyreg.extension".to_string(),
-                    name: format!("code_{}", extension_code),
-                    position,
-                    malformed: true,
-                    memo_index: None,
-                    memo_read: false,
-                };
+                let reference = GlobalRef::extension(extension_code, position);
                 self.push_stack_value(StackValue::Global(reference.clone()));
                 self.add_finding(Finding {
                     message: format!(
@@ -2074,8 +2013,8 @@ impl<'a> ScanState<'a> {
         let requires_external_buffer_context = self.next_buffer_count > 0;
         let analysis_incomplete =
             requires_external_buffer_context || self.readonly_buffer_invalid_stack_count > 0;
-        if analysis_incomplete && self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
+        if analysis_incomplete {
+            self.status.mark_inconclusive();
         }
         let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
@@ -2127,12 +2066,9 @@ impl<'a> ScanState<'a> {
     }
 
     fn pop_value_operand_preserving_mark(&mut self) -> Option<StackValue> {
-        match self.pop_stack_value() {
-            Some(StackValue::Mark) => {
-                self.push_stack_value(StackValue::Mark);
-                None
-            }
-            value => value,
+        match self.stack.last() {
+            Some(StackValue::Mark) => None,
+            _ => self.pop_stack_value(),
         }
     }
 
@@ -2205,49 +2141,43 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn apply_setitems(&mut self, values: &[StackValue]) {
-        for pair in values.chunks_exact(2) {
-            let key = pair
-                .first()
-                .and_then(|value| stack_value_string(value, self.payload));
-            if let Some(value) = pair.get(1) {
-                if let Some(key) = key {
-                    self.record_top_tracked_dict_entry(key.as_ref(), value.clone());
-                } else {
-                    self.record_top_tracked_dict_unknown_key_value(value.clone());
-                }
+    fn apply_setitems(&mut self, values: Vec<StackValue>) {
+        let mut values = values.into_iter();
+        while let (Some(key), Some(value)) = (values.next(), values.next()) {
+            if let Some(key) = stack_value_string(&key, self.payload) {
+                self.record_top_tracked_dict_entry(&key, value);
+            } else {
+                self.record_top_tracked_dict_unknown_key_value(value);
             }
         }
     }
 
-    fn tracked_dict_from_values(&mut self, values: &[StackValue]) -> StackValue {
+    fn tracked_dict_from_pairs<'b>(
+        &mut self,
+        pairs: impl Iterator<Item = (&'b StackValue, &'b StackValue)>,
+    ) -> StackValue {
         let mut entries = Vec::new();
         let mut unknown_key_values = Vec::new();
         let mut unknown_key_values_overflowed = false;
         let mut entry_budget_exhausted = false;
-        for pair in values.chunks_exact(2) {
-            let key = pair
-                .first()
-                .and_then(|value| stack_value_string(value, self.payload));
-            if let Some(value) = pair.get(1) {
+        for (key, value) in pairs {
+            if let Some(key) = stack_value_string(key, self.payload) {
                 let security_relevant = Self::tracked_dict_value_is_security_relevant(value);
-                if let Some(key) = key {
-                    if security_relevant {
-                        if !Self::insert_tracked_dict_entry(&mut entries, key, value.clone()) {
-                            unknown_key_values_overflowed = true;
-                            entry_budget_exhausted = true;
-                        }
-                    } else if !Self::insert_tracked_dict_entry(&mut entries, key, StackValue::Other)
-                    {
-                        unknown_key_values_overflowed = true;
-                    }
+                let stored = if security_relevant {
+                    value.clone()
                 } else {
-                    Self::insert_tracked_dict_unknown_key_value(
-                        &mut unknown_key_values,
-                        &mut unknown_key_values_overflowed,
-                        value.clone(),
-                    );
+                    StackValue::Other
+                };
+                if !Self::insert_tracked_dict_entry(&mut entries, key, stored) {
+                    unknown_key_values_overflowed = true;
+                    entry_budget_exhausted |= security_relevant;
                 }
+            } else {
+                Self::insert_tracked_dict_unknown_key_value(
+                    &mut unknown_key_values,
+                    &mut unknown_key_values_overflowed,
+                    value.clone(),
+                );
             }
         }
         if entry_budget_exhausted {
@@ -2512,14 +2442,7 @@ impl<'a> ScanState<'a> {
             "INST" => {
                 let values = self.pop_to_mark();
                 let (module, name) = opcode.arg.global_parts();
-                let reference = GlobalRef {
-                    module,
-                    name,
-                    position,
-                    malformed: false,
-                    memo_index: None,
-                    memo_read: false,
-                };
+                let reference = GlobalRef::new(module, name, position);
                 self.record_global_ref(&reference, opcode.name);
                 self.push_stack_value(StackValue::Constructed {
                     reference: reference.clone(),
@@ -2691,25 +2614,18 @@ impl<'a> ScanState<'a> {
             entries,
             unknown_key_values,
             unknown_key_values_overflowed,
-            memo_index,
-        } = value?
+            ..
+        } = self.resolve_tracked_dict_alias(value?)
         else {
             return None;
         };
-        if !self
-            .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-            .is_empty()
-            || self.current_tracked_dict_unknown_key_values_overflowed(
-                *unknown_key_values_overflowed,
-                *memo_index,
-            )
-        {
+        if !unknown_key_values.is_empty() || *unknown_key_values_overflowed {
             return None;
         }
 
         let mut names = Vec::new();
         let mut total_bytes = 0usize;
-        for (name, _) in self.current_tracked_dict_entries(entries, *memo_index) {
+        for (name, _) in entries {
             total_bytes = total_bytes.checked_add(name.len())?;
             if names.len() >= MAX_CALLABLE_KEYWORD_ARGUMENTS
                 || total_bytes > MAX_CALLABLE_KEYWORD_ARGUMENT_BYTES
@@ -2888,8 +2804,8 @@ impl<'a> ScanState<'a> {
             entries,
             unknown_key_values,
             unknown_key_values_overflowed,
-            memo_index,
-        } = namespace
+            ..
+        } = self.resolve_tracked_dict_alias(namespace)
         else {
             return vec![DynamicTypeCallableAttribute {
                 attribute_name: None,
@@ -2899,7 +2815,7 @@ impl<'a> ScanState<'a> {
         };
 
         let mut attributes = Vec::new();
-        for (key, value) in self.current_tracked_dict_entries(entries, *memo_index) {
+        for (key, value) in entries {
             let key = key.to_ascii_lowercase();
             if !is_suspicious_magic_method(&key) {
                 continue;
@@ -2912,7 +2828,7 @@ impl<'a> ScanState<'a> {
                 });
             }
         }
-        for value in self.current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index) {
+        for value in unknown_key_values {
             if let Some(callable) = Self::callable_reference_from_value(Some(value)) {
                 attributes.push(DynamicTypeCallableAttribute {
                     attribute_name: None,
@@ -2921,10 +2837,7 @@ impl<'a> ScanState<'a> {
                 });
             }
         }
-        if self.current_tracked_dict_unknown_key_values_overflowed(
-            *unknown_key_values_overflowed,
-            *memo_index,
-        ) {
+        if *unknown_key_values_overflowed {
             attributes.push(DynamicTypeCallableAttribute {
                 attribute_name: None,
                 callable: None,
@@ -2945,28 +2858,20 @@ impl<'a> ScanState<'a> {
         let Some(arguments) = arguments else {
             return;
         };
-        match kind {
-            TrackedDictMutationKind::SetItem => {
-                let [target, key, value] = arguments else {
-                    return;
-                };
+        match (kind, arguments) {
+            (TrackedDictMutationKind::SetItem, [target, key, value]) => {
                 self.record_tracked_dict_mutation(target, key, value);
             }
-            TrackedDictMutationKind::SetDefault => {
-                let [target, key] = arguments else {
-                    if let [target, key, value] = arguments {
-                        self.record_tracked_dict_setdefault_mutation(target, key, Some(value));
-                    }
-                    return;
-                };
+            (TrackedDictMutationKind::SetDefault, [target, key]) => {
                 self.record_tracked_dict_setdefault_mutation(target, key, None);
             }
-            TrackedDictMutationKind::Update => {
-                let [target, source] = arguments else {
-                    return;
-                };
+            (TrackedDictMutationKind::SetDefault, [target, key, value]) => {
+                self.record_tracked_dict_setdefault_mutation(target, key, Some(value));
+            }
+            (TrackedDictMutationKind::Update, [target, source]) => {
                 self.record_tracked_dict_update_mutation(target, source);
             }
+            _ => {}
         }
     }
 
@@ -3078,48 +2983,11 @@ impl<'a> ScanState<'a> {
         key: &StackValue,
         value: &StackValue,
     ) {
-        let StackValue::TrackedDict { memo_index, .. } = target else {
-            return;
-        };
-        let Some(memo_index) = *memo_index else {
-            return;
-        };
-        let key = stack_value_string(key, self.payload);
-        if key.is_some() && !Self::tracked_dict_value_is_security_relevant(value) {
-            if let Some(key) = key.as_deref() {
-                self.record_top_tracked_dict_shadow_entry(key, Some(memo_index));
-            }
-            return;
-        }
-        let Some(mut tracked_dict) = self.memo.get(&memo_index).cloned() else {
-            return;
-        };
-        let mut entry_budget_exhausted = false;
-        if let StackValue::TrackedDict {
-            entries,
-            unknown_key_values,
-            unknown_key_values_overflowed,
-            ..
-        } = &mut tracked_dict
-        {
-            if let Some(key) = key {
-                if !Self::insert_tracked_dict_entry(entries, key, value.clone()) {
-                    *unknown_key_values_overflowed = true;
-                    entry_budget_exhausted = true;
-                }
-            } else {
-                Self::insert_tracked_dict_unknown_key_value(
-                    unknown_key_values,
-                    unknown_key_values_overflowed,
-                    value.clone(),
-                );
-            }
-        }
-        self.replace_memo_value(memo_index, tracked_dict, "tracked_dict_entry");
-        if entry_budget_exhausted {
-            self.record_tracked_state_budget_exhausted(
-                "tracked_dict_entries",
-                MAX_TRACKED_DICT_ENTRIES + 1,
+        if let Some(index) = Self::tracked_dict_memo_index(target) {
+            self.write_tracked_dict_entry(
+                index,
+                stack_value_string(key, self.payload),
+                Some(value),
             );
         }
     }
@@ -3130,34 +2998,30 @@ impl<'a> ScanState<'a> {
         key: &StackValue,
         value: Option<&StackValue>,
     ) {
-        let StackValue::TrackedDict {
-            memo_index,
-            entries,
-            ..
-        } = target
-        else {
-            return;
-        };
-        let Some(memo_index) = *memo_index else {
+        let Some(index) = Self::tracked_dict_memo_index(target) else {
             return;
         };
         let key = stack_value_string(key, self.payload);
         if key.as_ref().is_some_and(|key| {
-            self.current_tracked_dict_entries(entries, Some(memo_index))
-                .iter()
-                .any(|(candidate, _)| candidate == key)
+            matches!(self.resolve_tracked_dict_alias(target), StackValue::TrackedDict { entries, .. }
+                if entries.iter().any(|(candidate, _)| candidate == key))
         }) {
             return;
         }
-        let value = value.cloned().unwrap_or(StackValue::Primitive {
-            type_name: "NoneType",
-            repr: "None".to_string(),
-        });
-        if key.is_some() && !Self::tracked_dict_value_is_security_relevant(&value) {
-            if let Some(key) = key.as_deref() {
+        self.write_tracked_dict_entry(index, key, value);
+    }
+
+    fn write_tracked_dict_entry(
+        &mut self,
+        memo_index: i64,
+        key: Option<String>,
+        value: Option<&StackValue>,
+    ) {
+        if let Some(key) = key.as_deref() {
+            if !value.is_some_and(Self::tracked_dict_value_is_security_relevant) {
                 self.record_top_tracked_dict_shadow_entry(key, Some(memo_index));
+                return;
             }
-            return;
         }
         let Some(mut tracked_dict) = self.memo.get(&memo_index).cloned() else {
             return;
@@ -3170,6 +3034,10 @@ impl<'a> ScanState<'a> {
             ..
         } = &mut tracked_dict
         {
+            let value = value.cloned().unwrap_or_else(|| StackValue::Primitive {
+                type_name: "NoneType",
+                repr: "None".to_string(),
+            });
             if let Some(key) = key {
                 if !Self::insert_tracked_dict_entry(entries, key, value) {
                     *unknown_key_values_overflowed = true;
@@ -3193,10 +3061,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_tracked_dict_update_mutation(&mut self, target: &StackValue, source: &StackValue) {
-        let StackValue::TrackedDict { memo_index, .. } = target else {
-            return;
-        };
-        let Some(memo_index) = *memo_index else {
+        let Some(memo_index) = Self::tracked_dict_memo_index(target) else {
             return;
         };
         let Some((source_entries, source_unknown_key_values, source_overflowed)) =
@@ -3247,20 +3112,15 @@ impl<'a> ScanState<'a> {
             entries,
             unknown_key_values,
             unknown_key_values_overflowed,
-            memo_index,
-        } = value
+            ..
+        } = self.resolve_tracked_dict_alias(value)
         else {
             return None;
         };
         Some((
-            self.current_tracked_dict_entries(entries, *memo_index)
-                .to_vec(),
-            self.current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-                .to_vec(),
-            self.current_tracked_dict_unknown_key_values_overflowed(
-                *unknown_key_values_overflowed,
-                *memo_index,
-            ),
+            entries.to_vec(),
+            unknown_key_values.to_vec(),
+            *unknown_key_values_overflowed,
         ))
     }
 
@@ -4299,33 +4159,25 @@ impl<'a> ScanState<'a> {
             return Some(MappingLookup::BudgetExceeded);
         }
         *visited_nodes += 1;
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::DefaultDict { default_factory } => {
                 Some(MappingLookup::Found(default_factory))
             }
             StackValue::TrackedDict {
                 entries,
-                memo_index,
                 unknown_key_values,
                 unknown_key_values_overflowed,
                 ..
             } => {
-                if memo_index.is_some_and(|index| !visited.insert(index)) {
+                if Self::tracked_dict_memo_index(mapping)
+                    .is_some_and(|index| !visited.insert(index))
+                {
                     return None;
                 }
-                let entries = self.current_tracked_dict_entries(entries, *memo_index);
-                let unknown_key_lookup_is_opaque = key.is_none()
-                    && !self
-                        .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-                        .is_empty();
+                let unknown_key_lookup_is_opaque = key.is_none() && !unknown_key_values.is_empty();
                 if key.is_some_and(|key| entries.iter().any(|(candidate, _)| candidate == key)) {
                     Some(MappingLookup::Shadowed)
-                } else if unknown_key_lookup_is_opaque
-                    || self.current_tracked_dict_unknown_key_values_overflowed(
-                        *unknown_key_values_overflowed,
-                        *memo_index,
-                    )
-                {
+                } else if unknown_key_lookup_is_opaque || *unknown_key_values_overflowed {
                     Some(MappingLookup::BudgetExceeded)
                 } else {
                     None
@@ -4377,22 +4229,21 @@ impl<'a> ScanState<'a> {
             return Some(MappingLookup::BudgetExceeded);
         }
         *visited_nodes += 1;
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::DefaultDict { default_factory } => {
                 Some(MappingLookup::Found(default_factory))
             }
             StackValue::TrackedDict {
                 entries,
-                memo_index,
                 unknown_key_values,
                 unknown_key_values_overflowed,
                 ..
             } => {
-                let visit_key = memo_index.map(|index| (index, path.len()));
+                let visit_key =
+                    Self::tracked_dict_memo_index(mapping).map(|index| (index, path.len()));
                 if visit_key.is_some_and(|key| !visited.insert(key)) {
                     return Some(MappingLookup::BudgetExceeded);
                 }
-                let entries = self.current_tracked_dict_entries(entries, *memo_index);
                 let result = if let Some((key, remaining_path)) = path.split_first() {
                     if let Some(key) = key.as_deref() {
                         if let Some((_, value)) =
@@ -4409,29 +4260,15 @@ impl<'a> ScanState<'a> {
                                 )
                                 .or(Some(MappingLookup::Shadowed))
                             }
-                        } else if self.current_tracked_dict_unknown_key_values_overflowed(
-                            *unknown_key_values_overflowed,
-                            *memo_index,
-                        ) {
+                        } else if *unknown_key_values_overflowed {
                             Some(MappingLookup::BudgetExceeded)
                         } else {
                             None
                         }
+                    } else if unknown_key_values.is_empty() && !*unknown_key_values_overflowed {
+                        None
                     } else {
-                        let unknown_key_values = self.current_tracked_dict_unknown_key_values(
-                            unknown_key_values,
-                            *memo_index,
-                        );
-                        if unknown_key_values.is_empty()
-                            && !self.current_tracked_dict_unknown_key_values_overflowed(
-                                *unknown_key_values_overflowed,
-                                *memo_index,
-                            )
-                        {
-                            None
-                        } else {
-                            Some(MappingLookup::BudgetExceeded)
-                        }
+                        Some(MappingLookup::BudgetExceeded)
                     }
                 } else {
                     Some(MappingLookup::BudgetExceeded)
@@ -4481,51 +4318,22 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn current_tracked_dict_entries<'b>(
-        &'b self,
-        entries: &'b [(String, StackValue)],
-        memo_index: Option<i64>,
-    ) -> &'b [(String, StackValue)] {
-        memo_index
-            .and_then(|index| self.memo.get(&index))
-            .and_then(|value| match value {
-                StackValue::TrackedDict { entries, .. } => Some(entries.as_slice()),
-                _ => None,
-            })
-            .unwrap_or(entries)
+    fn tracked_dict_memo_index(value: &StackValue) -> Option<i64> {
+        match value {
+            StackValue::TrackedDict { memo_index, .. } => *memo_index,
+            _ => None,
+        }
     }
 
-    fn current_tracked_dict_unknown_key_values<'b>(
-        &'b self,
-        unknown_key_values: &'b [StackValue],
-        memo_index: Option<i64>,
-    ) -> &'b [StackValue] {
-        memo_index
-            .and_then(|index| self.memo.get(&index))
-            .and_then(|value| match value {
-                StackValue::TrackedDict {
-                    unknown_key_values, ..
-                } => Some(unknown_key_values.as_slice()),
-                _ => None,
-            })
-            .unwrap_or(unknown_key_values)
+    fn memoized_tracked_dict(&self, value: &StackValue) -> Option<&StackValue> {
+        self.memo
+            .get(&Self::tracked_dict_memo_index(value)?)
+            .filter(|stored| matches!(stored, StackValue::TrackedDict { .. }))
     }
 
-    fn current_tracked_dict_unknown_key_values_overflowed(
-        &self,
-        unknown_key_values_overflowed: bool,
-        memo_index: Option<i64>,
-    ) -> bool {
-        memo_index
-            .and_then(|index| self.memo.get(&index))
-            .and_then(|value| match value {
-                StackValue::TrackedDict {
-                    unknown_key_values_overflowed,
-                    ..
-                } => Some(*unknown_key_values_overflowed),
-                _ => None,
-            })
-            .unwrap_or(unknown_key_values_overflowed)
+    // Traversals use the original alias's memo index as their visit key.
+    fn resolve_tracked_dict_alias<'b>(&'b self, value: &'b StackValue) -> &'b StackValue {
+        self.memoized_tracked_dict(value).unwrap_or(value)
     }
 
     fn formatter_vformat_invocations(
@@ -4610,7 +4418,7 @@ impl<'a> ScanState<'a> {
         let Some(mapping) = invocation.args.get(1) else {
             return true;
         };
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::Constructed { reference, defaultdict_without_factory: true } => {
                 !reference.malformed && reference.module == "collections" && reference.name == "defaultdict"
             }
@@ -4625,18 +4433,11 @@ impl<'a> ScanState<'a> {
                 entries,
                 unknown_key_values,
                 unknown_key_values_overflowed,
-                memo_index,
+                ..
             } => {
-                !self.current_tracked_dict_unknown_key_values_overflowed(
-                    *unknown_key_values_overflowed,
-                    *memo_index,
-                ) && self
-                    .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
-                    .is_empty()
-                    && self
-                        .current_tracked_dict_entries(entries, *memo_index)
-                        .iter()
-                        .all(|(_, value)| {
+                !*unknown_key_values_overflowed
+                    && unknown_key_values.is_empty()
+                    && entries.iter().all(|(_, value)| {
                             matches!(
                                 value,
                                 StackValue::Text { .. }
@@ -5319,144 +5120,63 @@ impl<'a> ScanState<'a> {
     }
 
     fn with_memo_index(&self, value: StackValue, index: i64) -> StackValue {
-        match value {
-            StackValue::FutureCallbacks(mut callbacks) => {
-                callbacks.memo_index = Some(index);
-                StackValue::FutureCallbacks(callbacks)
+        let value = self.memoized_tracked_dict(&value).cloned().unwrap_or(value);
+        Self::set_memo_index(value, index)
+    }
+
+    fn set_memo_index(mut value: StackValue, index: i64) -> StackValue {
+        let memo_index = match &mut value {
+            StackValue::Global(reference) | StackValue::Constructed { reference, .. } => {
+                &mut reference.memo_index
             }
-            StackValue::Global(mut reference) => {
-                reference.memo_index = Some(index);
-                StackValue::Global(reference)
-            }
-            StackValue::Constructed {
-                mut reference,
-                defaultdict_without_factory,
-            } => {
-                reference.memo_index = Some(index);
-                StackValue::Constructed {
-                    reference,
-                    defaultdict_without_factory,
-                }
-            }
-            StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
-                type_name,
-                memo_index: Some(index),
-            },
-            StackValue::TrackedDict {
-                entries,
-                unknown_key_values,
-                unknown_key_values_overflowed,
-                memo_index,
-            } => {
-                let entries = self
-                    .current_tracked_dict_entries(&entries, memo_index)
-                    .to_vec();
-                let unknown_key_values = self
-                    .current_tracked_dict_unknown_key_values(&unknown_key_values, memo_index)
-                    .to_vec();
-                let unknown_key_values_overflowed = self
-                    .current_tracked_dict_unknown_key_values_overflowed(
-                        unknown_key_values_overflowed,
-                        memo_index,
-                    );
-                StackValue::TrackedDict {
-                    entries,
-                    unknown_key_values,
-                    unknown_key_values_overflowed,
-                    memo_index: Some(index),
-                }
-            }
-            value => value,
-        }
+            StackValue::FutureCallbacks(callbacks) => &mut callbacks.memo_index,
+            StackValue::DynamicType { memo_index, .. }
+            | StackValue::TrackedDict { memo_index, .. } => memo_index,
+            _ => return value,
+        };
+        *memo_index = Some(index);
+        value
     }
 
     fn memo_value_for_stack(index: i64, value: &StackValue, memo_read: bool) -> StackValue {
-        match value {
-            StackValue::TrackedDict {
-                unknown_key_values_overflowed,
-                ..
-            } => StackValue::TrackedDict {
+        if let StackValue::TrackedDict {
+            unknown_key_values_overflowed,
+            ..
+        } = value
+        {
+            return StackValue::TrackedDict {
                 entries: Vec::new(),
                 unknown_key_values: Vec::new(),
                 unknown_key_values_overflowed: *unknown_key_values_overflowed,
                 memo_index: Some(index),
-            },
-            StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
-                type_name: type_name.clone(),
-                memo_index: Some(index),
-            },
-            StackValue::FutureCallbacks(callbacks) => {
-                let mut callbacks = callbacks.clone();
-                callbacks.memo_index = Some(index);
-                StackValue::FutureCallbacks(callbacks)
-            }
-            StackValue::Global(reference) => {
-                let mut reference = reference.clone();
-                reference.memo_index = Some(index);
-                reference.memo_read |= memo_read;
-                StackValue::Global(reference)
-            }
-            StackValue::Constructed {
-                reference,
-                defaultdict_without_factory,
-            } => {
-                let mut reference = reference.clone();
-                reference.memo_index = Some(index);
-                reference.memo_read |= memo_read;
-                StackValue::Constructed {
-                    reference,
-                    defaultdict_without_factory: *defaultdict_without_factory,
-                }
-            }
-            value => Self::memo_read_stack_value(value, memo_read),
+            };
         }
+        Self::set_memo_index(Self::memo_read_stack_value(value, memo_read), index)
     }
 
     fn memo_read_stack_value(value: &StackValue, memo_read: bool) -> StackValue {
         if !memo_read {
             return value.clone();
         }
-        match value {
-            StackValue::Global(reference) => {
-                let mut reference = reference.clone();
-                reference.memo_read = true;
-                StackValue::Global(reference)
-            }
-            StackValue::Constructed {
-                reference,
-                defaultdict_without_factory,
-            } => {
-                let mut reference = reference.clone();
-                reference.memo_read = true;
-                StackValue::Constructed {
-                    reference,
-                    defaultdict_without_factory: *defaultdict_without_factory,
-                }
-            }
-            StackValue::Text {
-                value,
-                memo_read: existing_memo_read,
-            } => StackValue::Text {
-                value: value.clone(),
-                memo_read: *existing_memo_read || memo_read,
-            },
-            StackValue::TextSpan {
-                start,
-                end,
-                memo_read: existing_memo_read,
-            } => StackValue::TextSpan {
-                start: *start,
-                end: *end,
-                memo_read: *existing_memo_read || memo_read,
-            },
-            StackValue::Tuple(values) => StackValue::Tuple(
+        if let StackValue::Tuple(values) = value {
+            return StackValue::Tuple(
                 values
                     .iter()
-                    .map(|item| Self::memo_read_stack_value(item, memo_read))
+                    .map(|item| Self::memo_read_stack_value(item, true))
                     .collect(),
-            ),
-            value => value.clone(),
+            );
         }
+        let mut value = value.clone();
+        match &mut value {
+            StackValue::Global(reference) | StackValue::Constructed { reference, .. } => {
+                reference.memo_read = true
+            }
+            StackValue::Text { memo_read, .. } | StackValue::TextSpan { memo_read, .. } => {
+                *memo_read = true
+            }
+            _ => {}
+        }
+        value
     }
 
     fn memoized_future_add_callback(&mut self, memo_index: i64, callback: GlobalRef) {
@@ -6097,65 +5817,29 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn tracked_dict_from_pair_iterable(&mut self, iterable: &StackValue) -> Option<StackValue> {
-        let mut iterable = iterable;
-        let items = loop {
+    fn tracked_dict_from_pair_iterable(&mut self, mut iterable: &StackValue) -> Option<StackValue> {
+        fn tuple_pair(item: &StackValue) -> Option<(&StackValue, &StackValue)> {
+            let StackValue::Tuple(items) = item else {
+                return None;
+            };
+            let [key, value] = items.as_slice() else {
+                return None;
+            };
+            Some((key, value))
+        }
+
+        loop {
             let StackValue::Tuple(items) = iterable else {
                 return None;
             };
-            if items.is_empty()
-                || items
-                    .iter()
-                    .all(|item| matches!(item, StackValue::Tuple(pair) if pair.len() == 2))
-            {
-                break items;
+            if items.iter().all(|item| tuple_pair(item).is_some()) {
+                return Some(self.tracked_dict_from_pairs(items.iter().filter_map(tuple_pair)));
             }
             let [wrapped] = items.as_slice() else {
                 return None;
             };
             iterable = wrapped;
-        };
-        let mut entries = Vec::new();
-        let mut unknown_key_values = Vec::new();
-        let mut unknown_key_values_overflowed = false;
-        let mut entry_budget_exhausted = false;
-        for item in items {
-            let StackValue::Tuple(pair) = item else {
-                return None;
-            };
-            let [key, value] = pair.as_slice() else {
-                return None;
-            };
-            let security_relevant = Self::tracked_dict_value_is_security_relevant(value);
-            if let Some(key) = stack_value_string(key, self.payload) {
-                if security_relevant {
-                    if !Self::insert_tracked_dict_entry(&mut entries, key, value.clone()) {
-                        unknown_key_values_overflowed = true;
-                        entry_budget_exhausted = true;
-                    }
-                } else if !Self::insert_tracked_dict_entry(&mut entries, key, StackValue::Other) {
-                    unknown_key_values_overflowed = true;
-                }
-            } else {
-                Self::insert_tracked_dict_unknown_key_value(
-                    &mut unknown_key_values,
-                    &mut unknown_key_values_overflowed,
-                    value.clone(),
-                );
-            }
         }
-        if entry_budget_exhausted {
-            self.record_tracked_state_budget_exhausted(
-                "tracked_dict_entries",
-                entries.len().saturating_add(1),
-            );
-        }
-        Some(StackValue::TrackedDict {
-            entries,
-            unknown_key_values,
-            unknown_key_values_overflowed,
-            memo_index: None,
-        })
     }
 
     fn mapping_wrapper_result(&self, values: &[StackValue]) -> Option<StackValue> {
@@ -6209,24 +5893,20 @@ impl<'a> ScanState<'a> {
             return true;
         }
         *visited_nodes += 1;
-        match mapping {
+        match self.resolve_tracked_dict_alias(mapping) {
             StackValue::DefaultDict { .. } => true,
             StackValue::TrackedDict {
                 entries,
-                memo_index,
                 unknown_key_values_overflowed,
                 ..
             } => {
-                if memo_index.is_some_and(|index| !visited.insert(index)) {
+                if Self::tracked_dict_memo_index(mapping)
+                    .is_some_and(|index| !visited.insert(index))
+                {
                     return false;
                 }
-                self.current_tracked_dict_unknown_key_values_overflowed(
-                    *unknown_key_values_overflowed,
-                    *memo_index,
-                ) || self
-                    .current_tracked_dict_entries(entries, *memo_index)
-                    .iter()
-                    .any(|(_, value)| {
+                *unknown_key_values_overflowed
+                    || entries.iter().any(|(_, value)| {
                         self.mapping_may_contain_default_factory_inner(
                             value,
                             visited,
@@ -6291,52 +5971,34 @@ impl<'a> ScanState<'a> {
         name_value: Option<StackValue>,
         position: usize,
     ) -> GlobalRef {
-        let memo_read = stack_value_memo_read(module_value.as_ref())
-            || stack_value_memo_read(name_value.as_ref());
-        let module = resolve_global_operand(module_value.as_ref(), self.payload);
-        let name = resolve_global_operand(name_value.as_ref(), self.payload);
-
-        match (module, name) {
-            (Some(module), Some(name)) => GlobalRef {
-                module,
-                name,
-                position,
-                malformed: false,
-                memo_index: None,
-                memo_read,
-            },
-            (module, name) => {
-                let malformed = GlobalRef {
-                    module: module.unwrap_or_else(|| "__unknown__".to_string()),
-                    name: name.unwrap_or_else(|| "__unknown__".to_string()),
-                    position,
-                    malformed: true,
-                    memo_index: None,
-                    memo_read,
-                };
-                self.add_finding(Finding {
-                    message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"
-                        .to_string(),
-                    severity: "critical",
-                    location: Some(format!("{} (pos {})", self.source, position)),
-                    rule_code: Some("MALFORMED_STACK_GLOBAL"),
-                    details: vec![
-                        (
-                            "module_operand".to_string(),
-                            DetailValue::String(operand_preview(module_value.as_ref())),
-                        ),
-                        (
-                            "name_operand".to_string(),
-                            DetailValue::String(operand_preview(name_value.as_ref())),
-                        ),
-                    ],
-                    why: Some(
-                        "Malformed STACK_GLOBAL operands can be used to bypass scanners that assume string-only operands.",
+        let module = module_value.as_ref();
+        let name = name_value.as_ref();
+        let memo_read = stack_value_memo_read(module) || stack_value_memo_read(name);
+        let mut reference = GlobalRef::from_stack_operands(module, name, self.payload, position);
+        reference.memo_read = memo_read;
+        if reference.malformed {
+            self.add_finding(Finding {
+                message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"
+                    .to_string(),
+                severity: "critical",
+                location: Some(format!("{} (pos {})", self.source, position)),
+                rule_code: Some("MALFORMED_STACK_GLOBAL"),
+                details: vec![
+                    (
+                        "module_operand".to_string(),
+                        DetailValue::String(operand_preview(module)),
                     ),
-                });
-                malformed
-            }
+                    (
+                        "name_operand".to_string(),
+                        DetailValue::String(operand_preview(name)),
+                    ),
+                ],
+                why: Some(
+                    "Malformed STACK_GLOBAL operands can be used to bypass scanners that assume string-only operands.",
+                ),
+            });
         }
+        reference
     }
 
     fn scan_string_literal(
@@ -6591,12 +6253,12 @@ impl<'a> ScanState<'a> {
                     .len()
                     .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
                 let probe = &value[offset..end];
-                let payload_extent =
-                    pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes);
-                let complete_payload = matches!(&payload_extent, Ok(Some(_)));
-                let incomplete_prefix = payload_extent
-                    .as_ref()
-                    .is_err_and(|error| error.scan_incomplete_prefix);
+                let candidate_is_pickle =
+                    pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes)
+                        .map_or_else(
+                            |error| error.scan_incomplete_prefix,
+                            |length| length.is_some(),
+                        );
                 let malformed_payload = has_execution_opcode(probe)
                     && (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
@@ -6605,11 +6267,7 @@ impl<'a> ScanState<'a> {
                         &value[offset..],
                         self.options.max_nested_pickle_bytes,
                     );
-                if !complete_payload
-                    && !incomplete_prefix
-                    && !malformed_payload
-                    && !truncated_payload
-                {
+                if !candidate_is_pickle && !malformed_payload && !truncated_payload {
                     continue;
                 }
                 if offsets.len() >= MAX_NESTED_PAYLOAD_PROBES {
@@ -6806,8 +6464,6 @@ impl<'a> ScanState<'a> {
 
         let probe_windows =
             encoded_nested_literal_probe_windows_with_limit(value, max_window_chars);
-        let probe_limit_exceeded = probe_windows.limit_exceeded;
-        let probe_limit_exceeded_encoding = probe_windows.limit_exceeded_encoding;
         for candidate in probe_windows.windows {
             if found_candidate && candidate.synthetic_prefix_bytes == 0 && candidate.value == value
             {
@@ -6829,7 +6485,7 @@ impl<'a> ScanState<'a> {
             );
         }
 
-        if let Some(encoding) = probe_limit_exceeded_encoding {
+        if let Some(encoding) = probe_windows.limit_exceeded_encoding {
             self.record_nested_probe_limit_exceeded(encoding, string_char_len(value), position);
         }
 
@@ -6837,7 +6493,7 @@ impl<'a> ScanState<'a> {
             return (true, whole_literal_is_encoded_pickle);
         }
 
-        if probe_coverage_incomplete || probe_limit_exceeded {
+        if probe_coverage_incomplete || probe_windows.limit_exceeded_encoding.is_some() {
             return (false, false);
         }
 
@@ -6914,9 +6570,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_raw_nested_payload_truncated(&mut self, payload_size: usize, position: usize) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: "Nested pickle payload exceeds configured deep-scan byte limit".to_string(),
             severity: "info",
@@ -6946,9 +6600,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         let details = vec![
             (
                 "encoding".to_string(),
@@ -7050,9 +6702,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: "Encoded pickle payload exceeds configured deep-scan byte limit".to_string(),
             severity: "info",
@@ -7182,10 +6832,10 @@ impl<'a> ScanState<'a> {
             })
         };
         self.push_stack_value(StackValue::Other);
-        let storage_descriptor = persistent_id
+        let storage_id = persistent_id
             .as_ref()
-            .and_then(|value| pytorch_storage_descriptor_ref(value, self.payload).cloned());
-        if let Some(descriptor) = storage_descriptor.as_ref() {
+            .and_then(|value| pytorch_storage_persistent_id(value, self.payload));
+        if let Some(descriptor) = storage_id.as_ref().and_then(|id| id.descriptor) {
             self.mark_pytorch_storage_persistent_id_import_reference(descriptor);
         }
         if self.persistent_id_count > 1 {
@@ -7201,14 +6851,14 @@ impl<'a> ScanState<'a> {
                 "persistent_id_preview".to_string(),
                 DetailValue::String(stack_value_preview(value, 0)),
             ));
-            if let Some(storage_key) = pytorch_storage_key(value, self.payload) {
+            if let Some(storage_id) = storage_id {
                 details.push((
                     "pytorch_storage_persistent_id".to_string(),
                     DetailValue::Bool(true),
                 ));
                 details.push((
                     "pytorch_storage_key".to_string(),
-                    DetailValue::String(storage_key),
+                    DetailValue::String(storage_id.key.into_owned()),
                 ));
             }
         }
@@ -7317,9 +6967,7 @@ impl<'a> ScanState<'a> {
         if self.import_references_truncated {
             return;
         }
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.import_references_truncated = true;
         self.add_notice(Notice {
             message: "Import reference metadata exceeded the scanner reporting limit".to_string(),
@@ -7351,9 +6999,7 @@ impl<'a> ScanState<'a> {
         if self.non_allowlisted_global_imports_truncated {
             return;
         }
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.non_allowlisted_global_imports_truncated = true;
         self.add_notice(Notice {
             message: "Non-allowlisted global findings exceeded the scanner reporting limit"
@@ -7584,9 +7230,7 @@ impl<'a> ScanState<'a> {
         if self.callable_invocations_truncated {
             return;
         }
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.callable_invocations_truncated = true;
         self.add_notice(Notice {
             message: "Callable invocation metadata exceeded the scanner reporting limit"
@@ -8031,9 +7675,7 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: format!(
                 "{} literal scan truncated at configured limit",
@@ -8073,9 +7715,7 @@ impl<'a> ScanState<'a> {
         limit_name: &'static str,
         limit: usize,
     ) {
-        if self.status.is_complete() {
-            self.status = ScanStatus::Inconclusive;
-        }
+        self.status.mark_inconclusive();
         self.add_notice(Notice {
             message: message.to_string(),
             severity: "info",
@@ -8103,9 +7743,7 @@ impl<'a> ScanState<'a> {
             self.source, encoding, position
         );
         if self.nested_depth >= self.options.max_nested_depth {
-            if self.status.is_complete() {
-                self.status = ScanStatus::Inconclusive;
-            }
+            self.status.mark_inconclusive();
             let details = vec![
                 (
                     "nested_encoding".to_string(),
@@ -8183,59 +7821,31 @@ impl<'a> ScanState<'a> {
         }
         let nested_incomplete = !nested_scan.status.is_complete();
         let nested_import_references = std::mem::take(&mut nested_scan.import_references);
-        let nested_root_opcode_counts = std::mem::take(&mut nested_scan.opcode_counts);
-        let nested_descendant_opcode_counts = std::mem::take(&mut nested_scan.nested_opcode_counts);
-        let nested_follow_on_opcode_counts =
-            std::mem::take(&mut nested_scan.follow_on_opcode_counts);
+        let nested_counts = nested_scan.take_opcode_counts();
         self.merge_follow_on_import_references(
             nested_import_references,
             nested_scan.import_references_truncated,
         );
-        Self::merge_opcode_counts(&mut self.nested_opcode_counts, nested_root_opcode_counts);
-        Self::merge_opcode_counts(
-            &mut self.nested_opcode_counts,
-            nested_descendant_opcode_counts,
-        );
-        Self::merge_opcode_counts(
-            &mut self.nested_opcode_counts,
-            nested_follow_on_opcode_counts,
-        );
+        Self::merge_opcode_counts(&mut self.nested_opcode_counts, nested_counts);
 
         for nested_finding in nested_scan.findings {
             if nested_finding.severity == "critical" {
                 outcome.has_critical_finding = true;
             }
-            let nested_details = nested_finding
-                .details
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
+            let import_details = ["import_reference", "module", "name", "opcode"].map(|key| {
+                detail_string(&nested_finding.details, key)
+                    .map(|value| (key.to_string(), DetailValue::String(value)))
+            });
             let mut details = vec![
-                (
-                    "nested_encoding".to_string(),
-                    DetailValue::String(encoding.to_string()),
-                ),
-                (
-                    "nested_source".to_string(),
-                    DetailValue::String(nested_source.clone()),
-                ),
-                (
-                    "nested_rule_code".to_string(),
-                    match nested_finding.rule_code {
-                        Some(rule_code) => DetailValue::String(rule_code.to_string()),
-                        None => DetailValue::None,
-                    },
-                ),
+                text_field("nested_encoding", Some(encoding)),
+                text_field("nested_source", Some(nested_source.as_str())),
+                text_field("nested_rule_code", nested_finding.rule_code),
                 (
                     "nested_details".to_string(),
-                    DetailValue::Dict(nested_details),
+                    DetailValue::Dict(nested_finding.details),
                 ),
             ];
-            for key in ["import_reference", "module", "name", "opcode"] {
-                if let Some(value) = detail_string(&nested_finding.details, key) {
-                    details.push((key.to_string(), DetailValue::String(value)));
-                }
-            }
+            details.extend(import_details.into_iter().flatten());
             self.add_finding(Finding {
                 message: format!("Nested pickle finding: {}", nested_finding.message),
                 severity: nested_finding.severity,
@@ -8247,9 +7857,7 @@ impl<'a> ScanState<'a> {
         }
 
         if nested_incomplete {
-            if self.status.is_complete() {
-                self.status = ScanStatus::Inconclusive;
-            }
+            self.status.mark_inconclusive();
             self.add_finding(Finding {
                 message: "Nested pickle analysis did not complete".to_string(),
                 severity: "critical",
@@ -8272,12 +7880,12 @@ impl<'a> ScanState<'a> {
             });
             let nested_errors = nested_scan
                 .errors
-                .iter()
+                .into_iter()
                 .map(scan_error_to_detail_value)
                 .collect::<Vec<_>>();
             let nested_notices = nested_scan
                 .notices
-                .iter()
+                .into_iter()
                 .map(notice_to_detail_value)
                 .collect::<Vec<_>>();
             self.add_notice(Notice {
@@ -8323,20 +7931,7 @@ impl<'a> ScanState<'a> {
             .bytes_scanned
             .max(tail_start.saturating_add(tail.len()));
 
-        let initial_stack = self
-            .stack
-            .iter()
-            .map(|value| post_budget_owned_stack_value(value, self.payload))
-            .collect::<Vec<_>>();
-        let memo_snapshot = self
-            .memo
-            .iter()
-            .map(|(index, value)| (*index, post_budget_owned_stack_value(value, self.payload)))
-            .collect::<HashMap<_, _>>();
-        for global_match in
-            post_budget_global_matches(tail, &initial_stack, memo_snapshot.len(), |memo_index| {
-                memo_snapshot.get(&memo_index).cloned()
-            })
+        for global_match in post_budget_global_matches(tail, self.payload, &self.stack, &self.memo)
         {
             let absolute_position = read_offset.saturating_add(global_match.pattern_start);
             let severity = if global_match.reduce_proximate {
@@ -8457,11 +8052,7 @@ impl<'a> ScanState<'a> {
             skip_offsets_before =
                 skip_offsets_before.max(absolute_offset.saturating_add(candidate_len));
             let had_findings = !follow_on_scan.findings.is_empty();
-            let follow_on_root_opcode_counts = std::mem::take(&mut follow_on_scan.opcode_counts);
-            let follow_on_nested_opcode_counts =
-                std::mem::take(&mut follow_on_scan.nested_opcode_counts);
-            let recursive_follow_on_opcode_counts =
-                std::mem::take(&mut follow_on_scan.follow_on_opcode_counts);
+            let follow_on_counts = follow_on_scan.take_opcode_counts();
             for finding in follow_on_scan.findings {
                 self.add_finding(finding);
             }
@@ -8473,18 +8064,7 @@ impl<'a> ScanState<'a> {
                 follow_on_scan.callable_invocations,
                 follow_on_scan.callable_invocations_truncated,
             );
-            Self::merge_opcode_counts(
-                &mut self.follow_on_opcode_counts,
-                follow_on_root_opcode_counts,
-            );
-            Self::merge_opcode_counts(
-                &mut self.follow_on_opcode_counts,
-                follow_on_nested_opcode_counts,
-            );
-            Self::merge_opcode_counts(
-                &mut self.follow_on_opcode_counts,
-                recursive_follow_on_opcode_counts,
-            );
+            Self::merge_opcode_counts(&mut self.follow_on_opcode_counts, follow_on_counts);
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),
@@ -8508,11 +8088,16 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn merge_opcode_counts(
-        target: &mut HashMap<&'static str, usize>,
-        counts: HashMap<&'static str, usize>,
-    ) {
-        for (opcode, count) in counts {
+    fn take_opcode_counts(&mut self) -> [OpcodeCounts; 3] {
+        [
+            std::mem::take(&mut self.opcode_counts),
+            std::mem::take(&mut self.nested_opcode_counts),
+            std::mem::take(&mut self.follow_on_opcode_counts),
+        ]
+    }
+
+    fn merge_opcode_counts(target: &mut OpcodeCounts, counts: [OpcodeCounts; 3]) {
+        for (opcode, count) in counts.into_iter().flatten() {
             *target.entry(opcode).or_insert(0) += count;
         }
     }
@@ -8670,23 +8255,9 @@ impl<'a> ScanState<'a> {
         report.set_item("status", self.status.as_str())?;
         report.set_item("verdict", self.verdict.as_str())?;
 
-        let findings = PyList::empty(py);
-        for finding in &self.findings {
-            findings.append(finding.to_py_object(py)?)?;
-        }
-        report.set_item("findings", findings)?;
-
-        let notices = PyList::empty(py);
-        for notice in &self.notices {
-            notices.append(notice.to_py_object(py)?)?;
-        }
-        report.set_item("notices", notices)?;
-
-        let errors = PyList::empty(py);
-        for error in &self.errors {
-            errors.append(error.to_py_object(py)?)?;
-        }
-        report.set_item("errors", errors)?;
+        report.set_item("findings", &self.findings)?;
+        report.set_item("notices", &self.notices)?;
+        report.set_item("errors", &self.errors)?;
 
         let raw_scan_complete = self.status.is_complete()
             && self
@@ -8712,7 +8283,7 @@ impl<'a> ScanState<'a> {
         metadata.set_item("globals_count", self.global_count)?;
         let import_references = PyList::empty(py);
         for reference in &self.import_references {
-            import_references.append(DetailValue::Dict(reference.clone()).to_py_object(py)?)?;
+            import_references.append(detail_dict_to_py(py, reference)?)?;
         }
         metadata.set_item("import_references", import_references)?;
         metadata.set_item(
@@ -8720,15 +8291,13 @@ impl<'a> ScanState<'a> {
             self.import_references_truncated,
         )?;
         let callable_invocations = PyList::empty(py);
+        // Serialize only the final report-wide proof, never an earlier true
+        // snapshot that a later opaque or recovered segment invalidated.
+        let template_execution_complete = self.template_execution_is_complete();
         for invocation in &self.callable_invocations {
-            // Serialize only the final report-wide proof, never an earlier true
-            // snapshot that a later opaque or recovered segment invalidated.
-            let mut details = invocation.clone();
-            details.push((
-                "template_execution_complete".to_string(),
-                DetailValue::Bool(self.template_execution_is_complete()),
-            ));
-            callable_invocations.append(DetailValue::Dict(details).to_py_object(py)?)?;
+            let details = detail_dict_to_py(py, invocation)?;
+            details.set_item("template_execution_complete", template_execution_complete)?;
+            callable_invocations.append(details)?;
         }
         metadata.set_item("callable_invocations", callable_invocations)?;
         metadata.set_item(
@@ -8841,30 +8410,6 @@ fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bo
         }
     }
     saw_import_reference
-}
-
-fn post_budget_owned_stack_value(value: &StackValue, payload: &[u8]) -> StackValue {
-    match value {
-        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
-            StackValue::Text {
-                value: String::from_utf8_lossy(&payload[*start..*end]).to_string(),
-                memo_read: false,
-            }
-        }
-        StackValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
-            StackValue::Bytes {
-                start: *start,
-                end: *end,
-            }
-        }
-        StackValue::Tuple(values) => StackValue::Tuple(
-            values
-                .iter()
-                .map(|item| post_budget_owned_stack_value(item, payload))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
 }
 
 fn advance_chars_from(value: &str, start: usize, count: usize) -> usize {
@@ -10206,21 +9751,11 @@ mod tests {
             0,
             Instant::now().checked_sub(Duration::from_secs(1)),
         );
-        let opcode = ParsedOpcode {
-            name: "NONE",
-            arg: ArgValue::None,
-            pos: 0,
-            next: 1,
-        };
-
         scan.opcode_count = TIME_CHECK_INTERVAL_OPCODES - 1;
-        assert!(matches!(scan.check_limits(&opcode), Ok(())));
+        assert!(matches!(scan.check_limits(), Ok(())));
 
         scan.opcode_count = TIME_CHECK_INTERVAL_OPCODES;
-        assert!(matches!(
-            scan.check_limits(&opcode),
-            Err(LimitError::Timeout)
-        ));
+        assert!(matches!(scan.check_limits(), Err(LimitError::Timeout)));
     }
 
     #[test]
@@ -11681,12 +11216,8 @@ mod tests {
 
     fn post_budget_prememo_options() -> ScanOptions {
         ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 7,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            ..default_test_options()
         }
     }
 
@@ -11997,18 +11528,31 @@ mod tests {
                 && detail_string(&finding.details, "pattern").as_deref() == Some("subprocess\nrun")
         }));
 
-        let ext_payload = b"\x80\x04\x88\x88\x82\x07R.".to_vec();
-        let ext_scan = run_test_scan("post-budget-ext.pkl", &ext_payload, &options);
-        let finding = ext_scan
-            .findings
-            .iter()
-            .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
-            .expect("post-budget extension finding");
-        assert_eq!(finding.severity, "critical");
-        assert_eq!(
-            detail_string(&finding.details, "pattern").as_deref(),
-            Some("copyreg.extension\ncode_7")
-        );
+        let expected = [
+            "copyreg.extension\ncode_7",
+            "copyreg.extension\ncode_4294967295",
+        ];
+        for (payload, expected_patterns) in [
+            (b"\x80\x04\x88\x88\x82\x07R.".as_slice(), &expected[..1]),
+            // The raw sweep continues past STOP and preserves the unsigned EXT4 code.
+            (
+                b"\x80\x04\x88\x88\x82\x07R.\x84\xff\xff\xff\xffR",
+                &expected[..],
+            ),
+        ] {
+            let ext_scan = run_test_scan("post-budget-ext.pkl", payload, &options);
+            let patterns: Vec<_> = ext_scan
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+                .map(|finding| {
+                    assert_eq!(finding.severity, "critical");
+                    detail_string(&finding.details, "pattern")
+                        .expect("post-budget extension pattern")
+                })
+                .collect();
+            assert_eq!(patterns, expected_patterns);
+        }
     }
 
     #[test]
