@@ -1873,7 +1873,7 @@ def test_gguf_retired_interleaved_row_groups_cannot_span_matrices(
             assert alignment_checks[0].details["row_group"] == row_group
             assert f"not aligned to its {row_group}-row block groups" in alignment_checks[0].message
     assert direct.success is True
-    assert aggregate.success is aligned
+    assert aggregate.success is True
     assert determine_exit_code(aggregate) == (0 if aligned else 1)
 
 
@@ -2372,6 +2372,19 @@ def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) 
     assert any(issue.rule_code == "S902" and "download" in issue.message for issue in malicious_aggregate.issues)
     assert not any(issue.rule_code == "S902" for issue in benign_aggregate.issues)
     assert determine_exit_code(benign_aggregate) == 0
+
+
+@pytest.mark.parametrize("severity", [Severity.MEDIUM, Severity.CRITICAL])
+def test_completed_gguf_scan_with_findings_reports_success(tmp_path: Path, severity: Severity) -> None:
+    path = create_mock_gguf(tmp_path / "model.gguf", metadata={"download": "curl -fO https://example.org/file"})
+    set_config(ModelAuditConfig(severity={"S902": severity}))
+    try:
+        result = scan_model_directory_or_file(str(path), cache_enabled=False)
+    finally:
+        reset_config()
+
+    assert result.success is True
+    assert determine_exit_code(result) == 1
 
 
 def test_gguf_metadata_curl_short_options_detected_in_directory_scan(tmp_path: Path) -> None:
