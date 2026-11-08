@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Explain when JSON parsing limits interrupt SafeTensors header validation and when YAML safe loading prevents template extraction.
 - Distinguish reshape dimensions from activation data when tracing both inputs of an ONNX attention contraction. Dynamically transformed weights retain their coverage gaps.
 
+- Keep the highest failed severity and its explanation when combining checks for one asset. Summaries that include informational findings now identify them as findings.
 - Preserve individual pickle coverage notices and member locations in consolidated scan results.
 - Validate PyTorch storage references alongside wide RNG state tuples and track up to 2,048 dictionary entries in pickle state analysis.
 - Recognize standalone Tekken vocabulary JSON without routing token spellings to model checkpoint parsers. Filtered domain-shaped code tokens in model cards no longer consume the network evidence classification budget.
