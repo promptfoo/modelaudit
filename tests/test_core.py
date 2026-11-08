@@ -4787,6 +4787,31 @@ def test_scan_file_routes_pickle_safetensors_polyglot_to_pickle(
     _assert_system_pickle_issue(result)
 
 
+@pytest.mark.parametrize("header_length", [63362, 133508, 492424])
+def test_scan_file_reports_pickle_extension_in_safetensors_length(tmp_path: Path, header_length: int) -> None:
+    path = tmp_path / "model.safetensors"
+    _write_safetensors_pickle_tail(path, header_length, bytes(4))
+    assert file_detection.detect_file_format(str(path)) == "safetensors"
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+    assert result.scanner_name == "safetensors"
+    assert result.metadata["file_type"] == "safetensors"
+    assert "pickle" in result.metadata["supplemental_scanners"]
+    assert any(issue.rule_code == "S211" and "extension reference" in issue.message for issue in result.issues)
+    assert not any(
+        check.name in {"Format Validation", "File Type Validation"} and check.status.value == "failed"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [b"p\xa2", b"X\x01\x00\x00\x00xpe", b"X\x01\x00\x00\x00xpe" + (b"x" * 50_000) + b"\n"],
+)
+def test_safetensors_pickle_overlap_rejects_impossible_memo_index(sample: bytes) -> None:
+    assert file_detection.classify_safetensors_pickle_overlap_sample(sample, file_size=10_000_000) is False
+
+
 def test_scan_file_routes_safetensors_pickle_operand_crossing_short_probe(tmp_path: Path) -> None:
     pickle_tail = (b"A" * file_detection.PROTO0_1_MAX_PROBE_BYTES) + b"\n0cos\nsystem\n(Vtrue\ntR."
     header_length = ord("V")
