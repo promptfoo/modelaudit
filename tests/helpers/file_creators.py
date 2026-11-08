@@ -55,6 +55,14 @@ def valid_jpeg_bytes() -> bytes:
     return _VALID_JPEG_1X1
 
 
+def valid_pcm_wave_bytes(frame_count: int = 4) -> bytes:
+    """Return 8 kHz mono PCM audio with canonical RIFF and data chunk sizes."""
+    frames = b"\xfc\xff" * frame_count
+    fmt = struct.pack("<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16)
+    header = b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt " + fmt + b"data"
+    return header + struct.pack("<I", len(frames)) + frames
+
+
 def malicious_pickle_bytes() -> bytes:
     """Return a tiny binary pickle payload that resolves to os.system."""
     return _MALICIOUS_PICKLE

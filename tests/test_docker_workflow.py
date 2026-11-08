@@ -77,6 +77,23 @@ def _job_steps(workflow: dict[str, Any], job_name: str) -> list[dict[str, Any]]:
     return steps
 
 
+@pytest.mark.parametrize("image", ("lightweight", "full", "tensorflow"))
+def test_image_scans_use_the_verified_trivy_binary(image: str) -> None:
+    steps = _job_steps(_load_docker_workflow(), f"build-test-{image}")
+    installer = _step_by_name(steps, "Install verified Trivy")
+    scan = next(step for step in steps if step.get("uses", "").startswith("aquasecurity/trivy-action@"))
+    assert steps.index(installer) < steps.index(scan)
+    assert "fetch-verified-release.sh" in installer["run"]
+    assert scan["with"] == {
+        "skip-setup-trivy": True,
+        "image-ref": f"modelaudit:{image}",
+        "format": "table",
+        "exit-code": "1",
+        "severity": "CRITICAL,HIGH",
+        "ignore-unfixed": True,
+    }
+
+
 def test_dockerfiles_pin_python_base_images_by_digest() -> None:
     lightweight_image = _python_image_from_arg("Dockerfile")
     full_image = _python_image_from_arg("Dockerfile.full")

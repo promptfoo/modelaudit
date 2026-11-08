@@ -367,6 +367,73 @@ def test_detect_large_renamed_flax_msgpack_by_later_root_without_promoting_gener
     assert detect_file_format(str(generic_map)) == "unknown"
 
 
+def test_jsonl_records_cannot_add_identity_to_the_first_jax_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+    records = tmp_path / "samples.jsonl"
+    records.write_bytes(b'{"text":"hello"}\n' * 32)
+
+    assert not file_detection.is_jax_json_checkpoint_file(records)
+    assert detect_file_format(str(records)) != "jax_checkpoint"
+
+    records.write_bytes(b'{"framework":"jax"}\n' + b'{"text":"hello"}\n' * 32)
+    assert file_detection.is_confirmed_jax_json_checkpoint_file(records)
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("training.log", b"INFO step=25 params=100\n" * 128),
+        ("review.jsonl", b'{"record":"example"}\n' * 128),
+        ("tokenizer.vocab", "▁sample\t-2.8\n".encode() * 128),
+        ("example.so", b"\x7fELF" + bytes(4096)),
+        ("example.dylib", b"\xcf\xfa\xed\xfe" + bytes(4096)),
+        ("libweights.a", b"!<arch>\n" + bytes(4096)),
+        ("tool", b"\x7fELF" + bytes(4096)),
+        ("weights.cact", b"\x84\x2a\xe1\x05" + bytes(4096)),
+    ],
+)
+def test_auxiliary_content_without_flax_keys_does_not_claim_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, content: bytes
+) -> None:
+    from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
+
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 16)
+    path = tmp_path / name
+    path.write_bytes(content)
+
+    assert not FlaxMsgpackScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) != "flax_msgpack"
+
+
+@pytest.mark.parametrize(
+    "encoding", [b"\xa6", b"\xd9\x06", b"\xda\0\x06", b"\xdb\0\0\0\x06", b"\xc4\x06", b"\xc5\0\x06", b"\xc6\0\0\0\x06"]
+)
+def test_auxiliary_flax_key_split_across_reads_retains_incomplete_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, encoding: bytes
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "FLAX_MSGPACK_STRUCTURE_READ_BYTES", 32)
+    path = tmp_path / "run.log"
+    # The "params" string in the second object straddles the first chunk boundary.
+    path.write_bytes(b"A" * (29 - len(encoding)) + b"\x81" + encoding + b"params\x81\xa6target\xa9os.system")
+
+    assert file_detection.is_flax_msgpack_checkpoint_file(path)
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+
+def test_auxiliary_flax_search_keeps_incomplete_coverage_when_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    path = tmp_path / "run.log"
+    path.write_bytes(b"A" * 65 + b"\x81\xa6params\x80")
+
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+
 def test_detect_large_json_array_remains_a_fail_closed_flax_candidate(tmp_path: Path) -> None:
     json_array = tmp_path / "metadata.jpg"
     json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
@@ -1226,6 +1293,30 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert detect_file_format(str(model_path)) == "coreml"
     assert detect_format_from_extension(str(model_path)) == "coreml"
     assert validate_file_type(str(model_path)) is True
+
+
+@pytest.mark.parametrize("tag", [0x34, 0x36, 0x37], ids=["unmatched-end-group", "reserved-6", "reserved-7"])
+def test_reject_invalid_wire_types_even_with_unread_protobuf_bytes(tag: int) -> None:
+    sample = b"\x08\x01" + bytes([tag])
+    assert file_detection._looks_like_coreml_model_proto_prefix(sample, sample_is_prefix=True) is False
+    assert file_detection._looks_like_coreml_description_proto_prefix(sample, sample_is_prefix=True) is False
+    # A valid length-delimited field with an unread payload remains unresolved.
+    assert file_detection._looks_like_coreml_model_proto_prefix(b"\x08\x01\x32\x08a", sample_is_prefix=True) is None
+
+
+def test_large_static_library_does_not_claim_protobuf_analysis(tmp_path: Path) -> None:
+    archive = tmp_path / "library.a"
+    members = bytearray(b"!<arch>\n")
+    for name, size in (("/", 106780), ("example.o/", 1024 * 1024)):
+        members.extend(f"{name:<16}{0:<12}{0:<6}{0:<6}{0:<8}{size:<10}`\n".encode("ascii"))
+        members.extend(b"\xc1" * size)
+    archive.write_bytes(members)
+    for detect in (detect_file_format, detect_file_format_from_magic, detect_file_format_for_skip_filter):
+        assert detect(str(archive)) == "unknown"
+
+    archive.write_bytes(b"cos\nsystem\n(S'id'\ntR.")
+    for detect in (detect_file_format, detect_file_format_from_magic, detect_file_format_for_skip_filter):
+        assert detect(str(archive)) == "pickle"
 
 
 def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_match(tmp_path: Path) -> None:
@@ -5588,22 +5679,28 @@ def _assert_tokenizer_route_evidence(tmp_path: Path, case_late_fields: str, case
     assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is case_expected_jax
 
 
-@pytest.mark.parametrize("filename", ["tekken.json", "v13.tekken.json"])
-def test_tekken_vocabulary_owns_only_complete_tokenizer_schema(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize(
+    ("filename", "version", "has_special_tokens"),
+    [("tekken.json", "v7", False), ("tekken.json", "v13", True), ("v13.tekken.json", "v13", True)],
+)
+def test_tekken_vocabulary_owns_only_complete_tokenizer_schema(
+    tmp_path: Path, filename: str, version: str, has_special_tokens: bool
+) -> None:
     path = tmp_path / filename
     config = {
-        "version": "v13",
+        "version": version,
         "pattern": ".",
         "num_vocab_tokens": 1,
         "default_vocab_size": 1,
         "default_num_special_tokens": 1,
     }
     vocab = [{"rank": 0, "token_str": "{{jax}}", "token_bytes": "e3tqYXh9fQ=="}]
-    document = {
+    document: dict[str, object] = {
         "config": config,
         "vocab": vocab,
-        "special_tokens": [{"rank": 0, "token_str": "<s>", "is_control": True}],
     }
+    if has_special_tokens:
+        document["special_tokens"] = [{"rank": 0, "token_str": "<s>", "is_control": True}]
     path.write_text(json.dumps(document))
     assert is_huggingface_tokenizer_json_file(path)
     assert detect_file_format(str(path)) == "unknown"
