@@ -170,11 +170,26 @@ def test_download_entry_rejects_unsafe_lock_paths_before_writing(
     assert not corpus_root.exists()
 
 
+def _zero_budget_download_args(lock_path: Path, corpus_root: Path, entries: list[dict[str, Any]]) -> list[str]:
+    large_pickle_corpus_qa._write_lock(lock_path, entries, tier="custom")
+    return [
+        "download",
+        "--lock",
+        str(lock_path),
+        "--corpus-root",
+        str(corpus_root),
+        "--budget-gb",
+        "0",
+        "--direct-only",
+    ]
+
+
 def test_download_validates_unsafe_entry_before_budget_skip(tmp_path: Path) -> None:
     corpus_root = tmp_path / "corpus"
     lock_path = tmp_path / "lock.json"
-    large_pickle_corpus_qa._write_lock(
+    args = _zero_budget_download_args(
         lock_path,
+        corpus_root,
         [
             {
                 "id": "../escaped",
@@ -184,21 +199,8 @@ def test_download_validates_unsafe_entry_before_budget_skip(tmp_path: Path) -> N
                 "remote_size_bytes": 1,
             }
         ],
-        tier="custom",
     )
-
-    exit_code = large_pickle_corpus_qa.main(
-        [
-            "download",
-            "--lock",
-            str(lock_path),
-            "--corpus-root",
-            str(corpus_root),
-            "--budget-gb",
-            "0",
-            "--direct-only",
-        ]
-    )
+    exit_code = large_pickle_corpus_qa.main(args)
 
     entry = json.loads(lock_path.read_text(encoding="utf-8"))["entries"][0]
     assert exit_code == 1
@@ -210,8 +212,9 @@ def test_download_validates_unsafe_entry_before_budget_skip(tmp_path: Path) -> N
 def test_download_keeps_safe_selected_over_budget_entry_skipped(tmp_path: Path) -> None:
     corpus_root = tmp_path / "corpus"
     lock_path = tmp_path / "lock.json"
-    large_pickle_corpus_qa._write_lock(
+    args = _zero_budget_download_args(
         lock_path,
+        corpus_root,
         [
             {
                 "id": "A01",
@@ -232,23 +235,8 @@ def test_download_keeps_safe_selected_over_budget_entry_skipped(tmp_path: Path) 
                 "download_error": "unselected prior error",
             },
         ],
-        tier="custom",
     )
-
-    exit_code = large_pickle_corpus_qa.main(
-        [
-            "download",
-            "--lock",
-            str(lock_path),
-            "--corpus-root",
-            str(corpus_root),
-            "--budget-gb",
-            "0",
-            "--direct-only",
-            "--ids",
-            "A01",
-        ]
-    )
+    exit_code = large_pickle_corpus_qa.main([*args, "--ids", "A01"])
 
     selected, unselected = json.loads(lock_path.read_text(encoding="utf-8"))["entries"]
     assert exit_code == 0
@@ -435,30 +423,24 @@ def test_classify_preserves_lock_selection_metadata(tmp_path: Path) -> None:
     assert payload["entries"][0]["classification"]["exists"] is True
 
 
-def test_scan_fails_closed_for_unsafe_lock_id(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def _single_pickle_scan_args(tmp_path: Path, artifact_id: str) -> tuple[list[str], Path]:
     artifact_path = tmp_path / "artifact.pkl"
     artifact_path.write_bytes(b"\x80\x04N.")
     lock_path = tmp_path / "lock.json"
     run_dir = tmp_path / "run"
     large_pickle_corpus_qa._write_lock(
-        lock_path,
-        [{"id": "../escaped", "local_path": str(artifact_path)}],
-        tier="custom",
+        lock_path, [{"id": artifact_id, "local_path": str(artifact_path)}], tier="custom"
     )
+    return ["scan", "--lock", str(lock_path), "--out", str(run_dir), "--no-synthetic"], run_dir
 
-    exit_code = large_pickle_corpus_qa.main(
-        [
-            "scan",
-            "--lock",
-            str(lock_path),
-            "--out",
-            str(run_dir),
-            "--no-synthetic",
-        ]
-    )
+
+def test_scan_fails_closed_for_unsafe_lock_id(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args, run_dir = _single_pickle_scan_args(tmp_path, "../escaped")
+
+    exit_code = large_pickle_corpus_qa.main(args)
 
     captured = capsys.readouterr()
     scan_rows = large_pickle_corpus_qa._read_jsonl(run_dir / "scan-results.jsonl")
@@ -476,15 +458,7 @@ def test_scan_error_exit_takes_precedence_over_blocking_drift(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    artifact_path = tmp_path / "artifact.pkl"
-    artifact_path.write_bytes(b"\x80\x04N.")
-    lock_path = tmp_path / "lock.json"
-    run_dir = tmp_path / "run"
-    large_pickle_corpus_qa._write_lock(
-        lock_path,
-        [{"id": "A01", "local_path": str(artifact_path)}],
-        tier="custom",
-    )
+    args, run_dir = _single_pickle_scan_args(tmp_path, "A01")
     scan_rows = [
         {
             "artifact_id": "A01",
@@ -507,17 +481,7 @@ def test_scan_error_exit_takes_precedence_over_blocking_drift(
 
     monkeypatch.setattr(large_pickle_corpus_qa, "_scan_records_for_entry", fake_scan_records_for_entry)
 
-    exit_code = large_pickle_corpus_qa.main(
-        [
-            "scan",
-            "--lock",
-            str(lock_path),
-            "--out",
-            str(run_dir),
-            "--no-synthetic",
-            "--fail-on-drift",
-        ]
-    )
+    exit_code = large_pickle_corpus_qa.main([*args, "--fail-on-drift"])
 
     captured = capsys.readouterr()
     drift = json.loads((run_dir / "parity-drift.json").read_text(encoding="utf-8"))
