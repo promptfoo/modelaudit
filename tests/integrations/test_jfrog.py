@@ -60,7 +60,6 @@ from tests.helpers.file_creators import (
 )
 from tests.helpers.http import FakeStreamingResponse
 
-
 _download_models_folder = partial(
     download_jfrog_folder,
     "https://company.jfrog.io/artifactory/repo/models/",
