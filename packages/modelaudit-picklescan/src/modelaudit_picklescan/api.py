@@ -1260,18 +1260,18 @@ def _validated_pytorch_storage_entry_ids(
             opcode_budget_remaining=storage_reference_opcodes_remaining,
             deadline=deadline,
         )
-        legacy_module = pid_validator.is_legacy_module(pickle_data, archive, entries_by_name, prefix)
-        if not reference_parse.parse_complete or legacy_module:
-            # This proof covers PID findings only. Leave generic member probing and
-            # its coverage diagnostic intact when archive discovery exhausted its budget.
-            pid_trust = pid_validator.validate(
-                pickle_data,
-                {key: entry.file_size for key, entry in storage_entries_by_key.items()},
-                legacy_module=legacy_module,
-                deadline=deadline,
-            )
-            if pid_trust is not None:
-                trusted_data_pkl_by_name[data_pkl_name] = pid_trust
+        pid_trust = pid_validator.validate(
+            pickle_data,
+            archive,
+            entries_by_name,
+            prefix,
+            storage_entries_by_key,
+            discovery_complete=reference_parse.parse_complete,
+            deadline=deadline,
+        )
+        if pid_trust is not None:
+            # Only the PID finding receives this proof. Preserve storage probing and its coverage diagnostics.
+            trusted_data_pkl_by_name[data_pkl_name] = pid_trust
         if not reference_parse.parse_complete:
             notices.append(
                 _pytorch_zip_storage_reference_validation_notice(
@@ -1386,7 +1386,7 @@ class _PytorchZipStoragePidValidator:
         self._provenance_remaining = [_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES]
 
     @staticmethod
-    def is_legacy_module(
+    def _is_legacy_module(
         pickle_data: bytes, archive: zipfile.ZipFile, entries_by_name: Mapping[str, list[zipfile.ZipInfo]], prefix: str
     ) -> bool:
         if (
@@ -1408,9 +1408,20 @@ class _PytorchZipStoragePidValidator:
             return False
 
     def validate(
-        self, pickle_data: bytes, storage_member_sizes: Mapping[str, int], *, legacy_module: bool, deadline: float
+        self,
+        pickle_data: bytes,
+        archive: zipfile.ZipFile,
+        entries_by_name: Mapping[str, list[zipfile.ZipInfo]],
+        prefix: str,
+        storage_entries_by_key: Mapping[str, zipfile.ZipInfo],
+        *,
+        discovery_complete: bool,
+        deadline: float,
     ) -> _PytorchZipDataPickleTrust | None:
         if self._opcodes_remaining[0] <= 0 or self._provenance_remaining[0] <= 0:
+            return None
+        legacy_module = self._is_legacy_module(pickle_data, archive, entries_by_name, prefix)
+        if discovery_complete and not legacy_module:
             return None
         parsed = _parse_single_pytorch_storage_stream(
             pickle_data,
@@ -1425,7 +1436,9 @@ class _PytorchZipStoragePidValidator:
             _pytorch_storage_ref_has_zip_size_proof(ref) for ref in parsed.storage_refs_by_key.values()
         ):
             return None
-        trust = _trusted_pytorch_storage_member_sizes(parsed, storage_member_sizes)
+        trust = _trusted_pytorch_storage_member_sizes(
+            parsed, {key: entry.file_size for key, entry in storage_entries_by_key.items()}
+        )
         if trust is None:
             return None
         return _PytorchZipDataPickleTrust(trust.storage_keys, frozenset(), parsed.first_legacy_pid_position)

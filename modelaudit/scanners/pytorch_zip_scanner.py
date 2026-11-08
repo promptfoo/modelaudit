@@ -8561,16 +8561,17 @@ class PyTorchZipScanner(BaseScanner):
                 opcode_budget_remaining=storage_reference_opcodes_remaining,
             )
             if pid_validator is not None:
-                legacy_module = pid_validator.is_legacy_module(pickle_data, zip_file, entries_by_name, prefix)
-                if not reference_parse.parse_complete or legacy_module:
-                    pid_trust = pid_validator.validate(
-                        pickle_data,
-                        {key: entry.file_size for key, entry in storage_entries_by_key.items()},
-                        legacy_module=legacy_module,
-                        deadline=time.monotonic() + self._get_remaining_time(),
-                    )
-                    if pid_trust is not None:
-                        additional_pid_keys[data_pkl_member] = pid_trust.storage_keys
+                pid_trust = pid_validator.validate(
+                    pickle_data,
+                    zip_file,
+                    entries_by_name,
+                    prefix,
+                    storage_entries_by_key,
+                    discovery_complete=reference_parse.parse_complete,
+                    deadline=time.monotonic() + self._get_remaining_time(),
+                )
+                if pid_trust is not None:
+                    additional_pid_keys[data_pkl_member] = pid_trust.storage_keys
             if not reference_parse.parse_complete:
                 self._record_storage_reference_validation_incomplete(
                     result,
