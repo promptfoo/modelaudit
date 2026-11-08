@@ -4384,8 +4384,15 @@ def test_gating_policy_prohibition_keeps_malware_literal_informational(tmp_path:
     "content",
     [
         "### Prohibited Uses\n1. Create, generate, or facilitate the creation of malicious code, malware, or viruses.",
-        "---\nextra_gated_prompt: |\n  ## Prohibited Uses\n  You will not use the model to:\n"
-        '  classify("""\n    1. Create malware\n  """)\n---\n',
+        '''---
+extra_gated_prompt: |
+  ## Prohibited Uses
+  You will not use the model to:
+  classify("""
+    1. Create malware
+  """)
+---
+''',
         """---
 extra_gated_prompt: >-
   #### Prohibited Uses
