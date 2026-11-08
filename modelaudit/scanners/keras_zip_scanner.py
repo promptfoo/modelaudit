@@ -4214,19 +4214,6 @@ class KerasZipScanner(BaseScanner):
             )
 
     @staticmethod
-    def _is_lambda_module_reference_dangerous(module_name: Any, function_name: Any) -> bool:
-        """Return True when Lambda sibling metadata names a risky symbol."""
-        if KerasZipScanner._is_dangerous_lambda_function_reference(module_name, function_name):
-            return True
-        if not isinstance(module_name, str):
-            return False
-
-        return KerasZipScanner._references_dangerous_module_literal(
-            module_name,
-            set(_DANGEROUS_LAMBDA_MODULE_TOKENS),
-        )
-
-    @staticmethod
     def _is_dangerous_lambda_function_reference(module_name: Any, function_name: Any) -> bool:
         """Return whether a function name is dangerous for the referenced module root."""
         if not isinstance(module_name, str) or not isinstance(function_name, str):

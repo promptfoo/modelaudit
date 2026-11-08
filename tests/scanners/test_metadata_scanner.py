@@ -202,6 +202,30 @@ class TestMetadataScanner:
             "ngrok.io",
         }
 
+    def test_malformed_url_does_not_interrupt_metadata_scan(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_text(
+            "Invalid link: https://[broken\nDownload: https://bit.ly/model\nAWS key: AKIAABCDEFGHIJKLMNOP\n",
+            encoding="utf-8",
+        )
+
+        result = MetadataScanner().scan(str(readme))
+
+        assert result.success is True
+        findings = {check.name: check.details for check in result.checks if check.status == CheckStatus.FAILED}
+        assert findings.keys() == {"suspicious_url", "exposed_secret"}
+        assert findings["suspicious_url"]["suspicious_domain"] == "bit.ly"
+        assert findings["exposed_secret"]["pattern_description"] == "AWS Access Key ID"
+
+    def test_malformed_link_in_benign_readme(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_text("IPv6 template: http://[host]/model\n", encoding="utf-8")
+
+        result = MetadataScanner().scan(str(readme))
+
+        assert result.success is True
+        assert result.issues == []
+
     def test_repeated_benign_urls_are_parsed_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Skip duplicate benign URLs before reparsing them."""
         scanner = MetadataScanner()

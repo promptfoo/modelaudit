@@ -28,6 +28,7 @@ from modelaudit.scanners.compressed_scanner import (
 )
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import EvalPayload
+from tests.helpers.tar import add_tar_bytes
 
 TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
 
@@ -234,9 +235,7 @@ def test_compound_tar_wrappers_route_to_tar_scanner(
     payload = b"weights"
 
     with tarfile.open(archive_path, mode) as tar:
-        info = tarfile.TarInfo("weights.bin")
-        info.size = len(payload)
-        tar.addfile(info, io.BytesIO(payload))
+        add_tar_bytes(tar, "weights.bin", payload)
 
     scanner = get_scanner_for_file(str(archive_path))
 
@@ -291,9 +290,7 @@ def test_compound_tar_wrappers_scan_benign_payloads_without_critical_findings(
     payload = pickle.dumps({"weights": [1, 2, 3]})
 
     with tarfile.open(archive_path, mode) as tar:
-        info = tarfile.TarInfo("safe.pkl")
-        info.size = len(payload)
-        tar.addfile(info, io.BytesIO(payload))
+        add_tar_bytes(tar, "safe.pkl", payload)
 
     scanner = get_scanner_for_file(str(archive_path))
 
@@ -323,9 +320,7 @@ def test_compound_tar_wrappers_surface_malicious_inner_findings(
     payload = pickle.dumps({"payload": _MaliciousPayload()})
 
     with tarfile.open(archive_path, mode) as tar:
-        info = tarfile.TarInfo("evil.pkl")
-        info.size = len(payload)
-        tar.addfile(info, io.BytesIO(payload))
+        add_tar_bytes(tar, "evil.pkl", payload)
 
     scanner = get_scanner_for_file(str(archive_path))
 

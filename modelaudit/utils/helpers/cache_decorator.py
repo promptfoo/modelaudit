@@ -306,7 +306,7 @@ def _should_defer_hash_for_legacy_pytorch_read_limit(
         with open(file_path, "rb") as handle:
             control_probe = handle.read(control_probe_size)
 
-            legacy_layout, _legacy_storage_valid = scanner._legacy_pytorch_layout_for_scan(
+            legacy_layout = scanner._legacy_pytorch_layout_for_scan(
                 control_probe,
                 total_size=file_size,
             )

@@ -3805,7 +3805,6 @@ class LlamafileScanner(BaseScanner):
                 _, torch7_offset, _, _, _ = self._find_embedded_payload_offsets(
                     path_obj,
                     self.max_payload_scan_bytes,
-                    stop_at_gguf=False,
                 )
             except OSError:
                 torch7_offset = None
@@ -3823,7 +3822,6 @@ class LlamafileScanner(BaseScanner):
             raw_payload_probe = self._find_embedded_payload_offsets(
                 path_obj,
                 self.max_payload_scan_bytes,
-                stop_at_gguf=False,
             )
             mapping_scan_end = self.max_payload_scan_bytes
             mapping_search_complete = max(0, mapping_scan_end) >= file_size
@@ -3858,7 +3856,6 @@ class LlamafileScanner(BaseScanner):
             ) = self._find_embedded_payload_offsets(
                 path_obj,
                 zip_candidate_scan_end,
-                stop_at_gguf=False,
             )
             gguf_candidates = sorted({*runtime_candidates, *([gguf_offset] if gguf_offset is not None else [])})
             boundary_candidates = [gguf_offset] if gguf_offset is not None else []
@@ -5511,7 +5508,6 @@ class LlamafileScanner(BaseScanner):
         path: Path,
         max_scan_bytes: int,
         *,
-        stop_at_gguf: bool = True,
         gguf_min_offset: int = 0,
     ) -> tuple[list[int], int | None, bool, bool, bool]:
         """Find GGUF and Torch7 payload signatures in one bounded pass."""
@@ -5536,46 +5532,32 @@ class LlamafileScanner(BaseScanner):
 
                 haystack = carry + chunk
                 window_offset = scanned - len(carry)
-                gguf_relative_index = -1
-                if not stop_at_gguf or not gguf_offsets:
-                    search_from = max(0, gguf_min_offset - window_offset)
-                    while gguf_candidates_checked < LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES:
-                        candidate_index = haystack.find(GGUF_MARKER, search_from)
-                        if candidate_index == -1:
-                            break
-                        search_from = candidate_index + len(GGUF_MARKER)
-                        candidate_offset = window_offset + candidate_index
-                        if candidate_offset <= last_gguf_candidate:
-                            continue
-                        last_gguf_candidate = candidate_offset
-                        gguf_candidates_checked += 1
-                        plausible, resource_limit_exceeded, header_incomplete = cls._probe_gguf_header(
-                            handle,
-                            candidate_offset,
-                            file_size,
-                        )
-                        gguf_header_limit_exceeded |= resource_limit_exceeded
-                        gguf_header_incomplete |= header_incomplete
-                        if not plausible:
-                            continue
-                        gguf_offsets.append(candidate_offset)
-                        gguf_relative_index = candidate_index
-                        if stop_at_gguf:
-                            break
+                search_from = max(0, gguf_min_offset - window_offset)
+                while gguf_candidates_checked < LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES:
+                    candidate_index = haystack.find(GGUF_MARKER, search_from)
+                    if candidate_index == -1:
+                        break
+                    search_from = candidate_index + len(GGUF_MARKER)
+                    candidate_offset = window_offset + candidate_index
+                    if candidate_offset <= last_gguf_candidate:
+                        continue
+                    last_gguf_candidate = candidate_offset
+                    gguf_candidates_checked += 1
+                    plausible, resource_limit_exceeded, header_incomplete = cls._probe_gguf_header(
+                        handle,
+                        candidate_offset,
+                        file_size,
+                    )
+                    gguf_header_limit_exceeded |= resource_limit_exceeded
+                    gguf_header_incomplete |= header_incomplete
+                    if not plausible:
+                        continue
+                    gguf_offsets.append(candidate_offset)
 
                 if torch7_offset is None:
                     torch7_relative_index = find_torch7_candidate_offset(haystack)
                     if torch7_relative_index is not None:
                         torch7_offset = window_offset + torch7_relative_index
-
-                if stop_at_gguf and gguf_relative_index != -1:
-                    return (
-                        gguf_offsets,
-                        torch7_offset,
-                        False,
-                        gguf_header_limit_exceeded,
-                        gguf_header_incomplete,
-                    )
 
                 carry = haystack[-overlap:] if overlap > 0 else b""
                 scanned += len(chunk)
