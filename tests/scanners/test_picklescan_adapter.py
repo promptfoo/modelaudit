@@ -23,7 +23,7 @@ from modelaudit_picklescan import (
 
 from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.config.rule_config import ModelAuditConfig, set_config
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 from modelaudit.scanners.picklescan_adapter import (
     apply_pickle_member_context,
@@ -36,6 +36,20 @@ from tests.helpers import create_mock_pytorch_zip
 _PINNED_BGE_SMALL_ZH_URL = (
     "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/7999e1d3359715c523056ef9478215996d62a620/pytorch_model.bin"
 )
+
+
+def _notice_report(
+    *,
+    source: str,
+    status: ScanStatus,
+    verdict: SafetyVerdict,
+    message: str,
+    location: str,
+    code: str,
+    details: dict[str, Any],
+) -> PickleReport:
+    notice = Notice(message=message, severity=Severity.INFO, location=location, code=code, details=details)
+    return PickleReport(source=source, status=status, verdict=verdict, notices=(notice,))
 
 
 def _benign_tail_import_references() -> list[dict[str, object]]:
@@ -235,57 +249,40 @@ def test_pickle_report_to_scan_result_treats_malformed_private_metadata_as_absen
 
 
 def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_serialization() -> None:
+    def source_fingerprints() -> dict[str, Any]:
+        return {
+            "reusable": True,
+            "search_context": ["/tmp/src"],
+            "resolution_context": {
+                "meta_path": ["importlib.PathFinder"],
+                "path_hooks": [],
+                "path_importers": [],
+            },
+            "module_sources": {"helper": "/tmp/src/helper.py"},
+            "loaded_module_sources": {},
+            "fingerprints": {"/tmp/src/helper.py": "1111"},
+            "read_fingerprints": {
+                "/tmp/src/helper.py": {
+                    "read_limit": 1024,
+                    "require_complete": True,
+                    "fingerprint": "2222",
+                }
+            },
+        }
+
     report = PickleReport(
         source="safe.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.CLEAN,
         metadata={"opcode_count": 3, "protocols": [4]},
-        private_metadata={
-            "call_graph_source_fingerprints": {
-                "reusable": True,
-                "search_context": ["/tmp/src"],
-                "resolution_context": {
-                    "meta_path": ["importlib.PathFinder"],
-                    "path_hooks": [],
-                    "path_importers": [],
-                },
-                "module_sources": {"helper": "/tmp/src/helper.py"},
-                "loaded_module_sources": {},
-                "fingerprints": {"/tmp/src/helper.py": "1111"},
-                "read_fingerprints": {
-                    "/tmp/src/helper.py": {
-                        "read_limit": 1024,
-                        "require_complete": True,
-                        "fingerprint": "2222",
-                    }
-                },
-            }
-        },
+        private_metadata={"call_graph_source_fingerprints": source_fingerprints()},
     )
 
     result = pickle_report_to_scan_result(report)
     serialized = result.to_dict(include_private_metadata=True)
 
     json.dumps(serialized)
-    assert serialized["_private_metadata"]["call_graph_source_fingerprints"] == {
-        "reusable": True,
-        "search_context": ["/tmp/src"],
-        "resolution_context": {
-            "meta_path": ["importlib.PathFinder"],
-            "path_hooks": [],
-            "path_importers": [],
-        },
-        "module_sources": {"helper": "/tmp/src/helper.py"},
-        "loaded_module_sources": {},
-        "fingerprints": {"/tmp/src/helper.py": "1111"},
-        "read_fingerprints": {
-            "/tmp/src/helper.py": {
-                "read_limit": 1024,
-                "require_complete": True,
-                "fingerprint": "2222",
-            }
-        },
-    }
+    assert serialized["_private_metadata"]["call_graph_source_fingerprints"] == source_fingerprints()
     assert result.to_dict()["metadata"]["opcode_count"] == 3
     assert result.to_dict()["metadata"]["protocols"] == [4]
     assert "call_graph_source_fingerprints" not in result.to_dict()["metadata"]
@@ -780,19 +777,14 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_module
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_inconclusive_report_without_findings() -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="budget.pkl",
         status=ScanStatus.INCONCLUSIVE,
         verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Opcode budget reached",
-                severity=Severity.INFO,
-                location="budget.pkl",
-                code="opcode_budget",
-                details={"analysis_incomplete": True},
-            ),
-        ),
+        message="Opcode budget reached",
+        location="budget.pkl",
+        code="opcode_budget",
+        details={"analysis_incomplete": True},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -823,25 +815,20 @@ def test_pickle_report_to_scan_result_fails_closed_for_protocol5_buffer_notice(
     report_status: ScanStatus,
     report_verdict: SafetyVerdict,
 ) -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="buffer.pkl",
         status=report_status,
         verdict=report_verdict,
-        notices=(
-            Notice(
-                message="Encountered 1 protocol 5 buffer opcode(s); external buffer context is opaque",
-                severity=Severity.INFO,
-                location="buffer.pkl (pos 2)",
-                code="buffer_opcode",
-                details={
-                    "buffer_opcode_count": 1,
-                    "next_buffer_count": 1,
-                    "readonly_buffer_count": 0,
-                    "requires_external_buffer_context": True,
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+        message="Encountered 1 protocol 5 buffer opcode(s); external buffer context is opaque",
+        location="buffer.pkl (pos 2)",
+        code="buffer_opcode",
+        details={
+            "buffer_opcode_count": 1,
+            "next_buffer_count": 1,
+            "readonly_buffer_count": 0,
+            "requires_external_buffer_context": True,
+            "analysis_incomplete": True,
+        },
     )
 
     result = pickle_report_to_scan_result(report)
@@ -861,27 +848,22 @@ def test_pickle_report_to_scan_result_fails_closed_for_protocol5_buffer_notice(
 
 
 def test_pickle_report_to_scan_result_preserves_complete_in_band_readonly_buffer_notice() -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="in-band-readonly-buffer.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.CLEAN,
-        notices=(
-            Notice(
-                message="Encountered 1 in-band protocol 5 buffer opcode(s)",
-                severity=Severity.INFO,
-                location="in-band-readonly-buffer.pkl (pos 12)",
-                code="buffer_opcode",
-                details={
-                    "buffer_opcode_count": 1,
-                    "next_buffer_count": 0,
-                    "readonly_buffer_count": 1,
-                    "readonly_buffer_empty_stack_count": 0,
-                    "readonly_buffer_invalid_stack_count": 0,
-                    "requires_external_buffer_context": False,
-                    "analysis_incomplete": False,
-                },
-            ),
-        ),
+        message="Encountered 1 in-band protocol 5 buffer opcode(s)",
+        location="in-band-readonly-buffer.pkl (pos 12)",
+        code="buffer_opcode",
+        details={
+            "buffer_opcode_count": 1,
+            "next_buffer_count": 0,
+            "readonly_buffer_count": 1,
+            "readonly_buffer_empty_stack_count": 0,
+            "readonly_buffer_invalid_stack_count": 0,
+            "requires_external_buffer_context": False,
+            "analysis_incomplete": False,
+        },
     )
 
     result = pickle_report_to_scan_result(report)
@@ -893,27 +875,22 @@ def test_pickle_report_to_scan_result_preserves_complete_in_band_readonly_buffer
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_legacy_invalid_readonly_buffer_notice() -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="invalid-readonly-buffer.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.CLEAN,
-        notices=(
-            Notice(
-                message="Encountered 1 malformed protocol 5 buffer opcode(s); stack context is opaque",
-                severity=Severity.INFO,
-                location="invalid-readonly-buffer.pkl (pos 3)",
-                code="buffer_opcode",
-                details={
-                    "buffer_opcode_count": 1,
-                    "next_buffer_count": 0,
-                    "readonly_buffer_count": 1,
-                    "readonly_buffer_empty_stack_count": 0,
-                    "readonly_buffer_invalid_stack_count": 1,
-                    "requires_external_buffer_context": False,
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+        message="Encountered 1 malformed protocol 5 buffer opcode(s); stack context is opaque",
+        location="invalid-readonly-buffer.pkl (pos 3)",
+        code="buffer_opcode",
+        details={
+            "buffer_opcode_count": 1,
+            "next_buffer_count": 0,
+            "readonly_buffer_count": 1,
+            "readonly_buffer_empty_stack_count": 0,
+            "readonly_buffer_invalid_stack_count": 1,
+            "requires_external_buffer_context": False,
+            "analysis_incomplete": True,
+        },
     )
 
     result = pickle_report_to_scan_result(report)
@@ -925,26 +902,21 @@ def test_pickle_report_to_scan_result_fails_closed_for_legacy_invalid_readonly_b
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_legacy_missing_invalid_readonly_counter() -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="legacy-invalid-readonly-buffer.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.CLEAN,
-        notices=(
-            Notice(
-                message="Encountered 1 protocol 5 readonly buffer opcode(s)",
-                severity=Severity.INFO,
-                location="legacy-invalid-readonly-buffer.pkl (pos 3)",
-                code="buffer_opcode",
-                details={
-                    "buffer_opcode_count": 1,
-                    "next_buffer_count": 0,
-                    "readonly_buffer_count": 1,
-                    "readonly_buffer_empty_stack_count": 0,
-                    "requires_external_buffer_context": False,
-                    "analysis_incomplete": False,
-                },
-            ),
-        ),
+        message="Encountered 1 protocol 5 readonly buffer opcode(s)",
+        location="legacy-invalid-readonly-buffer.pkl (pos 3)",
+        code="buffer_opcode",
+        details={
+            "buffer_opcode_count": 1,
+            "next_buffer_count": 0,
+            "readonly_buffer_count": 1,
+            "readonly_buffer_empty_stack_count": 0,
+            "requires_external_buffer_context": False,
+            "analysis_incomplete": False,
+        },
     )
 
     result = pickle_report_to_scan_result(report)
@@ -956,23 +928,28 @@ def test_pickle_report_to_scan_result_fails_closed_for_legacy_missing_invalid_re
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_notice() -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="large-string.pkl",
         status=ScanStatus.INCONCLUSIVE,
         verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="String literal scan truncated at configured limit",
-                severity=Severity.INFO,
-                location="large-string.pkl (pos 16)",
-                code="literal_scan_truncated",
-                details={"analysis_incomplete": True},
-            ),
-        ),
+        message="String literal scan truncated at configured limit",
+        location="large-string.pkl (pos 16)",
+        code="literal_scan_truncated",
+        details={"analysis_incomplete": True},
     )
 
     _assert_incomplete_notice_check(
         report, False, "literal_scan_truncated", "String literal scan truncated at configured limit"
+    )
+
+
+def _import_reference_cap_notice(location: str) -> Notice:
+    return Notice(
+        message="Import reference metadata exceeded the scanner reporting limit",
+        severity=Severity.INFO,
+        location=location,
+        code="import_references_truncated",
+        details={"analysis_incomplete": True, "max_import_references": 10_000},
     )
 
 
@@ -981,15 +958,7 @@ def test_pickle_report_to_scan_result_fails_closed_for_truncated_import_referenc
         source="import-reference-cap.pkl",
         status=ScanStatus.INCONCLUSIVE,
         verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Import reference metadata exceeded the scanner reporting limit",
-                severity=Severity.INFO,
-                location="import-reference-cap.pkl",
-                code="import_references_truncated",
-                details={"analysis_incomplete": True, "max_import_references": 10_000},
-            ),
-        ),
+        notices=(_import_reference_cap_notice("import-reference-cap.pkl"),),
         metadata={"analysis_incomplete": True, "import_references_truncated": True},
     )
 
@@ -1017,15 +986,7 @@ def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated
         source="legacy-import-reference-cap.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.CLEAN,
-        notices=(
-            Notice(
-                message="Import reference metadata exceeded the scanner reporting limit",
-                severity=Severity.INFO,
-                location="legacy-import-reference-cap.pkl",
-                code="import_references_truncated",
-                details={"analysis_incomplete": True, "max_import_references": 10_000},
-            ),
-        ),
+        notices=(_import_reference_cap_notice("legacy-import-reference-cap.pkl"),),
     )
 
     _assert_incomplete_report_not_cached(report, "import_references_truncated")
@@ -1045,15 +1006,7 @@ def test_pickle_report_to_scan_result_keeps_legacy_truncated_findings_successful
                 details={"module": "posix", "name": "system"},
             ),
         ),
-        notices=(
-            Notice(
-                message="Import reference metadata exceeded the scanner reporting limit",
-                severity=Severity.INFO,
-                location="legacy-import-reference-cap-finding.pkl",
-                code="import_references_truncated",
-                details={"analysis_incomplete": True, "max_import_references": 10_000},
-            ),
-        ),
+        notices=(_import_reference_cap_notice("legacy-import-reference-cap-finding.pkl"),),
     )
 
     result = pickle_report_to_scan_result(report)
@@ -1080,15 +1033,7 @@ def test_pickle_report_to_scan_result_keeps_operational_errors_unsuccessful_with
                 details={"module": "posix", "name": "system"},
             ),
         ),
-        notices=(
-            Notice(
-                message="Import reference metadata exceeded the scanner reporting limit",
-                severity=Severity.INFO,
-                location="short-read-import-reference-cap.pkl",
-                code="import_references_truncated",
-                details={"analysis_incomplete": True, "max_import_references": 10_000},
-            ),
-        ),
+        notices=(_import_reference_cap_notice("short-read-import-reference-cap.pkl"),),
         errors=(
             ScanError(
                 message="Could not read remainder of pickle stream",
@@ -1110,19 +1055,14 @@ def test_pickle_report_to_scan_result_keeps_operational_errors_unsuccessful_with
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated_callable_invocations() -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="legacy-callable-invocation-cap.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.CLEAN,
-        notices=(
-            Notice(
-                message="Callable invocation metadata exceeded the scanner reporting limit",
-                severity=Severity.INFO,
-                location="legacy-callable-invocation-cap.pkl",
-                code="callable_invocations_truncated",
-                details={"analysis_incomplete": True, "max_callable_invocations": 10_000},
-            ),
-        ),
+        message="Callable invocation metadata exceeded the scanner reporting limit",
+        location="legacy-callable-invocation-cap.pkl",
+        code="callable_invocations_truncated",
+        details={"analysis_incomplete": True, "max_callable_invocations": 10_000},
     )
 
     _assert_incomplete_report_not_cached(report, "callable_invocations_truncated")
@@ -1289,19 +1229,14 @@ def test_pickle_report_to_scan_result_fails_closed_for_nested_probe_limit_notice
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_nested_incomplete_notice() -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="nested-incomplete.pkl",
         status=ScanStatus.INCONCLUSIVE,
         verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Nested pickle analysis did not complete",
-                severity=Severity.INFO,
-                location="nested-incomplete.pkl (nested raw pickle at pos 16)",
-                code="nested_pickle_incomplete",
-                details={"analysis_incomplete": True},
-            ),
-        ),
+        message="Nested pickle analysis did not complete",
+        location="nested-incomplete.pkl (nested raw pickle at pos 16)",
+        code="nested_pickle_incomplete",
+        details={"analysis_incomplete": True},
     )
 
     _assert_incomplete_notice_check(
@@ -1320,19 +1255,14 @@ def test_pickle_report_to_scan_result_fails_closed_for_nested_incomplete_notice(
     ],
 )
 def test_pickle_report_to_scan_result_fails_closed_for_bounded_string_notice(notice_code: str) -> None:
-    report = PickleReport(
+    report = _notice_report(
         source="bounded-string.pkl",
         status=ScanStatus.INCONCLUSIVE,
         verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Bounded string analysis did not complete",
-                severity=Severity.INFO,
-                location="bounded-string.pkl (pos 4)",
-                code=notice_code,
-                details={"analysis_incomplete": True},
-            ),
-        ),
+        message="Bounded string analysis did not complete",
+        location="bounded-string.pkl (pos 4)",
+        code=notice_code,
+        details={"analysis_incomplete": True},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -1345,24 +1275,66 @@ def test_pickle_report_to_scan_result_fails_closed_for_bounded_string_notice(not
     assert notice_check.rule_code == "S902"
 
 
-def test_pickle_report_to_scan_result_keeps_parse_incomplete_notices_inconclusive() -> None:
-    report = PickleReport(
-        source="truncated.pkl",
+def _joblib_tail_import_references(*, include_ndarray: bool) -> list[dict[str, object]]:
+    references: list[dict[str, object]] = [
+        {
+            "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+            "module": "joblib.numpy_pickle",
+            "name": "NumpyArrayWrapper",
+            "opcode": "STACK_GLOBAL",
+            "position": 66,
+            "is_dangerous": False,
+        },
+    ]
+    if include_ndarray:
+        references.append(
+            {
+                "import_reference": "numpy.ndarray",
+                "module": "numpy",
+                "name": "ndarray",
+                "opcode": "STACK_GLOBAL",
+                "position": 103,
+                "is_dangerous": False,
+            }
+        )
+    return references
+
+
+def _parse_incomplete_report(
+    source: str,
+    *,
+    position: int,
+    exception_message: str,
+    metadata: Mapping[str, object],
+    exception_type: str = "ValueError",
+) -> PickleReport:
+    return PickleReport(
+        source=source,
         status=ScanStatus.INCONCLUSIVE,
         verdict=SafetyVerdict.UNKNOWN,
         notices=(
             Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
                 severity=Severity.INFO,
-                location="truncated.pkl (pos 4)",
+                location=f"{source} (pos {position})",
                 code="parse_incomplete",
                 details={
-                    "exception": "pickle exhausted before seeing STOP",
-                    "exception_type": "ValueError",
+                    "exception": exception_message,
+                    "exception_type": exception_type,
                     "analysis_incomplete": True,
                 },
             ),
         ),
+        metadata=metadata,
+    )
+
+
+def test_pickle_report_to_scan_result_keeps_parse_incomplete_notices_inconclusive() -> None:
+    report = _parse_incomplete_report(
+        "truncated.pkl",
+        position=4,
+        exception_message="pickle exhausted before seeing STOP",
+        metadata={},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -1370,72 +1342,30 @@ def test_pickle_report_to_scan_result_keeps_parse_incomplete_notices_inconclusiv
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
-    parse_issue = next(
-        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
-    )
-    assert parse_issue.severity == IssueSeverity.WARNING
-    assert parse_issue.rule_code == "S901"
-    assert parse_issue.location == "truncated.pkl (pos 4)"
-    assert parse_issue.details["category"] == "parse_error"
-    assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
-    assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
-    assert parse_issue.details["analysis_incomplete"] is True
+    _assert_truncated_parse_issue(result, "truncated.pkl (pos 4)")
 
 
 def test_pickle_report_to_scan_result_keeps_truncated_bin_parse_failure_inconclusive() -> None:
-    report = PickleReport(
-        source="truncated.bin",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: EOFError",
-                severity=Severity.INFO,
-                location="truncated.bin (pos 57)",
-                code="parse_incomplete",
-                details={
-                    "exception": "pickle exhausted before seeing STOP",
-                    "exception_type": "EOFError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        "truncated.bin",
+        position=57,
+        exception_type="EOFError",
+        exception_message="pickle exhausted before seeing STOP",
+        metadata={},
     )
 
     result = pickle_report_to_scan_result(report)
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    parse_issue = next(
-        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
-    )
-    assert parse_issue.severity == IssueSeverity.WARNING
-    assert parse_issue.rule_code == "S901"
-    assert parse_issue.location == "truncated.bin (pos 57)"
-    assert parse_issue.details["category"] == "parse_error"
-    assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
-    assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
-    assert parse_issue.details["analysis_incomplete"] is True
+    _assert_truncated_parse_issue(result, "truncated.bin (pos 57)")
 
 
 def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconclusive_notices() -> None:
-    report = PickleReport(
-        source="weights.bin",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
-                severity=Severity.INFO,
-                location="weights.bin (pos 57)",
-                code="parse_incomplete",
-                details={
-                    "exception": "at position 4096, opcode b'\\x00' unknown",
-                    "exception_type": "ValueError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        "weights.bin",
+        position=57,
+        exception_message="at position 4096, opcode b'\\x00' unknown",
         metadata={"first_pickle_end_pos": 56, "import_references": _benign_tail_import_references()},
     )
 
@@ -1445,23 +1375,11 @@ def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconcl
 
 
 def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive_notices() -> None:
-    report = PickleReport(
-        source="benign-tail.pkl",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: UnicodeDecodeError",
-                severity=Severity.INFO,
-                location="benign-tail.pkl (pos 21)",
-                code="parse_incomplete",
-                details={
-                    "exception": "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
-                    "exception_type": "UnicodeDecodeError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        "benign-tail.pkl",
+        position=21,
+        exception_type="UnicodeDecodeError",
+        exception_message="'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
         metadata={"first_pickle_end_pos": 20, "import_references": _benign_tail_import_references()},
     )
 
@@ -1471,23 +1389,10 @@ def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive
 
 
 def test_pickle_report_to_scan_result_keeps_zero_padding_tails_as_inconclusive_notices() -> None:
-    report = PickleReport(
-        source="padding.pkl",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
-                severity=Severity.INFO,
-                location="padding.pkl (pos 20)",
-                code="parse_incomplete",
-                details={
-                    "exception": "at position 4096, opcode b'\\x00' unknown",
-                    "exception_type": "ValueError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        "padding.pkl",
+        position=20,
+        exception_message="at position 4096, opcode b'\\x00' unknown",
         metadata={"first_pickle_end_pos": 19, "import_references": _benign_tail_import_references()},
     )
 
@@ -1508,23 +1413,11 @@ def test_pickle_report_to_scan_result_requires_no_dangerous_imports_for_tail_sup
     exception_type: str,
     exception_message: str,
 ) -> None:
-    report = PickleReport(
-        source=source,
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
-                severity=Severity.INFO,
-                location=f"{source} (pos 20)",
-                code="parse_incomplete",
-                details={
-                    "exception": exception_message,
-                    "exception_type": exception_type,
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        source,
+        position=20,
+        exception_type=exception_type,
+        exception_message=exception_message,
         metadata={
             "first_pickle_end_pos": 19,
             "import_references": [
@@ -1540,16 +1433,7 @@ def test_pickle_report_to_scan_result_requires_no_dangerous_imports_for_tail_sup
         },
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert "trusted_incomplete_tail" not in result.metadata
-    parse_issue = next(
-        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
-    )
-    assert parse_issue.severity == IssueSeverity.WARNING
-    assert parse_issue.rule_code == "S901"
-    assert parse_issue.details["analysis_incomplete"] is True
+    _assert_untrusted_tail_warning(report)
 
 
 @pytest.mark.parametrize(
@@ -1564,36 +1448,15 @@ def test_pickle_report_to_scan_result_requires_import_metadata_for_tail_suppress
     exception_type: str,
     exception_message: str,
 ) -> None:
-    report = PickleReport(
-        source=source,
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
-                severity=Severity.INFO,
-                location=f"{source} (pos 20)",
-                code="parse_incomplete",
-                details={
-                    "exception": exception_message,
-                    "exception_type": exception_type,
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        source,
+        position=20,
+        exception_type=exception_type,
+        exception_message=exception_message,
         metadata={"first_pickle_end_pos": 19},
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert "trusted_incomplete_tail" not in result.metadata
-    parse_issue = next(
-        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
-    )
-    assert parse_issue.severity == IssueSeverity.WARNING
-    assert parse_issue.rule_code == "S901"
-    assert parse_issue.details["analysis_incomplete"] is True
+    _assert_untrusted_tail_warning(report)
 
 
 @pytest.mark.parametrize(
@@ -1608,23 +1471,11 @@ def test_pickle_report_to_scan_result_suppresses_trusted_tails_with_empty_import
     exception_type: str,
     exception_message: str,
 ) -> None:
-    report = PickleReport(
-        source=source,
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
-                severity=Severity.INFO,
-                location=f"{source} (pos 20)",
-                code="parse_incomplete",
-                details={
-                    "exception": exception_message,
-                    "exception_type": exception_type,
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        source,
+        position=20,
+        exception_type=exception_type,
+        exception_message=exception_message,
         metadata={"first_pickle_end_pos": 19, "import_references": []},
     )
 
@@ -1643,23 +1494,10 @@ def test_pickle_report_to_scan_result_suppresses_trusted_tails_with_empty_import
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_raw_pickle_unknown_opcode_tail() -> None:
-    report = PickleReport(
-        source="unknown-tail.pkl",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
-                severity=Severity.INFO,
-                location="unknown-tail.pkl (pos 20)",
-                code="parse_incomplete",
-                details={
-                    "exception": "at position 20, opcode b'A' unknown",
-                    "exception_type": "ValueError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        "unknown-tail.pkl",
+        position=20,
+        exception_message="at position 20, opcode b'A' unknown",
         metadata={"first_pickle_end_pos": 19},
     )
 
@@ -1678,43 +1516,13 @@ def test_pickle_report_to_scan_result_fails_closed_for_raw_pickle_unknown_opcode
 
 
 def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_inconclusive_notices() -> None:
-    report = PickleReport(
-        source="numpy_arrays.joblib",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
-                severity=Severity.INFO,
-                location="numpy_arrays.joblib (pos 231)",
-                code="parse_incomplete",
-                details={
-                    "exception": "at position 230, opcode b'\\t' unknown",
-                    "exception_type": "ValueError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        "numpy_arrays.joblib",
+        position=231,
+        exception_message="at position 230, opcode b'\\t' unknown",
         metadata={
             "first_pickle_end_pos": 230,
-            "import_references": [
-                {
-                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
-                    "module": "joblib.numpy_pickle",
-                    "name": "NumpyArrayWrapper",
-                    "opcode": "STACK_GLOBAL",
-                    "position": 66,
-                    "is_dangerous": False,
-                },
-                {
-                    "import_reference": "numpy.ndarray",
-                    "module": "numpy",
-                    "name": "ndarray",
-                    "opcode": "STACK_GLOBAL",
-                    "position": 103,
-                    "is_dangerous": False,
-                },
-            ],
+            "import_references": _joblib_tail_import_references(include_ndarray=True),
         },
     )
 
@@ -1724,43 +1532,13 @@ def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_incon
 
 
 def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_joblib_tail_suppression() -> None:
-    report = PickleReport(
-        source="numpy_arrays.joblib (decompressed)",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
-                severity=Severity.INFO,
-                location="numpy_arrays.joblib (decompressed) (pos 231)",
-                code="parse_incomplete",
-                details={
-                    "exception": "at position 230, opcode b'\\t' unknown",
-                    "exception_type": "ValueError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
+    report = _parse_incomplete_report(
+        "numpy_arrays.joblib (decompressed)",
+        position=231,
+        exception_message="at position 230, opcode b'\\t' unknown",
         metadata={
             "first_pickle_end_pos": 230,
-            "import_references": [
-                {
-                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
-                    "module": "joblib.numpy_pickle",
-                    "name": "NumpyArrayWrapper",
-                    "opcode": "STACK_GLOBAL",
-                    "position": 66,
-                    "is_dangerous": False,
-                },
-                {
-                    "import_reference": "numpy.ndarray",
-                    "module": "numpy",
-                    "name": "ndarray",
-                    "opcode": "STACK_GLOBAL",
-                    "position": 103,
-                    "is_dangerous": False,
-                },
-            ],
+            "import_references": _joblib_tail_import_references(include_ndarray=True),
         },
     )
 
@@ -1779,35 +1557,11 @@ def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_jo
 
 
 def test_pickle_report_to_scan_result_requires_boundary_for_joblib_serialization_tail() -> None:
-    report = PickleReport(
-        source="numpy_arrays.joblib",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
-                severity=Severity.INFO,
-                location="numpy_arrays.joblib (pos 231)",
-                code="parse_incomplete",
-                details={
-                    "exception": "at position 230, opcode b'\\t' unknown",
-                    "exception_type": "ValueError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
-        metadata={
-            "import_references": [
-                {
-                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
-                    "module": "joblib.numpy_pickle",
-                    "name": "NumpyArrayWrapper",
-                    "opcode": "STACK_GLOBAL",
-                    "position": 66,
-                    "is_dangerous": False,
-                },
-            ],
-        },
+    report = _parse_incomplete_report(
+        "numpy_arrays.joblib",
+        position=231,
+        exception_message="at position 230, opcode b'\\t' unknown",
+        metadata={"import_references": _joblib_tail_import_references(include_ndarray=False)},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -1820,35 +1574,11 @@ def test_pickle_report_to_scan_result_requires_boundary_for_joblib_serialization
 
 
 def test_pickle_report_to_scan_result_requires_boundary_for_non_joblib_tail_suppression() -> None:
-    report = PickleReport(
-        source="numpy_arrays.dill",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
-        notices=(
-            Notice(
-                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
-                severity=Severity.INFO,
-                location="numpy_arrays.dill (pos 231)",
-                code="parse_incomplete",
-                details={
-                    "exception": "at position 230, opcode b'\\t' unknown",
-                    "exception_type": "ValueError",
-                    "analysis_incomplete": True,
-                },
-            ),
-        ),
-        metadata={
-            "import_references": [
-                {
-                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
-                    "module": "joblib.numpy_pickle",
-                    "name": "NumpyArrayWrapper",
-                    "opcode": "STACK_GLOBAL",
-                    "position": 66,
-                    "is_dangerous": False,
-                },
-            ],
-        },
+    report = _parse_incomplete_report(
+        "numpy_arrays.dill",
+        position=231,
+        exception_message="at position 230, opcode b'\\t' unknown",
+        metadata={"import_references": _joblib_tail_import_references(include_ndarray=False)},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -2091,6 +1821,32 @@ def test_pinned_bge_small_zh_hf_scan_completes_without_private_metadata_error(tm
     assert "pytorch_model/data.pkl" in serialized_report
     assert "pytorch_zip_scan_incomplete" not in serialized_report
     assert "analysis_incomplete" not in serialized_report
+
+
+def _assert_truncated_parse_issue(result: ScanResult, location: str) -> None:
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
+    assert parse_issue.location == location
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
+    assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
+    assert parse_issue.details["analysis_incomplete"] is True
+
+
+def _assert_untrusted_tail_warning(report: PickleReport) -> None:
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
+    assert parse_issue.details["analysis_incomplete"] is True
 
 
 def _assert_inconclusive_padding_notice(report: PickleReport, message: str) -> None:
