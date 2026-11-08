@@ -53,6 +53,7 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.utils import _path_hardening
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
@@ -115,6 +116,7 @@ from tests.helpers.file_creators import (
     write_truncated_ordered_hf_tokenizer_json as _write_truncated_ordered_hf_tokenizer_json,
 )
 from tests.helpers.scanners import install_zip_open_failure, scan_with_whitelisted_finding, without_keras_zip_scanner
+from tests.helpers.tar import add_tar_bytes
 from tests.helpers.tensorflow import _build_malicious_tf_savedmodel, _require_tf_protos, build_malicious_tf_metagraph
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
@@ -1934,6 +1936,33 @@ def test_directory_scan_late_checkpoint_child_scans_without_owner_context(
     assert determine_exit_code(result) == 1
 
 
+@pytest.mark.parametrize("changed_view", [None, "handle", "path"])
+def test_windows_file_hash_checks_each_view_for_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_view: str | None
+) -> None:
+    path = tmp_path / "weights"
+    path.write_bytes(b"weights")
+    base = path.stat()
+
+    def with_ctime(delta: int) -> os.stat_result:
+        return os.stat_result(base, {"st_mtime_ns": base.st_mtime_ns, "st_ctime_ns": base.st_ctime_ns + delta})
+
+    handles = iter([with_ctime(1), with_ctime(2 if changed_view == "handle" else 1)])
+    paths = iter([base, with_ctime(1) if changed_view == "path" else base])
+    windows_os = SimpleNamespace(**vars(os))
+    windows_os.name = "nt"
+    windows_os.fstat = lambda fd: next(handles)
+    windows_os.stat = lambda path, **kwargs: next(paths)
+    monkeypatch.setattr(_path_hardening, "os", windows_os)
+    monkeypatch.setattr(core_module, "os", windows_os)
+
+    if changed_view is None:
+        assert core_module._calculate_file_hash(str(path)) == hashlib.sha256(b"weights").hexdigest()
+    else:
+        with pytest.raises(OSError, match="changed while hashing"):
+            core_module._calculate_file_hash(str(path))
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
 def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
     tmp_path: Path,
@@ -2650,9 +2679,7 @@ def _write_tar_hdf5_userblock(
     tar_payload = io.BytesIO()
     with tarfile.open(fileobj=tar_payload, mode="w:gz" if compressed else "w") as archive:
         for name, data in members:
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            archive.addfile(info, io.BytesIO(data))
+            add_tar_bytes(archive, name, data)
     assert tar_payload.tell() <= userblock_size
     with path.open("r+b") as handle:
         handle.write(tar_payload.getvalue())
@@ -4787,6 +4814,32 @@ def test_scan_file_routes_pickle_safetensors_polyglot_to_pickle(
     _assert_system_pickle_issue(result)
 
 
+@pytest.mark.parametrize("header_length", [63362, 133508, 492424])
+def test_scan_file_reports_pickle_extension_in_safetensors_length(tmp_path: Path, header_length: int) -> None:
+    path = tmp_path / "model.safetensors"
+    _write_safetensors_pickle_tail(path, header_length, bytes(4))
+    assert file_detection.detect_file_format(str(path)) == "safetensors"
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+    assert result.scanner_name == "safetensors"
+    assert result.metadata["file_type"] == "safetensors"
+    assert "pickle" in result.metadata["supplemental_scanners"]
+    assert any(issue.rule_code == "S211" and "extension reference" in issue.message for issue in result.issues)
+    assert not any(
+        check.name in {"Format Validation", "File Type Validation"} and check.status.value == "failed"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [b"p\xa2", b"X\x01\x00\x00\x00xpe", b"X\x01\x00\x00\x00xpe" + (b"x" * 50_000) + b"\n"],
+    ids=["non-ascii-index", "truncated-invalid-index", "long-invalid-index"],
+)
+def test_safetensors_pickle_overlap_rejects_impossible_memo_index(sample: bytes) -> None:
+    assert file_detection.classify_safetensors_pickle_overlap_sample(sample, file_size=10_000_000) is False
+
+
 def test_scan_file_routes_safetensors_pickle_operand_crossing_short_probe(tmp_path: Path) -> None:
     pickle_tail = (b"A" * file_detection.PROTO0_1_MAX_PROBE_BYTES) + b"\n0cos\nsystem\n(Vtrue\ntR."
     header_length = ord("V")
@@ -5680,8 +5733,23 @@ def test_scan_file_merges_safetensors_findings_after_zip_preflight_rejection(tmp
     assert result.success is False
 
 
-def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(tmp_path: Path) -> None:
-    disguised_pickle = tmp_path / "payload.jpg"
+@pytest.mark.parametrize("requirement", ["torch>=2.10.0", "torch==1.9.0"])
+def test_scan_file_does_not_route_requirements_as_pickle(tmp_path: Path, requirement: str) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{requirement}\ntransformers\n")
+
+    assert file_detection.detect_file_format(str(path)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(path)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(path)) == "unknown"
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+    assert result.success
+    assert result.scanner_name == "text"
+
+
+@pytest.mark.parametrize("filename", ["payload.jpg", "requirements.txt"])
+def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(tmp_path: Path, filename: str) -> None:
+    disguised_pickle = tmp_path / filename
     disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle())
 
     assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
@@ -5963,9 +6031,7 @@ def test_scan_file_routes_nested_protocolless_binary_pickle_with_misleading_suff
         _create_misnamed_zip(archive_path, {entry_name: payload})
     else:
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo(entry_name)
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            add_tar_bytes(archive, entry_name, payload)
 
     result = scan_file(str(archive_path), config={"cache_scan_results": False})
 
@@ -6450,10 +6516,11 @@ def test_scan_file_routes_renamed_flax_stream_with_malicious_trailing_object(tmp
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
-def test_scan_file_routes_renamed_flax_stream_with_later_checkpoint_object(tmp_path: Path) -> None:
+@pytest.mark.parametrize("suffix", [".jpg", ".log", ".so", ".cact"])
+def test_scan_file_routes_renamed_flax_stream_with_later_checkpoint_object(tmp_path: Path, suffix: str) -> None:
     _require_msgpack()
 
-    checkpoint = tmp_path / "stream-later-root.jpg"
+    checkpoint = tmp_path / f"stream-later-root{suffix}"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb({"metadata": {"producer": "flax"}}, use_bin_type=True)
         + _pack_malicious_flax_checkpoint()
@@ -8701,14 +8768,10 @@ def test_embedded_hdf5_member_preserves_outer_tar_analysis(tmp_path: Path) -> No
         archive.addfile(tarfile.TarInfo("spacer.txt"), io.BytesIO())
 
         hdf_payload = embedded_hdf.read_bytes()
-        hdf_info = tarfile.TarInfo("model.h5")
-        hdf_info.size = len(hdf_payload)
-        archive.addfile(hdf_info, io.BytesIO(hdf_payload))
+        add_tar_bytes(archive, "model.h5", hdf_payload)
 
         pickle_payload = _build_malicious_pickle(protocol=0)
-        pickle_info = tarfile.TarInfo("late-payload.pkl")
-        pickle_info.size = len(pickle_payload)
-        archive.addfile(pickle_info, io.BytesIO(pickle_payload))
+        add_tar_bytes(archive, "late-payload.pkl", pickle_payload)
 
     signature_offset = find_hdf5_signature_offset(str(archive_path))
     assert signature_offset == 4 * tarfile.BLOCKSIZE
@@ -9006,11 +9069,12 @@ def test_raw_tar_hdf5_entry_limit_preserves_early_nemo_finding(tmp_path: Path) -
     )
 
 
-def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("target", "dangerous"), [("os.system", True), ("torch.nn.Linear", False)])
+def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path, target: str, dangerous: bool) -> None:
     model_path = tmp_path / "raw-nemo-padding-limit.h5"
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
-        [("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")],
+        [("model_config.yaml", f"model:\n  _target_: {target}\n  command: echo pwned\n".encode())],
     )
     config = {
         "cache_enabled": False,
@@ -9026,12 +9090,17 @@ def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path)
     assert result.scanner_name == "keras_h5"
     assert "nemo" in result.metadata["supplemental_scanners"]
     assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-        and check.status == CheckStatus.FAILED
-        and check.details["target"] == "os.system"
-        for check in result.checks
+    assert (
+        any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == target
+            for check in result.checks
+        )
+        is dangerous
     )
+    assert result.success is False
+    assert any(entry["path"].endswith(":model_config.yaml") for entry in result.metadata["contents"])
 
 
 def test_raw_tar_hdf5_metadata_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
@@ -9045,9 +9114,7 @@ def test_raw_tar_hdf5_metadata_limit_preserves_early_nemo_finding(tmp_path: Path
     tar_payload = io.BytesIO()
     with tarfile.open(fileobj=tar_payload, mode="w", format=tarfile.PAX_FORMAT) as archive:
         config_payload = b"model:\n  _target_: os.system\n  command: echo pwned\n"
-        config_info = tarfile.TarInfo("model_config.yaml")
-        config_info.size = len(config_payload)
-        archive.addfile(config_info, io.BytesIO(config_payload))
+        add_tar_bytes(archive, "model_config.yaml", config_payload)
         metadata_info = tarfile.TarInfo("weights.bin")
         metadata_info.pax_headers = {"comment": "A" * (80 * 1024)}
         archive.addfile(metadata_info, io.BytesIO(b""))
@@ -9110,9 +9177,7 @@ def test_empty_concatenated_gzip_members_do_not_inflate_hdf5_tar_ratio_denominat
     raw_tar = io.BytesIO()
     with tarfile.open(fileobj=raw_tar, mode="w") as archive:
         payload = b"A" * (12 * 1024 * 1024)
-        info = tarfile.TarInfo("weights.bin")
-        info.size = len(payload)
-        archive.addfile(info, io.BytesIO(payload))
+        add_tar_bytes(archive, "weights.bin", payload)
 
     empty_gzip = bytearray(gzip.compress(b"", mtime=0))
     empty_gzip[3] |= 0x04
@@ -9262,13 +9327,9 @@ def test_scan_file_routes_compressed_tar_when_hdf5_signature_is_inside_gzip_extr
     raw_tar = io.BytesIO()
     with tarfile.open(fileobj=raw_tar, mode="w") as archive:
         filler = b"A" * (128 * 1024)
-        filler_info = tarfile.TarInfo("large-weights.bin")
-        filler_info.size = len(filler)
-        archive.addfile(filler_info, io.BytesIO(filler))
+        add_tar_bytes(archive, "large-weights.bin", filler)
         payload = _build_malicious_pickle(protocol=0)
-        info = tarfile.TarInfo("late-payload.pkl")
-        info.size = len(payload)
-        archive.addfile(info, io.BytesIO(payload))
+        add_tar_bytes(archive, "late-payload.pkl", payload)
 
     signature_offset = _write_gzip_hdf5_extra_collision(model_path, raw_tar.getvalue())
 
@@ -9326,12 +9387,8 @@ def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar
     nested_tar = io.BytesIO()
     with tarfile.open(fileobj=nested_tar, mode="w") as archive:
         filler = b"A" * (1024 * 1024 + tarfile.BLOCKSIZE)
-        filler_info = tarfile.TarInfo("large-nested-weights.bin")
-        filler_info.size = len(filler)
-        archive.addfile(filler_info, io.BytesIO(filler))
-        payload_info = tarfile.TarInfo("late-payload.pkl")
-        payload_info.size = len(pickle_payload)
-        archive.addfile(payload_info, io.BytesIO(pickle_payload))
+        add_tar_bytes(archive, "large-nested-weights.bin", filler)
+        add_tar_bytes(archive, "late-payload.pkl", pickle_payload)
     assert nested_tar.tell() > 1024 * 1024
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
@@ -10736,9 +10793,7 @@ def test_scan_file_routes_nested_confirmed_jax_state_json(tmp_path: Path, archiv
         _create_misnamed_zip(archive_path, {"state.json": payload})
     else:
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("state.json")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            add_tar_bytes(archive, "state.json", payload)
 
     result = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
 
@@ -11648,6 +11703,61 @@ def test_scan_file_routes_misnamed_mxnet_symbol_and_detects_custom_library(tmp_p
         issue.message == "Suspicious library reference in MXNet graph attributes"
         and issue.details.get("attribute") == "library"
         for issue in result.issues
+    )
+
+
+def test_scan_file_large_safetensors_index_keeps_manifest_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    index_path = tmp_path / "model.safetensors.index.json"
+    weight_map = {f"layers.{i}.weight": "model-00001-of-00001.safetensors" for i in range(16)}
+    index = {"metadata": {"total_size": 1024, "total_parameters": 512}, "weight_map": weight_map}
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    config = {"cache_scan_results": False, "jinja_template_collection_max_items": 8}
+
+    result = scan_file(str(index_path), config=config)
+
+    assert result.success
+    assert result.scanner_name == "manifest"
+    assert result.metadata["root_type"] == "dict"
+    assert not any(
+        check.name in {"MXNet Symbol Routing", "Embedded Jinja Collection Budget"} for check in result.checks
+    )
+
+    # A late executable field must still reach embedded-template analysis.
+    index_path.write_text(
+        json.dumps({**index, "chat_template": "{{ cycler.__init__.__globals__.os.system('id') }}"}),
+        encoding="utf-8",
+    )
+    overlap = scan_file(str(index_path), config=config)
+
+    assert any(check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in overlap.checks)
+    assert any(check.status == CheckStatus.FAILED and "Jinja2" in check.name for check in overlap.checks)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        ',"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        ',"weight_map":{"layer.weight":"safe.safetensors"}}',
+        "} {}",
+        "",
+    ],
+)
+def test_unproven_safetensors_index_preserves_mxnet_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 64)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        '{"weight_map":{' + ",".join(f'"layer.{i}":"one.safetensors"' for i in range(8)) + "}" + suffix,
+        encoding="utf-8",
+    )
+
+    assert (
+        file_detection.detect_mxnet_symbol_content_route(index_path)
+        == file_detection.MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     )
 
 

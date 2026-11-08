@@ -14,6 +14,7 @@ from modelaudit.finding_identity import finding_identity, preserve_finding_ident
 from modelaudit.models import (
     ModelAuditResultModel,
     _details_have_incomplete_coverage,
+    _file_metadata_reports_scanner_failure,
     _metadata_has_coverage_only_operational_error,
     _metadata_has_incomplete_coverage,
     _metadata_value,
@@ -336,10 +337,6 @@ def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
     return records_have_incomplete_coverage(results.checks, allow_skipped_check_exemption=True)
 
 
-def _record_has_critical_severity(record: Any) -> bool:
-    return _normalized_enum_value(_metadata_value(record, "severity")) == IssueSeverity.CRITICAL.value
-
-
 def _record_is_failed_security_check(record: Any) -> bool:
     status = _normalized_enum_value(_metadata_value(record, "status"))
     return status == "failed" and _record_has_security_severity(record)
@@ -353,16 +350,12 @@ def results_have_security_findings(results: ModelAuditResultModel) -> bool:
 
 
 def results_should_be_unsuccessful(results: ModelAuditResultModel) -> bool:
-    """Return True when the aggregate result should not be considered successful."""
-    if results_have_operational_error(results):
-        return True
-
-    if results_have_inconclusive_outcome(results):
-        return True
-
-    has_failed_security_check = any(_record_is_failed_security_check(check) for check in (results.checks or []))
-    has_critical_issue = any(_record_has_critical_severity(issue) for issue in (results.issues or []))
-    return has_failed_security_check and not has_critical_issue
+    """Report incomplete or failed scans independently of security findings."""
+    return (
+        results_have_operational_error(results)
+        or results_have_inconclusive_outcome(results)
+        or _file_metadata_reports_scanner_failure(results.file_metadata)
+    )
 
 
 def to_telemetry_severity(severity: Any) -> str:
@@ -584,12 +577,13 @@ def _create_consolidated_message(
             return str(next(iter(messages)))
         return f"{check_name} completed successfully"
 
-    failed_messages = {c.get("message", "") for c in group_checks if c.get("status") == "failed"}
-
+    failed = [check for check in group_checks if check.get("status") == "failed"]
+    failed_messages = {check.get("message", "") for check in failed}
     if len(failed_messages) == 1:
         return str(next(iter(failed_messages)))
-    if failed_count == 1:
-        return f"{check_name} found 1 issue"
+
+    if any(check.get("severity") in ("info", "debug") for check in failed):
+        return f"{check_name} reported {failed_count} findings"
     return f"{check_name} found {failed_count} issues"
 
 
@@ -606,24 +600,6 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
         consolidated_details["findings"] = failed_details
 
     return consolidated_details
-
-
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-    """Extract severity and explanation from failed checks."""
-    consolidated_severity = None
-    consolidated_why = None
-
-    for check in group_checks:
-        if check.get("status") == "failed":
-            if not consolidated_severity and check.get("severity"):
-                consolidated_severity = check["severity"]
-            if not consolidated_why and check.get("why"):
-                consolidated_why = check["why"]
-
-            if consolidated_severity and consolidated_why:
-                break
-
-    return consolidated_severity, consolidated_why
 
 
 def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
@@ -664,8 +640,9 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
     consolidated_checks: list[dict[str, Any]] = []
 
     for (check_name, primary_asset), group_checks in check_groups.items():
-        if len(group_checks) == 1:
-            consolidated_checks.append(group_checks[0])
+        if len(group_checks) == 1 or any((c.get("details") or {}).get("analysis_incomplete") for c in group_checks):
+            # Coverage notices carry member-specific evidence even when the check passed.
+            consolidated_checks.extend(group_checks)
             continue
 
         statuses = [c.get("status") for c in group_checks]
@@ -678,22 +655,28 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
         else:
             consolidated_status = "skipped"
 
+        same_status = [check for check in group_checks if check.get("status") == consolidated_status]
+        representative = same_status[0]
+        if failed_count:
+            # Failed checks without a severity still count toward failure statistics.
+            severity_rank = {"debug": 0, "info": 1, "warning": 3, "critical": 4}
+            representative = max(
+                same_status,
+                key=lambda check: (severity_rank.get(check.get("severity", ""), 2), bool(check.get("why"))),
+            )
         identity_checks = [finding_identity(check) for check in group_checks]
         identity_message = _create_consolidated_message(check_name, identity_checks, consolidated_status, failed_count)
-        raw_check_name = group_checks[0].get("name", check_name)
-        message = next(
-            (
-                check["message"]
-                for check, identity in zip(group_checks, identity_checks, strict=True)
-                if identity.get("message") == identity_message
-            ),
-            _create_consolidated_message(raw_check_name, identity_checks, consolidated_status, failed_count),
-        )
+        raw_check_name = representative.get("name", check_name)
+        representative_identity = finding_identity(representative)
+        if representative_identity.get("message") == identity_message:
+            message = representative["message"]
+        else:
+            message = _create_consolidated_message(raw_check_name, identity_checks, consolidated_status, failed_count)
         consolidated_check = {
             "name": raw_check_name,
             "status": consolidated_status,
             "message": message,
-            "location": group_checks[0].get("location", primary_asset),
+            "location": representative.get("location", primary_asset),
             "details": _collect_consolidated_details(group_checks),
             "timestamp": _get_consolidated_timestamp(group_checks),
         }
@@ -703,13 +686,12 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
             "check_consolidation",
             name=check_name,
             message=identity_message,
-            location=identity_checks[0].get("location", primary_asset),
+            location=representative_identity.get("location", primary_asset),
         )
-        consolidated_severity, consolidated_why = _extract_failure_context(group_checks)
-        if consolidated_severity:
-            consolidated_check["severity"] = consolidated_severity
-        if consolidated_why:
-            consolidated_check["why"] = consolidated_why
+        if failed_count:
+            for field in ("severity", "why"):
+                if representative.get(field):
+                    consolidated_check[field] = representative[field]
 
         consolidated_checks.append(consolidated_check)
 

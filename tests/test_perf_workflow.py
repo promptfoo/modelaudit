@@ -208,6 +208,19 @@ def test_docs_workflow_passes_changed_files_to_prettier_as_json() -> None:
     assert "${{" not in run
 
 
+def test_docs_workflow_gives_advisory_links_a_separate_timeout() -> None:
+    jobs = _jobs(_load_workflow("docs-check.yml"))
+    formatting = jobs["format-check"]
+    links = jobs["link-check"]
+    assert links["needs"] == "format-check"
+    assert formatting["outputs"]["any_changed"] == "${{ steps.changed-files.outputs.any_changed }}"
+    assert links["if"] == "needs.format-check.outputs.any_changed == 'true'"
+    assert links["timeout-minutes"] > formatting["timeout-minutes"]
+    step = _step_by_name(links["steps"], "Check for broken links in markdown")
+    assert step["continue-on-error"] is True
+    assert step["with"].get("check-modified-files-only", "no") == "no"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Git filename edge cases require POSIX filesystem semantics")
 def test_docs_workflow_preserves_unusual_filenames_end_to_end(tmp_path: Path) -> None:
     workflow = _load_workflow("docs-check.yml")
@@ -420,8 +433,8 @@ def test_python_ci_integration_scheduling_covers_remaining_job_surface() -> None
         "uv-lock-check": f"{integration} || {dependencies} || {workflows}",
         "type-check": f"{integration} || {python} || {workflows}",
         "test-numpy-compatibility": f"{integration} || {dependencies}",
-        "test-vendored-protos": f"{integration} || {python} || {dependencies}",
-        "test-proto-reproducibility": f"{integration} || {python} || {dependencies}",
+        "test-vendored-protos": f"{integration} || {python} || {dependencies} || {workflows}",
+        "test-proto-reproducibility": f"{integration} || {python} || {dependencies} || {workflows}",
         "test-extras-smoke": f"{integration} || {dependencies}",
         "build": f"{integration} || {python} || {dependencies} || {workflows}",
         "picklescan-package": f"{integration} || {picklescan} || {workflows}",
@@ -452,6 +465,7 @@ def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() ->
             {"python-version": "3.10", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
             {"python-version": "3.12", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
             {"python-version": "3.13", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
+            {"python-version": "3.14", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
         ],
         [
             {
@@ -460,7 +474,7 @@ def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() ->
                 "shard-index": shard_index,
                 "shard-name": f"{shard_index + 1}/2",
             }
-            for python_version in ("3.10", "3.11", "3.12", "3.13")
+            for python_version in ("3.10", "3.11", "3.12", "3.13", "3.14")
             for shard_index in (0, 1)
         ],
     ]
@@ -589,6 +603,7 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
         ("EXPECT_DEPENDENCY_SURFACE", "UV_LOCK_RESULT"),
         ("EXPECT_CORE_FAST", "TYPE_CHECK_RESULT"),
         ("EXPECT_CORE_FAST", "WINDOWS_RESULT"),
+        ("EXPECT_CORE_FAST", "PYTHON314_SMOKE_RESULT"),
         ("EXPECT_TEST", "TEST_RESULT"),
         ("EXPECT_SLOW", "SLOW_RESULT"),
         ("EXPECT_COVERAGE", "COVERAGE_RESULT"),
@@ -634,8 +649,8 @@ def test_python_ci_requires_a_real_primary_upload_or_fatal_legacy_fallback() -> 
     assert "set -euo pipefail" in install_run
     assert "https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux" in install_run
     assert "ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d" in install_run
-    assert "--proto '=https' --proto-redir '=https'" in install_run
-    assert install_run.index("sha256sum --check") < install_run.index("chmod +x")
+    assert "https://api.github.com/repos/codecov/codecov-cli/releases/assets/470877726" in install_run
+    assert install_run.index("fetch-verified-release.sh") < install_run.index("chmod +x")
     assert steps.index(installer) < steps.index(_step_by_name(steps, "Run branch coverage shard"))
     assert steps.index(primary) < steps.index(fallback)
     assert coverage.get("continue-on-error") is None
@@ -773,15 +788,27 @@ def test_python_ci_legacy_fallback_cannot_hide_an_upload_failure(tmp_path: Path,
 @pytest.mark.skipif(
     os.name != "posix" or os.uname().sysname != "Linux", reason="The coverage uploader job runs on Linux"
 )
-@pytest.mark.parametrize("scenario", ["valid", "download-error", "hash-mismatch"])
-def test_python_ci_verifies_download_before_enabling_uploader(tmp_path: Path, scenario: str) -> None:
+@pytest.mark.parametrize(
+    ("scenario", "expected_status", "expected_hosts"),
+    [
+        ("valid", 0, ["github.com"]),
+        ("cached", 0, []),
+        ("stale-cache", 0, ["github.com"]),
+        ("primary-unavailable", 0, ["github.com", "api.github.com"]),
+        ("download-error", 22, ["github.com", "api.github.com"]),
+        ("hash-mismatch", 1, ["github.com"]),
+    ],
+)
+def test_python_ci_verifies_download_before_enabling_uploader(
+    tmp_path: Path, scenario: str, expected_status: int, expected_hosts: list[str]
+) -> None:
     import hashlib
     import sys
+    from urllib.parse import urlsplit
 
     steps = _jobs(_load_workflow("test.yml"))["coverage"]["steps"]
     script = _step_by_name(steps, "Install verified Codecov CLI")["run"]
     trusted_contents = b"#!/bin/sh\nexit 0\n"
-    # Exercise the real shell control flow against a known offline fixture.
     script = script.replace(
         "ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d",
         hashlib.sha256(trusted_contents).hexdigest(),
@@ -794,8 +821,10 @@ def test_python_ci_verifies_download_before_enabling_uploader(tmp_path: Path, sc
     curl.write_text(
         f"#!{sys.executable}\n"
         "import json, os, pathlib, shutil, sys\n"
-        "pathlib.Path(os.environ['CURL_ARGS']).write_text(json.dumps(sys.argv[1:]))\n"
-        "if os.environ['DOWNLOAD_SCENARIO'] == 'download-error':\n"
+        "with open(os.environ['CURL_ARGS'], 'a') as calls:\n"
+        "    print(json.dumps(sys.argv[1:]), file=calls)\n"
+        "scenario = os.environ['DOWNLOAD_SCENARIO']\n"
+        "if scenario == 'download-error' or (scenario == 'primary-unavailable' and '//github.com/' in sys.argv[-1]):\n"
         "    sys.exit(22)\n"
         "shutil.copyfile(os.environ['DOWNLOAD_SOURCE'], sys.argv[sys.argv.index('--output') + 1])\n",
         encoding="utf-8",
@@ -803,10 +832,14 @@ def test_python_ci_verifies_download_before_enabling_uploader(tmp_path: Path, sc
     curl.chmod(0o755)
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
-    curl_args = tmp_path / "curl-args.json"
+    binary = runner_temp / "modelaudit-codecov"
+    if scenario in {"cached", "stale-cache"}:
+        binary.write_bytes(trusted_contents if scenario == "cached" else b"untrusted")
+    curl_args = tmp_path / "curl-args.jsonl"
+    curl_args.touch()
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-c", script],
-        cwd=tmp_path,
+        cwd=Path(__file__).resolve().parents[1],
         env={
             **os.environ,
             "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
@@ -820,10 +853,38 @@ def test_python_ci_verifies_download_before_enabling_uploader(tmp_path: Path, sc
         timeout=15,
     )
 
-    binary = runner_temp / "modelaudit-codecov"
-    assert result.returncode == {"valid": 0, "download-error": 22, "hash-mismatch": 1}[scenario], result.stderr
-    assert os.access(binary, os.X_OK) is (scenario == "valid")
-    assert binary.is_file() is (scenario != "download-error")
-    assert json.loads(curl_args.read_text())[-1] == (
-        "https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux"
-    )
+    assert result.returncode == expected_status, result.stderr
+    assert os.access(binary, os.X_OK) is (expected_status == 0)
+    assert binary.is_file() is (expected_status == 0)
+    if expected_status == 0:
+        assert binary.read_bytes() == trusted_contents
+    calls = [json.loads(line) for line in curl_args.read_text().splitlines()]
+    assert [urlsplit(args[-1]).hostname for args in calls] == expected_hosts
+    for args in calls:
+        assert args[args.index("--proto") + 1] == args[args.index("--proto-redir") + 1] == "=https"
+        assert args[args.index("--header") + 1] == "Accept: application/octet-stream"
+
+
+def test_python314_platform_smoke_is_required_for_python_changes() -> None:
+    jobs = _jobs(_load_workflow("test.yml"))
+    smoke = jobs["python314-platform-smoke"]
+    assert smoke["if"] == jobs["lint"]["if"]
+    assert smoke["strategy"]["matrix"] == {"os": ["macos-latest", "windows-latest"]}
+    assert smoke["strategy"]["fail-fast"] is False
+    assert smoke["runs-on"] == "${{ matrix.os }}"
+    assert "python314-platform-smoke" in jobs["ci-success"]["needs"]
+    steps = smoke["steps"]
+    sync = _step_by_name(steps, "Sync Python 3.14 smoke dependencies")["run"]
+    assert "--locked --python 3.14 --extra all-ci-windows --extra h5" in sync
+    probe = _step_by_name(steps, "Verify Python 3.14 native and H5 imports")
+    # PowerShell reports the last native command's status, so the probe must own its step.
+    assert probe["run"].strip().splitlines() == [
+        'uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"'
+    ]
+    assert "if" not in probe
+    assert "continue-on-error" not in probe
+    assert "continue-on-error" not in smoke
+    test_step = _step_by_name(steps, "Test Python 3.14 native pickle and H5 scanning")
+    assert steps.index(probe) < steps.index(test_step)
+    assert "if" not in test_step
+    assert "--locked --python 3.14 pytest tests/test_python_compatibility.py -n 0" in test_step["run"]

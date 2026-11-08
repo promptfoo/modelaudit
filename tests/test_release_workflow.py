@@ -152,7 +152,7 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
         lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.14"
     )
     assert intel314["timeout-minutes"] == 75
-    arm314 = next(lane for lane in matrix["include"] if lane["os"] == "macos-14" and lane["python-version"] == "3.14")
+    arm314 = next(lane for lane in matrix["include"] if lane["os"] == "macos-15" and lane["python-version"] == "3.14")
     assert arm314["timeout-minutes"] == 60
     ubuntu_arm314 = next(
         lane for lane in matrix["include"] if lane["os"] == "ubuntu-24.04-arm" and lane["python-version"] == "3.14"
@@ -534,6 +534,44 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
     }
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash execution requires POSIX filesystem semantics")
+@pytest.mark.parametrize(
+    ("job", "step_name", "version_output"),
+    [
+        ("build", "Verify distribution artifacts and version consistency", "version"),
+        ("build-picklescan-package", "Verify standalone artifact version consistency", "picklescan_version"),
+    ],
+)
+@pytest.mark.parametrize("missing_version", [None, "wheel", "sdist"])
+def test_release_workflow_reads_artifact_metadata(
+    tmp_path: Path, job: str, step_name: str, version_output: str, missing_version: str | None
+) -> None:
+    step = _step_by_name(_job_steps(_load_release_workflow(), job), step_name)
+    version = "1.2.3"
+    metadata = f"Version: {version}\n".encode()
+    package = "modelaudit" if job == "build" else "modelaudit_picklescan"
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    # A different filename version makes the metadata check observable.
+    with zipfile.ZipFile(dist / f"{package}-9.9.9-py3-none-any.whl", "w") as wheel:
+        wheel.writestr(f"{package}-9.9.9.dist-info/METADATA", b"" if missing_version == "wheel" else metadata)
+    pkg_info = tmp_path / "PKG-INFO"
+    pkg_info.write_bytes(b"" if missing_version == "sdist" else metadata)
+    with tarfile.open(dist / f"{package}-9.9.9.tar.gz", "w:gz") as sdist:
+        sdist.add(pkg_info, arcname=f"{package}-9.9.9/PKG-INFO")
+
+    command = step["run"].replace("${{ needs.release-please.outputs." + version_output + " }}", version)
+    result = subprocess.run(
+        ["bash", "-c", command], cwd=tmp_path, env={**os.environ, **step["env"]}, capture_output=True, text=True
+    )
+    if missing_version is None:
+        assert result.returncode == 0, result.stderr
+        assert f"validation passed for version {version}" in result.stdout
+    else:
+        assert result.returncode == 1
+        assert "Could not find Version header" in result.stderr
+
+
 def test_release_workflow_restores_root_runtime_python_after_type_check() -> None:
     workflow = _load_release_workflow()
     steps = _job_steps(workflow, "build")
@@ -666,6 +704,24 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
     )
 
 
+def _picklescan_release_filenames(version: str) -> tuple[str, ...]:
+    return (
+        f"modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+        f"modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+        f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+        f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+        f"modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
+        f"modelaudit_picklescan-{version}.tar.gz",
+    )
+
+
+def _python_heredoc(command: str) -> str:
+    lines = command.splitlines()
+    assert lines[0] == "python - <<'PY'"
+    assert lines[-1] == "PY"
+    return "\n".join(lines[1:-1])
+
+
 def test_release_workflow_verifies_published_picklescan_package() -> None:
     workflow = _load_release_workflow()
 
@@ -680,27 +736,9 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
     wait_step = _step_by_name(steps, "Wait for modelaudit-picklescan files on PyPI")
     assert wait_step["env"] == {"PYPI_PROJECT": "modelaudit-picklescan"}
     wait_run = wait_step["run"]
-    assert "https://pypi.org/pypi/modelaudit-picklescan/{version}/json" in wait_run
-    assert "https://pypi.org/simple/modelaudit-picklescan/" in wait_run
-    assert (
-        '"Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, '
-        'text/html; q=0.01"' in wait_run
-    )
-    assert '"Accept-Encoding": "gzip, deflate"' in wait_run
-    assert '"Cache-Control": "max-age=0"' in wait_run
-    assert 'content_encoding == "gzip"' in wait_run
-    assert 'content_encoding == "deflate"' in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
-    assert 'if not entry.get("yanked", False)' in wait_run
     assert "missing_simple={missing_simple}" in wait_run
-    for expected_fragment in (
-        "modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
-        "modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
-        "modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
-        "modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
-        "modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
-        "modelaudit_picklescan-{version}.tar.gz",
-    ):
+    for expected_fragment in _picklescan_release_filenames("{version}"):
         assert expected_fragment in wait_run
 
     smoke_step = _step_by_name(steps, "Install published modelaudit-picklescan and smoke test API")
@@ -722,14 +760,7 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
             "Wait for modelaudit-picklescan files on PyPI",
             "modelaudit-picklescan",
             "0.1.9",
-            (
-                "modelaudit_picklescan-0.1.9-cp310-abi3-macosx_10_12_x86_64.whl",
-                "modelaudit_picklescan-0.1.9-cp310-abi3-macosx_11_0_arm64.whl",
-                "modelaudit_picklescan-0.1.9-cp310-abi3-manylinux_2_28_aarch64.whl",
-                "modelaudit_picklescan-0.1.9-cp310-abi3-manylinux_2_28_x86_64.whl",
-                "modelaudit_picklescan-0.1.9-cp310-abi3-win_amd64.whl",
-                "modelaudit_picklescan-0.1.9.tar.gz",
-            ),
+            _picklescan_release_filenames("0.1.9"),
         ),
         (
             "verify-pypi",
@@ -752,10 +783,7 @@ def test_release_workflow_waits_for_compressed_pypi_simple_index(
 ) -> None:
     workflow = _load_release_workflow()
     wait_run = _step_by_name(_job_steps(workflow, job_name), step_name)["run"]
-    lines = wait_run.splitlines()
-    assert lines[0] == "python - <<'PY'"
-    assert lines[-1] == "PY"
-    script = "\n".join(lines[1:-1])
+    script = _python_heredoc(wait_run)
 
     class EncodedResponse(io.BytesIO):
         def __init__(self, body: bytes, encoding: str) -> None:
@@ -773,13 +801,14 @@ def test_release_workflow_waits_for_compressed_pypi_simple_index(
             return io.BytesIO(json.dumps(api_payload).encode())
 
         assert url.full_url == f"https://pypi.org/simple/{project}/"
+        assert url.get_header("Accept") == (
+            "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01"
+        )
         assert url.get_header("Accept-encoding") == "gzip, deflate"
         assert url.get_header("Cache-control") == "max-age=0"
         calls["simple"] += 1
-        files = [
-            {"filename": name, "yanked": calls["simple"] == 1 and index == 0}
-            for index, name in enumerate(expected_files)
-        ]
+        files: list[dict[str, str | bool]] = [{"filename": name} for name in expected_files]
+        files[0]["yanked"] = calls["simple"] == 1
         body = json.dumps({"files": files}).encode()
         encoded_body = gzip.compress(body) if content_encoding == "gzip" else zlib.compress(body)
         return EncodedResponse(encoded_body, content_encoding)
@@ -788,7 +817,7 @@ def test_release_workflow_waits_for_compressed_pypi_simple_index(
     monkeypatch.setenv("EXPECTED_VERSION", version)
     monkeypatch.setenv("PYPI_PROJECT", project)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 3.0))
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 601.0))
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
 
     exec(compile(script, "release-pypi-propagation-step", "exec"), {})
@@ -858,10 +887,7 @@ def test_root_publish_fails_closed_until_picklescan_is_available(
         _job_steps(workflow, "publish-pypi"),
         "Verify the root picklescan dependency is available on PyPI",
     )
-    lines = step["run"].splitlines()
-    assert lines[0] == "python - <<'PY'"
-    assert lines[-1] == "PY"
-    script = "\n".join(lines[1:-1])
+    script = _python_heredoc(step["run"])
 
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -871,14 +897,7 @@ def test_root_publish_fails_closed_until_picklescan_is_available(
             f"Metadata-Version: 2.4\nName: modelaudit\nVersion: 0.2.50\nRequires-Dist: {requirement}\n",
         )
 
-    expected_files = [
-        f"modelaudit_picklescan-{published_version}-cp310-abi3-macosx_10_12_x86_64.whl",
-        f"modelaudit_picklescan-{published_version}-cp310-abi3-macosx_11_0_arm64.whl",
-        f"modelaudit_picklescan-{published_version}-cp310-abi3-manylinux_2_28_aarch64.whl",
-        f"modelaudit_picklescan-{published_version}-cp310-abi3-manylinux_2_28_x86_64.whl",
-        f"modelaudit_picklescan-{published_version}-cp310-abi3-win_amd64.whl",
-        f"modelaudit_picklescan-{published_version}.tar.gz",
-    ]
+    expected_files = list(_picklescan_release_filenames(published_version))
     if missing_wheel:
         expected_files.pop(0)
     if missing_sdist:
@@ -938,18 +957,7 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
     wait_step = _step_by_name(steps, "Wait for modelaudit files on PyPI")
     assert wait_step["env"] == {"PYPI_PROJECT": "modelaudit"}
     wait_run = wait_step["run"]
-    assert "https://pypi.org/pypi/modelaudit/{version}/json" in wait_run
-    assert "https://pypi.org/simple/modelaudit/" in wait_run
-    assert (
-        '"Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, '
-        'text/html; q=0.01"' in wait_run
-    )
-    assert '"Accept-Encoding": "gzip, deflate"' in wait_run
-    assert '"Cache-Control": "max-age=0"' in wait_run
-    assert 'content_encoding == "gzip"' in wait_run
-    assert 'content_encoding == "deflate"' in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
-    assert 'if not entry.get("yanked", False)' in wait_run
     assert "missing_simple={missing_simple}" in wait_run
     assert "modelaudit-{version}-py3-none-any.whl" in wait_run
     assert "modelaudit-{version}.tar.gz" in wait_run
@@ -1094,7 +1102,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert 'job.get("status") != "completed" or job.get("conclusion") != "success"' in source_run
 
     download_step = _step_by_name(steps, "Download original root build artifacts")
-    assert download_step["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+    assert download_step["uses"] == "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
     assert download_step["with"] == {
         "name": "dist",
         "path": "dist/",
@@ -1575,10 +1583,7 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
     verify_run = _step_by_name(
         _job_steps(workflow, "root-provenance-recovery"), "Verify recovered root artifacts match PyPI"
     )["run"]
-    lines = verify_run.splitlines()
-    assert lines[0] == "python - <<'PY'"
-    assert lines[-1] == "PY"
-    script = "\n".join(lines[1:-1])
+    script = _python_heredoc(verify_run)
 
     version = "0.2.50"
     wheel_name = f"modelaudit-{version}-py3-none-any.whl"

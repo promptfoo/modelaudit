@@ -4,11 +4,13 @@ This document defines what versions and environments are currently supported for
 
 ## Supported Versions
 
-| Component        | Supported              |
-| ---------------- | ---------------------- |
-| ModelAudit       | Latest release         |
-| Python           | 3.10, 3.11, 3.12, 3.13 |
-| Operating system | Linux, macOS, Windows  |
+| Component        | Supported                    |
+| ---------------- | ---------------------------- |
+| ModelAudit       | Latest release               |
+| Python           | 3.10, 3.11, 3.12, 3.13, 3.14 |
+| Operating system | Linux, macOS, Windows        |
+
+Python support covers standard GIL-enabled CPython. Free-threaded builds (3.13t/3.14t) are not supported.
 
 Older ModelAudit releases may continue to function, but only the latest release receives routine fixes.
 

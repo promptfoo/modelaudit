@@ -23,7 +23,7 @@ try:
 except ImportError:
     HAS_JOBLIB = False
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
@@ -56,7 +56,7 @@ class TestRealDillFiles:
             assert dill_related, "Critical issues should be dill-related if present"
 
     @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
-    def test_real_dill_complex_object(self, tmp_path):
+    def test_real_dill_complex_object(self, tmp_path: Path) -> None:
         """Test scanning dill files with complex objects."""
         dill_file = tmp_path / "complex.dill"
 
@@ -74,9 +74,27 @@ class TestRealDillFiles:
         scanner = PickleScanner()
         result = scanner.scan(str(dill_file))
 
-        # Should handle complex dill objects
-        assert result.success is True
         assert result.bytes_scanned > 0
+        if sys.version_info[:2] == (3, 14):
+            # RESUME/LOAD_CONST bytecode overlaps PROTO/REDUCE. Keep nested
+            # analysis fail-closed instead of exempting executable code bytes.
+            assert ComplexClass.__init__.__code__.co_code.startswith(b"\x80\x00\x52")
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "nested_pickle_incomplete" in result.metadata["scan_outcome_reasons"]
+            assert any(
+                issue.severity == IssueSeverity.CRITICAL
+                and issue.details.get("pickle_rule_code") == "S213"
+                and issue.details.get("nested_encoding") == "raw"
+                for issue in result.issues
+            )
+        else:
+            assert result.success is True
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and str(issue.details.get("import_reference", "")).startswith("dill._dill.")
+            for issue in result.issues
+        )
 
     @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
     def test_dill_malicious_detection_still_works(self, tmp_path):
