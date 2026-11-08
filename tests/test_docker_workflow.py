@@ -82,8 +82,8 @@ def test_dockerfiles_pin_python_base_images_by_digest() -> None:
     full_image = _python_image_from_arg("Dockerfile.full")
     tensorflow_image = _python_image_from_arg("Dockerfile.tensorflow")
 
-    assert full_image == lightweight_image
-    _assert_pinned_python_image(lightweight_image, "3.13-slim")
+    _assert_pinned_python_image(lightweight_image, "3.14-slim")
+    _assert_pinned_python_image(full_image, "3.13-slim")
     _assert_pinned_python_image(tensorflow_image, "3.12-slim")
 
     for path in ("Dockerfile", "Dockerfile.full"):

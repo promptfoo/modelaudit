@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
 - Report completed scans as successful in the Python API even when a security check raises a warning.
+- Run the lightweight Docker image on Python 3.14, with pip confined to the build stage. The full image stays on Python 3.13 for TensorFlow compatibility.
 - Upgrade APT and zlib packages in all Docker runtime images to include Debian security fixes.
 - Distinguish reshape dimensions from activation data when tracing both inputs of an ONNX attention contraction. Dynamically transformed weights retain their coverage gaps.
 
