@@ -520,6 +520,34 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
 
 
+@pytest.mark.parametrize(
+    ("default", "body", "expected_exit", "evidence"),
+    [
+        ("'text'", "{{ value|trim }}", 0, set()),
+        ("cycler.__init__.__globals__", "{{ value.__class__.__mro__ }}", 1, {"global_access", "object_traversal"}),
+    ],
+)
+def test_scan_cli_tokenizer_macro(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, default: str, body: str, expected_exit: int, evidence: set[str]
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.jinja2_template_scanner.HAS_JINJA2_SANDBOX", False)
+    target = tmp_path / "tokenizer_config.json"
+    template = "{% macro render(value=" + default + ") %}" + body + "{% endmacro %}"
+    target.write_text(json.dumps({"chat_template": template}), encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "json", str(target)], catch_exceptions=False)
+
+    assert result.exit_code == expected_exit
+    output = parse_click_json_output(result.output)
+    assert output["success"] is True
+    assert {
+        finding["pattern_type"]
+        for check in output["checks"]
+        if check["name"] == "Jinja2 Template Injection Detection"
+        for finding in check["details"].get("findings", [check["details"]])
+    } == evidence
+
+
 def test_scan_cli_tokenizer_json_late_chat_template_after_structure_budget_reports_issue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

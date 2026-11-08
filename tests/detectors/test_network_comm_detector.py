@@ -1293,6 +1293,21 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] == "ipv4_address"]
 
+    def test_requirements_pins_are_distinct_from_url_hosts(self) -> None:
+        data = (
+            b"example-package==0.70.12.2\n"
+            b"package[extra] == 3.10.0.0 ; python_version < '3.12'\n"
+            b"example==2.3.4.5 --hash=sha256:abababababababababababababababababababababababababababababababab\n"
+            b"locked==2.3.4.5 \\\n    --hash=sha256:abababababababababababababababababababababababababababababababab\n"
+            b"--index-url http://3.10.0.0/simple\n"
+            b"remote @ http://0.70.12.2/pkg.whl\n"
+        )
+        findings = NetworkCommDetector().scan(data, "requirements.txt")
+        assert [(f["ip"], f["position"]) for f in findings if f["type"] == "ipv4_address"] == [
+            ("3.10.0.0", data.rindex(b"3.10.0.0")),
+            ("0.70.12.2", data.rindex(b"0.70.12.2")),
+        ]
+
     def test_detect_ipv6_addresses(self) -> None:
         """Test detection of IPv6 addresses."""
         detector = NetworkCommDetector()
@@ -7884,6 +7899,31 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
 
+    @pytest.mark.parametrize(
+        "clock", [b"10:22:30", b"10:23 PM", b"2025-11-14T19:22Z", b"10:30:22", b"`10:22:30`", b"<time>10:22:30</time>"]
+    )
+    def test_clock_fields_are_not_ports(self, clock: bytes) -> None:
+        findings = NetworkCommDetector().scan(clock, "notes.txt")
+
+        assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
+
+    def test_unqualified_numeric_host_port_remains_actionable(self) -> None:
+        data = b'endpoint = "10:22"'
+        findings = NetworkCommDetector().scan(data, "config.txt")
+
+        assert any(f.get("port") == 22 and f.get("position") == data.index(b"22") for f in findings)
+
+    def test_percent_delimited_endpoint_still_reports_port(self) -> None:
+        data = b"sed -i 's%old%worker:4444%' config"
+        findings = NetworkCommDetector().scan(data, "setup.sh")
+        assert any(f.get("port") == 4444 and f.get("position") == data.index(b"4444") for f in findings)
+
+    def test_onnx_text_fallback_recognizes_second_line_endpoint(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"notes: plain text\nendpoint=server:4444"
+        findings = detector.scan(data, "model.onnx", onnx_metadata_context=True)
+        assert any(f.get("port") == 4444 for f in findings)
+
     def test_suspicious_port_after_decimal_near_match_keeps_actual_position(self) -> None:
         data = b"arxiv:2310.06825\nserver:23\n"
         findings = NetworkCommDetector().scan(data, "README.md")
@@ -7960,13 +8000,14 @@ class TestNetworkCommDetector:
 
         assert duration < 1.0
 
-    def test_port_name_lookup_uses_shared_mapping(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Port-name lookup should reuse the shared class mapping."""
-        detector = NetworkCommDetector()
-        monkeypatch.setattr(NetworkCommDetector, "PORT_NAMES", {9999: "Custom Service"})
+    @pytest.mark.parametrize("port", [22, 4444, 8080])
+    def test_port_number_does_not_identify_a_service(self, port: int) -> None:
+        findings = NetworkCommDetector().scan(f"endpoint = 'server:{port}'".encode(), "hook.py")
 
-        assert detector._get_port_name(9999) == "Custom Service"
-        assert detector._get_port_name(22) == "Unknown"
+        finding = next(f for f in findings if f["type"] == "suspicious_port")
+        assert finding["port"] == port
+        assert finding["message"] == f"Suspicious port detected: {port}"
+        assert "service" not in finding
 
     def test_blacklist_detection(self) -> None:
         """Test detection of blacklisted domains when configured."""

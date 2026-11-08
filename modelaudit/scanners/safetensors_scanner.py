@@ -1524,7 +1524,7 @@ class SafeTensorsScanner(BaseScanner):
                     result.add_check(
                         name="Header Format Validation",
                         passed=True,
-                        message="SafeTensors header format is valid JSON",
+                        message="First non-whitespace SafeTensors header byte is '{'",
                         location=path,
                     )
 
@@ -1536,15 +1536,22 @@ class SafeTensorsScanner(BaseScanner):
                         duplicate_key_utf8_bytes,
                         duplicate_key_preview_truncated_count,
                     ) = self._load_json_header(header_bytes)
-                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as e:
+                except (ValueError, RecursionError) as e:
+                    invalid_json = isinstance(e, (UnicodeDecodeError, json.JSONDecodeError))
                     result.add_check(
                         name="SafeTensors JSON Parse",
                         passed=False,
-                        message=f"Invalid JSON header: {e!s}",
+                        message=f"Invalid JSON header: {e}"
+                        if invalid_json
+                        else f"JSON header validation incomplete: {e}",
                         severity=IssueSeverity.INFO,
                         location=path,
                         details={"exception": str(e), "exception_type": type(e).__name__},
-                        why="SafeTensors header contained invalid JSON.",
+                        why=(
+                            "SafeTensors header contained invalid JSON."
+                            if invalid_json
+                            else "The scanner stopped parsing before it could validate the SafeTensors header."
+                        ),
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
                     result.finish(success=False)
