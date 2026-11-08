@@ -37,7 +37,7 @@ from typing import Any, cast
 from zipimport import zipimporter
 
 import pytest
-from pickle_test_helpers import _clear_call_graph_caches
+from pickle_test_helpers import _clear_call_graph_caches, _ClearedCallGraphCaches
 
 import modelaudit_picklescan.api as package_api
 import modelaudit_picklescan.call_graph as call_graph
@@ -284,11 +284,8 @@ def _refresh_zipimporter_directory_files(
 
 @contextmanager
 def _isolated_call_graph_caches() -> Iterator[None]:
-    _clear_call_graph_caches()
-    try:
+    with _ClearedCallGraphCaches():
         yield
-    finally:
-        _clear_call_graph_caches()
 
 
 @contextmanager
@@ -327,6 +324,16 @@ class _FailIfExecutedFinder:
         del target
         self.calls.append(f"find_spec:{fullname}")
         raise AssertionError("untrusted cached finder was executed")
+
+
+def _assert_source_unavailable(module: str) -> None:
+    assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
+    assert call_graph._import_module_can_execute_user_code(module) is True
+
+
+def _assert_untrusted_module_source(module: str) -> None:
+    assert call_graph._trusted_module_origin_kind(module) is None
+    _assert_source_unavailable(module)
 
 
 def _assert_non_allowlisted_global(report: PickleReport, module: str, name: str) -> None:
@@ -493,8 +500,7 @@ def test_builtin_and_frozen_resolution_uses_import_time_snapshots(
 
     try:
         assert call_graph._trusted_module_origin_kind(module) in {None, "unresolved"}
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_source_unavailable(module)
         assert call_graph._trusted_module_origin_kind("_io") == "stdlib"
         if ntpath_is_frozen:
             expected_reason = None if ntpath_was_trusted_loaded else "source_unavailable"
@@ -535,8 +541,7 @@ def test_loaded_module_cannot_forge_builtin_or_frozen_origin(
     with _isolated_call_graph_caches():
         assert call_graph._trusted_module_origin_kind(module) is None
         assert call_graph._find_module_spec_without_imports(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_source_unavailable(module)
 
 
 def test_loaded_trusted_interpreter_module_replacement_fails_closed(
@@ -548,15 +553,9 @@ def test_loaded_trusted_interpreter_module_replacement_fails_closed(
     replacement.__spec__ = ModuleSpec(module, cast(Any, BuiltinImporter), origin="built-in")
     monkeypatch.setitem(sys.modules, module, replacement)
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
         report = package_api.scan_bytes(b"c_io\nBytesIO\n.", source="poisoned-builtin.pkl")
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "_io.BytesIO"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "_io", "BytesIO")
 
 
 def test_cached_interpreter_origin_cannot_hide_module_replacement(
@@ -736,12 +735,7 @@ def test_loaded_interpreter_reference_mutation_cannot_remain_allowlisted(
             b"c_frozen_importlib\nModuleSpec\n.",
             source="mutated-module-spec.pkl",
         )
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "_frozen_importlib.ModuleSpec"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "_frozen_importlib", "ModuleSpec")
 
 
 def test_loaded_parent_package_namespace_hook_is_not_executed(
@@ -797,12 +791,7 @@ def test_loaded_filesystem_reference_replacement_cannot_reuse_cached_origin(
     assert call_graph._trusted_module_origin_kind(module) == "stdlib"
     replaced_report = package_api.scan_bytes(b"cargparse\nNamespace\n)R.", source="replaced-argparse.pkl")
 
-    assert replaced_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "argparse.Namespace"
-        for finding in replaced_report.findings
-    )
+    _assert_non_allowlisted_global(replaced_report, "argparse", "Namespace")
 
 
 def test_loaded_trusted_reference_ignores_untrusted_cached_path_finder(
@@ -865,11 +854,7 @@ def test_forged_loaded_filesystem_reference_is_not_trusted_on_first_use(
     assert call_graph._trusted_module_origin_kind(module) == "stdlib"
     report = package_api.scan_bytes(b"cstatistics\nmean\n.", source="forged-statistics.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "statistics.mean"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, "statistics", "mean")
 
 
 def test_loaded_site_package_reference_after_startup_uses_source_owner() -> None:
@@ -934,12 +919,7 @@ def test_loaded_trusted_function_code_mutation_is_not_allowlisted() -> None:
     _clear_call_graph_caches()
     try:
         report = package_api.scan_bytes(b"ctempfile\ngettempdir\n)R.", source="mutated-gettempdir.pkl")
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "tempfile.gettempdir"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "tempfile", "gettempdir")
     finally:
         function.__code__ = original_code
         _clear_call_graph_caches()
@@ -969,12 +949,7 @@ def test_loaded_trusted_function_global_mutation_is_not_allowlisted(
     monkeypatch.setitem(namespace, "_gettempdir", hostile_gettempdir)
     with _isolated_call_graph_caches():
         report = package_api.scan_bytes(b"ctempfile\ngettempdir\n)R.", source="mutated-gettempdir-global.pkl")
-        assert report.verdict == SafetyVerdict.SUSPICIOUS
-        assert any(
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and finding.details.get("import_reference") == "tempfile.gettempdir"
-            for finding in report.findings
-        )
+        _assert_non_allowlisted_global(report, "tempfile", "gettempdir")
 
     assert calls == []
 
@@ -1136,12 +1111,7 @@ def test_loaded_trusted_tempdir_rejects_hostile_posixpath_regex_cache(
 
     report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="hostile-posixpath-regex.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "tempfile.gettempdir"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, "tempfile", "gettempdir")
     assert calls == []
 
 
@@ -1186,11 +1156,7 @@ def test_loaded_trusted_class_rejects_hostile_slotnames_cache_without_execution(
 
     report = package_api.scan_bytes(b"ctarfile\nTarInfo\n)R.", source="hostile-slotnames.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "tarfile.TarInfo"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, "tarfile", "TarInfo")
     assert calls == []
 
 
@@ -1307,9 +1273,7 @@ def test_loaded_module_origin_value_cannot_execute_during_resolution(
     loaded_module.__spec__ = ModuleSpec(module, loader=None, origin=cast(Any, HostileOrigin()))
     monkeypatch.setitem(sys.modules, module, loaded_module)
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
 
     assert calls == []
 
@@ -1375,9 +1339,7 @@ def test_added_importlib_shadow_global_blocks_resolution_without_execution(
     monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
     with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
 
     assert calls == []
 
@@ -1395,9 +1357,7 @@ def test_hostile_meta_path_container_blocks_resolution_without_execution(
 
     monkeypatch.setattr(sys, "meta_path", HostileMetaPath([BuiltinImporter, FrozenImporter, PathFinder]))
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
 
     assert calls == []
 
@@ -3608,9 +3568,7 @@ def test_in_place_importer_code_mutation_blocks_unloaded_builtin() -> None:
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
     finally:
         function.__code__ = original_code
         _clear_call_graph_caches()
@@ -3633,9 +3591,7 @@ def test_in_place_import_runtime_dependency_mutation_blocks_unloaded_builtin(
     monkeypatch.setitem(thread_namespace, "RLock", hostile_rlock)
     with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
 
     assert calls == []
 
@@ -3656,9 +3612,7 @@ def test_in_place_import_runtime_builtins_mutation_blocks_unloaded_builtin(
     monkeypatch.setitem(builtins_namespace, "hasattr", hostile_hasattr)
     with _isolated_call_graph_caches():
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
 
     assert calls == []
 
@@ -3683,9 +3637,7 @@ def test_in_place_import_runtime_class_mutation_blocks_unloaded_builtin(
 
     try:
         assert call_graph._interpreter_import_runtime_is_trusted() is False
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
     finally:
         monkeypatch.setattr(module_lock, "__init__", original_init)
         _clear_call_graph_caches()
@@ -3737,9 +3689,7 @@ def test_hostile_importer_keyword_defaults_fail_closed_without_execution() -> No
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
     finally:
         function.__kwdefaults__ = original_keyword_defaults
         _clear_call_graph_caches()
@@ -3778,9 +3728,7 @@ def test_poisoned_import_lock_blocks_unloaded_builtin(
     monkeypatch.setitem(module_locks, PoisonedKey(), PoisonedLock())
     calls.clear()
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
 
     assert calls == []
 
@@ -3802,9 +3750,7 @@ def test_unloaded_builtin_with_mutated_importer_fails_closed(
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
     finally:
         type.__setattr__(BuiltinImporter, "find_spec", original_builtin_find_spec)
         _clear_call_graph_caches()
@@ -3842,9 +3788,7 @@ def test_unloaded_frozen_module_with_mutated_importer_fails_closed(
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
     finally:
         type.__setattr__(FrozenImporter, "find_spec", original_frozen_find_spec)
         _clear_call_graph_caches()
@@ -3873,9 +3817,7 @@ def test_in_place_importer_closure_code_mutation_blocks_unloaded_frozen() -> Non
     _clear_call_graph_caches()
 
     try:
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
     finally:
         inner.__code__ = original_code
         _clear_call_graph_caches()
@@ -3889,9 +3831,7 @@ def test_late_loaded_builtin_with_canonical_spec_fails_closed(
     loaded_module.__spec__ = ModuleSpec(module, cast(Any, BuiltinImporter), origin="built-in")
     monkeypatch.setitem(sys.modules, module, loaded_module)
     with _isolated_call_graph_caches():
-        assert call_graph._trusted_module_origin_kind(module) is None
-        assert call_graph._call_graph_source_unavailable_reason(module) == "source_unavailable"
-        assert call_graph._import_module_can_execute_user_code(module) is True
+        _assert_untrusted_module_source(module)
 
 
 def test_loaded_extension_export_does_not_fall_through_module_getattr(
