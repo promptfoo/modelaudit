@@ -454,23 +454,52 @@ def _has_execution_reference(nodes: list[ast.AST]) -> bool:
     )
 
 
-def _python_url_spans(source: bytes) -> list[tuple[int, int]] | None:
+def _imported_client_keywords(tree: ast.Module) -> list[ast.keyword]:
+    """Identify a client constructed directly after importing its SDK in an unlabelled example."""
+    imports: dict[str, str] = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                root = alias.name.split(".")[0]
+                imports[alias.asname or root] = alias.name if alias.asname else root
+        elif isinstance(statement, ast.ImportFrom) and statement.level == 0:
+            for alias in statement.names:
+                if alias.name == "*":
+                    return []
+                imports[alias.asname or alias.name] = f"{statement.module}.{alias.name}"
+        else:
+            if isinstance(statement, (ast.Expr, ast.Assign)) and isinstance(statement.value, ast.Call):
+                constructor = _loader_name(statement.value.func, imports)
+                if constructor and constructor[0] in imports and constructor[1] == "openai.OpenAI":
+                    return statement.value.keywords
+            break
+    return []
+
+
+def _python_url_spans(source: bytes, *, unlabelled: bool) -> list[tuple[int, int]] | None:
     """Return eligible spans, or None when the example cannot establish routine use."""
     try:
         tree = ast.parse(source.decode("utf-8"))
     except (UnicodeDecodeError, SyntaxError, ValueError, RecursionError):
         return None
+    if unlabelled and not any(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in tree.body):
+        return None
     nodes = list(ast.walk(tree))
     if _has_execution_reference(nodes):
         return None
 
+    client_keywords = set(_imported_client_keywords(tree)) if unlabelled else None
     literals: dict[ast.Constant, str] = {}
     for node in nodes:
-        if isinstance(node, ast.keyword) and node.arg == "base_url":
+        if (
+            isinstance(node, ast.keyword)
+            and node.arg == "base_url"
+            and (client_keywords is None or node in client_keywords)
+        ):
             literal = _literal_api_url(node.value)
             if literal is not None:
                 literals[literal] = str(literal.value)
-        elif isinstance(node, ast.Dict):
+        elif not unlabelled and isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values, strict=False):
                 if isinstance(key, ast.Constant) and key.value in {"base_url", "model_server", "api_base"}:
                     literal = _literal_api_url(value)
@@ -922,18 +951,16 @@ def _sql_comparison_domain_spans(source: bytes) -> list[tuple[int, int]]:
         value = literal["value"]
         if value is None:
             return []  # Unclosed string.
-        if literal["like"] and re.fullmatch(rb"[a-zA-Z0-9_.%@-]+", value):
-            start = literal.start("value")
-            spans.extend(
-                (start + host.start(), start + host.end())
-                for host in NetworkCommDetector.DOMAIN_PATTERN.finditer(value)
-            )
+        if literal["like"]:
+            host = re.fullmatch(rb"%?@?([A-Za-z0-9.-]{1,253})%?", value)
+            if host and NetworkCommDetector.DOMAIN_PATTERN.fullmatch(host[1]):
+                start = literal.start("value")
+                spans.append((start + host.start(1), start + host.end(1)))
     return spans
 
 
-def _routine_documentation_network_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
+def _routine_documentation_network_spans(payload: bytes, *, payload_complete: bool) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
-    sql_domains: set[tuple[int, int]] = set()
     opening: re.Match[bytes] | None = None
     executes_script = False
     outside_fences: list[tuple[int, int]] = []
@@ -959,19 +986,19 @@ def _routine_documentation_network_spans(payload: bytes) -> tuple[tuple[int, int
             and re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)", payload[start:end]) is None
         ):
             source = payload[start:end]
-            if language in PYTHON_LANGUAGES or (
-                not language and re.match(rb"\s*from[ \t]+[\w.]+[ \t]+import[ \t]+\w", source)
-            ):
-                python_spans = _python_url_spans(source)
-                executes_script |= python_spans is None
-                examples = python_spans or []
+            examples = []
+            if language in PYTHON_LANGUAGES or not language:
+                python_spans = _python_url_spans(source, unlabelled=not language)
+                if python_spans is None:
+                    executes_script |= bool(language) or _example_executes_script(source, language)
+                else:
+                    examples = python_spans
             else:
                 executes_script |= _example_executes_script(source, language)
-                examples = _shell_url_spans(source) if language in SHELL_LANGUAGES else []
-                if language == b"sql":
-                    sql_domains.update(
-                        (start + left, start + right) for left, right in _sql_comparison_domain_spans(source)
-                    )
+                if language in SHELL_LANGUAGES:
+                    examples = _shell_url_spans(source)
+                elif language == b"sql" and payload_complete:
+                    examples = _sql_comparison_domain_spans(source)
             spans.extend((start + left, start + right) for left, right in examples)
         else:
             executes_script = True
@@ -981,18 +1008,10 @@ def _routine_documentation_network_spans(payload: bytes) -> tuple[tuple[int, int
         executes_script = True
     else:
         outside_fences.append((previous_end, len(payload)))
-    if not executes_script:
+    if payload_complete and not executes_script:
         executes_script = _outside_fence_examples_execute_script(payload, outside_fences)
-    if executes_script:
+    if not payload_complete or executes_script:
         spans = [(start, end) for start, end in spans if not _repository_url(payload[start:end].decode("utf-8"))]
-    if sql_domains:
-        # The detector reports each domain once. Only lower it when the SQL
-        # comparisons account for every occurrence in the complete document.
-        comparison_only = {payload[left:right].lower() for left, right in sql_domains}
-        for host in NetworkCommDetector.DOMAIN_PATTERN.finditer(payload):
-            if host.span() not in sql_domains:
-                comparison_only.discard(host[0].lower())
-        spans.extend((left, right) for left, right in sql_domains if payload[left:right].lower() in comparison_only)
     return tuple(spans)
 
 
@@ -1050,7 +1069,9 @@ def _without_markdown_container_prefixes(payload: bytes) -> tuple[bytes, list[tu
     return bytes(normalized), removals
 
 
-def routine_documentation_network_spans(payload: bytes) -> tuple[tuple[int, int], ...]:
+def routine_documentation_network_spans(
+    payload: bytes, *, payload_complete: bool = True
+) -> tuple[tuple[int, int], ...]:
     """Return original network reference spans only after bounded Markdown example analysis."""
     if len(payload) > MAX_DOCUMENTATION_BYTES:
         return ()
@@ -1058,7 +1079,7 @@ def routine_documentation_network_spans(payload: bytes) -> tuple[tuple[int, int]
     if result is None:
         return ()
     normalized, removals = result
-    spans = _routine_documentation_network_spans(normalized)
+    spans = _routine_documentation_network_spans(normalized, payload_complete=payload_complete)
     starts = [start for start, _removed in removals]
 
     def original(position: int) -> int:

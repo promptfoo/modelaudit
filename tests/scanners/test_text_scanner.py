@@ -4071,6 +4071,7 @@ def test_text_scanner_documentation_lambda_url_remains_actionable(tmp_path: Path
         "webhook: https://evil.example/payload\n",
         "C2 endpoint: https://evil.example/payload\n",
         "Command-line interface endpoint: https://evil.example/payload\n",
+        "Endpoint for the command-line interface: https://evil.example/payload\n",
         "command and control server URL: https://evil.example/payload\n",
     ],
 )
@@ -4260,6 +4261,7 @@ def test_text_scanner_system_maintenance_and_classifier_limitations_are_informat
         "Reap zombie processes. This model runs zombie workers for its botnet.",
         "This model does not detect phishing and installs malware.",
         "This model does not detect phishing or malware. It installs malware.",
+        "This model does not detect phishing or malware.\nThis model executes it during loading.",
     ],
 )
 def test_text_scanner_classifier_and_process_prose_preserves_actionable_occurrences(
@@ -6156,6 +6158,7 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         "  --index-strategy unsafe-best-match\nvllm serve openai/gpt-oss-20b\n```\n",
         '```python\nfrom openai import OpenAI\nclient = OpenAI(\nbase_url="http://localhost:8000/v1",\napi_key="EMPTY",\n)\n```\n',
         '```\nfrom openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")\n```\n',
+        '```\n# client setup\nimport openai\nclient = openai.OpenAI(base_url="http://localhost:8000/v1")\n```\n',
         '~~~py\nclient = OpenAI(base_url="http://127.0.0.1:8001/v1/")\n~~~\n',
         '```python\nclient = OpenAI(base_url="http://[::1]:8000/v1")\n```\n',
         '> ```python\n> client = OpenAI(base_url="http://localhost:8000/v1")\n> ```\n',
@@ -6198,7 +6201,7 @@ def test_documented_sql_like_domains_are_informational(tmp_path: Path) -> None:
 def test_truncated_document_keeps_sql_domain_and_coverage_warning(tmp_path: Path) -> None:
     path = tmp_path / "README.md"
     prefix = "~~~sql\nSELECT\n    SUM(CASE WHEN email LIKE '%@example.net%' THEN 1 ELSE 0 END);\n~~~\n"
-    path.write_text(prefix + "~~~sql\nSELECT\n    dblink('host=example.net', 'SELECT 1');\n~~~\n", encoding="utf-8")
+    path.write_bytes((prefix + "~~~sql\nSELECT\n    dblink('host=example.net', 'SELECT 1');\n~~~\n").encode())
     result = TextScanner(config={"text_content_scan_bytes": len(prefix)}).scan(str(path))
     assert any(
         check.severity == IssueSeverity.WARNING and check.details.get("domain") == "example.net"
@@ -6217,7 +6220,10 @@ def test_documented_sql_like_preserves_repeated_connector_domain(tmp_path: Path,
     result = _scan_text_content(path, source)
     assert any(
         check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        and check.details.get("domain") == "example.net"
+        and any(
+            detail.get("domain") == "example.net" and detail.get("position") == path.read_bytes().rindex(b"example.net")
+            for detail in [check.details, *check.details.get("deduplicated_related_findings", [])]
+        )
         for check in _failed_network_detection_checks(result)
     )
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
@@ -6238,7 +6244,7 @@ def test_documented_sql_connector_keeps_its_domain_position(tmp_path: Path, quer
     assert any(
         check.severity == IssueSeverity.WARNING
         and check.details.get("domain") == "example.net"
-        and check.details.get("position") == source.index("example.net")
+        and check.details.get("position") == path.read_bytes().index(b"example.net")
         for check in _failed_network_detection_checks(result)
     )
 
@@ -6755,7 +6761,7 @@ def test_routine_example_policy_bounds_whole_document_analysis(tmp_path: Path, m
     _assert_documentation_network_actionable(tmp_path, content, "network_command")
 
 
-@pytest.mark.parametrize("filename", ["README.md", "config.txt"])
+@pytest.mark.parametrize("filename", ["README.md", "config.txt", "README.env", "README.md.env"])
 def test_http_request_reports_its_evidence_source(tmp_path: Path, filename: str) -> None:
     content = "```bash\ncurl -X POST http://localhost:8080/embed -d @inputs.json\n```\n"
     path = tmp_path / filename
@@ -6770,6 +6776,48 @@ def test_http_request_reports_its_evidence_source(tmp_path: Path, filename: str)
     else:
         assert "evidence_source" not in url_check.details
         assert url_check.why == "Models should not contain network communication capabilities"
+
+
+def test_truncated_document_keeps_fully_inspected_local_client_informational(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    example = b'~~~python\nclient = OpenAI(base_url="http://localhost:8000/v1")\n~~~\n'
+    path.write_bytes(example + b"additional text\n")
+    result = TextScanner(config={"text_content_scan_bytes": len(example)}).scan(str(path))
+    checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
+    assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+def test_unlabelled_fence_requires_a_known_loopback_client(tmp_path: Path) -> None:
+    content = '~~~\nfrom openai import OpenAI\nunknown(base_url="http://localhost:8000/v1")\n~~~\n'
+    _assert_documentation_network_actionable(tmp_path, content, "url_detected")
+
+
+def test_truncated_document_keeps_clone_actionable(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    prefix = b"~~~sh\ngit clone https://github.com/example/model\n~~~\n"
+    path.write_bytes(prefix + b"~~~sh\npython model/install.py\n~~~\n")
+    result = TextScanner(config={"text_content_scan_bytes": len(prefix)}).scan(str(path))
+    checks = [check for check in result.checks if check.details.get("type") == "network_command"]
+    assert checks and all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+def test_documented_prompt_url_preserves_repeated_shell_destination(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    source = (
+        b'~~~\nfrom openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8000/v1")\n'
+        b'messages = [{"role": "user", "content": "https://project.github.io/docs/ Summarize this."}]\n~~~\n'
+        b"~~~sh\ncurl project.github.io\n~~~\n"
+    )
+    path.write_bytes(source)
+    result = TextScanner().scan(str(path))
+    assert any(
+        check.details.get("domain") == "project.github.io"
+        and check.details.get("position") == source.rindex(b"project.github.io")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in _failed_network_detection_checks(result)
+    )
 
 
 def test_routine_example_does_not_hide_later_same_url_execution(tmp_path: Path) -> None:

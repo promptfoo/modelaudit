@@ -753,8 +753,7 @@ DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN = re.compile(
     rb");\s*$",
 )
 DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
-    rb"\b(?:beacon|callback|c2|command(?![ -]+line(?:[ -]+interface)?[ \t]*:)(?:[_ -]+and[_ -]+control)?"
-    rb"|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
+    rb"\b(?:beacon|callback|c2|command(?:[_ -]+and[_ -]+control)?|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
     rb"(?P<suffix>[^\n:]{0,32}):\s*$",
     re.IGNORECASE,
 )
@@ -776,11 +775,14 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"|\b(?:detect(?:ing|ion|s)?|mitigat(?:e|ing|ion)|resistan(?:ce|t)|robust(?:ness)?)\s+"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\b"
-    rb"|\b(?:does|do|will)\s+not\s+detect\s+[\w-]+\s+(?:and|or)\s+"
+    rb")",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN = re.compile(
+    rb"\b(?:does|do|will)\s+not\s+detect\s+[\w-]+\s+(?:and|or)\s+"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\b(?=[.!]?\s*$)"
-    rb"|\b(?:kill|reap|terminate)\s+zombie\s+(?:(?:gpu|cpu)\s+)?(?:process(?:es)?|procs?)\b"
-    rb")",
+    rb"|\b(?:kill|reap|terminate)\s+zombie\s+(?:(?:gpu|cpu)\s+)?(?:process(?:es)?|procs?)\b",
     re.IGNORECASE,
 )
 BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
@@ -938,7 +940,7 @@ class TextScanner(BaseScanner):
     @classmethod
     def _is_documentation_sidecar(cls, path: str) -> bool:
         filename = os.path.basename(path).lower()
-        return (
+        return not filename.endswith(".env") and (
             filename in DOCUMENTATION_TEXT_FILENAMES
             or cls._is_readme_documentation_filename(filename)
             or cls._is_model_card_documentation_filename(filename)
@@ -1867,6 +1869,8 @@ class TextScanner(BaseScanner):
 
     @staticmethod
     def _documentation_suspicious_label_is_actionable(prefix: bytes) -> bool:
+        if re.fullmatch(rb"[ \t]*(?:[-*+]\s+)?command[ -]line(?:[ -]interface)?[ \t]*:\s*", prefix, re.I):
+            return False
         for match in DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.finditer(prefix):
             suffix = match.group("suffix")
             if DOCUMENTATION_ACTIONABLE_NETWORK_LABEL_SUFFIX_PATTERN.search(suffix) is not None:
@@ -2516,8 +2520,20 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_finding_tokens(finding: dict[str, Any]) -> tuple[bytes, ...]:
+    def _routine_span_contains(spans: tuple[tuple[int, int], ...], position: int) -> bool:
+        preceding = bisect_right(spans, position, key=lambda span: span[0]) - 1
+        return preceding >= 0 and position < spans[preceding][1]
+
+    @classmethod
+    def _documentation_finding_tokens(
+        cls, finding: dict[str, Any], routine_spans: tuple[tuple[int, int], ...] = ()
+    ) -> tuple[bytes, ...]:
         finding_type = finding.get("type")
+        if finding_type == "domain_name" and isinstance(position := finding.get("position"), int):
+            domain = finding.get("domain")
+            if isinstance(domain, str) and domain and cls._routine_span_contains(routine_spans, position):
+                return (domain.encode().lower(),)
+
         if finding_type == "network_function":
             function = finding.get("function")
             return (function.encode().lower(),) if isinstance(function, str) and function else ()
@@ -2564,9 +2580,10 @@ class TextScanner(BaseScanner):
         finding: dict[str, Any],
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
+        routine_spans: tuple[tuple[int, int], ...] = (),
     ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
-        token_bytes_options = cls._documentation_finding_tokens(finding)
+        token_bytes_options = cls._documentation_finding_tokens(finding, routine_spans)
         if not token_bytes_options:
             return finding, False, remaining_occurrences
 
@@ -2607,6 +2624,11 @@ class TextScanner(BaseScanner):
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
             elif finding_type == "network_library":
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
+            elif finding_type == "domain_name":
+                # The detector emits only the first occurrence of a hostname.
+                actionable = not cls._routine_span_contains(
+                    routine_spans, position
+                ) and cls._documentation_finding_is_actionable(payload, candidate)
             elif finding_type == "suspicious_port":
                 actionable = cls._documentation_finding_is_actionable(payload, candidate)
             else:
@@ -2723,6 +2745,11 @@ class TextScanner(BaseScanner):
             payload
         ):
             return False
+        if any(
+            match.start() <= position < match.end()
+            for match in DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN.finditer(line)
+        ):
+            return True
         absolute_position = finding["position"]
         context_end = min(len(payload), absolute_position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         if context_end < len(payload):
@@ -3767,9 +3794,8 @@ class TextScanner(BaseScanner):
         documentation_sidecar = cls._is_documentation_sidecar(path)
         filename = os.path.basename(path).lower()
         routine_network_spans = (
-            routine_documentation_network_spans(payload)
+            tuple(sorted(routine_documentation_network_spans(payload, payload_complete=payload_complete)))
             if findings
-            and payload_complete
             and os.path.splitext(filename)[1] in {"", ".md", ".markdown"}
             and (cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename))
             else ()
@@ -3782,7 +3808,11 @@ class TextScanner(BaseScanner):
         lowered_payload = payload.lower() if documentation_sidecar else b""
         tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
         last_retargetable_index = max(
-            (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
+            (
+                index
+                for index, finding in enumerate(findings)
+                if cls._documentation_finding_tokens(finding, routine_network_spans)
+            ),
             default=-1,
         )
         for index, finding in enumerate(findings):
@@ -3795,6 +3825,7 @@ class TextScanner(BaseScanner):
                         finding,
                         remaining_occurrences,
                         index == last_retargetable_index,
+                        routine_network_spans,
                     )
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True
@@ -3818,7 +3849,8 @@ class TextScanner(BaseScanner):
             position = finding.get("position")
             routine_example = (
                 isinstance(position, int)
-                and any(start <= position < end for start, end in routine_network_spans)
+                and cls._routine_span_contains(routine_network_spans, position)
+                and (payload_complete or finding.get("type") != "domain_name")
                 and (
                     cls._documentation_network_command_is_correlatable(finding)
                     or (
