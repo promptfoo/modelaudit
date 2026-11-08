@@ -5071,7 +5071,8 @@ def safetensors_length_has_pickle_extension(magic8: bytes) -> bool:
                 and stream.read(1) == b"\x00"
             )
     except (ValueError, OverflowError):
-        pass
+        # A malformed pickle prefix cannot reach an extension lookup.
+        return False
     return False
 
 
