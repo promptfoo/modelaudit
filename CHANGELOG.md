@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validate legacy Bitcoin address checksums before reporting a match, so unrelated identifiers such as notebook IDs do not trigger embedded-secret alerts.
 - Run the lightweight Docker image on Python 3.14, with pip confined to the build stage. The full image stays on Python 3.13 for TensorFlow compatibility.
 - Upgrade APT and zlib packages in all Docker runtime images to include Debian security fixes.
+- Explain when JSON parsing limits interrupt SafeTensors header validation and when YAML safe loading prevents template extraction.
 - Distinguish reshape dimensions from activation data when tracing both inputs of an ONNX attention contraction. Dynamically transformed weights retain their coverage gaps.
 
 - Preserve individual pickle coverage notices and member locations in consolidated scan results.

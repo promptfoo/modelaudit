@@ -535,15 +535,18 @@ def test_tensor_validation_records_are_bounded_at_cardinality_limit(tmp_path: Pa
 
 def test_container_heavy_header_is_rejected_before_json_materialization(tmp_path: Path) -> None:
     file_path = tmp_path / "container-heavy.safetensors"
-    header_bytes = b'{"__metadata__":[' + (b"null," * 100_000) + b"null]}"
-    file_path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes)
+    save_file({f"tensor_{i}": np.zeros(1, dtype=np.float32) for i in range(20_000)}, str(file_path))
 
     result = SafeTensorsScanner().scan(str(file_path))
 
     parse_check = next(check for check in result.checks if check.name == "SafeTensors JSON Parse")
     assert result.success is False
     assert parse_check.status == CheckStatus.FAILED
+    assert "JSON header validation incomplete" in parse_check.message
     assert "JSON object/value limit" in parse_check.message
+    assert parse_check.severity == IssueSeverity.INFO
+    assert all("valid json" not in check.message.lower() for check in result.checks)
+    assert result.metadata["analysis_incomplete"] is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
 
 
@@ -3027,12 +3030,11 @@ def test_corrupted_header(tmp_path: Path) -> None:
     scanner = SafeTensorsScanner()
     result = scanner.scan(str(corrupt_path))
 
-    # Scanner may report corrupted header via has_errors or via issues/checks
-    assert result.has_errors or len(result.issues) > 0 or len(result.checks) > 0
-    # Check for JSON or header errors in issues or checks
-    all_messages = [issue.message.lower() for issue in result.issues]
-    all_messages.extend([check.message.lower() for check in result.checks])
-    assert any("json" in msg or "header" in msg or "invalid" in msg or "corrupt" in msg for msg in all_messages)
+    parse_check = next(check for check in result.checks if check.name == "SafeTensors JSON Parse")
+    assert result.success is False
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.message.startswith("Invalid JSON header:")
+    assert parse_check.details["exception_type"] == "JSONDecodeError"
 
 
 def test_non_object_header_is_inconclusive_not_clean(tmp_path: Path) -> None:
@@ -3445,19 +3447,9 @@ def test_deeply_nested_header(tmp_path: Path) -> None:
     result = scanner.scan(str(file_path))
 
     assert result.has_errors or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-    # Check that either RecursionError was caught OR the header was marked as invalid/deeply nested
-    # Also check for generic JSON error since deeply nested JSON might fail differently
-    # Include tensor validation errors as acceptable since deeply nested but valid JSON
-    # will parse successfully but create invalid SafeTensors structure
-    assert any(
-        (check.details and check.details.get("exception_type") == "RecursionError")
-        or "deeply nested" in check.message.lower()
-        or "recursion" in check.message.lower()
-        or "invalid json" in check.message.lower()
-        or "offsets out of bounds" in check.message.lower()  # Acceptable for this test
-        or "invalid data_offsets structure" in check.message.lower()
-        for check in result.checks
-    )
+    parse_check = next(check for check in result.checks if check.name == "SafeTensors JSON Parse")
+    assert parse_check.status == CheckStatus.FAILED
+    assert "JSON nesting depth limit" in parse_check.message
 
 
 def test_suspicious_metadata(tmp_path: Path) -> None:
