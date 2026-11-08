@@ -3976,7 +3976,6 @@ def _pytorch_storage_keys_from_pickle_bytes(
     storage_refs_by_key: dict[str, _PytorchStorageRef] = {}
     storage_global_positions: set[int] = set()
     canonical_tensor_rebuild_invocations: set[tuple[int, int]] = set()
-    tensor_rebuild_uses: set[tuple[int, int]] = set()
     tensor_rebuild_proof_valid = True
     all_persistent_ids_are_pytorch_storage = True
     discarded_tracked_storage_references = False
@@ -4301,7 +4300,6 @@ def _pytorch_storage_keys_from_pickle_bytes(
             "torch._utils",
             "_rebuild_tensor_v2",
         ):
-            tensor_rebuild_uses.add((function.position, reduce_position))
             if rebuild_tensor_v2_args_are_canonical(args):
                 canonical_tensor_rebuild_invocations.add((function.position, reduce_position))
                 return canonical_tensor
@@ -4640,9 +4638,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         storage_refs_by_key=storage_refs_by_key,
         storage_global_positions=storage_global_positions,
         canonical_tensor_rebuild_invocations=(
-            canonical_tensor_rebuild_invocations
-            if tensor_rebuild_proof_valid and tensor_rebuild_uses == canonical_tensor_rebuild_invocations
-            else set()
+            canonical_tensor_rebuild_invocations if tensor_rebuild_proof_valid else set()
         ),
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
