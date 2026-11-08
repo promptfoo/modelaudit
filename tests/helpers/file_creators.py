@@ -526,11 +526,6 @@ def bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def joblib_binunicode(value: str) -> bytes:
-    encoded = value.encode("utf-8")
-    return b"X" + struct.pack("<I", len(encoded)) + encoded
-
-
 def joblib_numpy_wrapper_control(
     *,
     shape: int = 4,
@@ -540,21 +535,21 @@ def joblib_numpy_wrapper_control(
     subclass_global = b"c" + subclass[0].encode("ascii") + b"\n" + subclass[1].encode("ascii") + b"\n"
     return (
         b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
-        + joblib_binunicode("subclass")
+        + pickle_binunicode_text("subclass")
         + subclass_global
-        + joblib_binunicode("shape")
+        + pickle_binunicode_text("shape")
         + b"K"
         + bytes([shape])
         + b"\x85"
-        + joblib_binunicode("order")
-        + joblib_binunicode("C")
-        + joblib_binunicode("dtype")
+        + pickle_binunicode_text("order")
+        + pickle_binunicode_text("C")
+        + pickle_binunicode_text("dtype")
         + b"cnumpy\ndtype\n"
-        + joblib_binunicode(dtype)
+        + pickle_binunicode_text(dtype)
         + b"\x89\x88\x87R"
-        + joblib_binunicode("allow_mmap")
+        + pickle_binunicode_text("allow_mmap")
         + b"\x88"
-        + joblib_binunicode("numpy_array_alignment_bytes")
+        + pickle_binunicode_text("numpy_array_alignment_bytes")
         + b"K\x10ub"
     )
 

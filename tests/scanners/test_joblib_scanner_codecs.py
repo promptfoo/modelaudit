@@ -41,13 +41,13 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file.detection import _LZ4_FRAME_MAGIC, validate_file_type_with_formats
 from tests.helpers.file_creators import SystemCommandPayload
 from tests.helpers.file_creators import (
-    joblib_binunicode as _binunicode,
-)
-from tests.helpers.file_creators import (
     joblib_numpy_raw_segment as _joblib_numpy_raw_segment,
 )
 from tests.helpers.file_creators import (
     joblib_numpy_wrapper_control as _joblib_numpy_wrapper_control,
+)
+from tests.helpers.file_creators import (
+    pickle_binunicode_text as _binunicode,
 )
 
 
