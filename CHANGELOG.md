@@ -42,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Validate storage IDs in PyTorch tensor batches and legacy TorchScript v1 parameter mappings with a separate allowance of 256,000 metadata opcodes and two million provenance-node visits per archive. Upgrade both `modelaudit` and `modelaudit-picklescan` to receive this fix. Member discovery limits and coverage diagnostics still apply.
-
 - Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
 - Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
 - Report completed scans as successful in the Python API even when a security check raises a warning.
@@ -53,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve individual pickle coverage notices and member locations in consolidated scan results.
 - Validate PyTorch storage references alongside wide RNG state tuples and track up to 2,048 dictionary entries in pickle state analysis.
+- Validate storage IDs in PyTorch tensor batches and legacy TorchScript v1 parameter mappings with a separate allowance of 256,000 metadata opcodes and two million provenance-node visits per archive. Upgrade both `modelaudit` and `modelaudit-picklescan` to receive this fix. Member discovery limits and coverage diagnostics still apply.
 - Recognize standalone Tekken vocabulary JSON without routing token spellings to model checkpoint parsers. Filtered domain-shaped code tokens in model cards no longer consume the network evidence classification budget.
 
 - Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.
