@@ -3,6 +3,7 @@
   "bootstrap-sha": "c17ad792f4a288918d3c2369b6f0f00082a20071",
   "include-component-in-tag": false,
   "include-v-in-tag": true,
+  "pull-request-header": "Review the versioned sections of each changed CHANGELOG.md in **Files changed** for the exact release notes. To revise a note and preserve your wording across bot updates, follow the [release guide](https://github.com/promptfoo/modelaudit/blob/main/docs/agents/release-process.md). The generated pull request inventory follows.",
   "packages": {
     ".": {
       "release-type": "python",

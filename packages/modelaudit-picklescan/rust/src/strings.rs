@@ -1657,6 +1657,26 @@ fn is_python_word_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
 
+    #[track_caller]
+    fn assert_string_match(literal: &str, pattern: &str) {
+        let matches = suspicious_string_matches(literal);
+        assert!(
+            matches.contains(&pattern.to_string()),
+            "{literal:?}: expected {pattern:?} in {matches:?}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_no_string_matches(literals: &[&str]) {
+        for &literal in literals {
+            let matches = suspicious_string_matches(literal);
+            assert!(
+                matches.is_empty(),
+                "{literal:?}: unexpected matches {matches:?}"
+            );
+        }
+    }
+
     #[test]
     fn suspicious_string_matching_keeps_magic_method_boundaries() {
         for literal in [
@@ -1736,10 +1756,7 @@ mod tests {
             "__truediv__",
             "__xor__",
         ] {
-            assert!(
-                suspicious_string_matches(literal).contains(&"magic method".to_string()),
-                "{literal:?}"
-            );
+            assert_string_match(literal, "magic method");
         }
         for literal in ["__1__", "__a__", "__x_y__", "a__b__c"] {
             assert!(
@@ -1747,14 +1764,12 @@ mod tests {
                 "{literal:?}"
             );
         }
-        for literal in [
+        assert_no_string_matches(&[
             "__version__",
             "__dict__",
             "['__slots__', '__module__']",
             "['__version__']",
-        ] {
-            assert!(suspicious_string_matches(literal).is_empty(), "{literal:?}");
-        }
+        ]);
     }
 
     #[test]
@@ -1778,25 +1793,18 @@ mod tests {
 
     #[test]
     fn suspicious_string_matching_keeps_case_insensitive_patterns() {
-        assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
-        assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
-        assert!(suspicious_string_matches("subprocess.\\\rPopen(['id'])")
-            .contains(&"subprocess call".to_string()));
-        assert!(
-            suspicious_string_matches(&format!("{}os.system('id')", "A".repeat(32)))
-                .contains(&"os.system".to_string())
-        );
-        assert!(
-            suspicious_string_matches(&format!("os.system('id'){}", "B".repeat(32)))
-                .contains(&"os.system".to_string())
-        );
-        assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
+        assert_string_match("OS.System('id')", "os.system");
+        assert_string_match("OS . system('id')", "os.system");
+        assert_string_match("subprocess.\\\rPopen(['id'])", "subprocess call");
+        assert_string_match(&format!("{}os.system('id')", "A".repeat(32)), "os.system");
+        assert_string_match(&format!("os.system('id'){}", "B".repeat(32)), "os.system");
+        assert_string_match("Import OS", "import statement");
     }
 
     #[test]
     fn suspicious_string_matching_keeps_word_boundaries() {
-        assert!(suspicious_string_matches("eval(x)").contains(&"eval(".to_string()));
-        assert!(suspicious_string_matches("os.system('id')").contains(&"os.system".to_string()));
+        assert_string_match("eval(x)", "eval(");
+        assert_string_match("os.system('id')", "os.system");
         assert!(suspicious_string_matches("recompile(x)").is_empty());
         assert!(suspicious_string_matches("foos.system('id')").is_empty());
         assert!(suspicious_string_matches("subprocess_eval_guard").is_empty());
@@ -1804,14 +1812,12 @@ mod tests {
 
     #[test]
     fn suspicious_string_matching_ignores_prose_call_mentions() {
-        for literal in [
+        assert_no_string_matches(&[
             "x=1; Do not call os.system(command) from loaders",
             "Documentation: if os.system(command) is referenced",
             "Use eval() function to compute results",
             "eval(x + 2) where x is input",
-        ] {
-            assert!(suspicious_string_matches(literal).is_empty(), "{literal:?}");
-        }
+        ]);
         for literal in [
             "eval(x); exec(y)",
             "eval(payload)\nfoo()",
@@ -1833,12 +1839,9 @@ mod tests {
             "eval(payload)\nfoo \\\n()",
             "eval(payload)\nfoo \\\r\n.bar()",
         ] {
-            assert!(
-                suspicious_string_matches(literal).contains(&"eval(".to_string()),
-                "{literal:?}"
-            );
+            assert_string_match(literal, "eval(");
         }
-        for literal in [
+        assert_no_string_matches(&[
             "eval(x)\nwhere x is input",
             "eval(x)\nexample\n(text)",
             "eval(x)\nexample.\ntext()",
@@ -1854,15 +1857,13 @@ mod tests {
             "eval(x)\nif needed, continue reading",
             "eval(x)\nNote (details follow)",
             "eval(x)\nR\u{e9}sum\u{e9}\u{2014}details follow",
-        ] {
-            assert!(suspicious_string_matches(literal).is_empty(), "{literal:?}");
-        }
+        ]);
         let overlong_identifier = "a".repeat(2 * 1024 * 1024);
         assert!(suffix_starts_with_call_expression(
             &overlong_identifier,
             false
         ));
-        for literal in [
+        assert_no_string_matches(&[
             "Do not call os.system(command) from loaders",
             "Do not call os.system(command)\nfrom loaders",
             "subprocess.run(args) is documented here",
@@ -1870,10 +1871,6 @@ mod tests {
             "importlib.import_module(name) is an API",
             "An import statement loads a module",
             r"The bytes are written as \x80 in docs",
-        ] {
-            assert!(suspicious_string_matches(literal).is_empty(), "{literal:?}");
-        }
-        for literal in [
             "https://example.invalid/os.system",
             "https://example.invalid/docs/os.system(command)",
             "https://example.invalid/api/subprocess.run(args)",
@@ -1883,10 +1880,8 @@ mod tests {
             "https://example.invalid/a'b/os.system(cmd)",
             "s3://bucket/docs/os.system(cmd)",
             "ftp://example.invalid/docs/subprocess.run(args)",
-        ] {
-            assert!(suspicious_string_matches(literal).is_empty(), "{literal}");
-        }
-        assert!(suspicious_string_matches("__reduce__ is a pickle protocol hook").is_empty());
+            "__reduce__ is a pickle protocol hook",
+        ]);
     }
 
     #[test]
@@ -1909,13 +1904,13 @@ mod tests {
             ("作者r'https://a;eval(x); payload='end'", "eval("),
             ("x=1# \"\"\"\nu='https://a';eval(x)\ny=2# \"\"\"", "eval("),
         ] {
-            assert!(suspicious_string_matches(literal).contains(&pattern.to_string()));
+            assert_string_match(literal, pattern);
         }
         let bounded_quote_run = format!(
             "{}https://a',os.system('id')",
             "'".repeat(MAX_URL_LOCAL_PREFIX_BYTES + 1)
         );
-        assert!(suspicious_string_matches(&bounded_quote_run).contains(&"os.system".to_string()));
+        assert_string_match(&bounded_quote_run, "os.system");
     }
 
     fn scan_two_overlapping_windows(value: &str) -> Vec<String> {
@@ -2004,10 +1999,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn window_continuation_captures_prefixed_quote_starting_at_overlap_boundary() {
+    #[track_caller]
+    fn assert_prefixed_quote_boundaries(prefixes: &[&str], expect_system_call: bool) {
         const BOUNDARY: usize = 64;
-        for prefix in ["f", "F", "fr", "Fr", "fR", "rf", "rF", "RF"] {
+        for &prefix in prefixes {
             for quote in ["'", "\"", "'''", "\"\"\""] {
                 let before_quote = format!("{} {prefix}", "A".repeat(BOUNDARY - prefix.len() - 1));
                 let literal = format!(
@@ -2018,8 +2013,9 @@ mod tests {
                     let matches =
                         scan_windows_split_inside_lexical_unit(&literal, boundary, BOUNDARY + 32);
 
-                    assert!(
+                    assert_eq!(
                         matches.contains(&"os.system".to_string()),
+                        expect_system_call,
                         "prefix={prefix:?} quote={quote:?} boundary={boundary} matches={matches:?}",
                     );
                 }
@@ -2028,28 +2024,18 @@ mod tests {
     }
 
     #[test]
-    fn window_continuation_keeps_nonformatted_prefixed_url_payload_inert() {
-        const BOUNDARY: usize = 64;
-        for prefix in [
-            "r", "R", "b", "B", "u", "U", "br", "Br", "bR", "rb", "rB", "RB",
-        ] {
-            for quote in ["'", "\"", "'''", "\"\"\""] {
-                let before_quote = format!("{} {prefix}", "A".repeat(BOUNDARY - prefix.len() - 1));
-                let literal = format!(
-                    "{before_quote}{quote}{}https://example.invalid/x{{os.system(cmd)}}{quote}",
-                    "B".repeat(128),
-                );
-                for boundary in BOUNDARY..BOUNDARY + quote.len() {
-                    let matches =
-                        scan_windows_split_inside_lexical_unit(&literal, boundary, BOUNDARY + 32);
+    fn window_continuation_captures_prefixed_quote_starting_at_overlap_boundary() {
+        assert_prefixed_quote_boundaries(&["f", "F", "fr", "Fr", "fR", "rf", "rF", "RF"], true);
+    }
 
-                    assert!(
-                        !matches.contains(&"os.system".to_string()),
-                        "prefix={prefix:?} quote={quote:?} boundary={boundary} matches={matches:?}",
-                    );
-                }
-            }
-        }
+    #[test]
+    fn window_continuation_keeps_nonformatted_prefixed_url_payload_inert() {
+        assert_prefixed_quote_boundaries(
+            &[
+                "r", "R", "b", "B", "u", "U", "br", "Br", "bR", "rb", "rB", "RB",
+            ],
+            false,
+        );
     }
 
     #[test]
@@ -2390,7 +2376,7 @@ mod tests {
             "https://example.invalid/a;{}eval(x)",
             " ".repeat(MAX_SUFFIX_CALL_LOOKAHEAD_CHARS - 2)
         );
-        assert!(suspicious_string_matches(&padded_call).contains(&"eval(".to_string()));
+        assert_string_match(&padded_call, "eval(");
 
         let bounded_identifier = format!(
             "https://example.invalid/a;{}(x)",
@@ -2416,22 +2402,20 @@ mod tests {
 
     #[test]
     fn suspicious_string_matching_detects_pickle_loader_literals() {
-        assert!(suspicious_string_matches("joblib.load(path)")
-            .contains(&"pickle loader call".to_string()));
-        assert!(suspicious_string_matches("cloudpickle.loads(blob)")
-            .contains(&"pickle loader call".to_string()));
-        assert!(
-            suspicious_string_matches("copyreg.add_extension(module, name, code)")
-                .contains(&"copyreg extension".to_string())
+        assert_string_match("joblib.load(path)", "pickle loader call");
+        assert_string_match("cloudpickle.loads(blob)", "pickle loader call");
+        assert_string_match(
+            "copyreg.add_extension(module, name, code)",
+            "copyreg extension",
         );
     }
 
     #[test]
     fn suspicious_string_matching_ignores_importlib_comment_text() {
         assert!(suspicious_string_matches("importlib # harmless").is_empty());
-        assert!(
-            suspicious_string_matches("import importlib; importlib.import_module('os')")
-                .contains(&"importlib".to_string())
+        assert_string_match(
+            "import importlib; importlib.import_module('os')",
+            "importlib",
         );
     }
 
@@ -2440,14 +2424,14 @@ mod tests {
         let matches = suspicious_string_matches("b3Muc3lzdGVtKCdpZCcp");
 
         assert!(matches.contains(&"base64 os.system".to_string()));
-        assert!(suspicious_string_matches("ZXZhbCh4KQ==").contains(&"base64 eval(".to_string()));
+        assert_string_match("ZXZhbCh4KQ==", "base64 eval(");
         assert!(
             suspicious_string_matches("https://example.invalid/path?q=b3Muc3lzdGVtKCdpZCcp")
                 .is_empty()
         );
-        assert!(suspicious_string_matches(
-            "loader=b3Muc3lzdGVtKCdpZCcp; docs=https://example.invalid/path"
-        )
-        .contains(&"base64 os.system".to_string()));
+        assert_string_match(
+            "loader=b3Muc3lzdGVtKCdpZCcp; docs=https://example.invalid/path",
+            "base64 os.system",
+        );
     }
 }
