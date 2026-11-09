@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -739,13 +738,21 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
     assert result.issues[0].rule_code == "S203"
 
 
-def test_pickle_report_preserves_finding_with_oversized_display_position() -> None:
-    set_digit_limit = getattr(sys, "set_int_max_str_digits", None)
-    get_digit_limit = getattr(sys, "get_int_max_str_digits", None)
-    if set_digit_limit is None or get_digit_limit is None:
-        pytest.skip("requires a configurable integer string conversion limit")
-
-    location = f"sample.pkl (pos {'1' * 641})"
+@pytest.mark.parametrize(
+    ("display_position", "structured", "first_position", "remaining"),
+    [
+        ("1" * 5000, {"position": 7}, 7, [8]),
+        ("1" * 5000, {}, 7, [7, 8]),
+        ("\N{ARABIC-INDIC DIGIT ZERO}" * 5000 + "\N{ARABIC-INDIC DIGIT EIGHT}", {}, 7, [7]),
+        ("0\N{ARABIC-INDIC DIGIT ZERO}" * 2500 + "8", {}, 7, [7]),
+        ("0" * 5000 + "1" + "0" * 640 + "8", {}, 7, [7, 8]),
+        ("1" + "0" * 639, {}, 10**639, [8]),
+    ],
+)
+def test_pickle_report_preserves_finding_with_long_display_position(
+    display_position: str, structured: dict[str, int], first_position: int, remaining: list[int]
+) -> None:
+    location = f"sample.pkl (pos {display_position})"
     reference = {"import_reference": "collections.Counter"}
     report = PickleReport(
         source="sample.pkl",
@@ -756,21 +763,19 @@ def test_pickle_report_preserves_finding_with_oversized_display_position() -> No
                 message="Sample finding",
                 severity=Severity.WARNING,
                 location=location,
-                details={**reference, "position": 7},
+                details={**reference, **structured},
             ),
         ),
-        metadata={"import_references": [{**reference, "position": 7}, {**reference, "position": 8}]},
+        metadata={"import_references": [{**reference, "position": first_position}, {**reference, "position": 8}]},
     )
 
-    previous_limit = get_digit_limit()
-    set_digit_limit(640)
-    try:
-        result = pickle_report_to_scan_result(report)
-    finally:
-        set_digit_limit(previous_limit)
+    result = pickle_report_to_scan_result(report)
 
-    assert [issue.location for issue in result.issues] == [location]
-    assert [check.details["position"] for check in result.checks if check.name == "Standalone Pickle Import"] == [8]
+    serialized = json.loads(result.to_json())
+    assert [(issue["location"], issue["severity"]) for issue in serialized["issues"]] == [(location, "warning")]
+    assert [
+        check.details["position"] for check in result.checks if check.name == "Standalone Pickle Import"
+    ] == remaining
 
 
 def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_module_name_findings() -> None:
