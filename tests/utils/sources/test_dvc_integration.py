@@ -2741,26 +2741,6 @@ class TestDvcSecurity:
             issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in results.issues
         )
 
-    @pytest.mark.parametrize("declaration", ["wdir: linked\nouts:\n- path: README.md", "outs:\n- path: linked"])
-    def test_dvc_preserves_alias_role_in_workdir_and_directory_outputs(
-        self, tmp_path: Path, requires_symlinks: None, declaration: str
-    ) -> None:
-        root = tmp_path / "real"
-        root.mkdir()
-        readme = root / "README.md"
-        readme.write_text("Review me.")
-        (tmp_path / "linked").symlink_to(root, target_is_directory=True)
-        pointer = tmp_path / "model.dvc"
-        pointer.write_text(declaration)
-        resolution = resolve_dvc_file_status(str(pointer))
-
-        expected = str(readme if declaration.startswith("wdir:") else root)
-        assert resolution.resolved_paths == (expected,)
-        assert resolution.aliased_output_paths == {expected}
-
-        pointer.write_text("outs:\n- path: real/README.md\n")
-        assert not resolve_dvc_file_status(str(pointer)).aliased_output_paths
-
     def test_hardlink_output_aliases_are_scanned_once_without_budget_error(self, tmp_path: Path) -> None:
         """Hardlink aliases should not consume scan or budget twice."""
         target = tmp_path / "model.pkl"
@@ -2777,7 +2757,6 @@ class TestDvcSecurity:
         results = scan_model_directory_or_file(str(dvc_file), max_total_size=target.stat().st_size)
 
         assert resolution.resolved_paths == (str(target),)
-        assert resolution.aliased_output_paths == {str(target), str(alias)}
         assert results.files_scanned == 1
         assert results.bytes_scanned == target.stat().st_size
         assert results.success is True

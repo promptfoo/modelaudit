@@ -13,14 +13,11 @@ import tokenize
 from array import array
 from bisect import bisect_right
 from collections.abc import Iterator, Sequence
-from contextlib import suppress
 from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, BinaryIO, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
-from modelaudit.config import get_config
-from modelaudit.config.rule_config import DISABLE_REVIEWED_CITATIONS_CONFIG_KEY
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.network_comm import (
     iter_port_token_positions,
@@ -30,7 +27,7 @@ from modelaudit.detectors.network_comm import (
 from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from modelaudit.scanners._archive_config import EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY, get_archive_depth
+from modelaudit.scanners._archive_config import EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
@@ -38,12 +35,6 @@ from modelaudit.scanners.text_scanner_support.model_card_policy import (
     disclosure_has_harmful_claim,
     model_card_policy_evidence,
 )
-from modelaudit.scanners.text_scanner_support.reviewed_citations import (
-    match_reviewed_citations,
-    reviewed_readme_stat,
-    unaliased_regular_file_stat,
-)
-from modelaudit.utils._path_hardening import _file_stat_matches
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
@@ -916,16 +907,14 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _is_regular_readme(cls, path: str, source: BinaryIO, *, archive_member: bool = False) -> bool:
+    def _is_regular_readme(cls, path: str, source: BinaryIO) -> bool:
         filename = os.path.basename(path).lower()
         if not cls._is_readme_documentation_filename(filename) or filename.endswith(".env"):
             return False
         try:
-            # The logical member name is independent of the staging directory spelling.
-            entry = os.lstat(path) if archive_member else unaliased_regular_file_stat(path)
+            entry = os.lstat(path)
             return (
-                entry is not None
-                and stat.S_ISREG(entry.st_mode)
+                stat.S_ISREG(entry.st_mode)
                 and not (entry.st_mode & 0o111)
                 and os.path.samestat(entry, os.fstat(source.fileno()))
             )
@@ -4252,31 +4241,12 @@ class TextScanner(BaseScanner):
 
         read_limit = self._get_content_security_scan_bytes()
         max_findings = self._get_content_security_max_findings()
-        config = get_config()
-        decisions = (
-            config.reviewed_citations
-            if check_network
-            and not get_archive_depth(self.config)
-            and not self.config.get(DISABLE_REVIEWED_CITATIONS_CONFIG_KEY)
-            else {}
-        )
-        source_stat = reviewed_readme_stat(path) if decisions and "S309" not in config.severity else None
         try:
             with open(path, "rb") as file_obj:
                 payload = file_obj.read(read_limit + 1)
-                if source_stat is not None:
-                    path_stat, source_stat = source_stat, None
-                    with suppress(OSError):
-                        descriptor_stat = os.fstat(file_obj.fileno())
-                        if len(payload) == file_size == path_stat.st_size and _file_stat_matches(
-                            descriptor_stat, path_stat, cross_view=True
-                        ):
-                            source_stat = descriptor_stat
                 regular_readme = self.config.get(
                     EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
-                ) != path and self._is_regular_readme(
-                    path, file_obj, archive_member=bool(get_archive_depth(self.config))
-                )
+                ) != path and self._is_regular_readme(path, file_obj)
         except OSError as error:
             self._mark_content_security_scan_incomplete(
                 result,
@@ -4299,7 +4269,6 @@ class TextScanner(BaseScanner):
         inspected_bytes = len(inspected_payload)
         readme_advisories = (
             regular_readme
-            and not self.config.get(DISABLE_REVIEWED_CITATIONS_CONFIG_KEY)
             and not truncated
             and inspected_bytes == file_size
             and self._is_readme_text(inspected_payload)
@@ -4385,27 +4354,11 @@ class TextScanner(BaseScanner):
                     inspected_payload,
                     network_findings,
                 )
-                reviews = {}
-                # A separate endpoint-classification limit still reports incomplete coverage below.
-                all_findings_emitted = finding_limit is None or (
-                    finding_limit.get("truncated_finding_type") == "endpoint_redaction_classification"
-                    and finding_limit.get("truncated_finding") is None
-                )
-                if network_findings and source_stat is not None and readme_advisories and all_findings_emitted:
-                    reviews = match_reviewed_citations(
-                        path,
-                        inspected_payload,
-                        result.metadata["text_content_sha256"],
-                        source_stat,
-                        network_findings,
-                        decisions,
-                    )
                 if network_findings or not truncated:
                     self.add_network_communication_findings(
                         network_findings,
                         result,
                         context=path,
-                        reviewed_citations=reviews,
                         readme_advisories=readme_advisories and not detector_incomplete and finding_limit is None,
                     )
                 if classification_incomplete:

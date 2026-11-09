@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import shutil
 import stat
@@ -37,7 +38,6 @@ from .auth.config import (
 from .cache.trusted_config_store import TrustedConfigStore
 from .config import ModelAuditConfig, set_config
 from .config.local_config import find_local_config_for_paths
-from .config.rule_config import bind_scan_rule_config, load_reviewed_citations
 from .core import (
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
@@ -2214,10 +2214,8 @@ def build_scan_rule_config(
     return cli_config, local_config_applied, local_config_path
 
 
-def expand_paths(paths: tuple[str, ...], *, citation_aliases: set[str] | None = None) -> tuple[list[str], list[str]]:
-    """Expand paths, optionally recording inputs whose logical source was aliased."""
-    import glob
-
+def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """Expand and validate input paths with type safety."""
     expanded: list[str] = []
     missing_globs: list[str] = []
     for path_str in paths:
@@ -2225,21 +2223,20 @@ def expand_paths(paths: tuple[str, ...], *, citation_aliases: set[str] | None = 
             expanded.append(path_str)
             continue
 
-        is_glob = "*" in path_str or "?" in path_str
-        matches = glob.glob(path_str, recursive=True) if is_glob else [path_str]
-        if not matches:
-            missing_globs.append(path_str)
-        for match in matches:
-            if is_glob and citation_aliases is None:
-                expanded.append(match)
-                continue
-            path = Path(match)
-            exists = path.exists()
-            target = str(path.resolve()) if exists else match
-            routed = match if is_glob else target
-            expanded.append(routed)
-            if citation_aliases is not None and (not exists or str(path.absolute()) != target):
-                citation_aliases.add(target)
+        # Handle glob patterns and resolve paths
+        path = Path(path_str)
+        is_remote_url = bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", path_str))
+        if ("*" in path_str or "?" in path_str) and not is_remote_url:
+            # Handle glob patterns
+            import glob
+
+            matches = glob.glob(path_str, recursive=True)
+            if matches:
+                expanded.extend(matches)
+            else:
+                missing_globs.append(path_str)
+        else:
+            expanded.append(str(path.resolve()) if path.exists() else path_str)
     return expanded, missing_globs
 
 
@@ -2388,21 +2385,14 @@ def _local_path_will_be_scanned(path: str, *, skip_non_model_files: bool) -> boo
     return any(scanner_class().can_handle(path) for scanner_class in SCANNER_REGISTRY)
 
 
-def _resolve_scan_paths(
-    paths: tuple[str, ...], scan_start_time: float, *, citation_aliases: set[str] | None = None
-) -> list[str]:
+def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[str]:
     """Expand user paths and order capped DVC pointers after concrete sibling inputs."""
-    expanded_paths, missing_globs = expand_paths(paths, citation_aliases=citation_aliases)
+    expanded_paths, missing_globs = expand_paths(paths)
     dvc_resolutions = {
         path: resolve_dvc_file_with_metadata(path)
         for path in expanded_paths
         if os.path.isfile(path) and path.lower().endswith(".dvc")
     }
-    if citation_aliases is not None:
-        for pointer, pointer_resolution in dvc_resolutions.items():
-            if pointer in citation_aliases:
-                citation_aliases.update(pointer_resolution.resolved_paths)
-            citation_aliases.update(pointer_resolution.aliased_output_paths)
     ordered_paths: list[str] = []
     capped_dvc_paths: list[str] = []
     for path in expanded_paths:
@@ -2529,8 +2519,6 @@ def _resolve_scan_runtime_config(
     suppress: tuple[str, ...],
     severity: tuple[str, ...],
     scan_start_time: float,
-    reviewed_citations: Path | None = None,
-    citation_aliases: frozenset[Path] = frozenset(),
 ) -> _ScanRuntimeConfig:
     """Build the effective scan runtime settings and apply rule config."""
     auto_defaults = generate_auto_defaults(expanded_paths)
@@ -2568,21 +2556,7 @@ def _resolve_scan_runtime_config(
         )
     except ValueError as exc:
         raise click.BadParameter(str(exc)) from exc
-    scan_config = cli_config
-    if reviewed_citations is not None or citation_aliases:
-        scan_config = cli_config.copy()
-        scan_config.reviewed_citation_aliases = citation_aliases
-    if reviewed_citations is not None:
-        try:
-            scan_config.reviewed_citations = load_reviewed_citations(reviewed_citations)
-        except ValueError as exc:
-            raise click.BadParameter(_escape_terminal_text(str(exc)), param_hint="--reviewed-citations") from exc
-
-    # Keep the existing process-wide rule settings, but scope reviewed decisions to this invocation.
     set_config(cli_config)
-    context = click.get_current_context(silent=True)
-    if context is not None:
-        context.call_on_close(bind_scan_rule_config(scan_config))
 
     if local_config_applied:
         if final_cache:
@@ -4563,11 +4537,6 @@ def delegate_info() -> None:
     help="Suppress specific rule codes (e.g., -s S101). Can be specified multiple times.",
 )
 @click.option(
-    "--reviewed-citations",
-    type=click.Path(exists=True, dir_okay=False, readable=True),
-    help="Apply operator-reviewed S309 documentation citations from a version 1 JSON decision file.",
-)
-@click.option(
     "--severity",
     "-S",
     multiple=True,
@@ -4662,7 +4631,6 @@ def scan_command(
     cache_dir: str | None,
     stream: bool,
     assume_shard_family: bool,
-    reviewed_citations: str | None = None,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -4746,8 +4714,7 @@ def scan_command(
     record_command_used("scan", duration=None, **telemetry_options)
     record_scan_started(list(paths), telemetry_options)
 
-    citation_aliases: set[str] = set()
-    expanded_paths = _resolve_scan_paths(paths, scan_start_time, citation_aliases=citation_aliases)
+    expanded_paths = _resolve_scan_paths(paths, scan_start_time)
     huggingface_preview_paths: list[str] = []
     if dry_run:
         huggingface_preview_paths = [path for path in expanded_paths if _is_huggingface_dry_run_preview_path(path)]
@@ -4782,8 +4749,6 @@ def scan_command(
         exclude_scanners=exclude_scanners,
         suppress=suppress,
         severity=severity,
-        reviewed_citations=Path(reviewed_citations) if reviewed_citations is not None else None,
-        citation_aliases=frozenset(Path(alias) for alias in citation_aliases),
         scan_start_time=scan_start_time,
     )
     if dry_run and huggingface_preview_paths and runtime.output_format == "sarif":

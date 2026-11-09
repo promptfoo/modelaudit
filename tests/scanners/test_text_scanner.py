@@ -427,6 +427,39 @@ def test_text_scanner_verified_huggingface_readme_click_cli_respects_whitelist_p
     assert (network[0]["details"]["severity"] == "INFO") is whitelist_enabled
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.parametrize(
+    ("text", "severity", "exit_code"),
+    [
+        pytest.param("Source (PDF [paper](https://docs.example.org/citation))", "info", 0, id="public-citation"),
+        pytest.param(
+            "[weights](https://downloads.example.org/weights.bin?access_token=fixture-token)",
+            "warning",
+            1,
+            id="credential-in-query",
+        ),
+    ],
+)
+def test_readme_in_symlinked_directory_preserves_url_evidence_and_severity(
+    tmp_path: Path, text: str, severity: str, exit_code: int
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text(text + "\n", encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+
+    result = CliRunner().invoke(cli, ["scan", str(alias / "README.md"), "--format", "json", "--no-cache"])
+
+    assert result.exit_code == exit_code, result.output
+    (issue,) = [issue for issue in json.loads(result.output)["issues"] if issue["rule_code"] == "S309"]
+    assert issue["severity"] == severity
+    evidence = issue["details"]
+    assert evidence["url"] in text
+    assert evidence["evidence_location"]["line"] == 1
+    assert bool(evidence.get("contains_credentials")) == ("access_token=" in text)
+
+
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 @pytest.mark.parametrize(
     ("whitelist_value", "_whitelist_enabled"),
