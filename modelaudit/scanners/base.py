@@ -1377,6 +1377,14 @@ class BaseScanner(ABC):
                 if part
             )
             network_rule_code = get_network_rule_code(network_indicator)
+            why = "Models should not contain network communication capabilities"
+            if readme_advisories and finding.get("contains_credentials"):
+                why = "This documentation contains a URL with credential material that readers can access."
+            elif finding.get("evidence_source") == "documentation":
+                why = (
+                    "This indicator appears in documentation. Any network access depends on how the documented "
+                    "code, configuration, or tools are used."
+                )
 
             result.add_check(
                 name="Network Communication Detection",
@@ -1386,12 +1394,7 @@ class BaseScanner(ABC):
                 severity=severity,
                 location=finding.get("context", context),
                 details=finding,
-                why=(
-                    "This indicator appears in documentation. Any network access depends on how the documented "
-                    "code, configuration, or tools are used."
-                    if finding.get("evidence_source") == "documentation"
-                    else "Models should not contain network communication capabilities"
-                ),
+                why=why,
             )
 
         if not findings and context and not self._raw_detector_failed(result, "network_communication"):

@@ -15,7 +15,7 @@ from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from functools import lru_cache
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
@@ -27,6 +27,7 @@ from modelaudit.detectors.network_comm import (
 from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from modelaudit.scanners._archive_config import EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
@@ -906,7 +907,7 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _is_regular_readme(cls, path: str, descriptor: int) -> bool:
+    def _is_regular_readme(cls, path: str, source: BinaryIO) -> bool:
         filename = os.path.basename(path).lower()
         if not cls._is_readme_documentation_filename(filename) or filename.endswith(".env"):
             return False
@@ -915,7 +916,7 @@ class TextScanner(BaseScanner):
             return (
                 stat.S_ISREG(entry.st_mode)
                 and not (entry.st_mode & 0o111)
-                and os.path.samestat(entry, os.fstat(descriptor))
+                and os.path.samestat(entry, os.fstat(source.fileno()))
             )
         except OSError:
             return False
@@ -4241,7 +4242,9 @@ class TextScanner(BaseScanner):
         try:
             with open(path, "rb") as file_obj:
                 payload = file_obj.read(read_limit + 1)
-                regular_readme = self._is_regular_readme(path, file_obj.fileno())
+                regular_readme = self.config.get(
+                    EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
+                ) != path and self._is_regular_readme(path, file_obj)
         except OSError as error:
             self._mark_content_security_scan_incomplete(
                 result,

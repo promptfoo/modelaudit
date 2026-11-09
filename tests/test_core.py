@@ -17073,3 +17073,42 @@ def test_readme_network_severity_depends_on_file_role(tmp_path: Path, input_role
         assert all(issue.severity == IssueSeverity.INFO for issue in calls)
     else:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in calls)
+
+
+def test_readme_in_archives_uses_each_members_own_execute_bits(tmp_path: Path) -> None:
+    payload = b'import requests\nrequests.get("https://models.example.invalid/image.png")\n'
+    nested = io.BytesIO()
+    with tarfile.open(fileobj=nested, mode="w") as tar:
+        for name, mode in [("bin/README.md", 0o755), ("docs/README.md", 0o644)]:
+            member = tarfile.TarInfo(name)
+            member.mode = mode
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+    path = tmp_path / "model.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, system, mode, body in [
+            ("nested.tar", 3, 0o755, nested.getvalue()),
+            ("bin/README.md", 3, 0o755, payload),
+            ("docs/README.md", 3, 0o644, payload),
+            ("dos/README.md", 0, 0o755, payload),
+        ]:
+            info = zipfile.ZipInfo(name)
+            info.create_system = system
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            archive.writestr(info, body)
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+    for member_path, expected in [
+        ("nested.tar:bin/README.md", IssueSeverity.CRITICAL),
+        ("nested.tar:docs/README.md", IssueSeverity.INFO),
+        ("bin/README.md", IssueSeverity.CRITICAL),
+        ("docs/README.md", IssueSeverity.INFO),
+        ("dos/README.md", IssueSeverity.INFO),
+    ]:
+        severities = {
+            issue.severity
+            for issue in result.issues
+            if issue.rule_code == "S302" and issue.location == f"{path}:{member_path}"
+        }
+        assert severities == {expected}, member_path
