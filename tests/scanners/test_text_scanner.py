@@ -1416,6 +1416,18 @@ def test_text_scanner_basic_auth_finding_limit_preserves_evidence_and_fails_clos
     assert "dTI6cA==" not in serialized
 
 
+@pytest.mark.parametrize(("visible_ending", "expected"), [("", False), ("\r\n", True)])
+def test_bounded_text_scan_requires_complete_uuid_bearer_field(
+    tmp_path: Path, visible_ending: str, expected: bool
+) -> None:
+    path = tmp_path / "README.md"
+    prefix = "Authorization: Bearer 8bf64a2c-4ac8-43e1-8a4b-8cf49df0850a" + visible_ending
+    path.write_bytes((prefix + "-longer-token").encode())
+    result = TextScanner(config={"text_content_scan_bytes": len(prefix), "check_network_comm": False}).scan(str(path))
+    assert result.metadata["analysis_incomplete"]
+    assert any(check.details.get("secret_type") == "Bearer Token" for check in result.checks) is expected
+
+
 @pytest.mark.integration
 def test_omnivoice_pinned_audio_tokenizer_readme_basic_links_not_basic_auth_secret(
     tmp_path: Path,

@@ -799,6 +799,8 @@ class BaseScanner(ABC):
         enable_check: bool = True,
         raise_on_error: bool = False,
         max_findings: int | None = None,
+        *,
+        complete_input: bool = True,
     ) -> list[dict[str, Any]]:
         """Collect embedded secret findings without creating checks."""
         if not enable_check or not self._get_bool_config("check_secrets", True):
@@ -812,7 +814,7 @@ class BaseScanner(ABC):
                 if detector_config is not None and not isinstance(detector_config, dict):
                     raise TypeError("secrets_config must be a mapping")
                 detector_config = {**(detector_config or {}), "max_findings": max_findings}
-            detector = SecretsDetector(detector_config)
+            detector = SecretsDetector(detector_config, complete_input=complete_input)
             findings = detector.scan_model_weights(data, context)
             return [dict(finding) for finding in findings]
 

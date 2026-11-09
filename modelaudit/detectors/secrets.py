@@ -18,6 +18,16 @@ from modelaudit.utils.helpers.evidence import format_evidence_string
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+BEARER_PATTERN = r"Bearer\s+[a-zA-Z0-9\-._~+/]+=*"
+UUID_V4_PATTERN = r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}"
+UUID_BEARER_VALUE = re.compile(rf"Bearer[ \t]+({UUID_V4_PATTERN})", re.IGNORECASE | re.ASCII)
+HTTP_LINE_START = r"(?:\A|(?<=[\r\n]))[ \t]*"
+UUID_BEARER_HEADER_PREFIX = re.compile(
+    rf"""(?:{HTTP_LINE_START}|(?:{HTTP_LINE_START}(?:(?:export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*)?"""
+    r"""|(?<!\S)(?:-H[ \t]+|--header(?:[ \t]+|=)))(?P<quote>["']))(?i:(?:proxy-)?authorization):[ \t]*\Z""",
+    re.ASCII,
+)
+UUID_BEARER_VALUE_END = re.compile(r"""[ \t]*(?P<end>[\r\n]|\Z|["'](?=\s|\Z))""")
 BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
 BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
@@ -84,9 +94,9 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     (r"amqp://[^:]+:[^@]+@[^/\s]+", "RabbitMQ Connection String"),
     # Tokens and Secrets
     (r"eyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*", "JWT Token"),
-    (r"Bearer\s+[a-zA-Z0-9\-._~+/]+=*", "Bearer Token"),
+    (BEARER_PATTERN, "Bearer Token"),
     (BASIC_AUTH_PATTERN, BASIC_AUTH_SECRET_TYPE),
-    (r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}", "UUID (potential secret)"),
+    (UUID_V4_PATTERN, "UUID (potential secret)"),
     # Passwords and Auth
     (r"password\s*[:=]\s*['\"]?([^'\"\s]{8,})['\"]?", "Hardcoded Password"),
     (r"passwd\s*[:=]\s*['\"]?([^'\"\s]{8,})['\"]?", "Hardcoded Password"),
@@ -544,7 +554,7 @@ def _canonical_basic_auth_header_object_name_value(value: object) -> str | None:
 class SecretsDetector:
     """Detects embedded secrets, API keys, and credentials in model data."""
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(self, config: dict[str, Any] | None = None, *, complete_input: bool = True):
         """Initialize the secrets detector with optional configuration.
 
         Args:
@@ -556,6 +566,7 @@ class SecretsDetector:
                 - min_secret_length: Minimum length for a string to be considered a secret (default: 8)
                 - require_high_confidence: Only report high-confidence matches (default: True)
         """
+        self.complete_input = complete_input
         self.config = config or {}
         self.min_entropy = self.config.get("min_entropy", 4.5)
         self.max_entropy = self.config.get("max_entropy", 7.5)
@@ -743,6 +754,26 @@ class SecretsDetector:
         for pattern, _description in self._compiled_patterns:
             redacted = pattern.sub(REDACTED_CONTEXT_SECRET, redacted)
         return redacted
+
+    @staticmethod
+    def _uuid_bearer_in_header(text: str, match: re.Match[str], *, complete_input: bool) -> str | None:
+        # Use the real header field and a complete value to distinguish a
+        # credential from a model ID or an ordinary mention of the word Bearer.
+        value = UUID_BEARER_VALUE.fullmatch(text, match.start(), match.end())
+        if value is None:
+            return None
+        prefix_start = max(0, match.start() - BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
+        header = UUID_BEARER_HEADER_PREFIX.search(text, prefix_start, match.start())
+        if header is None:
+            return None
+        ending = UUID_BEARER_VALUE_END.match(text, match.end())
+        quote = header.group("quote")
+        allowed_endings = {quote} if quote else {"", "\r", "\n"}
+        if ending is None or ending.group("end") not in allowed_endings:
+            return None
+        if not complete_input and ending.end() == len(text) and ending.group("end") not in {"\r", "\n"}:
+            return None
+        return value.group(1)
 
     @staticmethod
     def _basic_auth_match_has_header_context(text: str, position: int, match_end: int | None = None) -> bool:
@@ -1590,11 +1621,14 @@ class SecretsDetector:
 
         # First, try to detect secrets in decoded text
         try:
-            # Try UTF-8 decoding with error handling
-            text = data.decode("utf-8", errors="ignore")
-            # Pass a flag indicating this is from binary data
-            # This helps filter out false positives from model weights
-            text_findings = self.scan_text(text, context, is_binary_source=True)
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = data.decode("utf-8", errors="ignore")
+                # Dropping bytes can manufacture a field name or credential.
+                text_findings = self.scan_text(text, context, is_binary_source=True, exact_text=False)
+            else:
+                text_findings = self.scan_text(text, context, is_binary_source=True)
             findings.extend(text_findings)
             if self._findings_truncated:
                 return findings
@@ -1709,7 +1743,9 @@ class SecretsDetector:
 
         return is_binary
 
-    def scan_text(self, text: str, context: str = "", is_binary_source: bool = False) -> list[dict[str, Any]]:
+    def scan_text(
+        self, text: str, context: str = "", is_binary_source: bool = False, *, exact_text: bool = True
+    ) -> list[dict[str, Any]]:
         """Scan text content for embedded secrets using regex patterns.
 
         Args:
@@ -1724,6 +1760,7 @@ class SecretsDetector:
 
         # Limit text size to prevent DoS
         max_text_size = 100 * 1024 * 1024  # 100MB text analysis limit
+        complete_input = self.complete_input and len(text) <= max_text_size
         if len(text) > max_text_size:
             text = text[:max_text_size]
 
@@ -1781,7 +1818,14 @@ class SecretsDetector:
                 if (description in BINARY_FALSE_POSITIVE_TYPES) and self._is_likely_binary_context(text, position):
                     continue
 
-                confidence = self._calculate_confidence(secret_text, description, context)
+                confidence_context = context
+                if exact_text and description == "Bearer Token" and pattern.pattern == BEARER_PATTERN:
+                    token = self._uuid_bearer_in_header(text, match, complete_input=complete_input)
+                    if token is not None:
+                        if len(token) < self.min_secret_length or self._is_whitelisted(token):
+                            continue
+                        confidence_context = "Authorization"
+                confidence = self._calculate_confidence(secret_text, description, confidence_context)
 
                 if self.require_high_confidence and confidence < 0.6:
                     continue
