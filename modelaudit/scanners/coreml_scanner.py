@@ -87,12 +87,13 @@ def _skip_group(
             _value, offset = value_info
             continue
 
-        if wire_type == 1:
-            end = offset + 8
+        if wire_type in (1, 5):  # fixed64 or fixed32
+            width = 8 if wire_type == 1 else 4
+            end = offset + width
             if end > len(data):
                 if allow_truncated:
                     return len(data), fields_seen, None
-                return offset, fields_seen, f"truncated fixed64 field {field_number}"
+                return offset, fields_seen, f"truncated fixed{width * 8} field {field_number}"
             offset = end
             continue
 
@@ -119,15 +120,6 @@ def _skip_group(
             if field_number != group_stack[-1]:
                 return offset, fields_seen, f"mismatched end group field {field_number}"
             group_stack.pop()
-            continue
-
-        if wire_type == 5:
-            end = offset + 4
-            if end > len(data):
-                if allow_truncated:
-                    return len(data), fields_seen, None
-                return offset, fields_seen, f"truncated fixed32 field {field_number}"
-            offset = end
             continue
 
         return offset, fields_seen, f"unsupported wire type {wire_type} for field {field_number}"
@@ -175,12 +167,13 @@ def _parse_message(
             fields.append(_ProtoField(field_number, wire_type, value))
             continue
 
-        if wire_type == 1:  # fixed64
-            end = offset + 8
+        if wire_type in (1, 5):  # fixed64 or fixed32
+            width = 8 if wire_type == 1 else 4
+            end = offset + width
             if end > len(data):
                 if allow_truncated:
                     return fields, None
-                return fields, f"truncated fixed64 field {field_number}"
+                return fields, f"truncated fixed{width * 8} field {field_number}"
             value = int.from_bytes(data[offset:end], "little")
             offset = end
             fields.append(_ProtoField(field_number, wire_type, value))
@@ -233,17 +226,6 @@ def _parse_message(
 
         if wire_type == 4:
             return fields, f"unexpected end group field {field_number}"
-
-        if wire_type == 5:  # fixed32
-            end = offset + 4
-            if end > len(data):
-                if allow_truncated:
-                    return fields, None
-                return fields, f"truncated fixed32 field {field_number}"
-            value = int.from_bytes(data[offset:end], "little")
-            offset = end
-            fields.append(_ProtoField(field_number, wire_type, value))
-            continue
 
         return fields, f"unsupported wire type {wire_type} for field {field_number}"
 
