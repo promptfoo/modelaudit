@@ -407,7 +407,7 @@ class TestErrorScenarios:
             # Restore permissions for cleanup
             os.chmod(str(restricted_file), 0o644)
 
-    def test_network_file_timeout_simulation(self, tmp_path):
+    def test_network_file_timeout_simulation(self, tmp_path: Path) -> None:
         """Report an I/O timeout while opening an otherwise scannable file."""
         import pickle
 

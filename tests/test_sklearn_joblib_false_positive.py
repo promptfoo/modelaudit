@@ -47,7 +47,7 @@ class TestSklearnJoblibFalsePositive:
     """Test suite for sklearn/joblib false positive fixes."""
 
     @requires_sklearn
-    def test_sklearn_model_no_legacy_pattern_warnings(self, tmp_path):
+    def test_sklearn_model_no_legacy_pattern_warnings(self, tmp_path: Path) -> None:
         """
         Verify legitimate sklearn models don't trigger legacy pattern WARNINGs.
 
@@ -65,7 +65,7 @@ class TestSklearnJoblibFalsePositive:
         _assert_no_legacy_findings(model_path, "sklearn")
 
     @requires_sklearn
-    def test_sklearn_pipeline_no_legacy_pattern_warnings(self, tmp_path):
+    def test_sklearn_pipeline_no_legacy_pattern_warnings(self, tmp_path: Path) -> None:
         """
         Verify sklearn Pipeline models don't trigger legacy pattern WARNINGs.
 
@@ -88,7 +88,7 @@ class TestSklearnJoblibFalsePositive:
         _assert_no_legacy_findings(model_path, "Pipeline")
 
     @requires_sklearn
-    def test_sklearn_model_no_exit_code_1_from_patterns(self, tmp_path):
+    def test_sklearn_model_no_exit_code_1_from_patterns(self, tmp_path: Path) -> None:
         """
         Verify sklearn models don't cause exit code 1 due to legacy patterns.
 
@@ -106,7 +106,7 @@ class TestSklearnJoblibFalsePositive:
         _assert_no_legacy_findings(model_path, "sklearn", "NumpyArrayWrapper", "numpy_pickle")
 
     @requires_sklearn
-    def test_joblib_patterns_not_flagged(self, tmp_path):
+    def test_joblib_patterns_not_flagged(self, tmp_path: Path) -> None:
         """
         Verify joblib-specific patterns (NumpyArrayWrapper, numpy_pickle) don't trigger warnings.
 
