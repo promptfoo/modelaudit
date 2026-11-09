@@ -17199,7 +17199,7 @@ def test_changed_onnx_weight_hardlinks_invalidate_only_their_inode(
     unrelated.write_bytes(original)
     initial = aliases[0].stat()
     physical_id = (initial.st_dev, initial.st_ino)
-    real_stat, real_fstat = os.stat, os.fstat
+    real_stat, real_lstat, real_fstat = os.stat, os.lstat, os.fstat
     original_token = ScanResultsCache._get_file_change_token
     original_hash = core_module._calculate_file_hash
     generation = 1
@@ -17210,6 +17210,7 @@ def test_changed_onnx_weight_hardlinks_invalidate_only_their_inode(
         return _stat_result_with(info, ctime=1.0) if os.path.samestat(info, initial) else info
 
     monkeypatch.setattr(os, "stat", lambda *args, **kwargs: creation_time_view(real_stat(*args, **kwargs)))
+    monkeypatch.setattr(os, "lstat", lambda *args, **kwargs: creation_time_view(real_lstat(*args, **kwargs)))
     monkeypatch.setattr(os, "fstat", lambda fd: creation_time_view(real_fstat(fd)))
     monkeypatch.setattr(
         ScanResultsCache,
