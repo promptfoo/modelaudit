@@ -18,6 +18,23 @@ from tests.helpers.cache import single_file_metadata as _single_file_metadata
 HAS_TFLITE = importlib.util.find_spec("tflite") is not None
 
 
+def _mock_tflite_operator_model(
+    mock_tflite: MagicMock, *, subgraphs: int = 1, tensors: int = 1, operators: int = 1
+) -> MagicMock:
+    """Use the same subgraph, tensor and operator at each requested index."""
+    model = mock_tflite.Model.GetRootAsModel.return_value
+    model.SubgraphsLength.return_value = subgraphs
+    subgraph = model.Subgraphs.return_value
+    subgraph.TensorsLength.return_value = tensors
+    subgraph.OperatorsLength.return_value = operators
+    tensor = subgraph.Tensors.return_value
+    tensor.ShapeLength.return_value = 1
+    tensor.Shape.return_value = 1
+    subgraph.Operators.return_value.OpcodeIndex.return_value = 0
+    opcode: MagicMock = model.OperatorCodes.return_value
+    return opcode
+
+
 def _assert_tflite_inconclusive_exit2(aggregate: Any, reason: str) -> None:
     metadata = _single_file_metadata(aggregate)
     assert aggregate.success is False
@@ -311,24 +328,9 @@ def test_tflite_scanner_custom_operator(tmp_path: Path) -> None:
     path.write_bytes(valid_header)
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
-        mock_model = MagicMock()
-        mock_model.SubgraphsLength.return_value = 1
-        mock_subgraph = MagicMock()
-        mock_subgraph.TensorsLength.return_value = 1
-        mock_subgraph.OperatorsLength.return_value = 1
-        mock_tensor = MagicMock()
-        mock_tensor.ShapeLength.return_value = 1
-        mock_tensor.Shape.return_value = 1
-        mock_subgraph.Tensors.return_value = mock_tensor
-        mock_operator = MagicMock()
-        mock_operator.OpcodeIndex.return_value = 0
-        mock_subgraph.Operators.return_value = mock_operator
-        mock_opcode = MagicMock()
+        mock_opcode = _mock_tflite_operator_model(mock_tflite)
         mock_opcode.BuiltinCode.return_value = mock_tflite.BuiltinOperator.CUSTOM
         mock_opcode.CustomCode.return_value = b"my_custom_op"
-        mock_model.OperatorCodes.return_value = mock_opcode
-        mock_model.Subgraphs.return_value = mock_subgraph
-        mock_tflite.Model.GetRootAsModel.return_value = mock_model
 
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
@@ -348,23 +350,8 @@ def test_tflite_scanner_safe_model(tmp_path: Path) -> None:
     path.write_bytes(valid_header)
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
-        mock_model = MagicMock()
-        mock_model.SubgraphsLength.return_value = 1
-        mock_subgraph = MagicMock()
-        mock_subgraph.TensorsLength.return_value = 1
-        mock_subgraph.OperatorsLength.return_value = 1
-        mock_tensor = MagicMock()
-        mock_tensor.ShapeLength.return_value = 1
-        mock_tensor.Shape.return_value = 1
-        mock_subgraph.Tensors.return_value = mock_tensor
-        mock_operator = MagicMock()
-        mock_operator.OpcodeIndex.return_value = 0
-        mock_subgraph.Operators.return_value = mock_operator
-        mock_opcode = MagicMock()
+        mock_opcode = _mock_tflite_operator_model(mock_tflite)
         mock_opcode.BuiltinCode.return_value = mock_tflite.BuiltinOperator.ADD
-        mock_model.OperatorCodes.return_value = mock_opcode
-        mock_model.Subgraphs.return_value = mock_subgraph
-        mock_tflite.Model.GetRootAsModel.return_value = mock_model
 
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
@@ -381,23 +368,8 @@ def test_tflite_scanner_metadata_collection(tmp_path: Path) -> None:
 
     if HAS_TFLITE:
         with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
-            mock_model = MagicMock()
-            mock_model.SubgraphsLength.return_value = 2
-            mock_subgraph = MagicMock()
-            mock_subgraph.TensorsLength.return_value = 3
-            mock_subgraph.OperatorsLength.return_value = 4
-            mock_tensor = MagicMock()
-            mock_tensor.ShapeLength.return_value = 1
-            mock_tensor.Shape.return_value = 1
-            mock_subgraph.Tensors.return_value = mock_tensor
-            mock_operator = MagicMock()
-            mock_operator.OpcodeIndex.return_value = 0
-            mock_subgraph.Operators.return_value = mock_operator
-            mock_opcode = MagicMock()
+            mock_opcode = _mock_tflite_operator_model(mock_tflite, subgraphs=2, tensors=3, operators=4)
             mock_opcode.BuiltinCode.return_value = mock_tflite.BuiltinOperator.ADD
-            mock_model.OperatorCodes.return_value = mock_opcode
-            mock_model.Subgraphs.return_value = mock_subgraph
-            mock_tflite.Model.GetRootAsModel.return_value = mock_model
 
             scanner = TFLiteScanner()
             result = scanner.scan(str(path))
