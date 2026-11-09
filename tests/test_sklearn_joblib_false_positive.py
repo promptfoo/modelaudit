@@ -7,7 +7,6 @@ maintaining detection of actual CVE exploitation attempts.
 """
 
 import pickle
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -15,7 +14,6 @@ import pytest
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity
 
-# Skip tests if sklearn is not available
 try:
     import numpy as np
     from sklearn.ensemble import RandomForestClassifier
@@ -26,11 +24,30 @@ except ImportError:
     HAS_SKLEARN = False
 
 
-@pytest.mark.skipif(not HAS_SKLEARN, reason="sklearn not installed")
+requires_sklearn = pytest.mark.skipif(not HAS_SKLEARN, reason="sklearn not installed")
+
+
+def _assert_no_legacy_findings(model_path: Path, *patterns: str) -> None:
+    result = scan_file(str(model_path))
+    assert result.success
+    assert result.bytes_scanned == model_path.stat().st_size
+    assert result.metadata.get("opcode_count", 0) > 0
+
+    findings = [
+        issue.message
+        for issue in result.issues
+        if "Legacy" in issue.message
+        and issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        and any(pattern.lower() in issue.message.lower() for pattern in patterns)
+    ]
+    assert not findings, f"{model_path.name}: {findings}"
+
+
 class TestSklearnJoblibFalsePositive:
     """Test suite for sklearn/joblib false positive fixes."""
 
-    def test_sklearn_model_no_legacy_pattern_warnings(self, tmp_path):
+    @requires_sklearn
+    def test_sklearn_model_no_legacy_pattern_warnings(self, tmp_path: Path) -> None:
         """
         Verify legitimate sklearn models don't trigger legacy pattern WARNINGs.
 
@@ -43,27 +60,12 @@ class TestSklearnJoblibFalsePositive:
         model = LogisticRegression()
         model.fit(X, y)
 
-        # Save as pickle
         model_path = tmp_path / "sklearn_model.pkl"
-        with open(model_path, "wb") as f:
-            pickle.dump(model, f)
+        model_path.write_bytes(pickle.dumps(model))
+        _assert_no_legacy_findings(model_path, "sklearn")
 
-        # Scan the model
-        result = scan_file(str(model_path))
-
-        # Check for legacy pattern WARNINGs
-        legacy_warnings = [
-            issue for issue in result.issues if "Legacy" in issue.message and issue.severity == IssueSeverity.WARNING
-        ]
-
-        # Should NOT have any legacy pattern WARNINGs for "sklearn"
-        sklearn_warnings = [issue for issue in legacy_warnings if "sklearn" in issue.message.lower()]
-
-        assert len(sklearn_warnings) == 0, (
-            f"Found {len(sklearn_warnings)} false positive sklearn warnings: {[w.message for w in sklearn_warnings]}"
-        )
-
-    def test_sklearn_pipeline_no_legacy_pattern_warnings(self, tmp_path):
+    @requires_sklearn
+    def test_sklearn_pipeline_no_legacy_pattern_warnings(self, tmp_path: Path) -> None:
         """
         Verify sklearn Pipeline models don't trigger legacy pattern WARNINGs.
 
@@ -81,26 +83,12 @@ class TestSklearnJoblibFalsePositive:
         y = np.array([0, 1, 1])
         pipe.fit(X, y)
 
-        # Save as pickle
         model_path = tmp_path / "pipeline_model.pkl"
-        with open(model_path, "wb") as f:
-            pickle.dump(pipe, f)
+        model_path.write_bytes(pickle.dumps(pipe))
+        _assert_no_legacy_findings(model_path, "Pipeline")
 
-        # Scan the model
-        result = scan_file(str(model_path))
-
-        # Check for legacy pattern WARNINGs mentioning Pipeline
-        pipeline_warnings = [
-            issue
-            for issue in result.issues
-            if "Legacy" in issue.message and issue.severity == IssueSeverity.WARNING and "Pipeline" in issue.message
-        ]
-
-        assert len(pipeline_warnings) == 0, (
-            f"Found {len(pipeline_warnings)} false positive Pipeline warnings: {[w.message for w in pipeline_warnings]}"
-        )
-
-    def test_sklearn_model_no_exit_code_1_from_patterns(self, tmp_path):
+    @requires_sklearn
+    def test_sklearn_model_no_exit_code_1_from_patterns(self, tmp_path: Path) -> None:
         """
         Verify sklearn models don't cause exit code 1 due to legacy patterns.
 
@@ -113,60 +101,36 @@ class TestSklearnJoblibFalsePositive:
         model = RandomForestClassifier(n_estimators=2, max_depth=2, random_state=42)
         model.fit(X, y)
 
-        # Save as pickle
         model_path = tmp_path / "sklearn_rf.pkl"
-        with open(model_path, "wb") as f:
-            pickle.dump(model, f)
+        model_path.write_bytes(pickle.dumps(model))
+        _assert_no_legacy_findings(model_path, "sklearn", "NumpyArrayWrapper", "numpy_pickle")
 
-        # Scan the model
-        result = scan_file(str(model_path))
-
-        # Check for legacy pattern WARNINGs that would cause exit code 1
-        legacy_warnings = [
-            issue
-            for issue in result.issues
-            if "Legacy" in issue.message
-            and issue.severity == IssueSeverity.WARNING
-            and any(pattern in issue.message.lower() for pattern in ["sklearn", "numpyarraywrapper", "numpy_pickle"])
-        ]
-
-        assert len(legacy_warnings) == 0, (
-            f"Found {len(legacy_warnings)} false positive legacy warnings that would cause exit code 1"
-        )
-
-    def test_joblib_patterns_not_flagged(self, tmp_path):
+    @requires_sklearn
+    def test_joblib_patterns_not_flagged(self, tmp_path: Path) -> None:
         """
         Verify joblib-specific patterns (NumpyArrayWrapper, numpy_pickle) don't trigger warnings.
 
         Before fix: NumpyArrayWrapper and numpy_pickle triggered WARNINGs
         After fix: These patterns should not be flagged as they are legitimate joblib internals
         """
+        import joblib
+
         # Create a simple sklearn model
         X = np.array([[0], [1], [2]])
         y = np.array([0, 1, 1])
         model = LogisticRegression()
         model.fit(X, y)
 
-        # Save as pickle (may contain joblib references)
         model_path = tmp_path / "model.pkl"
-        with open(model_path, "wb") as f:
-            pickle.dump(model, f)
+        model_path.write_bytes(pickle.dumps(model))
+        _assert_no_legacy_findings(model_path, "NumpyArrayWrapper", "numpy_pickle")
 
-        # Scan the model
-        result = scan_file(str(model_path))
-
-        # Check for joblib-related legacy pattern WARNINGs
-        joblib_warnings = [
-            issue
-            for issue in result.issues
-            if "Legacy" in issue.message
-            and issue.severity == IssueSeverity.WARNING
-            and any(pattern in issue.message.lower() for pattern in ["numpyarraywrapper", "numpy_pickle"])
-        ]
-
-        assert len(joblib_warnings) == 0, (
-            f"Found {len(joblib_warnings)} false positive joblib warnings: {[w.message for w in joblib_warnings]}"
-        )
+        joblib_path = tmp_path / "model.joblib"
+        joblib.dump(model, joblib_path, compress=0)
+        payload = joblib_path.read_bytes()
+        assert b"NumpyArrayWrapper" in payload
+        assert b"numpy_pickle" in payload
+        _assert_no_legacy_findings(joblib_path, "NumpyArrayWrapper", "numpy_pickle")
 
     def test_malicious_patterns_still_detected(self, tmp_path):
         """
@@ -221,8 +185,8 @@ tR."""
         assert result is not None, "Scanner should still process the file without crashing"
 
 
-@pytest.mark.skipif(not HAS_SKLEARN, reason="sklearn not installed")
-def test_false_positive_summary():
+@requires_sklearn
+def test_false_positive_summary(tmp_path: Path) -> None:
     """
     Integration test: Verify the fix reduces false positives.
 
@@ -230,43 +194,16 @@ def test_false_positive_summary():
     - Before: 10 false positive WARNINGs on sklearn/joblib models
     - After: 0 false positive WARNINGs from legacy pattern detection
     """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
+    X = np.array([[0, 0], [1, 1], [2, 2]])
+    y = np.array([0, 1, 1])
 
-        # Create multiple sklearn models
-        X = np.array([[0, 0], [1, 1], [2, 2]])
-        y = np.array([0, 1, 1])
+    models = {
+        "logistic.pkl": LogisticRegression(),
+        "rf.pkl": RandomForestClassifier(n_estimators=2, max_depth=2, random_state=42),
+    }
 
-        models = {
-            "logistic.pkl": LogisticRegression(),
-            "rf.pkl": RandomForestClassifier(n_estimators=2, max_depth=2, random_state=42),
-        }
-
-        total_legacy_warnings = 0
-
-        for filename, model in models.items():
-            model.fit(X, y)
-            model_path = tmp_path / filename
-
-            with open(model_path, "wb") as f:
-                pickle.dump(model, f)
-
-            # Scan and count legacy pattern WARNINGs
-            result = scan_file(str(model_path))
-
-            legacy_warnings = [
-                issue
-                for issue in result.issues
-                if "Legacy" in issue.message
-                and issue.severity == IssueSeverity.WARNING
-                and any(
-                    pattern in issue.message for pattern in ["sklearn", "NumpyArrayWrapper", "numpy_pickle", "Pipeline"]
-                )
-            ]
-
-            total_legacy_warnings += len(legacy_warnings)
-
-        # After fix: Should have 0 false positive legacy pattern WARNINGs
-        assert total_legacy_warnings == 0, (
-            f"Expected 0 false positive legacy warnings after fix, but found {total_legacy_warnings}"
-        )
+    for filename, model in models.items():
+        model.fit(X, y)
+        model_path = tmp_path / filename
+        model_path.write_bytes(pickle.dumps(model))
+        _assert_no_legacy_findings(model_path, "sklearn", "NumpyArrayWrapper", "numpy_pickle", "Pipeline")
