@@ -7836,9 +7836,13 @@ impl<'a> ScanState<'a> {
             .bytes_scanned
             .max(tail_start.saturating_add(tail.len()));
 
-        for global_match in post_budget_global_matches(tail, self.payload, &self.stack, &self.memo)
-        {
-            let absolute_position = read_offset.saturating_add(global_match.pattern_start);
+        for global_match in post_budget_global_matches(
+            tail,
+            self.position_offset.saturating_add(tail_start),
+            self.payload,
+            &self.stack,
+            &self.memo,
+        ) {
             let severity = if global_match.reduce_proximate {
                 "critical"
             } else {
@@ -7851,7 +7855,7 @@ impl<'a> ScanState<'a> {
                 location: Some(format!(
                     "{} (pos {})",
                     self.source,
-                    self.position_offset + absolute_position
+                    global_match.position
                 )),
                 rule_code: Some("POST_BUDGET_GLOBAL"),
                 details: vec![
@@ -7866,7 +7870,7 @@ impl<'a> ScanState<'a> {
                     ("name".to_string(), DetailValue::String(global_match.name)),
                     (
                         "position".to_string(),
-                        DetailValue::UInt((self.position_offset + absolute_position) as u64),
+                        DetailValue::UInt(global_match.position as u64),
                     ),
                     (
                         "reduce_proximate".to_string(),
@@ -11362,6 +11366,53 @@ mod tests {
                 }),
                 "missing critical memoized post-budget finding for {label}"
             );
+        }
+    }
+
+    #[test]
+    fn post_budget_calls_keep_the_position_of_inherited_references() {
+        let prefix = b"\x80\x02c__main__\nplaceholder\n";
+        let collision = b"q\x000NNc__main__\nplaceholder\n0h\x00)R.";
+        let second_global = prefix.len() + b"q\x000NN".len();
+        for (suffix, max_opcodes, expected_positions) in [
+            (b")R.".as_slice(), 2, vec![2]),
+            (b"q\x000h\x00)R.", 4, vec![2]),
+            // The second GLOBAL starts at tail index 2, the first GLOBAL's absolute position.
+            // The raw sweep also reports the second GLOBAL's module-name bytes.
+            (collision, 4, vec![second_global, 2, second_global + 1]),
+        ] {
+            let payload = [prefix.as_slice(), suffix].concat();
+            let options = ScanOptions {
+                max_opcodes,
+                ..default_test_options()
+            };
+            for offset in [0, 137] {
+                let mut scan = ScanState::new(
+                    "inherited.pkl".to_string(),
+                    &payload,
+                    &options,
+                    Some(payload.len()),
+                    offset,
+                    0,
+                    None,
+                );
+                scan.run();
+                let findings: Vec<_> = scan
+                    .findings
+                    .iter()
+                    .filter(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+                    .collect();
+                assert_eq!(findings.len(), expected_positions.len());
+                for (finding, expected) in findings.iter().zip(&expected_positions) {
+                    let expected = offset + expected;
+                    assert_eq!(finding.severity, "critical");
+                    assert_eq!(detail_usize(&finding.details, "position"), Some(expected));
+                    assert_eq!(
+                        finding.location,
+                        Some(format!("inherited.pkl (pos {expected})"))
+                    );
+                }
+            }
         }
     }
 
