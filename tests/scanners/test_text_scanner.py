@@ -1227,8 +1227,9 @@ def test_readme_bitcoin_addresses_require_a_valid_base58check_payload(tmp_path: 
         ("README.md", "#!/bin/sh\n", IssueSeverity.WARNING),
     ],
 )
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 def test_public_receiving_addresses_in_readme(
-    tmp_path: Path, filename: str, prefix: str, expected_severity: IssueSeverity
+    tmp_path: Path, filename: str, prefix: str, expected_severity: IssueSeverity, newline: str
 ) -> None:
     # The ordinary detector emits all three address types in this model context.
     directory = tmp_path / "token-model"
@@ -1238,15 +1239,16 @@ def test_public_receiving_addresses_in_readme(
     eth = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
     ltc = "LKDyUEtTR1HXamkiEphisSiBJu6o3ZPE34"
     content = f"{prefix}# Donations\nBitcoin: {btc}\nEthereum: {eth}\nLitecoin: {ltc}\nBitcoin: {btc}\n"
-    path.write_text(content, encoding="utf-8")
+    payload = content.replace("\n", newline).encode()
+    path.write_bytes(payload)
 
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
 
     assert {(issue.details["secret_type"], issue.details["position"]) for issue in aggregate.issues} == {
-        ("Bitcoin Address", content.index(btc)),
-        ("Bitcoin Address", content.rindex(btc)),
-        ("Ethereum Address", content.index(eth)),
-        ("Litecoin Address", content.index(ltc)),
+        ("Bitcoin Address", payload.index(btc.encode())),
+        ("Bitcoin Address", payload.rindex(btc.encode())),
+        ("Ethereum Address", payload.index(eth.encode())),
+        ("Litecoin Address", payload.index(ltc.encode())),
     }
     for issue in aggregate.issues:
         assert issue.severity == expected_severity
@@ -1275,22 +1277,23 @@ def test_receiving_address_as_a_password_and_seed_phrase_stay_actionable(tmp_pat
     assert determine_exit_code(aggregate) == 1
 
 
-def test_custom_secret_pattern_named_bitcoin_address_keeps_its_severity(tmp_path: Path) -> None:
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_custom_secret_pattern_named_bitcoin_address_keeps_its_severity(tmp_path: Path, newline: str) -> None:
     directory = tmp_path / "token-model"
     directory.mkdir()
     path = directory / "README.md"
     address = "31hb9kC72UasjkEZGKWfR4nKWsQmqGB7FA"
     credential = "AzTySe4PqUR7QmphQnwZ"
-    content = f"Bitcoin: {address}\nfixture_credential={credential}\n"
-    path.write_text(content, encoding="utf-8")
+    payload = f"Bitcoin: {address}{newline}fixture_credential={credential}{newline}".encode()
+    path.write_bytes(payload)
     custom_pattern = r"fixture_credential=(\w+)"
     scanner = TextScanner({"secrets_config": {"patterns": [(custom_pattern, "Bitcoin Address")]}})
 
     issues = scanner.scan(str(path)).issues
 
     assert [(issue.details["position"], issue.severity) for issue in issues] == [
-        (content.index(address), IssueSeverity.INFO),
-        (content.index(credential), IssueSeverity.WARNING),
+        (payload.index(address.encode()), IssueSeverity.INFO),
+        (payload.index(credential.encode()), IssueSeverity.WARNING),
     ]
     assert issues[0].details["readme_severity_adjusted"] is True
     assert issues[1].details["pattern"] == custom_pattern
