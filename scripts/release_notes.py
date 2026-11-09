@@ -196,8 +196,10 @@ def candidate_inventory(
     if not heading.startswith(f"## [{after}]({comparison})"):
         raise ValueError(f"{changelog}: expected release comparison {comparison}")
     link = f"[Full comparison]({comparison})"
-    _, disclosure, inventory = body.rpartition(INVENTORY)
+    _, disclosure, inventory = body.partition(INVENTORY)
     if disclosure:
+        if INVENTORY in inventory:
+            raise ValueError(f"{changelog}: multiple All changes disclosures; restore the generated inventory")
         inventory = inventory.rstrip()
         if not inventory.endswith("</details>"):
             raise ValueError(f"{changelog}: incomplete All changes disclosure")
@@ -226,7 +228,7 @@ def check_candidate(
     candidate_inventory(sections, changelog, prefix, before, after)
     # Review comments can replace the prose. The categories and numbered references
     # still come from the fragment filenames and belong above the generated inventory.
-    reviewed, _, _ = sections[after].rpartition(INVENTORY)
+    reviewed, _, _ = sections[after].partition(INVENTORY)
     reviewed_lines = set(reviewed.splitlines())
     for line in summary.splitlines():
         if line.startswith(("### ", "<summary>")) and line not in reviewed_lines:

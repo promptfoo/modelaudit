@@ -164,13 +164,21 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
     assert "### Highlights" not in public
     assert (root / "CHANGELOG.md").read_bytes() == before
 
-    # A retry must not feed already-reviewed text back into the raw commit inventory.
     changelog = root / SIBLING / "CHANGELOG.md"
-    damaged = changelog.read_text().replace("<summary>All changes</summary>", "<summary>Changed label</summary>")
-    changelog.write_text(damaged)
-    retry = run(root, "render", "--base", base, check=False)
-    assert retry.returncode != 0 and "restore the generated inventory" in retry.stderr
-    assert changelog.read_text() == damaged
+    original = changelog.read_text()
+    comparison = next(line for line in public.splitlines() if line.startswith("[Full comparison]"))
+    extra = f"\n<details>\n<summary>All changes</summary>\n\n{comparison}\n\n</details>\n"
+    for damaged in (
+        original.replace("<summary>All changes</summary>", "<summary>Changed label</summary>"),
+        original.replace(public, public + extra),
+    ):
+        # Treating the text as raw or choosing the last disclosure loses reviewed inventory.
+        changelog.write_text(damaged)
+        for operation in ("check", "render"):
+            retry = run(root, operation, "--base", base, check=False)
+            assert retry.returncode != 0 and "restore the generated inventory" in retry.stderr
+        assert changelog.read_text() == damaged
+        assert (root / "CHANGELOG.md").read_bytes() == before
 
 
 @pytest.mark.parametrize(

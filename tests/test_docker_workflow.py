@@ -397,14 +397,17 @@ def test_full_image_ml_dependency_probe_fails_hard() -> None:
     assert "Some ML dependencies missing" not in dependency_run
 
 
+def test_docker_image_filters_ignore_standalone_release_fragments() -> None:
+    steps = _job_steps(_load_docker_workflow(), "changes")
+    filter_step = next(step for step in steps if step.get("id") == "filter")
+    filters = yaml.safe_load(filter_step["with"]["filters"])
+    for image in ("docker", "full-image", "tensorflow-image"):
+        sibling = [path for path in filters[image] if path.startswith("packages/modelaudit-picklescan/")]
+        assert sibling == ["packages/modelaudit-picklescan/!(changes/**)"]
+
+
 def test_tensorflow_image_changes_are_built_and_probed() -> None:
     workflow = _load_docker_workflow()
-
-    changes_steps = _job_steps(workflow, "changes")
-    filter_step = next(step for step in changes_steps if step.get("id") == "filter")
-    tensorflow_filter = filter_step["with"]["filters"].split("tensorflow-image:", maxsplit=1)[1]
-    assert "'packages/modelaudit-picklescan/**'" in tensorflow_filter
-
     tensorflow_job = _jobs(workflow)["build-test-tensorflow"]
     assert isinstance(tensorflow_job, dict)
     assert tensorflow_job["needs"] == "changes"
