@@ -2180,10 +2180,7 @@ class TestOciLayerScanner:
         """Links without a target are malformed and must not be treated as safe."""
         layer_path = tmp_path / "empty-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            link_info = tarfile.TarInfo("links/empty")
-            link_info.type = link_type
-            link_info.linkname = ""
-            tar.addfile(link_info)
+            tar.addfile(make_tar_link("links/empty", "", link_type))
 
         manifest_path = tmp_path / "empty-link.manifest"
         manifest_path.write_text(json.dumps({"layers": ["empty-link.tar.gz"]}))
@@ -2259,10 +2256,7 @@ class TestOciLayerScanner:
         layer_path = tmp_path / "linked-model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="payload.bin")
-            link_info = tarfile.TarInfo("models/weights.pkl")
-            link_info.type = link_type
-            link_info.linkname = link_target
-            tar.addfile(link_info)
+            tar.addfile(make_tar_link("models/weights.pkl", link_target, link_type))
 
         manifest_path = tmp_path / "linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
