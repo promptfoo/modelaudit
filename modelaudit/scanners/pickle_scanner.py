@@ -11,7 +11,7 @@ import io
 import pickletools
 import re
 import tokenize
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from itertools import islice, pairwise
@@ -976,110 +976,114 @@ def _pop_legacy_pytorch_marked_tuple(stack: list[object], marker: object) -> tup
     return None
 
 
-def _legacy_pytorch_storage_records(
-    data: bytes,
-    storage_keys: tuple[str, ...],
-) -> tuple[_LegacyPyTorchStorageRecord, ...] | None:
+def _iter_legacy_pytorch_storage_pids(data: bytes, *, strict: bool) -> Iterator[tuple[int | None, object]]:
+    """Yield BINPERSID operands until the control stream ends or exceeds a parser limit."""
     marker = object()
     unknown = object()
     memo: dict[int, object] = {}
     stack: list[object] = []
-    records: dict[str, _LegacyPyTorchStorageRecord] = {}
-    expected_keys = set(storage_keys)
 
-    try:
-        for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
-            if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
-                return None
-            opcode_name = opcode.name
-            if opcode_name in {"PROTO", "FRAME", "STOP"}:
-                continue
-            if opcode_name == "MARK":
-                stack.append(marker)
-            elif opcode_name in _PICKLE_STRING_OPCODE_NAMES:
-                stack.append(arg if isinstance(arg, str) else unknown)
-            elif opcode_name == "GLOBAL":
-                if not isinstance(arg, str):
-                    stack.append(unknown)
-                else:
-                    parts = arg.split()
-                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else unknown)
-            elif opcode_name == "STACK_GLOBAL":
-                if len(stack) < 2:
-                    stack.clear()
-                    continue
-                name = stack.pop()
-                module = stack.pop()
-                stack.append(
-                    _LegacyPickleGlobalRef(module, name, position)
-                    if isinstance(module, str) and isinstance(name, str)
-                    else unknown
-                )
-            elif opcode_name == "EMPTY_TUPLE":
-                stack.append(())
-            elif opcode_name == "TUPLE":
-                tuple_value = _pop_legacy_pytorch_marked_tuple(stack, marker)
-                if tuple_value is None:
-                    stack.clear()
-                else:
-                    stack.append(tuple_value)
-            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-                tuple_size = int(opcode_name[-1])
-                if len(stack) < tuple_size:
-                    stack.clear()
-                    continue
-                items = stack[-tuple_size:]
-                del stack[-tuple_size:]
-                stack.append(tuple(items))
-            elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
-                stack.append(arg if isinstance(arg, int) and not isinstance(arg, bool) else unknown)
-            elif opcode_name == "NONE":
-                stack.append(None)
-            elif opcode_name == "NEWTRUE":
-                stack.append(True)
-            elif opcode_name == "NEWFALSE":
-                stack.append(False)
-            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                key = _legacy_pytorch_memo_key(arg)
-                if key is not None:
-                    if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES and key not in memo:
-                        return None
-                    memo[key] = stack[-1] if stack else unknown
-            elif opcode_name == "MEMOIZE":
-                if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
-                    return None
-                memo[len(memo)] = stack[-1] if stack else unknown
-            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-                key = _legacy_pytorch_memo_key(arg)
-                stack.append(memo.get(key, unknown) if key is not None else unknown)
-            elif opcode_name == "POP":
-                if stack:
-                    stack.pop()
-            elif opcode_name == "POP_MARK":
-                _pop_legacy_pytorch_marked_tuple(stack, marker)
-            elif opcode_name == "DUP":
-                if stack:
-                    stack.append(stack[-1])
-            elif opcode_name == "PERSID":
-                return None
-            elif opcode_name == "BINPERSID":
-                pid = stack.pop() if stack else unknown
-                record = _legacy_pytorch_storage_record_from_pid(pid, expected_keys=expected_keys)
-                if record is None or (record.key in records and records[record.key] != record):
-                    return None
-                records[record.key] = record
+    for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
+        if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
+            raise ValueError("Legacy PyTorch control opcode limit exceeded")
+        opcode_name = opcode.name
+        if opcode_name in {"PROTO", "FRAME", "STOP"}:
+            continue
+        if opcode_name == "MARK":
+            stack.append(marker)
+        elif opcode_name in _PICKLE_STRING_OPCODE_NAMES:
+            stack.append(arg if isinstance(arg, str) else unknown)
+        elif opcode_name == "GLOBAL":
+            if not isinstance(arg, str):
                 stack.append(unknown)
             else:
+                parts = arg.split()
+                stack.append(_LegacyPickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else unknown)
+        elif opcode_name == "STACK_GLOBAL":
+            if len(stack) < 2:
                 stack.clear()
+                continue
+            name = stack.pop()
+            module = stack.pop()
+            stack.append(
+                _LegacyPickleGlobalRef(module, name, position)
+                if isinstance(module, str) and isinstance(name, str)
+                else unknown
+            )
+        elif opcode_name == "EMPTY_TUPLE":
+            stack.append(())
+        elif opcode_name == "TUPLE":
+            tuple_value = _pop_legacy_pytorch_marked_tuple(stack, marker)
+            if tuple_value is None and strict:
+                stack.clear()
+            else:
+                stack.append(tuple_value if tuple_value is not None else unknown)
+        elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+            tuple_size = int(opcode_name[-1])
+            if len(stack) < tuple_size:
+                stack.clear()
+                continue
+            items = stack[-tuple_size:]
+            del stack[-tuple_size:]
+            stack.append(tuple(items))
+        elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
+            stack.append(arg if isinstance(arg, int) and not isinstance(arg, bool) else unknown)
+        elif opcode_name == "NONE":
+            stack.append(None)
+        elif opcode_name == "NEWTRUE":
+            stack.append(True)
+        elif opcode_name == "NEWFALSE":
+            stack.append(False)
+        elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+            key = _legacy_pytorch_memo_key(arg)
+            if key is not None:
+                if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES and key not in memo:
+                    raise ValueError("Legacy PyTorch memo limit exceeded")
+                memo[key] = stack[-1] if stack else unknown
+        elif opcode_name == "MEMOIZE":
+            if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
+                raise ValueError("Legacy PyTorch memo limit exceeded")
+            memo[len(memo)] = stack[-1] if stack else unknown
+        elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+            key = _legacy_pytorch_memo_key(arg)
+            stack.append(memo.get(key, unknown) if key is not None else unknown)
+        elif opcode_name == "POP":
+            if stack:
+                stack.pop()
+        elif opcode_name == "POP_MARK":
+            _pop_legacy_pytorch_marked_tuple(stack, marker)
+        elif opcode_name == "DUP":
+            if stack:
+                stack.append(stack[-1])
+        elif opcode_name == "PERSID" and strict:
+            raise ValueError("Text persistent ID in legacy PyTorch storage layout")
+        elif opcode_name == "BINPERSID":
+            pid = stack.pop() if stack else unknown
+            yield position, pid
+            stack.append(unknown)
+        else:
+            stack.clear()
 
-            if len(stack) > _PYTORCH_LEGACY_MAX_STACK_DEPTH:
+        if len(stack) > _PYTORCH_LEGACY_MAX_STACK_DEPTH:
+            raise ValueError("Legacy PyTorch stack limit exceeded")
+
+
+def _legacy_pytorch_storage_records(
+    data: bytes,
+    storage_keys: tuple[str, ...],
+) -> tuple[_LegacyPyTorchStorageRecord, ...] | None:
+    records: dict[str, _LegacyPyTorchStorageRecord] = {}
+    expected_keys = set(storage_keys)
+    try:
+        for _, pid in _iter_legacy_pytorch_storage_pids(data, strict=True):
+            record = _legacy_pytorch_storage_record_from_pid(pid, expected_keys=expected_keys)
+            if record is None or (record.key in records and records[record.key] != record):
                 return None
+            records[record.key] = record
     except Exception:
         return None
 
-    if set(records) != expected_keys:
-        return None
-    if not _pickle_stack_is_valid(data):
+    if set(records) != expected_keys or not _pickle_stack_is_valid(data):
         return None
     return tuple(records[key] for key in storage_keys)
 
@@ -1087,96 +1091,13 @@ def _legacy_pytorch_storage_records(
 def _legacy_pytorch_storage_persistent_id_records(
     data: bytes,
 ) -> tuple[_LegacyPyTorchStoragePersistentIdRecord, ...]:
-    marker = object()
-    unknown = object()
-    memo: dict[int, object] = {}
-    stack: list[object] = []
     records: list[_LegacyPyTorchStoragePersistentIdRecord] = []
-
-    try:
-        for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
-            if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
-                break
-            opcode_name = opcode.name
-            if opcode_name in {"PROTO", "FRAME", "STOP"}:
-                continue
-            if opcode_name == "MARK":
-                stack.append(marker)
-            elif opcode_name in _PICKLE_STRING_OPCODE_NAMES:
-                stack.append(arg if isinstance(arg, str) else unknown)
-            elif opcode_name == "GLOBAL":
-                if not isinstance(arg, str):
-                    stack.append(unknown)
-                else:
-                    parts = arg.split()
-                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else unknown)
-            elif opcode_name == "STACK_GLOBAL":
-                if len(stack) < 2:
-                    stack.clear()
-                    continue
-                name = stack.pop()
-                module = stack.pop()
-                stack.append(
-                    _LegacyPickleGlobalRef(module, name, position)
-                    if isinstance(module, str) and isinstance(name, str)
-                    else unknown
-                )
-            elif opcode_name == "EMPTY_TUPLE":
-                stack.append(())
-            elif opcode_name == "TUPLE":
-                tuple_value = _pop_legacy_pytorch_marked_tuple(stack, marker)
-                stack.append(tuple_value if tuple_value is not None else unknown)
-            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-                tuple_size = int(opcode_name[-1])
-                if len(stack) < tuple_size:
-                    stack.clear()
-                    continue
-                items = stack[-tuple_size:]
-                del stack[-tuple_size:]
-                stack.append(tuple(items))
-            elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
-                stack.append(arg if isinstance(arg, int) and not isinstance(arg, bool) else unknown)
-            elif opcode_name == "NONE":
-                stack.append(None)
-            elif opcode_name == "NEWTRUE":
-                stack.append(True)
-            elif opcode_name == "NEWFALSE":
-                stack.append(False)
-            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                key = _legacy_pytorch_memo_key(arg)
-                if key is not None:
-                    if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES and key not in memo:
-                        break
-                    memo[key] = stack[-1] if stack else unknown
-            elif opcode_name == "MEMOIZE":
-                if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
-                    break
-                memo[len(memo)] = stack[-1] if stack else unknown
-            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-                key = _legacy_pytorch_memo_key(arg)
-                stack.append(memo.get(key, unknown) if key is not None else unknown)
-            elif opcode_name == "POP":
-                if stack:
-                    stack.pop()
-            elif opcode_name == "POP_MARK":
-                _pop_legacy_pytorch_marked_tuple(stack, marker)
-            elif opcode_name == "DUP":
-                if stack:
-                    stack.append(stack[-1])
-            elif opcode_name == "BINPERSID":
-                pid = stack.pop() if stack else unknown
-                record = _legacy_pytorch_storage_record_from_pid(pid, expected_keys=None)
-                if record is not None and position is not None:
-                    records.append(_LegacyPyTorchStoragePersistentIdRecord(position=position, record=record))
-                stack.append(unknown)
-            else:
-                stack.clear()
-
-            if len(stack) > _PYTORCH_LEGACY_MAX_STACK_DEPTH:
-                break
-    except Exception:
-        return tuple(records)
-
+    # Partial annotation retains the records observed before malformed input or a parser limit.
+    with suppress(Exception):
+        for position, pid in _iter_legacy_pytorch_storage_pids(data, strict=False):
+            record = _legacy_pytorch_storage_record_from_pid(pid, expected_keys=None)
+            if record is not None and position is not None:
+                records.append(_LegacyPyTorchStoragePersistentIdRecord(position=position, record=record))
     return tuple(records)
 
 
