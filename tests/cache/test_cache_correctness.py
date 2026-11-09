@@ -63,6 +63,7 @@ from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_co
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 from modelaudit.utils.repository_context import REPOSITORY_SCAN_ROOT_CONFIG_KEY
+from tests.helpers.cache import scope_cache_ancestor_identity_to_tree
 from tests.helpers.pickle_framework import _replace_source_after_fstat, _replace_source_on_read
 
 
@@ -166,26 +167,6 @@ def _wait_for_ancestor_identity_to_settle(cache: ScanResultsCache, file_path: Pa
             return
         previous = current
     pytest.fail(f"ancestor identity did not settle for {file_path}")
-
-
-def _scope_cache_ancestor_identity_to_tree(
-    cache: ScanResultsCache,
-    root: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    original_capture = cache._capture_ancestor_identity
-    root_path = Path(os.path.abspath(root))
-
-    def capture_ancestor_identity(file_path: str) -> AncestorIdentity:
-        identity = original_capture(file_path)
-        entries = tuple(
-            entry
-            for entry in identity
-            if (entry_path := Path(entry[0])) == root_path or root_path in entry_path.parents
-        )
-        return AncestorIdentity(entries)
-
-    monkeypatch.setattr(cache, "_capture_ancestor_identity", capture_ancestor_identity)
 
 
 def _record_opened_descriptors(opened_descriptors: list[int]) -> Callable[[str, int], int]:
@@ -3130,7 +3111,7 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(
 
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
     assert cache_manager.cache is not None
-    _scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
+    scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
     swap_blocked = {"value": False}
@@ -3190,7 +3171,7 @@ def test_unmonitored_platform_does_not_cache_higher_ancestor_swap(
 
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
     assert cache_manager.cache is not None
-    _scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
+    scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
     monkeypatch.setattr(sys, "platform", "darwin")
@@ -3916,7 +3897,7 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
     path_entry = str(package_path)
     file_path = _make_cacheable_file(tmp_path, "nested-population.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
-    _scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
+    scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
     version_context = build_cache_version_context({})
     monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
     if context_kind == "loaded":
@@ -4581,7 +4562,7 @@ def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
 ) -> None:
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
-    _scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
+    scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
     version_context = build_cache_version_context({})
     metadata = {
         "pickle_report_status": "complete",
