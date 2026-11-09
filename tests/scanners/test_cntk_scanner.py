@@ -209,7 +209,7 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
     assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -244,7 +244,7 @@ def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
     direct = CntkScanner().scan(str(path))
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -278,7 +278,7 @@ def test_cntk_scanner_signature_read_failure_is_inconclusive(
     result = CntkScanner().scan(str(path))
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -320,7 +320,7 @@ def test_cntk_scanner_marks_late_string_payload_inconclusive(
     assert budget_checks[0].details["analysis_incomplete"] is True
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,

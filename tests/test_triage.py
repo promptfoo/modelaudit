@@ -304,21 +304,31 @@ def test_text_scanner_hashes_only_complete_inspected_content(truncated: bool, tm
         assert "text_content_sha256" not in result.metadata
     else:
         assert result.metadata["text_content_sha256"] == hashlib.sha256(payload).hexdigest()
-        assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        urls = [issue for issue in result.issues if issue.details.get("type") == "url_detected"]
+        assert len(urls) == 1
+        assert urls[0].severity == IssueSeverity.INFO
+        assert urls[0].details["severity"] == "MEDIUM"
 
 
-def _write_real_scan_case(tmp_path: Path, case_id: str) -> Path:
+def _write_real_scan_case(tmp_path: Path, case_id: str, filename: str) -> Path:
     document = next(case["document"] for case in CORPUS["cases"] if case["case_id"] == case_id)
-    path = tmp_path.resolve() / "README.md"
+    path = tmp_path.resolve() / filename
     path.write_bytes(document.encode("utf-8"))
     return path
 
 
-@pytest.mark.parametrize(("case_id", "expected_exit"), [("routine_clone", 0), ("clone_then_execute", 1)])
+@pytest.mark.parametrize(
+    ("case_id", "filename", "expected_exit"),
+    [
+        ("routine_clone", "README.md", 0),
+        ("clone_then_execute", "README.md", 0),
+        ("clone_then_execute", "model_card.md", 1),
+    ],
+)
 def test_real_scan_triages_only_actionable_documentation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_id: str, expected_exit: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_id: str, filename: str, expected_exit: int
 ) -> None:
-    path = _write_real_scan_case(tmp_path, case_id)
+    path = _write_real_scan_case(tmp_path, case_id, filename)
     post = mock_api(monkeypatch, [assessment(classification="needs_attention")])
 
     result = CliRunner().invoke(cli_module.cli, ["scan", str(path), "--format", "json", "--no-cache", "--quiet"])
@@ -547,7 +557,7 @@ entry._run()
 
 
 def test_dry_run_never_calls_triage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    path = _write_real_scan_case(tmp_path, "clone_then_execute")
+    path = _write_real_scan_case(tmp_path, "clone_then_execute", "model_card.md")
     post = mock_api(monkeypatch, [])
     result = CliRunner().invoke(cli_module.cli, ["scan", str(path), "--dry-run", "--no-cache", "--quiet"])
     assert result.exit_code == 1, result.output

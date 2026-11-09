@@ -1,0 +1,1 @@
+Skops archives report pickle, joblib, and scikit-learn references in plain README documentation as informational. The CVE-2025-54886 finding for loader evidence recommends the upstream fix in skops 0.13.0.

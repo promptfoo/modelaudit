@@ -409,7 +409,7 @@ def test_executorch_read_failure_result_is_not_cached(
     monkeypatch.setattr(ExecuTorchScanner, "_read_header", staticmethod(raise_os_error))
     monkeypatch.setattr(ExecuTorchScanner, "can_handle", classmethod(lambda _cls, _path: True))
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = core.scan_model_directory_or_file(
             str(file_path),
             cache_enabled=True,
@@ -1529,7 +1529,7 @@ def test_executorch_zip_budget_failure_propagates_exit_code_and_is_not_cached(
         zipf.writestr("weights.bin", b"A" * 32)
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         for _ in range(2):
             scan_kwargs: dict[str, Any] = {
                 "cache_enabled": True,
@@ -1825,7 +1825,7 @@ def test_executorch_pickle_discovery_entry_limit_propagates_exit_code_and_is_not
         zipf.writestr("payload", b"benign skipped discovery candidate")
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         for _ in range(2):
             aggregate = core.scan_model_directory_or_file(
                 str(model_path),

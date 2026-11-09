@@ -283,7 +283,7 @@ def test_tf_metagraph_read_failure_result_is_not_cached(
 
     monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner._read_bounded", raise_read_error)
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(unreadable_meta),
             cache_enabled=True,
@@ -311,7 +311,7 @@ def test_tf_metagraph_single_file_scan_bypasses_stale_cache_when_read_fails(
     cached_clean.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with monkeypatch.context() as cache_setup:
             cache_setup.setattr(
                 cache_decorator,
@@ -355,7 +355,7 @@ def test_tf_metagraph_directory_scan_bypasses_stale_cache_when_read_fails_with_s
     malicious_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "payload", "op": "PyFunc"}]))
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with monkeypatch.context() as cache_setup:
             cache_setup.setattr(
                 cache_decorator,

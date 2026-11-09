@@ -15,7 +15,7 @@ from ..core_results import mark_operational_scan_error
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.file.detection import is_declared_text_content_filename
 from ..utils.helpers.assets import asset_from_scan_result
-from ._archive_config import get_archive_depth
+from ._archive_config import EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY, get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import (
@@ -2056,6 +2056,8 @@ class ZipScanner(BaseScanner):
                         nested_config.pop(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
                         nested_config.pop(ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
                         nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
+                        if info.create_system in _UNIX_MODE_ZIP_CREATOR_SYSTEMS and (info.external_attr >> 16) & 0o111:
+                            nested_config[EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY] = tmp_path
                         # Extracted members are deleted below and cannot provide
                         # stable cache keys for a subsequent scan.
                         nested_config["cache_enabled"] = False

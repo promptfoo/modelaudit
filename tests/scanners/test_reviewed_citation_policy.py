@@ -17,14 +17,19 @@ CITATION = f"Source (PDF [paper]({CITATION_URL}))\n"
 
 
 def _reviewed_site(readme: Path) -> dict[str, Any]:
-    payload = readme.read_bytes()
     result = scan_file(str(readme), {"cache_enabled": False})
     (finding,) = [i for i in result.issues if i.rule_code == "S309" and i.details.get("url") == CITATION_URL]
-    assert finding.severity == IssueSeverity.WARNING
+    assert finding.severity == IssueSeverity.INFO
+    assert finding.details["severity"] in {"MEDIUM", "WARNING"}
+    assert finding.details["deduplicated_related_findings"][0]["domain"] == "docs.example.com"
+    return _decision_for_finding(readme, finding)
+
+
+def _decision_for_finding(readme: Path, finding: Issue) -> dict[str, Any]:
+    payload = readme.read_bytes()
     evidence = finding.details
     span = evidence["evidence_location"]
-    related = evidence["deduplicated_related_findings"]
-    assert related and related[0]["domain"] == "docs.example.com"
+    related = evidence.get("deduplicated_related_findings", [])
     encoded = json.dumps(related, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return {
         "rule": "S309",
@@ -33,7 +38,7 @@ def _reviewed_site(readme: Path) -> dict[str, Any]:
         "sha256": hashlib.sha256(payload).hexdigest(),
         "position": evidence["position"],
         "fingerprint": evidence["evidence_fingerprint"],
-        "url": CITATION_URL,
+        "url": evidence["url"],
         "raw_span": payload[span["span_start"] : span["span_end"]].decode(),
         "related_sha256": hashlib.sha256(encoded).hexdigest(),
         "reason": "Operator verified this paper citation.",
@@ -54,7 +59,7 @@ def test_reviewed_readme_citation_preserves_check_issue_and_raw_evidence(tmp_pat
     path = tmp_path / "README.md"
     path.write_text(CITATION, encoding="utf-8")
     baseline = scan_model_directory_or_file(str(path), cache_enabled=False)
-    assert determine_exit_code(baseline) == 1
+    assert determine_exit_code(baseline) == 0
     site = _reviewed_site(path)
     with _apply_site(site):
         reviewed = scan_model_directory_or_file(str(path), cache_enabled=False)
@@ -102,12 +107,12 @@ def test_review_decision_preserves_same_file_command_and_independent_secret(tmp_
     for before_rows, after_rows in ((baseline.checks, reviewed.checks), (baseline.issues, reviewed.issues)):
         assert independent_findings(before_rows) == independent_findings(after_rows)
         assert any(r.rule_code == "S704" and r.severity == IssueSeverity.CRITICAL for r in after_rows)
-        assert any(r.details.get("url") == command_url and r.severity == IssueSeverity.WARNING for r in after_rows)
+        assert any(r.details.get("url") == command_url and r.severity == IssueSeverity.INFO for r in after_rows)
         assert any(r.details.get("url") == CITATION_URL and r.severity == IssueSeverity.INFO for r in after_rows)
 
 
 @pytest.mark.parametrize("change", ["moved", "different_byte", "raw_span", "related_sha256"])
-def test_stale_citation_review_retains_warning(tmp_path: Path, change: str) -> None:
+def test_stale_citation_review_retains_default_severity(tmp_path: Path, change: str) -> None:
     path = tmp_path / "README.md"
     path.write_text(CITATION)
     site = _reviewed_site(path)
@@ -123,8 +128,8 @@ def test_stale_citation_review_retains_warning(tmp_path: Path, change: str) -> N
     with _apply_site(site):
         result = scan_model_directory_or_file(str(path), cache_enabled=False)
     (issue,) = [i for i in result.issues if i.rule_code == "S309"]
-    assert issue.severity == IssueSeverity.WARNING and "reviewed_citation" not in issue.details
-    assert determine_exit_code(result) == 1
+    assert issue.severity == IssueSeverity.INFO and "reviewed_citation" not in issue.details
+    assert determine_exit_code(result) == 0
 
 
 @pytest.mark.parametrize("role", ["model_card.md", "requirements.txt", "archive.zip"])
@@ -142,7 +147,8 @@ def test_review_decision_requires_standalone_readme(tmp_path: Path, role: str) -
         result = scan_file(str(other), {"cache_enabled": False})
     matching = [i for i in result.issues if i.rule_code == "S309" and i.details.get("url") == CITATION_URL]
     assert matching
-    assert all(i.severity == IssueSeverity.WARNING and "reviewed_citation" not in i.details for i in matching)
+    expected = IssueSeverity.INFO if role == "archive.zip" else IssueSeverity.WARNING
+    assert all(i.severity == expected and "reviewed_citation" not in i.details for i in matching)
 
 
 def test_incomplete_read_preserves_citation_warning_and_coverage_error(tmp_path: Path) -> None:
@@ -178,6 +184,28 @@ def test_review_decision_does_not_follow_readme_aliases(tmp_path: Path, alias_pa
         result = scan_file(str(alias), {"cache_enabled": False})
     assert not any("reviewed_citation" in i.details for i in result.issues)
     assert any(i.rule_code == "S309" and i.severity == IssueSeverity.WARNING for i in result.issues)
+
+
+@pytest.mark.parametrize("restriction", ["executable", "credential_path"])
+def test_review_does_not_override_executable_or_credential_alerts(tmp_path: Path, restriction: str) -> None:
+    readme = tmp_path / "README.md"
+    url = CITATION_URL if restriction == "executable" else "https://docs.example.com/password/fixture"
+    readme.write_text(CITATION.replace(CITATION_URL, url))
+    if restriction == "executable":
+        readme.chmod(0o755)
+        if not readme.stat().st_mode & 0o111:
+            pytest.skip("filesystem does not preserve executable mode")
+    baseline = scan_file(str(readme), {"cache_enabled": False})
+    (issue,) = [i for i in baseline.issues if i.rule_code == "S309" and i.details.get("type") == "url_detected"]
+    assert issue.severity == IssueSeverity.WARNING
+    if restriction == "credential_path":
+        assert issue.details["contains_credentials"]
+    site = _decision_for_finding(readme, issue)
+    with _apply_site(site):
+        reviewed = scan_file(str(readme), {"cache_enabled": False})
+    (observation,) = [i for i in reviewed.issues if i.rule_code == "S309" and i.details.get("type") == "url_detected"]
+    assert observation.severity == issue.severity
+    assert observation.details == issue.details
 
 
 def test_aggregate_preserves_individual_citation_reviews_in_sarif(tmp_path: Path) -> None:
@@ -218,6 +246,6 @@ def test_citation_review_preserves_hostname_findings(tmp_path: Path, destination
     site = _reviewed_site(readme)
     with _apply_site(site):
         result = scan_model_directory_or_file(str(readme), use_cache=False)
-    assert determine_exit_code(result) == 1
-    assert any(i.rule_code == "S309" and i.severity == IssueSeverity.WARNING for i in result.issues)
+    assert determine_exit_code(result) == 0
+    assert any(i.rule_code == "S309" and i.severity == IssueSeverity.INFO for i in result.issues)
     assert any(i.details.get("reviewed_citation") for i in result.issues) is review_applies

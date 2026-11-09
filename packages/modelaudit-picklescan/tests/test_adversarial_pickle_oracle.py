@@ -33,8 +33,7 @@ from pickle_test_helpers import (
 )
 from pickle_test_helpers import _has_module as _module_available
 
-import modelaudit_picklescan.call_graph as call_graph
-from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, call_graph, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE, _with_call_graph_findings
 from modelaudit_picklescan.call_graph import (
     _call_graph_entrypoints,

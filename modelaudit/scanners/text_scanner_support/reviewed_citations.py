@@ -108,6 +108,8 @@ def match_reviewed_citations(
         if (
             finding.get("type") != "url_detected"
             or finding.get("severity") not in {"WARNING", "MEDIUM"}
+            or finding.get("contains_credentials")
+            or finding.get("url_credential_check_incomplete")
             or finding.get("evidence_source") != "documentation"
             or finding.get("context") != path
             or not isinstance(position, int)

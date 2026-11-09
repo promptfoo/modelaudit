@@ -6,6 +6,17 @@ _FIELDS = frozenset({"message", "location", "type", "rule_code", "name"})
 _DETAIL_FIELDS = frozenset({"evidence_fingerprint", "zip_entry_id", "zip_entry", "check_consolidation_key"})
 
 
+def readme_adjusted_occurrence(details: dict[str, Any]) -> str | int | None:
+    """Identify README occurrences that could coincide after a severity adjustment."""
+    if details.get("readme_severity_adjusted") is not True:
+        return None
+    fingerprint = details.get("evidence_fingerprint")
+    if isinstance(fingerprint, str) and fingerprint:
+        return fingerprint
+    position = details.get("position")
+    return position if type(position) is int and position >= 0 else None
+
+
 def finding_identity(record: Any) -> Any:
     """Return an identity copy, accepting only producer-stamped record metadata."""
     metadata = record.get("finding_identity") if isinstance(record, dict) else getattr(record, "finding_identity", None)

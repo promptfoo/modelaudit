@@ -124,6 +124,8 @@ from modelaudit.utils.file.detection import (
     TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
+    FlaxKeyAbsenceProbe,
+    OnnxWeightProofIdentity,
     _detect_tar_route,
     _has_supported_tar_compression_wrapper,
     _is_malformed_sentencepiece_model_proto_candidate_file,
@@ -143,7 +145,9 @@ from modelaudit.utils.file.detection import (
     is_huggingface_tokenizer_json_file,
     is_jax_json_checkpoint_file,
     is_sentencepiece_model_proto_file,
+    onnx_weight_routing_proof,
     should_defer_safetensors_header_limit_hash,
+    should_prove_large_onnx_weights,
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
@@ -2680,7 +2684,89 @@ def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResu
     return result
 
 
-def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> str:
+def _pickle_license_probe_limit(
+    path: str, result: ScanResult, config: dict[str, Any], *, over_total_budget: bool
+) -> int:
+    """Admit a complete structural metadata read only within the file's scan coverage."""
+    if (
+        not path.lower().endswith(".pkl")
+        or over_total_budget
+        or _scan_result_has_operational_error(result)
+        or _metadata_has_incomplete_coverage(result.metadata)
+    ):
+        return 0
+    limit = result.bytes_scanned
+    for option in ("max_file_size", "max_file_read_size"):
+        configured = config.get(option)
+        if type(configured) is int and configured > 0:
+            limit = min(limit, configured)
+    return limit
+
+
+def _onnx_weight_proof_allowed(path: Path, size: int, config: dict[str, Any]) -> bool:
+    if not should_prove_large_onnx_weights(path, size):
+        return False
+    limits = (config.get("max_file_read_size"), config.get("max_file_size"), config.get("max_total_size"))
+    return not any(isinstance(limit, int) and 0 < limit < size for limit in limits) and policy_from_config(
+        config
+    ).allows("flax_msgpack")
+
+
+def _weight_snapshot_alias_matches_blob(path: Path, alias: Path) -> bool:
+    """Recheck a snapshot alias after discovery approved its physical blob target."""
+    try:
+        return (
+            not path.suffix
+            and alias.suffix.lower() == ".onnx_data"
+            and alias.is_symlink()
+            and alias.resolve(strict=True) == path.absolute()
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+@dataclass
+class _OnnxWeightHardlinks:
+    weight_path: Path
+    identity: OnnxWeightProofIdentity
+    hashed_paths: list[str]
+
+
+def _find_onnx_weight_hardlinks(
+    paths: list[str], config: dict[str, Any], aliases: dict[str, Path], deadline: float | None
+) -> dict[tuple[int, int], _OnnxWeightHardlinks]:
+    groups: dict[tuple[int, int], _OnnxWeightHardlinks] = {}
+    for name in paths:
+        if deadline is not None and deadline - time.time() <= _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS:
+            break
+        path = Path(name)
+        alias = aliases.get(name)
+        if (alias or path).suffix.lower() != ".onnx_data":
+            continue
+        with suppress(OSError):
+            info = path.lstat()
+            key = (info.st_dev, info.st_ino)
+            if (
+                info.st_nlink > 1
+                and stat.S_ISREG(info.st_mode)
+                and key not in groups
+                and _onnx_weight_proof_allowed(alias or path, info.st_size, config)
+                and (alias is None or _weight_snapshot_alias_matches_blob(path, alias))
+            ):
+                identity = OnnxWeightProofIdentity.capture(path, info)
+                if identity is not None:
+                    groups[key] = _OnnxWeightHardlinks(path, identity, [])
+    return groups
+
+
+def _calculate_file_hash(
+    file_path: str,
+    *,
+    deadline: float | None = None,
+    onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity] | None = None,
+    onnx_weight_alias: Path | None = None,
+    weight_hardlinks: _OnnxWeightHardlinks | None = None,
+) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
     Deadline enforcement is best effort between synchronous reads. Distant
@@ -2708,6 +2794,25 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
             if not _file_stat_matches(opened_stat, path_stat_before, cross_view=True):
                 raise OSError(f"File changed before hashing: {file_path}")
 
+            proof_identity = None
+            weight_path = weight_hardlinks.weight_path if weight_hardlinks is not None else Path(file_path)
+            if (
+                onnx_weight_proofs is not None
+                and should_prove_large_onnx_weights(onnx_weight_alias or weight_path, opened_stat.st_size)
+                and (
+                    weight_hardlinks is None
+                    or (
+                        _file_stat_matches(opened_stat, weight_hardlinks.identity.stat, cross_view=True)
+                        and weight_hardlinks.identity.matches(weight_path)
+                    )
+                )
+                and (deadline is None or deadline - time.time() > _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS)
+                and (onnx_weight_alias is None or _weight_snapshot_alias_matches_blob(weight_path, onnx_weight_alias))
+            ):
+                proof_identity = OnnxWeightProofIdentity.capture(Path(file_path), path_stat_before)
+            key_probe = (
+                FlaxKeyAbsenceProbe.for_hash_stream(source, opened_stat.st_size) if proof_identity is not None else None
+            )
             hash_sha256 = hashlib.sha256()
             coarse_read_seconds: float | None = None
             calibration_read_seconds: float | None = None
@@ -2756,6 +2861,8 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                     calibration_read_seconds = read_elapsed
                     calibration_mode = True
                 hash_sha256.update(chunk)
+                if key_probe is not None:
+                    key_probe.observe(chunk)
 
             final_stat = os.fstat(source.fileno())
             path_stat_after = os.stat(file_path, follow_symlinks=False)
@@ -2763,6 +2870,15 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                 path_stat_before, path_stat_after
             ):
                 raise OSError(f"File changed while hashing: {file_path}")
+            if (
+                onnx_weight_proofs is not None
+                and proof_identity is not None
+                and key_probe is not None
+                and key_probe.excludes_keys(final_stat.st_size)
+                and proof_identity.matches(Path(file_path))
+                and (deadline is None or time.time() <= deadline)
+            ):
+                onnx_weight_proofs[(final_stat.st_dev, final_stat.st_ino)] = proof_identity
             return hash_sha256.hexdigest()
     finally:
         os.close(descriptor)
@@ -2820,6 +2936,7 @@ def _should_defer_hash_for_max_total_size(
     return hashed_bytes > max_total_size
 
 
+_CHANGED_WEIGHT_HARDLINK_PREFIX = "unhashable_changed_weight_hardlink_"
 _FILE_BACKED_HDF5_UNHASHABLE_PREFIX = "unhashable_file_backed_hdf5_"
 _FILE_BACKED_ONNX_UNHASHABLE_PREFIX = "unhashable_file_backed_onnx_"
 
@@ -2857,6 +2974,8 @@ def _hash_files_by_path(
     config: dict[str, Any] | None = None,
     routing_paths: dict[str, str] | None = None,
     hashed_identities: dict[str, dict[str, int]] | None = None,
+    onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity] | None = None,
+    onnx_weight_aliases: dict[str, Path] | None = None,
     deadline: float | None = None,
 ) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
@@ -2872,6 +2991,12 @@ def _hash_files_by_path(
     """
     content_hashes: dict[str, str] = {}
     hashes_by_inode: dict[tuple[int, int, int, int, int], str] = {}
+    weight_aliases = onnx_weight_aliases or {}
+    weight_groups = (
+        _find_onnx_weight_hardlinks(file_paths, config or {}, weight_aliases, deadline)
+        if onnx_weight_proofs is not None
+        else {}
+    )
     hashed_bytes = 0
 
     for file_path in file_paths:
@@ -2899,10 +3024,14 @@ def _hash_files_by_path(
             continue
         try:
             inode_key: tuple[int, int, int, int, int] | None = None
+            weight_group = None
             pre_hash_stat: os.stat_result | None = None
             try:
                 pre_hash_stat = os.stat(file_path, follow_symlinks=False)
                 if pre_hash_stat.st_nlink > 1:
+                    weight_group = weight_groups.get((pre_hash_stat.st_dev, pre_hash_stat.st_ino))
+                    if weight_group is not None:
+                        weight_group.hashed_paths.append(file_path)
                     inode_key = (
                         pre_hash_stat.st_dev,
                         pre_hash_stat.st_ino,
@@ -2930,7 +3059,23 @@ def _hash_files_by_path(
                 continue
             with suppress(OSError):
                 hashed_bytes += os.path.getsize(file_path)
-            content_hashes[file_path] = _calculate_file_hash(file_path, deadline=deadline)
+            weight_path = weight_group.weight_path if weight_group is not None else Path(file_path)
+            alias = weight_aliases.get(str(weight_path))
+            if (
+                onnx_weight_proofs is not None
+                and pre_hash_stat is not None
+                and _onnx_weight_proof_allowed(alias or weight_path, pre_hash_stat.st_size, hash_config)
+                and not _should_defer_hash_for_max_total_size(hash_config, hashed_bytes=hashed_bytes)
+            ):
+                content_hashes[file_path] = _calculate_file_hash(
+                    file_path,
+                    deadline=deadline,
+                    onnx_weight_proofs=onnx_weight_proofs,
+                    onnx_weight_alias=alias,
+                    weight_hardlinks=weight_group,
+                )
+            else:
+                content_hashes[file_path] = _calculate_file_hash(file_path, deadline=deadline)
             post_hash_stat = os.stat(file_path, follow_symlinks=False)
             if pre_hash_stat is None or any(
                 getattr(pre_hash_stat, field) != getattr(post_hash_stat, field)
@@ -2952,6 +3097,16 @@ def _hash_files_by_path(
             logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
             content_hashes[file_path] = f"unhashable_{id(file_path)}"
 
+    for inode, group in weight_groups.items():
+        if all(group.identity.matches(Path(path)) for path in group.hashed_paths):
+            continue
+        logger.warning("ONNX weight hard links changed during hashing; omitting their hashes")
+        for path in group.hashed_paths:
+            content_hashes[path] = f"{_CHANGED_WEIGHT_HARDLINK_PREFIX}{id(path)}"
+            if hashed_identities is not None:
+                hashed_identities.pop(path, None)
+        if onnx_weight_proofs is not None:
+            onnx_weight_proofs.pop(inode, None)
     return content_hashes
 
 
@@ -3283,6 +3438,7 @@ def scan_model_directory_or_file(
     reviewed_citation_aliases = set(rule_config.reviewed_citation_aliases)
     reviewed_citation_aliases.update(Path(alias) for alias in kwargs.pop(_DVC_REVIEWED_CITATION_ALIASES_CONFIG_KEY, ()))
     dvc_parent_file = kwargs.pop(_DVC_PARENT_FILE_CONFIG_KEY, None)
+    onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity] = {}
     dvc_remaining_total_size = kwargs.pop(_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY, None)
     dvc_total_size_limit = kwargs.pop(_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY, None)
     dvc_excluded_paths_value = kwargs.pop(_DVC_EXCLUDED_PATHS_CONFIG_KEY, ())
@@ -3562,6 +3718,7 @@ def scan_model_directory_or_file(
             directory_walk_covered_directories: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
             hf_onnx_alias_hash_sources: dict[str, str] = {}
+            weight_snapshot_aliases: dict[str, Path] = {}
             reported_traversal_targets: set[str] = set()
 
             # First pass: collect all file paths that need scanning
@@ -3882,7 +4039,7 @@ def scan_model_directory_or_file(
                         repository_inventory_files.append(repository_member)
                     snapshot_path = Path(file_path).absolute()
                     # Record every contributing name before directory deduplication chooses one scan.
-                    if rule_config.reviewed_citations and str(snapshot_path) != str(resolved_file):
+                    if str(snapshot_path) != str(resolved_file):
                         reviewed_citation_aliases.add(resolved_file)
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
@@ -3932,10 +4089,7 @@ def scan_model_directory_or_file(
                     if file.lower().endswith(".dvc"):
                         dvc_pointer_file = file_path
                         dvc_resolution = resolve_dvc_file_status(file_path)
-                        if rule_config.reviewed_citations:
-                            reviewed_citation_aliases.update(
-                                Path(alias) for alias in dvc_resolution.aliased_output_paths
-                            )
+                        reviewed_citation_aliases.update(Path(alias) for alias in dvc_resolution.aliased_output_paths)
                         if dvc_resolution.has_non_cap_gap:
                             _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
                             aggregate_hash_complete = False
@@ -3976,6 +4130,12 @@ def scan_model_directory_or_file(
                         is_hf_onnx_alias = route_hf_onnx_alias and target_path == scan_source
                         if is_hf_onnx_alias:
                             hf_onnx_alias_hash_sources[target_str] = str(resolved_file)
+                        if (
+                            is_hf_cache_symlink
+                            and target_path == resolved_file
+                            and snapshot_path.suffix.lower() == ".onnx_data"
+                        ):
+                            weight_snapshot_aliases[target_str] = snapshot_path
                         dedupe_target_str = (
                             str(resolved_file)
                             if (
@@ -4538,6 +4698,8 @@ def scan_model_directory_or_file(
                 hashed_identities_by_source: dict[str, dict[str, int]] = {}
                 hashes_by_source = _hash_files_by_path(
                     hash_sources,
+                    onnx_weight_aliases=weight_snapshot_aliases,
+                    onnx_weight_proofs=onnx_weight_proofs,
                     config=config,
                     routing_paths=routing_paths_by_source,
                     hashed_identities=hashed_identities_by_source,
@@ -4872,6 +5034,7 @@ def scan_model_directory_or_file(
                 if any(
                     content_hash.startswith(
                         (
+                            _CHANGED_WEIGHT_HARDLINK_PREFIX,
                             _FILE_BACKED_HDF5_UNHASHABLE_PREFIX,
                             _FILE_BACKED_ONNX_UNHASHABLE_PREFIX,
                             "unhashable_max_file_size_",
@@ -4957,7 +5120,14 @@ def scan_model_directory_or_file(
                                 and _openvino_xml_companion_key(openvino_owner) in covered_openvino_xml_companions
                             ):
                                 file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
-                            file_result = scan_file(representative_file, file_config)
+                            file_result = _scan_with_onnx_weight_proof(
+                                representative_file,
+                                file_config,
+                                onnx_weight_proofs,
+                                onnx_weight_alias=weight_snapshot_aliases.get(representative_file),
+                            )
+                            if file_result is None:
+                                file_result = scan_file(representative_file, file_config)
                             file_result.bytes_scanned += covered_openvino_companion_sizes.get(
                                 _openvino_xml_companion_key(Path(representative_file)),
                                 0,
@@ -5060,6 +5230,12 @@ def scan_model_directory_or_file(
                                 license_metadata = collect_license_metadata(
                                     scanned_file_path,
                                     nearby_license_cache=nearby_license_cache,
+                                    pickle_probe_limit=_pickle_license_probe_limit(
+                                        scanned_file_path,
+                                        file_result,
+                                        file_config,
+                                        over_total_budget=0 < max_total_size < results.bytes_scanned,
+                                    ),
                                 )
                             finally:
                                 _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
@@ -5178,8 +5354,7 @@ def scan_model_directory_or_file(
             if is_dvc_pointer:
                 dvc_resolution = resolve_dvc_file_status(path)
                 single_dvc_resolution = dvc_resolution
-                if rule_config.reviewed_citations:
-                    reviewed_citation_aliases.update(Path(alias) for alias in dvc_resolution.aliased_output_paths)
+                reviewed_citation_aliases.update(Path(alias) for alias in dvc_resolution.aliased_output_paths)
                 if dvc_resolution.has_non_cap_gap:
                     _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
                     aggregate_hash_complete = False
@@ -5426,9 +5601,18 @@ def scan_model_directory_or_file(
                 ):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
+                        target_size = 0
                         with suppress(OSError):
-                            top_level_hashed_bytes += os.path.getsize(target)
-                        file_hash = _calculate_file_hash(target)
+                            target_size = os.path.getsize(target)
+                            top_level_hashed_bytes += target_size
+                        if _onnx_weight_proof_allowed(Path(target), target_size, target_config) and not (
+                            _should_defer_hash_for_max_total_size(target_config, hashed_bytes=top_level_hashed_bytes)
+                        ):
+                            file_hash = _calculate_file_hash(
+                                target, deadline=start_time + timeout, onnx_weight_proofs=onnx_weight_proofs
+                            )
+                        else:
+                            file_hash = _calculate_file_hash(target)
                         if not is_dvc_pointer or file_hash not in file_hashes:
                             file_hashes.append(file_hash)
                     except Exception as e:
@@ -5438,7 +5622,9 @@ def scan_model_directory_or_file(
 
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
-                    file_result = scan_file(target, target_config)
+                    file_result = _scan_with_onnx_weight_proof(target, target_config, onnx_weight_proofs)
+                    if file_result is None:
+                        file_result = scan_file(target, target_config)
                 finally:
                     _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -5496,6 +5682,12 @@ def scan_model_directory_or_file(
                     license_metadata = collect_license_metadata(
                         target,
                         nearby_license_cache=nearby_license_cache,
+                        pickle_probe_limit=_pickle_license_probe_limit(
+                            target,
+                            file_result,
+                            target_config,
+                            over_total_budget=0 < max_total_size < results.bytes_scanned,
+                        ),
                     )
                 finally:
                     _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
@@ -6022,6 +6214,50 @@ def _preserve_hf_download_sidecar_asset(
     if scanner_selection_extensions is not None:
         return False
     return _has_hf_download_metadata_sidecar(path)
+
+
+def _scan_with_onnx_weight_proof(
+    path: str,
+    config: dict[str, Any],
+    onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity],
+    *,
+    onnx_weight_alias: Path | None = None,
+) -> ScanResult | None:
+    """Scan with verified weight evidence, or leave dispatch to the caller."""
+    file_path = Path(path)
+    if not onnx_weight_proofs or (onnx_weight_alias is None and file_path.suffix.lower() != ".onnx_data"):
+        return None
+    if onnx_weight_alias is not None and not _weight_snapshot_alias_matches_blob(file_path, onnx_weight_alias):
+        return None
+    try:
+        path_stat = file_path.lstat()
+    except OSError:
+        return None
+    identity = onnx_weight_proofs.get((path_stat.st_dev, path_stat.st_ino))
+    if identity is None:
+        return None
+    if not _onnx_weight_proof_allowed(
+        onnx_weight_alias or file_path, identity.stat.st_size, config
+    ) or not identity.matches(file_path):
+        return None
+    with onnx_weight_routing_proof(path, identity):
+        result = scan_file(path, config)
+    if not identity.matches(file_path) or (
+        onnx_weight_alias is not None and not _weight_snapshot_alias_matches_blob(file_path, onnx_weight_alias)
+    ):
+        reason = "onnx_weights_changed_during_scan"
+        result.add_check(
+            name="ONNX Weights Identity Check",
+            passed=False,
+            message="ONNX weights changed during scanning; routing coverage is incomplete.",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={"analysis_incomplete": True, "scan_outcome_reason": reason},
+        )
+        _mark_operational_scan_error(result, reason)
+        _mark_inconclusive_scan_outcome(result, reason)
+        result.finish(success=False)
+    return result
 
 
 @cached_scan()
@@ -7171,6 +7407,7 @@ def scan_model_streaming(
     hashed_stream_file_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
     hashed_stream_source_hashes_by_path: dict[Path, str] = {}
     hashed_stream_source_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
+    onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity] = {}
     counted_onnx_external_data_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     counted_onnx_external_data_targets: set[_FileTargetIdentityKey] = set()
     consumed_onnx_external_data_aliases: dict[Path, _FileTargetIdentityKey] = {}
@@ -7340,6 +7577,7 @@ def scan_model_streaming(
         track_stream_source: bool = False,
         skip_if_stream_source_seen: bool = False,
         skip_if_stream_target_seen: bool = False,
+        onnx_weight_alias: Path | None = None,
     ) -> str | None:
         """Hash one streamed source once before it can be deleted or consumed."""
         nonlocal aggregate_hash_complete, top_level_hashed_bytes
@@ -7386,7 +7624,21 @@ def scan_model_streaming(
             )
         with suppress(OSError):
             top_level_hashed_bytes += scan_path.stat().st_size
-        file_hash = compute_sha256_hash(scan_path)
+        if (
+            scan_path_identity is not None
+            and stat.S_ISREG(scan_path_identity.lstat[2])
+            and _onnx_weight_proof_allowed(
+                onnx_weight_alias or scan_path, _snapshot_file_size(scan_path_identity), scan_config
+            )
+        ):
+            file_hash = _calculate_file_hash(
+                str(scan_path),
+                deadline=start_time + timeout,
+                onnx_weight_proofs=onnx_weight_proofs,
+                onnx_weight_alias=onnx_weight_alias,
+            )
+        else:
+            file_hash = compute_sha256_hash(scan_path)
         file_hashes.append(file_hash)
         if scan_path_identity is not None:
             hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
@@ -7534,6 +7786,7 @@ def scan_model_streaming(
             if not is_precomputed_streamed_result and source_key in consumed_openvino_companions:
                 continue
             scan_path = source_path
+            onnx_weight_alias: Path | None = None
             pinned_scan_context: Any | None = None
             preserve_source_after_scan = is_precomputed_streamed_result
             openvino_scan_companion_path: Path | None = None
@@ -7664,6 +7917,8 @@ def scan_model_streaming(
                     )
                     if route_hf_onnx_alias:
                         scan_path = snapshot_path
+                    elif is_hf_cache_symlink and snapshot_path.suffix.lower() == ".onnx_data":
+                        onnx_weight_alias = snapshot_path
                 consumed_onnx_external_data_target = consumed_onnx_external_data_aliases.get(source_key)
                 if consumed_onnx_external_data_target is not None:
                     source_identity = _snapshot_file_identity(scan_path)
@@ -7763,7 +8018,7 @@ def scan_model_streaming(
                     **scan_kwargs,
                 }
                 rule_config = get_config()
-                if rule_config.reviewed_citations and (
+                if (
                     str(source_path.absolute()) != str(scan_path.absolute())
                     or (reported_source_path is not None and reported_source_path != str(source_path))
                     or _has_reviewed_citation_alias(scan_path.absolute(), rule_config.reviewed_citation_aliases)
@@ -7837,6 +8092,7 @@ def scan_model_streaming(
                     progress_label=source_path.name,
                     track_stream_source=True,
                     skip_if_stream_target_seen=suppress_consumed_onnx_external_data_accounting,
+                    onnx_weight_alias=onnx_weight_alias,
                 )
                 if openvino_scan_companion_path is not None:
                     append_streamed_openvino_companion_hash(
@@ -7897,12 +8153,28 @@ def scan_model_streaming(
                                 continue
                         external_data_hash = None
                         if not defer_hash_for_file_backed_onnx:
+                            hash_path = onnx_external_data_path
+                            hash_alias = None
+                            if (
+                                external_data_identity is not None
+                                and external_data_identity.resolved_path is not None
+                                and stat.S_ISLNK(external_data_identity.lstat[2])
+                                and _onnx_weight_proof_allowed(
+                                    hash_path, _snapshot_file_size(external_data_identity), scan_config
+                                )
+                            ):
+                                from .scanners.onnx_scanner import _is_trusted_huggingface_cache_external_alias
+
+                                blob = Path(external_data_identity.resolved_path)
+                                if _is_trusted_huggingface_cache_external_alias(scan_path, hash_path, blob):
+                                    hash_alias, hash_path = hash_path, blob
                             external_data_hash = append_streamed_file_hash(
-                                onnx_external_data_path,
+                                hash_path,
                                 scan_config,
                                 progress_label=onnx_external_data_path.name,
                                 skip_if_stream_source_seen=True,
                                 skip_if_stream_target_seen=True,
+                                onnx_weight_alias=hash_alias,
                             )
                         if external_data_target_key is not None and (
                             defer_hash_for_file_backed_onnx or external_data_hash is not None
@@ -7913,10 +8185,11 @@ def scan_model_streaming(
                 if progress_callback:
                     progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
-                scan_result = scan_file(
-                    str(scan_path),
-                    config=scan_config,
+                scan_result = _scan_with_onnx_weight_proof(
+                    str(scan_path), scan_config, onnx_weight_proofs, onnx_weight_alias=onnx_weight_alias
                 )
+                if scan_result is None:
+                    scan_result = scan_file(str(scan_path), config=scan_config)
                 if suppress_consumed_onnx_external_data_accounting:
                     scan_result.bytes_scanned = 0
                 openvino_sidecar_needs_independent_scan = (

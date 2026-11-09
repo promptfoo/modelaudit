@@ -1,4 +1,4 @@
-"""Recognize model repository metadata that shares the JSON dataset extension."""
+"""Determine whether model and dataset extensions are corroborated by their contents."""
 
 import json
 import math
@@ -95,6 +95,16 @@ def _read_metadata_bytes(path: Path, size_limit: int, *, follow_symlinks: bool =
         return raw if len(raw) == info.st_size else None
     except (OSError, ValueError):
         return None
+
+
+def is_pickled_training_dataset(path: Path, max_bytes: int | None = None) -> bool:
+    from ..detectors._metadata import has_pickled_training_rows
+
+    size_limit = _MAX_METADATA_BYTES if max_bytes is None else min(max_bytes, _MAX_METADATA_BYTES)
+    if size_limit <= 0:
+        return False
+    raw = _read_metadata_bytes(path, size_limit, follow_symlinks=False)
+    return raw is not None and has_pickled_training_rows(raw)
 
 
 def _nonnegative_integer(value: object) -> bool:

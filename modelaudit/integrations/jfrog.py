@@ -14,6 +14,7 @@ from typing import Any
 from ..models import ModelAuditResultModel
 from ..scanner_selection import SCANNER_SELECTION_CONFIG_KEY
 from ..utils.helpers.evidence import format_terminal_text
+from ..utils.sources import jfrog as _jfrog
 from ..utils.sources.jfrog import (
     _positive_limit,
     _require_size_within_limit,
@@ -21,7 +22,8 @@ from ..utils.sources.jfrog import (
     download_artifact,
     download_jfrog_folder,
 )
-from ..utils.sources.jfrog import format_size as format_size
+
+format_size = _jfrog.format_size
 
 logger = logging.getLogger(__name__)
 

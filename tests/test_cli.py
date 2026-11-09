@@ -649,17 +649,21 @@ def test_scan_reviewed_citations_explicit_json(
     policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
     args = ["scan", "--format", "json", "--no-cache", "--no-triage"]
 
-    def programmatic_severities() -> list[str]:
+    def programmatic_findings() -> list[tuple[str, bool]]:
         result = scan_model_directory_or_file(str(reviewed_readme), cache_enabled=False)
-        return [issue.severity.value for issue in result.issues if issue.rule_code == "S309"]
+        return [
+            (issue.severity.value, "reviewed_citation" in issue.details)
+            for issue in result.issues
+            if issue.rule_code == "S309"
+        ]
 
     # Use an already-running API caller so its context is independent of Click's.
     with ThreadPoolExecutor(max_workers=1) as pool:
-        assert pool.submit(programmatic_severities).result() == ["warning"]
+        assert pool.submit(programmatic_findings).result() == [("info", False)]
 
         def scan_while_peer_is_active(path: str, **kwargs: Any) -> ModelAuditResultModel:
             assert list(get_config().reviewed_citations.values()) == [reviewed_site]
-            assert pool.submit(programmatic_severities).result() == ["warning"]
+            assert pool.submit(programmatic_findings).result() == [("info", False)]
             return scan_model_directory_or_file(path, **kwargs)
 
         with monkeypatch.context() as patcher:
@@ -670,14 +674,20 @@ def test_scan_reviewed_citations_explicit_json(
 
     assert reviewed.exit_code == 0, reviewed.output
     report = parse_click_json_output(reviewed.output)
-    assert [i["severity"] for i in report["issues"] if i.get("rule_code") == "S309"] == ["info"]
+    assert [
+        (i["severity"], i["details"]["reviewed_citation"]["reason"])
+        for i in report["issues"]
+        if i.get("rule_code") == "S309"
+    ] == [("info", reviewed_site["reason"])]
     assert not get_config().reviewed_citations
-    assert programmatic_severities() == ["warning"]
+    assert programmatic_findings() == [("info", False)]
 
     ordinary = CliRunner().invoke(cli, [*args, str(reviewed_readme)], catch_exceptions=False)
-    assert ordinary.exit_code == 1, ordinary.output
+    assert ordinary.exit_code == 0, ordinary.output
     report = parse_click_json_output(ordinary.output)
-    assert [i["severity"] for i in report["issues"] if i.get("rule_code") == "S309"] == ["warning"]
+    assert [
+        (i["severity"], "reviewed_citation" in i["details"]) for i in report["issues"] if i.get("rule_code") == "S309"
+    ] == [("info", False)]
 
 
 @pytest.mark.parametrize(
@@ -822,7 +832,7 @@ def test_reviewed_citations_preserve_discovered_alias_warning(
                 (item["severity"], "reviewed_citation" in item["details"])
                 for item in observations
                 if Path(item["location"]).resolve() == independent
-            ] == [("info", True) if reviewed else ("warning", False)]
+            ] == [("info", reviewed)]
 
 
 def test_reviewed_citations_direct_dvc_output_remains_eligible(
@@ -914,7 +924,7 @@ def test_reviewed_citations_do_not_follow_aliased_dvc_pointer(
                 if item.get("rule_code") == "S309"
             } == {
                 (reviewed_readme, "warning", False),
-                (independent, "info" if reviewed else "warning", reviewed),
+                (independent, "info", reviewed),
             }
 
 
@@ -1009,14 +1019,22 @@ def test_scan_local_config_cannot_enable_reviewed_citations(
     store = TrustedConfigStore(root / "trust" / "local.json")
     monkeypatch.setattr(cli_module, "can_use_trusted_local_config", lambda output_format: output_format == "text")
     monkeypatch.setattr(cli_module, "get_trusted_config_store", lambda: store)
+
+    def scan_without_local_reviews(path: str, **kwargs: Any) -> ModelAuditResultModel:
+        assert not get_config().reviewed_citations
+        return scan_model_directory_or_file(path, **kwargs)
+
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_without_local_reviews)
     runner = CliRunner()
     args = ["scan", "--format", "text", "--no-cache", "--no-triage", str(reviewed_readme)]
     declined = runner.invoke(cli, args, input="n\n", catch_exceptions=False)
-    assert declined.exit_code == 1, declined.output
+    assert declined.exit_code == 0, declined.output
     assert "Found local ModelAudit config" in strip_ansi(declined.output)
+    assert reviewed_site["reason"] not in declined.output
     trusted = runner.invoke(cli, args, input="a\n", catch_exceptions=False)
-    assert trusted.exit_code == 1, trusted.output
+    assert trusted.exit_code == 0, trusted.output
     assert "Using local ModelAudit config" in strip_ansi(trusted.output)
+    assert reviewed_site["reason"] not in trusted.output
     assert store.store_path.exists()
 
 
@@ -1210,6 +1228,29 @@ def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_pat
     assert invocation["executionSuccessful"] is False
     assert invocation["exitCodeDescription"] == "No files were scanned"
     assert invocation["properties"]["filesScanned"] == 0
+
+
+def test_readme_network_examples_are_notes_in_json_and_sarif(tmp_path: Path) -> None:
+    readme = tmp_path / "README.en.md"
+    readme.write_text(
+        "# Loading an image\n\n```python\nfrom urllib.request import urlopen\n"
+        'image = urlopen("https://models.example.invalid/sample.png")\n```\n',
+        encoding="utf-8",
+    )
+    args = ["scan", str(readme), "--no-cache", "--no-triage", "--format"]
+    json_result = _run_cli_subprocess([*args, "json"])
+    assert json_result.returncode == 0, json_result.stderr
+    issues = json.loads(json_result.stdout)["issues"]
+    calls = [issue for issue in issues if issue["rule_code"] == "S302"]
+    assert calls and all(issue["severity"] == "info" for issue in calls)
+    assert any(issue["details"]["severity"] == "HIGH" for issue in calls)
+
+    sarif_result = _run_cli_subprocess([*args, "sarif"])
+    assert sarif_result.returncode == 0, sarif_result.stderr
+    run = json.loads(sarif_result.stdout)["runs"][0]
+    signal = [item for item in run["results"] if item["ruleId"] == "S302"]
+    assert signal and all(item["level"] == "note" for item in signal)
+    assert run["invocations"][0]["exitCode"] == 0
 
 
 def test_scan_sarif_subprocess_preserves_modelaudit_rule_codes() -> None:

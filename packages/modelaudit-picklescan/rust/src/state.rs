@@ -849,6 +849,10 @@ impl<'a> ScanState<'a> {
     }
 
     pub(crate) fn run(&mut self) {
+        self.run_with_encoded_probe(false);
+    }
+
+    fn run_with_encoded_probe(&mut self, encoded_probe: bool) {
         let scan_limit = self.scan_limit();
         if self.bytes_total == Some(0) || scan_limit == 0 {
             if self.bytes_total.is_some() && self.bytes_total != Some(0) {
@@ -886,6 +890,31 @@ impl<'a> ScanState<'a> {
                 };
 
                 if parsed.has_invalid_persistent_id() {
+                    // A speculative decoded frame followed only by constants and an invalid ID
+                    // does not establish a pickle boundary. Keep the parse failure and recovery.
+                    if encoded_probe
+                        && self.active_frame.is_some_and(|frame| frame.position == 0)
+                        && self.opcode_counts.keys().all(|name| {
+                            matches!(
+                                *name,
+                                "FRAME"
+                                    | "NONE"
+                                    | "NEWTRUE"
+                                    | "NEWFALSE"
+                                    | "INT"
+                                    | "BININT"
+                                    | "BININT1"
+                                    | "BININT2"
+                                    | "LONG"
+                                    | "LONG1"
+                                    | "LONG4"
+                                    | "FLOAT"
+                                    | "BINFLOAT"
+                            )
+                        })
+                    {
+                        self.remove_oversized_frame_warning(&format!("{} (pos 0)", self.source));
+                    }
                     self.handle_parse_error(
                         ParseError::new("protocol 0 persistent ID must be ASCII"),
                         index,
@@ -6930,6 +6959,21 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn remove_oversized_frame_warning(&mut self, location: &str) {
+        self.findings.retain(|finding| {
+            !(finding.rule_code == Some("STRUCTURAL_TAMPER")
+                && finding.message == "Pickle FRAME length exceeds remaining stream bytes"
+                && finding.location.as_deref() == Some(location))
+        });
+        self.notices.retain(|notice| {
+            !(notice.code == Some("oversized_frame")
+                && notice.message == "Pickle FRAME declares more bytes than remain in the stream"
+                && notice.location.as_deref() == Some(location))
+        });
+        self.rebuild_seen_finding_keys();
+        self.rebuild_seen_notice_keys();
+    }
+
     fn record_frame_boundary_overrun(
         &mut self,
         active_frame: ActiveFrame,
@@ -6941,19 +6985,8 @@ impl<'a> ScanState<'a> {
         } else {
             "next FRAME opcode"
         };
-        let location = Some(format!("{} (pos {})", self.source, active_frame.position));
-        self.findings.retain(|finding| {
-            !(finding.rule_code == Some("STRUCTURAL_TAMPER")
-                && finding.message == "Pickle FRAME length exceeds remaining stream bytes"
-                && finding.location == location)
-        });
-        self.notices.retain(|notice| {
-            !(notice.code == Some("oversized_frame")
-                && notice.message == "Pickle FRAME declares more bytes than remain in the stream"
-                && notice.location == location)
-        });
-        self.rebuild_seen_finding_keys();
-        self.rebuild_seen_notice_keys();
+        let location = format!("{} (pos {})", self.source, active_frame.position);
+        self.remove_oversized_frame_warning(&location);
         let details = vec![
             (
                 "position".to_string(),
@@ -6979,7 +7012,7 @@ impl<'a> ScanState<'a> {
         self.add_finding(Finding {
             message: format!("Pickle FRAME length crosses the {boundary_label}"),
             severity: "warning",
-            location: location.clone(),
+            location: Some(location.clone()),
             rule_code: Some("STRUCTURAL_TAMPER"),
             details: {
                 let mut finding_details = vec![(
@@ -6998,7 +7031,7 @@ impl<'a> ScanState<'a> {
                 "Pickle FRAME declares more bytes than remain before the {boundary_label}"
             ),
             severity: "info",
-            location,
+            location: Some(location),
             code: Some("oversized_frame"),
             details,
         });
@@ -7306,7 +7339,7 @@ impl<'a> ScanState<'a> {
             self.nested_depth + 1,
             Some(self.deadline),
         );
-        nested_scan.run();
+        nested_scan.run_with_encoded_probe(matches!(encoding, "base64" | "hex" | "escaped_hex"));
         // Nested imports join the parent even when nested invocation rows do not.
         // Preserve their complete execution proof before moving any child fields.
         self.template_execution_may_be_unmodeled |= !nested_scan.template_execution_is_complete();

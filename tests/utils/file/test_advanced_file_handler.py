@@ -1736,7 +1736,7 @@ class TestAdvancedFileHandler:
         restricted_paths = [str(shard_one.resolve())]
         expanded_paths = [str(shard_one.resolve()), str(shard_two.resolve())]
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             restricted = scan_advanced_large_file(
                 str(shard_one),
                 scanner,
@@ -1809,7 +1809,7 @@ class TestAdvancedFileHandler:
         )
         scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first = scan_advanced_large_file(str(shard_one), scanner)
             assert Counter(scanned_payloads) == Counter([b"one", b"two"])
             first_scan_count = len(scanned_payloads)
@@ -1857,7 +1857,7 @@ class TestAdvancedFileHandler:
 
         scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(tmp_path / "cache")})
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             absent = scan_advanced_large_file(str(shard_one), scanner)
             assert len(scanned_paths) == 2
             assert not any(check.name == "PyTorch Configuration Detection" for check in absent.checks)
@@ -2167,7 +2167,7 @@ class TestAdvancedFileHandler:
             lambda: True,
         )
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cache_manager = get_cache_manager(str(cache_dir), enabled=True)
             assert cache_manager.cache is not None
             original_hash_file = cache_manager.cache.hasher.hash_file
@@ -2233,7 +2233,7 @@ class TestAdvancedFileHandler:
             lambda: False,
         )
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first = scan_advanced_large_file(str(shard_one), scanner)
             shard_two.write_bytes(b"bad")
             second = scan_advanced_large_file(str(shard_one), scanner)
@@ -2287,7 +2287,7 @@ class TestAdvancedFileHandler:
             lambda: True,
         )
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cache = get_cache_manager(str(cache_dir), enabled=True).cache
             assert cache is not None
             scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
@@ -2350,7 +2350,7 @@ class TestAdvancedFileHandler:
             lambda: True,
         )
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             result = scan_advanced_large_file(str(shard_one), scanner)
             cache_manager = get_cache_manager(str(cache_dir), enabled=True)
             assert cache_manager.get_stats()["total_entries"] == 0

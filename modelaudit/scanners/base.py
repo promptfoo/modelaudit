@@ -292,7 +292,9 @@ class BaseScanner(ABC):
                     (
                         index
                         for index, candidate in enumerate(unmatched_entries)
-                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
+                        if entry.get("name") == candidate["name"]
+                        and entry.get("rule_code") == candidate["rule_code"]
+                        and ("severity" not in candidate or entry.get("severity") == candidate["severity"])
                     ),
                     None,
                 )
@@ -799,6 +801,8 @@ class BaseScanner(ABC):
         enable_check: bool = True,
         raise_on_error: bool = False,
         max_findings: int | None = None,
+        *,
+        complete_input: bool = True,
     ) -> list[dict[str, Any]]:
         """Collect embedded secret findings without creating checks."""
         if not enable_check or not self._get_bool_config("check_secrets", True):
@@ -812,7 +816,7 @@ class BaseScanner(ABC):
                 if detector_config is not None and not isinstance(detector_config, dict):
                     raise TypeError("secrets_config must be a mapping")
                 detector_config = {**(detector_config or {}), "max_findings": max_findings}
-            detector = SecretsDetector(detector_config)
+            detector = SecretsDetector(detector_config, complete_input=complete_input)
             findings = detector.scan_model_weights(data, context)
             return [dict(finding) for finding in findings]
 
@@ -833,6 +837,8 @@ class BaseScanner(ABC):
         findings: list[dict[str, Any]],
         result: ScanResult,
         context: str = "",
+        *,
+        readme_advisories: bool = False,
     ) -> int:
         """Emit explicit embedded secret checks from detector findings and return the count."""
         for finding in findings:
@@ -846,6 +852,20 @@ class BaseScanner(ABC):
                 finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
             )
             secret_rule_code = get_secret_rule_code(secret_descriptor)
+            why = finding.get("recommendation", "Remove sensitive data from model")
+            if readme_advisories and finding.get("secret_type") in {
+                "Bitcoin Address",
+                "Ethereum Address",
+                "Litecoin Address",
+            }:
+                from modelaudit.detectors.secrets import SECRET_PATTERNS
+
+                # Custom patterns can reuse a built-in display name for different evidence.
+                if (finding.get("pattern"), secret_descriptor) in SECRET_PATTERNS:
+                    if severity != IssueSeverity.INFO:
+                        severity = IssueSeverity.INFO
+                        finding = {**finding, "readme_severity_adjusted": True}
+                    why = "This is a public receiving address. Spending requires the corresponding private key."
 
             result.add_check(
                 name="Embedded Secrets Detection",
@@ -855,7 +875,7 @@ class BaseScanner(ABC):
                 severity=severity,
                 location=finding.get("context", context),
                 details=finding,
-                why=finding.get("recommendation", "Remove sensitive data from model"),
+                why=why,
             )
 
         if not findings and context and not self._raw_detector_failed(result, "embedded_secrets"):
@@ -1341,6 +1361,7 @@ class BaseScanner(ABC):
         context: str = "",
         *,
         reviewed_citations: dict[int, dict[str, Any]] | None = None,
+        readme_advisories: bool = False,
     ) -> int:
         """Emit explicit network communication checks from detector findings and return the count."""
         for index, finding in enumerate(findings):
@@ -1355,6 +1376,18 @@ class BaseScanner(ABC):
             }
             finding_severity = str(finding.get("severity", "WARNING")).upper()
             severity = severity_map.get(finding_severity, IssueSeverity.WARNING)
+            detector_severity = severity
+            if readme_advisories:
+                if finding.get("contains_credentials"):
+                    if severity in {IssueSeverity.INFO, IssueSeverity.DEBUG}:
+                        severity = IssueSeverity.WARNING
+                elif not finding.get("url_credential_check_incomplete") and severity in {
+                    IssueSeverity.WARNING,
+                    IssueSeverity.CRITICAL,
+                }:
+                    severity = IssueSeverity.INFO
+                if severity != detector_severity:
+                    finding = {**finding, "readme_severity_adjusted": True}
             network_indicator = " ".join(
                 str(part)
                 for part in [
@@ -1372,10 +1405,18 @@ class BaseScanner(ABC):
                 review = reviewed_citations[index]
                 finding = {
                     **finding,
-                    "reviewed_citation": {**review, "original_severity": severity.value},
+                    "reviewed_citation": {**review, "original_severity": detector_severity.value},
                     "check_consolidation_key": f"S309:{review['sha256']}:{review['position']}:{review['fingerprint']}",
                 }
                 severity = IssueSeverity.INFO
+            why = "Models should not contain network communication capabilities"
+            if readme_advisories and finding.get("contains_credentials"):
+                why = "This documentation contains a URL with credential material that readers can access."
+            elif finding.get("evidence_source") == "documentation":
+                why = (
+                    "This indicator appears in documentation. Any network access depends on how the documented "
+                    "code, configuration, or tools are used."
+                )
 
             result.add_check(
                 name="Network Communication Detection",
@@ -1385,12 +1426,7 @@ class BaseScanner(ABC):
                 severity=severity,
                 location=finding.get("context", context),
                 details=finding,
-                why=(
-                    "This indicator appears in documentation. Any network access depends on how the documented "
-                    "code, configuration, or tools are used."
-                    if finding.get("evidence_source") == "documentation"
-                    else "Models should not contain network communication capabilities"
-                ),
+                why=why,
             )
 
         if not findings and context and not self._raw_detector_failed(result, "network_communication"):

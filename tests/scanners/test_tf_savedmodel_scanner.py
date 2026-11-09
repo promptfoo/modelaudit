@@ -1099,7 +1099,7 @@ def test_oversized_protobuf_string_without_full_coverage_fails_closed(tmp_path: 
     )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregates = [
             scan_model_directory_or_file(
                 model_path,
@@ -1263,7 +1263,7 @@ def test_savedmodel_graph_node_budget_marks_scan_inconclusive(
     assert budget_checks[0].details["analysis_incomplete"] is True
     assert determine_exit_code(aggregate) == 2
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregates = [
             scan_model_directory_or_file(
                 str(model_path),

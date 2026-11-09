@@ -410,7 +410,7 @@ def test_scan_read_failure_is_inconclusive_not_security_finding(
     assert "torch7_read_failed" in direct.metadata["scan_outcome_reasons"]
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -453,7 +453,7 @@ def test_scan_string_extraction_limit_marks_late_torch7_payload_inconclusive(tmp
     assert budget_checks[0].details["analysis_incomplete"] is True
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = core.scan_model_directory_or_file(
             str(path),
             torch7_max_extracted_strings=2,

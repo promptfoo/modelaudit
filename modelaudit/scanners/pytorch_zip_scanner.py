@@ -1001,22 +1001,26 @@ class PyTorchZipScanner(BaseScanner):
         return True
 
     @staticmethod
-    def _is_legacy_torchscript_declaration(source: bytes) -> bool:
+    def _legacy_torchscript_parameters(source: bytes) -> frozenset[str] | None:
         source = source.removeprefix(b"op_version_set = 1\n")
         lines = source.split(b"\n")
         if len(lines) < 5 or lines[0] != b"class Module(Module):" or lines[2] != b"  __annotations__ = []" or lines[-1]:
-            return False
+            return None
         names = []
         for line in lines[3:-1]:
             match = re.fullmatch(rb'  __annotations__\["((?!__)[A-Za-z0-9_]+(?:[|.][A-Za-z0-9_]+)*)"\] = Tensor', line)
             if not match:
-                return False
+                return None
             names.append(match[1])
         parameters = b"".join(b'"' + name + b'", ' for name in names)
-        return len(set(names)) == len(names) and lines[1] == b"  __parameters__ = [" + parameters + b"]"
+        if len(set(names)) != len(names) or lines[1] != b"  __parameters__ = [" + parameters + b"]":
+            return None
+        return frozenset(name.decode("ascii") for name in names)
 
     @classmethod
-    def _read_legacy_torchscript_record(cls, archive: zipfile.ZipFile, entry: zipfile.ZipInfo, limit: int) -> bytes:
+    def _read_legacy_torchscript_record(
+        cls, archive: zipfile.ZipFile, entry: zipfile.ZipInfo, limit: int, *, stored_payload: bytes | None = None
+    ) -> bytes:
         if (
             entry.orig_filename != entry.filename
             or entry.file_size > limit
@@ -1025,6 +1029,14 @@ class PyTorchZipScanner(BaseScanner):
             or not cls._zip_payload_bounds_match(archive, entry)
         ):
             raise ValueError("Invalid legacy TorchScript record bounds")
+        if stored_payload is not None and entry.compress_type == zipfile.ZIP_STORED:
+            if (
+                len(stored_payload) != entry.file_size
+                or entry.compress_size != entry.file_size
+                or binascii.crc32(stored_payload) != entry.CRC
+            ):
+                raise ValueError("Legacy TorchScript stored record size or CRC mismatch")
+            return stored_payload
         # ZipExtFile truncates at the declared size. Probe past it so a forged
         # harmless prefix and matching CRC cannot hide appended code.
         probe = copy(entry)
@@ -1067,7 +1079,7 @@ class PyTorchZipScanner(BaseScanner):
                 ):
                     return False
                 source = self._read_legacy_torchscript_record(zip_file, entry, _TORCHSCRIPT_SOURCE_MAX_BYTES)
-                return self._is_legacy_torchscript_declaration(source)
+                return self._legacy_torchscript_parameters(source) is not None
             if _TORCHSCRIPT_DEBUG_PAYLOAD_MARKER not in debug_prefix:
                 return False
 
@@ -7720,12 +7732,11 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _repeated_trivial_stream_offset(sample: bytes, offset: int) -> int:
-        original_offset = offset
         sample_length = len(sample)
         while offset < sample_length:
             if offset + 2 <= sample_length and sample[offset : offset + 2] == b"N.":
                 offset += 2
-            elif offset < sample_length and sample[offset : offset + 1] == b"I":
+            elif sample[offset : offset + 1] == b"I":
                 match = _REPEATED_PROTO0_INT_STREAM_RE.match(sample, offset)
                 if match is None:
                     break
@@ -7734,7 +7745,7 @@ class PyTorchZipScanner(BaseScanner):
                 break
             while offset < sample_length and sample[offset] in PROTO0_1_IGNORABLE_TRAILING_BYTES:
                 offset += 1
-        return offset if offset != original_offset else original_offset
+        return offset
 
     @staticmethod
     def _repeated_none_stream_trailing(sample: bytes) -> bytes | None:
@@ -7799,6 +7810,269 @@ class PyTorchZipScanner(BaseScanner):
         self._check_cve_2022_45907_vulnerability(pytorch_version_info, result, path)
         self._check_cve_2024_5480_vulnerability(pytorch_version_info, result, path)
         self._check_cve_2024_48063_vulnerability(pytorch_version_info, result, path)
+
+    def _legacy_torchscript_global_positions(
+        self,
+        archive: zipfile.ZipFile,
+        info: zipfile.ZipInfo,
+        source_name: str,
+        data: bytes | None,
+        prove: Callable[..., frozenset[int]],
+    ) -> frozenset[int]:
+        # The scan's open_preflighted_zip already validated the central directory on this
+        # descriptor. Require a single, unprefixed generated layout; alternate loaders
+        # (e.g. mobile bytecode) can bind different methods for exactly the same data.pkl.
+        root = info.filename.removesuffix("data.pkl")
+        control_names = {
+            root + "version",
+            root + "constants.pkl",
+            info.filename,
+            source_name,
+            source_name + ".debug_pkl",
+        }
+        if any(name not in archive.NameToInfo for name in control_names):
+            return frozenset()
+        storage_prefix = root + "data/"
+        entries = archive.infolist()
+        if (
+            not entries
+            or len(entries) > self.max_archive_entries
+            or entries[0].header_offset != 0
+            or not self._zip_payload_bounds_match(archive, entries[0])
+            or not entries[0].filename.startswith(root)
+            or archive.getinfo(info.filename) is not info
+            or len({item.filename for item in entries}) != len(entries)
+        ):
+            return frozenset()
+        storage_sizes = {}
+        remaining_deflated_bytes = _TORCHSCRIPT_SOURCE_MAX_BYTES
+        for entry in entries:
+            name = entry.filename
+            if (
+                entry.orig_filename != name
+                or entry.extra
+                or stat.S_ISLNK(entry.external_attr >> 16)
+                or not name.isascii()
+                or not self._is_canonical_pytorch_zip_member_name(name)
+                or len(name) > 511  # PyTorch lists records through a 512-byte C buffer.
+            ):
+                return frozenset()
+            if name in control_names:
+                continue
+            key = name.removeprefix(storage_prefix)
+            if key == name or not self._is_ascii_decimal_digits(key):
+                return frozenset()
+            self._check_timeout()
+            if entry.compress_type == zipfile.ZIP_STORED:
+                if entry.file_size != entry.compress_size or not self._zip_payload_bounds_match(archive, entry):
+                    return frozenset()
+                with archive.open(entry):
+                    pass  # ZipFile also checks the local filename without reading storage payloads.
+            else:
+                self._read_legacy_torchscript_record(archive, entry, remaining_deflated_bytes)
+                remaining_deflated_bytes -= entry.file_size
+            storage_sizes[key] = entry.file_size
+        version = self._read_legacy_torchscript_record(archive, archive.getinfo(root + "version"), 2)
+        if (
+            version not in {b"1\n", b"2\n"}
+            or self._read_legacy_torchscript_record(archive, archive.getinfo(root + "constants.pkl"), 4)
+            != b"\x80\x02)."
+            or self._read_legacy_torchscript_record(
+                archive, archive.getinfo(source_name + ".debug_pkl"), len(_TORCHSCRIPT_LEGACY_DEBUG)
+            )
+            != _TORCHSCRIPT_LEGACY_DEBUG
+        ):
+            return frozenset()
+        parameters = self._legacy_torchscript_parameters(
+            self._read_legacy_torchscript_record(archive, archive.getinfo(source_name), _TORCHSCRIPT_SOURCE_MAX_BYTES)
+        )
+        if not parameters:
+            return frozenset()
+        return prove(
+            self._read_legacy_torchscript_record(archive, info, _TORCHSCRIPT_SOURCE_MAX_BYTES, stored_payload=data),
+            parameters,
+            storage_sizes,
+            archive_version=int(version),
+            max_opcodes=scan_options_from_config(self.config).max_opcodes,
+            deadline=time.monotonic() + self._get_remaining_time(),
+        )
+
+    def _bind_legacy_torchscript_root(
+        self,
+        archive: zipfile.ZipFile,
+        info: zipfile.ZipInfo,
+        member_name: str,
+        sub_result: ScanResult,
+        data: bytes | None,
+    ) -> None:
+        """Attribute loader-bound GLOBALs in the primary TorchScript data pickle."""
+        prove = getattr(_picklescan_api, "_declared_torchscript_global_positions", None)
+        coverage = sub_result.metadata.get("pickle_coverage")
+        # Embedded and concatenated streams share the member's import summary. Their
+        # GLOBAL offsets can collide with the primary control's loader-bound offsets.
+        if (
+            prove is None
+            or member_name.count("/") != 1
+            or not member_name.endswith("/data.pkl")
+            or not isinstance(coverage, dict)
+            or coverage.get("raw_scan_complete") is not True
+            or coverage.get("opcode_scan_complete") is not True
+            or sub_result.metadata.get("nested_opcode_counts") != {}
+            or sub_result.metadata.get("follow_on_opcode_counts") != {}
+        ):
+            return
+
+        def loader_reference(record: Check | Issue) -> bool:
+            details = record.details
+            if record.rule_code != "NON_ALLOWLISTED_GLOBAL" or details.get("opcode") != "GLOBAL":
+                return False
+            reference = details.get("import_reference")
+            if reference == "__torch__.Module":
+                return details.get("invoked") is True and details.get("position") == 2
+            if details.get("source_backed_import_initialization_untrusted") is not True:
+                return False
+            # The native unpickler handles tensor reconstruction and typed scalar-storage enums.
+            return reference == "torch._utils._rebuild_tensor_v2" or (
+                details.get("module") == "torch"
+                and details.get("name") in _PYTORCH_STORAGE_ITEM_SIZES
+                and details["name"] != "UntypedStorage"
+            )
+
+        def storage_constructor_graph(record: Check | Issue) -> bool:
+            details = record.details
+            reference = details.get("import_reference")
+            path = details.get("call_path")
+            return (
+                record.rule_code == "DANGEROUS_CALL_GRAPH"
+                and details.get("analysis") == "python_call_graph"
+                and details.get("opcode") == "GLOBAL"
+                and details.get("invocation_import_reference") is None
+                and details.get("module") == "torch"
+                and details.get("name") in _PYTORCH_STORAGE_ITEM_SIZES
+                and details.get("name") != "UntypedStorage"
+                and reference == f"torch.{details['name']}"
+                and isinstance(path, (tuple, list))
+                and len(path) >= 2
+                and path[0] in {f"{reference}.__init__", f"{reference}.__new__"}
+                and path[-1] == details.get("sink")
+            )
+
+        candidates = [
+            check
+            for check in sub_result.checks
+            if check.status == CheckStatus.FAILED and (loader_reference(check) or storage_constructor_graph(check))
+        ]
+        if not candidates or any(
+            "nested_source" in record.details
+            or "nested_encoding" in record.details
+            or "nested_has_execution_opcode" in record.details
+            for record in chain[Check | Issue](sub_result.checks, sub_result.issues)
+        ):
+            return
+        source_name = member_name.removesuffix("data.pkl") + "code/__torch__.py"
+        try:
+            positions = self._legacy_torchscript_global_positions(archive, info, source_name, data, prove)
+        except Exception as exc:
+            logger.debug("Could not bind TorchScript root %s to its archive declaration: %s", member_name, exc)
+            return
+        if not positions:
+            return
+        # Call-graph findings aggregate imports by symbol, so require every recorded
+        # occurrence to belong to the certified control stream before attributing one.
+        graph_references: set[str] = set()
+        if (
+            positions
+            and sub_result.metadata.get("import_references_truncated") is False
+            and sub_result.metadata.get("callable_invocations_truncated") is False
+        ):
+            certified = set(positions)
+            graph_references = PickleScanner._trusted_legacy_pytorch_storage_import_references(
+                sub_result,
+                {
+                    check.details["import_reference"]: certified
+                    for check in candidates
+                    if storage_constructor_graph(check)
+                },
+            )
+
+        def bound(record: Check | Issue) -> bool:
+            if loader_reference(record):
+                return record.details.get("position") in positions
+            return storage_constructor_graph(record) and record.details.get("import_reference") in graph_references
+
+        matching = [check for check in candidates if bound(check)]
+        if not matching:
+            return
+        self._remove_private_actionable_failed_check_entries(
+            sub_result,
+            [
+                {
+                    "name": check.name,
+                    "rule_code": check.rule_code or "",
+                    "severity": "critical" if check.rule_code == "DANGEROUS_CALL_GRAPH" else "warning",
+                }
+                for check in matching
+            ],
+        )
+        for check in matching:
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            reference = check.details["import_reference"]
+            check.details["torchscript_declaration"] = source_name
+            if check.rule_code == "DANGEROUS_CALL_GRAPH":
+                check.name = "TorchScript Storage Constructor Call Graph"
+                check.details.update(torchscript_native_resolution=True, pytorch_storage_type_operand=True)
+                check.message = (
+                    f"TorchScript uses {reference} as a storage type. The installed Python constructor "
+                    f"has a conditional call-graph path to {check.details['sink']}."
+                )
+                check.why = (
+                    "The native TorchScript loader decodes this type without invoking its Python constructor. "
+                    "The recorded path describes the installed Python implementation."
+                )
+            elif reference == "__torch__.Module":
+                check.message = "Constructs the TorchScript module declared by the archive"
+                check.why = "TorchScript resolves this class from the archive and restores its declared tensor slots."
+            else:
+                check.name = (
+                    "TorchScript Tensor Reconstruction"
+                    if reference == "torch._utils._rebuild_tensor_v2"
+                    else "TorchScript Storage Type"
+                )
+                check.details["torchscript_native_resolution"] = True
+                check.details["python_import_assessment_scope"] = "standalone_pickle"
+                check.message = f"Native TorchScript loader resolves {reference}"
+                check.why = (
+                    "The TorchScript loader handles this GLOBAL internally. "
+                    "Deserializing the control pickle separately uses Python import resolution."
+                )
+        sub_result.issues = [issue for issue in sub_result.issues if not bound(issue)]
+        actionable = sub_result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, [])
+        if (
+            graph_references
+            and sub_result.metadata.get("pickle_verdict") == "malicious"
+            and not sub_result.has_errors
+            and isinstance(actionable, list)
+            and all(isinstance(entry, dict) and entry.get("severity") == "warning" for entry in actionable)
+        ):
+            if actionable or sub_result.has_warnings:
+                sub_result.metadata["pickle_verdict"] = "suspicious"
+            elif (
+                sub_result.metadata.get("analysis_incomplete")
+                or sub_result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            ):
+                sub_result.metadata["pickle_verdict"] = "unknown"
+            else:
+                sub_result.metadata["pickle_verdict"] = "clean"
+        if (
+            not sub_result.has_errors
+            and not sub_result.has_warnings
+            and not sub_result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+            and not sub_result.metadata.get("analysis_incomplete")
+            and sub_result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+            and sub_result.metadata.get("pickle_verdict") == "suspicious"
+        ):
+            sub_result.metadata["pickle_verdict"] = "clean"
 
     def _scan_pickle_files(
         self,
@@ -7909,6 +8183,7 @@ class PyTorchZipScanner(BaseScanner):
                         pickle_source=pickle_source,
                         pickle_filename=name,
                     )
+            self._bind_legacy_torchscript_root(zip_file, info, name, sub_result, in_memory_pickle_data)
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
             if trusted_storage_keys is not None and in_memory_pickle_data is not None:

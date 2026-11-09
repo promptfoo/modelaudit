@@ -91,7 +91,6 @@ from pickle_test_helpers import (
 )
 
 import modelaudit_picklescan.api as package_api
-import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -101,6 +100,7 @@ from modelaudit_picklescan import (
     ScanOptions,
     ScanStatus,
     Severity,
+    call_graph,
     scan_bytes,
     scan_file,
 )
@@ -768,10 +768,6 @@ _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD = (
     b"q\x11h\x05\x86q\x12Rq\x13tq\x14b."
 )
 _MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
-
-
-_SHADOW_FRAMEWORK_MODULE = "transformers.training_args"
-_SHADOW_FRAMEWORK_NAME = "TrainingArguments"
 
 
 def _write_same_module_rebind_trusted_transformers_package(site_packages: Path) -> None:
@@ -2150,6 +2146,44 @@ def test_scan_bytes_preserves_nested_prefix_before_invalid_persid(
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "PERSID"
         for finding in report.findings
     )
+
+
+def test_scan_bytes_does_not_infer_nested_frame_from_invalid_persid() -> None:
+    # Tensor data can decode to FRAME and NONE followed by a non-ASCII persistent ID.
+    candidate = b"\x95" + (1000).to_bytes(8, "little") + b"NP\xff\n"
+    report = scan_bytes(pickle.dumps(base64.b64encode(candidate), protocol=4))
+
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
+    assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+    assert not any(finding.rule_code == "STRUCTURAL_TAMPER" for finding in report.findings)
+
+
+def test_scan_bytes_finds_encoded_executable_after_unconfirmed_frame() -> None:
+    invalid = b"\x95" + (1000).to_bytes(8, "little") + b"NP\xff\n"
+    candidate = invalid + b"!\x80\x04cposix\nsystem\n)R."
+    report = scan_bytes(pickle.dumps(base64.b64encode(candidate), protocol=4))
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_import_finding(report, "DANGEROUS_CALL", "posix.system")
+
+
+@pytest.mark.parametrize("opaque_operand", [b"P\xff", b"\x8a"], ids=["persistent-id", "integer"])
+def test_scan_bytes_keeps_opaque_encoded_frame_inconclusive(opaque_operand: bytes) -> None:
+    inner = b"\x80\x04\x8c\x08builtins\x8c\x04eval\x93\x8c\x031+1\x85R."
+    operand = opaque_operand + (bytes([len(inner)]) if opaque_operand == b"\x8a" else b"") + inner
+    tail = b"\n" if opaque_operand.startswith(b"P") else b"P\xff\n"
+    candidate = b"\x95" + (1000).to_bytes(8, "little") + operand + tail
+    report = scan_bytes(pickle.dumps(base64.b64encode(candidate), protocol=4))
+
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.MALICIOUS)
+    assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+
+
+def test_scan_bytes_preserves_encoded_extension_before_invalid_persid() -> None:
+    candidate = b"\x95" + (1000).to_bytes(8, "little") + b"\x82\x01P\xff\n"
+    report = scan_bytes(pickle.dumps(base64.b64encode(candidate), protocol=4))
+
+    assert any(finding.rule_code == "EXTENSION_REF" for finding in report.findings)
 
 
 def test_scan_bytes_resumes_after_invalid_persid_operand() -> None:

@@ -54,8 +54,10 @@ def test_public_modules_import_independently(module: str) -> None:
         [
             sys.executable,
             "-c",
-            "import importlib, pathlib, sys; module = importlib.import_module(sys.argv[1]); "
-            "assert pathlib.Path(module.__file__).resolve().is_relative_to(pathlib.Path.cwd())",
+            (
+                "import importlib, pathlib, sys; module = importlib.import_module(sys.argv[1]); "
+                "assert pathlib.Path(module.__file__).resolve().is_relative_to(pathlib.Path.cwd())"
+            ),
             module,
         ],
         cwd=Path(__file__).resolve().parents[1],
@@ -743,6 +745,64 @@ class TestModelAuditResultModel:
         result.issues = [issue, issue, issue]
         result.deduplicate_issues()
         assert len(result.issues) == 1
+
+    @pytest.mark.parametrize(
+        ("query1", "query2", "reported", "sarif_level"),
+        [
+            ("", "", IssueSeverity.INFO, "note"),
+            ("?api_key=fixture-one", "?api_key=fixture-two", IssueSeverity.WARNING, "warning"),
+        ],
+    )
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+    def test_readme_citation_and_command_keep_both_url_occurrences(
+        self, tmp_path: Path, query1: str, query2: str, reported: IssueSeverity, sarif_level: str, newline: str
+    ) -> None:
+        from modelaudit.core import scan_file, scan_model_directory_or_file
+        from modelaudit.integrations.sarif_formatter import format_sarif_output
+
+        url = "https://github.com/example/package"
+        content = (
+            f"Code is available on GitHub: [project]({url}{query1})\n\nModel documentation — examples.\n\n"
+            f"```sh\ncurl {url}{query2}\n```\n"
+        )
+        readme = tmp_path / "README.md"
+        payload = content.replace("\n", newline).encode("utf-8")
+        readme.write_bytes(payload)
+        url_bytes = url.encode("ascii")
+        expected_positions = [payload.index(url_bytes), payload.rindex(url_bytes)]
+
+        direct = scan_file(str(readme), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(readme), cache_enabled=False)
+        restored = ModelAuditResultModel.model_validate_json(aggregate.model_dump_json())
+        restored.deduplicate_issues()
+        for issues in (direct.issues, aggregate.issues, restored.issues):
+            occurrences = [i for i in issues if i.details.get("url") == url]
+            assert [i.details["position"] for i in occurrences] == expected_positions
+            assert [i.severity for i in occurrences] == [reported, reported]
+            assert [i.details["severity"] for i in occurrences] == ["INFO", "MEDIUM"]
+            assert len({i.details["evidence_fingerprint"] for i in occurrences}) == 2
+
+        sarif = json.loads(format_sarif_output(restored, [str(readme)]))
+        rows = [row for row in sarif["runs"][0]["results"] if row["properties"].get("url") == url]
+        assert [row["properties"]["position"] for row in rows] == expected_positions
+        assert [row["level"] for row in rows] == [sarif_level, sarif_level]
+        assert len({row["partialFingerprints"]["primaryLocationLineHash"] for row in rows}) == 2
+
+    def test_readme_advisories_without_network_fingerprints_use_offsets(self) -> None:
+        from modelaudit.integrations.sarif_formatter import format_sarif_output
+
+        aggregate = create_initial_audit_result()
+        mention = Issue(message="Network library found", severity=IssueSeverity.INFO, location="README.md")
+        advisories = [
+            mention.model_copy(update={"details": {"readme_severity_adjusted": True, "position": offset}})
+            for offset in (0, 80)
+        ]
+        # Exact duplicates collapse in either order. Unmarked reports keep their existing identity.
+        aggregate.issues = [*advisories, *reversed(advisories), mention, mention]
+        aggregate.deduplicate_issues()
+        assert aggregate.issues == [*advisories, mention]
+        rows = json.loads(format_sarif_output(aggregate, ["README.md"]))["runs"][0]["results"]
+        assert len({row["partialFingerprints"]["primaryLocationLineHash"] for row in rows}) == 3
 
     def test_dict_compat(self):
         """Test dictionary-like access."""

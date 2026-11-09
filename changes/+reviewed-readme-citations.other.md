@@ -1,1 +1,1 @@
-Operators can use `--reviewed-citations` to mark individual, previously reviewed README URL warnings as informational while retaining their evidence in the report.
+Operators can use `--reviewed-citations` to attach a review reason to an individual README URL occurrence. JSON and SARIF preserve the matched decision and the original detector severity.

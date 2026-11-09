@@ -2569,9 +2569,10 @@ def _resolve_scan_runtime_config(
     except ValueError as exc:
         raise click.BadParameter(str(exc)) from exc
     scan_config = cli_config
-    if reviewed_citations is not None:
+    if reviewed_citations is not None or citation_aliases:
         scan_config = cli_config.copy()
         scan_config.reviewed_citation_aliases = citation_aliases
+    if reviewed_citations is not None:
         try:
             scan_config.reviewed_citations = load_reviewed_citations(reviewed_citations)
         except ValueError as exc:
@@ -4746,10 +4747,7 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     citation_aliases: set[str] = set()
-    if reviewed_citations is None:
-        expanded_paths = _resolve_scan_paths(paths, scan_start_time)
-    else:
-        expanded_paths = _resolve_scan_paths(paths, scan_start_time, citation_aliases=citation_aliases)
+    expanded_paths = _resolve_scan_paths(paths, scan_start_time, citation_aliases=citation_aliases)
     huggingface_preview_paths: list[str] = []
     if dry_run:
         huggingface_preview_paths = [path for path in expanded_paths if _is_huggingface_dry_run_preview_path(path)]

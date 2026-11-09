@@ -5,10 +5,12 @@ import importlib
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from itertools import chain
+from pathlib import Path
 from types import ModuleType
-from typing import Any, Final
+from typing import Any, Final, TextIO
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from modelaudit.config.name_blacklist import check_model_name_policies
@@ -16,8 +18,10 @@ from modelaudit.core_results import mark_operational_scan_error, scan_result_has
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from ..utils._path_hardening import _file_stat_matches
 from ..utils.file.safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
 from . import base as scanner_base
+from ._archive_config import get_archive_depth
 from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
@@ -474,6 +478,7 @@ _TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3-{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
 )
 _PARSE_FAILED: Final = object()
+_HF_DOWNLOAD_RECORD: Final = object()
 _INI_SECTION_HEADER_RE = re.compile(r"^\s*\[[A-Za-z0-9_. -]+\]\s*(?:[#;].*)?(?:\r?\n|$)")
 
 
@@ -523,6 +528,41 @@ def _is_trusted_url_domain(url: str) -> bool:
         return True
 
     return any(host.endswith(f".{trusted}") for trusted in _TRUSTED_URL_SUBDOMAIN_SUFFIXES)
+
+
+def _matches_hf_download_metadata(path: Path, text: str, handle: TextIO) -> bool:
+    """Recognize the download record format on the same regular file used for manifest checks."""
+    # A protocol-0 GLOBAL can import a module even when the remaining stream is malformed.
+    if handle.newlines not in ("\n", "\r\n") or not re.fullmatch(
+        r"[0-9abdef][0-9a-f]{39}\n(?:[0-9a-f]{40}|[0-9a-f]{64})\n(?:0|[1-9][0-9]{0,15})\.[0-9]{1,16}\n",
+        text,
+    ):
+        return False
+    timestamp = text.splitlines()[-1]
+    if (
+        path.suffix != ".metadata"
+        or path.stem in {".", ".."}
+        or ".." in path.parts
+        or str(float(timestamp)) != timestamp
+    ):
+        return False
+    try:
+        path = path.absolute()
+        layout = (".cache", "huggingface", "download")
+        roots = [parent for parent in path.parents if tuple(p.lower() for p in parent.parts[-3:]) == layout]
+        if len(roots) != 1 or roots[0].parts[-3:] != layout or path.resolve(strict=True) != path:
+            return False
+        observed = os.fstat(handle.fileno())
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or getattr(observed, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            or not _file_stat_matches(observed, path.lstat(), cross_view=True)
+        ):
+            return False
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return True
 
 
 class ManifestScanner(BaseScanner):
@@ -640,6 +680,7 @@ class ManifestScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
         self._manifest_text_cache: dict[str, str] = {}
+        self._hf_download_records: set[str] = set()
 
         try:
             # Store the file path for use in issue locations
@@ -663,7 +704,25 @@ class ManifestScanner(BaseScanner):
             content = self._parse_file(path, ext, result)
             self._check_timeout()
 
-            if content is _PARSE_FAILED:
+            if content is _HF_DOWNLOAD_RECORD:
+                result.bytes_scanned = file_size
+                result.add_check(
+                    name="Hugging Face Download Metadata Coverage",
+                    passed=False,
+                    message=(
+                        "The scanned content matches the Hugging Face download metadata format. "
+                        "The record alone cannot verify the associated artifact."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "reason": "hf_download_artifact_unverified",
+                        "analysis_incomplete": True,
+                    },
+                    rule_code="S902",
+                )
+                self._mark_inconclusive_scan_result(result, "hf_download_artifact_unverified")
+            elif content is _PARSE_FAILED:
                 result.add_check(
                     name="Manifest Parse Coverage",
                     passed=False,
@@ -770,6 +829,7 @@ class ManifestScanner(BaseScanner):
             return result
         finally:
             self._manifest_text_cache.clear()
+            self._hf_download_records.clear()
 
         self._finish_manifest_result(result)
         return result
@@ -911,6 +971,8 @@ class ManifestScanner(BaseScanner):
         """Parse the file based on its extension"""
         try:
             content = self._read_manifest_text(path)
+            if path in getattr(self, "_hf_download_records", ()):
+                return _HF_DOWNLOAD_RECORD
 
             stripped_content = content.strip()
 
@@ -1445,6 +1507,14 @@ class ManifestScanner(BaseScanner):
 
         with open(path, encoding="utf-8") as f:
             content = f.read()
+            if (
+                path.endswith(".metadata")
+                and hasattr(self, "_hf_download_records")
+                and self.config.get("_trusted_source_provenance") is None
+                and get_archive_depth(self.config) == 0
+                and _matches_hf_download_metadata(Path(path), content, f)
+            ):
+                self._hf_download_records.add(path)
 
         if hasattr(self, "_manifest_text_cache"):
             self._manifest_text_cache[path] = content

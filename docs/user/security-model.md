@@ -37,7 +37,7 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 
 ### Reviewed README citations
 
-After reviewing a URL warning in a complete `README.md`, an operator can record that occurrence as informational in future scans. Supply the decision file explicitly in interactive scans and CI.
+An operator can attach a review reason to an exact S309 URL occurrence in a complete, non-executable `README.md`. Ordinary README links already report as informational. A matched review records the original detector severity and the operator’s decision in JSON and SARIF. URLs flagged for credential material or incomplete credential inspection stay ineligible. Supply the decision file explicitly in interactive scans and CI.
 
 ```bash
 modelaudit scan README.md --reviewed-citations /path/to/reviews.json --format json
@@ -82,6 +82,12 @@ or keep them in an audit/detail view rather than counting each row as a blocker.
 Some compatibility findings intentionally include a secondary rule-code row for
 dashboards that rely on older rule identifiers; these rows carry `supporting_rule_code=true` in details and
 should be excluded from primary issue counts when de-duplicating.
+
+In a README, ModelAudit reports documented network activity and public cryptocurrency
+receiving addresses as informational. JSON retains each detector's severity in the
+finding details alongside the reported severity and source location. Exposed credentials,
+including credentials in URLs, can still produce alerts. An incomplete scan can still
+exit with code 2.
 
 Exit codes:
 

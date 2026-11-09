@@ -16,6 +16,7 @@ from contextlib import suppress
 from functools import lru_cache
 from importlib.resources import files
 from io import BytesIO
+from itertools import pairwise
 from typing import Any, ClassVar
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
 
@@ -53,6 +54,12 @@ _SENSITIVE_PATH_KEY_PATTERN = re.compile(
     r")$",
     re.IGNORECASE,
 )
+# A path segment such as "auth" or "session" is also common in documentation URLs.
+_URL_CREDENTIAL_PATH_KEYS = frozenset(
+    {"api_key", "apikey", "x_api_key", "access_token", "refresh_token", "auth_token", "client_secret", "password"}
+)
+_URL_CREDENTIAL_MAX_CHARS = 64 * 1024
+_URL_CREDENTIAL_MAX_FIELDS = 256
 _URL_ASSIGNMENT_PREFIX_PATTERN = re.compile(
     rb"(?:\"\"\"|'''|[\"'])?\s*[:=]\s*(?:[rRuUbBfF]{0,3})?(?:\"\"\"|'''|[\"'])?\s*"
 )
@@ -528,6 +535,10 @@ def _is_public_model_revision_segment(hostname: str, segments: list[str], index:
     if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or index == 0:
         return False
     return segments[index - 1].lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS
+
+
+def _is_public_source_repository_url(hostname: str, path_segments: list[str]) -> bool:
+    return hostname in {"github.com", "www.github.com"} and len(path_segments) == 2 and all(path_segments)
 
 
 def _is_public_source_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
@@ -1103,6 +1114,54 @@ def redact_url_for_finding(url: str) -> str:
 
     safe_path = _redact_url_path_tokens(scheme, raw_hostname.lower(), parsed.path)
     return urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
+
+
+def url_contains_credentials(url: str, *, redacted_url: str | None = None) -> bool | None:
+    """Inspect the original URL within fixed budgets. None means credential status is undetermined."""
+    if len(url) > _URL_CREDENTIAL_MAX_CHARS:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+
+    # A username identifies an account. A password or a recognizable token can authenticate as one.
+    username = unquote(parsed.username or "")
+    if parsed.password or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(username):
+        return True
+
+    # Redaction is deliberately broader than detection: a long citation slug alone is not a credential.
+    if _REDACTED_PATH_TOKEN in (redacted_url if redacted_url is not None else redact_url_for_finding(url)):
+        host = parsed.hostname or ""
+        if host == "hooks.slack.com" and re.fullmatch(r"/services/[^/]+/[^/]+/[A-Za-z0-9_-]+", parsed.path):
+            return True
+        parts = re.split(r"[/;=:]", _decode_path_token(parsed.path))
+        if any(_SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(part) for part in (*host.split("."), *parts) if part):
+            return True
+        if not _is_public_source_repository_url(host, parsed.path.strip("/").split("/")):
+            for part, value in pairwise(parts):
+                if part.casefold().replace("-", "_") in _URL_CREDENTIAL_PATH_KEYS:
+                    name = value.casefold().rstrip(_TRAILING_PATH_DELIMITERS)
+                    if (
+                        name
+                        and name not in {"readme", "guide"}
+                        and not name.endswith((".md", ".markdown", ".rst", ".txt", ".html", ".htm", ".adoc"))
+                    ):
+                        return True
+
+    complete = True
+    for component in (parsed.query, parsed.fragment.replace("?", "&", 1)):
+        try:
+            fields = parse_qsl(
+                _URL_COMPONENT_SEPARATOR_PATTERN.sub("&", component), max_num_fields=_URL_CREDENTIAL_MAX_FIELDS
+            )
+        except ValueError:
+            complete = False
+            continue
+        for key, value in fields:
+            if _is_sensitive_path_key(key) or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(value):
+                return True
+    return False if complete else None
 
 
 def _redact_network_evidence(text: str) -> str:
@@ -2895,14 +2954,6 @@ def _is_valid_official_readme_sample_image_example(
         operation_statement = operation_membership[3]
         reference_statement = reference_membership[3]
         return binding_precedes_reference_in_supported_body(reference_statement, operation_statement)
-
-    def is_direct_expression_call(call: ast.Call) -> bool:
-        call_membership = direct_statement_membership(call)
-        return (
-            call_membership is not None
-            and isinstance(call_membership[3], ast.Expr)
-            and call_membership[3].value is call
-        )
 
     def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
         if is_supported_direct_eager_call(call) and operation_definitely_follows_reference(operation, call):
@@ -5522,7 +5573,8 @@ class NetworkCommDetector:
         elif self._is_cloud_storage_url(url):
             severity = "INFO"
 
-        return self._record_finding(
+        return self._record_url_evidence(
+            url,
             {
                 "type": "url_detected",
                 "severity": severity,
@@ -5531,8 +5583,16 @@ class NetworkCommDetector:
                 "url": safe_url,
                 "position": position,
                 "context": context,
-            }
+            },
         )
+
+    def _record_url_evidence(self, url: str, finding: dict[str, Any]) -> bool:
+        contains_credentials = url_contains_credentials(url, redacted_url=finding["url"])
+        if contains_credentials:
+            finding["contains_credentials"] = True
+        elif contains_credentials is None:
+            finding["url_credential_check_incomplete"] = True
+        return self._record_finding(finding)
 
     def _url_uses_suspicious_port(self, url: str) -> bool:
         with suppress(ValueError):
@@ -5593,7 +5653,7 @@ class NetworkCommDetector:
                 or extension in {"py", "sh", "bash", "ps1", "exe", "dll", "so", "js"}
             ):
                 return None
-        if self._is_public_source_repository_url(hostname, path_segments):
+        if _is_public_source_repository_url(hostname, path_segments):
             return "source_repository"
         if self._is_public_model_repository_url(hostname, path_segments):
             return "model_repository"
@@ -5608,12 +5668,6 @@ class NetworkCommDetector:
         if hostname.startswith(self.INFORMATIONAL_URL_HOST_PREFIXES):
             return "documentation"
         return None
-
-    @staticmethod
-    def _is_public_source_repository_url(hostname: str, path_segments: list[str]) -> bool:
-        if hostname not in {"github.com", "www.github.com"}:
-            return False
-        return len(path_segments) == 2 and all(path_segments)
 
     @staticmethod
     def _is_public_model_repository_url(hostname: str, path_segments: list[str]) -> bool:
@@ -5679,7 +5733,8 @@ class NetworkCommDetector:
                     severity = "WARNING"
                     confidence = 0.95
 
-                if not self._record_finding(
+                if not self._record_url_evidence(
+                    url,
                     {
                         "type": "cloud_storage_url",
                         "severity": severity,
@@ -5690,7 +5745,7 @@ class NetworkCommDetector:
                         "description": description,
                         "position": match.start(),
                         "context": context,
-                    }
+                    },
                 ):
                     return
 

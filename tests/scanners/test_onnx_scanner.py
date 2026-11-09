@@ -41262,7 +41262,7 @@ class _RawControlFixtureProxy:
             while frame is not None:
                 if frame.f_code.co_name in {"constant_int64_vector_values", "constant_scalar_value"}:
                     self.serialization_attempts.append(name)
-                    raise AssertionError("A control decoder must not serialize a model or tensor for admission")
+                    raise AttributeError(f"Serialization accessor {name!r} is unavailable during control admission")
                 frame = frame.f_back
         return getattr(self.owner, name)
 
@@ -43286,7 +43286,7 @@ class _OnnxFingerprintPayloadSentinel:
             "graphs",
         }:
             object.__getattribute__(self, "accesses").append(name)
-            raise AssertionError("Fingerprint attempted a payload accessor")
+            raise AttributeError(f"Payload accessor {name!r} is unavailable for fingerprinting")
         return object.__getattribute__(self, name)
 
     def __repr__(self) -> str:
