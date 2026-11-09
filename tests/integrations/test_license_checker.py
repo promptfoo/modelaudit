@@ -9,7 +9,7 @@ import pytest
 from pydantic import HttpUrl
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.integrations import license_checker
+from modelaudit.integrations import dataset_license, license_checker
 from modelaudit.integrations.license_checker import (
     _LICENSE_HEADER_MAX_BYTES,
     CopyrightInfo,
@@ -333,6 +333,36 @@ class TestLicenseFiles:
 
 class TestUnlicensedDatasetDetection:
     """Test detection of unlicensed datasets."""
+
+    @pytest.mark.parametrize(("byte_limit", "token_limit"), [(128, 200_000), (512, 4)], ids=["bytes", "tokens"])
+    def test_large_safetensors_index_requires_complete_weight_map_proof(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, byte_limit: int, token_limit: int
+    ) -> None:
+        monkeypatch.setattr(dataset_license, "_MAX_METADATA_BYTES", byte_limit)
+        monkeypatch.setattr(dataset_license, "_MAX_METADATA_TOKENS", token_limit)
+        monkeypatch.setattr(dataset_license, "INDEX_PROBE_BYTES", 1024)
+        path = tmp_path / "model.safetensors.index.json"
+        weights = {f"model.layers.{i}.mlp.weight": "model-00001-of-00002.safetensors" for i in range(5)}
+        index = {"weight_map": weights}
+        path.write_text(json.dumps(index))
+
+        assert 128 < path.stat().st_size < 512
+        assert collect_license_metadata(str(path))["is_dataset"] is False
+        assert detect_unlicensed_datasets([str(path)]) == []
+
+        for ambiguous in (
+            json.dumps({**index, "examples": [{"prompt": "training data"}]}),
+            '{"weight_map":{},' + json.dumps(index)[1:],
+            json.dumps(index) + " " * 1024,
+        ):
+            path.write_text(ambiguous)
+            assert collect_license_metadata(str(path))["is_dataset"] is True
+            assert detect_unlicensed_datasets([str(path)]) == [str(path)]
+
+    def test_small_index_with_nested_shard_paths_is_still_metadata(self, tmp_path: Path) -> None:
+        path = tmp_path / "model.safetensors.index.json"
+        path.write_text(json.dumps({"weight_map": {"encoder/w": "shards/model.safetensors"}}))
+        assert collect_license_metadata(str(path))["is_dataset"] is False
 
     def test_detect_unlicensed_csv(self, tmp_path):
         """Test detection of unlicensed CSV file."""

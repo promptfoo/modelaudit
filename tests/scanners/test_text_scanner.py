@@ -5125,6 +5125,7 @@ def test_text_scanner_documentation_cc_markers_remain_actionable(tmp_path: Path)
     [
         "SSH uses port 22.\n",
         "Local demo: http://localhost:8080\n",
+        "The server speaks the OpenAI chat API on port 8080.\n",
     ],
 )
 def test_text_scanner_documentation_port_prose_is_informational(tmp_path: Path, content: str) -> None:
@@ -5138,12 +5139,25 @@ def test_text_scanner_documentation_port_prose_is_informational(tmp_path: Path, 
         if check.name == "Network Communication Detection" and check.details.get("type") == "suspicious_port"
     ]
     assert port_checks
-    assert all(check.severity == IssueSeverity.INFO for check in port_checks)
+    for check in port_checks:
+        port = check.details["port"]
+        assert check.severity == IssueSeverity.INFO
+        assert check.message == check.details["message"] == f"Documentation mentions port {port}"
+        assert check.details["evidence_source"] == "documentation"
+        assert check.details["position"] == content.encode().index(str(port).encode())
+        assert check.rule_code == "S310"
     assert determine_exit_code(aggregate) == 0
 
 
-def test_text_scanner_documentation_port_assignment_remains_actionable(tmp_path: Path) -> None:
-    _assert_documentation_network_actionable(tmp_path, "PORT=4444\n", "suspicious_port")
+@pytest.mark.parametrize("content", ["PORT=4444\n", "curl http://localhost:4444/status\n"])
+def test_text_scanner_documentation_actionable_port_keeps_warning(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "README.md"
+    result = _scan_text_content(path, content)
+    port = next(check for check in result.checks if check.details.get("type") == "suspicious_port")
+    assert port.severity == IssueSeverity.WARNING
+    assert port.message == port.details["message"] == "Suspicious port detected: 4444"
+    assert port.rule_code == "S310"
+    assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 1
 
 
 def test_text_scanner_later_port_assignment_is_not_hidden_by_prose(tmp_path: Path) -> None:

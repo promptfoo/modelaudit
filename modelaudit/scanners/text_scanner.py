@@ -3800,7 +3800,13 @@ class TextScanner(BaseScanner):
         standalone: dict[int, dict[str, Any]] = {}
         for index, finding in enumerate(findings):
             finding = {**finding, "evidence_source": "documentation"}
-            if finding.get("type") == "url_detected" and isinstance(url := finding.get("url"), str):
+            if (
+                finding.get("type") == "suspicious_port"
+                and finding.get("severity") == "INFO"
+                and isinstance(port := finding.get("port"), int)
+            ):
+                finding["message"] = f"Documentation mentions port {port}"
+            elif finding.get("type") == "url_detected" and isinstance(url := finding.get("url"), str):
                 finding["message"] = f"URL detected in documentation: {url[:100]}"
             evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences, line_lookup)
             if evidence is None:
