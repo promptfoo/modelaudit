@@ -930,8 +930,6 @@ mod tests {
             ("unittest.loader", "defaultTestLoader.discover"),
             ("unittest.loader", "TestLoader.loadTestsFromName"),
             ("unittest.loader", "TestLoader.loadTestsFromNames"),
-        ]);
-        assert_critical_globals(&[
             ("unittest.mock", "Mock"),
             ("unittest.mock", "MagicMock"),
             ("unittest.mock", "_get_target"),
@@ -1093,31 +1091,27 @@ mod tests {
         ] {
             assert!(!global_import_requires_review(module, "KnownSafe"));
         }
-        assert!(!global_import_requires_review(
-            "_xxsubinterpreters",
-            "run_string"
-        ));
-        assert!(!global_import_requires_review("dotenv.main", "set_key"));
-        assert!(global_import_requires_review(
-            "_xxsubinterpreters",
-            "create"
-        ));
-        assert!(global_import_requires_review(
-            "_xxsubinterpreters",
-            "Gadget"
-        ));
-        assert!(global_import_requires_review("dotenv.main", "Gadget"));
-        assert!(global_import_requires_review(
-            "modelaudit_custom_payload",
-            "Gadget"
-        ));
-        assert!(global_import_requires_review("numpy.evil", "Gadget"));
-        assert!(global_import_requires_review("torch.evil", "Gadget"));
-        assert!(global_import_requires_review("vendor.package", "Gadget"));
-        assert!(!global_import_requires_review("copy_reg", "_reconstructor"));
-        assert!(global_import_requires_review("copy_reg", "Gadget"));
-        assert!(!global_import_requires_review("exceptions", "ValueError"));
-        assert!(global_import_requires_review("exceptions", "Gadget"));
+        for (module, name, requires_review) in [
+            ("_xxsubinterpreters", "run_string", false),
+            ("dotenv.main", "set_key", false),
+            ("_xxsubinterpreters", "create", true),
+            ("_xxsubinterpreters", "Gadget", true),
+            ("dotenv.main", "Gadget", true),
+            ("modelaudit_custom_payload", "Gadget", true),
+            ("numpy.evil", "Gadget", true),
+            ("torch.evil", "Gadget", true),
+            ("vendor.package", "Gadget", true),
+            ("copy_reg", "_reconstructor", false),
+            ("copy_reg", "Gadget", true),
+            ("exceptions", "ValueError", false),
+            ("exceptions", "Gadget", true),
+        ] {
+            assert_eq!(
+                global_import_requires_review(module, name),
+                requires_review,
+                "{module}.{name}"
+            );
+        }
         assert_eq!(global_severity("commands", "getoutput"), Some("critical"));
         assert_eq!(global_severity("urllib2", "urlopen"), Some("critical"));
     }

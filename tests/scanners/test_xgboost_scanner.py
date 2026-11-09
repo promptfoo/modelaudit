@@ -462,6 +462,21 @@ def _assert_no_xgboost_s1004(result: ModelAuditResultModel) -> None:
     assert not any(issue.rule_code == "S1004" for issue in result.issues)
 
 
+def _assert_sentencepiece_scans_cleanly(tmp_path: Path, payload: bytes) -> None:
+    tokenizer_model = tmp_path / "tokenizer.model"
+    tokenizer_model.write_bytes(payload)
+
+    direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
+
+    assert direct.success is True
+    assert direct.scanner_name == "unknown"
+    _assert_no_xgboost_s1004(aggregate)
+    _assert_no_xgboost_s1004(streaming)
+    assert cli_result.exit_code == 0
+    assert "xgboost" not in cli_payload.get("scanner_names", [])
+    assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+
 def _assert_xgboost_s1004(result: ModelAuditResultModel) -> None:
     assert "xgboost" in result.scanner_names
     assert determine_exit_code(result) == 2
@@ -2249,34 +2264,12 @@ class TestXGBoostFailClosedEndToEnd:
         self, tmp_path: Path
     ) -> None:
         # Synthetic regression for HuggingFaceH4/zephyr-7b-beta@892b3d7... tokenizer.model.
-        tokenizer_model = tmp_path / "tokenizer.model"
-        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_default_unknown_metadata())
-
-        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
-
-        assert direct.success is True
-        assert direct.scanner_name == "unknown"
-        _assert_no_xgboost_s1004(aggregate)
-        _assert_no_xgboost_s1004(streaming)
-        assert cli_result.exit_code == 0
-        assert "xgboost" not in cli_payload.get("scanner_names", [])
-        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+        _assert_sentencepiece_scans_cleanly(tmp_path, _sentencepiece_model_proto_with_default_unknown_metadata())
 
     def test_sentencepiece_model_with_repeated_trainer_spec_merge_is_not_xgboost_false_positive(
         self, tmp_path: Path
     ) -> None:
-        tokenizer_model = tmp_path / "tokenizer.model"
-        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_split_trainer_spec_metadata())
-
-        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
-
-        assert direct.success is True
-        assert direct.scanner_name == "unknown"
-        _assert_no_xgboost_s1004(aggregate)
-        _assert_no_xgboost_s1004(streaming)
-        assert cli_result.exit_code == 0
-        assert "xgboost" not in cli_payload.get("scanner_names", [])
-        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+        _assert_sentencepiece_scans_cleanly(tmp_path, _sentencepiece_model_proto_with_split_trainer_spec_metadata())
 
     @pytest.mark.parametrize("archive_kind", ["zip", "tar", "gz"])
     def test_archived_sentencepiece_repeated_trainer_spec_merge_is_not_xgboost_false_positive(
@@ -2302,34 +2295,12 @@ class TestXGBoostFailClosedEndToEnd:
     def test_sentencepiece_model_with_trainer_varint_field_52_is_not_xgboost_false_positive(
         self, tmp_path: Path
     ) -> None:
-        tokenizer_model = tmp_path / "tokenizer.model"
-        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_varint_field_52())
-
-        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
-
-        assert direct.success is True
-        assert direct.scanner_name == "unknown"
-        _assert_no_xgboost_s1004(aggregate)
-        _assert_no_xgboost_s1004(streaming)
-        assert cli_result.exit_code == 0
-        assert "xgboost" not in cli_payload.get("scanner_names", [])
-        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+        _assert_sentencepiece_scans_cleanly(tmp_path, _sentencepiece_model_proto_with_trainer_varint_field_52())
 
     def test_sentencepiece_model_with_trainer_string_field_54_is_not_xgboost_false_positive(
         self, tmp_path: Path
     ) -> None:
-        tokenizer_model = tmp_path / "tokenizer.model"
-        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_string_field_54())
-
-        direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
-
-        assert direct.success is True
-        assert direct.scanner_name == "unknown"
-        _assert_no_xgboost_s1004(aggregate)
-        _assert_no_xgboost_s1004(streaming)
-        assert cli_result.exit_code == 0
-        assert "xgboost" not in cli_payload.get("scanner_names", [])
-        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+        _assert_sentencepiece_scans_cleanly(tmp_path, _sentencepiece_model_proto_with_trainer_string_field_54())
 
     def test_large_real_sentencepiece_model_shape_is_not_tensorflow_or_xgboost_false_positive(
         self, tmp_path: Path

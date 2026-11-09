@@ -28,10 +28,11 @@ class TestCacheCLI:
             assert "Total entries: 0" in result.output
             assert "Hit rate: 0.0%" in result.output
 
-    def test_cache_clear_dry_run(self):
+    def test_cache_clear_dry_run(self, tmp_path: Path) -> None:
         """Test cache clear dry run."""
         runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "clear", "--dry-run"])
+        with patch.object(Path, "home", return_value=tmp_path):
+            result = runner.invoke(cli, ["cache", "clear", "--dry-run"])
 
         assert result.exit_code == 0
         assert "Would clear" in result.output
@@ -75,10 +76,11 @@ class TestCacheCLI:
         result = runner.invoke(cli, ["cache", "stats", "--cache-dir", str(cache_dir)])
         assert "Total entries: 0" in result.output
 
-    def test_cache_cleanup_dry_run(self):
+    def test_cache_cleanup_dry_run(self, tmp_path: Path) -> None:
         """Test cache cleanup dry run."""
         runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "cleanup", "--dry-run", "--max-age", "7"])
+        with patch.object(Path, "home", return_value=tmp_path):
+            result = runner.invoke(cli, ["cache", "cleanup", "--dry-run", "--max-age", "7"])
 
         assert result.exit_code == 0
         assert "Would cleanup cache entries older than 7 days" in result.output
