@@ -407,40 +407,24 @@ class TestErrorScenarios:
             # Restore permissions for cleanup
             os.chmod(str(restricted_file), 0o644)
 
-    @pytest.mark.slow
     def test_network_file_timeout_simulation(self, tmp_path):
-        """Test timeout handling for slow file operations.
+        """Report an I/O timeout while opening an otherwise scannable file."""
+        import pickle
 
-        Note: This test is marked as slow because mocking builtins.open
-        with a delay can cause the scanner to call open() many times,
-        accumulating significant delays.
-        """
         slow_file = tmp_path / "slow.joblib"
-
-        with open(slow_file, "wb") as f:
-            f.write(b"joblib")
-            import pickle
-
-            pickle.dump({"data": "test"}, f)
-
+        slow_file.write_bytes(b"joblib" + pickle.dumps({"data": "test"}))
         scanner = PickleScanner()
+        control = scanner.scan(str(slow_file))
+        assert control.success
+        assert control.bytes_scanned == slow_file.stat().st_size
 
-        # Track how many times open was called to verify the test works
-        call_count = 0
-        original_open = open
-
-        def counting_open(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return original_open(*args, **kwargs)
-
-        # Use a simpler mock that doesn't add delays
-        with patch("builtins.open", side_effect=counting_open):
-            # Scanner should still complete
+        timeout = TimeoutError("network read timed out")
+        with patch("modelaudit.scanners.pickle_scanner.open", side_effect=timeout) as open_file:
             result = scanner.scan(str(slow_file))
-            assert isinstance(result.success, bool)
-            # Verify open was actually called
-            assert call_count > 0
+
+        open_file.assert_any_call(str(slow_file), "rb")
+        assert not result.success
+        assert any("network read timed out" in issue.message for issue in result.issues)
 
 
 if __name__ == "__main__":
