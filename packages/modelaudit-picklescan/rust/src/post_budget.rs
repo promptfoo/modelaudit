@@ -10,7 +10,7 @@ const POST_BUDGET_REDUCE_BYTES: &[u8] = b"Rob\x81\x92";
 pub(crate) struct PostBudgetGlobalMatch {
     pub(crate) module: String,
     pub(crate) name: String,
-    pub(crate) pattern_start: usize,
+    pub(crate) position: usize,
     pub(crate) reduce_proximate: bool,
     pub(crate) severity: &'static str,
 }
@@ -23,11 +23,17 @@ impl PostBudgetGlobalMatch {
 
 #[derive(Default)]
 struct PostBudgetMatches {
+    tail_offset: usize,
     slots: HashMap<(usize, Box<str>, Box<str>), usize>,
     matches: Vec<PostBudgetGlobalMatch>,
 }
 
 impl PostBudgetMatches {
+    // References inherited from the main scan already carry absolute positions.
+    fn absolute_position(&self, tail_index: usize) -> usize {
+        self.tail_offset.saturating_add(tail_index)
+    }
+
     fn get_or_insert(
         &mut self,
         module: &str,
@@ -42,7 +48,7 @@ impl PostBudgetMatches {
         self.matches.push(PostBudgetGlobalMatch {
             module: module.to_owned(),
             name: name.to_owned(),
-            pattern_start: position,
+            position,
             reduce_proximate: false,
             severity,
         });
@@ -52,11 +58,15 @@ impl PostBudgetMatches {
 
 pub(crate) fn post_budget_global_matches(
     tail: &[u8],
+    tail_offset: usize,
     payload: &[u8],
     initial_stack: &[StackValue],
     initial_memo: &HashMap<i64, StackValue>,
 ) -> Vec<PostBudgetGlobalMatch> {
-    let mut sink = PostBudgetMatches::default();
+    let mut sink = PostBudgetMatches {
+        tail_offset,
+        ..Default::default()
+    };
     record_post_budget_opcode_stream(tail, payload, initial_stack, initial_memo, &mut sink);
 
     for index in 0..tail.len() {
@@ -96,7 +106,8 @@ fn record_post_budget_module_name_pair(
     let Some(severity) = post_budget_global_severity(module, name) else {
         return;
     };
-    let (found, inserted) = sink.get_or_insert(module, name, module_start, severity);
+    let (found, inserted) =
+        sink.get_or_insert(module, name, sink.absolute_position(module_start), severity);
     if inserted {
         // The raw sweep leaves the structured match's proximity unchanged on a duplicate.
         found.reduce_proximate = has_reduce_class_byte_nearby(tail, name_end.saturating_add(1));
@@ -246,7 +257,7 @@ fn handle_post_budget_opcode(
                 pop_to_mark(stack);
             }
             let (module, name) = opcode.arg.global_parts();
-            let reference = GlobalRef::new(module, name, opcode.pos);
+            let reference = GlobalRef::new(module, name, sink.absolute_position(opcode.pos));
             stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, is_inst, opcode.next, tail, sink);
         }
@@ -258,7 +269,7 @@ fn handle_post_budget_opcode(
                     module_value.as_ref(),
                     name_value.as_ref(),
                     tail,
-                    opcode.pos,
+                    sink.absolute_position(opcode.pos),
                 )
             };
             stack.push(StackValue::Global(reference.clone()));
@@ -266,7 +277,8 @@ fn handle_post_budget_opcode(
         }
         "EXT1" | "EXT2" | "EXT4" => {
             let extension_code = opcode.arg.as_i64().unwrap_or_default();
-            let reference = GlobalRef::extension(extension_code, opcode.pos);
+            let reference =
+                GlobalRef::extension(extension_code, sink.absolute_position(opcode.pos));
             stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, false, opcode.next, tail, sink);
         }
@@ -385,7 +397,7 @@ fn record_post_budget_extension_ref(tail: &[u8], index: usize, sink: &mut PostBu
     let (found, _) = sink.get_or_insert(
         "copyreg.extension",
         &format!("code_{extension_code}"),
-        index,
+        sink.absolute_position(index),
         "warning",
     );
     found.reduce_proximate |= has_reduce_class_byte_nearby(tail, next);
