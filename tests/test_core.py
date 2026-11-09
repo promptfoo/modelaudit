@@ -4194,6 +4194,15 @@ def test_directory_scan_deferred_shard_hash_rejects_same_size_rewrite(
     assert coverage_check.details["scan_outcome_reason"] == "unvalidated_model_shards"
 
 
+def _scan_cache_config(cache_dir: Path) -> dict[str, Any]:
+    """Enable scan result caching for test files of any size."""
+    return {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+
 def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) -> None:
     """Caching or its safety bypass must not hide a newly malicious sibling shard."""
     shard_one = tmp_path / "checkpoint_1.pt"
@@ -4201,11 +4210,7 @@ def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) 
     shard_one.write_bytes(pickle.dumps({"weights": [1]}))
     shard_two.write_bytes(pickle.dumps({"weights": [2]}))
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first_result = scan_file(str(shard_one), config=config)
@@ -5627,7 +5632,7 @@ def test_scan_file_does_not_route_benign_binary_padding_past_opcode_budget(tmp_p
     near_match = tmp_path / "notes.py"
     near_match.write_bytes(b"\x8c\x01x0" * (file_detection.PROTO0_1_MAX_PROBE_OPCODES + 1))
     cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    config = _scan_cache_config(cache_dir)
 
     assert file_detection.detect_file_format(str(near_match)) == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     assert (
@@ -7347,11 +7352,7 @@ def test_scan_file_ambiguous_renamed_msgpack_result_is_not_cached(tmp_path: Path
         )
     )
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(checkpoint), config=config)
@@ -7366,11 +7367,7 @@ def test_scan_file_missing_msgpack_result_is_not_cached(tmp_path: Path, monkeypa
     checkpoint = tmp_path / "model.flax"
     checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
     monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
@@ -7391,11 +7388,7 @@ def test_scan_file_missing_yaml_parser_result_is_not_cached(
     yaml_file = model_dir / "config.yaml"
     yaml_file.write_text("model: safe\n", encoding="utf-8")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
     monkeypatch.setattr(jinja2_template_scanner, "HAS_YAML", False)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
@@ -7414,11 +7407,7 @@ def test_scan_file_oversized_standalone_jinja_result_is_not_cached(tmp_path: Pat
     template_file = tmp_path / "large.jinja"
     template_file.write_text("{{ content }}" * 10000, encoding="utf-8")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(template_file), config=config)
@@ -7472,11 +7461,7 @@ def test_scan_file_unreadable_standalone_jinja_result_is_not_cached(tmp_path: Pa
     template_file = tmp_path / "invalid.jinja"
     template_file.write_bytes(b"{{ cycler.__init__.__globals__ }}\xff")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(template_file), config=config)
@@ -7539,7 +7524,7 @@ def test_scan_file_prefers_hdf5_and_preserves_executable_zip_userblock(
     _prepend_stub(polyglot, _valid_elf64_header())
     signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
     cache_dir = tmp_path / "executable-zip-cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    config = _scan_cache_config(cache_dir)
     monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
 
     assert file_detection.detect_file_format(str(polyglot)) == EXECUTABLE_ZIP_POLYGLOT_FORMAT
@@ -7996,7 +7981,7 @@ def test_scan_file_fails_closed_for_non_padding_between_concatenated_hdf5_userbl
     polyglot.write_bytes(first_zip.read_bytes() + _build_malicious_pickle() + trailing_zip.read_bytes())
     _append_hdf5_userblock_candidate(polyglot, plausible=True)
     cache_dir = tmp_path / "non-padding-concatenated-cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    config = _scan_cache_config(cache_dir)
     monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
@@ -8249,7 +8234,7 @@ def test_scan_file_fails_closed_for_ratio_limited_compressed_tar_inside_valid_hd
     assert file_detection.detect_file_format(str(model_path)) == "tar"
 
     cache_dir = tmp_path / "cache"
-    cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    cache_config = _scan_cache_config(cache_dir)
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         file_result = scan_file(str(model_path), config=cache_config)
         repeated_result = scan_file(str(model_path), config=cache_config)
@@ -8304,7 +8289,7 @@ def test_scan_file_preserves_keras_finding_for_ratio_limited_tar_inside_valid_hd
     assert file_detection.detect_file_format(str(model_path)) == "tar"
 
     cache_dir = tmp_path / "cache"
-    cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    cache_config = _scan_cache_config(cache_dir)
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         file_result = scan_file(str(model_path), config=cache_config)
         repeated_result = scan_file(str(model_path), config=cache_config)
@@ -9942,11 +9927,7 @@ def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailabl
         },
     )
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
     load_scanner = without_keras_zip_scanner(core_module._registry._load_scanner)
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
@@ -9989,11 +9970,7 @@ def test_scan_file_bypasses_stale_cache_when_keras_zip_scanner_becomes_unavailab
         },
     )
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
     keras_scanner_available = _switch_keras_availability(monkeypatch)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
@@ -10015,11 +9992,7 @@ def test_scan_file_bypasses_stale_cache_when_pytorch_zip_scanner_becomes_unavail
 ) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
     original_load_scanner = core_module._registry._load_scanner
     pytorch_scanner_available = True
 
@@ -10057,11 +10030,7 @@ def test_scan_file_bypasses_outer_archive_cache_when_nested_scanner_becomes_unav
         archive.writestr("nested.keras", nested_keras.getvalue())
 
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
     keras_scanner_available = _switch_keras_availability(monkeypatch)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
@@ -10777,11 +10746,7 @@ def test_scan_file_fails_closed_for_oversized_renamed_jax_json_and_does_not_cach
     )
     near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(model_path), config=config)
@@ -14678,11 +14643,7 @@ def test_scan_file_keeps_s901_for_cached_hidden_onnx_evidence(tmp_path: Path, ru
     set_config(rule_config)
     disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / f"{rule_mode}-cached-malicious.pt", op_type="PythonOp")
     cache_dir = tmp_path / f"{rule_mode}-cache"
-    cache_config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    cache_config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first_result = scan_file(str(disguised_onnx), config=cache_config)
@@ -15100,11 +15061,7 @@ def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structu
     ambiguous_onnx = tmp_path / "ambiguous.jpg"
     ambiguous_onnx.write_bytes(b"\x4a\x00" * 4097)
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(ambiguous_onnx), config=config)
@@ -15246,7 +15203,7 @@ def test_scan_file_fails_closed_for_oversized_renamed_tf_savedmodel_without_cach
     seed = _build_malicious_tf_savedmodel()
     disguised_savedmodel.write_bytes(seed + (b"x" * (_MAX_PARSE_BYTES + 1 - len(seed))))
     cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(disguised_savedmodel), config=config)
@@ -15271,7 +15228,7 @@ def test_scan_file_fails_closed_for_incomplete_tf_protobuf_routing_without_cachi
     ambiguous_payload = tmp_path / "ambiguous-routing.jpg"
     ambiguous_payload.write_bytes(b"\x08\x01" + (b"\x18\x00" * 4))
     cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(ambiguous_payload), config=config)
@@ -15303,7 +15260,7 @@ def test_scan_file_keeps_versioned_oversized_protobuf_on_inconclusive_route_with
     oversized_field_size = _MAX_PARSE_BYTES + 1
     generic_payload.write_bytes(b"\x08\x01" + b"\x12\x81\x80\x80\x0a" + (b"x" * oversized_field_size))
     cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(generic_payload), config=config)
@@ -15324,11 +15281,7 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
     seed = _build_malicious_tf_metagraph()
     disguised_metagraph.write_bytes(seed + (b"x" * (_MAX_PARSE_BYTES + 1 - len(seed))))
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(disguised_metagraph), config=config)
@@ -15351,11 +15304,7 @@ def test_scan_file_fails_closed_on_unparseable_tentative_onnx_candidate(tmp_path
     malformed_payload = tmp_path / f"malformed-large{suffix}"
     malformed_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         result = scan_file(str(malformed_payload), config=config)
@@ -15643,11 +15592,7 @@ def test_scan_file_unavailable_recognized_format_result_is_not_cached(
     unavailable_onnx = tmp_path / "model.onnx"
     unavailable_onnx.write_bytes(b"recognized-format")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "onnx")
     monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "onnx")
@@ -16036,11 +15981,7 @@ def test_scan_file_unavailable_protobuf_candidate_analyzer_fails_closed_and_is_n
     candidate = tmp_path / "candidate.jpg"
     candidate.write_bytes(b"bounded-probe candidate")
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     monkeypatch.setattr(core_module, "detect_file_format", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
     monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
@@ -16105,11 +16046,7 @@ def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -
         encoding="utf-8",
     )
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(ambiguous_xml), config=config)
@@ -16377,11 +16314,7 @@ def test_scan_file_rar_inconclusive_result_is_not_cached(tmp_path: Path) -> None
     rar_path = tmp_path / "archive.rar"
     rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
     cache_dir = tmp_path / "cache"
-    config = {
-        "cache_enabled": True,
-        "cache_dir": str(cache_dir),
-        "min_cache_file_size": 0,
-    }
+    config = _scan_cache_config(cache_dir)
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         first = scan_file(str(rar_path), config=config)
