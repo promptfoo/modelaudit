@@ -293,7 +293,7 @@ class TestOciLayerScanner:
         manifest_path.write_text(json.dumps({"layers": ["missing.tar.gz", "layer.tar.gz"]}))
         cache_dir = tmp_path / "stacked-cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first = scan_model_directory_or_file(
                 str(manifest_path),
                 cache_enabled=True,
@@ -2129,7 +2129,7 @@ class TestOciLayerScanner:
         )
 
         cache_dir = tmp_path / "traversal-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(manifest_path),
                 cache_enabled=True,

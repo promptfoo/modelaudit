@@ -475,7 +475,7 @@ class TestSkopsScannerEdgeCases:
         assert parse_checks[0].severity == IssueSeverity.INFO
         assert parse_checks[0].details["entry"] == entry_name
         cache_dir = tmp_path / "parse-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
             for aggregate in (first, second):
                 metadata = aggregate.file_metadata[str(skops_file)]
@@ -721,7 +721,7 @@ class TestSkopsScannerEdgeCases:
         )
 
         cache_dir = tmp_path / f"unreadable-cache-{exception_type.__name__}"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
             for aggregate in (first, second):
                 metadata = aggregate.file_metadata[str(skops_file)]
@@ -880,7 +880,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -907,7 +907,7 @@ class TestSkopsScannerEdgeCases:
                 zf.writestr(f"file_{index}.bin", b"data")
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -934,7 +934,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -990,7 +990,7 @@ class TestSkopsScannerEdgeCases:
 
         monkeypatch.setattr(SkopsScanner, "_scan_archive_members", fail_member_scan)
         cache_dir = tmp_path / "unexpected-failure-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
             for aggregate in (first, second):
                 metadata = aggregate.file_metadata[str(skops_file)]
@@ -1030,7 +1030,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("step/0/content/0.npy", _make_numeric_npy())
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -1055,7 +1055,7 @@ class TestSkopsScannerEdgeCases:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(
                 skops_file,
                 cache_dir,
@@ -1207,7 +1207,7 @@ def _assert_skops_core_error_without_cache(
     skops_file.write_bytes(payload)
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first, second = _scan_twice_with_cache(skops_file, cache_dir)
 
         for result in (first, second):

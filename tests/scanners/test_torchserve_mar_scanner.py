@@ -122,7 +122,7 @@ def _assert_inconclusive_aggregate_not_cached(
     cache_dir: Path,
     **scan_kwargs: Any,
 ) -> None:
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -4219,7 +4219,7 @@ def test_scan_does_not_cache_temporary_nested_archive_members(tmp_path: Path) ->
     )
     cache_dir = tmp_path / "nested-member-cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         for _ in range(2):
             aggregate = core.scan_model_directory_or_file(
                 str(mar_path),

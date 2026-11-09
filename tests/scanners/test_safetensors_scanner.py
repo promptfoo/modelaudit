@@ -2787,7 +2787,7 @@ def test_zlib_shaped_deep_header_fails_closed(tmp_path: Path) -> None:
         "min_cache_file_size": 0,
     }
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         result = scan_file(str(file_path), config=config)
         repeated_result = scan_file(str(file_path), config=config)
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0

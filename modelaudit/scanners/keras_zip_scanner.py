@@ -53,7 +53,7 @@ from .archive_dispatch import (
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .keras_utils import (
-    _DANGEROUS_CONFIG_MODULE_ROOTS,
+    DANGEROUS_CONFIG_MODULE_ROOTS,
     _keras_exact_module_policy,
     check_custom_loss_config,
     check_custom_metric_config,
@@ -2267,7 +2267,7 @@ class KerasZipScanner(BaseScanner):
         redacted_module_value = redact_evidence_string(module_value)
         redacted_object_class = redact_evidence_string(object_class)
         top_module = module_value.split(".")[0]
-        is_dangerous = top_module in _DANGEROUS_CONFIG_MODULE_ROOTS or self._is_dangerous_exact_module_reference(
+        is_dangerous = top_module in DANGEROUS_CONFIG_MODULE_ROOTS or self._is_dangerous_exact_module_reference(
             source,
             module_value,
             object_class,

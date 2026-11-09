@@ -54,7 +54,7 @@ def _assert_incomplete_llamafile_not_cached(binary: Path, cache_dir: Path) -> No
     assert aggregate.success is False
     assert determine_exit_code(aggregate) == 2
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             cache_enabled=True,
@@ -1241,7 +1241,7 @@ def test_llamafile_scanner_fails_closed_for_incomplete_ape_mapping_search(tmp_pa
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "bounded-ape-cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             cache_enabled=True,
@@ -1318,7 +1318,7 @@ def test_llamafile_scanner_propagates_trusted_embedded_gguf_inconclusive_state(t
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "embedded-gguf-cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             gguf_max_metadata_keys=1,
@@ -1424,7 +1424,7 @@ def test_llamafile_scanner_marks_omitted_runtime_bytes_inconclusive(tmp_path: Pa
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "runtime-coverage-cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             llamafile_payload_scan_bytes=3 * 1024 * 1024,
@@ -2082,7 +2082,7 @@ def test_llamafile_runtime_preview_read_failure_is_inconclusive_not_security_fin
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             cache_enabled=True,
@@ -3362,7 +3362,7 @@ def test_llamafile_scanner_fails_closed_when_payload_scan_window_ends_before_ggu
     assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
             llamafile_payload_scan_bytes=256,

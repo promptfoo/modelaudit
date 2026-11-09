@@ -184,7 +184,7 @@ def _assert_inconclusive_aggregate_not_reused(
     expected_security_findings: bool = False,
     **scan_kwargs: Any,
 ) -> None:
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -2007,7 +2007,7 @@ class TestTarScanner:
             _add_tar_bytes(archive, "large.bin", oversized)
 
         cache_dir = tmp_path / "nested-member-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             for _ in range(2):
                 aggregate = core.scan_model_directory_or_file(
                     str(archive_path),

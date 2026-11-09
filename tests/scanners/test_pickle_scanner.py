@@ -604,7 +604,7 @@ def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
     assert leaked_secret not in caplog.text
     assert "<redacted>" in str(result.metadata)
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregate = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -887,7 +887,7 @@ def test_nested_probe_limit_operational_semantics_and_cache_policy(tmp_path: Pat
         for check in direct_result.checks
     )
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregate_result = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,

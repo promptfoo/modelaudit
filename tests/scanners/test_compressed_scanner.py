@@ -527,7 +527,7 @@ def test_compressed_scanner_unparseable_python_payload_is_inconclusive(tmp_path:
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["scan_outcome_reasons"] == ["compressed_python_payload_analysis_incomplete"]
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1055,7 +1055,7 @@ def test_compressed_scanner_excess_members_are_exit2_and_not_cached(tmp_path: Pa
     path = tmp_path / "too_many_members.pkl.zlib"
     path.write_bytes(zlib.compress(b"a") + zlib.compress(b"b") + zlib.compress(b"c"))
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1082,7 +1082,7 @@ def test_compressed_scanner_complete_wrapper_caches_without_ephemeral_inner_entr
     path = tmp_path / "safe_payload.pkl.gz"
     path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]}, protocol=4)))
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1119,7 +1119,7 @@ def test_compressed_scanner_depth_limit_preserves_exit1_and_is_not_cached(tmp_pa
     path = tmp_path / "depth_limited_payload.pkl.gz"
     path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1149,7 +1149,7 @@ def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cache
     path = tmp_path / "size_limited_payload.pkl.gz"
     path.write_bytes(gzip.compress(b"A" * 4096))
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1179,7 +1179,7 @@ def test_compressed_scanner_corrupt_stream_preserves_exit1_and_is_not_cached(tmp
     path = tmp_path / "corrupt_payload.pkl.gz"
     path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -1418,7 +1418,7 @@ def test_compressed_scanner_missing_lz4_is_exit2_and_not_cached(
 
     monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(_raise_missing_dependency))
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(lz4_path),
             cache_enabled=True,

@@ -314,7 +314,7 @@ def _assert_uncached_rerun_preserves_inconclusive_exit2(
     reason: str,
     **scan_kwargs: Any,
 ) -> None:
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,

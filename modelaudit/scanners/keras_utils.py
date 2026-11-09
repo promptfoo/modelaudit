@@ -16,7 +16,7 @@ from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .base import IssueSeverity, ScanResult
 
 # Importable module roots that are explicitly dangerous when referenced in config.json.
-_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
+DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
     {
         "os",
         "sys",

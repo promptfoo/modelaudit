@@ -2242,7 +2242,7 @@ def test_flax_msgpack_visible_finding_with_deep_sibling_remains_security_finding
     assert any(issue.severity == IssueSeverity.CRITICAL and "os\\.system" in issue.message for issue in result.issues)
     assert any("Maximum recursion depth exceeded" in check.message for check in result.checks)
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregates = [
             scan_model_directory_or_file(
                 str(path),
@@ -2604,7 +2604,7 @@ def test_flax_msgpack_redacts_openai_project_key_across_persisted_outputs(tmp_pa
     create_msgpack_file(path, {token: b"0" * 4096})
     scanner = FlaxMsgpackScanner(config={"cache_enabled": True, "cache_dir": str(cache_dir)})
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         direct = scanner.scan(str(path))
         first = scanner.scan_with_cache(str(path))
         cached = scanner.scan_with_cache(str(path))
