@@ -8100,7 +8100,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         and _typing_uses_reviewed_annotationlib_proxy(context)
     ):
         aliases["_lazy_annotationlib"] = "annotationlib"
-    calls_by_function, class_entrypoints = _collect_function_calls(
+    calls_by_function = _collect_function_calls(
         context.module_statements,
         module_name,
         context.is_package,
@@ -8113,7 +8113,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         aliases=aliases,
         direct_names=export_summary.direct_names,
         calls_by_function=calls_by_function,
-        class_entrypoints=class_entrypoints,
+        class_entrypoints=local_class_entrypoints,
     )
 
 
@@ -8952,12 +8952,8 @@ def _class_source_context_for_target(class_target: str, context: _ClassSourceCon
     return _source_class_context(class_target)
 
 
-@_register_source_sensitive_cache
-@lru_cache(maxsize=4096)
-def _source_function_context(
-    function_name: str,
-) -> tuple[str, bool, ast.FunctionDef | ast.AsyncFunctionDef] | None:
-    module_name, qualified_name = _split_source_qualified_name(function_name)
+def _qualified_source_statements(target: str) -> tuple[str, str, Path, tuple[ast.stmt, ...]] | None:
+    module_name, qualified_name = _split_source_qualified_name(target)
     if module_name is None:
         return None
     source_path = _resolve_module_source(module_name)
@@ -8969,38 +8965,30 @@ def _source_function_context(
     except Exception:
         return None
 
-    module_statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
-    function_node = _find_qualified_function_def(module_statements, qualified_name)
-    if function_node is None:
-        return _inherited_source_function_context(module_statements, module_name, source_path, qualified_name)
-    return module_name, source_path.name == "__init__.py", function_node
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
+    return module_name, qualified_name, source_path, statements
 
 
-def _inherited_source_function_context(
-    module_statements: Iterable[ast.stmt],
-    module_name: str,
-    source_path: Path,
-    qualified_name: str,
+@_register_source_sensitive_cache
+@lru_cache(maxsize=4096)
+def _source_function_context(
+    function_name: str,
 ) -> tuple[str, bool, ast.FunctionDef | ast.AsyncFunctionDef] | None:
+    scope = _qualified_source_statements(function_name)
+    if scope is None:
+        return None
+    module_name, qualified_name, source_path, module_statements = scope
+    function_node = _find_qualified_function_def(module_statements, qualified_name)
+    if function_node is not None:
+        return module_name, source_path.name == "__init__.py", function_node
+
     class_qualified_name, _separator, method_name = qualified_name.rpartition(".")
     if not class_qualified_name or not method_name:
         return None
-    class_node = _find_qualified_class_def(module_statements, class_qualified_name)
-    if class_node is None:
+    class_context = _find_class_source_context(module_statements, module_name, source_path, class_qualified_name)
+    if class_context is None:
         return None
-    is_package = source_path.name == "__init__.py"
-    aliases = _collect_import_aliases(module_statements, module_name, is_package)
-    local_defs = _collect_local_defs(module_statements)
-    inherited_method = _inherited_class_methods(
-        _ClassSourceContext(
-            module_name=module_name,
-            class_node=class_node,
-            aliases=aliases,
-            local_defs=local_defs,
-            local_class_nodes=_local_class_nodes(module_statements),
-            module_statements=tuple(module_statements),
-        )
-    ).get(method_name)
+    inherited_method = _inherited_class_methods(class_context).get(method_name)
     if inherited_method is None:
         return None
     inherited_source_path = _resolve_module_source(inherited_method.module_name)
@@ -9011,19 +8999,16 @@ def _inherited_source_function_context(
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
 def _source_class_context(class_name: str) -> _ClassSourceContext | None:
-    module_name, qualified_name = _split_source_qualified_name(class_name)
-    if module_name is None:
+    scope = _qualified_source_statements(class_name)
+    if scope is None:
         return None
-    source_path = _resolve_module_source(module_name)
-    if source_path is None:
-        return None
-    try:
-        source = _read_bounded_source_text(source_path)
-        tree = ast.parse(source, filename=str(source_path))
-    except Exception:
-        return None
+    module_name, qualified_name, source_path, module_statements = scope
+    return _find_class_source_context(module_statements, module_name, source_path, qualified_name)
 
-    module_statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
+
+def _find_class_source_context(
+    module_statements: tuple[ast.stmt, ...], module_name: str, source_path: Path, qualified_name: str
+) -> _ClassSourceContext | None:
     class_node = _find_qualified_class_def(module_statements, qualified_name)
     if class_node is None:
         return None
@@ -9749,21 +9734,11 @@ def _class_base_targets(
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
 def _constructor_parameter_self_attribute_targets(class_name: str, parameter_name: str) -> tuple[str, ...]:
-    module_name, qualified_name = _split_source_qualified_name(class_name)
-    if module_name is None:
+    scope = _qualified_source_statements(class_name)
+    if scope is None:
         return ()
-    source_path = _resolve_module_source(module_name)
-    if source_path is None:
-        return ()
-    try:
-        source = _read_bounded_source_text(source_path)
-        tree = ast.parse(source, filename=str(source_path))
-    except Exception:
-        return ()
-
-    class_node = _find_qualified_class_def(
-        _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name)), qualified_name
-    )
+    _module_name, qualified_name, _source_path, statements = scope
+    class_node = _find_qualified_class_def(statements, qualified_name)
     if class_node is None:
         return ()
     init_node = next(
@@ -9842,43 +9817,38 @@ def _collect_function_calls(
     local_defs: set[str],
     local_class_targets: set[str],
     local_class_entrypoints: dict[str, tuple[str, ...]],
-) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+) -> dict[str, tuple[str, ...]]:
     calls_by_function: dict[str, tuple[str, ...]] = {}
+
+    def record_calls(
+        function_name: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        function_aliases: dict[str, str],
+        class_name: str | None = None,
+    ) -> None:
+        calls = _calls_in_function(
+            node,
+            module_name,
+            is_package,
+            function_aliases,
+            local_defs,
+            local_class_targets,
+            local_class_entrypoints,
+            class_name=class_name,
+        )
+        existing = calls_by_function.get(function_name)
+        calls_by_function[function_name] = calls if existing is None else _dedupe_calls((*existing, *calls))
+
     statement_tuple = tuple(statements)
     local_class_nodes = _local_class_nodes(statement_tuple)
     for statement in statement_tuple:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
             function_name = f"{module_name}.{statement.name}"
-            _add_function_calls(
-                calls_by_function,
-                function_name,
-                _calls_in_function(
-                    statement,
-                    module_name,
-                    is_package,
-                    aliases,
-                    local_defs,
-                    local_class_targets,
-                    local_class_entrypoints,
-                ),
-            )
+            record_calls(function_name, statement, aliases)
         elif isinstance(statement, ast.ClassDef):
             for method_name, child in _class_method_nodes(statement).items():
                 function_name = f"{module_name}.{statement.name}.{method_name}"
-                _add_function_calls(
-                    calls_by_function,
-                    function_name,
-                    _calls_in_function(
-                        child,
-                        module_name,
-                        is_package,
-                        aliases,
-                        local_defs,
-                        local_class_targets,
-                        local_class_entrypoints,
-                        class_name=statement.name,
-                    ),
-                )
+                record_calls(function_name, child, aliases, statement.name)
             for method_name, method in _inherited_class_methods(
                 _ClassSourceContext(module_name, statement, statement_tuple, aliases, local_defs, local_class_nodes)
             ).items():
@@ -9890,30 +9860,8 @@ def _collect_function_calls(
                     **method.aliases,
                     **{local_name: f"{method.module_name}.{local_name}" for local_name in method.local_defs},
                 }
-                _add_function_calls(
-                    calls_by_function,
-                    function_name,
-                    _calls_in_function(
-                        method.node,
-                        module_name,
-                        is_package,
-                        inherited_aliases,
-                        local_defs,
-                        local_class_targets,
-                        local_class_entrypoints,
-                        class_name=statement.name,
-                    ),
-                )
-    return calls_by_function, local_class_entrypoints
-
-
-def _add_function_calls(
-    calls_by_function: dict[str, tuple[str, ...]],
-    function_name: str,
-    calls: tuple[str, ...],
-) -> None:
-    existing = calls_by_function.get(function_name)
-    calls_by_function[function_name] = calls if existing is None else _dedupe_calls((*existing, *calls))
+                record_calls(function_name, method.node, inherited_aliases, statement.name)
+    return calls_by_function
 
 
 def _dedupe_calls(calls: Iterable[str]) -> tuple[str, ...]:
