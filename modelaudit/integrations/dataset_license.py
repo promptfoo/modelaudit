@@ -66,6 +66,10 @@ def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 def _read_metadata_bytes(path: Path, size_limit: int, *, follow_symlinks: bool = True) -> bytes | None:
     def open_nonblocking(name: str, flags: int) -> int:
         if not follow_symlinks:
@@ -259,7 +263,7 @@ def _has_causal_lm_companion(descriptor: Path) -> bool:
         return False
     try:
         validate_json_structural_limits(raw, _MAX_METADATA_TOKENS, "Transformers configuration")
-        config = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
+        config = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=_reject_json_constant)
     except (ValueError, RecursionError):
         return False
     if not isinstance(config, dict):

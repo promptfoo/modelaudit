@@ -582,6 +582,10 @@ class TestUnlicensedDatasetDetection:
             b'{"model_type":"example"}',
             json.dumps({**config, "num_hidden_layers": True}).encode(),
             json.dumps({**config, "architectures": ["ExampleForSequenceClassification"]}).encode(),
+            *(
+                json.dumps({**config, "options": [value]}).encode()
+                for value in (float("nan"), float("inf"), -float("inf"))
+            ),
             json.dumps(config).replace('"vocab_size":', '"vocab_size": 0, "vocab_size":').encode(),
             json.dumps(config).encode() + b" " * (64 * 1024),
         ):
