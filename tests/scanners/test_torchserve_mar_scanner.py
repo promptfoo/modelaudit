@@ -89,6 +89,17 @@ def _create_standard_mar_archive(
     )
 
 
+def _create_handler_mar(tmp_path: Path, handler_source: bytes, *, filename: str = "model.mar") -> Path:
+    return _create_standard_mar_archive(
+        tmp_path, entries={"handler.py": handler_source, "weights.bin": b"weights"}, filename=filename
+    )
+
+
+def _scan_handler_mar(tmp_path: Path, handler_source: bytes, *, filename: str) -> ScanResult:
+    mar_path = _create_handler_mar(tmp_path, handler_source, filename=filename)
+    return TorchServeMarScanner().scan(str(mar_path))
+
+
 def _build_malicious_pickle() -> bytes:
     import os as os_module
 
@@ -158,13 +169,7 @@ def _assert_inconclusive_aggregate_not_cached(
 
 
 def test_can_handle_valid_mar_archive(tmp_path: Path) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return data\n",
-            "weights.bin": b"weights",
-        },
-    )
+    mar_path = _create_handler_mar(tmp_path, b"def handle(data, context):\n    return data\n")
 
     assert TorchServeMarScanner.can_handle(str(mar_path))
 
@@ -189,13 +194,8 @@ def test_can_handle_rejects_invalid_manifest_json(tmp_path: Path) -> None:
 
 
 def test_depth_limit_returns_inconclusive_exit_code_without_security_finding(tmp_path: Path) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return data\n",
-            "weights.bin": b"weights",
-        },
-        filename="bounded_depth.mar",
+    mar_path = _create_handler_mar(
+        tmp_path, b"def handle(data, context):\n    return data\n", filename="bounded_depth.mar"
     )
 
     direct = TorchServeMarScanner(config={"_mar_depth": 1, "max_mar_depth": 1}).scan(str(mar_path))
@@ -638,13 +638,8 @@ def test_unreadable_handler_returns_inconclusive_exit_code_and_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return data\n",
-            "weights.bin": b"weights",
-        },
-        filename="unreadable_handler.mar",
+    mar_path = _create_handler_mar(
+        tmp_path, b"def handle(data, context):\n    return data\n", filename="unreadable_handler.mar"
     )
     _install_member_read_failure(monkeypatch, "handler.py")
 
@@ -661,13 +656,8 @@ def test_unreadable_handler_returns_inconclusive_exit_code_and_is_not_cached(
 
 
 def test_unparseable_handler_returns_inconclusive_exit_code_and_is_not_cached(tmp_path: Path) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return (\n",
-            "weights.bin": b"weights",
-        },
-        filename="unparseable_handler.mar",
+    mar_path = _create_handler_mar(
+        tmp_path, b"def handle(data, context):\n    return (\n", filename="unparseable_handler.mar"
     )
 
     direct = TorchServeMarScanner().scan(str(mar_path))
@@ -706,16 +696,7 @@ def test_scan_detects_aliased_getattr_wrapped_handler_execution_primitive(
     tmp_path: Path,
     handler_source: bytes,
 ) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": handler_source,
-            "weights.bin": b"weights",
-        },
-        filename="keyword_getattr_handler.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_source, filename="keyword_getattr_handler.mar")
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
 
     assert len(handler_failures) == 1
@@ -749,13 +730,7 @@ def test_scan_detects_dynamic_import_getattr_handler_execution_primitive(
     handler_source: bytes,
     dangerous_name: str,
 ) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={"handler.py": handler_source, "weights.bin": b"weights"},
-        filename="dynamic_import_getattr_handler.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_source, filename="dynamic_import_getattr_handler.mar")
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
 
     assert len(handler_failures) == 1
@@ -786,13 +761,7 @@ def test_scan_detects_dynamic_import_getattr_handler_execution_primitive(
     ],
 )
 def test_scan_detects_dynamic_handler_execution_bypasses(tmp_path: Path, handler_source: bytes) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={"handler.py": handler_source, "weights.bin": b"weights"},
-        filename="dynamic_handler_bypass.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_source, filename="dynamic_handler_bypass.mar")
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
 
     assert len(handler_failures) == 1
@@ -3043,13 +3012,7 @@ def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
 )
 def test_scan_detects_handler_execution_primitive(tmp_path: Path, handler_source: bytes, dangerous_name: str) -> None:
     handler_source = handler_source.replace(b"LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")).encode())
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={"handler.py": handler_source, "weights.bin": b"weights"},
-        filename="os_process_launch_handler.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_source, filename="os_process_launch_handler.mar")
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
 
     assert len(handler_failures) == 1
@@ -3061,13 +3024,7 @@ def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
     handler_source = (
         b"import runpy\ndef handle(data, context):\n    runpy.run_path = len\n    return runpy.run_path([])\n"
     )
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={"handler.py": handler_source, "weights.bin": b"weights"},
-        filename="safe_replaced_runpy_handler.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_source, filename="safe_replaced_runpy_handler.mar")
 
     assert result.success is True
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
@@ -3083,13 +3040,7 @@ def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
     ],
 )
 def test_scan_allows_shadowed_direct_handler_primitives(tmp_path: Path, handler_source: bytes) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={"handler.py": handler_source, "weights.bin": b"weights"},
-        filename="safe_shadowed_direct_handler.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_source, filename="safe_shadowed_direct_handler.mar")
 
     assert result.success is True
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
@@ -3384,16 +3335,9 @@ def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Pat
 
 
 def test_non_handler_python_analysis_without_extra_python_files_is_back_compatible(tmp_path: Path) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-        },
-        filename="no_extra_python.mar",
+    result = _scan_handler_mar(
+        tmp_path, b"def handle(data, context):\n    return {'ok': True}\n", filename="no_extra_python.mar"
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
     non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
     assert len(non_handler_failures) == 0
 
@@ -3803,13 +3747,8 @@ def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
 
 
 def test_unreadable_symlink_target_returns_inconclusive_exit_code(tmp_path: Path) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return data\n",
-            "weights.bin": b"weights",
-        },
-        filename="oversized_symlink_target.mar",
+    mar_path = _create_handler_mar(
+        tmp_path, b"def handle(data, context):\n    return data\n", filename="oversized_symlink_target.mar"
     )
     symlink_info = zipfile.ZipInfo("model_link")
     symlink_info.create_system = 3
@@ -4181,13 +4120,8 @@ def test_unexpected_scan_failure_returns_inconclusive_exit_code_and_is_not_cache
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return data\n",
-            "weights.bin": b"weights",
-        },
-        filename="scan_failure.mar",
+    mar_path = _create_handler_mar(
+        tmp_path, b"def handle(data, context):\n    return data\n", filename="scan_failure.mar"
     )
 
     def fail_archive_member_scan(self: TorchServeMarScanner, *args: Any, **kwargs: Any) -> None:
@@ -4332,13 +4266,7 @@ def test_scan_detects_executable_content_inside_pytorch_extra_file(tmp_path: Pat
 
 
 def test_core_routes_mar_to_dedicated_scanner(tmp_path: Path) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return data\n",
-            "weights.bin": b"weights",
-        },
-    )
+    mar_path = _create_handler_mar(tmp_path, b"def handle(data, context):\n    return data\n")
 
     result = core.scan_file(str(mar_path))
     assert result.scanner_name == "torchserve_mar"
@@ -4396,13 +4324,7 @@ def handle(data, context):
     marker = "subprocess.Popen should not trigger from string"
     return {"marker": marker}
 """
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={"handler.py": handler_code, "weights.bin": b"weights"},
-        filename="comments_only.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_code, filename="comments_only.mar")
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
     assert len(handler_failures) == 0
 
@@ -4416,13 +4338,7 @@ def handle(data, context):
     import subprocess as sp
     return sp.run(["echo", "real-call"])
 """
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={"handler.py": handler_code, "weights.bin": b"weights"},
-        filename="bypass_attempt.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, handler_code, filename="bypass_attempt.mar")
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
     assert len(handler_failures) >= 1
     assert handler_failures[0].severity == IssueSeverity.CRITICAL
@@ -4880,16 +4796,9 @@ def test_scan_bounds_requirements_reads_to_dedicated_limit(
 
 
 def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Path) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-        },
-        filename="requirements_missing.mar",
+    result = _scan_handler_mar(
+        tmp_path, b"def handle(data, context):\n    return {'ok': True}\n", filename="requirements_missing.mar"
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
     requirements_checks = [
         check for check in result.checks if check.name == "TorchServe Requirements Supply Chain Analysis"
     ]
@@ -4939,16 +4848,7 @@ def _assert_handler_without_system_call(handler_source: bytes) -> None:
 
 
 def _assert_getattr_handler_execution(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": source_bytes,
-            "weights.bin": b"weights",
-        },
-        filename=filename,
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, source_bytes, filename=filename)
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
 
     assert len(handler_failures) == 1
@@ -4984,16 +4884,7 @@ def _assert_inert_python_metadata(tmp_path: Path, source_bytes: bytes, filename:
 
 
 def _assert_safe_getattr_handler(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
-    mar_path = _create_standard_mar_archive(
-        tmp_path,
-        entries={
-            "handler.py": (source_bytes),
-            "weights.bin": b"weights",
-        },
-        filename=filename,
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
+    result = _scan_handler_mar(tmp_path, source_bytes, filename=filename)
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
 
     assert handler_failures == []
