@@ -722,10 +722,11 @@ def _finding_reference_keys(findings: tuple[Finding, ...]) -> set[tuple[str, int
         location = finding.location or ""
         display_position = _LOCATION_POSITION_RE.search(location)
         if display_position:
+            # Read the matched text without invoking indexing hooks on a provider's label.
             start, end = display_position.span("position")
             tail = max(start, end - _MAX_DISPLAY_POSITION_DIGITS)
             if start == tail or _only_zero_padding(location, start, tail):
-                positions.add(int(location[tail:end]))
+                positions.add(int(str.__getitem__(location, slice(tail, end))))
         if positions:
             keys.update((reference, position) for reference in import_references for position in positions)
         elif display_position is None:
@@ -734,12 +735,14 @@ def _finding_reference_keys(findings: tuple[Finding, ...]) -> set[tuple[str, int
 
 
 def _only_zero_padding(text: str, start: int, end: int) -> bool:
-    first = text[start]
+    first = str.__getitem__(text, start)
     if int(first):
         return False
     # Count a run of one zero glyph without allocating a substring. Mixed scripts
     # can also represent decimal zero, so check their digits individually.
-    return text.count(first, start, end) == end - start or all(int(text[index]) == 0 for index in range(start, end))
+    return str.count(text, first, start, end) == end - start or all(
+        int(str.__getitem__(text, index)) == 0 for index in range(start, end)
+    )
 
 
 def _reference_has_finding(

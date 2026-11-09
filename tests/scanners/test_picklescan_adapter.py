@@ -738,6 +738,15 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
     assert result.issues[0].rule_code == "S203"
 
 
+class _OpaqueDisplayLocation(str):
+    def __getitem__(self, key: object, /) -> str:
+        raise IndexError("display label does not support indexing")
+
+    def count(self, *args: Any, **kwargs: Any) -> int:
+        raise TypeError("display label does not support counting")
+
+
+@pytest.mark.parametrize("location_type", [str, _OpaqueDisplayLocation])
 @pytest.mark.parametrize(
     ("display_position", "structured", "first_position", "remaining"),
     [
@@ -750,9 +759,13 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
     ],
 )
 def test_pickle_report_preserves_finding_with_long_display_position(
-    display_position: str, structured: dict[str, int], first_position: int, remaining: list[int]
+    display_position: str,
+    structured: dict[str, int],
+    first_position: int,
+    remaining: list[int],
+    location_type: type[str],
 ) -> None:
-    location = f"sample.pkl (pos {display_position})"
+    location = location_type(f"sample.pkl (pos {display_position})")
     reference = {"import_reference": "collections.Counter"}
     report = PickleReport(
         source="sample.pkl",
