@@ -986,6 +986,31 @@ class TestSevenZipScanner:
             scanner._bounded_archive_file_names(MissingMetadataArchive())
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_selectively_extracted_hf_metadata_uses_manifest_coverage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import py7zr  # type: ignore[import-untyped]
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path.resolve()))
+        path = tmp_path / "records.7z"
+        metadata = ".cache/huggingface/download/config.txt.metadata"
+        with py7zr.SevenZipFile(path, "w") as archive:
+            archive.writestr(b"ordinary text", "config.txt")
+            archive.writestr(b"a" * 40 + b"\n" + b"b" * 64 + b"\n1700000000.5\n", metadata)
+
+        result = SevenZipScanner().scan(str(path))
+        assert result.metadata["total_files"] == 2
+        assert result.metadata["scannable_files"] == 1
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "manifest_parse_failed" in result.metadata["scan_outcome_reasons"]
+        check = next(c for c in result.checks if c.name == "Manifest Parse Coverage")
+        assert check.status == CheckStatus.FAILED
+        assert check.location == f"{path}:{metadata}"
+        assert check.details["reason"] == "manifest_parse_failed"
+        assert not any(c.name == "Hugging Face Download Metadata Coverage" for c in result.checks)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_real_archive_entry_limit_does_not_call_getnames(
         self,
         scanner: SevenZipScanner,

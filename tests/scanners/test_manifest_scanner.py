@@ -1,6 +1,7 @@
 import builtins
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,16 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners import manifest_scanner
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+    make_trusted_source_provenance,
+)
 from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
 from modelaudit.utils.helpers import cache_decorator
+from modelaudit.utils.sources.cloud_storage import _build_safe_local_path
 from tests.cache_lifecycle import IsolatedCacheManager
 
 
@@ -1712,6 +1720,222 @@ def test_manifest_scanner_top_level_list_untrusted_url_detected(tmp_path: Path) 
 
     aggregate = scan_model_directory_or_file(str(test_file), cache_scan_results=False)
     assert determine_exit_code(aggregate) == 0
+
+
+_HF_RECORD = b"a" * 40 + b"\n" + b"b" * 64 + b"\n1700000000.5\n"
+_HF_RECORD_MESSAGE = (
+    "The scanned content matches the Hugging Face download metadata format. "
+    "The record alone cannot verify the associated artifact."
+)
+
+
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_hf_download_metadata_retains_inconclusive_coverage(tmp_path: Path, line_ending: bytes) -> None:
+    path = tmp_path / ".cache/huggingface/download/nested/configuration_model.py.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD.replace(b"\n", line_ending))
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert result.files_scanned == 1
+    assert {asset.path for asset in result.assets} == {str(path)}
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    metadata = result.file_metadata[str(path)]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert metadata["scan_outcome_reasons"] == ["hf_download_artifact_unverified"]
+    check = next(c for c in result.checks if c.name == "Hugging Face Download Metadata Coverage")
+    assert check.status == CheckStatus.FAILED and check.severity == IssueSeverity.INFO
+    assert check.rule_code == "S902"
+    assert check.location == str(path)
+    assert check.message == _HF_RECORD_MESSAGE
+    assert check.details == {"reason": "hf_download_artifact_unverified", "analysis_incomplete": True}
+    assert not any(c.name == "Manifest Parse Coverage" for c in result.checks)
+
+
+def test_hf_download_metadata_from_inside_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = tmp_path / ".cache"
+    path = cache / "huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+    (tmp_path / "config").write_text("present")
+    monkeypatch.chdir(cache)
+
+    result = ManifestScanner().scan("huggingface/download/config.metadata")
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == ["hf_download_artifact_unverified"]
+    check = next(c for c in result.checks if c.name == "Hugging Face Download Metadata Coverage")
+    assert check.message == _HF_RECORD_MESSAGE
+
+
+def test_hf_download_metadata_checks_deadline_after_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / ".cache/huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+    scanner = ManifestScanner(config={"timeout": 1})
+    read = scanner._read_manifest_text
+
+    def expire_after_read(filename: str) -> str:
+        text = read(filename)
+        scanner.scan_start_time = 0
+        return text
+
+    monkeypatch.setattr(scanner, "_read_manifest_text", expire_after_read)
+    result = scanner.scan(str(path))
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
+    assert [c.name for c in result.checks if c.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+
+
+def test_hf_download_metadata_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "model/.cache/huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+    cache_dir = tmp_path / "cache"
+    with IsolatedCacheManager(lambda: reset_cache_manager()):
+        for _ in range(2):
+            result = scan_model_directory_or_file(
+                str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+            )
+            assert determine_exit_code(result) == 2
+            assert result.file_metadata[str(path)]["scan_outcome_reasons"] == ["hf_download_artifact_unverified"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_hf_download_metadata_preserves_raw_findings(tmp_path: Path) -> None:
+    path = tmp_path / ".cache/huggingface/download/configuration_model.py.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+    result = scan_model_directory_or_file(str(path), blacklist_patterns=["a" * 40], cache_scan_results=False)
+    assert any(
+        i.severity == IssueSeverity.CRITICAL and i.details.get("blacklisted_term") == "a" * 40 for i in result.issues
+    )
+    assert determine_exit_code(result) == 1
+
+
+@pytest.mark.parametrize(
+    ("relative", "record"),
+    [
+        ("cache/huggingface/download/config.metadata", _HF_RECORD),
+        (".cache/huggingface/download/vendor/.cache/huggingface/download/config.metadata", _HF_RECORD),
+        (".CACHE/HUGGINGFACE/DOWNLOAD/vendor/.cache/huggingface/download/config.metadata", _HF_RECORD),
+        (".cache/huggingface/download/vendor/.CACHE/HUGGINGFACE/DOWNLOAD/config.metadata", _HF_RECORD),
+        (".cache/HuggingFace/download/config.metadata", _HF_RECORD),
+        (".cache/huggingface/download/config.metadata", _HF_RECORD + b"extra\n"),
+        (".cache/huggingface/download/config.metadata", _HF_RECORD.replace(b".5\n", b".500\n")),
+        (".cache/huggingface/download/config.metadata", _HF_RECORD.replace(b"a", b"A")),
+        (".cache/huggingface/download/config.metadata", _HF_RECORD.replace(b"\n", b"\r")),
+        (".cache/huggingface/download/config.metadata", _HF_RECORD.replace(b"a" * 40, b"c" + b"a" * 39)),
+        (".cache/huggingface/download/config.metadata", b"c" + b"a" * 39 + b"\n" + b"b" * 40 + b"\n2.0\n"),
+    ],
+)
+def test_unproven_hf_download_metadata_uses_manifest_coverage(tmp_path: Path, relative: str, record: bytes) -> None:
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(record)
+    result = ManifestScanner().scan(str(path))
+    assert result.metadata["scan_outcome_reasons"] == ["manifest_parse_failed"]
+    assert not any(c.name == "Hugging Face Download Metadata Coverage" for c in result.checks)
+
+
+def test_symlinked_hf_download_metadata_uses_manifest_coverage(tmp_path: Path, requires_symlinks: None) -> None:
+    path = tmp_path / ".cache/huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    original = tmp_path / "record"
+    original.write_bytes(_HF_RECORD)
+    path.symlink_to(original)
+    assert ManifestScanner().scan(str(path)).metadata["scan_outcome_reasons"] == ["manifest_parse_failed"]
+
+
+def test_hardlinked_hf_download_metadata_uses_manifest_coverage(tmp_path: Path) -> None:
+    path = tmp_path / ".cache/huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    original = tmp_path / "record"
+    original.write_bytes(_HF_RECORD)
+    try:
+        os.link(original, path)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    assert ManifestScanner().scan(str(path)).metadata["scan_outcome_reasons"] == ["manifest_parse_failed"]
+
+
+def test_s3_staged_hf_download_metadata_preserves_record_location(tmp_path: Path) -> None:
+    prefix = "s3://bucket/model"
+    key = f"{prefix}/.cache/huggingface/download/Config.json.metadata"
+    path = _build_safe_local_path(prefix, key, tmp_path)
+    assert path.parent.name.startswith("~")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+
+    result = ManifestScanner().scan(str(path))
+    check = next(c for c in result.checks if c.name == "Hugging Face Download Metadata Coverage")
+    assert check.location == str(path)
+    assert check.message == _HF_RECORD_MESSAGE
+    assert check.details == {"reason": "hf_download_artifact_unverified", "analysis_incomplete": True}
+
+
+def test_hf_download_metadata_recognized_after_cloud_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / ".cache/huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+    monkeypatch.setattr(
+        ManifestScanner, "_read_manifest_text", _cloud_read_failure(ManifestScanner._read_manifest_text)
+    )
+
+    result = ManifestScanner().scan(str(path))
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "manifest_cloud_storage_read_failed"
+    assert set(result.metadata["scan_outcome_reasons"]) == {
+        "manifest_cloud_storage_read_failed",
+        "hf_download_artifact_unverified",
+    }
+    assert {c.name for c in result.checks if c.status == CheckStatus.FAILED} == {
+        "Cloud Storage URL Detection",
+        "Hugging Face Download Metadata Coverage",
+    }
+    assert any(
+        i.message == _HF_RECORD_MESSAGE and i.location == str(path) and i.rule_code == "S902" for i in result.issues
+    )
+    assert not any(i.details.get("exception_type") == "JSONDecodeError" for i in result.issues)
+
+
+def test_hf_download_metadata_diagnosis_uses_original_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / ".cache/huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+    replacement = tmp_path / "replacement"
+    replacement.write_text('{"name": "different file"}', encoding="utf-8")
+    scanner = ManifestScanner()
+    read = scanner._read_manifest_text
+
+    def replace_after_read(filename: str) -> str:
+        text = read(filename)
+        if replacement.exists():
+            replacement.replace(path)
+        return text
+
+    monkeypatch.setattr(scanner, "_read_manifest_text", replace_after_read)
+    result = scanner.scan(str(path))
+    assert not replacement.exists()
+    assert result.metadata["scan_outcome_reasons"] == ["hf_download_artifact_unverified"]
+    assert any(
+        c.name == "Hugging Face Download Metadata Coverage" and c.message == _HF_RECORD_MESSAGE for c in result.checks
+    )
+
+
+def test_publisher_file_and_real_manifest_keep_original_analysis(tmp_path: Path) -> None:
+    path = tmp_path / ".cache/huggingface/download/config.metadata"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_HF_RECORD)
+    provenance = make_trusted_source_provenance("org/repo", "huggingface")
+    result = ManifestScanner(config={"_trusted_source_provenance": provenance}).scan(str(path))
+    assert result.metadata["scan_outcome_reasons"] == ["manifest_parse_failed"]
+
+    path.write_text('{"name": "real-manifest"}', encoding="ascii")
+    manifest = ManifestScanner().scan(str(path))
+    assert manifest.success and manifest.metadata["root_type"] == "dict"
 
 
 def test_manifest_scanner_malformed_manifest_is_inconclusive(tmp_path: Path) -> None:
