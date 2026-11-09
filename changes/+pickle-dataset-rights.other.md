@@ -1,0 +1,1 @@
+License reports list files with a `.pkl` extension and an unspecified license separately from datasets. Each keeps an informational notice to verify usage rights for any data it contains. The SBOM omits the dataset property when the role is unknown.

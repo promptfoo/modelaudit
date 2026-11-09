@@ -818,6 +818,16 @@ class TestSpdxLicenseChecks:
         else:
             assert warnings == []
 
+    def test_pickle_license_warning_from_legacy_dataset_flag(self, tmp_path: Path) -> None:
+        path = tmp_path / "checkpoint.PKL"
+        path.write_bytes(b"x" * (100 * 1024 + 1))
+        warnings = check_commercial_use_warnings({"file_metadata": {str(path): {"is_dataset": True}}})
+
+        assert len(warnings) == 1
+        assert warnings[0]["message"].startswith(".pkl files with unspecified licenses")
+        assert warnings[0]["severity"] == "info"
+        assert warnings[0]["details"]["files"] == [str(path)]
+
     @pytest.mark.parametrize("strict", [False, True])
     def test_deprecated_identifiers_count_each_file_once(self, tmp_path: Path, strict: bool) -> None:
         paths = [str(tmp_path / name) for name in ("first.py", "second.py")]
@@ -870,14 +880,14 @@ Bob,30
         assert metadata["is_dataset"] is True
         assert metadata["is_model"] is False
 
-    def test_collect_license_metadata_model(self, tmp_path):
+    def test_collect_license_metadata_model(self, tmp_path: Path) -> None:
         """Test license metadata for model file."""
         test_file = tmp_path / "model.pkl"
         test_file.write_bytes(b"dummy model content")
 
         metadata = collect_license_metadata(str(test_file))
 
-        assert metadata["is_dataset"] is True  # .pkl is both dataset and model extension
+        assert metadata["is_dataset"] is None
         assert metadata["is_model"] is True
 
     def test_collect_license_metadata_reuses_lowered_header(
