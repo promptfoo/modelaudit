@@ -12485,6 +12485,22 @@ print(json.dumps({{"before_loaded": before_loaded, "before": summarize(before), 
     assert expected_finding in summary["after"]["findings"]
 
 
+def test_safe_numpy_dataflow_bounds_byte_slices_across_follow_on_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"N." * 64 + _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD
+    original_genops = package_api.pickletools.genops
+    bytes_submitted = 0
+
+    def counted_genops(data: bytes | io.BytesIO) -> collections.abc.Iterator[Any]:
+        nonlocal bytes_submitted
+        if isinstance(data, bytes):
+            bytes_submitted += len(data)
+        yield from original_genops(data)
+
+    monkeypatch.setattr(package_api.pickletools, "genops", counted_genops)
+    assert package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+    assert bytes_submitted <= len(payload)
+
+
 def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_after_opcode_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
