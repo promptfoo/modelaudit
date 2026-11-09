@@ -247,27 +247,74 @@ class TestSkopsScannerCVE2025_54886:
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
-    def test_detects_readme_with_joblib(self, tmp_path: Path) -> None:
-        """Test detection of README with joblib fallback pattern."""
-        skops_file = tmp_path / "malicious.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            readme_content = textwrap.dedent(
-                """
-                # Model README
-                Load the model using joblib.load() if skops fails.
-                """
-            ).strip()
-            zf.writestr("README.md", readme_content)
-            zf.writestr("schema.json", '{"version": "1.0"}')
+    @pytest.mark.parametrize(
+        ("filename", "content", "pattern"),
+        [
+            ("README.md", "# Model README\nLoad the model using joblib.load() if skops fails.", "joblib.load"),
+            (r"docs\ReAdMe.fr.rst", "Utilisez sklearn pour ce modèle.\n", "sklearn"),
+            ("readme", "The get_model() API has a joblib fallback.", "Card.get_model fallback"),
+        ],
+    )
+    def test_readme_references_are_informational(
+        self, tmp_path: Path, filename: str, content: str, pattern: str
+    ) -> None:
+        archive = tmp_path / "documentation.skops"
+        with zipfile.ZipFile(archive, "w") as files:
+            files.writestr(filename, content)
+            files.writestr("schema.json", '{"version": "1.0"}')
 
-        scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
+        result = SkopsScanner().scan(str(archive))
+        assert result.success
+        [reference] = [check for check in result.checks if check.name == "Skops README Loader Reference"]
+        assert reference.severity == IssueSeverity.INFO
+        assert reference.details["references"] == [{"file": filename, "pattern": pattern}]
+        assert not result.has_warnings
 
-        assert result.success is False
-        cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+    def test_mixed_readme_and_loader_keep_independent_findings(self, tmp_path: Path) -> None:
+        archive = tmp_path / "model.skops"
+        with zipfile.ZipFile(archive, "w") as files:
+            files.writestr("schema.json", "{}")
+            files.writestr("README.md", "# Loading\nUse joblib.load().")
+            files.writestr("card.py", "import joblib\njoblib.load(path)")
+
+        result = SkopsScanner().scan(str(archive))
+        checks = {check.name: check for check in result.checks}
+        cve = checks["CVE-2025-54886 Detection"]
+        assert cve.severity == IssueSeverity.CRITICAL
+        assert cve.details["suspicious_files"] == ["card.py"]
+        assert cve.details["affected_versions"] == "skops < 0.13.0"
+        assert cve.details["cvss"] == "8.4 (High)"
+        fallback = checks["Unsafe Joblib Fallback Detection"]
+        assert fallback.severity == IssueSeverity.WARNING
+        assert fallback.details["files_with_joblib"] == [{"file": "card.py", "pattern": "joblib.load"}]
+        assert checks["Skops README Loader Reference"].details["references"][0]["file"] == "README.md"
+
+    @pytest.mark.parametrize(
+        ("name", "content", "mode"),
+        [
+            ("README.md", b"#!/bin/sh\n# invokes joblib.load", stat.S_IFREG | 0o644),
+            ("README.md", b"\xef\xbb\xbf#!/usr/bin/python\n# uses joblib.load", stat.S_IFREG | 0o644),
+            ("README.md", b"joblib.load(model)", stat.S_IFREG | 0o755),
+            ("README.md", b"Vjoblib.load\np0\n.", stat.S_IFREG | 0o644),
+            ("README.md", b"\x00joblib.load", stat.S_IFREG | 0o644),
+            ("README.md", b"joblib.load", stat.S_IFLNK | 0o644),
+            ("README.env", b"LOAD=joblib.load", stat.S_IFREG | 0o644),
+        ],
+    )
+    def test_non_documentation_readme_members_retain_loader_detection(
+        self, tmp_path: Path, name: str, content: bytes, mode: int
+    ) -> None:
+        archive = tmp_path / "loader.skops"
+        member = zipfile.ZipInfo(name)
+        member.create_system = 3
+        member.external_attr = mode << 16
+        with zipfile.ZipFile(archive, "w") as files:
+            files.writestr("schema.json", "{}")
+            files.writestr(member, content)
+        result = SkopsScanner().scan(str(archive))
+        [fallback] = [check for check in result.checks if check.name == "Unsafe Joblib Fallback Detection"]
+        assert fallback.severity == IssueSeverity.WARNING
+        assert not any(check.name == "Skops README Loader Reference" for check in result.checks)
 
     def test_download_text_in_readme_is_not_cve_54886(self, tmp_path: Path) -> None:
         """Benign README prose containing 'download' must not trigger CVE-2025-54886."""

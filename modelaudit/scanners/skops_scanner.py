@@ -1,7 +1,7 @@
 """Scanner for skops serialized files.
 
-Skops is a secure serialization format for scikit-learn models, but versions < 0.12.0
-contain critical vulnerabilities (CVE-2025-54412, CVE-2025-54413, CVE-2025-54886).
+Skops is a serialization format for scikit-learn models. This scanner checks
+for risks associated with CVE-2025-54412, CVE-2025-54413 and CVE-2025-54886.
 """
 
 from __future__ import annotations
@@ -9,11 +9,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import zipfile
 from contextlib import suppress
 from typing import Any, ClassVar
 
-from ..utils.file.detection import is_skops_archive, read_magic_bytes
+from ..utils.file.detection import (
+    PROTO0_1_MAX_PROBE_BYTES,
+    _is_complete_declared_text_payload,
+    _looks_like_proto0_or_1_pickle,
+    is_declared_text_content_filename,
+    is_skops_archive,
+    read_magic_bytes,
+)
 from ._archive_outcomes import mark_archive_scan_incomplete
 from .archive_dispatch import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
@@ -243,52 +251,6 @@ class SkopsScanner(BaseScanner):
                 ),
             )
 
-    def _detect_cve_2025_54886(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
-        """Detect CVE-2025-54886: Card.get_model silent joblib fallback → code execution.
-
-        This CVE allows code execution through Card.get_model's unsafe joblib fallback.
-        """
-        # Look for Card metadata and joblib patterns
-        suspicious_files = []
-
-        for file_info in zip_file.filelist:
-            file_name = file_info.filename.lower()
-            # Check for Card/model card files
-            if "card" in file_name or "model_card" in file_name or "readme" in file_name:
-                with suppress(Exception):
-                    raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
-                    if raw_content is None:
-                        continue
-
-                    content = raw_content.decode("utf-8", errors="ignore")
-                    # Require explicit joblib/pickle fallback evidence; avoid generic
-                    # substrings such as "download" in benign card/readme prose.
-                    if self._contains_card_joblib_fallback_signal(content):
-                        suspicious_files.append(file_info.filename)
-
-        if suspicious_files:
-            result.add_check(
-                name="CVE-2025-54886 Detection",
-                passed=False,
-                message="Detected Card.get_model with potential joblib fallback - CVE-2025-54886 risk",
-                severity=IssueSeverity.CRITICAL,
-                location=zip_path,
-                details={
-                    "cve_id": "CVE-2025-54886",
-                    "cvss": "9.8 (Critical)",
-                    "cwe": "CWE-502: Deserialization of Untrusted Data",
-                    "affected_versions": "skops < 0.12.0",
-                    "suspicious_files": suspicious_files,
-                    "vulnerability": "Card.get_model silent joblib fallback",
-                    "remediation": "Upgrade to skops >= 0.12.0",
-                },
-                why=(
-                    "CVE-2025-54886: Card.get_model silently falls back to unsafe joblib deserialization "
-                    "when skops parsing fails, enabling arbitrary code execution. "
-                    "Affected versions: skops < 0.12.0. Remediation: Upgrade to skops >= 0.12.0"
-                ),
-            )
-
     def _check_protocol_version(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Check skops protocol version and warn if using vulnerable version."""
         # Look for protocol version information
@@ -422,39 +384,87 @@ class SkopsScanner(BaseScanner):
                 matches.append(f"loader: {loader_name} in {file_info.filename}")
         return matches
 
+    @staticmethod
+    def _is_plain_readme_member(info: zipfile.ZipInfo, content: bytes) -> bool:
+        basename = info.filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if not (
+            basename == "readme" or (basename.startswith("readme.") and is_declared_text_content_filename(basename))
+        ):
+            return False
+        mode = info.external_attr >> 16
+        if stat.S_IFMT(mode) not in {0, stat.S_IFREG} or mode & 0o111 or content.startswith((b"#!", b"\xef\xbb\xbf#!")):
+            return False
+        if len(content) != info.file_size or not _is_complete_declared_text_payload(content):
+            return False
+        # The text form of pickle can consist entirely of printable ASCII.
+        return not _looks_like_proto0_or_1_pickle(
+            content[:PROTO0_1_MAX_PROBE_BYTES], sample_is_prefix=len(content) > PROTO0_1_MAX_PROBE_BYTES
+        )
+
     def _check_unsafe_joblib_fallback(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
-        """Check for unsafe joblib fallback patterns in skops files."""
-        # Scan all files for joblib deserialization patterns
-        joblib_patterns = [
-            b"joblib.load",
-            b"sklearn",
-            b"pickle.load",
-            b"_pickle",
-        ]
-
+        """Classify loader references in the archive and its documentation."""
+        joblib_patterns = (b"joblib.load", b"sklearn", b"pickle.load", b"_pickle")
+        suspicious_files = []
         files_with_joblib = []
+        readme_references = []
 
-        for file_info in zip_file.filelist:
-            is_metadata = self._is_skops_metadata(file_info.filename)
+        for info in zip_file.filelist:
+            content = self._read_zip_entry_safely(zip_file, info, result=result, zip_path=zip_path)
+            if content is None:
+                continue
+            name = info.filename.lower()
+            card_fallback = ("card" in name or "readme" in name) and self._contains_card_joblib_fallback_signal(
+                content.decode("utf-8", errors="ignore")
+            )
+            is_metadata = self._is_skops_metadata(info.filename)
+            pattern = next((p for p in joblib_patterns if not (is_metadata and p == b"sklearn") and p in content), None)
+            if not card_fallback and pattern is None:
+                continue
+            if self._is_plain_readme_member(info, content):
+                readme_references.append(
+                    {
+                        "file": info.filename,
+                        "pattern": pattern.decode("ascii") if pattern is not None else "Card.get_model fallback",
+                    }
+                )
+                continue
+            if card_fallback:
+                suspicious_files.append(info.filename)
+            if pattern is not None:
+                files_with_joblib.append({"file": info.filename, "pattern": pattern.decode("ascii")})
 
-            with suppress(Exception):
-                content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
-                if content is None:
-                    continue
-                for pattern in joblib_patterns:
-                    # Only suppress the broad `sklearn` heuristic for metadata
-                    # files; explicit signals like `joblib.load` / `pickle.load`
-                    # must still be reported even inside schema.json.
-                    if is_metadata and pattern == b"sklearn":
-                        continue
-                    if pattern in content:
-                        files_with_joblib.append(
-                            {
-                                "file": file_info.filename,
-                                "pattern": pattern.decode("utf-8", errors="ignore"),
-                            }
-                        )
-                        break
+        if readme_references:
+            result.add_check(
+                name="Skops README Loader Reference",
+                passed=False,
+                message="README documentation references scikit-learn or pickle/joblib loading",
+                severity=IssueSeverity.INFO,
+                location=zip_path,
+                details={"references": readme_references[:10], "total_count": len(readme_references)},
+            )
+
+        if suspicious_files:
+            result.add_check(
+                name="CVE-2025-54886 Detection",
+                passed=False,
+                message="Detected Card.get_model with potential joblib fallback - CVE-2025-54886 risk",
+                severity=IssueSeverity.CRITICAL,
+                location=zip_path,
+                details={
+                    "cve_id": "CVE-2025-54886",
+                    "cvss": "8.4 (High)",
+                    "cwe": "CWE-502: Deserialization of Untrusted Data",
+                    "affected_versions": "skops < 0.13.0",
+                    "suspicious_files": suspicious_files,
+                    "vulnerability": "Card.get_model silent joblib fallback",
+                    "remediation": "Upgrade to skops >= 0.13.0",
+                },
+                why=(
+                    "CVE-2025-54886: Card.get_model silently falls back to unsafe joblib deserialization "
+                    "when given a non-ZIP model, enabling arbitrary code execution. "
+                    "Affected versions: skops < 0.13.0. Remediation: Upgrade to skops >= 0.13.0"
+                ),
+            )
 
         if files_with_joblib:
             result.add_check(
@@ -600,7 +610,6 @@ class SkopsScanner(BaseScanner):
                 # Run CVE detection checks (with content analysis)
                 self._detect_cve_2025_54412(zip_file, result, path)
                 self._detect_cve_2025_54413(zip_file, result, path)
-                self._detect_cve_2025_54886(zip_file, result, path)
 
                 # Check protocol version
                 self._check_protocol_version(zip_file, result, path)
