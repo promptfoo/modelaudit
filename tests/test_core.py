@@ -6310,7 +6310,7 @@ def test_scan_file_routes_renamed_flax_stream_with_malicious_trailing_object(tmp
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
-@pytest.mark.parametrize("suffix", [".jpg", ".log", ".so", ".cact"])
+@pytest.mark.parametrize("suffix", [".jpg", ".log", ".so", ".cact", ".onnx_data"])
 def test_scan_file_routes_renamed_flax_stream_with_later_checkpoint_object(tmp_path: Path, suffix: str) -> None:
     _require_msgpack()
 

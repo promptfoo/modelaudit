@@ -396,6 +396,7 @@ def test_jsonl_records_cannot_add_identity_to_the_first_jax_object(
         ("libweights.a", b"!<arch>\n" + bytes(4096)),
         ("tool", b"\x7fELF" + bytes(4096)),
         ("weights.cact", b"\x84\x2a\xe1\x05" + bytes(4096)),
+        ("model_fp16.onnx_data", bytes(4096)),
     ],
 )
 def test_auxiliary_content_without_flax_keys_does_not_claim_checkpoint(
@@ -435,6 +436,19 @@ def test_auxiliary_flax_search_keeps_incomplete_coverage_when_capped(
     path = tmp_path / "run.log"
     path.write_bytes(b"A" * 65 + b"\x81\xa6params\x80")
 
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+
+def test_onnx_data_flax_exclusion_requires_a_complete_key_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    path = tmp_path / "model_fp16.onnx_data"
+    path.write_bytes(bytes(65))
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+    path.write_bytes(bytes(32) + b"\x81\xa6params\x80")
     assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
 
 
