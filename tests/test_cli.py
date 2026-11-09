@@ -555,6 +555,56 @@ def test_reviewed_citations_reject_invalid_file(tmp_path: Path, reviewed_site: d
         load_reviewed_citations(path)
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"), reason="requires POSIX FIFO support")
+def test_reviewed_citations_reject_fifo_open_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "decisions.json"
+    path.write_text('{"version":1,"sites":[]}')
+    original_open = os.open
+    opened: list[int] = []
+
+    def open_after_swap(
+        name: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(os.fsdecode(name)) == path:
+            assert flags & os.O_NONBLOCK, "a substituted FIFO must not block waiting for a writer"
+            path.unlink()
+            os.mkfifo(path)
+            fd = original_open(name, flags, mode, dir_fd=dir_fd)
+            opened.append(fd)
+            assert stat.S_ISFIFO(os.fstat(fd).st_mode)
+            return fd
+        return original_open(name, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "open", open_after_swap)
+        with pytest.raises(ValueError, match="regular"):
+            load_reviewed_citations(path)
+
+    assert len(opened) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(opened[0])
+    assert closed.value.errno == errno.EBADF
+
+
+def test_reviewed_citations_allow_symlink_to_regular_file(
+    tmp_path: Path, reviewed_site: dict[str, Any], requires_symlinks: None
+) -> None:
+    path = tmp_path / "decisions.json"
+    path.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+    link = tmp_path / "active-review.json"
+    link.symlink_to(path)
+    assert list(load_reviewed_citations(link).values()) == [reviewed_site]
+
+
+def test_reviewed_citations_reject_directory(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        load_reviewed_citations(tmp_path)
+
+
 def test_reviewed_citations_identity_and_cache(tmp_path: Path, reviewed_site: dict[str, Any]) -> None:
     path = tmp_path / "decisions.json"
     other_site = {**reviewed_site, "position": 9}

@@ -8,7 +8,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import stat
 from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -96,10 +98,14 @@ def reviewed_citation_digest(sites: CitationIndex) -> str:
 
 def load_reviewed_citations(path: Path) -> CitationIndex:
     """Load an explicitly selected, versioned set of operator-reviewed documentation findings."""
+
+    def open_nonblocking(name: str, flags: int) -> int:
+        return os.open(name, flags | getattr(os, "O_NONBLOCK", 0))
+
     try:
-        if not path.is_file():
-            raise ValueError("expected a regular decision file")
-        with path.open("rb") as source:
+        with open(path, "rb", opener=open_nonblocking) as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("expected a regular decision file")
             data = source.read(_MAX_REVIEWED_CITATION_BYTES + 1)
     except OSError as exc:
         raise ValueError(f"cannot read decision file: {exc.strerror}") from exc
