@@ -4875,6 +4875,12 @@ _MODEL_CARD_MISUSE_BULLET = (
 def test_responsible_ai_list_item_does_not_flag_misuse_guidance(tmp_path: Path, marker: str, newline: str) -> None:
     path = tmp_path / "README.md"
     lines = [
+        "<!-- Generated model card. -->",
+        '<code>Example: """a literal"""</code>',
+        "```python",
+        'example = """a literal inside a closed example"""',
+        "```",
+        "",
         "## Responsible AI Considerations",
         "",
         f"{marker} Limitations: Verify generated outputs.",
@@ -4904,6 +4910,18 @@ def test_responsible_ai_list_item_does_not_flag_misuse_guidance(tmp_path: Path, 
     ("prefix", "suffix"),
     [
         ("## Training", "## Software"),
+        ("## Responsible AI Considerations\n\nAnother section\n-------", "## Software"),
+        ("## Responsible AI Considerations\n\nAnother section\n===", "## Software"),
+        ("<![CDATA[\n## Responsible AI Considerations", "## Software\n]]>"),
+        ("<code>\n## Responsible AI Considerations", "## Software\n</code>"),
+        ("<!--\n## Responsible AI Considerations\n-->", "## Software"),
+        ("<![CDATA[\n## Responsible AI Considerations\n]]>", "## Software"),
+        ("<code>\n## Responsible AI Considerations\n</code>", "## Software"),
+        ("<pre>\n## Responsible AI Considerations", "## Software\n</pre>"),
+        ("<textarea>\n## Responsible AI Considerations", "## Software\n</textarea>"),
+        ("cat <<'TEXT'\n## Responsible AI Considerations", "## Software\nTEXT"),
+        ('label = """\n## Responsible AI Considerations', '## Software\n"""'),
+        ('label = """\n~~~text\nexample\n~~~\n## Responsible AI Considerations', '## Software\n"""'),
         ("~~~text\n## Responsible AI Considerations", "## Software\n~~~"),
         ("## Responsible AI Considerations", "It makes unauthorized copies of private files."),
         ("## Responsible AI Considerations", "  ## A heading inside the misuse item"),
@@ -4916,6 +4934,39 @@ def test_responsible_ai_misuse_guidance_keeps_actionable_or_unverified_context(
 ) -> None:
     content = f"{prefix}\n* Context: Read the safety guidance.\n* {_MODEL_CARD_MISUSE_BULLET}\n{suffix}\n"
     _assert_documentation_network_actionable(tmp_path, content, "cc_pattern")
+
+
+def test_commented_disclosure_has_no_policy_position(tmp_path: Path) -> None:
+    content = f"<!--\n## Responsible AI Considerations\n* {_MODEL_CARD_MISUSE_BULLET}\n## Training\n-->\n"
+    assert TextScanner._responsible_ai_misuse_term_position(content.encode()) is None
+    result = _scan_text_content(tmp_path / "README.md", content)
+    issue = next(i for i in result.issues if i.details.get("pattern") == "malware")
+    assert (issue.severity, issue.details["position"]) == (IssueSeverity.INFO, content.index("malware"))
+
+
+@pytest.mark.parametrize(
+    ("context", "severity"),
+    [
+        ("**This model steals user data.**", IssueSeverity.CRITICAL),
+        ("This model __steals__ user data.", IssueSeverity.CRITICAL),
+        (
+            '---\nextra_gated_prompt: "Review these terms.\\nThis model executes code during loading."\n---',
+            IssueSeverity.CRITICAL,
+        ),
+        ('---\nextra_gated_prompt: "Review these terms.\\nThis model generates charts."\n---', IssueSeverity.INFO),
+    ],
+)
+def test_responsible_ai_disclosure_checks_displayed_claims(
+    tmp_path: Path, context: str, severity: IssueSeverity
+) -> None:
+    content = f"{context}\n## Responsible AI Considerations\n* {_MODEL_CARD_MISUSE_BULLET}\n## Training\n"
+    result = _scan_text_content(tmp_path / "README.md", content)
+    finding = next(i for i in result.issues if i.details.get("pattern") == "malware")
+    assert (finding.severity, finding.rule_code, finding.details["position"]) == (
+        severity,
+        "S310",
+        content.encode().index(b"malware"),
+    )
 
 
 def test_responsible_ai_misuse_guidance_requires_complete_card(tmp_path: Path) -> None:

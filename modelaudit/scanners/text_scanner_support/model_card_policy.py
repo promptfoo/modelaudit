@@ -6,6 +6,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from .documentation_examples import MAX_DOCUMENTATION_BYTES, _plain_url
 
+_EMPHASIS_DELIMITER = re.compile(rb"(?<!\w)[*_]{1,3}(?=\w)|(?<=\w)[*_]{1,3}(?!\w)")
 _FIELD = re.compile(rb'(?m)^extra_gated_prompt:[ \t]+(?:"|[>|][-+]?[ \t]*\r?$)')
 _NEXT_KEY = re.compile(rb"(?m)^\S")
 _OPENING = re.compile(rb"\A---[ \t]*\r?\n")
@@ -110,6 +111,15 @@ def _same_displayed_destination(label: bytes, target: bytes) -> bool:
         return params.get("u") == visible and re.fullmatch(r"[\w-]+", params.get("h", "")) is not None
     except (ValueError, UnicodeDecodeError):
         return False
+
+
+def disclosure_has_harmful_claim(payload: bytes, harmful_claim: re.Pattern[bytes]) -> bool:
+    """Check the source and displayed license, including claims split by Markdown emphasis."""
+    _, license_body = _displayed_license(payload)
+    return any(
+        harmful_claim.search(source) or harmful_claim.search(_EMPHASIS_DELIMITER.sub(b"", source))
+        for source in (payload, license_body)
+    )
 
 
 def model_card_policy_evidence(
