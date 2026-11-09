@@ -49,7 +49,11 @@ from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_malicious_pickle
 
 
-def _assert_llamafile_scan_not_cached(binary: Path, cache_dir: Path) -> None:
+def _assert_incomplete_llamafile_not_cached(binary: Path, cache_dir: Path) -> None:
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
     with IsolatedCacheManager(lambda: reset_cache_manager()):
         cached_aggregate = scan_model_directory_or_file(
             str(binary),
@@ -829,12 +833,7 @@ def test_llamafile_multiple_benign_gguf_candidates_are_inconclusive_and_not_cach
     assert len(checks) == 1
     assert checks[0].message == "Multiple plausible embedded GGUF payload boundaries were found"
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "ambiguous-gguf-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "ambiguous-gguf-cache")
 
 
 def test_llamafile_scanner_trusts_structural_zip_gguf_boundary_for_ape(tmp_path: Path) -> None:
@@ -898,12 +897,7 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
     assert checks[0].message == "Embedded ZIP GGUF member could not be fully probed for trailing polyglot payloads"
     assert not any(check.name == "Llamafile Runtime String Analysis" for check in direct.checks)
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "compressed-gguf-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "compressed-gguf-cache")
 
 
 def test_llamafile_scanner_scans_trailing_gguf_inside_stored_zip_member(tmp_path: Path) -> None:
@@ -1596,12 +1590,7 @@ def test_llamafile_fails_closed_when_torch7_marker_probe_limit_is_exceeded(tmp_p
         f"Stopped embedded Torch7 analysis after {LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES} candidate markers"
     )
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "torch7-marker-probe-limit-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "torch7-marker-probe-limit-cache")
 
 
 def test_llamafile_finds_torch7_in_initial_payload_pass_while_skipping_marker_decoys(
@@ -2151,12 +2140,8 @@ def test_llamafile_runtime_stream_failures_are_inconclusive_and_not_cached(
     assert read_checks[0].message == expected_message
     assert read_checks[0].details["scan_outcome_reason"] == LLAMAFILE_RUNTIME_STREAM_READ_REASON
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
     cache_dir = tmp_path / f"runtime-stream-cache-{'error' if read_error else 'short'}"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, cache_dir)
 
 
 def test_llamafile_runtime_stream_failure_retains_only_pre_boundary_preview_findings(
@@ -2213,12 +2198,7 @@ def test_llamafile_long_runtime_string_is_inconclusive_and_not_cached(tmp_path: 
     assert coverage_checks[0].message == "Runtime printable string exceeded the bounded cross-chunk analysis window"
     assert coverage_checks[0].details["max_string_bytes"] == LLAMAFILE_RUNTIME_STREAM_MAX_STRING_BYTES
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "runtime-string-limit-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "runtime-string-limit-cache")
 
 
 def test_llamafile_transfer_token_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2237,12 +2217,7 @@ def test_llamafile_transfer_token_limit_is_inconclusive_and_not_cached(tmp_path:
     assert coverage_checks[0].message == "Runtime transfer command exceeded the bounded token analysis limit"
     assert coverage_checks[0].details["max_tokens"] == LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "transfer-token-limit-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "transfer-token-limit-cache")
 
 
 def test_llamafile_transfer_command_preprocessing_is_bounded() -> None:
@@ -2384,12 +2359,7 @@ def test_llamafile_interpreter_token_limit_is_inconclusive_and_not_cached(tmp_pa
     assert coverage_checks[0].message == "Runtime interpreter command exceeded the bounded argument analysis limit"
     assert coverage_checks[0].details["max_tokens"] == LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "interpreter-token-limit-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "interpreter-token-limit-cache")
 
 
 @pytest.mark.parametrize(
@@ -2440,12 +2410,7 @@ def test_llamafile_transfer_option_ambiguity_is_inconclusive_and_not_cached(
         for check in direct.checks
     )
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "transfer-option-ambiguity-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "transfer-option-ambiguity-cache")
 
 
 def test_llamafile_utf16_ambiguity_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2463,12 +2428,7 @@ def test_llamafile_utf16_ambiguity_is_inconclusive_and_not_cached(tmp_path: Path
     assert coverage_checks[0].message == "Runtime bytes had conflicting UTF-16 byte-order interpretations"
     assert not any(check.name == "Llamafile Runtime String Analysis" for check in direct.checks)
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "utf16-ambiguity-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "utf16-ambiguity-cache")
 
 
 def test_llamafile_gguf_candidate_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2488,12 +2448,7 @@ def test_llamafile_gguf_candidate_limit_is_inconclusive_and_not_cached(tmp_path:
     assert coverage_checks[0].message == ("Embedded GGUF candidate count exceeded the bounded structural probe limit")
     assert coverage_checks[0].details["max_candidates"] == LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "gguf-candidate-limit-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "gguf-candidate-limit-cache")
 
 
 def test_llamafile_gguf_header_resource_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2510,12 +2465,7 @@ def test_llamafile_gguf_header_resource_limit_is_inconclusive_and_not_cached(tmp
     assert len(checks) == 1
     assert checks[0].message == "Embedded GGUF header declares resource counts above the structural probe limit"
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "gguf-header-resource-limit-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "gguf-header-resource-limit-cache")
 
 
 def test_llamafile_truncated_gguf_header_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
@@ -2530,12 +2480,7 @@ def test_llamafile_truncated_gguf_header_is_inconclusive_and_not_cached(tmp_path
     assert len(checks) == 1
     assert checks[0].message == "Embedded GGUF marker is truncated before its complete header"
 
-    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
-    assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
-
-    cache_dir = tmp_path / "truncated-gguf-cache"
-    _assert_llamafile_scan_not_cached(binary, cache_dir)
+    _assert_incomplete_llamafile_not_cached(binary, tmp_path / "truncated-gguf-cache")
 
 
 @pytest.mark.parametrize("version", [4, 10_001])
