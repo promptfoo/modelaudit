@@ -510,7 +510,7 @@ fn global_ref_details(
     details
 }
 
-type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+type GlobalReferenceDedupeKey = (usize, String, &'static str, bool);
 type ImportReferenceDedupeKey = (String, String, String);
 type CallableInvocationDedupeKey = (
     String,
@@ -6276,30 +6276,19 @@ impl<'a> ScanState<'a> {
             self.template_receiver_may_have_mutated = true;
             self.template_execution_may_be_unmodeled = true;
         }
-        let symbol = reference.symbol();
-        let severity = global_severity(&reference.module, &reference.name);
-        let is_dangerous = severity.is_some();
-        let reference_kind = if reference.malformed {
-            "malformed"
-        } else if is_dangerous {
-            "dangerous"
-        } else {
-            "observed"
-        };
-        let key = (
-            symbol.clone(),
-            op_name.to_string(),
-            reference.position,
-            reference_kind,
-            reference.malformed,
-        );
-
         if reference.malformed {
-            self.seen_global_reference_keys.insert(key);
             return;
         }
 
         self.global_count += 1;
+        let symbol = reference.symbol();
+        let severity = global_severity(&reference.module, &reference.name);
+        let is_dangerous = severity.is_some();
+        // The parser advances to a new byte position for each opcode. Only references
+        // from the current opcode can still be duplicates.
+        self.seen_global_reference_keys
+            .retain(|(position, ..)| *position == reference.position);
+        let key = (reference.position, symbol.clone(), op_name, is_dangerous);
         let details = global_ref_details(reference, symbol.clone(), op_name, "position", None);
         if self.seen_global_reference_keys.insert(key) {
             let mut import_reference_details = details.clone();
@@ -9185,7 +9174,7 @@ mod tests {
     }
 
     #[test]
-    fn global_reference_dedupe_preserves_malformed_state() {
+    fn malformed_global_does_not_shadow_a_well_formed_reference() {
         let options = default_test_options();
         let payload = b".";
         let mut scan = new_test_scan("global-dedupe.pkl", payload, &options);
@@ -9204,13 +9193,24 @@ mod tests {
             ..malformed.clone()
         };
 
-        scan.record_global_ref(&malformed, "STACK_GLOBAL");
-        scan.record_global_ref(&well_formed, "STACK_GLOBAL");
-        scan.record_global_ref(&well_formed, "STACK_GLOBAL");
+        let distinct = GlobalRef::new(
+            "builtins".to_string(),
+            "list".to_string(),
+            well_formed.position,
+        );
+        for reference in [
+            &malformed,
+            &well_formed,
+            &distinct,
+            &malformed,
+            &well_formed,
+        ] {
+            scan.record_global_ref(reference, "STACK_GLOBAL");
+        }
 
         assert_eq!(scan.seen_global_reference_keys.len(), 2);
-        assert_eq!(scan.import_references.len(), 1);
-        assert_eq!(scan.global_count, 2);
+        assert_eq!(scan.import_references.len(), 2);
+        assert_eq!(scan.global_count, 3);
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_GLOBAL")
                 && detail_string(&finding.details, "import_reference").as_deref()
@@ -9908,36 +9908,24 @@ mod tests {
         ] {
             let mut scan = new_test_scan(format!("{module}-{name}-import-cap.pkl"), b"", &options);
 
-            for index in 0..MAX_IMPORT_REFERENCES {
-                scan.push_import_reference(vec![
-                    (
-                        "module".to_string(),
-                        DetailValue::String(module.to_string()),
-                    ),
-                    ("name".to_string(), DetailValue::String(name.to_string())),
-                    (
-                        "opcode".to_string(),
-                        DetailValue::String("GLOBAL".to_string()),
-                    ),
-                    ("position".to_string(), DetailValue::UInt(index as u64)),
-                ]);
+            let mut reference =
+                GlobalRef::new(module.to_string(), name.to_string(), MAX_IMPORT_REFERENCES);
+            let mut child = new_test_scan("nested.pkl", b"", &options);
+            child.record_global_ref(&reference, "GLOBAL");
+            scan.merge_follow_on_import_references(child.import_references, false);
+            for position in 0..MAX_IMPORT_REFERENCES - 1 {
+                reference.position = position;
+                scan.record_global_ref(&reference, "GLOBAL");
             }
-            scan.push_import_reference(vec![
-                (
-                    "module".to_string(),
-                    DetailValue::String(module.to_string()),
-                ),
-                ("name".to_string(), DetailValue::String(name.to_string())),
-                (
-                    "opcode".to_string(),
-                    DetailValue::String(overflow_opcode.to_string()),
-                ),
-                (
-                    "position".to_string(),
-                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
-                ),
-            ]);
 
+            // A previously recorded position is still a duplicate, including for storage globals.
+            scan.record_global_ref(&reference, "GLOBAL");
+            assert!(!scan.import_references_truncated, "{module}.{name}");
+            reference.position = MAX_IMPORT_REFERENCES;
+            scan.record_global_ref(&reference, overflow_opcode);
+            scan.record_global_ref(&reference, overflow_opcode);
+
+            assert_eq!(scan.seen_global_reference_keys.len(), 1);
             assert!(scan.import_references_truncated, "{module}.{name}");
             assert_eq!(scan.status, ScanStatus::Inconclusive, "{module}.{name}");
         }
@@ -10048,7 +10036,11 @@ mod tests {
         let mut scan = new_test_scan("follow-on-truncated-imports.pkl", b"", &options);
 
         scan.merge_follow_on_import_references(Vec::new(), true);
+        let reference = GlobalRef::new("builtins".to_string(), "list".to_string(), 2);
+        scan.record_global_ref(&reference, "GLOBAL");
 
+        assert_eq!(scan.import_references.len(), 1);
+        assert_eq!(scan.seen_global_reference_keys.len(), 1);
         assert!(scan.import_references_truncated);
         assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert!(scan
