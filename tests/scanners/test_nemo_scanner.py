@@ -235,7 +235,7 @@ def _build_malicious_pickle() -> bytes:
 
 
 def _assert_failed_nemo_not_cached(path: Path, cache_dir: Path) -> None:
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cached_aggregate = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
