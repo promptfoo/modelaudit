@@ -99,7 +99,7 @@ def _assert_inconclusive_zip_aggregate_not_cached(
     expected_security_findings: bool = False,
     **scan_kwargs: Any,
 ) -> None:
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = core.scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -159,7 +159,7 @@ def _assert_inconclusive_zip_scan_not_cached(
         "min_cache_file_size": 0,
         **scan_kwargs,
     }
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = ZipScanner(config=scan_config).scan_with_cache(str(path))
         second = ZipScanner(config=scan_config).scan_with_cache(str(path))
 

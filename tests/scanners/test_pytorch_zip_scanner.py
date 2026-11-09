@@ -8804,7 +8804,7 @@ def _assert_blacklist_inconclusive_not_cached(
     reason: str,
     **scan_kwargs: Any,
 ) -> None:
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -9200,7 +9200,7 @@ def test_pytorch_zip_scan_failure_is_inconclusive_and_not_cached(
 
     monkeypatch.setattr(PyTorchZipScanner, "_discover_pickle_files", fail_discovery)
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         for _ in range(2):
             aggregate = scan_model_directory_or_file(
                 str(zip_path),
@@ -17976,7 +17976,7 @@ def _assert_pytorch_zip_inconclusive_not_cached(
     expected_exit_code: int,
     **scan_kwargs: Any,
 ) -> None:
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
@@ -20556,7 +20556,8 @@ def test_pytorch_zip_memo_round5_repeated_binary_calls_have_prior_reservations(m
     ) -> bool:
         nonlocal binary_bytes, calls
         assert work_budget_remaining is remaining
-        assert reservations.pop(sys._getframe(1).f_code.co_name) >= len(candidate)
+        reserved_bytes = reservations.pop(sys._getframe(1).f_code.co_name)
+        assert reserved_bytes >= len(candidate)
         calls += 1
         binary_bytes += len(candidate)
         assert binary_bytes <= admitted_bytes
@@ -21161,7 +21162,8 @@ def test_pytorch_zip_memo_round6_extended_liveness_is_reserved_before_copy(
             ):
                 start, end, step = key.indices(len(self))
                 if step == 1 and end - start > 8192:
-                    assert reservations.pop(0) == end - start
+                    reserved_bytes = reservations.pop(0)
+                    assert reserved_bytes == end - start
             return super().__getitem__(key)
 
     def consume(budget: list[int], work_bytes: int) -> bool:
@@ -21820,7 +21822,8 @@ def test_pytorch_zip_memo_round6_retry_progress_and_exhaustion(
             ):
                 start, end, step = key.indices(len(self))
                 if step == 1 and end - start >= 8192:
-                    assert reservations.pop(0) == end - start
+                    reserved_bytes = reservations.pop(0)
+                    assert reserved_bytes == end - start
                     assert not copied or end - start > copied[-1]
                     copied.append(end - start)
             return super().__getitem__(key)

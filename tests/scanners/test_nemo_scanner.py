@@ -523,7 +523,7 @@ class TestNemoScannerBasic:
         assert "tar_compressed_trailing_data" in result.metadata["scan_outcome_reasons"]
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -735,7 +735,7 @@ class TestNemoScannerBasic:
         assert determine_exit_code(aggregate) == 2
 
         cache_dir = tmp_path / "ratio-prefix-malicious-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -784,7 +784,7 @@ class TestNemoScannerBasic:
         assert determine_exit_code(aggregate) == 2
 
         cache_dir = tmp_path / "late-invalid-benign-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -818,7 +818,7 @@ class TestNemoScannerBasic:
         assert determine_exit_code(aggregate) == 1
 
         cache_dir = tmp_path / "late-invalid-malicious-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -868,7 +868,7 @@ class TestNemoScannerBasic:
         assert determine_exit_code(aggregate) == expected_exit_code
 
         cache_dir = tmp_path / f"compressed-tail-benign-{codec}-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -921,7 +921,7 @@ class TestNemoScannerBasic:
         assert determine_exit_code(aggregate) == expected_exit_code
 
         cache_dir = tmp_path / f"compressed-tail-malicious-{codec}-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -973,7 +973,7 @@ class TestNemoScannerBasic:
         assert determine_exit_code(aggregate) == expected_exit_code
 
         cache_dir = tmp_path / f"xz-padding-limit-{'malicious' if expects_hydra_finding else 'benign'}-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -1045,7 +1045,7 @@ class TestNemoScannerBasic:
         )
 
         cache_dir = tmp_path / f"metadata-budget-{target.replace('.', '-')}-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -1104,7 +1104,7 @@ class TestNemoScannerBasic:
         assert determine_exit_code(aggregate) == 2
 
         cache_dir = tmp_path / "corrupt-crc-malicious-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -3168,7 +3168,7 @@ class TestCVE202523304HydraTarget:
         )
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -3370,7 +3370,7 @@ class TestCVE202523304HydraTarget:
             _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
 
         cache_dir = tmp_path / "raw-pax-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -6538,7 +6538,7 @@ class TestCVE202523304HydraTarget:
         assert "nemo_config_yaml_complexity_limit" in direct_result.metadata["scan_outcome_reasons"]
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate_result = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -6831,7 +6831,7 @@ class TestCVE202523304HydraTarget:
         assert "nemo_config_size_limit" in result.metadata["scan_outcome_reasons"]
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(path),
                 cache_enabled=True,
@@ -6999,7 +6999,7 @@ class TestCVE202523304HydraTarget:
         assert determine_exit_code(aggregate_result) == 2
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached_aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7114,7 +7114,7 @@ class TestCVE202523304HydraTarget:
         )
 
         cache_dir = tmp_path / f"over-budget-{target.replace('.', '-')}-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7175,7 +7175,7 @@ class TestCVE202523304HydraTarget:
             _add_tar_bytes(archive, "late.pkl", b'cos\nsystem\n(S"echo late"\ntR.')
 
         cache_dir = tmp_path / f"entry-prefix-{target.replace('.', '-')}-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7240,7 +7240,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch.setattr(tarfile.TarFile, "getmembers", tracked_getmembers)
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7297,7 +7297,7 @@ class TestCVE202523304HydraTarget:
         )
 
         cache_dir = tmp_path / "prefix-fallback-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7340,7 +7340,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", replace_after_nemo_analysis)
 
         cache_dir = tmp_path / "tar-followup-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(model_path),
                 cache_enabled=True,
@@ -7391,7 +7391,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", mutate_after_nemo_analysis)
 
         cache_dir = tmp_path / f"tar-followup-{mutation}-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(model_path),
                 cache_enabled=True,
@@ -7435,7 +7435,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch.setattr(tar_scanner_module.TarScanner, "_preflight_tar_archive", truncate_after_preflight)
 
         cache_dir = tmp_path / "identity-corruption-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7477,7 +7477,7 @@ class TestCVE202523304HydraTarget:
         monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", fail_after_nemo_finding)
 
         cache_dir = tmp_path / "identity-corruption-finding-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7588,7 +7588,7 @@ class TestCVE202523304HydraTarget:
         assert determine_exit_code(aggregate_result) == 1
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached_aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,
@@ -7661,7 +7661,7 @@ class TestCVE202523304HydraTarget:
         assert determine_exit_code(aggregate_result) == 1
 
         cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             cached_aggregate = scan_model_directory_or_file(
                 str(nemo_path),
                 cache_enabled=True,

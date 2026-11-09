@@ -7720,12 +7720,11 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _repeated_trivial_stream_offset(sample: bytes, offset: int) -> int:
-        original_offset = offset
         sample_length = len(sample)
         while offset < sample_length:
             if offset + 2 <= sample_length and sample[offset : offset + 2] == b"N.":
                 offset += 2
-            elif offset < sample_length and sample[offset : offset + 1] == b"I":
+            elif sample[offset : offset + 1] == b"I":
                 match = _REPEATED_PROTO0_INT_STREAM_RE.match(sample, offset)
                 if match is None:
                     break
@@ -7734,7 +7733,7 @@ class PyTorchZipScanner(BaseScanner):
                 break
             while offset < sample_length and sample[offset] in PROTO0_1_IGNORABLE_TRAILING_BYTES:
                 offset += 1
-        return offset if offset != original_offset else original_offset
+        return offset
 
     @staticmethod
     def _repeated_none_stream_trailing(sample: bytes) -> bytes | None:

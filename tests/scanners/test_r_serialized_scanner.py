@@ -148,7 +148,7 @@ def test_scan_read_failure_is_operationally_inconclusive_and_not_cached(tmp_path
     _write_raw_r_serialized(path, "safe\nmodel\nweights")
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with patch.object(
             RSerializedScanner,
             "_read_payload_for_analysis",
@@ -196,7 +196,7 @@ def test_scan_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
         "min_cache_file_size": 0,
     }
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with patch(
             "modelaudit.utils.helpers.cache_decorator.should_bypass_cache_for_read_failure_aware_file",
             return_value=False,
@@ -242,7 +242,7 @@ def test_scan_renamed_read_failure_bypasses_stale_clean_cache(tmp_path: Path) ->
         "min_cache_file_size": 0,
     }
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with patch(
             "modelaudit.utils.helpers.cache_decorator.should_bypass_cache_for_read_failure_aware_file",
             return_value=False,
@@ -335,7 +335,7 @@ def test_scan_string_extraction_ceiling_is_exit2_and_not_cached(tmp_path: Path) 
     _write_raw_r_serialized(path, "feature_000\nfeature_001\nfeature_002\nfeature_003")
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = core.scan_model_directory_or_file(
             str(path),
             r_max_extracted_strings=2,

@@ -3,10 +3,47 @@
 from collections.abc import Callable
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import Any, Protocol, cast
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
+
+__all__ = [
+    "SystemCommandPayload",
+    "_assert_shadow_framework_unpickle_executes",
+    "_binary_magic_tensor_storage_bytes",
+    "_clear_ultralytics_modules",
+    "_float_storage_element_count_for_bytes",
+    "_force_framework_metadata_unresolved",
+    "_frame_first_large_malicious_eval_pickle_payload",
+    "_frame_first_raw_storage_bytes",
+    "_large_proto0_system_payload",
+    "_make_dup_heavy_pickle",
+    "_make_memo_expansion_pickle",
+    "_make_pre_memoized_post_budget_stack_global_payload",
+    "_pickle_binint",
+    "_pickle_int_tuple",
+    "_pickleish_tensor_storage_bytes",
+    "_pytorch_storage_protocol0_persistent_id_payload",
+    "_pytorch_storage_then_arbitrary_protocol0_persistent_id_payload",
+    "_replace_source_after_fstat",
+    "_replace_source_on_read",
+    "_require_torch_distribution",
+    "_shadow_framework_divergence_cases",
+    "_shadow_newobj_build_payload",
+    "_shadow_slot_state_build_payload",
+    "_static_getattr_protocol0_unicode_payload",
+    "_write_cross_module_rebind_target_package",
+    "_write_enum_trusted_transformers_package",
+    "_write_import_side_effect_transformers_package",
+    "_write_init_heavy_trusted_transformers_package",
+    "_write_init_inert_setstate_transformers_package",
+    "_write_rebindable_trusted_torch_utils_package",
+    "_write_rebindable_trusted_transformers_package",
+    "_write_runtime_mutable_trusted_transformers_package",
+    "_write_sitecustomize_trusting_site_packages",
+    "_yolov5n6_tensor_storage_prefix_bytes",
+    "pickle_short_binunicode",
+]
 
 _SOURCE = Path(__file__).resolve().parents[2] / "packages/modelaudit-picklescan/tests/framework_fixtures.py"
 _SPEC = spec_from_file_location("modelaudit_test_framework_fixtures", _SOURCE)
@@ -16,7 +53,8 @@ _SPEC.loader.exec_module(_fixtures)
 
 
 class _UnpickleOracle(Protocol):
-    def __call__(self, payload_path: Path, tmp_path: Path, *, mode: str, extension_code: int | None) -> None: ...
+    def __call__(self, payload_path: Path, tmp_path: Path, *, mode: str, extension_code: int | None) -> None:
+        """Check the fixture's marker after unpickling it in the shadow package."""
 
 
 _PackageWriter = Callable[[Path], None]
@@ -46,33 +84,38 @@ _write_cross_module_rebind_target_package = cast(_PackageWriter, _fixtures._writ
 
 
 class _SystemCommandPayloadFactory(Protocol):
-    def __call__(self, command: str, system_getter: Callable[[], Any] | None = None) -> object: ...
+    def __call__(self, command: str, system_getter: Callable[[], Any] | None = None) -> object:
+        """Construct a serializable command fixture with an optional reducer target."""
 
 
 SystemCommandPayload = cast(_SystemCommandPayloadFactory, _fixtures.SystemCommandPayload)
 
 
 class _DupHeavyPayload(Protocol):
-    def __call__(self, iterations: int) -> bytes: ...
+    def __call__(self, iterations: int) -> bytes:
+        """Build a pickle that repeatedly duplicates a memoized list."""
 
 
 class _MemoExpansionPayload(Protocol):
-    def __call__(self, iterations: int, *, inert_writes: int = 0) -> bytes: ...
+    def __call__(self, iterations: int, *, inert_writes: int = 0) -> bytes:
+        """Build nested memo references with optional padding writes."""
 
 
 class _StorageProtocol0Payload(Protocol):
-    def __call__(self, key: str, *, storage_qualname: str = "torch.FloatStorage", size: int | str = 1) -> bytes: ...
+    def __call__(self, key: str, *, storage_qualname: str = "torch.FloatStorage", size: int | str = 1) -> bytes:
+        """Encode a PyTorch storage persistent ID in a protocol 0 pickle."""
 
 
 class _ShadowBuildPayload(Protocol):
-    def __call__(self, protocol: int = 4) -> bytes: ...
+    def __call__(self, protocol: int = 4) -> bytes:
+        """Build a NEWOBJ/BUILD fixture targeting the shadow package."""
 
 
 _binary_magic_tensor_storage_bytes = cast(Callable[[], bytes], _fixtures._binary_magic_tensor_storage_bytes)
 _clear_ultralytics_modules = cast(Callable[[], None], _fixtures._clear_ultralytics_modules)
 _float_storage_element_count_for_bytes = cast(Callable[[bytes], int], _fixtures._float_storage_element_count_for_bytes)
 _force_framework_metadata_unresolved = cast(
-    "Callable[[pytest.MonkeyPatch], None]", _fixtures._force_framework_metadata_unresolved
+    Callable[[pytest.MonkeyPatch], None], _fixtures._force_framework_metadata_unresolved
 )
 _frame_first_large_malicious_eval_pickle_payload = cast(
     Callable[[], bytes], _fixtures._frame_first_large_malicious_eval_pickle_payload
@@ -105,8 +148,8 @@ _static_getattr_protocol0_unicode_payload = cast(
 )
 _yolov5n6_tensor_storage_prefix_bytes = cast(Callable[[], bytes], _fixtures._yolov5n6_tensor_storage_prefix_bytes)
 _replace_source_on_read = cast(
-    "Callable[[pytest.MonkeyPatch, Path, Path, Path], None]", _fixtures._replace_source_on_read
+    Callable[[pytest.MonkeyPatch, Path, Path, Path], None], _fixtures._replace_source_on_read
 )
 _replace_source_after_fstat = cast(
-    "Callable[[pytest.MonkeyPatch, Path, Path, Path], None]", _fixtures._replace_source_after_fstat
+    Callable[[pytest.MonkeyPatch, Path, Path, Path], None], _fixtures._replace_source_after_fstat
 )

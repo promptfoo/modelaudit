@@ -2698,7 +2698,7 @@ class TestXGBoostFailClosedEndToEnd:
         json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
         cache_dir = tmp_path / "cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(json_file, cache_dir)
 
             for result in (first, second):
@@ -2715,7 +2715,7 @@ class TestXGBoostFailClosedEndToEnd:
         json_file.write_text('{"version":[1,7,4],"learner":{"gradient_booster":')
         cache_dir = tmp_path / "cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(json_file, cache_dir)
 
             for result in (first, second):
@@ -2732,7 +2732,7 @@ class TestXGBoostFailClosedEndToEnd:
         ubj_file.write_bytes(b"\x7b\x55")
         cache_dir = tmp_path / "cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
                 first, second = _scan_twice_with_cache(ubj_file, cache_dir)
 
@@ -2768,7 +2768,7 @@ class TestXGBoostFailClosedEndToEnd:
         bst_file.write_bytes(_xgboost_ubjson_probe())
         cache_dir = tmp_path / "cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
                 first, second = _scan_twice_with_cache(bst_file, cache_dir)
 
@@ -2791,7 +2791,7 @@ class TestXGBoostFailClosedEndToEnd:
         assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "xgboost_binary_pickle_spoof" in direct.metadata["scan_outcome_reasons"]
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(spoof_file, cache_dir)
 
             for result in (first, second):
@@ -2843,7 +2843,7 @@ class TestXGBoostFailClosedEndToEnd:
         binary_file.write_bytes(b"abcdefghijklmnopqrstuvwxyzabcde")
         cache_dir = tmp_path / "cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(binary_file, cache_dir)
 
             for result in (first, second):
@@ -2892,7 +2892,7 @@ class TestXGBoostFailClosedEndToEnd:
         binary_file.write_bytes(b"abcdefghijklmnopqrstuvwxyzabcdef")
         cache_dir = tmp_path / "cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first, second = _scan_twice_with_cache(binary_file, cache_dir)
 
             for result in (first, second):

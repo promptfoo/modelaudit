@@ -91,7 +91,6 @@ from pickle_test_helpers import (
 )
 
 import modelaudit_picklescan.api as package_api
-import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -101,6 +100,7 @@ from modelaudit_picklescan import (
     ScanOptions,
     ScanStatus,
     Severity,
+    call_graph,
     scan_bytes,
     scan_file,
 )
@@ -768,10 +768,6 @@ _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD = (
     b"q\x11h\x05\x86q\x12Rq\x13tq\x14b."
 )
 _MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
-
-
-_SHADOW_FRAMEWORK_MODULE = "transformers.training_args"
-_SHADOW_FRAMEWORK_NAME = "TrainingArguments"
 
 
 def _write_same_module_rebind_trusted_transformers_package(site_packages: Path) -> None:

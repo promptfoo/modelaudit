@@ -190,7 +190,7 @@ def test_tflite_missing_dependency_result_is_not_cached(tmp_path: Path) -> None:
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", False):
             first = core.scan_model_directory_or_file(
                 str(path),
@@ -295,7 +295,7 @@ def test_tflite_invalid_magic_uncached_rerun_preserves_exit2(tmp_path: Path) -> 
     path.write_bytes(b"invalid tflite data")
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True):
             first = core.scan_model_directory_or_file(
                 str(path),
