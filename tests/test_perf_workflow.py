@@ -421,6 +421,58 @@ def test_python_ci_triggers_merge_group_and_cancels_superseded_main_runs() -> No
     assert 'echo "integration=false" >> "$GITHUB_OUTPUT"' in classify_run
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Python CI change detection runs in Bash on Ubuntu")
+@pytest.mark.parametrize(
+    ("files", "docs_only"),
+    [
+        (("changes/1.highlight.md", "packages/modelaudit-picklescan/changes/1.upgrade.md"), True),
+        (("packages/modelaudit-picklescan/changes/1.typo.md",), True),
+        (("packages/modelaudit-picklescan/changes/1.upgrade.mdd",), False),
+        (("changes/1.typo.md", "modelaudit/cli.py"), False),
+    ],
+)
+def test_python_ci_requires_fragment_validation_for_docs_and_mixed_prs(
+    tmp_path: Path, files: tuple[str, ...], docs_only: bool
+) -> None:
+    workflow = _load_workflow("test.yml")
+    assert _workflow_triggers(workflow)["pull_request"] is None
+    jobs = _jobs(workflow)
+    assert "changes" in jobs["ci-success"]["needs"]
+    steps = jobs["changes"]["steps"]
+    validation = _step_by_name(steps, "Validate release note fragments and changelogs")
+    assert "if" not in validation and "continue-on-error" not in validation
+    assert 'scripts/release_notes.py check --base "$BASE_SHA"' in validation["run"]
+    assert validation["env"]["BASE_SHA"] == (
+        "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}"
+    )
+    assert (
+        next(step for step in steps if step.get("id") == "filter")["if"] == "steps.classify.outputs.docs_only != 'true'"
+    )
+
+    repo, base = _init_test_repository(tmp_path)
+    for filename in files:
+        path = repo / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Example\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "PR")
+    output = tmp_path / "outputs"
+    classify = _step_by_name(steps, "Classify CI event")
+    subprocess.run(
+        ["bash", "-eu", "-c", classify["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PR_BASE": base,
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_REF": "refs/pull/1/merge",
+            "GITHUB_EVENT_NAME": "pull_request",
+        },
+        check=True,
+    )
+    assert ("docs_only=true" in output.read_text().splitlines()) == docs_only
+
+
 def test_python_ci_integration_scheduling_covers_remaining_job_surface() -> None:
     jobs = _jobs(_load_workflow("test.yml"))
     integration = "needs.changes.outputs.integration == 'true'"

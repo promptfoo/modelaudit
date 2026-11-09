@@ -164,6 +164,36 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
     assert (root / "CHANGELOG.md").read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    ("old", "new", "error"),
+    [
+        ("## [0.1.2]", "## [0.1.3]", "expected 0.1.2 immediately after Unreleased"),
+        ("/compare/modelaudit-picklescan-v0.1.1...", "/compare/v0.1.1...", "expected release comparison"),
+        ("<summary>All changes</summary>", "<summary>Miscellaneous</summary>", "missing All changes"),
+        ("</details>\n\n## [0.1.1]", "## [0.1.1]", "incomplete All changes"),
+        ("[Full comparison]", "[Old comparison]", "missing Full comparison"),
+        ("<!-- release-note-source:", "<!-- removed:", "missing release-note-source"),
+        ("### Upgrade notes", "", "missing reviewed category"),
+        ("<summary>Other changes</summary>", "", "missing reviewed category"),
+        ("- First change. [#42]", "- First change. [#43]", "missing reviewed reference for"),
+    ],
+)
+def test_check_rejects_incomplete_release_candidate(repository: Path, old: str, new: str, error: str) -> None:
+    fragment(repository, f"{SIBLING}/changes/42.upgrade.md", "First change.\n")
+    fragment(repository, f"{SIBLING}/changes/43.upgrade.md", "Second change.\n")
+    fragment(repository, f"{SIBLING}/changes/+cli.other.md", "The CLI reports progress.\n")
+    base = commit(repository, "add standalone release notes")
+    write_manifest(repository, "0.2.1", "0.1.2")
+    raw_section(repository, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    run(repository, "render", "--base", base)
+    run(repository, "check", "--base", base)
+    changelog = repository / SIBLING / "CHANGELOG.md"
+    changelog.write_text(changelog.read_text().replace(old, new, 1))
+    rejected = run(repository, "check", "--base", base, check=False)
+    assert rejected.returncode != 0
+    assert f"{Path(SIBLING) / 'CHANGELOG.md'}: {error}" in rejected.stderr
+
+
 def test_sibling_release_leaves_root_fragments_pending(repository: Path) -> None:
     root = repository
     fragment(root, "changes/42.upgrade.md", "Root callers must migrate.\n")
@@ -194,9 +224,105 @@ def test_shipped_fragment_paths_cannot_be_silently_reused(repository: Path) -> N
     commit(root, "release")
     git(root, "tag", "v0.2.2")
     fragment(root, "changes/46.other.md", "Different.\n")
-    rejected = run(root, "pending", "--package", "modelaudit", check=False)
-    assert rejected.returncode != 0
-    assert "new fragment filename" in rejected.stderr
+    for args in (("check",), ("pending", "--package", "modelaudit")):
+        rejected = run(root, *args, check=False)
+        assert rejected.returncode != 0
+        assert "new fragment filename" in rejected.stderr
+
+
+def test_late_fragments_survive_a_squash_of_an_older_release_candidate(repository: Path) -> None:
+    root = repository
+    git(root, "branch", "-M", "main")
+    fragment(root, "changes/70.other.md", "Reviewed earlier.\n")
+    fragment(root, "changes/71.other.md", "Original instructions.\n")
+    source = commit(root, "review these fragments")
+    git(root, "switch", "-c", "release-pr")
+    write_manifest(root, "0.2.2", "0.1.1")
+    raw_section(root, ".", "0.2.1", "0.2.2", "v")
+    run(root, "render", "--base", source)
+    commit(root, "render reviewed changelog")
+    git(root, "switch", "main")
+    fragment(root, "changes/71.other.md", "Revised instructions.\n")
+    fragment(root, "changes/72.security.md", "Late security fix.\n")
+    late = commit(root, "amend a pending note and add a fix before the bot refreshes")
+    git(root, "merge", "--squash", "release-pr")
+    released = commit(root, "squash release onto a newer main")
+    run(root, "check", "--base", late)
+    git(root, "tag", "v0.2.2")
+    first = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2", "--ref", "v0.2.2").stdout
+    assert f"<!-- release-note-source: {source} -->" in first
+    assert "Late security fix." not in first and "Original instructions." in first
+    pending = run(root, "pending", "--package", "modelaudit").stdout
+    assert "Late security fix." in pending and "Revised instructions." in pending and "Reviewed earlier." not in pending
+
+    write_manifest(root, "0.2.3", "0.1.1")
+    raw_section(root, ".", "0.2.2", "0.2.3", "v")
+    run(root, "render", "--base", released)
+    second = run(root, "extract", "--package", "modelaudit", "--version", "0.2.3").stdout
+    assert pending in second and "Reviewed earlier." not in second
+    commit(root, "ship the late notes")
+    git(root, "tag", "v0.2.3")
+    assert run(root, "pending", "--package", "modelaudit").stdout.strip() == "No pending release notes."
+
+
+def test_render_rejects_fragments_missing_from_or_changed_since_review_base(repository: Path) -> None:
+    root = repository
+    path = "changes/70.other.md"
+    fragment(root, path, "Original.\n")
+    source = commit(root, "release base")
+    write_manifest(root, "0.2.2", "0.1.1")
+    raw_section(root, ".", "0.2.1", "0.2.2", "v")
+    for name in ("changes/71.other.md", path):
+        fragment(root, name, "Candidate-only addition or edit.\n")
+        rejected = run(root, "render", "--base", source, check=False)
+        assert rejected.returncode != 0 and "release candidate fragments differ" in rejected.stderr
+        (root / name).unlink()
+
+
+def test_legacy_and_invalid_tagged_fragment_sources(repository: Path) -> None:
+    root = repository
+    fragment(root, "changes/70.other.md", "Shipped before source markers.\n")
+    base = commit(root, "last release without a snapshot")
+    git(root, "tag", "-f", "v0.2.1", base)
+    assert run(root, "pending", "--package", "modelaudit").stdout.strip() == "No pending release notes."
+    other_history = git(root, "commit-tree", "HEAD^{tree}", "-m", "unrelated history")
+    file = root / "CHANGELOG.md"
+    original = file.read_text()
+    for marker in ("HEAD", other_history):
+        file.write_text(
+            original.replace(
+                "## [0.2.1] - 2026-10-01", f"## [0.2.1] - 2026-10-01\n\n<!-- release-note-source: {marker} -->"
+            )
+        )
+        git(root, "tag", "-f", "v0.2.1", commit(root, "tag with a bad marker"))
+        rejected = run(root, "pending", "--package", "modelaudit", check=False)
+        assert rejected.returncode != 0 and (
+            "Invalid release-note-source" in rejected.stderr or "must be a commit" in rejected.stderr
+        )
+
+
+def test_untagged_release_uses_the_pr_base_but_normal_checkout_requires_its_exact_tag(repository: Path) -> None:
+    fragment(repository, "changes/72.other.md", "Pending release wording.\n")
+    base = commit(repository, "add a fragment before preparing the candidate")
+    git(repository, "update-ref", "refs/remotes/origin/main", base)
+    git(repository, "switch", "-c", "release-please--branches--main")
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    run(repository, "render", "--base", base)
+    commit(repository, "release candidate")
+    run(repository, "check")
+    pending = run(repository, "pending", "--package", "modelaudit").stdout
+    assert "Pending release wording." in pending
+
+    # A detached checkout can specify its PR base. Without it, do not guess
+    # that an older available tag is the latest release in an incomplete clone.
+    git(repository, "switch", "--detach")
+    run(repository, "check", "--base", base)
+    assert run(repository, "pending", "--package", "modelaudit", "--base", base).stdout == pending
+    for args in (("check",), ("pending", "--package", "modelaudit")):
+        missing = run(repository, *args, check=False)
+        assert missing.returncode != 0
+        assert "git fetch origin tag v0.2.2" in missing.stderr
 
 
 def test_extract_from_historical_tags_with_repeated_unreleased_headings(repository: Path) -> None:
@@ -346,3 +472,22 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     assert "Candidate template" not in public
     assert "Unapproved wording." not in public
     assert "Draft instructions." not in public
+
+
+def test_multiline_upgrade_note_keeps_reference_outside_the_code_block(repository: Path) -> None:
+    fragment(repository, "changes/42.upgrade.md", "Scan locally.\n\n```sh\nmodelaudit scan ./model\n```\n")
+    base = commit(repository, "document an upgrade command")
+    expected = (
+        "- Scan locally.\n\n  ```sh\n  modelaudit scan ./model\n  ```\n\n"
+        "  [#42](https://github.com/promptfoo/modelaudit/issues/42)"
+    )
+    preview = run(repository, "pending", "--package", "modelaudit").stdout
+    assert expected in preview
+
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    run(repository, "render", "--base", base)
+    run(repository, "render", "--base", base)
+    ref = commit(repository, "render release notes")
+    public = run(repository, "extract", "--package", "modelaudit", "--version", "0.2.2", "--ref", ref).stdout
+    assert public.count(expected) == 1
