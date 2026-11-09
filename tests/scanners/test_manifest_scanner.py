@@ -1791,7 +1791,7 @@ def test_hf_download_metadata_is_not_cached(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_bytes(_HF_RECORD)
     cache_dir = tmp_path / "cache"
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         for _ in range(2):
             result = scan_model_directory_or_file(
                 str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
