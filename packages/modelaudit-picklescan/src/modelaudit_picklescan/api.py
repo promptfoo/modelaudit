@@ -6302,12 +6302,14 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
         return None
 
     try:
-        stream = io.BytesIO(payload)
+        # A bytes subclass can preserve its own slicing behavior through scan_bytes.
+        stream = io.BytesIO(payload) if type(payload) is bytes else None
+        offset = 0
         opcode_count = 0
         # genops consumes one stream through STOP. Only the memo carries over.
-        while stream.tell() < len(payload):
+        while (stream.tell() if stream is not None else offset) < len(payload):
             stack = []
-            for opcode, arg, _position in pickletools.genops(stream):
+            for opcode, arg, position in pickletools.genops(stream if stream is not None else payload[offset:]):
                 opcode_count += 1
                 if opcode_count > _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES:
                     return False
@@ -6317,6 +6319,10 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                 if opcode_name in {"PROTO", "FRAME"}:
                     continue
                 if opcode_name == "STOP":
+                    if position is None:
+                        return False
+                    if stream is None:
+                        offset += position + 1
                     break
                 if opcode_name == "MARK":
                     stack.append(_ABSTRACT_MARK)
