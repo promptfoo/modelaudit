@@ -14,7 +14,7 @@ import pickletools
 import struct
 import zlib
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from importlib.metadata import version as distribution_version
@@ -949,20 +949,6 @@ class JoblibScanner(BaseScanner):
         result: ScanResult,
         validated_control_occurrences: dict[str, frozenset[int]],
     ) -> None:
-        def validated_candidate_reference(finding: Any) -> str | None:
-            details = getattr(finding, "details", {})
-            if not isinstance(details, dict):
-                return None
-            import_reference = details.get("import_reference")
-            if import_reference not in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES:
-                return None
-            if (
-                getattr(finding, "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
-                or details.get("notice_code") == "call_graph_source_unavailable"
-            ):
-                return str(import_reference)
-            return None
-
         def reference_origin_is_trusted(*, finding: Any = None, reference: dict[str, Any] | None = None) -> bool:
             if reference is None:
                 reference = getattr(finding, "details", {})
@@ -977,17 +963,22 @@ class JoblibScanner(BaseScanner):
             except Exception:
                 return False
 
-        def finding_position(finding: Any) -> int | None:
-            details = getattr(finding, "details", {})
-            position = details.get("position") if isinstance(details, dict) else None
-            return position if type(position) is int else None
-
         def reference_position(reference: dict[str, Any]) -> int | None:
             position = reference.get("position")
             return position if type(position) is int else None
 
         def position_sort_key(position: int | None, sequence: int) -> tuple[int, int, int]:
             return (1 if position is None else 0, position if position is not None else 0, sequence)
+
+        def mixed_position_references(records: Iterable[tuple[str, int | None]]) -> set[str]:
+            known: set[str] = set()
+            missing: set[str] = set()
+            for reference, position in records:
+                if position is None:
+                    missing.add(reference)
+                else:
+                    known.add(reference)
+            return missing & known
 
         def origin_review_references_are_validated() -> bool:
             import_references = result.metadata.get("import_references")
@@ -1003,17 +994,10 @@ class JoblibScanner(BaseScanner):
             if not origin_review_references:
                 return False
 
-            references_with_missing_positions = {
-                str(reference.get("import_reference"))
+            if mixed_position_references(
+                (str(reference.get("import_reference")), reference_position(reference))
                 for reference in origin_review_references
-                if reference_position(reference) is None
-            }
-            references_with_known_positions = {
-                str(reference.get("import_reference"))
-                for reference in origin_review_references
-                if reference_position(reference) is not None
-            }
-            if references_with_missing_positions & references_with_known_positions:
+            ):
                 return False
 
             seen_occurrences: dict[str, int] = {}
@@ -1026,10 +1010,7 @@ class JoblibScanner(BaseScanner):
                 import_reference = str(reference.get("import_reference"))
                 position = reference_position(reference)
                 occurrence_key = ("position", position) if position is not None else ("missing", sequence)
-                if (
-                    import_reference not in seen_occurrence_keys
-                    or seen_occurrence_keys[import_reference] != occurrence_key
-                ):
+                if seen_occurrence_keys.get(import_reference) != occurrence_key:
                     seen_occurrences[import_reference] = seen_occurrences.get(import_reference, 0) + 1
                 seen_occurrence_keys[import_reference] = occurrence_key
                 occurrence = seen_occurrences[import_reference]
@@ -1052,49 +1033,50 @@ class JoblibScanner(BaseScanner):
                 details.get("import_reference") if isinstance(details, dict) else None,
             )
 
-        candidates: list[tuple[int | None, int, str, Any]] = []
+        Candidate = tuple[int | None, int, str, Any]
+        GroupKey = tuple[str, tuple[Any, ...]]
+
+        def missing_position_groups(records: list[Candidate]) -> tuple[dict[GroupKey, int], set[GroupKey]]:
+            first_sequence: dict[GroupKey, int] = {}
+            seen_kinds: set[tuple[GroupKey, bool]] = set()
+            ambiguous: set[GroupKey] = set()
+            for position, sequence, import_reference, finding in records:
+                if position is not None:
+                    continue
+                group_key = (import_reference, no_position_finding_signature(finding))
+                first_sequence.setdefault(group_key, sequence)
+                # One occurrence can produce both an issue and a check. Repeating either is ambiguous.
+                group_kind = (group_key, isinstance(finding, Check))
+                if group_kind in seen_kinds:
+                    ambiguous.add(group_key)
+                seen_kinds.add(group_kind)
+            return first_sequence, ambiguous
+
+        candidates: list[Candidate] = []
         for sequence, finding in enumerate((*result.issues, *result.checks)):
-            import_reference = validated_candidate_reference(finding)
-            if import_reference is not None:
-                candidates.append((finding_position(finding), sequence, import_reference, finding))
+            details = getattr(finding, "details", {})
+            if not isinstance(details, dict):
+                continue
+            import_reference = details.get("import_reference")
+            if import_reference not in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES:
+                continue
+            if (
+                getattr(finding, "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
+                or details.get("notice_code") == "call_graph_source_unavailable"
+            ):
+                candidates.append((reference_position(details), sequence, str(import_reference), finding))
         occurrence_candidates = [
             candidate
             for candidate in candidates
             if getattr(candidate[3], "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
         ]
 
-        candidate_references_with_missing_positions = {
-            import_reference
-            for position, _sequence, import_reference, _finding in occurrence_candidates
-            if position is None
-        }
-        candidate_references_with_known_positions = {
-            import_reference
-            for position, _sequence, import_reference, _finding in occurrence_candidates
-            if position is not None
-        }
-        ambiguous_missing_position_references = (
-            candidate_references_with_missing_positions & candidate_references_with_known_positions
+        ambiguous_missing_position_references = mixed_position_references(
+            (import_reference, position) for position, _sequence, import_reference, _finding in occurrence_candidates
         )
-        no_position_group_first_sequence: dict[tuple[str, tuple[Any, ...]], int] = {}
-        no_position_group_kinds: dict[tuple[str, tuple[Any, ...]], Counter[str]] = {}
-        for position, sequence, import_reference, finding in occurrence_candidates:
-            if position is not None:
-                continue
-            group_key = (import_reference, no_position_finding_signature(finding))
-            no_position_group_first_sequence[group_key] = min(
-                sequence,
-                no_position_group_first_sequence.get(group_key, sequence),
-            )
-            kind = "check" if isinstance(finding, Check) else "issue"
-            no_position_group_kinds.setdefault(group_key, Counter())[kind] += 1
-        ambiguous_no_position_groups = {
-            group_key
-            for group_key, kind_counts in no_position_group_kinds.items()
-            if any(count > 1 for count in kind_counts.values())
-        }
+        no_position_group_first_sequence, ambiguous_no_position_groups = missing_position_groups(occurrence_candidates)
 
-        def candidate_sort_key(candidate: tuple[int | None, int, str, Any]) -> tuple[int, int, int]:
+        def candidate_sort_key(candidate: Candidate) -> tuple[int, int, int]:
             position, sequence, import_reference, finding = candidate
             if position is not None:
                 return position_sort_key(position, sequence)
@@ -1118,7 +1100,7 @@ class JoblibScanner(BaseScanner):
                 if _position is not None
                 else ("missing", no_position_finding_signature(finding))
             )
-            if import_reference not in seen_occurrence_keys or seen_occurrence_keys[import_reference] != occurrence_key:
+            if seen_occurrence_keys.get(import_reference) != occurrence_key:
                 seen_occurrences[import_reference] = seen_occurrences.get(import_reference, 0) + 1
             seen_occurrence_keys[import_reference] = occurrence_key
             occurrence = seen_occurrences[import_reference]
@@ -1135,18 +1117,9 @@ class JoblibScanner(BaseScanner):
                 if isinstance(getattr(candidate[3], "details", {}), dict)
                 and candidate[3].details.get("notice_code") == "call_graph_source_unavailable"
             ]
-            source_missing_position_groups = {
-                (import_reference, no_position_finding_signature(finding))
-                for position, _sequence, import_reference, finding in source_unavailable_candidates
-                if position is None
-            }
-            source_missing_position_group_kinds: dict[tuple[str, tuple[Any, ...]], Counter[str]] = {}
-            for position, _sequence, import_reference, finding in source_unavailable_candidates:
-                if position is not None:
-                    continue
-                group_key = (import_reference, no_position_finding_signature(finding))
-                kind = "check" if isinstance(finding, Check) else "issue"
-                source_missing_position_group_kinds.setdefault(group_key, Counter())[kind] += 1
+            source_missing_position_groups, ambiguous_source_unavailable_groups = missing_position_groups(
+                source_unavailable_candidates
+            )
             source_missing_position_group_counts = Counter(
                 import_reference for import_reference, _signature in source_missing_position_groups
             )
@@ -1155,20 +1128,11 @@ class JoblibScanner(BaseScanner):
                 for import_reference, count in source_missing_position_group_counts.items()
                 if count > 1
             }
-            ambiguous_source_unavailable_groups = {
-                group_key
-                for group_key, kind_counts in source_missing_position_group_kinds.items()
-                if any(count > 1 for count in kind_counts.values())
-            }
-            for _position, _sequence, _import_reference, finding in candidates:
-                details = getattr(finding, "details", {})
-                no_position_group_key = (_import_reference, no_position_finding_signature(finding))
+            for _position, _sequence, import_reference, finding in source_unavailable_candidates:
+                no_position_group_key = (import_reference, no_position_finding_signature(finding))
                 if (
-                    isinstance(details, dict)
-                    and details.get("notice_code") == "call_graph_source_unavailable"
-                    and reference_origin_is_trusted(finding=finding)
-                    and _import_reference not in ambiguous_source_unavailable_references
-                    and (_position is not None or no_position_group_key in source_missing_position_groups)
+                    reference_origin_is_trusted(finding=finding)
+                    and import_reference not in ambiguous_source_unavailable_references
                     and no_position_group_key not in ambiguous_source_unavailable_groups
                 ):
                     validated_finding_ids.add(builtins.id(finding))
