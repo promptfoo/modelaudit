@@ -38,7 +38,7 @@ From the repository root, run `python scripts/release_notes.py check` to validat
 
 On the rolling release branch, both commands use the merge base with `origin/main` to find the last published versions. For a detached release PR checkout, pass `--base <PR-base-SHA>` to either command. If a package tag is missing locally, the error names the tag to fetch. To see wording supplied by reviewers, read the generated changelog on the release PR.
 
-Each generated version section records the reviewed `main` commit in a hidden Markdown comment. If another fragment lands or a pending fragment changes before the release PR merges, the next release picks up that addition or revision. Older tags without the comment keep their original cutoff. If an open release PR is missing its comment, refresh its metadata using the command below.
+Each generated version section records the reviewed `main` commit and the number of rendered notes in hidden Markdown comments. Identical notes grouped by Towncrier count as one entry. If another fragment lands or a pending fragment changes before the release PR merges, the next release picks up that addition or revision. Older tags without a source comment keep their original cutoff. If an open release PR is missing these comments, refresh its metadata using the command below.
 
 ### Reviewing the rolling release PR
 

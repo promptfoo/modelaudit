@@ -40,7 +40,8 @@ def fragment(root: Path, path: str, text: str) -> None:
 
 def raw_section(root: Path, path: str, before: str, after: str, prefix: str) -> None:
     file = root / path / "CHANGELOG.md"
-    header = f"## [{after}](https://example.org/compare/{prefix}{before}...{prefix}{after}) (2026-11-08)"
+    comparison = f"https://github.com/promptfoo/modelaudit/compare/{prefix}{before}...{prefix}{after}"
+    header = f"## [{after}]({comparison}) (2026-11-08)"
     old = file.read_text()
     file.write_text(
         old.replace("## [Unreleased]", f"{header}\n\n### Bug Fixes\n\n- merged change\n\n## [Unreleased]", 1)
@@ -173,6 +174,7 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
         ("</details>\n\n## [0.1.1]", "## [0.1.1]", "incomplete All changes"),
         ("[Full comparison]", "[Old comparison]", "missing Full comparison"),
         ("<!-- release-note-source:", "<!-- removed:", "missing release-note-source"),
+        ("<!-- release-note-entries:", "<!-- removed:", "reviewed entry count"),
         ("### Upgrade notes", "", "missing reviewed category"),
         ("<summary>Other changes</summary>", "", "missing reviewed category"),
         ("- First change. [#42]", "- First change. [#43]", "missing reviewed reference for"),
@@ -192,6 +194,26 @@ def test_check_rejects_incomplete_release_candidate(repository: Path, old: str, 
     rejected = run(repository, "check", "--base", base, check=False)
     assert rejected.returncode != 0
     assert f"{Path(SIBLING) / 'CHANGELOG.md'}: {error}" in rejected.stderr
+
+
+@pytest.mark.parametrize("repository_url", ["https://example.org", "https://github.com/another/project"])
+def test_release_comparisons_must_point_to_this_repository(repository: Path, repository_url: str) -> None:
+    base = git(repository, "rev-parse", "HEAD")
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    file = repository / "CHANGELOG.md"
+    comparison = "https://github.com/promptfoo/modelaudit/compare/v0.2.1...v0.2.2"
+    wrong = f"{repository_url}/compare/v0.2.1...v0.2.2"
+    raw = file.read_text()
+    file.write_text(raw.replace(comparison, wrong))
+    assert "expected release comparison" in run(repository, "render", "--base", base, check=False).stderr
+
+    file.write_text(raw)
+    run(repository, "render", "--base", base)
+    reviewed = file.read_text()
+    assert reviewed.count(comparison) == 2  # Heading and full comparison in the inventory.
+    file.write_text(reviewed.replace(comparison, wrong))
+    assert "expected release comparison" in run(repository, "check", "--base", base, check=False).stderr
 
 
 def test_sibling_release_leaves_root_fragments_pending(repository: Path) -> None:
@@ -491,3 +513,43 @@ def test_multiline_upgrade_note_keeps_reference_outside_the_code_block(repositor
     ref = commit(repository, "render release notes")
     public = run(repository, "extract", "--package", "modelaudit", "--version", "0.2.2", "--ref", ref).stdout
     assert public.count(expected) == 1
+
+
+def test_reviewed_entry_count_preserves_grouping_and_catches_dropped_notes(repository: Path) -> None:
+    fragments = {
+        "80.other.md": "Shared note.",
+        "81.other.md": "Shared note.",
+        "80.other.1.md": "Second note for the same issue.",
+        "+one.upgrade.md": "Unnumbered instructions.",
+        "+two.upgrade.md": "Separate orphan note.",
+        "+multi.upgrade.md": "Run these steps.\n\n- nested list\n\n```text\n- example line\n```",
+    }
+    for name, body in fragments.items():
+        fragment(repository, f"changes/{name}", body)
+    base = commit(repository, "add duplicate, numbered and unnumbered entries")
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    run(repository, "render", "--base", base)
+    changelog = repository / "CHANGELOG.md"
+    original = changelog.read_text()
+    assert original.count("- Shared note.") == 1
+    assert "<!-- release-note-entries: 5 -->" in original
+    run(repository, "check", "--base", base)
+
+    for missing in ("- Second note for the same issue.", "- Separate orphan note."):
+        changelog.write_text("\n".join(line for line in original.split("\n") if not line.startswith(missing)))
+        result = run(repository, "check", "--base", base, check=False)
+        assert result.returncode != 0 and "reviewed entry count" in result.stderr
+
+    # Reviewers can intentionally give two fragments the same wording. Towncrier
+    # consolidates the resulting entry even though the source texts differ.
+    changelog.write_text(original)
+    reviews = repository.parent / f"{repository.name}-merged-entries.json"
+    reviews.write_text(
+        json.dumps([{"body": "<!-- release-note: changes/+two.upgrade.md -->\nUnnumbered instructions."}])
+    )
+    run(repository, "render", "--base", base, "--reviews", str(reviews))
+    approved = changelog.read_text()
+    assert "<!-- release-note-entries: 4 -->" in approved
+    assert approved.count("- Unnumbered instructions.") == 1
+    run(repository, "check", "--base", base)

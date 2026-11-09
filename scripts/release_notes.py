@@ -188,11 +188,10 @@ def candidate_inventory(
     section: str, changelog: Path, prefix: str, before: str, after: str, *, require_reviewed: bool
 ) -> tuple[str, str]:
     heading, _, body = section.partition("\n")
-    comparison = re.search(r"\]\((https://[^)]+)\)", heading)
-    expected_range = f"/compare/{prefix}{before}...{prefix}{after}"
-    if not comparison or not comparison[1].endswith(expected_range):
-        raise ValueError(f"{changelog}: expected release comparison ending in {expected_range}")
-    link = f"[Full comparison]({comparison[1]})"
+    comparison = f"{REPOSITORY_URL}/compare/{prefix}{before}...{prefix}{after}"
+    if not heading.startswith(f"## [{after}]({comparison})"):
+        raise ValueError(f"{changelog}: expected release comparison {comparison}")
+    link = f"[Full comparison]({comparison})"
     _, disclosure, inventory = body.rpartition(INVENTORY)
     if disclosure:
         inventory = inventory.rstrip()
@@ -206,6 +205,12 @@ def candidate_inventory(
     else:
         inventory = body.strip() + "\n\n" + link
     return heading, inventory
+
+
+def entry_count_marker(summary: str) -> str:
+    # Towncrier groups identical reviewed prose and indents all continuation lines.
+    entries = sum(line.startswith("- ") for line in summary.splitlines())
+    return f"<!-- release-note-entries: {entries} -->"
 
 
 def check_candidate(
@@ -223,6 +228,9 @@ def check_candidate(
         issue = path.name.partition(".")[0]
         if issue.isdecimal() and f"[#{issue}]({REPOSITORY_URL}/issues/{issue})" not in reviewed:
             raise ValueError(f"{changelog}: missing reviewed reference for {path}")
+    markers = [line for line in reviewed.splitlines() if line.startswith("<!-- release-note-entries")]
+    if markers != [entry_count_marker(reviewed)]:
+        raise ValueError(f"{changelog}: reviewed entry count differs or is missing; refresh the release PR metadata")
 
 
 def render(base: str, reviews: dict[str, str]) -> None:
@@ -254,9 +262,9 @@ def render(base: str, reviews: dict[str, str]) -> None:
                 f"{folder}: release candidate fragments differ from {base}; merge fragment edits on main first"
             )
         summary = towncrier_summary(paths, after, reviews)
-        marker = f"{SOURCE_MARKER} {base} -->"
+        markers = f"{SOURCE_MARKER} {base} -->\n\n{entry_count_marker(summary)}"
         next_section = "\n\n".join(
-            filter(None, [heading, marker, summary, f"{INVENTORY}\n\n{inventory}\n\n</details>"])
+            filter(None, [heading, markers, summary, f"{INVENTORY}\n\n{inventory}\n\n</details>"])
         )
         start = original.index(sections["Unreleased"])
         position = start + len(sections["Unreleased"])
