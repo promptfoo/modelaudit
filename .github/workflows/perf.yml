@@ -5,6 +5,7 @@ on:
     paths: &benchmark-trigger-paths
       - "modelaudit/**"
       - "packages/modelaudit-picklescan/**"
+      - "!packages/modelaudit-picklescan/changes/**"
       - "tests/benchmarks/**"
       - "tests/helpers/**"
       - "tests/conftest.py"

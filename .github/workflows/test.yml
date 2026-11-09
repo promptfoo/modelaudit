@@ -81,7 +81,7 @@ jobs:
               - 'pyproject.toml'
               - 'uv.lock'
             picklescan:
-              - 'packages/modelaudit-picklescan/**'
+              - 'packages/modelaudit-picklescan/!(changes/**)'
             docker:
               - 'Dockerfile*'
               - 'docker-install-rust.sh'
