@@ -507,7 +507,7 @@ class PickleScanner:
                     error=error,
                     stream_start_offset=position_offset,
                 )
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read pickle stream: {error!s}",
                 category="short_read",
@@ -515,7 +515,7 @@ class PickleScanner:
                 bytes_total=error.expected_size,
             )
         except Exception as error:
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read pickle stream: {error!s}",
                 category="io_error",
@@ -611,7 +611,7 @@ class PickleScanner:
                     enrich_call_graph=enrich_call_graph,
                 )
         except OSError as error:
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read pickle file: {error!s}",
                 category="io_error",
@@ -619,7 +619,7 @@ class PickleScanner:
                 bytes_total=None,
             )
         except zipfile.BadZipFile as error:
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read PyTorch ZIP file: {error!s}",
                 category="zip_error",
@@ -718,7 +718,7 @@ class PickleScanner:
                         reports.append(member_report)
                     except Exception as error:
                         reports.append(
-                            _io_error_report(
+                            _scan_error_report(
                                 source=member_source,
                                 message=f"Could not read PyTorch ZIP pickle member: {error!s}",
                                 category="zip_error",
@@ -4997,7 +4997,7 @@ def _with_short_read_error(
     )
 
 
-def _io_error_report(
+def _scan_error_report(
     *,
     source: str,
     message: str,
@@ -5071,24 +5071,12 @@ def _scan_pickle_payload_native(
             return _with_call_graph_findings(report, payload=payload)
         return _with_import_origin_findings(report)
     except Exception as error:
-        return PickleReport(
+        return _scan_error_report(
             source=source,
-            status=ScanStatus.ERROR,
-            verdict=SafetyVerdict.UNKNOWN,
-            errors=(
-                ScanError(
-                    message=f"Rust pickle scanner failed: {error!s}",
-                    category="rust_engine_error",
-                    location=source,
-                    exception_type=type(error).__name__,
-                ),
-            ),
-            coverage=CoverageSummary(
-                bytes_scanned=0,
-                bytes_total=native_bytes_total,
-                raw_scan_complete=False,
-                opcode_scan_complete=False,
-            ),
+            message=f"Rust pickle scanner failed: {error!s}",
+            category="rust_engine_error",
+            exception=error,
+            bytes_total=native_bytes_total,
         )
 
 
