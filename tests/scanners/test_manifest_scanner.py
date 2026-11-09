@@ -33,6 +33,10 @@ def _cloud_read_failure(
     return fail_cloud_url_read_once
 
 
+def _write_json_manifest(path: Path, /, **fields: object) -> None:
+    path.write_text(json.dumps(fields), encoding="utf-8")
+
+
 def _https_url(host: str, path: str = "/model.bin") -> str:
     """Build HTTPS URLs without embedding full host literals in test assertions."""
     return f"https://{host}{path}"
@@ -122,7 +126,7 @@ def test_manifest_blacklist_read_failure_is_inconclusive_not_security_finding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+    _write_json_manifest(test_file, model_type="bert")
 
     def raise_os_error(_self: ManifestScanner, _path: str) -> str:
         raise OSError("simulated manifest read failure")
@@ -197,7 +201,7 @@ def test_manifest_unreadable_path_preflight_is_operational_not_security_finding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+    _write_json_manifest(test_file, model_type="bert")
 
     monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
 
@@ -217,7 +221,7 @@ def test_manifest_zip_probe_failure_preserves_owner_for_parser_read_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+    _write_json_manifest(test_file, model_type="bert")
 
     def raise_zip_error(_path: str) -> bool:
         raise OSError("simulated ZIP probe read failure")
@@ -241,7 +245,7 @@ def test_manifest_blacklist_read_failure_bypasses_stale_clean_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(json.dumps({"model_type": "bert", "padding": "x" * 11_000}), encoding="utf-8")
+    _write_json_manifest(test_file, model_type="bert", padding="x" * 11_000)
     cache_dir = tmp_path / "cache"
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
@@ -292,7 +296,7 @@ def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(json.dumps({"model_type": "bert", "padding": "x" * 11_000}), encoding="utf-8")
+    _write_json_manifest(test_file, model_type="bert", padding="x" * 11_000)
     cache_dir = tmp_path / "cache"
 
     with IsolatedCacheManager(lambda: reset_cache_manager()):
@@ -339,10 +343,7 @@ def test_manifest_cloud_storage_read_failure_is_inconclusive_after_parse_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(
-        json.dumps({"model_type": "bert", "weights": "https://bucket.s3.amazonaws.com/malware/model.bin"}),
-        encoding="utf-8",
-    )
+    _write_json_manifest(test_file, model_type="bert", weights="https://bucket.s3.amazonaws.com/malware/model.bin")
     fail_cloud_url_read_once = _cloud_read_failure(ManifestScanner._read_manifest_text)
 
     monkeypatch.setattr(ManifestScanner, "_read_manifest_text", fail_cloud_url_read_once)
@@ -370,15 +371,11 @@ def test_manifest_cloud_storage_read_failure_remains_unsuccessful_with_recovered
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(
-        json.dumps(
-            {
-                "model_type": "bert",
-                "weights": "https://bucket.s3.amazonaws.com/releases/model.bin",
-                "checksum": "0" * 40,
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        test_file,
+        model_type="bert",
+        weights="https://bucket.s3.amazonaws.com/releases/model.bin",
+        checksum="0" * 40,
     )
     fail_cloud_url_read_once = _cloud_read_failure(ManifestScanner._read_manifest_text)
 
@@ -401,15 +398,11 @@ def test_manifest_cloud_storage_read_failure_bypasses_stale_clean_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     test_file = tmp_path / "config.json"
-    test_file.write_text(
-        json.dumps(
-            {
-                "model_type": "bert",
-                "weights": "https://bucket.s3.amazonaws.com/releases/model.bin",
-                "padding": "x" * 11_000,
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        test_file,
+        model_type="bert",
+        weights="https://bucket.s3.amazonaws.com/releases/model.bin",
+        padding="x" * 11_000,
     )
     cache_dir = tmp_path / "cache"
 
@@ -652,7 +645,7 @@ def test_manifest_scanner_can_handle(tmp_path: Path) -> None:
 
 def test_manifest_scanner_flags_blacklist_on_manifest_suffix(tmp_path: Path) -> None:
     test_file = tmp_path / "artifact.manifest"
-    test_file.write_text(json.dumps({"description": "unsafe model"}), encoding="utf-8")
+    _write_json_manifest(test_file, description="unsafe model")
 
     result = ManifestScanner(config={"blacklist_patterns": ["unsafe"]}).scan(str(test_file))
 
@@ -688,14 +681,10 @@ def test_manifest_scanner_url_shortener_flagged(tmp_path):
 
 def test_manifest_scanner_delegates_malicious_chat_templates_to_jinja_analysis(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template="{{ ''.__class__.__mro__[1].__subclasses__() }}",
     )
 
     result = ManifestScanner().scan(str(config_path))
@@ -709,17 +698,13 @@ def test_manifest_scanner_delegates_malicious_chat_templates_to_jinja_analysis(t
 def test_manifest_scanner_delegates_nested_chat_template_containers_to_jinja_analysis(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     payload = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": {
-                    "default": payload,
-                    "description": "plain prose",
-                },
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template={
+            "default": payload,
+            "description": "plain prose",
+        },
     )
 
     result = ManifestScanner().scan(str(config_path))
@@ -754,14 +739,10 @@ def test_manifest_scanner_deep_jinja_collection_budget_fails_closed(tmp_path: Pa
     for index in range(5):
         nested_config = {"nested": nested_config, "level": index}
 
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "metadata": nested_config,
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        metadata=nested_config,
     )
     config = {"jinja_template_collection_max_depth": 3}
 
@@ -785,15 +766,11 @@ def test_manifest_scanner_jinja_collection_budget_preserves_malicious_template_d
     for index in range(5):
         nested_config = {"nested": nested_config, "level": index}
 
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
-                "metadata": nested_config,
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template="{{ ''.__class__.__mro__[1].__subclasses__() }}",
+        metadata=nested_config,
     )
 
     result = ManifestScanner(config={"jinja_template_collection_max_depth": 3}).scan(str(config_path))
@@ -972,14 +949,10 @@ def test_manifest_scanner_depth_budget_skips_only_overdeep_branch(tmp_path: Path
     nested_config: dict[str, Any] = {"leaf": "plain metadata"}
     for _ in range(5):
         nested_config = {"nested": nested_config}
-    config_path.write_text(
-        json.dumps(
-            {
-                "metadata": nested_config,
-                "later": {"chat_template": malicious},
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        metadata=nested_config,
+        later={"chat_template": malicious},
     )
 
     result = ManifestScanner(config={"jinja_template_collection_max_depth": 3}).scan(str(config_path))
@@ -1001,14 +974,10 @@ def test_manifest_scanner_depth_budget_skips_only_overdeep_branch(tmp_path: Path
 def test_manifest_scanner_prioritizes_template_fields_before_item_budget(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     malicious = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
-    config_path.write_text(
-        json.dumps(
-            {
-                "metadata": [{"name": f"layer-{index}"} for index in range(8)],
-                "chat_template": malicious,
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        metadata=[{"name": f"layer-{index}"} for index in range(8)],
+        chat_template=malicious,
     )
 
     result = ManifestScanner(config={"jinja_template_collection_max_items": 3}).scan(str(config_path))
@@ -1043,14 +1012,10 @@ def test_manifest_scanner_invalid_jinja_budget_values_use_defaults() -> None:
 
 def test_manifest_scanner_wide_jinja_collection_item_budget_fails_closed(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "metadata": [{"name": f"layer-{index}"} for index in range(8)],
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        metadata=[{"name": f"layer-{index}"} for index in range(8)],
     )
 
     result = ManifestScanner(config={"jinja_template_collection_max_items": 4}).scan(str(config_path))
@@ -1144,19 +1109,13 @@ def test_manifest_scanner_preserves_templates_with_colliding_redacted_locations(
 
 def test_manifest_scanner_nested_near_match_jinja_template_still_scanned(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template_metadata": {"description": "near-match container name"},
-                "generation": {
-                    "variants": [
-                        {"chat_template": ("{% for message in messages %}{{ message['content'] }}{% endfor %}")}
-                    ]
-                },
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template_metadata={"description": "near-match container name"},
+        generation={
+            "variants": [{"chat_template": ("{% for message in messages %}{{ message['content'] }}{% endfor %}")}]
+        },
     )
 
     result = ManifestScanner(
@@ -1201,16 +1160,12 @@ def test_manifest_scanner_ignores_plain_nested_template_metadata() -> None:
 def test_manifest_scanner_nested_oversized_chat_template_fails_closed(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     payload = "{{ message['content'] }}" + (" safe" * 32)
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": {
-                    "default": payload,
-                },
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template={
+            "default": payload,
+        },
     )
 
     result = ManifestScanner(config={"max_template_size": 64}).scan(str(config_path))
@@ -1225,16 +1180,12 @@ def test_manifest_scanner_nested_oversized_chat_template_fails_closed(tmp_path: 
 
 def test_manifest_scanner_ignores_plain_nested_chat_template_container_strings(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": {
-                    "description": "plain prose",
-                },
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template={
+            "description": "plain prose",
+        },
     )
 
     result = ManifestScanner().scan(str(config_path))
@@ -1246,17 +1197,13 @@ def test_manifest_scanner_template_path_collision_does_not_hide_malicious_candid
     config_path = tmp_path / "config.json"
     malicious = "{{ lipsum.__globals__.os.popen('id') }}"
     benign = "{{ message['content'] }}"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": {
-                    "a.b": malicious,
-                    "a": {"b": benign},
-                },
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template={
+            "a.b": malicious,
+            "a": {"b": benign},
+        },
     )
 
     result = ManifestScanner().scan(str(config_path))
@@ -1271,14 +1218,10 @@ def test_manifest_scanner_template_path_collision_does_not_hide_malicious_candid
 
 def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template="{% for message in messages %}{{ message['content'] }}{% endfor %}",
     )
 
     result = ManifestScanner().scan(str(config_path))
@@ -1293,14 +1236,10 @@ def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> N
 def test_manifest_scanner_propagates_jinja_sandbox_budget_inconclusive(tmp_path: Path) -> None:
     pytest.importorskip("jinja2.sandbox")
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "chat_template": "{{ 'A' * 1000000 }}",
-            }
-        ),
-        encoding="utf-8",
+    _write_json_manifest(
+        config_path,
+        model_type="llama",
+        chat_template="{{ 'A' * 1000000 }}",
     )
     config = {
         "sandbox_render_max_output_chars": 16,
@@ -1363,10 +1302,7 @@ def test_manifest_scanner_honors_excluded_embedded_jinja_selection(tmp_path: Pat
 
 def test_manifest_scanner_skips_jinja_collection_budget_when_excluded(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps({"model_type": "llama", "metadata": {"nested": {"value": "benign"}}}),
-        encoding="utf-8",
-    )
+    _write_json_manifest(config_path, model_type="llama", metadata={"nested": {"value": "benign"}})
 
     result = ManifestScanner(
         config={

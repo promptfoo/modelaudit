@@ -95,6 +95,15 @@ def _make_whitelisted_scanner(file_path: Path) -> MockScanner:
     return scanner
 
 
+def _assert_warning_not_downgraded(scanner: MockScanner) -> None:
+    result = scanner._create_result()
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
 def test_base_scanner_can_handle():
     """Test the can_handle method of BaseScanner."""
     scanner = MockScanner()
@@ -853,7 +862,7 @@ def test_whitelist_no_downgrade_info(tmp_path: Path) -> None:
     assert result.checks[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_disabled():
+def test_whitelist_disabled() -> None:
     """Test that whitelist can be disabled via config."""
     from modelaudit.whitelists import POPULAR_MODELS
 
@@ -870,14 +879,7 @@ def test_whitelist_disabled():
         model_source="huggingface",
     )
 
-    # Create a result and add a warning issue
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    # Should NOT be downgraded because whitelist is disabled
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
 def test_whitelist_staleness_recent_no_warning(
@@ -1008,7 +1010,7 @@ def test_whitelist_staleness_unknown_model_no_warning(
     assert not any("HuggingFace whitelist is" in rec.message for rec in caplog.records)
 
 
-def test_whitelist_unknown_model():
+def test_whitelist_unknown_model() -> None:
     """Test that unknown models are not whitelisted."""
     scanner = MockScanner()
     # Create a context with an unknown model
@@ -1020,17 +1022,10 @@ def test_whitelist_unknown_model():
         model_source="huggingface",
     )
 
-    # Create a result and add a warning issue
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    # Should NOT be downgraded
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
-def test_whitelist_no_model_id():
+def test_whitelist_no_model_id() -> None:
     """Test that files without model ID are not whitelisted."""
     scanner = MockScanner()
     # Create a context without a model ID
@@ -1042,14 +1037,7 @@ def test_whitelist_no_model_id():
         model_source=None,
     )
 
-    # Create a result and add a warning issue
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    # Should NOT be downgraded
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
 def test_whitelist_no_downgrade_local_spoofed_config(tmp_path: Path) -> None:
@@ -1068,12 +1056,7 @@ def test_whitelist_no_downgrade_local_spoofed_config(tmp_path: Path) -> None:
     assert scanner.context.model_id == whitelisted_model
     assert scanner.context.model_source == "local"
 
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
 def test_whitelist_no_downgrade_hf_cache_path_without_explicit_provenance(
@@ -1092,12 +1075,7 @@ def test_whitelist_no_downgrade_hf_cache_path_without_explicit_provenance(
     assert scanner.context.model_id == whitelisted_model
     assert scanner.context.model_source == "huggingface_cache"
 
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
 def test_whitelist_downgrade_explicit_hf_provenance(
@@ -1150,12 +1128,7 @@ def test_whitelist_ignores_raw_config_provenance_override(tmp_path: Path) -> Non
     assert scanner.context.model_id is None
     assert scanner.context.model_source is None
 
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
 def test_whitelist_no_downgrade_spoofed_hf_cache_layout(tmp_path: Path) -> None:
@@ -1174,12 +1147,7 @@ def test_whitelist_no_downgrade_spoofed_hf_cache_layout(tmp_path: Path) -> None:
     assert scanner.context.model_id is None
     assert scanner.context.model_source is None
 
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
 def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(
@@ -1197,12 +1165,7 @@ def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(
     assert scanner.context.model_id == "unknown-author/unknown-model-12345"
     assert scanner.context.model_source == "huggingface_cache"
 
-    result = scanner._create_result()
-    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
-
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.WARNING
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    _assert_warning_not_downgraded(scanner)
 
 
 def test_whitelist_downgrade_critical_check(tmp_path: Path) -> None:

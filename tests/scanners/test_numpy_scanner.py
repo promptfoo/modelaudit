@@ -302,6 +302,34 @@ class _SSLPayload:
         return (ssl.get_server_certificate, (("example.com", 443),))
 
 
+def _add_validated_reconstruction_warning(result: ScanResult, context_path: str, position: int) -> None:
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="validated reconstruct",
+        severity=IssueSeverity.WARNING,
+        location=context_path,
+        details={
+            "import_reference": "numpy._core.multiarray._reconstruct",
+            "module": "numpy._core.multiarray",
+            "name": "_reconstruct",
+            "position": position,
+        },
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+
+
+def _mock_trusted_numpy_reconstruction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+
+
 def _failed_checks(result: ScanResult) -> list[Check]:
     return [c for c in result.checks if c.status.value == "failed"]
 
@@ -935,32 +963,12 @@ def test_numpy_object_dtype_benign_direct_scan_success_after_reconstruction_clea
         context_path: str,
     ) -> ScanResult:
         result = ScanResult(scanner_name="pickle")
-        result.add_check(
-            name="Standalone Pickle Finding",
-            passed=False,
-            message="validated reconstruct",
-            severity=IssueSeverity.WARNING,
-            location=context_path,
-            details={
-                "import_reference": "numpy._core.multiarray._reconstruct",
-                "module": "numpy._core.multiarray",
-                "name": "_reconstruct",
-                "position": file_obj.tell(),
-            },
-            rule_code="NON_ALLOWLISTED_GLOBAL",
-        )
+        _add_validated_reconstruction_warning(result, context_path, file_obj.tell())
         result.finish(success=False)
         return result
 
     monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
-    monkeypatch.setattr(
-        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
-        lambda _module, _name: True,
-    )
-    monkeypatch.setattr(
-        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
-        lambda _payload: True,
-    )
+    _mock_trusted_numpy_reconstruction(monkeypatch)
 
     result = NumPyScanner().scan(str(path))
 
@@ -992,20 +1000,7 @@ def test_numpy_object_dtype_direct_scan_preserves_retained_embedded_failure_afte
         context_path: str,
     ) -> ScanResult:
         result = ScanResult(scanner_name="pickle")
-        result.add_check(
-            name="Standalone Pickle Finding",
-            passed=False,
-            message="validated reconstruct",
-            severity=IssueSeverity.WARNING,
-            location=context_path,
-            details={
-                "import_reference": "numpy._core.multiarray._reconstruct",
-                "module": "numpy._core.multiarray",
-                "name": "_reconstruct",
-                "position": file_obj.tell(),
-            },
-            rule_code="NON_ALLOWLISTED_GLOBAL",
-        )
+        _add_validated_reconstruction_warning(result, context_path, file_obj.tell())
         result.add_check(
             name="Standalone Pickle Finding",
             passed=False,
@@ -1024,14 +1019,7 @@ def test_numpy_object_dtype_direct_scan_preserves_retained_embedded_failure_afte
         return result
 
     monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
-    monkeypatch.setattr(
-        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
-        lambda _module, _name: True,
-    )
-    monkeypatch.setattr(
-        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
-        lambda _payload: True,
-    )
+    _mock_trusted_numpy_reconstruction(monkeypatch)
 
     result = NumPyScanner().scan(str(path))
 
@@ -1148,20 +1136,7 @@ def test_numpy_object_dtype_direct_scan_preserves_info_downgraded_embedded_priva
         context_path: str,
     ) -> ScanResult:
         result = ScanResult(scanner_name="pickle")
-        result.add_check(
-            name="Standalone Pickle Finding",
-            passed=False,
-            message="validated reconstruct",
-            severity=IssueSeverity.WARNING,
-            location=context_path,
-            details={
-                "import_reference": "numpy._core.multiarray._reconstruct",
-                "module": "numpy._core.multiarray",
-                "name": "_reconstruct",
-                "position": file_obj.tell(),
-            },
-            rule_code="NON_ALLOWLISTED_GLOBAL",
-        )
+        _add_validated_reconstruction_warning(result, context_path, file_obj.tell())
         result.add_check(
             name="Dangerous Embedded Code",
             passed=False,
@@ -1177,14 +1152,7 @@ def test_numpy_object_dtype_direct_scan_preserves_info_downgraded_embedded_priva
         return result
 
     monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
-    monkeypatch.setattr(
-        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
-        lambda _module, _name: True,
-    )
-    monkeypatch.setattr(
-        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
-        lambda _payload: True,
-    )
+    _mock_trusted_numpy_reconstruction(monkeypatch)
 
     result = NumPyScanner().scan(str(path))
 

@@ -173,45 +173,21 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
 
 
 def test_pmml_scanner_benign_ecosystem_call_is_not_flagged(tmp_path: Path) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension>ecosystem()</Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "ecosystem.pmml"
-    result = _scan_pmml_fixture(path, pmml)
+    result = _scan_pmml_header(tmp_path / "ecosystem.pmml", "<Extension>ecosystem()</Extension>")
 
     assert result.success is True
     assert not any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
 
 
 def test_pmml_scanner_system_call_is_flagged(tmp_path: Path) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension>system('id')</Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "system_call.pmml"
-    result = _scan_pmml_fixture(path, pmml)
+    result = _scan_pmml_header(tmp_path / "system_call.pmml", "<Extension>system('id')</Extension>")
 
     assert result.success is True
     assert any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
 
 
 def test_pmml_scanner_mixed_case_system_call_is_flagged(tmp_path: Path) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension>SyStEm('id')</Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "mixed_case_system_call.pmml"
-    result = _scan_pmml_fixture(path, pmml)
+    result = _scan_pmml_header(tmp_path / "mixed_case_system_call.pmml", "<Extension>SyStEm('id')</Extension>")
 
     assert result.success is True
     assert any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
@@ -236,15 +212,9 @@ def test_pmml_scanner_namespaced_extension_content(tmp_path: Path) -> None:
 
 
 def test_pmml_scanner_benign_subprocess_prose_is_not_flagged(tmp_path: Path) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension extender='metrics'>subprocess latency summary</Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "subprocess_metrics.pmml"
-    result = _scan_pmml_fixture(path, pmml)
+    result = _scan_pmml_header(
+        tmp_path / "subprocess_metrics.pmml", "<Extension extender='metrics'>subprocess latency summary</Extension>"
+    )
 
     assert result.success is True
     assert not any(
@@ -259,18 +229,13 @@ def test_pmml_scanner_benign_subprocess_prose_is_not_flagged(tmp_path: Path) -> 
 
 
 def test_pmml_scanner_code_shaped_subprocess_extension_is_flagged(tmp_path: Path) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension>
+    result = _scan_pmml_header(
+        tmp_path / "subprocess_code.pmml",
+        """<Extension>
       import subprocess
       subprocess.run('id')
-    </Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "subprocess_code.pmml"
-    result = _scan_pmml_fixture(path, pmml)
+    </Extension>""",
+    )
 
     assert result.success is True
     assert any(
@@ -288,15 +253,9 @@ def test_pmml_scanner_code_shaped_subprocess_extension_is_flagged(tmp_path: Path
 def test_pmml_scanner_subprocess_getoutput_call_is_flagged_without_import(
     tmp_path: Path,
 ) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension>subprocess.getoutput('id')</Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "subprocess_getoutput.pmml"
-    result = _scan_pmml_fixture(path, pmml)
+    result = _scan_pmml_header(
+        tmp_path / "subprocess_getoutput.pmml", "<Extension>subprocess.getoutput('id')</Extension>"
+    )
 
     assert result.success is True
     assert any(
@@ -308,15 +267,9 @@ def test_pmml_scanner_subprocess_getoutput_call_is_flagged_without_import(
 
 
 def test_pmml_scanner_importlib_subprocess_call_is_flagged(tmp_path: Path) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension>importlib.import_module('subprocess').run('id')</Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "importlib_subprocess.pmml"
-    result = _scan_pmml_fixture(path, pmml)
+    result = _scan_pmml_header(
+        tmp_path / "importlib_subprocess.pmml", "<Extension>importlib.import_module('subprocess').run('id')</Extension>"
+    )
 
     assert result.success is True
     assert any(
@@ -925,6 +878,17 @@ def test_pmml_scanner_metadata_tracking(tmp_path: Path) -> None:
 def _scan_pmml_fixture(path: Path, pmml: str) -> ScanResult:
     path.write_text(pmml, encoding="utf-8")
     return PmmlScanner().scan(str(path))
+
+
+def _scan_pmml_header(path: Path, child_xml: str) -> ScanResult:
+    pmml = f"""<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    {child_xml}
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    return _scan_pmml_fixture(path, pmml)
 
 
 def _external_resource_issues(result: ScanResult) -> list[Issue]:
