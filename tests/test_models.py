@@ -753,20 +753,23 @@ class TestModelAuditResultModel:
             ("?api_key=fixture-one", "?api_key=fixture-two", IssueSeverity.WARNING, "warning"),
         ],
     )
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
     def test_readme_citation_and_command_keep_both_url_occurrences(
-        self, tmp_path: Path, query1: str, query2: str, reported: IssueSeverity, sarif_level: str
+        self, tmp_path: Path, query1: str, query2: str, reported: IssueSeverity, sarif_level: str, newline: str
     ) -> None:
         from modelaudit.core import scan_file, scan_model_directory_or_file
         from modelaudit.integrations.sarif_formatter import format_sarif_output
 
         url = "https://github.com/example/package"
         content = (
-            f"Code is available on GitHub: [project]({url}{query1})\n\nModel documentation.\n\n"
+            f"Code is available on GitHub: [project]({url}{query1})\n\nModel documentation — examples.\n\n"
             f"```sh\ncurl {url}{query2}\n```\n"
         )
         readme = tmp_path / "README.md"
-        readme.write_text(content, encoding="utf-8")
-        expected_positions = [content.index(url), content.rindex(url)]
+        payload = content.replace("\n", newline).encode("utf-8")
+        readme.write_bytes(payload)
+        url_bytes = url.encode("ascii")
+        expected_positions = [payload.index(url_bytes), payload.rindex(url_bytes)]
 
         direct = scan_file(str(readme), config={"cache_enabled": False})
         aggregate = scan_model_directory_or_file(str(readme), cache_enabled=False)
