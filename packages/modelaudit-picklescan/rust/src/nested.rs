@@ -3196,33 +3196,20 @@ mod tests {
 
     #[test]
     fn short_base64_payload_evidence_distinguishes_prefixes_from_security_signals() {
-        assert!(!base64_nested_payload_has_sufficient_evidence(
-            "grouped",
-            b"\x82\xba.",
-            false,
-            false,
-        ));
-        assert!(!base64_nested_payload_has_sufficient_evidence(
-            "grou",
-            b"\x82\xba.",
-            false,
-            false,
-        ));
-        assert!(base64_nested_payload_has_sufficient_evidence(
-            "TlEu", b"NQ.", false, false,
-        ));
-        assert!(base64_nested_payload_has_sufficient_evidence(
-            "ly4=", b"\x97.", false, false,
-        ));
-        assert!(!base64_nested_payload_has_sufficient_evidence(
-            "grouped",
-            b"\x82\xba.",
-            true,
-            false,
-        ));
-        assert!(base64_nested_payload_has_sufficient_evidence(
-            "UApY", b"P\nX", true, false,
-        ));
+        let has_evidence = |encoded: &str, payload: &[u8], analysis_incomplete| {
+            base64_nested_payload_has_sufficient_evidence(
+                encoded,
+                payload,
+                analysis_incomplete,
+                false,
+            )
+        };
+        assert!(!has_evidence("grouped", b"\x82\xba.", false));
+        assert!(!has_evidence("grou", b"\x82\xba.", false));
+        assert!(has_evidence("TlEu", b"NQ.", false));
+        assert!(has_evidence("ly4=", b"\x97.", false));
+        assert!(!has_evidence("grouped", b"\x82\xba.", true));
+        assert!(has_evidence("UApY", b"P\nX", true));
         assert!(has_high_confidence_truncated_execution_prefix(b"P\nX"));
         assert!(!has_high_confidence_truncated_execution_prefix(b"P\x80\nX"));
 
@@ -3323,6 +3310,9 @@ mod tests {
         assert!(!is_strict_base64_literal(b"=gAR9Lg="));
         assert!(!is_strict_base64_literal(b"g=AR9Lg="));
         assert!(!is_strict_base64_literal(b"gAR9Lg===="));
+        let has_raw_execution_probe = |encoded: &[u8]| {
+            strict_base64_literal_has_raw_execution_probe(encoded, TEST_MAX_NESTED_PICKLE_BYTES)
+        };
         let raw_probes: &[&[u8]] = &[
             b"NQAAAAAAgAROLg==",
             b"NNQAgAROLgAAAAAA",
@@ -3330,50 +3320,30 @@ mod tests {
             b"AAAANQAAAAAAgAROLg==",
         ];
         for &probe in raw_probes {
-            assert!(
-                strict_base64_literal_has_raw_execution_probe(probe, TEST_MAX_NESTED_PICKLE_BYTES),
-                "{probe:?}"
-            );
+            assert!(has_raw_execution_probe(probe), "{probe:?}");
         }
         let mut separated_raw_probe = b"NQ".to_vec();
         separated_raw_probe.extend_from_slice(&[b'A'; 18]);
         separated_raw_probe.extend_from_slice(b"VkFBQUFBQUFBQUFBQUFBQUEKLg==");
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            &separated_raw_probe,
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
+        assert!(has_raw_execution_probe(&separated_raw_probe));
         let mut long_raw_probe = Vec::new();
         for _ in 0..6 {
             long_raw_probe.extend_from_slice(b"C+");
             long_raw_probe.extend_from_slice(&[b'A'; 43]);
         }
         long_raw_probe.extend_from_slice(b"QgAROLgAAAAAA");
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            &long_raw_probe,
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
+        assert!(has_raw_execution_probe(&long_raw_probe));
         let mut opcode_budget_raw_probe = b"N".to_vec();
         opcode_budget_raw_probe.extend_from_slice(&[b'2'; 80]);
         opcode_budget_raw_probe.extend_from_slice(b"QgAROLgAAAAAA");
-        assert!(strict_base64_literal_has_raw_execution_probe(
-            &opcode_budget_raw_probe,
-            TEST_MAX_NESTED_PICKLE_BYTES,
+        assert!(has_raw_execution_probe(&opcode_budget_raw_probe));
+        assert!(!has_raw_execution_probe(
+            b"KFJFQURNRSBpcyBvcmRpbmFyeSB0ZXh0"
         ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            b"KFJFQURNRSBpcyBvcmRpbmFyeSB0ZXh0",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            b"ordinaryCNQHtext",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            &vec![b'V'; 500_000],
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        ));
-        assert!(!strict_base64_literal_has_raw_execution_probe(
-            &[b"junk".repeat(25_000), b"Q".to_vec()].concat(),
-            TEST_MAX_NESTED_PICKLE_BYTES,
+        assert!(!has_raw_execution_probe(b"ordinaryCNQHtext"));
+        assert!(!has_raw_execution_probe(&vec![b'V'; 500_000]));
+        assert!(!has_raw_execution_probe(
+            &[b"junk".repeat(25_000), b"Q".to_vec()].concat()
         ));
         assert_eq!(
             confirmed_base64_pickle_spans(b"!VkFBQUFBQUFBQUFBQUFBQUEKLg==ab", 64),

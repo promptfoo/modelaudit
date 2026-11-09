@@ -42,9 +42,17 @@ def _sequential_config(layer: dict[str, Any]) -> dict[str, Any]:
     return {"class_name": "Sequential", "config": {"layers": [layer]}}
 
 
+def _single_unit_dense_config() -> dict[str, Any]:
+    return _sequential_config({"class_name": "Dense", "config": {"units": 1}})
+
+
 def _named_sequential_config(name: str, layer: dict[str, Any]) -> dict[str, Any]:
     """Return a fresh named Sequential config around the supplied layer."""
     return {"class_name": "Sequential", "config": {"name": name, "layers": [layer]}}
+
+
+def _named_lambda_config(model_name: str, layer_config: dict[str, Any]) -> dict[str, Any]:
+    return _named_sequential_config(model_name, {"class_name": "Lambda", "config": layer_config})
 
 
 def test_keras_h5_scanner_can_handle(tmp_path):
@@ -570,9 +578,7 @@ def test_large_benign_keras_h5_scans_file_backed_without_default_read_cap(
     """Valid large HDF5 Keras files should reach h5py-backed inspection."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         file_name="large_benign.h5",
     )
     inflate_h5_file_to_size(model_path)
@@ -609,9 +615,7 @@ def test_large_keras_h5_directory_scan_defers_core_hashing(
     model_dir.mkdir()
     model_path = create_custom_h5_file(
         model_dir,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         file_name="large_directory_model.h5",
     )
     inflate_h5_file_to_size(model_path)
@@ -646,9 +650,7 @@ def test_large_keras_h5_streaming_scan_defers_core_hashing(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         file_name="large_streamed_model.h5",
     )
     inflate_h5_file_to_size(model_path)
@@ -729,9 +731,7 @@ def test_large_malformed_keras_h5_fails_closed_without_size_limit(tmp_path: Path
 def test_large_hdf5_external_link_still_detected_without_target_resolution(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="large_external_link.h5",
     )
@@ -761,9 +761,7 @@ def test_large_hdf5_external_link_still_detected_without_target_resolution(tmp_p
 def test_large_hdf5_soft_link_to_external_link_still_detected(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="large_soft_external_link.h5",
     )
@@ -795,9 +793,7 @@ def test_large_hdf5_soft_link_to_external_storage_still_detected(tmp_path: Path)
     raw_storage.write_bytes(b"\x00" * 8)
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="large_soft_external_storage.h5",
     )
@@ -834,9 +830,7 @@ def test_large_hdf5_virtual_dataset_source_still_detected(tmp_path: Path) -> Non
         f.create_dataset("payload", data=[1.0, 2.0])
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="large_virtual_dataset.h5",
     )
@@ -872,9 +866,7 @@ def test_large_file_backed_hdf5_bypasses_cache_content_hash(
 
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.2",
         file_name="huge_cache_bypass.h5",
     )
@@ -916,9 +908,7 @@ def test_keras_h5_virtual_dataset_external_source_after_report_cap_still_detecte
         f.create_dataset("payload", data=[1.0])
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="late_virtual_dataset.h5",
     )
@@ -956,9 +946,7 @@ def test_keras_h5_virtual_dataset_source_inspection_limit_fails_closed(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="virtual_dataset_inspection_limit.h5",
     )
@@ -997,9 +985,7 @@ def test_keras_h5_virtual_dataset_external_source_before_scan_wide_budget_still_
         f.create_dataset("payload", data=[1.0, 2.0])
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="virtual_dataset_external_before_budget.h5",
     )
@@ -1041,9 +1027,7 @@ def test_keras_h5_virtual_dataset_source_inspection_budget_is_scan_wide(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="virtual_dataset_scan_wide_budget.h5",
     )
@@ -1079,9 +1063,7 @@ def test_keras_h5_virtual_dataset_source_inspection_budget_is_scan_wide(
 def test_keras_h5_same_file_virtual_dataset_source_stays_clean(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="same_file_virtual_dataset.h5",
     )
@@ -1104,9 +1086,7 @@ def test_keras_h5_same_file_virtual_dataset_source_stays_clean(tmp_path: Path) -
 def test_keras_h5_scanner_flags_model_config_keras3_layer_vars_external_link(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="keras3_layer_vars_with_model_config.h5",
     )
@@ -1143,9 +1123,7 @@ def test_keras_h5_scanner_flags_model_config_keras3_layer_vars_external_link(tmp
 def test_keras_h5_scanner_allows_model_config_keras3_same_file_virtual_dataset(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="keras3_same_file_vds_with_model_config.h5",
     )
@@ -1170,9 +1148,7 @@ def test_keras_h5_scanner_flags_model_config_keras3_root_vars_external_link(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         keras_version="3.13.1",
         file_name="keras3_root_vars_with_model_config.h5",
     )
@@ -1322,9 +1298,7 @@ def test_keras_h5_scanner_allows_internal_arbitrary_keras3_saveable_vars(tmp_pat
 def test_large_hdf5_soft_link_cycle_fails_closed_without_size_limit(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _sequential_config(
-            {"class_name": "Dense", "config": {"units": 1}},
-        ),
+        _single_unit_dense_config(),
         file_name="large_soft_cycle.h5",
     )
     with h5py.File(model_path, "a") as f:
@@ -1517,13 +1491,7 @@ def test_large_dense_hdf5_name_attribute_uses_isolated_worker(tmp_path: Path, mo
 
 def test_large_variable_string_model_config_uses_json_budget(tmp_path: Path) -> None:
     model_path = tmp_path / "large_variable_model_config.h5"
-    model_config = _named_sequential_config(
-        "A" * 5000,
-        {
-            "class_name": "Lambda",
-            "config": {"function": "lambda x: __import__('os').system('id')"},
-        },
-    )
+    model_config = _named_lambda_config("A" * 5000, {"function": "lambda x: __import__('os').system('id')"})
     with h5py.File(model_path, "w") as f:
         f.attrs.create(
             "model_config",
@@ -1549,9 +1517,7 @@ def test_large_variable_string_model_config_uses_json_budget(tmp_path: Path) -> 
 
 def test_variable_string_vector_custom_objects_does_not_skip_training_config(tmp_path: Path) -> None:
     model_path = tmp_path / "vector_custom_objects.h5"
-    model_config = _sequential_config(
-        {"class_name": "Dense", "config": {"units": 1}},
-    )
+    model_config = _single_unit_dense_config()
     training_config = {
         "loss": {"output_1": "malicious_loss"},
         "metrics": [["accuracy"]],
@@ -1915,11 +1881,7 @@ def test_missing_h5py_routes_hdf5_userblock_and_bypasses_cache(
 
     model_path = tmp_path / "userblock_model.h5"
     with h5py.File(model_path, "w", userblock_size=512) as h5_file:
-        h5_file.attrs["model_config"] = json.dumps(
-            _sequential_config(
-                {"class_name": "Dense", "config": {"units": 1}},
-            )
-        )
+        h5_file.attrs["model_config"] = json.dumps(_single_unit_dense_config())
         weights_group = h5_file.require_group("model_weights")
         weights_group["linked_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
 
@@ -1943,11 +1905,7 @@ def test_missing_h5py_routes_hdf5_userblock_and_bypasses_cache(
 def test_broken_h5py_import_still_fails_closed_for_extensionless_userblock(tmp_path: Path) -> None:
     model_path = tmp_path / "broken_h5py_userblock"
     with h5py.File(model_path, "w", userblock_size=512) as h5_file:
-        h5_file.attrs["model_config"] = json.dumps(
-            _sequential_config(
-                {"class_name": "Dense", "config": {"units": 1}},
-            )
-        )
+        h5_file.attrs["model_config"] = json.dumps(_single_unit_dense_config())
 
     script = textwrap.dedent(
         """
@@ -2391,20 +2349,14 @@ def test_keras_h5_invalid_training_config_returns_inconclusive_exit2(
     model_path = (
         create_raw_config_h5_file(
             tmp_path,
-            model_config_attr=json.dumps(
-                _sequential_config(
-                    {"class_name": "Dense", "config": {"units": 1}},
-                )
-            ),
+            model_config_attr=json.dumps(_single_unit_dense_config()),
             training_config_attr=training_config,
             file_name="invalid_training_config_json.h5",
         )
         if isinstance(training_config, str)
         else create_custom_h5_file(
             tmp_path,
-            _sequential_config(
-                {"class_name": "Dense", "config": {"units": 1}},
-            ),
+            _single_unit_dense_config(),
             training_config=training_config,
             file_name="invalid_training_config_type.h5",
         )
@@ -3218,14 +3170,11 @@ def test_keras_h5_scanner_with_blacklist(tmp_path: Path) -> None:
 
     with h5py.File(h5_path, "w") as f:
         # Create model config with suspicious content
-        model_config = _named_sequential_config(
+        model_config = _named_lambda_config(
             "sequential",
             {
-                "class_name": "Lambda",
-                "config": {
-                    # This matches our blacklist
-                    "function": "suspicious_function(x)",
-                },
+                # This matches our blacklist
+                "function": "suspicious_function(x)",
             },
         )
 
@@ -3257,13 +3206,7 @@ def test_lambda_safe_normalization_pattern_still_passes(tmp_path: Path) -> None:
     """Safe normalization lambdas should continue matching the safe-pattern allowlist."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "safe_lambda_model",
-            {
-                "class_name": "Lambda",
-                "config": {"function": "lambda x: x / 255"},
-            },
-        ),
+        _named_lambda_config("safe_lambda_model", {"function": "lambda x: x / 255"}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3295,10 +3238,7 @@ def test_lambda_safe_normalization_pattern_still_passes(tmp_path: Path) -> None:
 def test_lambda_additional_safe_normalization_patterns_still_pass(tmp_path: Path, function_str: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "safe_lambda_model_extra",
-            {"class_name": "Lambda", "config": {"function": function_str}},
-        ),
+        _named_lambda_config("safe_lambda_model_extra", {"function": function_str}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3315,10 +3255,7 @@ def test_lambda_additional_safe_normalization_patterns_still_pass(tmp_path: Path
 def test_lambda_whitespace_padded_safe_source_still_passes(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "whitespace_padded_safe_lambda",
-            {"class_name": "Lambda", "config": {"function": "  lambda x: x / 255  "}},
-        ),
+        _named_lambda_config("whitespace_padded_safe_lambda", {"function": "  lambda x: x / 255  "}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3356,10 +3293,7 @@ def test_lambda_additional_safe_prefixes_with_injected_code_are_flagged(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "unsafe_lambda_model_extra",
-            {"class_name": "Lambda", "config": {"function": function_str}},
-        ),
+        _named_lambda_config("unsafe_lambda_model_extra", {"function": function_str}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3395,10 +3329,7 @@ def test_lambda_framework_helpers_outside_source_allowlist_fail_closed(
     """Trusted framework roots are not enough for a Lambda source pass."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "unsafe_framework_helper_model",
-            {"class_name": "Lambda", "config": {"function": function_str}},
-        ),
+        _named_lambda_config("unsafe_framework_helper_model", {"function": function_str}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3424,12 +3355,8 @@ def test_lambda_safe_prefix_with_comment_token_in_malicious_payload_is_flagged(t
     """A single comment token in malicious payload must not suppress detection."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "unsafe_comment_lambda_model",
-            {
-                "class_name": "Lambda",
-                "config": {"function": 'lambda x: x / 255; __import__("os").system("evil") # noop'},
-            },
+        _named_lambda_config(
+            "unsafe_comment_lambda_model", {"function": 'lambda x: x / 255; __import__("os").system("evil") # noop'}
         ),
     )
 
@@ -3456,13 +3383,7 @@ def test_lambda_dynamic_builtins_dispatch_is_not_marked_safe(tmp_path: Path) -> 
     )
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "dynamic_lambda_model",
-            {
-                "class_name": "Lambda",
-                "config": {"function": dynamic_exec_lambda},
-            },
-        ),
+        _named_lambda_config("dynamic_lambda_model", {"function": dynamic_exec_lambda}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3487,13 +3408,7 @@ def test_lambda_malformed_source_fails_closed_without_echoing_source(tmp_path: P
     malformed_source = "lambda x: x +"
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "malformed_source_model",
-            {
-                "class_name": "Lambda",
-                "config": {"name": "malformed_source", "function": malformed_source},
-            },
-        ),
+        _named_lambda_config("malformed_source_model", {"name": "malformed_source", "function": malformed_source}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3513,13 +3428,7 @@ def test_lambda_malformed_source_fails_closed_without_echoing_source(tmp_path: P
 def test_lambda_empty_source_fails_closed(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "empty_source_model",
-            {
-                "class_name": "Lambda",
-                "config": {"name": "empty_source", "function": ""},
-            },
-        ),
+        _named_lambda_config("empty_source_model", {"name": "empty_source", "function": ""}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3536,10 +3445,7 @@ def test_lambda_empty_source_fails_closed(tmp_path: Path) -> None:
 def test_lambda_malformed_safe_pattern_lookalike_fails_closed(tmp_path: Path, malformed_source: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "malformed_safe_pattern_model",
-            {"class_name": "Lambda", "config": {"function": malformed_source}},
-        ),
+        _named_lambda_config("malformed_safe_pattern_model", {"function": malformed_source}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3565,10 +3471,7 @@ def test_lambda_malformed_safe_pattern_lookalike_fails_closed(tmp_path: Path, ma
 def test_lambda_zero_divisor_is_not_allowlisted(tmp_path: Path, unsafe_source: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "zero_divisor_model",
-            {"class_name": "Lambda", "config": {"function": unsafe_source}},
-        ),
+        _named_lambda_config("zero_divisor_model", {"function": unsafe_source}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -3634,12 +3537,8 @@ def test_lambda_non_code_function_metadata_fails_closed_without_echoing_value(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "malformed_function_metadata_model",
-            {
-                "class_name": "Lambda",
-                "config": {"name": "malformed_function_metadata", "function": function_value},
-            },
+        _named_lambda_config(
+            "malformed_function_metadata_model", {"name": "malformed_function_metadata", "function": function_value}
         ),
     )
 
@@ -3661,14 +3560,11 @@ def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path:
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "safe_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "safe_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
-                },
+                "name": "safe_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
             },
         ),
     )
@@ -3694,14 +3590,11 @@ def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Pa
     encoded_code = base64.b64encode(marshal.dumps(code)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "dangerous_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "dangerous_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
-                },
+                "name": "dangerous_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
             },
         ),
     )
@@ -3889,15 +3782,12 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
 def test_lambda_invalid_source_ignores_keyword_substrings_in_other_metadata(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "invalid_lambda_near_match_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "evaluation_layer",
-                    "description": "retrieval quality",
-                    "function": "not valid python!",
-                },
+                "name": "evaluation_layer",
+                "description": "retrieval quality",
+                "function": "not valid python!",
             },
         ),
     )
@@ -3911,14 +3801,11 @@ def test_lambda_invalid_source_ignores_keyword_substrings_in_other_metadata(tmp_
 def test_lambda_invalid_source_does_not_casefold_builtin_names(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "invalid_lambda_uppercase_builtin_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "uppercase_builtin_lambda",
-                    "function": "lambda x: EVAL(x",
-                },
+                "name": "uppercase_builtin_lambda",
+                "function": "lambda x: EVAL(x",
             },
         ),
     )
@@ -3934,17 +3821,14 @@ def test_lambda_nested_metadata_omits_artifact_controlled_keys_and_fake_wrapped_
     nested_class_secret = "NESTED_LAMBDA_CLASS_SECRET_7F3A9"
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "nested_lambda_metadata_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": "lambda x: x",
-                    "metadata": {nested_key_secret: {"payload": "eval"}},
-                    "layer": {
-                        "class_name": nested_class_secret,
-                        "config": {"units": 1},
-                    },
+                "function": "lambda x: x",
+                "metadata": {nested_key_secret: {"payload": "eval"}},
+                "layer": {
+                    "class_name": nested_class_secret,
+                    "config": {"units": 1},
                 },
             },
         ),
@@ -3972,14 +3856,11 @@ def test_lambda_nested_metadata_omits_artifact_controlled_keys_and_fake_wrapped_
 def test_lambda_nested_metadata_ignores_suspicious_term_near_matches(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "nested_lambda_near_match_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": "lambda x: x",
-                    "metadata": {"arbitrary": {"payload": "evaluation"}},
-                },
+                "function": "lambda x: x",
+                "metadata": {"arbitrary": {"payload": "evaluation"}},
             },
         ),
     )
@@ -3995,10 +3876,7 @@ def test_lambda_nested_metadata_ignores_suspicious_term_near_matches(tmp_path: P
 def test_lambda_scalar_function_metadata_fails_closed_without_echoing_value(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "scalar_lambda_function_model",
-            {"class_name": "Lambda", "config": {"function": 7}},
-        ),
+        _named_lambda_config("scalar_lambda_function_model", {"function": 7}),
         keras_version="3.11.3",
     )
 
@@ -4027,10 +3905,7 @@ def test_lambda_scalar_function_metadata_fails_closed_without_echoing_value(tmp_
 def test_lambda_null_function_placeholder_is_not_treated_as_malformed(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "null_lambda_function_model",
-            {"class_name": "Lambda", "config": {"function": None}},
-        ),
+        _named_lambda_config("null_lambda_function_model", {"function": None}),
         keras_version="3.11.3",
     )
 
@@ -4049,16 +3924,13 @@ def test_lambda_dict_bytecode_with_benign_module_fields_still_critical(tmp_path:
     encoded_code = base64.b64encode(marshal.dumps(code)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "mixed_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "mixed_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
-                    "module": "keras.ops",
-                    "function_name": "identity",
-                },
+                "name": "mixed_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                "module": "keras.ops",
+                "function_name": "identity",
             },
         ),
     )
@@ -4086,16 +3958,13 @@ def test_lambda_dict_bytecode_with_benign_module_fields_stays_warning(tmp_path: 
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "mixed_safe_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "mixed_safe_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
-                    "module": "keras.ops",
-                    "function_name": "identity",
-                },
+                "name": "mixed_safe_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                "module": "keras.ops",
+                "function_name": "identity",
             },
         ),
     )
@@ -4118,14 +3987,11 @@ def test_lambda_dict_malformed_config_does_not_echo_payload(tmp_path: Path) -> N
     payload = "attacker-controlled-secret-payload"
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "malformed_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "malformed_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": payload},
-                },
+                "name": "malformed_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": payload},
             },
         ),
     )
@@ -4150,14 +4016,11 @@ def test_lambda_list_bytecode_with_dangerous_pattern_is_critical(tmp_path: Path)
     encoded_code = base64.b64encode(marshal.dumps(code)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "list_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "dangerous_list_lambda",
-                    "function": [encoded_code, None, None],
-                },
+                "name": "dangerous_list_lambda",
+                "function": [encoded_code, None, None],
             },
         ),
     )
@@ -4182,16 +4045,13 @@ def test_lambda_list_bytecode_with_benign_module_fields_stays_warning(tmp_path: 
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "mixed_safe_list_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "mixed_safe_list_lambda",
-                    "function": [encoded_code, None, None],
-                    "module": "keras.ops",
-                    "function_name": "identity",
-                },
+                "name": "mixed_safe_list_lambda",
+                "function": [encoded_code, None, None],
+                "module": "keras.ops",
+                "function_name": "identity",
             },
         ),
     )
@@ -4219,14 +4079,11 @@ def test_lambda_list_missing_encoded_code_stays_warning(tmp_path: Path, function
     """Malformed list-format Lambda metadata must remain a security finding."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "malformed_list_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "malformed_list_lambda",
-                    "function": function_data,
-                },
+                "name": "malformed_list_lambda",
+                "function": function_data,
             },
         ),
     )
@@ -4248,16 +4105,13 @@ def test_unrecognized_lambda_function_dict_still_uses_module_reference_check(tmp
     """Only recognized __lambda__ dictionaries should preempt module/function reference analysis."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "unrecognized_dict_module_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "unrecognized_dict_module",
-                    "function": {"class_name": "SomeCallable", "config": {}},
-                    "module": "os",
-                    "function_name": "system",
-                },
+                "name": "unrecognized_dict_module",
+                "function": {"class_name": "SomeCallable", "config": {}},
+                "module": "os",
+                "function_name": "system",
             },
         ),
     )
@@ -4278,17 +4132,14 @@ def test_lambda_function_dict_function_key_uses_module_reference_check(tmp_path:
     """Callable dict metadata using a function key must not bypass H5 Lambda module checks."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "function_key_dict_module_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "function_key_dict_module",
-                    "function": {
-                        "class_name": "function",
-                        "module": "posix",
-                        "function": "relu",
-                    },
+                "name": "function_key_dict_module",
+                "function": {
+                    "class_name": "function",
+                    "module": "posix",
+                    "function": "relu",
                 },
             },
         ),
@@ -4309,17 +4160,14 @@ def test_lambda_function_dict_safe_function_key_is_allowlisted(tmp_path: Path) -
     """Benign callable dict metadata should still pass the narrow Lambda allowlist."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "safe_function_key_dict_module_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "safe_function_key_dict_module",
-                    "function": {
-                        "class_name": "function",
-                        "module": "keras.activations",
-                        "function": "relu",
-                    },
+                "name": "safe_function_key_dict_module",
+                "function": {
+                    "class_name": "function",
+                    "module": "keras.activations",
+                    "function": "relu",
                 },
             },
         ),
@@ -4348,18 +4196,15 @@ def test_lambda_encoded_dict_with_embedded_function_metadata_checks_both_paths(t
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "encoded_dict_embedded_module_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "encoded_dict_embedded_module",
-                    "function": {
-                        "class_name": "__lambda__",
-                        "config": {"code": encoded_code},
-                        "module": "posix",
-                        "function": "system",
-                    },
+                "name": "encoded_dict_embedded_module",
+                "function": {
+                    "class_name": "__lambda__",
+                    "config": {"code": encoded_code},
+                    "module": "posix",
+                    "function": "system",
                 },
             },
         ),
@@ -4387,18 +4232,15 @@ def test_lambda_encoded_dict_with_safe_embedded_function_metadata_is_not_critica
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "encoded_dict_safe_embedded_module_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "encoded_dict_safe_embedded_module",
-                    "function": {
-                        "class_name": "__lambda__",
-                        "config": {"code": encoded_code},
-                        "module": "keras.activations",
-                        "function": "relu",
-                    },
+                "name": "encoded_dict_safe_embedded_module",
+                "function": {
+                    "class_name": "__lambda__",
+                    "config": {"code": encoded_code},
+                    "module": "keras.activations",
+                    "function": "relu",
                 },
             },
         ),
@@ -4425,14 +4267,11 @@ def test_lambda_encoded_dict_with_safe_embedded_function_metadata_is_not_critica
 def test_unrecognized_lambda_function_dict_without_module_fails_closed(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "unrecognized_dict_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "unrecognized_dict",
-                    "function": {"class_name": "SomeCallable", "config": {"secret": "do-not-retain"}},
-                },
+                "name": "unrecognized_dict",
+                "function": {"class_name": "SomeCallable", "config": {"secret": "do-not-retain"}},
             },
         ),
     )
@@ -4464,16 +4303,13 @@ def test_lambda_malformed_module_reference_is_not_marked_safe(
     """Malformed mixed module/function metadata must not become a passed safety check."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "malformed_module_reference_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "malformed_module_reference",
-                    "function": {"class_name": "SomeCallable", "config": {}},
-                    "module": module_name,
-                    "function_name": function_name,
-                },
+                "name": "malformed_module_reference",
+                "function": {"class_name": "SomeCallable", "config": {}},
+                "module": module_name,
+                "function_name": function_name,
             },
         ),
     )
@@ -4501,16 +4337,13 @@ def test_lambda_dict_bytecode_with_dangerous_module_fields_still_checks_module_r
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "mixed_dangerous_module_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "mixed_dangerous_module",
-                    "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
-                    "module": "os",
-                    "function_name": "system",
-                },
+                "name": "mixed_dangerous_module",
+                "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                "module": "os",
+                "function_name": "system",
             },
         ),
     )
@@ -4535,16 +4368,13 @@ def test_lambda_safe_string_with_dangerous_module_fields_still_checks_module_ref
     """Safe-looking inline Lambda code must not suppress a dangerous sibling module reference."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "mixed_safe_string_module_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "mixed_safe_string_module",
-                    "function": "lambda x: x / 255",
-                    "module": "os",
-                    "function_name": "system",
-                },
+                "name": "mixed_safe_string_module",
+                "function": "lambda x: x / 255",
+                "module": "os",
+                "function_name": "system",
             },
         ),
     )
@@ -4572,14 +4402,11 @@ def test_lambda_dict_bytecode_does_not_match_dangerous_substrings_inside_identif
     encoded_code = base64.b64encode(b"def benign():\n    opened = 1\n    return opened\n").decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "benign_identifier_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "benign_identifier_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
-                },
+                "name": "benign_identifier_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
             },
         ),
     )
@@ -4605,14 +4432,11 @@ def test_lambda_dict_oversized_code_is_not_decoded(tmp_path: Path, monkeypatch: 
     """Oversized encoded Lambda bytecode must fail closed before allocating a decoded copy."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "oversized_dict_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "oversized_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": {"code": "A" * 9}},
-                },
+                "name": "oversized_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": {"code": "A" * 9}},
             },
         ),
     )
@@ -4642,14 +4466,11 @@ def test_lambda_list_oversized_code_is_not_decoded(tmp_path: Path, monkeypatch: 
     """Oversized list-format Lambda bytecode must fail closed before allocating a decoded copy."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "oversized_list_lambda_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "oversized_list_lambda",
-                    "function": ["A" * 9, None, None],
-                },
+                "name": "oversized_list_lambda",
+                "function": ["A" * 9, None, None],
             },
         ),
     )
@@ -4824,14 +4645,11 @@ def test_lambda_module_reference_uses_token_boundaries_for_benign_modules(tmp_pa
     """Benign module names containing suspicious substrings should stay warning-level."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "benign_module_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "module": "custom_package.systematic_math",
-                    "function_name": "normalize",
-                },
+                "module": "custom_package.systematic_math",
+                "function_name": "normalize",
             },
         ),
         keras_version="3.11.3",
@@ -4862,14 +4680,11 @@ def test_lambda_module_reference_uses_token_boundaries_for_benign_modules(tmp_pa
 def test_lambda_nested_config_suspicious_terms_remain_case_insensitive(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "uppercase_nested_lambda_config",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": "lambda x: x",
-                    "metadata": {"callback": "OS.SYSTEM", "runner": "SubProcess"},
-                },
+                "function": "lambda x: x",
+                "metadata": {"callback": "OS.SYSTEM", "runner": "SubProcess"},
             },
         ),
         keras_version="3.11.3",
@@ -4894,14 +4709,11 @@ def test_lambda_nested_config_suspicious_terms_remain_case_insensitive(tmp_path:
 def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "allowlisted_module_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "module": "keras.ops",
-                    "function_name": "normalize",
-                },
+                "module": "keras.ops",
+                "function_name": "normalize",
             },
         ),
         keras_version="3.11.3",
@@ -4942,15 +4754,12 @@ def test_lambda_legacy_named_framework_function_still_passes(
     """Canonical legacy H5 named-callable metadata should use the reference allowlist."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "legacy_named_function_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": function_name,
-                    "function_type": "function",
-                    "module": module_name,
-                },
+                "function": function_name,
+                "function_type": "function",
+                "module": module_name,
             },
         ),
         keras_version="3.11.3",
@@ -4978,14 +4787,11 @@ def test_lambda_legacy_named_framework_function_still_passes(
 def test_lambda_legacy_function_type_with_source_uses_source_allowlist(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "legacy_source_function",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": "lambda x: x / 255",
-                    "function_type": "function",
-                },
+                "function": "lambda x: x / 255",
+                "function_type": "function",
             },
         ),
         keras_version="3.11.3",
@@ -5021,10 +4827,7 @@ def test_lambda_serialized_auxiliary_callback_is_scanned(tmp_path: Path, callbac
     }
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "auxiliary_callback_model",
-            {"class_name": "Lambda", "config": layer_config},
-        ),
+        _named_lambda_config("auxiliary_callback_model", layer_config),
         keras_version="3.11.3",
         file_name=f"malicious_{callback_field}.h5",
     )
@@ -5089,18 +4892,15 @@ def test_trusted_keras_submodule_lambda_path_scans_dict_bytecode(tmp_path: Path)
 def test_lambda_raw_output_shape_is_not_treated_as_executable_callback(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "raw_output_shape_model",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "raw_output_shape",
-                    "function": "relu",
-                    "function_type": "function",
-                    "module": "keras.activations",
-                    "output_shape": [None, 32],
-                    "output_shape_type": "raw",
-                },
+                "name": "raw_output_shape",
+                "function": "relu",
+                "function_type": "function",
+                "module": "keras.activations",
+                "output_shape": [None, 32],
+                "output_shape_type": "raw",
             },
         ),
         keras_version="3.11.3",
@@ -5126,15 +4926,12 @@ def test_lambda_raw_output_shape_is_not_treated_as_executable_callback(tmp_path:
 def test_lambda_empty_legacy_named_function_fails_closed(tmp_path: Path, function_value: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "empty_legacy_named_function",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": function_value,
-                    "function_type": "function",
-                    "module": "keras.activations",
-                },
+                "function": function_value,
+                "function_type": "function",
+                "module": "keras.activations",
             },
         ),
         keras_version="3.11.3",
@@ -5159,16 +4956,13 @@ def test_lambda_named_reference_metadata_does_not_suppress_source_analysis(tmp_p
     """A separate function name must not reinterpret attacker-controlled source as a named reference."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "conflicting_named_function_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": 'lambda x: __import__("os").system("id")',
-                    "function_type": "function",
-                    "module": "keras.activations",
-                    "function_name": "relu",
-                },
+                "function": 'lambda x: __import__("os").system("id")',
+                "function_type": "function",
+                "module": "keras.activations",
+                "function_name": "relu",
             },
         ),
         keras_version="3.11.3",
@@ -5208,15 +5002,12 @@ def test_lambda_legacy_named_function_reference_fails_closed(
     """Legacy named callables outside the narrow allowlist must remain findings."""
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "legacy_named_function_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": function_name,
-                    "function_type": "function",
-                    "module": module_name,
-                },
+                "function": function_name,
+                "function_type": "function",
+                "module": module_name,
             },
         ),
         keras_version="3.11.3",
@@ -5251,12 +5042,8 @@ def test_lambda_moduleless_legacy_function_reference_is_case_insensitive(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "moduleless_legacy_function_reference",
-            {
-                "class_name": "Lambda",
-                "config": {"function": function_name, "function_type": "function"},
-            },
+        _named_lambda_config(
+            "moduleless_legacy_function_reference", {"function": function_name, "function_type": "function"}
         ),
         keras_version="3.11.3",
         file_name="moduleless_legacy_function_reference.h5",
@@ -5293,12 +5080,8 @@ def test_lambda_trusted_looking_module_reference_is_not_allowlisted(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "trusted_looking_module_reference",
-            {
-                "class_name": "Lambda",
-                "config": {"module": module_name, "function_name": function_name},
-            },
+        _named_lambda_config(
+            "trusted_looking_module_reference", {"module": module_name, "function_name": function_name}
         ),
         keras_version="3.11.3",
         file_name="trusted_looking_module_reference.h5",
@@ -5343,13 +5126,7 @@ def test_lambda_trusted_looking_module_reference_is_not_allowlisted(
 def test_lambda_exact_native_module_reference_is_critical(tmp_path: Path, module_name: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "native_module_reference",
-            {
-                "class_name": "Lambda",
-                "config": {"module": module_name, "function_name": "native_callable"},
-            },
-        ),
+        _named_lambda_config("native_module_reference", {"module": module_name, "function_name": "native_callable"}),
         keras_version="3.11.3",
         file_name=f"native_module_reference_{module_name}.h5",
     )
@@ -5370,13 +5147,7 @@ def test_lambda_exact_native_module_reference_is_critical(tmp_path: Path, module
 def test_lambda_native_module_near_match_is_not_critical(tmp_path: Path, module_name: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "native_module_near_match",
-            {
-                "class_name": "Lambda",
-                "config": {"module": module_name, "function_name": "add"},
-            },
-        ),
+        _named_lambda_config("native_module_near_match", {"module": module_name, "function_name": "add"}),
         keras_version="3.11.3",
         file_name=f"native_module_near_match_{module_name.replace('.', '_')}.h5",
     )
@@ -5392,14 +5163,11 @@ def test_lambda_native_module_near_match_is_not_critical(tmp_path: Path, module_
 def test_lambda_allowlisted_framework_root_does_not_hide_code_loader(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "allowlisted_code_loader",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "module": "tensorflow",
-                    "function_name": "load_op_library",
-                },
+                "module": "tensorflow",
+                "function_name": "load_op_library",
             },
         ),
         keras_version="3.11.3",
@@ -5425,14 +5193,11 @@ def test_lambda_allowlisted_framework_root_does_not_hide_code_loader(tmp_path: P
 def test_lambda_trusted_framework_unknown_callback_stays_warning(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "trusted_unknown_callback",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "module": "tensorflow.io",
-                    "function_name": "write_file",
-                },
+                "module": "tensorflow.io",
+                "function_name": "write_file",
             },
         ),
         keras_version="3.11.3",
@@ -5466,14 +5231,11 @@ def test_lambda_dotted_function_reference_uses_callback_semantics(
 ) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "dotted_dangerous_function_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "module": "tensorflow",
-                    "function_name": function_name,
-                },
+                "module": "tensorflow",
+                "function_name": function_name,
             },
         ),
         keras_version="3.11.3",
@@ -5495,14 +5257,11 @@ def test_lambda_dotted_function_reference_uses_callback_semantics(
 def test_lambda_dotted_function_reference_uses_token_boundaries(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "dotted_benign_function_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "module": "tensorflow",
-                    "function_name": "io.systematic_helper",
-                },
+                "module": "tensorflow",
+                "function_name": "io.systematic_helper",
             },
         ),
         keras_version="3.11.3",
@@ -5524,14 +5283,11 @@ def test_lambda_dotted_function_reference_uses_token_boundaries(tmp_path: Path) 
 def test_lambda_allowlisted_framework_root_does_not_hide_python_callback_helper(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "allowlisted_dangerous_callback",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "module": "tensorflow",
-                    "function_name": "py_function",
-                },
+                "module": "tensorflow",
+                "function_name": "py_function",
             },
         ),
         keras_version="3.11.3",
@@ -5560,13 +5316,7 @@ def test_lambda_allowlisted_framework_root_does_not_hide_python_callback_helper(
 def test_lambda_tensorflow_raw_python_callback_alias_is_critical(tmp_path: Path, function_name: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "raw_python_callback",
-            {
-                "class_name": "Lambda",
-                "config": {"module": "tensorflow", "function_name": function_name},
-            },
-        ),
+        _named_lambda_config("raw_python_callback", {"module": "tensorflow", "function_name": function_name}),
         keras_version="3.11.3",
         file_name=f"raw_python_callback_{function_name.lower()}.h5",
     )
@@ -5587,12 +5337,8 @@ def test_lambda_tensorflow_raw_python_callback_near_match_is_not_critical(tmp_pa
     function_name = "raw_ops.PyFunctional"
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            "raw_python_callback_near_match",
-            {
-                "class_name": "Lambda",
-                "config": {"module": "tensorflow", "function_name": function_name},
-            },
+        _named_lambda_config(
+            "raw_python_callback_near_match", {"module": "tensorflow", "function_name": function_name}
         ),
         keras_version="3.11.3",
         file_name="raw_python_callback_near_match.h5",
@@ -5609,15 +5355,12 @@ def test_lambda_tensorflow_raw_python_callback_near_match_is_not_critical(tmp_pa
 def test_lambda_safe_source_does_not_suppress_dangerous_module_reference(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "mixed_source_module_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "function": "lambda x: x / 255",
-                    "module": "os",
-                    "function_name": "system",
-                },
+                "function": "lambda x: x / 255",
+                "module": "os",
+                "function_name": "system",
             },
         ),
         keras_version="3.11.3",
@@ -5638,16 +5381,13 @@ def test_lambda_allowlisted_module_does_not_suppress_dict_bytecode_analysis(tmp_
     encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             "mixed_dict_module_reference",
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": "mixed_dict_lambda",
-                    "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
-                    "module": "keras.layers",
-                    "function_name": "normalize",
-                },
+                "name": "mixed_dict_lambda",
+                "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                "module": "keras.layers",
+                "function_name": "normalize",
             },
         ),
         keras_version="3.11.3",
@@ -6388,18 +6128,15 @@ class TestCVE20251550H5ModuleReferences:
     def test_lambda_function_dict_checks_authoritative_config_and_registered_name(self, tmp_path: Path) -> None:
         model_path = create_custom_h5_file(
             tmp_path,
-            _named_sequential_config(
+            _named_lambda_config(
                 "h5_conflicting_lambda_callable",
                 {
-                    "class_name": "Lambda",
-                    "config": {
-                        "name": "lambda_conflict",
-                        "function": {
-                            "class_name": "function",
-                            "module": "tensorflow",
-                            "config": "load_op_library",
-                            "registered_name": "identity",
-                        },
+                    "name": "lambda_conflict",
+                    "function": {
+                        "class_name": "function",
+                        "module": "tensorflow",
+                        "config": "load_op_library",
+                        "registered_name": "identity",
                     },
                 },
             ),
@@ -6593,13 +6330,7 @@ class TestCVE20259905H5SafeMode:
         """Lambda layer in H5 file should flag CVE-2025-9905."""
         h5_path = tmp_path / "model.h5"
         with h5py.File(h5_path, "w") as f:
-            model_config = _named_sequential_config(
-                "test",
-                {
-                    "class_name": "Lambda",
-                    "config": {"function": "lambda x: x * 2"},
-                },
-            )
+            model_config = _named_lambda_config("test", {"function": "lambda x: x * 2"})
             f.attrs["model_config"] = json.dumps(model_config)
             f.attrs["keras_version"] = "3.11.2"
 
@@ -6708,13 +6439,7 @@ class TestCVE20259905H5SafeMode:
         """CVE details should be present in issue details."""
         h5_path = tmp_path / "model.h5"
         with h5py.File(h5_path, "w") as f:
-            model_config = _named_sequential_config(
-                "test",
-                {
-                    "class_name": "Lambda",
-                    "config": {"function": "lambda x: x"},
-                },
-            )
+            model_config = _named_lambda_config("test", {"function": "lambda x: x"})
             f.attrs["model_config"] = json.dumps(model_config)
 
         scanner = KerasH5Scanner()
@@ -6754,13 +6479,7 @@ class TestCVE20259905H5SafeMode:
         """Lambda layer with fixed Keras version should not be CVE-attributed."""
         h5_path = tmp_path / f"model_{keras_version.replace('.', '_').replace('+', '_')}.h5"
         with h5py.File(h5_path, "w") as f:
-            model_config = _named_sequential_config(
-                "test",
-                {
-                    "class_name": "Lambda",
-                    "config": {"function": "lambda x: x"},
-                },
-            )
+            model_config = _named_lambda_config("test", {"function": "lambda x: x"})
             f.attrs["model_config"] = json.dumps(model_config)
             f.attrs["keras_version"] = keras_version
 
@@ -6782,10 +6501,7 @@ class TestCVE20259905H5SafeMode:
         """3.11.3 prereleases are still pre-fix builds and should remain CVE-attributed."""
         model_path = create_custom_h5_file(
             tmp_path,
-            _named_sequential_config(
-                "test",
-                {"class_name": "Lambda", "config": {"function": "lambda x: x"}},
-            ),
+            _named_lambda_config("test", {"function": "lambda x: x"}),
             keras_version=keras_version,
             file_name=f"model_{keras_version.replace('.', '_').replace('-', '_')}.h5",
         )
@@ -6805,13 +6521,7 @@ class TestCVE20259905H5SafeMode:
         for version in versions:
             h5_path = tmp_path / f"model_{version.replace('.', '_')}.h5"
             with h5py.File(h5_path, "w") as f:
-                model_config = _named_sequential_config(
-                    "test",
-                    {
-                        "class_name": "Lambda",
-                        "config": {"function": "lambda x: x"},
-                    },
-                )
+                model_config = _named_lambda_config("test", {"function": "lambda x: x"})
                 f.attrs["model_config"] = json.dumps(model_config)
                 f.attrs["keras_version"] = version
 
@@ -6827,10 +6537,7 @@ class TestCVE20259905H5SafeMode:
     def test_cve_2024_3660_unparseable_version_marks_unknown_risk(self, tmp_path: Path) -> None:
         model_path = create_custom_h5_file(
             tmp_path,
-            _named_sequential_config(
-                "test",
-                {"class_name": "Lambda", "config": {"function": "lambda x: x"}},
-            ),
+            _named_lambda_config("test", {"function": "lambda x: x"}),
             keras_version="2.12.0-gpu",
             file_name="model_noncanonical_2_12_gpu.h5",
         )
@@ -6848,10 +6555,7 @@ class TestCVE20259905H5SafeMode:
         """Two-part versions such as 3.11 should be evaluated as 3.11.0, not unknown risk."""
         model_path = create_custom_h5_file(
             tmp_path,
-            _named_sequential_config(
-                "test",
-                {"class_name": "Lambda", "config": {"function": "lambda x: x"}},
-            ),
+            _named_lambda_config("test", {"function": "lambda x: x"}),
             keras_version="3.11",
             file_name="model_3_11.h5",
         )
@@ -6871,13 +6575,7 @@ class TestCVE20259905H5SafeMode:
         for version in versions:
             h5_path = tmp_path / f"model_{version.replace('.', '_')}.h5"
             with h5py.File(h5_path, "w") as f:
-                model_config = _named_sequential_config(
-                    "test",
-                    {
-                        "class_name": "Lambda",
-                        "config": {"function": "lambda x: x"},
-                    },
-                )
+                model_config = _named_lambda_config("test", {"function": "lambda x: x"})
                 f.attrs["model_config"] = json.dumps(model_config)
                 f.attrs["keras_version"] = version
 
@@ -6910,13 +6608,7 @@ def _assert_safe_h5_module(tmp_path: Path, model_name: str, layer_name: str, mod
 def _assert_unsafe_lambda_expression(tmp_path: Path, model_name: str, expression: str) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
-            model_name,
-            {
-                "class_name": "Lambda",
-                "config": {"function": expression},
-            },
-        ),
+        _named_lambda_config(model_name, {"function": expression}),
     )
 
     result = KerasH5Scanner().scan(str(model_path))
@@ -6939,19 +6631,16 @@ def _assert_lambda_output_shape(
     encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
     model_path = create_custom_h5_file(
         tmp_path,
-        _named_sequential_config(
+        _named_lambda_config(
             model_name,
             {
-                "class_name": "Lambda",
-                "config": {
-                    "name": layer_name,
-                    "function": "relu",
-                    "function_type": "function",
-                    "module": "keras.activations",
-                    field_name: {
-                        "class_name": "__lambda__",
-                        "config": {"code": encoded_code},
-                    },
+                "name": layer_name,
+                "function": "relu",
+                "function_type": "function",
+                "module": "keras.activations",
+                field_name: {
+                    "class_name": "__lambda__",
+                    "config": {"code": encoded_code},
                 },
             },
         ),

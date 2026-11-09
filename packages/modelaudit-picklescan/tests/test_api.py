@@ -465,6 +465,12 @@ def _write_float_storage_zip(archive_path: Path, storage_blob: bytes) -> None:
     )
 
 
+def _scan_padded_float_storage_zip(archive_path: Path, storage_blob: bytes) -> PickleReport:
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    _write_float_storage_zip(archive_path, storage_blob)
+    return scan_file(archive_path)
+
+
 def _torch_rebuild_tensor_v2_warnings(report: PickleReport) -> list[Finding]:
     return [
         finding
@@ -5458,10 +5464,7 @@ def test_scan_file_scans_protocol0_int_crossing_trusted_probe_boundary(tmp_path:
 def test_scan_file_scans_extension_opcode_crossing_trusted_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + (b" " * 4093) + b"\x82\x01."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -5485,10 +5488,7 @@ def test_scan_file_routes_encoded_extension_operand_cut_after_recovered_mark(tmp
     archive_path = tmp_path / "recovered-mark-extension-boundary.pt"
     nested_payload = b"(" + (b"N" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES - 2)) + b"\x82\x01)R."
     storage_blob = _proto0_string_literal(base64.b64encode(nested_payload))
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict != SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -5498,10 +5498,7 @@ def test_scan_file_routes_nested_mark_extension_context(tmp_path: Path) -> None:
     archive_path = tmp_path / "nested-mark-extension.pt"
     payload = b"(N(N10\x82\x01)o\xff"
     storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict != SafetyVerdict.CLEAN
@@ -5518,10 +5515,7 @@ def test_scan_file_routes_nested_mark_extension_context(tmp_path: Path) -> None:
 def test_scan_file_routes_encoded_extension_fail_closed_suffixes(tmp_path: Path, payload: bytes) -> None:
     archive_path = tmp_path / "extension-fail-closed-suffix.pt"
     storage_blob = b"S'" + base64.b64encode(payload) + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict != SafetyVerdict.CLEAN
@@ -5541,10 +5535,7 @@ def test_scan_file_preserves_later_payload_after_exhausted_extension_context(
 ) -> None:
     archive_path = tmp_path / "extension-exhausted-context-later-payload.pt"
     storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
@@ -5875,10 +5866,7 @@ def test_scan_file_routes_binunicode8_literal_after_trivial_prefix(tmp_path: Pat
     archive_path = tmp_path / "model.pt"
     encoded_payload = base64.b64encode(b"cposix\nsystem\n)R.")
     storage_blob = b"N." + _binunicode8(encoded_payload) + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -5897,10 +5885,7 @@ def test_scan_file_scans_length_operand_crossing_trusted_probe_boundary(tmp_path
 def test_scan_file_marks_oversized_length_operand_inconclusive(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + b"X" + (70_000).to_bytes(4, "little") + (b"A" * 70_000)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert report.metadata["analysis_incomplete"] is True
@@ -5936,10 +5921,7 @@ def test_scan_file_scans_second_frame_header_crossing_trusted_probe_boundary(tmp
     second_frame = b"\x95" + len(second_frame_body).to_bytes(8, "little") + second_frame_body
     padding = b" " * (4096 - len(b"N.") - len(first_frame) - 1)
     storage_blob = b"N." + padding + first_frame + second_frame
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -5960,10 +5942,7 @@ def test_scan_file_marks_oversized_frame_payload_inconclusive(tmp_path: Path) ->
     frame_body += b"cposix\nsystem\n(S'echo hidden'\ntR."
     frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
     storage_blob = b"N." + frame
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert report.metadata["analysis_incomplete"] is True
@@ -6103,10 +6082,7 @@ def test_scan_file_scans_truncated_inst_operand_after_trivial_stream_at_trusted_
     storage_prefix = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"i"))) + b"i"
     assert len(storage_prefix) == package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + b"posix\nsystem\n(S'echo hidden'\ntR."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.status == ScanStatus.INCONCLUSIVE
@@ -6119,10 +6095,7 @@ def test_scan_file_scans_truncated_inst_operand_after_trivial_stream_at_trusted_
 def test_scan_file_routes_nested_extension_reference_literal_storage(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"U\x03\x82\x01.."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.status == ScanStatus.INCONCLUSIVE
@@ -6132,10 +6105,7 @@ def test_scan_file_routes_nested_extension_reference_literal_storage(tmp_path: P
 def test_scan_file_routes_base64_extension_reduce_literal_storage(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'ggFOMClSLg=='\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.verdict == SafetyVerdict.MALICIOUS
@@ -6248,10 +6218,7 @@ def test_scan_file_fails_closed_for_encoded_nested_pickle_after_candidate_budget
         (b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"Z" * 9000) + nested_payload
     )
     storage_blob = b"S'" + encoded_payload + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict != SafetyVerdict.CLEAN
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6288,10 +6255,7 @@ def test_scan_file_scans_scalar_literal_after_clean_nontrivial_stream(tmp_path: 
 def test_scan_file_preserves_suspicious_literal_after_trivial_stream(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N.]S'__reduce__'\na."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6318,10 +6282,7 @@ def test_scan_file_scans_scalar_literal_with_escaped_binary_nested_pickle(tmp_pa
 def test_scan_file_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'eval('\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6336,10 +6297,7 @@ def test_scan_file_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -
 def test_scan_file_continues_literal_inspection_after_surrogate_unicode(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"V\\ud800\nS'os.system'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6349,10 +6307,7 @@ def test_scan_file_continues_literal_inspection_after_surrogate_unicode(tmp_path
 def test_scan_file_scans_scalar_literal_with_magic_method_suspicious_string(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'__reduce__'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6422,10 +6377,7 @@ def test_scan_file_skips_repeated_malformed_separator_literal_near_match(tmp_pat
 def test_scan_file_routes_binunicode_literal_with_repeated_line_continuations(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"\x80\x02" + _binunicode(b"os\\\n\\\n.system('id') ") + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6457,10 +6409,7 @@ def test_scan_file_scans_malformed_separator_after_benign_binary_candidates(
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + tail
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert report.verdict == expected_verdict
@@ -6479,10 +6428,7 @@ def test_scan_file_scans_malformed_separator_after_benign_binary_candidates(
 def test_scan_file_reports_large_malformed_separator_tensor_noise_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + (b"\xff" * 100_000)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6497,10 +6443,7 @@ def test_scan_file_scans_malformed_separator_unicode_literal_nested_pickle(tmp_p
     archive_path = tmp_path / "model.pt"
     encoded = base64.b64encode(b"cbuiltins\neval\n(S'1'\ntR.")
     storage_blob = b"N.!V" + encoded + b"\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6721,10 +6664,7 @@ def test_scan_file_routes_scalar_literals_with_full_suspicious_string_policy(
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == expected_verdict
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6741,10 +6681,7 @@ def test_scan_file_skips_repeated_text_candidate_budget_near_match(tmp_path: Pat
     archive_path = tmp_path / "model.pt"
     literal = b"abc" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.CLEAN)
     assert report.metadata["pickle_files"] == ("archive/data.pkl",)
@@ -6895,10 +6832,7 @@ def test_scan_file_routes_extension_opcode_after_raw_candidate_budget_gap(tmp_pa
     archive_path = tmp_path / "model.pt"
     literal = (b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"A" * 10) + b"\x82\x01."
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
@@ -6914,10 +6848,7 @@ def test_scan_file_scans_whitespace_hex_nested_pickle_literal(tmp_path: Path) ->
     archive_path = tmp_path / "model.pt"
     encoded = binascii.hexlify(b"cposix\nsystem\n)R.")
     storage_blob = _proto0_string_literal(encoded[:8] + b" " + encoded[8:])
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert "archive/data/0" in report.metadata["pickle_files"]
@@ -6994,10 +6925,7 @@ def test_scan_file_marks_repeated_trivial_streams_filling_expanded_probe_inconcl
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = (b"N." * 32768) + pickle.dumps(MaliciousPayload(), protocol=4)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN)
     assert report.metadata["analysis_incomplete"] is True
@@ -7068,10 +6996,7 @@ def test_scan_file_scans_comment_prefixed_pickle_after_trivial_scalar_prefix(tmp
 def test_scan_file_scans_persid_after_trivial_prefix_crossing_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N.P" + (b"A" * 4093) + b"\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert any(
@@ -7089,10 +7014,7 @@ def test_scan_file_scans_security_relevant_pickle_after_trivial_scalar_prefix(
 ) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + trailing_payload
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert any(
@@ -16726,10 +16648,7 @@ def _assert_storage_skipped(archive_path: Path, storage_blob: bytes) -> PickleRe
 
 
 def _assert_storage_pickle_detected(archive_path: Path, storage_blob: bytes) -> None:
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     _assert_malicious_storage_report(report, archive_path)
 
@@ -16819,10 +16738,7 @@ def _assert_dill_reference_dangerous(payload_bytes: bytes, source_name: str, rul
 def _assert_encoded_extension_routes(tmp_path: Path, filename: str, payload_bytes: bytes) -> None:
     archive_path = tmp_path / filename
     storage_blob = payload_bytes
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    _write_float_storage_zip(archive_path, storage_blob)
-
-    report = scan_file(archive_path)
+    report = _scan_padded_float_storage_zip(archive_path, storage_blob)
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
