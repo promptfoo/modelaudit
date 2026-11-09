@@ -395,9 +395,6 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
     ),
 ];
 
-const EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES: &[(&str, &str, usize, usize)] =
-    &[("tokenize", "generate_tokens", 1, 0)];
-
 const EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS: &[(&str, &str, usize, usize)] = &[
     ("array", "array.extend", 2, 1),
     ("builtins", "bytearray.__init__", 2, 1),
@@ -2265,12 +2262,14 @@ impl<'a> ScanState<'a> {
                     else {
                         return Vec::new();
                     };
-                    (
-                        values.first().cloned(),
-                        Self::tuple_argument_values(values.get(1)),
-                        None,
-                        self.tracked_keyword_arg_names(values.get(2)),
-                    )
+                    let mut operands = values.into_iter();
+                    let callable = operands.next();
+                    let arguments = match operands.next() {
+                        Some(StackValue::Tuple(arguments)) => Some(arguments),
+                        _ => None,
+                    };
+                    let keyword_names = self.tracked_keyword_arg_names(operands.next().as_ref());
+                    (callable, arguments, None, keyword_names)
                 }
                 "OBJ" => {
                     let values = self.pop_to_mark();
@@ -4916,13 +4915,6 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn tuple_argument_values(value: Option<&StackValue>) -> Option<Vec<StackValue>> {
-        match value {
-            Some(StackValue::Tuple(values)) => Some(values.clone()),
-            _ => None,
-        }
-    }
-
     fn with_memo_index(&self, value: StackValue, index: i64) -> StackValue {
         let value = self.memoized_tracked_dict(&value).cloned().unwrap_or(value);
         Self::set_memo_index(value, index)
@@ -5031,76 +5023,104 @@ impl<'a> ScanState<'a> {
     }
 
     fn push_reducer_result(&mut self, values: &[StackValue], op_name: &'static str) {
-        if let Some(call_iterator) = Self::call_iterator_result(values) {
-            self.push_stack_value(call_iterator);
-            return;
+        if let Some(result) = self.modeled_reducer_result(values, op_name) {
+            self.push_stack_value(result);
+        } else {
+            self.push_constructed_result(values.first());
         }
-        if let Some(call_iterator) = Self::lazy_zero_arg_callback_iterable_result(values) {
-            self.push_stack_value(call_iterator);
-            return;
-        }
-        if let Some(call_iterator) = Self::lazy_call_iterator_wrapper_result(values) {
-            self.push_stack_value(call_iterator);
-            return;
-        }
-        if let Some(call_iterator_tuple) = Self::call_iterator_tuple_wrapper_result(values) {
-            self.push_stack_value(call_iterator_tuple);
-            return;
-        }
-        if let Some(defaultdict) = Self::defaultdict_result(values, op_name) {
-            self.push_stack_value(defaultdict);
-            return;
-        }
-        if let Some(mapping_wrapper) = self.mapping_wrapper_result(values) {
-            self.push_stack_value(mapping_wrapper);
-            return;
-        }
-        if let Some(dynamic_type) = self.dynamic_type_result(values) {
-            self.push_stack_value(dynamic_type);
-            return;
-        }
-        if let Some(tracked_dict) = self.dict_constructor_result(values) {
-            self.push_stack_value(tracked_dict);
-            return;
-        }
-        if let Some(template) = self.string_template_result(values) {
-            self.push_stack_value(template);
-            return;
-        }
-        if let Some(tuple_item) = Self::tuple_getitem_result(values) {
-            self.push_stack_value(tuple_item);
-            return;
-        }
-        if let Some(joined) = self.str_join_result(values) {
-            self.push_stack_value(joined);
-            return;
-        }
-        if let Some(regex_pattern) = self.regex_pattern_result(values) {
-            self.push_stack_value(regex_pattern);
-            return;
-        }
-        if let Some(regex_scanner) = Self::regex_scanner_result(values) {
-            self.push_stack_value(regex_scanner);
-            return;
-        }
-        if let Some(future) = Self::future_callbacks_result(values) {
-            self.push_stack_value(future);
-            return;
-        }
-        if let Some(resolved) = self.static_getattr_reconstruction_result(values) {
-            self.push_stack_value(StackValue::Global(resolved));
-            return;
-        }
-        self.push_constructed_result(values.first());
     }
 
-    fn static_getattr_reconstruction_result(&self, values: &[StackValue]) -> Option<GlobalRef> {
-        let Some(StackValue::Global(callable)) = values.first() else {
+    fn modeled_reducer_result(
+        &mut self,
+        values: &[StackValue],
+        op_name: &'static str,
+    ) -> Option<StackValue> {
+        let [StackValue::Global(reference), StackValue::Tuple(arguments), ..] = values else {
             return None;
         };
-        let arguments = Self::tuple_argument_values(values.get(1))?;
-        self.static_getattr_reconstruction(callable, "REDUCE", &arguments)
-            .and_then(|reconstruction| reconstruction.resolved)
+        if reference.malformed {
+            return None;
+        }
+        let module = match reference.module.as_str() {
+            "__builtin__" | "__builtins__" => "builtins",
+            other => other,
+        };
+        let name = reference.name.as_str();
+        let arguments = arguments.as_slice();
+        let iterator_callable = match (module, name, arguments) {
+            ("builtins", "iter", [callback, _]) | ("tokenize", "generate_tokens", [callback]) => {
+                Self::callable_reference_from_value(Some(callback))
+            }
+            ("builtins", _, _) => {
+                Self::builtins_lazy_call_iterator_wrapper_callable(name, arguments)
+            }
+            ("itertools", _, _) => {
+                Self::itertools_lazy_call_iterator_wrapper_callable(name, arguments)
+            }
+            ("heapq", "merge", [_, ..]) => arguments.iter().find_map(Self::call_iterator_callable),
+            _ => None,
+        };
+        if let Some(callable) = iterator_callable {
+            return Some(StackValue::CallIterator { callable });
+        }
+        match (module, name, arguments) {
+            ("itertools", "tee", [iterable] | [iterable, _]) => {
+                Some(StackValue::CallIteratorTuple {
+                    callable: Self::call_iterator_callable(iterable)?,
+                    item_count: Self::tee_item_count(arguments),
+                })
+            }
+            ("collections", "defaultdict", _) => {
+                Self::defaultdict_result(reference, arguments, op_name)
+            }
+            ("collections", "ChainMap", [_, ..]) | ("types", "MappingProxyType", [_]) => {
+                self.mapping_wrapper_result(reference, arguments)
+            }
+            ("builtins", "dict", _) => self.dict_constructor_result(arguments),
+            ("string", "Template", [template]) => Some(StackValue::StringTemplate {
+                template: stack_value_string(template, self.payload)?,
+            }),
+            ("operator", "getitem", [container, index]) => {
+                Self::tuple_getitem_result(container, index)
+            }
+            ("builtins", "str.join", [separator, iterable]) => {
+                self.str_join_result(separator, iterable)
+            }
+            ("re", "compile", [pattern] | [pattern, _]) => Some(StackValue::RegexPattern {
+                pattern: stack_value_string(pattern, self.payload)?,
+                flags: arguments.get(1).map_or(Some(0), Self::stack_value_integer),
+            }),
+            ("re", "Scanner", [lexicon] | [lexicon, _]) => {
+                let StackValue::RegexScannerLexicon { rules } = lexicon else {
+                    return None;
+                };
+                Some(StackValue::RegexScanner {
+                    rules: rules.clone(),
+                    flags: arguments.get(1).map_or(Some(0), Self::stack_value_integer),
+                })
+            }
+            (_, _, []) if Self::is_concurrent_future_symbol(reference, "Future") => {
+                Some(StackValue::FutureCallbacks(FutureCallbacks {
+                    callbacks: Vec::new(),
+                    done: false,
+                    memo_index: None,
+                }))
+            }
+            _ if is_builtin_getattr_reference(reference) => self
+                .static_getattr_reconstruction(reference, "REDUCE", arguments)?
+                .resolved
+                .map(StackValue::Global),
+            _ => {
+                let constructor_arguments =
+                    Self::dynamic_type_constructor_arguments(values.first(), arguments)?;
+                Some(StackValue::DynamicType {
+                    type_name: constructor_arguments
+                        .first()
+                        .and_then(|value| stack_value_string(value, self.payload)),
+                    memo_index: None,
+                })
+            }
+        }
     }
 
     fn static_getattr_reconstruction(
@@ -5146,187 +5166,6 @@ impl<'a> ScanState<'a> {
             target_is_direct,
             resolved,
         })
-    }
-
-    fn dynamic_type_result(&self, values: &[StackValue]) -> Option<StackValue> {
-        let arguments = Self::tuple_argument_values(values.get(1))?;
-        let constructor_arguments =
-            Self::dynamic_type_constructor_arguments(values.first(), &arguments)?;
-        let type_name = constructor_arguments
-            .first()
-            .and_then(|value| stack_value_string(value, self.payload));
-        Some(StackValue::DynamicType {
-            type_name,
-            memo_index: None,
-        })
-    }
-
-    fn call_iterator_result(values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || !matches!(
-                (
-                    callable_reference.module.as_str(),
-                    callable_reference.name.as_str()
-                ),
-                ("builtins" | "__builtin__" | "__builtins__", "iter")
-            )
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        if arguments.len() != 2 {
-            return None;
-        }
-        let callable = Self::callable_reference_from_value(arguments.first())?;
-        Some(StackValue::CallIterator { callable })
-    }
-
-    fn regex_pattern_result(&self, values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || callable_reference.module != "re"
-            || callable_reference.name != "compile"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        if !(1..=2).contains(&arguments.len()) {
-            return None;
-        }
-        let pattern = arguments
-            .first()
-            .and_then(|value| stack_value_string(value, self.payload))?;
-        let flags = arguments.get(1).map_or(Some(0), Self::stack_value_integer);
-        Some(StackValue::RegexPattern { pattern, flags })
-    }
-
-    fn regex_scanner_result(values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || callable_reference.module != "re"
-            || callable_reference.name != "Scanner"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        if !(1..=2).contains(&arguments.len()) {
-            return None;
-        }
-        let Some(StackValue::RegexScannerLexicon { rules }) = arguments.first() else {
-            return None;
-        };
-        let flags = arguments.get(1).map_or(Some(0), Self::stack_value_integer);
-        Some(StackValue::RegexScanner {
-            rules: rules.clone(),
-            flags,
-        })
-    }
-
-    fn future_callbacks_result(values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || !Self::is_concurrent_future_symbol(callable_reference, "Future")
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        if !arguments.is_empty() {
-            return None;
-        }
-        Some(StackValue::FutureCallbacks(FutureCallbacks {
-            callbacks: Vec::new(),
-            done: false,
-            memo_index: None,
-        }))
-    }
-
-    fn string_template_result(&self, values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || callable_reference.module != "string"
-            || callable_reference.name != "Template"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        if arguments.len() != 1 {
-            return None;
-        }
-        let template = arguments
-            .first()
-            .and_then(|value| stack_value_string(value, self.payload))?;
-        Some(StackValue::StringTemplate { template })
-    }
-
-    fn lazy_zero_arg_callback_iterable_result(values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        let (_, _, _, callback_arg_index) = EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES
-            .iter()
-            .find(|(consumer_module, consumer_name, arity, _)| {
-                Self::consumer_module_matches(&callable_reference.module, consumer_module)
-                    && *consumer_name == callable_reference.name
-                    && *arity == arguments.len()
-            })?;
-        let callable = Self::callable_reference_from_value(arguments.get(*callback_arg_index))?;
-        Some(StackValue::CallIterator { callable })
-    }
-
-    fn lazy_call_iterator_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        let callable = match callable_reference.module.as_str() {
-            "builtins" | "__builtin__" | "__builtins__" => {
-                Self::builtins_lazy_call_iterator_wrapper_callable(
-                    &callable_reference.name,
-                    arguments,
-                )
-            }
-            "itertools" => Self::itertools_lazy_call_iterator_wrapper_callable(
-                &callable_reference.name,
-                arguments,
-            ),
-            "heapq" => {
-                Self::heapq_lazy_call_iterator_wrapper_callable(&callable_reference.name, arguments)
-            }
-            _ => None,
-        }?;
-        Some(StackValue::CallIterator { callable })
     }
 
     fn builtins_lazy_call_iterator_wrapper_callable(
@@ -5376,24 +5215,8 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn heapq_lazy_call_iterator_wrapper_callable(
-        name: &str,
-        arguments: &[StackValue],
-    ) -> Option<GlobalRef> {
-        match name {
-            "merge" if !arguments.is_empty() => {
-                arguments.iter().find_map(Self::call_iterator_callable)
-            }
-            _ => None,
-        }
-    }
-
     fn call_iterator_callable(value: &StackValue) -> Option<GlobalRef> {
-        match value {
-            StackValue::CallIterator { callable } => Some(callable.clone()),
-            StackValue::CallIteratorTuple { callable, .. } => Some(callable.clone()),
-            _ => None,
-        }
+        Self::call_iterator_callable_ref(value).cloned()
     }
 
     fn call_iterator_callable_ref(value: &StackValue) -> Option<&GlobalRef> {
@@ -5411,29 +5234,6 @@ impl<'a> ScanState<'a> {
         })
     }
 
-    fn call_iterator_tuple_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || callable_reference.module != "itertools"
-            || callable_reference.name != "tee"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        if !(1..=2).contains(&arguments.len()) {
-            return None;
-        }
-        let callable = arguments.first().and_then(Self::call_iterator_callable)?;
-        Some(StackValue::CallIteratorTuple {
-            callable,
-            item_count: Self::tee_item_count(arguments),
-        })
-    }
-
     fn tee_item_count(arguments: &[StackValue]) -> Option<usize> {
         let Some(count_value) = arguments.get(1) else {
             return Some(2);
@@ -5441,22 +5241,10 @@ impl<'a> ScanState<'a> {
         Self::stack_value_nonnegative_index(count_value)
     }
 
-    fn tuple_getitem_result(values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || callable_reference.module != "operator"
-            || callable_reference.name != "getitem"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        let [container, index_value] = arguments.as_slice() else {
-            return None;
-        };
+    fn tuple_getitem_result(
+        container: &StackValue,
+        index_value: &StackValue,
+    ) -> Option<StackValue> {
         match container {
             StackValue::Tuple(items) => {
                 let index = Self::stack_value_tuple_index(index_value, items.len())?;
@@ -5479,25 +5267,7 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn str_join_result(&self, values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || !matches!(
-                callable_reference.module.as_str(),
-                "builtins" | "__builtin__" | "__builtins__"
-            )
-            || callable_reference.name != "str.join"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        let [separator, iterable] = arguments.as_slice() else {
-            return None;
-        };
+    fn str_join_result(&self, separator: &StackValue, iterable: &StackValue) -> Option<StackValue> {
         let separator = stack_value_string(separator, self.payload)?;
         let StackValue::Tuple(items) = iterable else {
             return None;
@@ -5548,22 +5318,14 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn defaultdict_result(values: &[StackValue], op_name: &'static str) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || callable_reference.module != "collections"
-            || callable_reference.name != "defaultdict"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
+    fn defaultdict_result(
+        callable_reference: &GlobalRef,
+        arguments: &[StackValue],
+        op_name: &'static str,
+    ) -> Option<StackValue> {
         if op_name == "REDUCE"
             && matches!(
-                arguments.as_slice(),
+                arguments,
                 [] | [StackValue::Primitive {
                     type_name: "NoneType",
                     ..
@@ -5582,23 +5344,8 @@ impl<'a> ScanState<'a> {
         Some(StackValue::DefaultDict { default_factory })
     }
 
-    fn dict_constructor_result(&mut self, values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed
-            || !matches!(
-                callable_reference.module.as_str(),
-                "builtins" | "__builtin__" | "__builtins__"
-            )
-            || callable_reference.name != "dict"
-        {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-        match arguments.as_slice() {
+    fn dict_constructor_result(&mut self, arguments: &[StackValue]) -> Option<StackValue> {
+        match arguments {
             [] => Some(StackValue::TrackedDict {
                 entries: Vec::new(),
                 unknown_key_values: Vec::new(),
@@ -5645,38 +5392,20 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn mapping_wrapper_result(&self, values: &[StackValue]) -> Option<StackValue> {
-        let Some(StackValue::Global(callable_reference)) = values.first() else {
-            return None;
-        };
-        if callable_reference.malformed {
-            return None;
-        }
-        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
-            return None;
-        };
-
-        let mappings = match (
-            callable_reference.module.as_str(),
-            callable_reference.name.as_str(),
-        ) {
-            ("collections", "ChainMap") if !arguments.is_empty() => arguments.clone(),
-            ("types", "MappingProxyType") if arguments.len() == 1 => {
-                vec![arguments[0].clone()]
-            }
-            _ => return None,
-        };
-
+    fn mapping_wrapper_result(
+        &self,
+        reference: &GlobalRef,
+        mappings: &[StackValue],
+    ) -> Option<StackValue> {
         if mappings
             .iter()
             .all(|mapping| !self.mapping_may_contain_default_factory(mapping))
         {
             return None;
         }
-
         Some(StackValue::MappingWrapper {
-            reference: callable_reference.clone(),
-            mappings,
+            reference: reference.clone(),
+            mappings: mappings.to_vec(),
         })
     }
 
@@ -8281,7 +8010,7 @@ mod tests {
     #[test]
     fn constructor_provenance_survives_memo_without_blessing_unknown_aliases() {
         let options = default_test_options();
-        let scan = new_test_scan("constructor-proof", b"", &options);
+        let mut scan = new_test_scan("constructor-proof", b"", &options);
         let known = factoryless_defaultdict();
         let StackValue::Constructed { reference, .. } = &known else {
             panic!("constructed fixture")
@@ -8310,17 +8039,16 @@ mod tests {
             StackValue::Tuple(Vec::new()),
         ];
         assert!(matches!(
-            ScanState::defaultdict_result(&values, "REDUCE"),
+            scan.modeled_reducer_result(&values, "REDUCE"),
             Some(StackValue::Constructed {
                 defaultdict_without_factory: true,
                 ..
             })
         ));
-        assert!(ScanState::defaultdict_result(&values, "NEWOBJ").is_none());
-        assert!(
-            ScanState::defaultdict_result(&[values[0].clone(), StackValue::Other], "REDUCE")
-                .is_none()
-        );
+        assert!(scan.modeled_reducer_result(&values, "NEWOBJ").is_none());
+        assert!(scan
+            .modeled_reducer_result(&[values[0].clone(), StackValue::Other], "REDUCE")
+            .is_none());
     }
 
     #[test]
@@ -9400,7 +9128,7 @@ mod tests {
     fn str_join_result_counts_separator_bytes_before_appending() {
         let options = default_test_options();
         let payload = b"";
-        let scan = new_test_scan("str-join-bound.pkl", payload, &options);
+        let mut scan = new_test_scan("str-join-bound.pkl", payload, &options);
         let callable = StackValue::Global(GlobalRef {
             module: "builtins".to_string(),
             name: "str.join".to_string(),
@@ -9430,7 +9158,7 @@ mod tests {
             ]),
         ];
         assert!(matches!(
-            scan.str_join_result(&within_bound),
+            scan.modeled_reducer_result(&within_bound, "REDUCE"),
             Some(StackValue::Text { value, .. }) if value.len() == MAX_TRACKED_STR_JOIN_RESULT_BYTES
         ));
 
@@ -9453,7 +9181,7 @@ mod tests {
                 ]),
             ]),
         ];
-        assert!(scan.str_join_result(&over_bound).is_none());
+        assert!(scan.modeled_reducer_result(&over_bound, "REDUCE").is_none());
     }
 
     #[test]
