@@ -1412,6 +1412,61 @@ class TestSecretsDetector:
         serialized = json.dumps(findings, sort_keys=True)
         assert raw_secret in serialized
 
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "Authorization: Bearer {value}",
+            "préface\r\nPROXY-AUTHORIZATION:\tBeArEr {value} \r\n",
+            "HEADER='Authorization: Bearer {value}'",
+            'curl -H "Authorization: Bearer {value}"',
+        ],
+    )
+    def test_uuid_bearer_in_explicit_header(self, header: str) -> None:
+        value = "8bf64a2c-4ac8-43e1-8a4b-8cf49df0850a"
+        text = header.format(value=value)
+        [finding] = SecretsDetector().scan_text(text, "README.md")
+        expected = text[text.lower().index("bearer") : text.index(value) + len(value)]
+        assert finding["secret_type"] == "Bearer Token"
+        assert finding["severity"] == "WARNING"
+        assert text[finding["position"] : finding["position"] + finding["length"]] == expected
+        assert finding["redacted_value"] == expected
+        assert value not in finding["context"]
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "model ID {value}",
+            "Bearer {value}",
+            "X-Authorization: Bearer {value}",
+            "Authorization: Bearer\n{value}",
+            "Authorization: Bearer {value}!longer",
+            "Authorization: Bearer {value} trailing text",
+            'Authorization: Bearer {value}"bad',
+            "curl -H 'Authorization: Bearer {value}\"",
+            "X-Description: 'Authorization: Bearer {value}'",
+            "curl -h 'Authorization: Bearer {value}'",
+            "curl -H 'Authorization: Bearer {value}'-suffix",
+            """curl -H 'X-'"Authorization: Bearer {value}" """,
+            "Authorization: Bearer <your-token>",
+            "Authorization: Bearer 550e8400-e29b-11d4-a716-446655440000",
+        ],
+    )
+    def test_uuid_bearer_requires_complete_field_and_value(self, header: str) -> None:
+        value = "8bf64a2c-4ac8-43e1-8a4b-8cf49df0850a"
+        assert SecretsDetector().scan_text(header.format(value=value), "README.md") == []
+
+    @pytest.mark.parametrize("offset", [6, 18, 29])
+    def test_lossy_byte_decoding_does_not_invent_uuid_bearer_header(self, offset: int) -> None:
+        text = b"Authorization: Bearer 8bf64a2c-4ac8-43e1-8a4b-8cf49df0850a"
+        binary = text[:offset] + b"\xff" + text[offset:]
+        assert not any(f["secret_type"] == "Bearer Token" for f in SecretsDetector().scan_bytes(binary))
+
+    def test_uuid_bearer_respects_detector_settings(self) -> None:
+        value = "8bf64a2c-4ac8-43e1-8a4b-8cf49df0850a"
+        header = f"Authorization: Bearer {value}"
+        assert SecretsDetector({"whitelist": [f"^{value}$"]}).scan_text(header) == []
+        assert SecretsDetector({"min_secret_length": len(value) + 1}).scan_text(header) == []
+
     def test_secret_context_does_not_change_uuid_false_positive_filtering(self) -> None:
         """Secret-bearing paths must not turn an ordinary UUID into a finding."""
         detector = SecretsDetector()
