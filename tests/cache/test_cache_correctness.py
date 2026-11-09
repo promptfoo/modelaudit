@@ -3311,6 +3311,13 @@ def _assert_pickle_result_stored(
     )
 
 
+def _store_and_lookup(
+    cache: ScanResultsCache, file_path: Path, scan_result: dict[str, Any], version_context: dict[str, Any]
+) -> dict[str, Any] | None:
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
+    return cache.get_cached_result(str(file_path), version_context=version_context)
+
+
 def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3337,8 +3344,7 @@ def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     }
     expected_cached_result: dict[str, Any] = {"checks": [], "issues": [], "metadata": {}}
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) == expected_cached_result
     internal_cached_result = cache.get_cached_result(
         str(file_path),
         version_context=version_context,
@@ -3392,8 +3398,7 @@ def test_scan_cache_invalidates_symlink_sensitive_parent_search_context(
     fingerprint_metadata["search_context"] = cache._source_search_context()
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     monkeypatch.setattr(sys, "path", [str(poisoned_entry), *original_search_path])
 
@@ -3420,8 +3425,7 @@ def test_scan_cache_invalidates_when_loaded_module_override_appears(
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     replacement_module = ModuleType("cache_switch_module")
     replacement_module.__spec__ = ModuleSpec("cache_switch_module", loader=None, origin=str(second_source))
@@ -3451,8 +3455,7 @@ def test_scan_cache_invalidates_when_loaded_parent_package_can_redirect_child(
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     loaded_parent = ModuleType("cache_pkg")
     loaded_parent.__path__ = [str(second_source.parent)]
@@ -3495,8 +3498,7 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     loaded_parent.__path__ = [str(second_source.parent)]
 
@@ -3540,8 +3542,7 @@ def test_scan_cache_invalidates_loaded_package_importer_semantics_change(
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     monkeypatch.setitem(
         sys.path_importer_cache,
@@ -3575,8 +3576,7 @@ def test_scan_cache_rejects_custom_importer_on_matching_loaded_parent_package_pa
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     class CustomFinder:
         pass
@@ -3607,8 +3607,7 @@ def test_scan_cache_invalidates_when_loaded_module_disappears(
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     monkeypatch.delitem(sys.modules, "loaded_then_removed")
 
@@ -3823,8 +3822,7 @@ def test_scan_cache_rejects_resolution_metadata_without_current_picklescan_helpe
     file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata())
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     monkeypatch.setattr(
         "modelaudit.cache.scan_results_cache._PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE",
@@ -3853,8 +3851,7 @@ def test_scan_cache_revalidates_sources_after_standard_importer_cache_population
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     finder = FileFinder(
         path_entry,
@@ -3929,8 +3926,7 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
         }
 
     scan_result = _private_fingerprint_result(fingerprint_metadata)
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     finder = FileFinder(
         path_entry,
@@ -4028,8 +4024,7 @@ def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
     file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     monkeypatch.setitem(sys.path_importer_cache, path_entry, None)
 
@@ -4074,8 +4069,7 @@ def test_scan_cache_revalidates_sources_when_namespace_precedence_changes(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     scan_result = _private_fingerprint_result(fingerprint_metadata)
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     earlier_package = earlier_root / parent_module
     earlier_package.mkdir()
@@ -4137,8 +4131,7 @@ def test_scan_cache_invalidates_when_import_resolution_hooks_change(
     file_path, cache, version_context = _pickle_cache_context(tmp_path)
     scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata({str(missing_source.absolute()): None}))
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     class NoopFinder(MetaPathFinder):
         pass
@@ -4167,8 +4160,7 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
     }
     expected_cached_result: dict[str, Any] = {"checks": [], "issues": [], "metadata": {}}
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) == expected_cached_result
 
     missing_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
 
@@ -4189,8 +4181,7 @@ def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Pat
         _call_graph_fingerprint_metadata({str(extension_path.absolute()): extension_fingerprint})
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
     replacement_path.write_bytes(b"y" * (1024 * 1024 + 1))
@@ -4377,8 +4368,7 @@ def test_scan_cache_invalidates_when_read_fingerprint_directory_changes(tmp_path
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     (bytecode_dir / "helper.cpython-312.opt-1.pyc").write_bytes(b"second")
 
@@ -4391,8 +4381,7 @@ def test_scan_cache_rejects_legacy_fingerprint_metadata_without_read_records(tmp
     fingerprint_metadata.pop("read_fingerprints")
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is None
 
 
 def test_scan_cache_rejects_oversized_source_fingerprint_sets(tmp_path: Path) -> None:
@@ -4400,8 +4389,7 @@ def test_scan_cache_rejects_oversized_source_fingerprint_sets(tmp_path: Path) ->
     fingerprints: dict[str, str | None] = {str(tmp_path / f"candidate-{index}.py"): None for index in range(4097)}
     scan_result = _private_fingerprint_result(_call_graph_fingerprint_metadata(fingerprints))
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is None
 
 
 def test_scan_cache_invalidates_legacy_pickle_call_graph_metadata_without_fingerprints(tmp_path: Path) -> None:
@@ -4417,9 +4405,7 @@ def test_scan_cache_invalidates_legacy_pickle_call_graph_metadata_without_finger
         },
     }
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is None
 
 
 def test_scan_cache_invalidates_legacy_pytorch_zip_metadata_without_fingerprints(tmp_path: Path) -> None:
@@ -4438,9 +4424,7 @@ def test_scan_cache_invalidates_legacy_pytorch_zip_metadata_without_fingerprints
         },
     }
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is None
 
 
 def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
@@ -4471,9 +4455,7 @@ def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
         },
     }
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-
-    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) == expected_cached_result
 
 
 @pytest.mark.parametrize(
@@ -4507,9 +4489,7 @@ def test_scan_cache_accepts_source_independent_call_graph_metadata_under_unreusa
     }
     scan_result = _result_with_fingerprints(metadata, _source_independent_call_graph_fingerprint_metadata())
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-
-    assert cache.get_cached_result(str(file_path), version_context=version_context) == {
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) == {
         "checks": [],
         "issues": [],
         "metadata": metadata,
@@ -4539,9 +4519,7 @@ def test_scan_cache_rejects_malformed_source_independent_call_graph_metadata(
         fingerprint_metadata,
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is None
 
 
 @pytest.mark.parametrize(
@@ -4573,9 +4551,7 @@ def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
     }
     scan_result = _result_with_fingerprints(metadata, _source_independent_call_graph_fingerprint_metadata())
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is None
 
 
 @pytest.mark.parametrize(
@@ -4615,8 +4591,7 @@ def test_scan_cache_requires_all_critical_source_inputs_to_be_covered(
         },
     }
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    cached_result = _store_and_lookup(cache, file_path, scan_result, version_context)
     assert (cached_result is not None) is expected_hit
 
 
@@ -4646,9 +4621,7 @@ def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returnin
     )
     expected_cached_result = {key: value for key, value in scan_result.items() if key != "_private_metadata"}
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-
-    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    cached_result = _store_and_lookup(cache, file_path, scan_result, version_context)
     assert cached_result is not None
     assert cached_result == expected_cached_result
     assert "_private_metadata" not in cached_result
@@ -4670,8 +4643,7 @@ def test_scan_cache_validates_private_fingerprints_without_public_metadata(tmp_p
         )
     )
 
-    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+    assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
 
     source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
 
@@ -4706,9 +4678,7 @@ def test_scan_cache_by_key_invalidates_private_call_graph_source_fingerprint_cha
 
 
 def test_scan_cache_private_metadata_cannot_override_cache_bookkeeping(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path, "model.pkl")
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    version_context = build_cache_version_context({})
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
     fingerprint_metadata = _call_graph_fingerprint_metadata()
     scan_result = {
         "checks": [],
@@ -4727,9 +4697,7 @@ def test_scan_cache_private_metadata_cannot_override_cache_bookkeeping(tmp_path:
         },
     }
 
-    assert cache.store_result(
-        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
-    )
+    _assert_pickle_result_stored(cache, file_path, scan_result, version_context)
     cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
     assert cache_key is not None
     cache_entry = json.loads(cache._get_cache_file_path(cache_key).read_text(encoding="utf-8"))
