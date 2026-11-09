@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -739,7 +740,12 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
 
 
 def test_pickle_report_preserves_finding_with_oversized_display_position() -> None:
-    location = f"sample.pkl (pos {'1' * 5000})"
+    set_digit_limit = getattr(sys, "set_int_max_str_digits", None)
+    get_digit_limit = getattr(sys, "get_int_max_str_digits", None)
+    if set_digit_limit is None or get_digit_limit is None:
+        pytest.skip("requires a configurable integer string conversion limit")
+
+    location = f"sample.pkl (pos {'1' * 641})"
     reference = {"import_reference": "collections.Counter"}
     report = PickleReport(
         source="sample.pkl",
@@ -756,7 +762,12 @@ def test_pickle_report_preserves_finding_with_oversized_display_position() -> No
         metadata={"import_references": [{**reference, "position": 7}, {**reference, "position": 8}]},
     )
 
-    result = pickle_report_to_scan_result(report)
+    previous_limit = get_digit_limit()
+    set_digit_limit(640)
+    try:
+        result = pickle_report_to_scan_result(report)
+    finally:
+        set_digit_limit(previous_limit)
 
     assert [issue.location for issue in result.issues] == [location]
     assert [check.details["position"] for check in result.checks if check.name == "Standalone Pickle Import"] == [8]
