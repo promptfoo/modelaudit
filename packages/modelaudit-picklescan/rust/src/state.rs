@@ -9918,7 +9918,7 @@ mod tests {
                 scan.record_global_ref(&reference, "GLOBAL");
             }
 
-            // A previously recorded position is still a duplicate, including for storage globals.
+            // Repeating the reference at the current opcode must not trigger truncation.
             scan.record_global_ref(&reference, "GLOBAL");
             assert!(!scan.import_references_truncated, "{module}.{name}");
             reference.position = MAX_IMPORT_REFERENCES;
