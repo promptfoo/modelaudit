@@ -507,7 +507,7 @@ class PickleScanner:
                     error=error,
                     stream_start_offset=position_offset,
                 )
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read pickle stream: {error!s}",
                 category="short_read",
@@ -515,7 +515,7 @@ class PickleScanner:
                 bytes_total=error.expected_size,
             )
         except Exception as error:
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read pickle stream: {error!s}",
                 category="io_error",
@@ -611,7 +611,7 @@ class PickleScanner:
                     enrich_call_graph=enrich_call_graph,
                 )
         except OSError as error:
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read pickle file: {error!s}",
                 category="io_error",
@@ -619,7 +619,7 @@ class PickleScanner:
                 bytes_total=None,
             )
         except zipfile.BadZipFile as error:
-            return _io_error_report(
+            return _scan_error_report(
                 source=source,
                 message=f"Could not read PyTorch ZIP file: {error!s}",
                 category="zip_error",
@@ -718,7 +718,7 @@ class PickleScanner:
                         reports.append(member_report)
                     except Exception as error:
                         reports.append(
-                            _io_error_report(
+                            _scan_error_report(
                                 source=member_source,
                                 message=f"Could not read PyTorch ZIP pickle member: {error!s}",
                                 category="zip_error",
@@ -4899,7 +4899,6 @@ def _without_unproven_oversized_frame_tamper(
         verdict=verdict,
         findings=findings,
         notices=notices,
-        metadata=report.to_dict()["metadata"],
     )
 
 
@@ -4932,7 +4931,6 @@ def _with_truncated_stream_notice(
         Notice(message=message, severity=Severity.INFO, location=source, code=code, details=details),
     )
     verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
-    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return replace(
         report,
         status=ScanStatus.INCONCLUSIVE,
@@ -4945,7 +4943,7 @@ def _with_truncated_stream_notice(
             raw_scan_complete=False,
             opcode_scan_complete=False,
         ),
-        metadata=metadata,
+        metadata={**report.metadata, "analysis_incomplete": True},
     )
 
 
@@ -4977,7 +4975,7 @@ def _with_short_read_error(
     )
     verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
     metadata = {
-        **report.to_dict()["metadata"],
+        **report.metadata,
         "analysis_incomplete": True,
         "stream_short_read": True,
         "stream_bytes_read": error.bytes_read,
@@ -4999,7 +4997,7 @@ def _with_short_read_error(
     )
 
 
-def _io_error_report(
+def _scan_error_report(
     *,
     source: str,
     message: str,
@@ -5065,30 +5063,20 @@ def _scan_pickle_payload_native(
                 return _with_call_graph_source_fingerprint_metadata(
                     report,
                     _source_independent_call_graph_fingerprint_metadata(
-                        critical_references=not _call_graph_has_no_source_inputs(report)
+                        critical_references=bool(
+                            report.metadata.get("import_references") or report.metadata.get("callable_invocations")
+                        )
                     ),
                 )
             return _with_call_graph_findings(report, payload=payload)
         return _with_import_origin_findings(report)
     except Exception as error:
-        return PickleReport(
+        return _scan_error_report(
             source=source,
-            status=ScanStatus.ERROR,
-            verdict=SafetyVerdict.UNKNOWN,
-            errors=(
-                ScanError(
-                    message=f"Rust pickle scanner failed: {error!s}",
-                    category="rust_engine_error",
-                    location=source,
-                    exception_type=type(error).__name__,
-                ),
-            ),
-            coverage=CoverageSummary(
-                bytes_scanned=0,
-                bytes_total=native_bytes_total,
-                raw_scan_complete=False,
-                opcode_scan_complete=False,
-            ),
+            message=f"Rust pickle scanner failed: {error!s}",
+            category="rust_engine_error",
+            exception=error,
+            bytes_total=native_bytes_total,
         )
 
 
@@ -5297,19 +5285,6 @@ def _source_independent_builtin_import_reference(reference: Mapping[str, object]
         and bool(name)
         and name not in _SOURCE_INDEPENDENT_BUILTIN_DANGEROUS_NAMES
         and reference.get("is_dangerous") is not True
-    )
-
-
-def _call_graph_has_no_source_inputs(report: PickleReport) -> bool:
-    return not any(
-        report.metadata.get(key)
-        for key in (
-            "import_references",
-            "callable_invocations",
-            "import_references_truncated",
-            "callable_invocations_truncated",
-            "non_allowlisted_global_imports_truncated",
-        )
     )
 
 
@@ -5585,22 +5560,12 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         else ()
     )
     additional_findings = (*rce_findings, *startup_findings, *limit_findings)
-    updated_report = (
-        PickleReport(
-            source=updated_report.source,
-            status=updated_report.status,
+    if additional_findings:
+        updated_report = replace(
+            updated_report,
             verdict=SafetyVerdict.MALICIOUS,
             findings=(*updated_report.findings, *additional_findings),
-            notices=updated_report.notices,
-            errors=updated_report.errors,
-            coverage=updated_report.coverage,
-            metadata=updated_report.to_dict()["metadata"],
-            private_metadata=updated_report.private_metadata,
-            duration_s=updated_report.duration_s,
         )
-        if additional_findings
-        else updated_report
-    )
     return (
         _with_call_graph_enrichment_errors(updated_report, tuple(enrichment_errors))
         if enrichment_errors
@@ -5733,7 +5698,6 @@ def _without_proven_safe_getattr_reconstruction_findings(
         report,
         verdict=_verdict_for_findings(report.status, findings),
         findings=findings,
-        metadata=report.to_dict()["metadata"],
     )
 
 
@@ -6109,7 +6073,6 @@ def _without_proven_safe_import_findings(
         report,
         verdict=verdict,
         findings=findings,
-        metadata=report.to_dict()["metadata"],
         private_metadata={},
     )
 
@@ -6671,7 +6634,6 @@ def _with_call_graph_enrichment_errors(
             for analysis, error in enrichment_errors
         ),
     )
-    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return replace(
         report,
         status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
@@ -6681,7 +6643,7 @@ def _with_call_graph_enrichment_errors(
             else SafetyVerdict.UNKNOWN
         ),
         errors=errors,
-        metadata=metadata,
+        metadata={**report.metadata, "analysis_incomplete": True},
     )
 
 
@@ -6693,11 +6655,7 @@ def _with_call_graph_source_fingerprint_metadata(
         return report
     private_metadata = dict(report.private_metadata)
     private_metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY] = dict(source_fingerprints)
-    return replace(
-        report,
-        metadata=report.to_dict()["metadata"],
-        private_metadata=private_metadata,
-    )
+    return replace(report, private_metadata=private_metadata)
 
 
 def _with_unanalyzed_call_graph_notices(
@@ -6730,7 +6688,6 @@ def _with_unanalyzed_call_graph_notices(
             for reference in uncovered_references
         ),
     )
-    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return replace(
         report,
         status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
@@ -6740,7 +6697,7 @@ def _with_unanalyzed_call_graph_notices(
             else SafetyVerdict.UNKNOWN
         ),
         notices=notices,
-        metadata=metadata,
+        metadata={**report.metadata, "analysis_incomplete": True},
     )
 
 
@@ -6904,6 +6861,5 @@ def _append_untrusted_import_findings(report: PickleReport, additional_findings:
         report,
         verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
         findings=(*report.findings, *additional_findings),
-        metadata=report.to_dict()["metadata"],
         private_metadata={},
     )
