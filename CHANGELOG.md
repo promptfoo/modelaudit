@@ -2,10 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](docs/agents/release-process.md#version-scheme-0ver).
+
+## [Unreleased]
+
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.55...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
 
 ## [0.2.55](https://github.com/promptfoo/modelaudit/compare/v0.2.54...v0.2.55) (2026-11-06)
+
+### Highlights
+
+- ModelAudit supports standard CPython 3.14 on Linux, macOS, and Windows. Use `metadata --table-limit` to control the number of directory entries in a metadata table.
+- GGUF scans validate tensor bounds for additional ggml types and check interleaved row groups per matrix. ONNX scans retain weight coverage through bounded control-flow analysis and report incomplete coverage when a weight path cannot be established.
+- Metadata JSON stays on stdout when YAML extraction falls back. Directory tables and `--security-only` retain extraction errors. Consolidated pickle results preserve individual coverage notices and member locations.
+
+### Upgrade notes
+
+- In Python scan results, `success` now measures completion. A completed scan can return `success=True` alongside security findings. Consumers that block a model on findings should inspect the reported issues and checks. In the CLI, exit code 1 signals security findings and 2 signals a scan error.
+- Building the native pickle scanner from source requires Rust 1.85 or newer. Installing a supported prebuilt wheel does not require Rust.
+- Docker runtime images include Debian APT security updates.
+
+<details>
+<summary>All changes</summary>
 
 ### Features
 
@@ -28,97 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **results:** report completed scans with security findings as successful ([#1941](https://github.com/promptfoo/modelaudit/issues/1941)) ([d37d506](https://github.com/promptfoo/modelaudit/commit/d37d506844d3a2107dd4c4a1a4d120a375f2821e))
 - **routing:** avoid pickle false positives on license text ([#1911](https://github.com/promptfoo/modelaudit/issues/1911)) ([6128247](https://github.com/promptfoo/modelaudit/commit/6128247b084f3bb64724706ab037c7de8ab242f5))
 
-## [Unreleased]
+[Detailed scanner changes at the release tag](https://github.com/promptfoo/modelaudit/blob/v0.2.55/CHANGELOG.md#unreleased) · [Full comparison](https://github.com/promptfoo/modelaudit/compare/v0.2.54...v0.2.55)
 
-### Added
-
-- Add advisory API triage for README/model-card findings when `OPENAI_API_KEY` is set, with `--no-triage` to disable it. Advice goes to stderr without changing scanner reports, verdicts, or exit codes.
-- Support standard CPython 3.14 with native pickle and H5 scanner validation across Linux, macOS, and Windows.
-- Add `metadata --table-limit` to control the number of file entries displayed in directory tables.
-
-### Changed
-
-- Require Rust 1.85 or newer for source builds of the native pickle scanner and use Rust 1.85 in Docker builds for PyO3 0.30 compatibility.
-
-### Fixed
-
-- Recognize one-byte F8_E4M3 tensors in GGUF files and validate their payload bounds.
-- Avoid checkpoint routing errors on logs, JSON Lines datasets, tokenizer vocabularies, PCM audio, and native binaries. Keep inspecting possible serialized payloads in mixed-format files.
-- Attribute README and model-card network findings to their documentation source. Recognize passive SQL comparisons, local client examples, maintenance and classifier terminology, usage restrictions, and contact details. Preserve alerts for active uses.
-- Report routine setup commands, local inference endpoints, and documentation links in README and model-card examples as informational. Preserve alerts for suspicious destinations and documented clone-and-execute sequences.
-- Stop flagging licenses as incompatible solely because they lack OSI approval. Distinguish Creative Commons Attribution from ShareAlike and NonCommercial declarations, recognize RAIL names at word boundaries, and count each file once when reporting deprecated identifiers.
-- Reduce false alerts for passive model-card links, image attributes, standard misuse notices, and arXiv IDs containing port-like numbers. Preserve alerts in executable or configuration contexts and report incomplete coverage when parsing limits are reached.
-- Continue checking README and model-card URLs and credentials after a malformed link.
-- Report completed scans as successful in the Python API even when a security check raises a warning.
-- Validate legacy Bitcoin address checksums before reporting a match, so unrelated identifiers such as notebook IDs do not trigger embedded-secret alerts.
-- Avoid incomplete GGUF, GGML, and sharded model scans and skipped file hashes on Windows when an unchanged file reports different creation times through its path and its open handle.
-- Run the lightweight Docker image on Python 3.14, with pip confined to the build stage. The full image stays on Python 3.13 for TensorFlow compatibility.
-- Upgrade APT and zlib packages in all Docker runtime images to include Debian security fixes.
-- Explain when JSON parsing limits interrupt SafeTensors header validation and when YAML safe loading prevents template extraction.
-- Distinguish reshape dimensions from activation data when tracing both inputs of an ONNX attention contraction. Dynamically transformed weights retain their coverage gaps.
-
-- Keep the highest failed severity and its explanation when combining checks for one asset. Summaries that include informational findings now identify them as findings.
-- Preserve individual pickle coverage notices and member locations in consolidated scan results.
-- Report individual pickle findings in PyTorch ZIP checkpoints without attributing ordinary serialization opcodes to CVE-2025-32434. The runtime advisory now names the affected legacy TAR loader.
-- Validate PyTorch storage references alongside wide RNG state tuples and track up to 2,048 dictionary entries in pickle state analysis.
-- Validate storage IDs in PyTorch tensor batches and legacy TorchScript v1 parameter mappings with a separate allowance of 256,000 metadata opcodes and two million provenance-node visits per archive. Upgrade both `modelaudit` and `modelaudit-picklescan` to receive this fix. Member discovery limits and coverage diagnostics still apply.
-- Recognize standalone Tekken vocabulary JSON without routing token spellings to model checkpoint parsers. Filtered domain-shaped code tokens in model cards no longer consume the network evidence classification budget.
-- Recognize SentencePiece tokenizers with large trainer symbol lists and complete tiktoken rank files sharing the XGBoost model extension.
-
-- Recognize Tekken v7 vocabularies and large SafeTensors weight indexes during JSON routing, preserving manifest security checks and incomplete results for ambiguous files.
-- Exclude weight consumers in proven-unreachable Loop and Scan bodies while retaining operator security checks and coverage for uncertain execution.
-- Resolve bound function attributes during finite ONNX replay and ignore unrelated dead transforms without dropping live weight consumers.
-- Bound duplicate singular fields during ONNX control preflight and preserve findings and explicit incomplete coverage when admission stops.
-- Reject impossible protobuf wire types when probing large non-model files such as native static libraries.
-- Preserve finite-loop vector proofs when ONNX Concat combines carried state with known constant operands, while retaining incomplete coverage for unknown operands.
-
-- Separate physical ONNX weight-storage checks from logical expanded-view admission, preserving per-view and cumulative limits without repeatedly copying source payloads.
-- Preserve immutable constants captured by effective ONNX function graph bindings during recurrent weight proofs, including defaults, overrides and forwarded graphs.
-- Reuse successful and rejected ONNX vector-control proofs across Expand, axes and Reshape analysis, including recurrent state proofs, so each immutable tensor payload is read once.
-- Bound primary Einsum weight orientation with the shared literal-equation cache before decoding, including resolved Expand and repeated function consumers.
-- Require immutable or proven Scan-8 batch extents and admit typed, budgeted body-local constants before finite weight replay.
-- Preserve trusted runtime-input types through ONNX loop replay and function scopes without trusting shadowed names or unknown operands.
-- Bound and reuse parsed ONNX Einsum equations during repeated shape inference, and reuse capture proofs for equivalent scalar bindings without weakening type checks.
-- Exclude unused function graph arguments from finite ONNX replay while retaining unknown results for unresolved used bindings and scopes.
-- Keep unknown Cast targets and unproven pooling samples from suppressing ONNX weight-coverage gaps.
-- Bound retained ONNX function opset maps before construction and preserve incomplete coverage when a scope exceeds the aggregate budget.
-- Reject unresolved ONNX function overrides and invalid Squeeze rank proofs without consuming capture budgets for unused graph arguments across reentry, dependency, and reachability traversal.
-- Keep local-function graph captures reachable during ONNX weight analysis, and prevent invalid transform bindings from establishing weight-coverage exclusions.
-- Bound and reuse ONNX repeated Constant attribute copies and opset environments, and resolve caller-bound weight-transform attributes while preserving findings and incomplete-coverage outcomes.
-- Reuse ONNX local-function default maps and bound copying them into call environments.
-- Avoid false ONNX weight-coverage gaps for empty Scan-8 batches while retaining downstream coverage for returned states and output dimensions.
-- Charge each distinct ONNX weight-analysis view against the cumulative byte budget while preserving accepted findings and reporting incomplete coverage for skipped views.
-- Preserve ONNX training-normalization and loop-exit weight coverage when entry shapes are unproven or state ranks later increase.
-- Apply ONNX output rank and type semantics to deferred numeric provenance, and retain coverage when pooling or convolution turns dimensions into numeric coefficients.
-- Retain nested ONNX Loop control dependencies despite unused captures, promote deferred BatchNormalization parameter coverage to matrix outputs, and require proven entry ranks before suppressing recurrent weight gaps.
-- Preserve ONNX weight coverage across unknown broadcast ranks, including runtime values with only shape-control provenance, unproven branch and Reshape dimensions, captured runtime inputs, and repeated loop state changes, including initializer-backed states, cumulative scalar rank growth, repeated body consumers, and final transformed weights without stale first-iteration shapes or fabricated products of symbolic dimensions; distinguish builtin operators from exact local-function overloads in weight roles, transforms, and shape proofs while retaining unmatched builtin overloads; avoid false coverage gaps for unchanged shape-control values and provenance, separately captured constants, and fixed-shape single-step Scans including shared sequence extents beside symbolic inputs and feature widths, no-op shape-restoring loops, unchanged Scan-8 batch views, and padded Scan-8 outputs with omitted sequence lengths only for builtin Scan producers.
-- Preserve ONNX coverage through successive, replacement, and sibling loop-state transfers without feeding stacked Scan outputs back into independent sequence slices, including independent Constant and initializer replacements, deferred gaps and retained matrix lineages, activation recurrences with independently analyzed opposite weight views through nested graph and function calls, including constant-initialized activations and invariant carried weights, without suppressing later weight uses or sibling transfers, and nested branch, skipped-loop, and caller-bound shape and graph attributes; preserve optional control-flow output positions, distinguish immutable caller bindings, use initial state for provably skipped Loops and zero-extent modern Scans, preserve invariant modern Scan shape values and the invariant entry condition, and honor independent immutable Loop bounds, sliced Shape attributes, and prove single-iteration termination with caller-bound attributes only for builtin operators, excluding local Constant call attributes from immutable control proofs, and materialize bounded Scan input slices and stacked Loop and Scan weight views with their actual axes only when their values remain invariant; preserve proven axes of partially known Loop stacks without widening iteration replay or concrete-shape metadata; use proven per-iteration input shapes for nested Scan bounds, recurrence, and GatherND indices without trusting intermediate shape declarations or unresolved source-lineage shapes, preserve separately proven recurrent hidden/cell state shapes, and keep Scan-8 sequence lengths and batch axes separate from body transforms, preserve initial states for immutable zero lengths, and fail closed for unmaterialized final-state, sequence-input, and stacked views without analyzing unused Scan-8 padding as a weight.
-- Exclude empty weight views before statistical reductions, enforce per-tensor and cumulative ONNX budgets on expanded weight views in both scanner routes, and bound and reuse successful or failed scalar-control decoding before dimension allocation, shared condition-producer indexes, invocation-local Scan axis decoding and bounded lineage-name views, repeated graph and sibling-state traversal while excluding unreferenced function graph arguments, constant-context copying and aggregate cache-key construction after excluding shadowed and nonconstant bindings and reusing only relevant immutable attribute environments, dependency-closure work, inferred ranks, rank-only permutations, aggregate shape dimensions, and analysis-cache retention; keep inferred dimension arithmetic within signed 64-bit bounds; retain traversal-exhaustion evidence independently of model value names and invalidate Scan slices that exceed the transform budget; reuse Scan repetition proofs across sibling states, reject copying reshapes, and preserve independent weight findings and budget capacity when another view cannot be prepared.
-- Avoid incomplete ONNX weight analysis when mixed shape and activation bookkeeping fanout does not feed generated weights.
-- Preserve ONNX lineage coverage when zero-length Scan paths, overridable shape defaults, or capped rank-promotable values can hide generated weights.
-- Bound ONNX repeated-state reentry work while preserving local-function, shape, and lineage coverage.
-- Preserve caller-bound ONNX Loop conditions over body initializer defaults and reuse local-function analysis across unused attribute values.
-- Preserve early TAR findings after sparse-file probing and enforce SafeTensors JSON nesting limits consistently across Python versions.
-- Recognize SafeTensors files whose header length resembles a pickle. Preserve warnings for reachable pickle extension lookups.
-- Keep complete streamed pickle analysis available for oversized remote source URLs across Python versions, preserving SBOM findings and source associations.
-- Exclude pinned package versions, clock fields, and CSS dimensions from network findings. Report suspicious port numbers without inferring which service is running.
-- Validate retired interleaved GGUF row groups within each matrix, so incomplete groups cannot pass by combining rows across higher dimensions.
-- Send metadata YAML fallback warnings to stderr so they do not contaminate JSON output.
-- Correct SafeTensors missing-shard reports for manifest-declared zero-based single-shard files and mixed Hugging Face range and local scans. Report unverified tensor assignments separately from confirmed index mismatches.
-- Preserve metadata extraction errors with `--security-only` and display them in directory table output.
-- Recognize model shard indexes, chat templates, added-token maps, Core ML package manifests, Transformers processor configurations, ModelOpt quantization and sparse-attention configurations, and Hugging Face download tree records when reporting datasets with unspecified licenses.
-- Avoid treating ordinary license text such as `Microsoft.` as a pickle stream when its apparent opcodes have an invalid stack. Preserve valid streams with residual stack values or overwritten memo entries, nested payload detection, and completed executable prefixes with malformed trailing data.
-- Avoid routing package requirements such as `torch>=2.10.0` to the pickle scanner.
-- Recognize the remaining GGUF tensor types that ggml defines (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ4_NL, I8, I16, I32, I64, F64, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0, and Q2_0) and the retired Q4_0_4_4, Q4_0_4_8, and Q4_0_8_8 layouts that published files still use, so GGUF files that use them get tensor bounds validation instead of an inconclusive scan. Other retired and unknown type IDs remain inconclusive.
-- Reduce false injection findings from sentence punctuation, formatting instructions, and routine macro declarations in oversized GGUF chat templates. Report the matching signature and source offset alongside incomplete analysis.
-- Check GGUF block alignment per tensor row, as ggml does, so a block-quantized tensor whose first dimension is not a multiple of its block size is flagged even when its total element count is. The retired Q4_0 layouts must also hold whole groups of rows.
-- Avoid template-injection alerts for Jinja chat-template macro declarations. The scanner still checks macro defaults and bodies for injection.
-- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
-- Reject non-ASCII protocol 0 persistent IDs so bytes inside tensor storage cannot produce a nested persistent-ID finding from an invalid operand.
-- Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit. Continue supplemental stream checks after call-graph coverage gaps, and keep operational failures unsuccessful even with trusted padding.
-- Preserve detection of startup-hook writes through Click 8.5’s legacy `LazyFile` export.
-- Recognize declaration-only compiler output in legacy TorchScript ZIP archives when scanning for embedded Python code.
-- Make the nested archive test fixture portable to Windows.
+</details>
 
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
 
@@ -127,10 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Require GitPython 3.2.0 or newer in the `mlflow`, `all-ci`, and `all` extras and lockfile to fix `Remote.pull()` refspec option injection ([GHSA-f9j4-qggq-h239](https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-f9j4-qggq-h239)).
 - Require AnyIO 4.14.2 or newer in published package dependencies as well as the lockfile.
 
-### Changed
+### Upgrade notes
 
-- Include original credential values and configured debug paths in scan evidence, diagnostics, and exported reports while retaining detections and output bounds.
-- Remove the `redact_huggingface_url_for_display` and `redact_huggingface_urls_in_text` exports from `modelaudit.utils.sources.huggingface` and `huggingface_paths`. Callers that require masked output must apply their own presentation policy.
+- Scan evidence, diagnostics, and exported reports now include original credential values and configured debug paths. If you share these outputs, apply your masking policy before forwarding them.
+- Callers that imported `redact_huggingface_url_for_display` or `redact_huggingface_urls_in_text` from `modelaudit.utils.sources.huggingface` or `huggingface_paths` must replace those imports with their own display policy. The two exports were removed.
 - Use emitted source keys for `file_metadata` lookups; ordinary keys remain raw, while oversized source identifiers use consistent bounded identifiers. Previously masked keys are no longer aliases. Metadata values and per-source associations remain intact.
 - Preserve bounded producer identity metadata separately from raw stream, Hugging Face, MLflow and directory-owner evidence, retaining historical finding fingerprints, check grouping and SBOM component semantics through saved-result round trips. Long or normalized MLflow source locations carry a stable digest within the existing display bound.
 

@@ -39,3 +39,6 @@ test-reports/
 
 # Copied external projects (for analysis only)
 promptfoo/
+
+# Jinja controls the spacing of Towncrier's Markdown output.
+scripts/release-tools/template.md
