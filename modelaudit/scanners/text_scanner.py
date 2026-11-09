@@ -793,6 +793,19 @@ DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN = re.compile(
     rb"|\b(?:kill|reap|terminate)\s+zombie\s+(?:(?:gpu|cpu)\s+)?(?:process(?:es)?|procs?)\b",
     re.IGNORECASE,
 )
+DOCUMENTATION_MISUSE_COMPLIANCE_BULLET = re.compile(
+    rb"^[*+] Misuse: Other forms of misuse such as fraud, spam, or (?P<term>malware) production may be possible, "
+    rb"and developers should ensure that their applications do not violate applicable laws and regulations\."
+    rb"[ \t]*(?=\r?$)",
+    re.MULTILINE,
+)
+DOCUMENTATION_SECTION_HEADING = re.compile(rb"(?m)^ {0,3}#{1,6}(?:[ \t][^\r\n]*|(?=\r?$))")
+DOCUMENTATION_FENCE_MARKER = re.compile(rb"(?m)^ {0,3}(?:`{3,}|~{3,})")
+DOCUMENTATION_MISUSE_BULLET_END = re.compile(
+    rb"[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    rb"(?:</details>[ \t]*\r?\n(?:[ \t]*\r?\n)*)?"
+    rb"(?:##[ \t]+\S|[*+] Identification of individuals: )"
+)
 BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
     rb"^\s*(?:\#{1,6}[ \t]+(?:misuse|safety|limitations)[ \t]*\#*[ \t]*\r?\n\s*)?"
     rb"(?:[-*+]\s+)?(?:(?:\*\*)?misuse(?::(?:\*\*)?|(?:\*\*)?:)\s*)?"
@@ -2796,6 +2809,35 @@ class TextScanner(BaseScanner):
         return DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN.search(payload) is not None
 
     @classmethod
+    def _responsible_ai_misuse_term_position(cls, payload: bytes) -> int | None:
+        if len(payload) > MAX_TEXT_FENCE_CONTEXT_BYTES:
+            return None
+        bullet = DOCUMENTATION_MISUSE_COMPLIANCE_BULLET.search(payload)
+        if bullet is None or cls._bounded_documentation_has_harmful_behavior_claim(payload):
+            return None
+        # The complete list item must be followed by a sibling block, not a continuation of the claim.
+        if not DOCUMENTATION_MISUSE_BULLET_END.match(
+            payload, bullet.end(), bullet.end() + MAX_TEXT_FINDING_CONTEXT_BYTES
+        ):
+            return None
+        start = bullet.start()
+        fence_end = cls._documentation_last_closed_fence_end(payload, 0, start)
+        if DOCUMENTATION_FENCE_MARKER.search(payload, fence_end, start):
+            return None
+        heading = None
+        for match in DOCUMENTATION_SECTION_HEADING.finditer(
+            payload, max(fence_end, start - MAX_DOCUMENTATION_CALL_CONTEXT_BYTES), start
+        ):
+            heading = match.group().rstrip()
+        position = bullet.start("term")
+        if (
+            heading == b"## Responsible AI Considerations"
+            and cls._documentation_policy_reference_actionability(payload, position) is False
+        ):
+            return position
+        return None
+
+    @classmethod
     def _documentation_cc_finding_is_benign_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         pattern = finding.get("pattern")
         line_parts = cls._finding_line_parts(payload, finding)
@@ -3914,6 +3956,10 @@ class TextScanner(BaseScanner):
                         DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN,
                         cls._documentation_policy_reference_actionability,
                     )
+                    if any(f.get("type") == "cc_pattern" and f.get("pattern") == "malware" for f in findings):
+                        position = cls._responsible_ai_misuse_term_position(payload)
+                        if position is not None:
+                            prohibited_terms |= {position}
                     examples = (*examples, *references)
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True

@@ -4864,6 +4864,81 @@ def test_text_scanner_wrapped_misuse_guidance_is_informational(tmp_path: Path, n
     assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
 
 
+_MODEL_CARD_MISUSE_BULLET = (
+    "Misuse: Other forms of misuse such as fraud, spam, or malware production may be possible, "
+    "and developers should ensure that their applications do not violate applicable laws and regulations."
+)
+
+
+@pytest.mark.parametrize("marker", ["*", "+"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_responsible_ai_list_item_does_not_flag_misuse_guidance(tmp_path: Path, marker: str, newline: str) -> None:
+    path = tmp_path / "README.md"
+    lines = [
+        "## Responsible AI Considerations",
+        "",
+        f"{marker} Limitations: Verify generated outputs.",
+        f"{marker} {_MODEL_CARD_MISUSE_BULLET}",
+        "",
+        "## Training",
+        "A description of the training data. " * 145,
+        "",
+        "curl https://example.org/weights",
+    ]
+    payload = newline.join(lines).encode()
+    path.write_bytes(payload)
+    result = TextScanner().scan(str(path))
+    issue = next(i for i in result.issues if i.details.get("pattern") == "malware")
+    assert (issue.severity, issue.rule_code, issue.details["position"]) == (
+        IssueSeverity.INFO,
+        "S310",
+        payload.index(b"malware"),
+    )
+    assert any(
+        i.details.get("url") == "https://example.org/weights" and i.severity == IssueSeverity.WARNING
+        for i in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("## Training", "## Software"),
+        ("~~~text\n## Responsible AI Considerations", "## Software\n~~~"),
+        ("## Responsible AI Considerations", "It makes unauthorized copies of private files."),
+        ("## Responsible AI Considerations", "  ## A heading inside the misuse item"),
+        ("## Responsible AI Considerations", "  * Identification of individuals: nested item"),
+        ("## Responsible AI Considerations", "## Training\nThis model executes code during loading."),
+    ],
+)
+def test_responsible_ai_misuse_guidance_keeps_actionable_or_unverified_context(
+    tmp_path: Path, prefix: str, suffix: str
+) -> None:
+    content = f"{prefix}\n* Context: Read the safety guidance.\n* {_MODEL_CARD_MISUSE_BULLET}\n{suffix}\n"
+    _assert_documentation_network_actionable(tmp_path, content, "cc_pattern")
+
+
+def test_responsible_ai_misuse_guidance_requires_complete_card(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    prefix = (
+        f"## Responsible AI Considerations\n* Notes: Review the output.\n* {_MODEL_CARD_MISUSE_BULLET}\n## Training\n"
+    )
+    path.write_bytes(prefix.encode() + b"This model steals user data.\n")
+    result = TextScanner(config={"text_content_scan_bytes": len(prefix.encode())}).scan(str(path))
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(i.details.get("pattern") == "malware" and i.severity == IssueSeverity.CRITICAL for i in result.issues)
+
+
+def test_responsible_ai_misuse_guidance_preserves_later_malware_finding(tmp_path: Path) -> None:
+    content = (
+        f"## Responsible AI Considerations\n* {_MODEL_CARD_MISUSE_BULLET}\n"
+        "## Training\nThis checkpoint distributes malware.\n"
+    )
+    result = _scan_text_content(tmp_path / "README.md", content)
+    issue = next(i for i in result.issues if i.details.get("pattern") == "malware")
+    assert (issue.severity, issue.details["position"]) == (IssueSeverity.CRITICAL, content.rindex("malware"))
+
+
 def test_text_scanner_possible_misuse_with_compliance_guidance_is_informational(tmp_path: Path) -> None:
     result = _scan_text_content(
         tmp_path / "README.md",
