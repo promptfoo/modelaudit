@@ -4296,9 +4296,7 @@ class TextScanner(BaseScanner):
                         secret_findings,
                         result,
                         context=path,
-                        readme_advisories=readme_advisories
-                        and finding_limit is None
-                        and "patterns" not in (self.config.get("secrets_config") or {}),
+                        readme_advisories=readme_advisories and finding_limit is None,
                     )
                 if finding_limit is not None:
                     detector_incomplete = True

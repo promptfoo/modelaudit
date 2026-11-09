@@ -854,10 +854,14 @@ class BaseScanner(ABC):
                 "Ethereum Address",
                 "Litecoin Address",
             }:
-                if severity != IssueSeverity.INFO:
-                    severity = IssueSeverity.INFO
-                    finding = {**finding, "readme_severity_adjusted": True}
-                why = "This is a public receiving address. Spending requires the corresponding private key."
+                from modelaudit.detectors.secrets import SECRET_PATTERNS
+
+                # Custom patterns can reuse a built-in display name for different evidence.
+                if (finding.get("pattern"), secret_descriptor) in SECRET_PATTERNS:
+                    if severity != IssueSeverity.INFO:
+                        severity = IssueSeverity.INFO
+                        finding = {**finding, "readme_severity_adjusted": True}
+                    why = "This is a public receiving address. Spending requires the corresponding private key."
 
             result.add_check(
                 name="Embedded Secrets Detection",

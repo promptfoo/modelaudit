@@ -1275,6 +1275,28 @@ def test_receiving_address_as_a_password_and_seed_phrase_stay_actionable(tmp_pat
     assert determine_exit_code(aggregate) == 1
 
 
+def test_custom_secret_pattern_named_bitcoin_address_keeps_its_severity(tmp_path: Path) -> None:
+    directory = tmp_path / "token-model"
+    directory.mkdir()
+    path = directory / "README.md"
+    address = "31hb9kC72UasjkEZGKWfR4nKWsQmqGB7FA"
+    credential = "AzTySe4PqUR7QmphQnwZ"
+    content = f"Bitcoin: {address}\nfixture_credential={credential}\n"
+    path.write_text(content, encoding="utf-8")
+    custom_pattern = r"fixture_credential=(\w+)"
+    scanner = TextScanner({"secrets_config": {"patterns": [(custom_pattern, "Bitcoin Address")]}})
+
+    issues = scanner.scan(str(path)).issues
+
+    assert [(issue.details["position"], issue.severity) for issue in issues] == [
+        (content.index(address), IssueSeverity.INFO),
+        (content.index(credential), IssueSeverity.WARNING),
+    ]
+    assert issues[0].details["readme_severity_adjusted"] is True
+    assert issues[1].details["pattern"] == custom_pattern
+    assert "readme_severity_adjusted" not in issues[1].details
+
+
 @pytest.mark.parametrize(
     ("filename", "content", "token"),
     [
