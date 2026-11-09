@@ -22,6 +22,7 @@ import pytest
 import yaml
 from packaging.requirements import Requirement
 
+from tests.helpers.tar import add_tar_bytes, make_tar_link
 from tests.helpers.workflows import _jobs, _step_by_name, _workflow_triggers
 
 try:
@@ -176,6 +177,12 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     evidence = _step_by_name(steps, "Preserve Windows standalone test evidence")
     assert evidence["if"] == "always() && runner.os == 'Windows'"
     assert evidence["uses"].startswith("actions/upload-artifact@")
+    build = _step_by_name(steps, "Build standalone package")
+    output_dir = "/tmp/modelaudit-picklescan-dist"
+    primary, retry = build["run"].split("||")
+    assert shlex.split(primary, comments=True) == ["uv", "build", "--out-dir", output_dir]
+    assert shlex.split(retry) == ["uv", "build", "--offline", "--out-dir", output_dir]
+    assert not build.get("continue-on-error")
     smoke = _step_by_name(steps, "Smoke test standalone package wheel install")["run"]
     assert 'uv pip install --python "$SMOKE_PYTHON"' in smoke
     assert "/Scripts/python.exe" in smoke
@@ -308,15 +315,14 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
         == "steps.manual.outputs.manual_release != 'true' && github.event_name != 'repository_dispatch'"
     )
 
-    ensure_release_step = _step_by_name(release_steps, "Ensure manual GitHub releases exist")
-    assert ensure_release_step["if"] == (
-        "steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.root_provenance_recovery != 'true'"
-    )
-    ensure_release_run = ensure_release_step["run"]
-    assert 'gh release view "$ROOT_TAG"' in ensure_release_run
-    assert 'gh release view "$PICKLESCAN_TAG"' in ensure_release_run
-    assert 'gh release create "$ROOT_TAG"' in ensure_release_run
-    assert 'gh release create "$PICKLESCAN_TAG"' in ensure_release_run
+    publish_notes = _step_by_name(release_steps, "Publish notes from the tagged changelogs")
+    assert "root_provenance_recovery != 'true'" in publish_notes["if"]
+    notes_run = publish_notes["run"]
+    assert 'extract --package "$package" --version "$version" --ref "$source"' in notes_run
+    assert 'gh release create "$tag" --verify-tag' in notes_run
+    assert 'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"' in notes_run
+    assert 'publish_notes modelaudit "$ROOT_VERSION" v' in notes_run
+    assert 'publish_notes modelaudit-picklescan "$PICKLESCAN_VERSION" modelaudit-picklescan-v' in notes_run
 
     check_pr_step = _step_by_name(release_steps, "Check if PR exists")
     assert check_pr_step["env"] == {
@@ -599,7 +605,7 @@ def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     workflow = _load_release_workflow()
     sync_job = _jobs(workflow)["sync-release-metadata"]
     assert isinstance(sync_job, dict)
-    assert sync_job["permissions"] == {"contents": "read"}
+    assert sync_job["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert sync_job["needs"] == "release-please"
     assert sync_job["if"] == "needs.release-please.outputs.pr_branch != ''"
     assert sync_job["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
@@ -621,6 +627,7 @@ def test_release_changelogs_keep_one_unreleased_section() -> None:
 
     for changelog in changelogs:
         headings = [line for line in changelog.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
+        assert headings[0] == "## [Unreleased]"
         assert headings.count("## [Unreleased]") == 1
 
 
@@ -629,6 +636,8 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
     sync_steps = _job_steps(workflow, "sync-release-metadata")
     checkout_step = next(step for step in sync_steps if step.get("uses", "").startswith("actions/checkout@"))
     assert checkout_step["with"]["persist-credentials"] is False
+    assert _step_by_name(sync_steps, "Install uv")["with"]["enable-cache"] is False
+    assert _step_by_name(sync_steps, "Setup Node.js")["with"]["package-manager-cache"] is False
 
     source_step = _step_by_name(sync_steps, "Record release metadata source")
     assert source_step["id"] == "source"
@@ -1206,50 +1215,54 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
 
 @pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash mocks require POSIX filesystem semantics")
 @pytest.mark.parametrize(
-    ("mutation", "should_pass"),
+    ("mutation", "should_pass", "expect_comparisons"),
     [
-        ("workflow-dispatch", True),
-        ("push", True),
-        ("wrong-workflow", False),
-        ("pull-request", False),
-        ("wrong-repository", False),
-        ("wrong-head-repository", False),
-        ("wrong-default-branch", False),
-        ("invalid-head-sha", False),
-        ("run-in-progress", False),
-        ("provenance-failed", True),
-        ("run-cancelled", False),
-        ("missing-job", False),
-        ("duplicate-job", False),
-        ("job-in-progress", False),
-        ("job-failed", False),
-        ("diverged-head", False),
-        ("behind-head", False),
-        ("wrong-merge-base", False),
-        ("invalid-compare-metadata", False),
-        ("diverged-tag", False),
-        ("behind-tag", False),
-        ("wrong-tag-merge-base", False),
-        ("invalid-tag-compare-metadata", False),
-        ("diverged-source-tag", False),
-        ("behind-source-tag", False),
-        ("wrong-source-tag-merge-base", False),
-        ("allowed-renamed-source-tag-file", True),
-        ("unexpected-source-tag-file", False),
-        ("unexpected-renamed-source-tag-file", False),
-        ("unexpected-renamed-destination-tag-file", False),
-        ("invalid-renamed-source-tag-file", False),
-        ("unexpected-previous-source-tag-file", False),
-        ("invalid-source-tag-file-status", False),
-        ("too-many-source-tag-files", False),
-        ("invalid-source-tag-compare-metadata", False),
-        ("invalid-tag-sha", False),
-        ("invalid-run-id", False),
+        pytest.param(mutation, should_pass, expect_comparisons, id=f"{mutation}-{should_pass}")
+        for mutation, should_pass, expect_comparisons in [
+            ("workflow-dispatch", True, True),
+            ("push", True, True),
+            ("wrong-workflow", False, False),
+            ("pull-request", False, False),
+            ("wrong-repository", False, False),
+            ("wrong-head-repository", False, False),
+            ("wrong-default-branch", False, False),
+            ("invalid-head-sha", False, False),
+            ("run-in-progress", False, False),
+            ("provenance-failed", True, True),
+            ("run-cancelled", False, False),
+            ("missing-job", False, False),
+            ("duplicate-job", False, False),
+            ("job-in-progress", False, False),
+            ("job-failed", False, False),
+            ("diverged-head", False, True),
+            ("behind-head", False, True),
+            ("wrong-merge-base", False, True),
+            ("invalid-compare-metadata", False, True),
+            ("diverged-tag", False, True),
+            ("behind-tag", False, True),
+            ("wrong-tag-merge-base", False, True),
+            ("invalid-tag-compare-metadata", False, True),
+            ("diverged-source-tag", False, True),
+            ("behind-source-tag", False, True),
+            ("wrong-source-tag-merge-base", False, True),
+            ("allowed-renamed-source-tag-file", True, True),
+            ("unexpected-source-tag-file", False, True),
+            ("unexpected-renamed-source-tag-file", False, True),
+            ("unexpected-renamed-destination-tag-file", False, True),
+            ("invalid-renamed-source-tag-file", False, True),
+            ("unexpected-previous-source-tag-file", False, True),
+            ("invalid-source-tag-file-status", False, True),
+            ("too-many-source-tag-files", False, True),
+            ("invalid-source-tag-compare-metadata", False, True),
+            ("invalid-tag-sha", False, False),
+            ("invalid-run-id", False, False),
+        ]
     ],
 )
 def test_root_provenance_recovery_rejects_untrusted_source_runs(
     mutation: str,
     should_pass: bool,
+    expect_comparisons: bool,
     tmp_path: Path,
 ) -> None:
     workflow = _load_release_workflow()
@@ -1476,31 +1489,7 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ["api", "--paginate", "--slurp", f"repos/{repository}/actions/runs/{source_run_id}/jobs?per_page=100"],
         ["api", f"repos/{repository}"],
     ]
-    if mutation in {
-        "workflow-dispatch",
-        "push",
-        "provenance-failed",
-        "diverged-head",
-        "behind-head",
-        "wrong-merge-base",
-        "invalid-compare-metadata",
-        "diverged-tag",
-        "behind-tag",
-        "wrong-tag-merge-base",
-        "invalid-tag-compare-metadata",
-        "diverged-source-tag",
-        "behind-source-tag",
-        "wrong-source-tag-merge-base",
-        "allowed-renamed-source-tag-file",
-        "unexpected-source-tag-file",
-        "unexpected-renamed-source-tag-file",
-        "unexpected-renamed-destination-tag-file",
-        "invalid-renamed-source-tag-file",
-        "unexpected-previous-source-tag-file",
-        "invalid-source-tag-file-status",
-        "too-many-source-tag-files",
-        "invalid-source-tag-compare-metadata",
-    }:
+    if expect_comparisons:
         expected_calls.append(["api", f"repos/{repository}/compare/{source_head_sha}...main"])
         expected_calls.append(["api", f"repos/{repository}/compare/{tag_commit_sha}...main"])
         expected_calls.append(["api", f"repos/{repository}/compare/{tag_commit_sha}...{source_head_sha}"])
@@ -1513,69 +1502,73 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
 
 
 @pytest.mark.parametrize(
-    ("mutation", "should_pass"),
+    ("mutation", "should_pass", "expected_error"),
     [
-        ("valid", True),
-        ("directory-sdist-member", True),
-        ("invalid-version", False),
-        ("wrong-tag-version", False),
-        ("invalid-tag-toml", False),
-        ("invalid-tag-utf8", False),
-        ("missing-tag-project", False),
-        ("invalid-tag-project", False),
-        ("missing-dist-directory", False),
-        ("unreadable-dist-directory", False),
-        ("missing-local", False),
-        ("extra-local", False),
-        ("wrong-pypi-version", False),
-        ("pypi-error", False),
-        ("invalid-pypi-json", False),
-        ("oversized-pypi-metadata", False),
-        ("invalid-pypi-metadata", False),
-        ("invalid-pypi-info", False),
-        ("invalid-pypi-urls", False),
-        ("invalid-pypi-entry", False),
-        ("invalid-pypi-filename", False),
-        ("missing-pypi-file", False),
-        ("yanked", False),
-        ("invalid-pypi-digests", False),
-        ("invalid-digest", False),
-        ("hash-mismatch", False),
-        ("lock-mismatch", False),
-        ("pyproject-mismatch", False),
-        ("missing-sdist-metadata", False),
-        ("duplicate-sdist-metadata", False),
-        ("linked-sdist-metadata", False),
-        ("oversized-sdist-metadata", False),
-        ("traversal-sdist-metadata-alias", False),
-        ("symlink-sdist-metadata-alias", False),
-        ("hardlink-sdist-member", False),
-        ("absolute-sdist-member", False),
-        ("drive-sdist-member", False),
-        ("backslash-sdist-member", False),
-        ("dot-sdist-member", False),
-        ("empty-segment-sdist-directory", False),
-        ("case-sdist-metadata-alias", False),
-        ("trailing-dot-sdist-metadata-alias", False),
-        ("trailing-space-sdist-directory-alias", False),
-        ("ads-sdist-member", False),
-        ("special-sdist-member", False),
-        ("oversized-sdist-member", False),
-        ("too-many-sdist-members", False),
-        ("duplicate-nonmetadata", False),
-        ("case-alias-nonmetadata", False),
-        ("case-alias-directory", False),
-        ("unicode-alias-nonmetadata", False),
-        ("unicode-casefold-alias-nonmetadata", False),
-        ("file-before-child", False),
-        ("child-before-file", False),
-        ("unicode-file-before-child", False),
-        ("unicode-child-before-file", False),
+        pytest.param(mutation, should_pass, expected_error, id=f"{mutation}-{should_pass}")
+        for mutation, should_pass, expected_error in [
+            ("valid", True, None),
+            ("directory-sdist-member", True, None),
+            ("invalid-version", False, None),
+            ("wrong-tag-version", False, None),
+            ("invalid-tag-toml", False, "Could not parse tagged root pyproject.toml"),
+            ("invalid-tag-utf8", False, "Could not parse tagged root pyproject.toml"),
+            ("missing-tag-project", False, "Tagged root pyproject.toml has no valid [project] table"),
+            ("invalid-tag-project", False, "Tagged root pyproject.toml has no valid [project] table"),
+            ("missing-dist-directory", False, "Could not inspect recovered root artifacts"),
+            ("unreadable-dist-directory", False, "Could not inspect recovered root artifacts"),
+            ("missing-local", False, None),
+            ("extra-local", False, None),
+            ("wrong-pypi-version", False, None),
+            ("pypi-error", False, "Could not verify PyPI metadata"),
+            ("invalid-pypi-json", False, "Could not verify PyPI metadata"),
+            ("oversized-pypi-metadata", False, "PyPI metadata for modelaudit 0.2.50 exceeds 10485760 bytes"),
+            ("invalid-pypi-metadata", False, "PyPI returned invalid modelaudit metadata"),
+            ("invalid-pypi-info", False, "PyPI returned invalid modelaudit metadata"),
+            ("invalid-pypi-urls", False, "PyPI returned an invalid artifact list"),
+            ("invalid-pypi-entry", False, "PyPI returned an invalid artifact list"),
+            ("invalid-pypi-filename", False, "PyPI returned an invalid artifact list"),
+            ("missing-pypi-file", False, None),
+            ("yanked", False, None),
+            ("invalid-pypi-digests", False, "PyPI did not return valid digests"),
+            ("invalid-digest", False, None),
+            ("hash-mismatch", False, None),
+            ("lock-mismatch", False, None),
+            ("pyproject-mismatch", False, None),
+            ("missing-sdist-metadata", False, None),
+            ("duplicate-sdist-metadata", False, None),
+            ("linked-sdist-metadata", False, None),
+            ("oversized-sdist-metadata", False, None),
+            ("traversal-sdist-metadata-alias", False, "contains an unsafe member path"),
+            ("symlink-sdist-metadata-alias", False, "contains a linked member"),
+            ("hardlink-sdist-member", False, "contains a linked member"),
+            ("absolute-sdist-member", False, "contains an unsafe member path"),
+            ("drive-sdist-member", False, "contains an unsafe member path"),
+            ("backslash-sdist-member", False, "contains an unsafe member path"),
+            ("dot-sdist-member", False, "contains an unsafe member path"),
+            ("empty-segment-sdist-directory", False, "contains an unsafe member path"),
+            ("case-sdist-metadata-alias", False, "contains a metadata path alias"),
+            ("trailing-dot-sdist-metadata-alias", False, "contains an unsafe member path"),
+            ("trailing-space-sdist-directory-alias", False, "contains an unsafe member path"),
+            ("ads-sdist-member", False, "contains an unsafe member path"),
+            ("special-sdist-member", False, "contains a non-file member"),
+            ("oversized-sdist-member", False, "member has an unsafe size"),
+            ("too-many-sdist-members", False, "exceeds 10000 members"),
+            ("duplicate-nonmetadata", False, "contains a duplicate or case-normalized path"),
+            ("case-alias-nonmetadata", False, "contains a duplicate or case-normalized path"),
+            ("case-alias-directory", False, "contains a duplicate or case-normalized path"),
+            ("unicode-alias-nonmetadata", False, "contains a duplicate or case-normalized path"),
+            ("unicode-casefold-alias-nonmetadata", False, "contains a duplicate or case-normalized path"),
+            ("file-before-child", False, "contains a file/directory path conflict"),
+            ("child-before-file", False, "contains a file/directory path conflict"),
+            ("unicode-file-before-child", False, "contains a file/directory path conflict"),
+            ("unicode-child-before-file", False, "contains a file/directory path conflict"),
+        ]
     ],
 )
 def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
     mutation: str,
     should_pass: bool,
+    expected_error: str | None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1622,51 +1615,30 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
 
     with tarfile.open(dist_path / sdist_name, "w:gz") as archive:
         for member_name, content in metadata_contents.items():
-            member = tarfile.TarInfo(member_name)
-            member.size = len(content)
-            archive.addfile(member, io.BytesIO(content))
+            add_tar_bytes(archive, member_name, content)
         if mutation == "duplicate-sdist-metadata":
-            duplicate = tarfile.TarInfo(f"modelaudit-{version}/uv.lock")
-            duplicate.size = len(lock_content)
-            archive.addfile(duplicate, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version}/uv.lock", lock_content)
         elif mutation == "linked-sdist-metadata":
-            link = tarfile.TarInfo(f"modelaudit-{version}/uv.lock")
-            link.type = tarfile.SYMTYPE
-            link.linkname = f"modelaudit-{version}/pyproject.toml"
-            archive.addfile(link)
+            archive.addfile(
+                make_tar_link(f"modelaudit-{version}/uv.lock", f"modelaudit-{version}/pyproject.toml", tarfile.SYMTYPE)
+            )
         elif mutation == "traversal-sdist-metadata-alias":
-            alias = tarfile.TarInfo(f"modelaudit-{version}/sub/../uv.lock")
-            alias.size = len(lock_content)
-            archive.addfile(alias, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version}/sub/../uv.lock", lock_content)
         elif mutation == "symlink-sdist-metadata-alias":
-            link = tarfile.TarInfo(f"modelaudit-{version}/sub")
-            link.type = tarfile.SYMTYPE
-            link.linkname = "."
-            archive.addfile(link)
-            alias = tarfile.TarInfo(f"modelaudit-{version}/sub/uv.lock")
-            alias.size = len(lock_content)
-            archive.addfile(alias, io.BytesIO(lock_content))
+            archive.addfile(make_tar_link(f"modelaudit-{version}/sub", ".", tarfile.SYMTYPE))
+            add_tar_bytes(archive, f"modelaudit-{version}/sub/uv.lock", lock_content)
         elif mutation == "hardlink-sdist-member":
-            link = tarfile.TarInfo(f"modelaudit-{version}/other.lock")
-            link.type = tarfile.LNKTYPE
-            link.linkname = f"modelaudit-{version}/uv.lock"
-            archive.addfile(link)
+            archive.addfile(
+                make_tar_link(f"modelaudit-{version}/other.lock", f"modelaudit-{version}/uv.lock", tarfile.LNKTYPE)
+            )
         elif mutation == "absolute-sdist-member":
-            member = tarfile.TarInfo(f"/modelaudit-{version}/other.lock")
-            member.size = len(lock_content)
-            archive.addfile(member, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"/modelaudit-{version}/other.lock", lock_content)
         elif mutation == "drive-sdist-member":
-            member = tarfile.TarInfo(f"C:/modelaudit-{version}/other.lock")
-            member.size = len(lock_content)
-            archive.addfile(member, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"C:/modelaudit-{version}/other.lock", lock_content)
         elif mutation == "backslash-sdist-member":
-            member = tarfile.TarInfo(f"modelaudit-{version}\\other.lock")
-            member.size = len(lock_content)
-            archive.addfile(member, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version}\\other.lock", lock_content)
         elif mutation == "dot-sdist-member":
-            member = tarfile.TarInfo(f"modelaudit-{version}/./other.lock")
-            member.size = len(lock_content)
-            archive.addfile(member, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version}/./other.lock", lock_content)
         elif mutation == "directory-sdist-member":
             directory = tarfile.TarInfo(f"modelaudit-{version}/modelaudit/")
             directory.type = tarfile.DIRTYPE
@@ -1676,30 +1648,20 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             directory.type = tarfile.DIRTYPE
             archive.addfile(directory)
         elif mutation == "case-sdist-metadata-alias":
-            alias = tarfile.TarInfo(f"modelaudit-{version}/UV.LOCK")
-            alias.size = len(lock_content)
-            archive.addfile(alias, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version}/UV.LOCK", lock_content)
         elif mutation == "trailing-dot-sdist-metadata-alias":
-            alias = tarfile.TarInfo(f"modelaudit-{version}/uv.lock.")
-            alias.size = len(lock_content)
-            archive.addfile(alias, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version}/uv.lock.", lock_content)
         elif mutation == "trailing-space-sdist-directory-alias":
-            alias = tarfile.TarInfo(f"modelaudit-{version} /uv.lock")
-            alias.size = len(lock_content)
-            archive.addfile(alias, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version} /uv.lock", lock_content)
         elif mutation == "ads-sdist-member":
-            member = tarfile.TarInfo(f"modelaudit-{version}/uv.lock:stream")
-            member.size = len(lock_content)
-            archive.addfile(member, io.BytesIO(lock_content))
+            add_tar_bytes(archive, f"modelaudit-{version}/uv.lock:stream", lock_content)
         elif mutation == "special-sdist-member":
             member = tarfile.TarInfo(f"modelaudit-{version}/device")
             member.type = tarfile.CHRTYPE
             archive.addfile(member)
         elif mutation == "oversized-sdist-member":
             content = b"0" * (16 * 1024 * 1024 + 1)
-            member = tarfile.TarInfo(f"modelaudit-{version}/large.bin")
-            member.size = len(content)
-            archive.addfile(member, io.BytesIO(content))
+            add_tar_bytes(archive, f"modelaudit-{version}/large.bin", content)
         elif mutation == "too-many-sdist-members":
             for index in range(10_000):
                 archive.addfile(tarfile.TarInfo(f"modelaudit-{version}/extra-{index}"))
@@ -1720,9 +1682,7 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
                 first_name = f"modelaudit-{version}/modelaudit/S\u0301.py"
                 second_name = f"modelaudit-{version}/modelaudit/\u017f\u0301.py"
             for member_name, content in ((first_name, b"safe"), (second_name, b"replaced")):
-                member = tarfile.TarInfo(member_name)
-                member.size = len(content)
-                archive.addfile(member, io.BytesIO(content))
+                add_tar_bytes(archive, member_name, content)
         elif mutation == "case-alias-directory":
             for member_name in (
                 f"modelaudit-{version}/modelaudit/package",
@@ -1746,9 +1706,7 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             if mutation in {"child-before-file", "unicode-child-before-file"}:
                 entries.reverse()
             for member_name, content in entries:
-                member = tarfile.TarInfo(member_name)
-                member.size = len(content)
-                archive.addfile(member, io.BytesIO(content))
+                add_tar_bytes(archive, member_name, content)
 
     contents = {filename: (dist_path / filename).read_bytes() for filename in (wheel_name, sdist_name)}
 
@@ -1836,46 +1794,5 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
     else:
         with pytest.raises(SystemExit) as error:
             exec(compile(script, "root-provenance-recovery-step", "exec"), {})
-        expected_errors = {
-            "invalid-tag-toml": "Could not parse tagged root pyproject.toml",
-            "invalid-tag-utf8": "Could not parse tagged root pyproject.toml",
-            "missing-tag-project": "Tagged root pyproject.toml has no valid [project] table",
-            "invalid-tag-project": "Tagged root pyproject.toml has no valid [project] table",
-            "traversal-sdist-metadata-alias": "contains an unsafe member path",
-            "missing-dist-directory": "Could not inspect recovered root artifacts",
-            "unreadable-dist-directory": "Could not inspect recovered root artifacts",
-            "pypi-error": "Could not verify PyPI metadata",
-            "invalid-pypi-json": "Could not verify PyPI metadata",
-            "oversized-pypi-metadata": "PyPI metadata for modelaudit 0.2.50 exceeds 10485760 bytes",
-            "invalid-pypi-metadata": "PyPI returned invalid modelaudit metadata",
-            "invalid-pypi-info": "PyPI returned invalid modelaudit metadata",
-            "invalid-pypi-urls": "PyPI returned an invalid artifact list",
-            "invalid-pypi-entry": "PyPI returned an invalid artifact list",
-            "invalid-pypi-filename": "PyPI returned an invalid artifact list",
-            "invalid-pypi-digests": "PyPI did not return valid digests",
-            "symlink-sdist-metadata-alias": "contains a linked member",
-            "hardlink-sdist-member": "contains a linked member",
-            "absolute-sdist-member": "contains an unsafe member path",
-            "drive-sdist-member": "contains an unsafe member path",
-            "backslash-sdist-member": "contains an unsafe member path",
-            "dot-sdist-member": "contains an unsafe member path",
-            "empty-segment-sdist-directory": "contains an unsafe member path",
-            "case-sdist-metadata-alias": "contains a metadata path alias",
-            "trailing-dot-sdist-metadata-alias": "contains an unsafe member path",
-            "trailing-space-sdist-directory-alias": "contains an unsafe member path",
-            "ads-sdist-member": "contains an unsafe member path",
-            "special-sdist-member": "contains a non-file member",
-            "oversized-sdist-member": "member has an unsafe size",
-            "too-many-sdist-members": "exceeds 10000 members",
-            "duplicate-nonmetadata": "contains a duplicate or case-normalized path",
-            "case-alias-nonmetadata": "contains a duplicate or case-normalized path",
-            "case-alias-directory": "contains a duplicate or case-normalized path",
-            "unicode-alias-nonmetadata": "contains a duplicate or case-normalized path",
-            "unicode-casefold-alias-nonmetadata": "contains a duplicate or case-normalized path",
-            "file-before-child": "contains a file/directory path conflict",
-            "child-before-file": "contains a file/directory path conflict",
-            "unicode-file-before-child": "contains a file/directory path conflict",
-            "unicode-child-before-file": "contains a file/directory path conflict",
-        }
-        if mutation in expected_errors:
-            assert expected_errors[mutation] in str(error.value)
+        if expected_error is not None:
+            assert expected_error in str(error.value)
