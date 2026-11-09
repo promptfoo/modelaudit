@@ -4235,6 +4235,7 @@ class TextScanner(BaseScanner):
                     path,
                     raise_on_error=True,
                     max_findings=max_findings,
+                    complete_input=not truncated and inspected_bytes == file_size,
                 )
                 secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
                 secret_findings, passive_finding_limit = self._downgrade_sidecar_secret_findings(
