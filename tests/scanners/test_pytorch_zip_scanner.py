@@ -67,7 +67,7 @@ from modelaudit.utils.repository_context import (
 from tests.cache_lifecycle import IsolatedCacheManager
 from tests.helpers import create_mock_pytorch_zip
 from tests.helpers.cache import private_actionable_failed_checks as _private_actionable_failed_checks
-from tests.helpers.file_creators import EvalPayload
+from tests.helpers.file_creators import EvalPayload, legacy_pytorch_container_from_object_stream
 from tests.helpers.file_creators import (
     pickle_binunicode as _pickle_binunicode,
 )
@@ -13899,6 +13899,47 @@ def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path
 
 
 # These archives predate __buffers__ and FORMAT_WITH_STRING_TABLE.
+def test_torchscript_module_keeps_unrelated_private_finding_with_same_rule(tmp_path: Path) -> None:
+    from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
+
+    members = _legacy_torchscript_archive_members(1)
+    path = tmp_path / "module.ot"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in members.items():
+            archive.writestr(name, payload)
+
+    embedded = ScanResult(scanner_name="pickle")
+    embedded.metadata.update(
+        pickle_verdict="suspicious",
+        nested_opcode_counts={},
+        follow_on_opcode_counts={},
+        pickle_coverage={"raw_scan_complete": True, "opcode_scan_complete": True},
+    )
+    embedded._record_private_failed_check(
+        ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+        name="Standalone Pickle Finding",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        severity=IssueSeverity.CRITICAL,
+    )
+    embedded.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Imported class",
+        severity=IssueSeverity.WARNING,
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={"import_reference": "__torch__.Module", "position": 2, "invoked": True, "opcode": "GLOBAL"},
+    )
+    with zipfile.ZipFile(path) as archive:
+        PyTorchZipScanner()._bind_legacy_torchscript_root(
+            archive, archive.getinfo("model/data.pkl"), "model/data.pkl", embedded, members["model/data.pkl"]
+        )
+    assert embedded.checks[0].status == CheckStatus.PASSED
+    assert embedded._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] == [
+        {"name": "Standalone Pickle Finding", "rule_code": "NON_ALLOWLISTED_GLOBAL", "severity": "critical"}
+    ]
+    assert embedded.metadata["pickle_verdict"] == "suspicious"
+
+
 _LEGACY_TORCHSCRIPT_DECLARATION = (
     b'class Module(Module):\n  __parameters__ = ["weight", "bias", ]\n  __annotations__ = []\n'
     b'  __annotations__["weight"] = Tensor\n  __annotations__["bias"] = Tensor\n'
@@ -25266,3 +25307,580 @@ def test_pytorch_zip_storage_reference_honors_class_parser_override() -> None:
     assert RejectStorageScanner._storage_ref_from_protocol0_persid_text(text, {"0"}) is None
     assert RejectStorageScanner()._storage_ref_from_protocol0_persid_text(text, {"0"}) is None
     assert observed_sizes == ["1", "1"]
+
+
+def _legacy_torchscript_archive_members(version: int) -> dict[str, bytes]:
+    control = _legacy_torchscript_v1_tensor_state(foreign_second_id=False)
+    if version == 2:
+        # Version 2 dropped the trailing view field from each storage persistent ID.
+        control = control.replace(b"K\x08NtQ", b"K\x08tQ")
+    declaration = (b"op_version_set = 1\n" if version == 1 else b"") + _LEGACY_TORCHSCRIPT_DECLARATION
+    return {
+        "model/version": f"{version}\n".encode(),
+        "model/data.pkl": control,
+        "model/constants.pkl": b"\x80\x02).",
+        "model/code/__torch__.py": declaration,
+        "model/code/__torch__.py.debug_pkl": _LEGACY_TORCHSCRIPT_DEBUG,
+        "model/data/0": bytes(32),
+        "model/data/1": bytes(32),
+    }
+
+
+def _write_legacy_torchscript_archive(path: Path, members: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+
+def _legacy_torchscript_module_checks(result: ScanResult) -> list[Check]:
+    return [
+        check
+        for check in result.checks
+        if check.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+        and check.details.get("import_reference") == "__torch__.Module"
+        and check.details.get("position") == 2
+    ]
+
+
+@pytest.fixture
+def unresolved_torchscript_imports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    _force_framework_metadata_unresolved(monkeypatch)
+    for name in ("torch", "torch._utils"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        yield
+    finally:
+        _clear_source_sensitive_caches()
+
+
+def _legacy_torchscript_native_checks(result: ScanResult, member: str) -> list[Check]:
+    return [
+        check
+        for check in result.checks
+        if check.details.get("pickle_filename") == member
+        and check.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+        and check.details.get("source_backed_import_initialization_untrusted") is True
+        and check.details.get("import_reference") in {"torch._utils._rebuild_tensor_v2", "torch.FloatStorage"}
+    ]
+
+
+@pytest.mark.usefixtures("unresolved_torchscript_imports")
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_torchscript_module_reference_is_bound_only_in_the_root_control(tmp_path: Path, version: int) -> None:
+    path = tmp_path / "generated.ot"
+    members = _legacy_torchscript_archive_members(version)
+    _write_legacy_torchscript_archive(path, members)
+    result = PyTorchZipScanner().scan(str(path))
+
+    mixed_path = tmp_path / "mixed.ot"
+    _write_legacy_torchscript_archive(
+        mixed_path,
+        {
+            **members,
+            "model/other.pkl": members["model/data.pkl"],
+            "model/sidecar.py": b"import os\nos.system('id')\n",
+            "model/bytecode.pkl": b"\x80\x02" + _metadata_reduce_payload("builtins", "eval", b"1+1") + b".",
+        },
+    )
+    mixed = PyTorchZipScanner().scan(str(mixed_path))
+    assert any(
+        check.name == "Python Code File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "model/sidecar.py"
+        for check in mixed.checks
+    )
+    assert any(
+        issue.details.get("pickle_filename") == "model/bytecode.pkl"
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("import_reference") == "builtins.eval"
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in mixed.issues
+    )
+    assert {
+        (check.details["pickle_filename"], check.status, check.severity)
+        for check in _legacy_torchscript_module_checks(result)
+    } == {("model/data.pkl", CheckStatus.PASSED, IssueSeverity.INFO)}
+    assert {
+        (check.details["pickle_filename"], check.status, check.severity)
+        for check in _legacy_torchscript_module_checks(mixed)
+    } == {
+        ("model/data.pkl", CheckStatus.FAILED, IssueSeverity.WARNING),
+        ("model/other.pkl", CheckStatus.FAILED, IssueSeverity.WARNING),
+    }
+    # The ordinary PID descriptor proof already handles version 2 storage imports.
+    native_globals = {"torch._utils _rebuild_tensor_v2"}
+    if version == 1:
+        native_globals.add("torch FloatStorage")
+    native_positions = {
+        (arg.replace(" ", "."), pos)
+        for opcode, arg, pos in pickletools.genops(members["model/data.pkl"])
+        if opcode.name == "GLOBAL" and arg in native_globals
+    }
+    assert len(native_positions) == 2 * len(native_globals)
+    for scanned, member, status, severity in (
+        (result, "model/data.pkl", CheckStatus.PASSED, IssueSeverity.INFO),
+        (mixed, "model/data.pkl", CheckStatus.FAILED, IssueSeverity.WARNING),
+        (mixed, "model/other.pkl", CheckStatus.FAILED, IssueSeverity.WARNING),
+    ):
+        assert {
+            (check.details["import_reference"], check.details["position"], check.status, check.severity)
+            for check in _legacy_torchscript_native_checks(scanned, member)
+        } == {(reference, position, status, severity) for reference, position in native_positions}
+    expected_positions = {("__torch__.Module", 2), *native_positions}
+    for scanned, warning_members in ((result, ()), (mixed, ("model/data.pkl", "model/other.pkl"))):
+        assert {
+            (issue.details["pickle_filename"], issue.details.get("import_reference"), issue.details.get("position"))
+            for issue in scanned.issues
+            if issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+            and (issue.details.get("import_reference"), issue.details.get("position")) in expected_positions
+        } == {(name, reference, position) for name in warning_members for reference, position in expected_positions}
+    assert any(
+        issue.details.get("pickle_filename") == "model/data.pkl"
+        and issue.details.get("import_reference") == "collections.OrderedDict"
+        and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
+
+    standalone = tmp_path / "standalone.pkl"
+    standalone.write_bytes(members["model/data.pkl"])
+    standalone_result = scan_model_directory_or_file(str(standalone), cache_enabled=False)
+    assert expected_positions <= {
+        (issue.details.get("import_reference"), issue.details.get("position"))
+        for issue in standalone_result.issues
+        if issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL" and issue.severity == IssueSeverity.WARNING
+    }
+
+
+@pytest.mark.usefixtures("unresolved_torchscript_imports")
+@pytest.mark.parametrize(
+    ("member", "replacement"),
+    [
+        ("model/version", b"3\n"),
+        ("model/constants.pkl", None),
+        ("model/constants.pkl", b"\x80\x02N."),
+        ("model/code/__torch__.py.debug_pkl", _LEGACY_TORCHSCRIPT_DEBUG + b"."),
+        # The source is a valid passive declaration, but the control omits one of its parameters.
+        (
+            "model/code/__torch__.py",
+            _LEGACY_TORCHSCRIPT_DECLARATION.replace(b'"bias", ]', b'"bias", "offset", ]')
+            + b'  __annotations__["offset"] = Tensor\n',
+        ),
+        (
+            "model/code/__torch__.py",
+            _LEGACY_TORCHSCRIPT_DECLARATION + b"  def __setstate__(self, state):\n    return state\n",
+        ),
+    ],
+)
+def test_legacy_torchscript_module_reference_requires_inert_companions(
+    tmp_path: Path, member: str, replacement: bytes | None
+) -> None:
+    path = tmp_path / "near-match.ot"
+    members = _legacy_torchscript_archive_members(2)
+    if replacement is None:
+        del members[member]
+    else:
+        members[member] = replacement
+    _write_legacy_torchscript_archive(path, members)
+
+    result = PyTorchZipScanner().scan(str(path))
+    assert [check.status for check in _legacy_torchscript_module_checks(result)] == [CheckStatus.FAILED]
+    native_checks = _legacy_torchscript_native_checks(result, "model/data.pkl")
+    assert native_checks and all(check.status == CheckStatus.FAILED for check in native_checks)
+
+
+@pytest.mark.usefixtures("unresolved_torchscript_imports")
+@pytest.mark.parametrize("member", ["model/data.pkl", "model/code/__torch__.py", "model/constants.pkl"])
+def test_legacy_torchscript_module_reference_requires_unique_members(tmp_path: Path, member: str) -> None:
+    path = tmp_path / "duplicate.ot"
+    members = _legacy_torchscript_archive_members(2)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr(member, members[member])
+
+    result = PyTorchZipScanner().scan(str(path))
+    checks = _legacy_torchscript_module_checks(result)
+    assert checks and all(check.status == CheckStatus.FAILED for check in checks)
+    native_checks = _legacy_torchscript_native_checks(result, "model/data.pkl")
+    assert native_checks and all(check.status == CheckStatus.FAILED for check in native_checks)
+
+
+def test_legacy_torchscript_module_reference_preserves_an_independent_reducer(tmp_path: Path) -> None:
+    path = tmp_path / "active-state.ot"
+    members = _legacy_torchscript_archive_members(2)
+    control = members["model/data.pkl"]
+    # Preserve the declared tensor state and the root BUILD, but execute a reducer before BUILD.
+    state_end = control.rindex(b"ub")
+    members["model/data.pkl"] = (
+        control[:state_end] + b"u" + _metadata_reduce_payload("posix", "system") + b"0" + control[state_end + 1 :]
+    )
+    _write_legacy_torchscript_archive(path, members)
+
+    result = PyTorchZipScanner().scan(str(path))
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_filename") == "model/data.pkl"
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("associated_global") == "posix.system"
+        for issue in result.issues
+    )
+
+
+def test_legacy_torchscript_module_reference_rejects_forged_constants_extent(tmp_path: Path) -> None:
+    path = tmp_path / "forged-constants.ot"
+    members = _legacy_torchscript_archive_members(2)
+    name = "model/constants.pkl"
+    canonical_constants = members[name]
+    members[name] += b"cbuiltins\neval\n."
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member, data in members.items():
+            archive.writestr(member, data)
+        entry = archive.getinfo(name)
+        entry.file_size = len(canonical_constants)
+        entry.CRC = zlib.crc32(canonical_constants)
+    with path.open("r+b") as stream:
+        stream.seek(entry.header_offset + 14)
+        stream.write(struct.pack("<III", entry.CRC, entry.compress_size, entry.file_size))
+    with zipfile.ZipFile(path) as archive:
+        assert archive.read(name) == canonical_constants
+
+    result = PyTorchZipScanner().scan(str(path))
+    assert [check.status for check in _legacy_torchscript_module_checks(result)] == [CheckStatus.FAILED]
+
+
+@pytest.mark.parametrize(
+    ("canonical", "near_match"),
+    [
+        (b"q\x00)\x81", b"q\x05)\x81"),
+        (b"ubq\x01.", b"u0q\x01."),
+        (b"ubq\x01.", b"uh\x00)R0bq\x01."),
+        (b"ubq\x01.", b"uNq\x000bq\x01."),
+        (_pickle_binunicode(b"weight"), _pickle_binunicode(b"height")),
+        (_pickle_binunicode(b"bias"), _pickle_binunicode(b"weight")),
+        (b"ubq\x01.", b"ubq\x01.N."),
+    ],
+    ids=[
+        "different-class-memo",
+        "missing-build",
+        "second-invocation-via-class-memo",
+        "rebound-class-memo",
+        "undeclared-tensor-state-key",
+        "duplicate-state-key-omits-declared-bias",
+        "trailing-stream",
+    ],
+)
+def test_legacy_torchscript_module_reference_requires_the_generated_control(
+    tmp_path: Path, canonical: bytes, near_match: bytes
+) -> None:
+    path = tmp_path / "different-control.ot"
+    members = _legacy_torchscript_archive_members(2)
+    assert members["model/data.pkl"].count(canonical) == 1
+    members["model/data.pkl"] = members["model/data.pkl"].replace(canonical, near_match)
+    _write_legacy_torchscript_archive(path, members)
+
+    result = PyTorchZipScanner().scan(str(path))
+    assert [check.status for check in _legacy_torchscript_module_checks(result)] == [CheckStatus.FAILED]
+
+
+@pytest.mark.usefixtures("unresolved_torchscript_imports")
+def test_legacy_torchscript_storage_alias_keeps_its_own_warning(tmp_path: Path) -> None:
+    path = tmp_path / "foreign-storage.ot"
+    members = _legacy_torchscript_archive_members(1)
+    members["model/data.pkl"] = members["model/data.pkl"].replace(
+        _pickle_global("torch", "FloatStorage"), _pickle_global("torch.storage", "FloatStorage"), 1
+    )
+    _write_legacy_torchscript_archive(path, members)
+
+    result = PyTorchZipScanner().scan(str(path))
+    assert any(
+        issue.details.get("pickle_filename") == "model/data.pkl"
+        and issue.details.get("import_reference") == "torch.storage.FloatStorage"
+        and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
+
+
+@pytest.mark.usefixtures("unresolved_torchscript_imports")
+def test_legacy_torchscript_zip_after_legacy_checkpoint_keeps_python_import_warnings(tmp_path: Path) -> None:
+    path = tmp_path / "prefixed.ot"
+    _write_legacy_torchscript_archive(path, _legacy_torchscript_archive_members(1))
+    checkpoint, _ = legacy_pytorch_container_from_object_stream(b"", pickle.dumps(None, protocol=2), storage_keys=())
+    path.write_bytes(checkpoint + path.read_bytes())
+
+    result = PyTorchZipScanner().scan(str(path))
+    assert [check.status for check in _legacy_torchscript_module_checks(result)] == [CheckStatus.FAILED]
+    native_checks = _legacy_torchscript_native_checks(result, "model/data.pkl")
+    assert len(native_checks) == 4
+    assert all(
+        check.status == CheckStatus.FAILED and check.severity == IssueSeverity.WARNING for check in native_checks
+    )
+
+
+def test_legacy_torchscript_module_without_package_proof_keeps_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from modelaudit_picklescan import api as picklescan_api
+
+    monkeypatch.delattr(picklescan_api, "_declared_torchscript_global_positions", raising=False)
+    path = tmp_path / "older-picklescan.ot"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in _legacy_torchscript_archive_members(1).items():
+            archive.writestr(name, payload)
+    result = PyTorchZipScanner().scan(str(path))
+    assert any(
+        check.status == CheckStatus.FAILED and check.severity == IssueSeverity.WARNING
+        for check in _legacy_torchscript_module_checks(result)
+    )
+
+
+@pytest.fixture
+def installed_torch_storage_constructor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from modelaudit_picklescan import call_graph
+
+    package = tmp_path / "torch"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "import importlib\n"
+        "def get_default_dtype(name):\n"
+        "    return importlib.import_module(name)\n"
+        "class FloatStorage:\n"
+        "    def __init__(self, *args, name='math'):\n"
+        "        get_default_dtype(name)\n",
+        encoding="utf-8",
+    )
+    # A Python unpickler using this installed reducer would call the storage class.
+    (package / "_utils.py").write_text(
+        "from torch import FloatStorage\ndef _rebuild_tensor_v2(*args):\n    return FloatStorage(*args)\n",
+        encoding="utf-8",
+    )
+    dist = tmp_path / "torch-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text("Name: torch\nVersion: 1.0\n", encoding="utf-8")
+    (dist / "RECORD").write_text("torch/__init__.py,,\ntorch/_utils.py,,\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        call_graph, "_TRUSTED_SITE_PACKAGE_PATHS", (*call_graph._TRUSTED_SITE_PACKAGE_PATHS, tmp_path.resolve())
+    )
+    for name in ("__torch__", "torch", "torch._utils", "torch.storage"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        yield
+    finally:
+        _clear_source_sensitive_caches()
+
+
+def _torch_storage_graph_checks(result: ScanResult, member: str) -> list[Check]:
+    return [
+        check
+        for check in result.checks
+        if check.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
+        and check.details.get("import_reference") == "torch.FloatStorage"
+        and check.details.get("pickle_filename") == member
+    ]
+
+
+@pytest.mark.usefixtures("installed_torch_storage_constructor")
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_torchscript_storage_graph_is_conditional_only_for_native_control(tmp_path: Path, version: int) -> None:
+    members = _legacy_torchscript_archive_members(version)
+    control = members["model/data.pkl"]
+    path = tmp_path / "generated.ot"
+    _write_legacy_torchscript_archive(path, members)
+
+    raw = picklescan_api.scan_bytes(control, source="data.pkl")
+    expected_path = ("torch.FloatStorage.__init__", "torch.get_default_dtype", "importlib.import_module")
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.severity.value == "critical"
+        and finding.details.get("import_reference") == "torch.FloatStorage"
+        and finding.details.get("call_path") == expected_path
+        for finding in raw.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.severity.value == "critical"
+        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        and finding.details.get("opcode") == "REDUCE"
+        and finding.details.get("call_path") == ("torch._utils._rebuild_tensor_v2", *expected_path)
+        for finding in raw.findings
+    )
+    assert "torch" not in sys.modules
+    result = PyTorchZipScanner().scan(str(path))
+    (native,) = _torch_storage_graph_checks(result, "model/data.pkl")
+    assert (native.status, native.severity) == (CheckStatus.PASSED, IssueSeverity.INFO)
+
+    mixed_path = tmp_path / "with-sibling.ot"
+    _write_legacy_torchscript_archive(mixed_path, {**members, "model/other.pkl": control})
+    mixed = PyTorchZipScanner().scan(str(mixed_path))
+    for member in ("model/data.pkl", "model/other.pkl"):
+        (unbound,) = _torch_storage_graph_checks(mixed, member)
+        assert (unbound.status, unbound.severity) == (CheckStatus.FAILED, IssueSeverity.CRITICAL)
+        assert tuple(unbound.details["call_path"]) == expected_path
+    assert native.details["opcode"] == "GLOBAL"
+    assert native.details["sink"] == "importlib.import_module"
+    assert tuple(native.details["call_path"]) == expected_path
+    assert native.details["torchscript_native_resolution"] is True
+    assert native.details["pytorch_storage_type_operand"] is True
+    assert native.details["torchscript_declaration"] == "model/code/__torch__.py"
+    assert "storage type" in native.message.lower()
+    assert "conditional" in native.message
+    assert native.why and "without invoking its Python constructor" in native.why
+    for scanned, actionable_members in ((result, ()), (mixed, ("model/data.pkl", "model/other.pkl"))):
+        assert {
+            issue.details["pickle_filename"]
+            for issue in scanned.issues
+            if issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
+            and issue.details.get("import_reference") == "torch.FloatStorage"
+            and issue.severity == IssueSeverity.CRITICAL
+        } == set(actionable_members)
+
+
+@pytest.mark.usefixtures("installed_torch_storage_constructor")
+@pytest.mark.parametrize("case", ["storage-size", "declaration-alias", "memoized-constructor", "foreign-reducer"])
+def test_legacy_torchscript_storage_graph_stays_critical_without_native_proof(tmp_path: Path, case: str) -> None:
+    members = _legacy_torchscript_archive_members(1)
+    if case == "storage-size":
+        members["model/data/1"] = bytes(31)
+    elif case == "declaration-alias":
+        members["model/CODE/__TORCH__.py"] = members["model/code/__torch__.py"]
+    elif case == "memoized-constructor":
+        storage = _pickle_global("torch", "FloatStorage")
+        control = members["model/data.pkl"].replace(storage, storage + b"q\x07", 1)
+        members["model/data.pkl"] = control[:-1] + b"0h\x07)R."
+    else:
+        evaluate_dict = _pickle_global("builtins", "eval") + _pickle_binunicode(b"{}") + b"\x85R"
+        members["model/data.pkl"] = members["model/data.pkl"].replace(
+            _pytorch_empty_ordered_dict_reduce_expr(), evaluate_dict, 1
+        )
+    path = tmp_path / "unproven.ot"
+    _write_legacy_torchscript_archive(path, members)
+    result = PyTorchZipScanner().scan(str(path))
+
+    (graph,) = _torch_storage_graph_checks(result, "model/data.pkl")
+    assert (graph.status, graph.severity) == (CheckStatus.FAILED, IssueSeverity.CRITICAL)
+    assert graph.details["opcode"] == ("REDUCE" if case == "memoized-constructor" else "GLOBAL")
+    assert any(
+        issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
+        and issue.details.get("import_reference") == "torch.FloatStorage"
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+    if case == "foreign-reducer":
+        assert any(
+            issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+            and issue.details.get("import_reference") == "builtins.eval"
+            and issue.severity == IssueSeverity.CRITICAL
+            for issue in result.issues
+        )
+
+
+@pytest.mark.usefixtures("installed_torch_storage_constructor")
+@pytest.mark.parametrize("same_offset", [False, True], ids=["different-offset", "same-offset"])
+def test_legacy_torchscript_storage_graph_stays_critical_with_nested_constructor(
+    tmp_path: Path, same_offset: bool
+) -> None:
+    members = _legacy_torchscript_archive_members(1)
+    control = members["model/data.pkl"]
+    storage = _pickle_global("torch", "FloatStorage")
+    offset = control.index(storage) if same_offset else 2
+    nested = b"\x80\x02" + b"N0" * ((offset - 2) // 2) + storage + b")R."
+    assert nested.index(storage) == offset
+    members["model/data.pkl"] = control[:-1] + _pickle_binunicode(base64.b64encode(nested)) + b"0."
+    path = tmp_path / "nested-constructor.ot"
+    _write_legacy_torchscript_archive(path, members)
+
+    result = PyTorchZipScanner().scan(str(path))
+    assert any(
+        issue.rule_code == "S601"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_filename") == "model/data.pkl"
+        and issue.details.get("encoding") == "base64"
+        and issue.details.get("nested_has_execution_opcode") is True
+        for issue in result.issues
+    )
+    assert {check.status for check in _legacy_torchscript_module_checks(result)} == {CheckStatus.FAILED}
+    assert {(check.status, check.severity) for check in _torch_storage_graph_checks(result, "model/data.pkl")} == {
+        (CheckStatus.FAILED, IssueSeverity.CRITICAL)
+    }
+    assert any(
+        issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
+        and issue.details.get("pickle_filename") == "model/data.pkl"
+        and issue.details.get("import_reference") == "torch.FloatStorage"
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("zip64,valid", [(False, False), (True, True), (True, False)])
+def test_torchscript_native_directory_counts_must_match_the_visible_marker(
+    tmp_path: Path, zip64: bool, valid: bool
+) -> None:
+    path = tmp_path / "archive.ot"
+    members = _legacy_torchscript_archive_members(1)
+    constants = members.pop("model/constants.pkl")
+    members["model/constants.pkl"] = constants
+    _write_legacy_torchscript_archive(path, members)
+    raw = path.read_bytes()
+    footer = bytearray(raw[-22:])
+    assert footer[:4] == b"PK\x05\x06"
+    count, length, offset = struct.unpack_from("<HII", footer, 10)
+    assert count == len(members)
+    native_count = count if valid else count - 1
+    if zip64:
+        record_offset = len(raw) - 22
+        record = struct.pack("<4sQ2H2I4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, native_count, native_count, length, offset)
+        locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, record_offset, 1)
+        path.write_bytes(raw[:-22] + record + locator + footer)
+    else:
+        struct.pack_into("<HH", footer, 8, native_count, native_count)
+        path.write_bytes(raw[:-22] + footer)
+    with zipfile.ZipFile(path) as archive:
+        assert archive.namelist()[-1] == "model/constants.pkl"
+    result = PyTorchZipScanner().scan(str(path))
+    if valid:
+        assert any(check.status == CheckStatus.PASSED for check in _legacy_torchscript_module_checks(result))
+    else:
+        assert result.success is False
+        assert any(issue.rule_code == "S902" and "ZIP entry count mismatch" in issue.message for issue in result.issues)
+        assert not any(check.details.get("torchscript_declaration") for check in result.checks)
+
+
+def test_torchscript_native_names_must_fit_the_loader_record_list(tmp_path: Path) -> None:
+    path = tmp_path / "long-root.ot"
+    root = "a" * 500
+    members = {root + n[len("model") :]: data for n, data in _legacy_torchscript_archive_members(1).items()}
+    _write_legacy_torchscript_archive(path, members)
+    with zipfile.ZipFile(path) as archive:
+        assert root + "/constants.pkl" in archive.namelist()
+    with zipfile.ZipFile(path) as archive:
+        scanner = PyTorchZipScanner()
+        from modelaudit_picklescan import api as picklescan_api
+
+        info = archive.getinfo(root + "/data.pkl")
+        assert not scanner._legacy_torchscript_global_positions(
+            archive,
+            info,
+            root + "/code/__torch__.py",
+            members[info.filename],
+            picklescan_api._declared_torchscript_global_positions,
+        )
+
+
+@pytest.mark.parametrize("override", [".DATA/VERSION", "MODEL.JSON", "BYTECODE.PKL"])
+def test_torchscript_native_format_selectors_keep_pickle_findings(tmp_path: Path, override: str) -> None:
+    path = tmp_path / "alternate.ot"
+    members = _legacy_torchscript_archive_members(1)
+    members["model/" + override] = {".DATA/VERSION": b"3\n", "MODEL.JSON": b"{}", "BYTECODE.PKL": b"\x80\x02)."}[
+        override
+    ]
+    _write_legacy_torchscript_archive(path, members)
+    result = PyTorchZipScanner().scan(str(path))
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "__torch__.Module"
+        and issue.details.get("position") == 2
+        for issue in result.issues
+    )

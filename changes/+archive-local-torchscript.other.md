@@ -1,0 +1,1 @@
+ModelAudit distinguishes native TorchScript module and tensor reconstruction from Python imports after verifying the archive’s declaration and tensor state. A storage constructor’s installed call graph is reported as conditional in this context. Standalone pickles and unverified archives retain their security findings.

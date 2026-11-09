@@ -292,7 +292,9 @@ class BaseScanner(ABC):
                     (
                         index
                         for index, candidate in enumerate(unmatched_entries)
-                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
+                        if entry.get("name") == candidate["name"]
+                        and entry.get("rule_code") == candidate["rule_code"]
+                        and ("severity" not in candidate or entry.get("severity") == candidate["severity"])
                     ),
                     None,
                 )

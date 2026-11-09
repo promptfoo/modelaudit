@@ -3789,6 +3789,47 @@ def _pytorch_storage_keys_from_pickle_bytes(
     )
 
 
+def _declared_torchscript_global_positions(
+    data: bytes,
+    parameters: frozenset[str],
+    storage_member_sizes: Mapping[str, int],
+    *,
+    archive_version: int,
+    max_opcodes: int,
+    deadline: float,
+) -> frozenset[int]:
+    """Return loader-bound GLOBAL offsets for the complete declared protocol-2 tensor state."""
+    if (
+        archive_version not in {1, 2}
+        or not parameters
+        or not data.startswith(b"\x80\x02c__torch__\nModule\nq\x00)\x81}(")
+    ):
+        return frozenset()
+    parsed = _parse_single_pytorch_storage_stream(
+        data,
+        opcode_budget_remaining=None,
+        max_opcodes=min(max_opcodes, _PYTORCH_STORAGE_TRUST_MAX_OPCODES),
+        large_pid_provenance_remaining=[_PYTORCH_LARGE_STORAGE_PID_MAX_PROVENANCE_NODES],
+        legacy_module=True,
+        declared_parameters=parameters,
+        version_two_module=archive_version == 2,
+        deadline=deadline,
+        position_offset=0,
+    )
+    if (
+        not parsed.canonical_tensor_rebuild_invocations
+        or _trusted_pytorch_storage_member_sizes(parsed, storage_member_sizes) is None
+    ):
+        return frozenset()
+    return frozenset(
+        {
+            2,
+            *parsed.storage_global_positions,
+            *(position for position, _ in parsed.canonical_tensor_rebuild_invocations),
+        }
+    )
+
+
 def _parse_single_pytorch_storage_stream(
     pickle_data: bytes,
     *,
@@ -3796,6 +3837,8 @@ def _parse_single_pytorch_storage_stream(
     max_opcodes: int,
     large_pid_provenance_remaining: list[int] | None = None,
     legacy_module: bool = False,
+    declared_parameters: frozenset[str] | None = None,
+    version_two_module: bool = False,
     deadline: float | None,
     position_offset: int,
 ) -> _PytorchStorageReferenceParse:
@@ -4082,7 +4125,8 @@ def _parse_single_pytorch_storage_stream(
         if location is None:
             return None
         # PyTorch's v1 JIT writer appends a literal NONE for view metadata.
-        if len(pid) != (6 if legacy_module else 5) or (legacy_module and pid[5] is not literal_none):
+        has_view_field = legacy_module and not version_two_module
+        if len(pid) != (6 if has_view_field else 5) or (has_view_field and pid[5] is not literal_none):
             return storage_key
         storage_size = pid[4]
         if (
@@ -4166,6 +4210,16 @@ def _parse_single_pytorch_storage_stream(
             opcode_name = opcode.name
             if opcode_name in {"PROTO", "FRAME"}:
                 continue
+            if (
+                declared_parameters is not None
+                and position > 23
+                and (
+                    opcode_name in {"NEWOBJ", "NEWOBJ_EX"}
+                    or (opcode_name in {"GET", "PUT", "BINGET", "BINPUT", "LONG_BINGET", "LONG_BINPUT"} and arg == 0)
+                )
+            ):
+                # Reusing or replacing the root class memo would make its first GLOBAL ambiguous.
+                return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
             if opcode_name == "STOP":
                 if legacy_module and (len(stack) != 1 or stack[0] is not legacy_built):
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
@@ -4478,6 +4532,7 @@ def _parse_single_pytorch_storage_stream(
                         or obj is not legacy_instance
                         or type(state) is not _PytorchDictionaryState
                         or not state
+                        or (declared_parameters is not None and state.keys() != declared_parameters)
                         or not all(type(k) is str and v is canonical_tensor for k, v in state.items())
                     ):
                         return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
