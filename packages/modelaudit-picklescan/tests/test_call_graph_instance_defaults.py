@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -183,7 +184,9 @@ def _assert_botocore_process_provider_rce(tmp_path: Path) -> None:
     assert marker.read_text() == marker_content
 
 
-def _run_botocore_process_provider_check(tmp_path: Path, *, warm_parent: bool = False) -> None:
+def _run_process_provider_check(
+    tmp_path: Path, check: Callable[[Path], None], *, warm_module: str | None = None
+) -> None:
     test_file = Path(__file__).resolve()
     package = test_file.parents[1]
     script = (
@@ -192,49 +195,46 @@ def _run_botocore_process_provider_check(tmp_path: Path, *, warm_parent: bool = 
         f"sys.path[:0] = {[str(package / 'src'), str(test_file.parent)]!r}\n"
         f"namespace = runpy.run_path({str(test_file)!r})\n"
     )
-    if warm_parent:
-        script += (
-            "import botocore.credentials\n"
-            "assert 'botocore.credentials' in sys.modules\n"
-            "namespace['test_scan_bytes_blocks_botocore_process_provider_rce'](Path(sys.argv[1]))\n"
-        )
+    if warm_module is None:
+        # The CLEAN controls exercise cold imports; already-loaded callable defaults can be suspicious.
+        script += "assert 'botocore.credentials' not in sys.modules and 'aiobotocore.credentials' not in sys.modules\n"
     else:
         script += (
-            "assert 'botocore.credentials' not in sys.modules\n"
-            "namespace['_assert_botocore_process_provider_rce'](Path(sys.argv[1]))\n"
+            "from importlib import import_module\n"
+            f"import_module({warm_module!r})\n"
+            f"assert {warm_module!r} in sys.modules\n"
         )
+    script += f"namespace[{check.__name__!r}](Path(sys.argv[1]))\n"
     result = subprocess.run(
         [sys.executable, "-I", "-B", "-c", script, str(tmp_path)],
         cwd=tmp_path,
         check=False,
         capture_output=True,
         text=True,
-        timeout=120 if warm_parent else 90,
+        timeout=120 if warm_module else 90,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
 def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None:
-    # The CLEAN control needs cold import state; loaded callable defaults remain conservative.
-    _run_botocore_process_provider_check(tmp_path)
+    _run_process_provider_check(tmp_path, _assert_botocore_process_provider_rce)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
 def test_botocore_process_provider_check_isolates_warm_parent(tmp_path: Path) -> None:
-    _run_botocore_process_provider_check(tmp_path, warm_parent=True)
+    _run_process_provider_check(
+        tmp_path, test_scan_bytes_blocks_botocore_process_provider_rce, warm_module="botocore.credentials"
+    )
 
 
-@pytest.mark.skipif(find_spec("aiobotocore") is None, reason="aiobotocore is unavailable")
-@pytest.mark.skipif(find_spec("anyio") is None, reason="anyio is unavailable")
-@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
-def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None:
+def _assert_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None:
     marker = tmp_path / "aiobotocore_anyio_backend_rce_marker"
     control_payload = b"\x80\x04" + _aiobotocore_process_provider_operand() + b"."
     payload, marker_content = _aiobotocore_anyio_backend_rce_payload(marker)
 
     control_report = scan_bytes(control_payload, source="aiobotocore-process-provider-control.pkl")
-    assert control_report.verdict == SafetyVerdict.CLEAN
+    assert control_report.verdict == SafetyVerdict.CLEAN, control_report.to_dict()
 
     assert not marker.exists()
     pickle.loads(control_payload)
@@ -251,6 +251,22 @@ def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None
 
     assert not marker.exists()
     _assert_pickle_payload_executes_in_subprocess(payload, marker, marker_content, tmp_path)
+
+
+@pytest.mark.skipif(find_spec("aiobotocore") is None, reason="aiobotocore is unavailable")
+@pytest.mark.skipif(find_spec("anyio") is None, reason="anyio is unavailable")
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None:
+    _run_process_provider_check(tmp_path, _assert_aiobotocore_anyio_backend_rce)
+
+
+@pytest.mark.skipif(find_spec("aiobotocore") is None, reason="aiobotocore is unavailable")
+@pytest.mark.skipif(find_spec("anyio") is None, reason="anyio is unavailable")
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_aiobotocore_process_provider_check_isolates_warm_parent(tmp_path: Path) -> None:
+    _run_process_provider_check(
+        tmp_path, test_scan_bytes_blocks_aiobotocore_anyio_backend_rce, warm_module="aiobotocore.credentials"
+    )
 
 
 def _process_provider_operand(*, module_name: str, class_name: str) -> bytes:
