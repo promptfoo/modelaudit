@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -332,10 +333,46 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
         "RETRY_BRANCH": "${{ github.event.client_payload.pr_branch || '' }}",
     }
     check_pr_run = check_pr_step["run"]
-    assert '"$RETRY_BRANCH" == "release-please--branches--main"' in check_pr_run
-    assert 'gh pr view "$RETRY_BRANCH" --repo "$GITHUB_REPOSITORY" --json state,headRefName' in check_pr_run
-    assert '"$OPEN_BRANCH" != "$RETRY_BRANCH"' in check_pr_run
-    assert "Refusing release metadata retry for an unexpected branch." in check_pr_run
+    assert '"$branch" != "release-please--branches--main"' in check_pr_run
+    assert ".headRefName == $branch" in check_pr_run
+    assert '.state == "OPEN" and .baseRefName == "main" and .isCrossRepository == false' in check_pr_run
+    assert "Refusing release metadata for an unexpected branch." in check_pr_run
+
+
+@pytest.mark.skipif(os.name == "nt" or shutil.which("jq") is None, reason="Release PR admission uses Bash and jq")
+@pytest.mark.parametrize("event", ["release", "retry"])
+def test_release_metadata_requires_open_same_repo_release_branch(tmp_path: Path, event: str) -> None:
+    branch = "release-please--branches--main"
+    head = "1" * 40
+    steps = _job_steps(_load_release_workflow(), "release-please")
+    shell = _step_by_name(steps, "Check if PR exists")["run"]
+    gh = tmp_path / "gh"
+    gh.write_text('#!/bin/sh\ncat "$MOCK_PR"\n')
+    gh.chmod(0o755)
+    pr = {"number": 7, "state": "OPEN", "baseRefName": "main", "headRefName": branch, "headRefOid": head}
+    output = tmp_path / "output"
+    env = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "MOCK_PR": str(tmp_path / "pr.json"),
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_REPOSITORY": "example/modelaudit",
+        "PR_OUTPUT": json.dumps({"headBranchName": branch}) if event == "release" else "",
+        "RETRY_EVENT": "release-metadata-retry" if event == "retry" else "",
+        "RETRY_BRANCH": branch,
+    }
+    for override in (
+        {"state": "CLOSED"},
+        {"headRefName": "other"},
+        {"baseRefName": "other"},
+        {"isCrossRepository": True},
+    ):
+        (tmp_path / "pr.json").write_text(json.dumps({**pr, "isCrossRepository": False, **override}))
+        assert subprocess.run(["bash", "-c", shell], env=env, capture_output=True).returncode != 0
+        assert not output.exists()
+    (tmp_path / "pr.json").write_text(json.dumps({**pr, "isCrossRepository": False}))
+    subprocess.run(["bash", "-c", shell], env=env, capture_output=True, check=True)
+    assert output.read_text().splitlines() == [f"pr_branch={branch}", "pr_number=7", f"pr_head={head}"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash execution requires POSIX filesystem semantics")
@@ -635,13 +672,15 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
     workflow = _load_release_workflow()
     sync_steps = _job_steps(workflow, "sync-release-metadata")
     checkout_step = next(step for step in sync_steps if step.get("uses", "").startswith("actions/checkout@"))
-    assert checkout_step["with"]["persist-credentials"] is False
+    assert checkout_step["with"] == {"ref": "refs/heads/main", "fetch-depth": 0, "persist-credentials": False}
     assert _step_by_name(sync_steps, "Install uv")["with"]["enable-cache"] is False
     assert _step_by_name(sync_steps, "Setup Node.js")["with"]["package-manager-cache"] is False
 
-    source_step = _step_by_name(sync_steps, "Record release metadata source")
+    source_step = _step_by_name(sync_steps, "Prepare release metadata inputs")
     assert source_step["id"] == "source"
-    assert 'echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"' in source_step["run"]
+    assert source_step["env"] == {"EXPECTED_HEAD": "${{ needs.release-please.outputs.pr_head }}"}
+    assert sync_steps.index(source_step) < sync_steps.index(_step_by_name(sync_steps, "Install uv"))
+    assert 'echo "sha=$head" >> "$GITHUB_OUTPUT"' in source_step["run"]
 
     for name in (
         "Sync uv.lock with pyproject.toml",
@@ -666,19 +705,19 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
 
     push_job = _jobs(workflow)["push-release-metadata"]
     assert isinstance(push_job, dict)
-    assert push_job["permissions"] == {"contents": "write"}
+    assert push_job["permissions"] == {"contents": "write", "pull-requests": "read"}
     assert push_job["needs"] == ["release-please", "sync-release-metadata"]
     assert push_job["if"] == "needs.release-please.outputs.pr_branch != ''"
     push_steps = _job_steps(workflow, "push-release-metadata")
     push_checkout = next(step for step in push_steps if step.get("uses", "").startswith("actions/checkout@"))
-    assert push_checkout["with"]["persist-credentials"] is False
+    assert push_checkout == checkout_step
 
     download_step = _step_by_name(push_steps, "Download release metadata")
     assert download_step["id"] == "download-metadata"
     assert download_step["continue-on-error"] is True
     assert download_step["with"] == {
         "name": "modelaudit-release-metadata-${{ github.run_attempt }}",
-        "path": "/tmp/modelaudit-release-metadata",
+        "path": "${{ runner.temp }}/modelaudit-release-metadata",
     }
 
     retry_step = _step_by_name(push_steps, "Regenerate missing release metadata")
@@ -704,13 +743,12 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
     assert push_step["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "PR_BRANCH": "${{ needs.release-please.outputs.pr_branch }}",
+        "PR_NUMBER": "${{ needs.release-please.outputs.pr_number }}",
         "EXPECTED_HEAD": "${{ needs.sync-release-metadata.outputs.source_sha }}",
     }
-    assert '"$(git rev-parse HEAD)" != "$EXPECTED_HEAD"' in push_step["run"]
-    assert (
-        'git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${PR_BRANCH}"'
-        in (push_step["run"])
-    )
+    assert 'git read-tree "$EXPECTED_HEAD"' in push_step["run"]
+    assert 'git commit-tree "$tree" -p "$EXPECTED_HEAD"' in push_step["run"]
+    assert 'git push --force-with-lease="$ref:$EXPECTED_HEAD"' in push_step["run"]
 
 
 def _picklescan_release_filenames(version: str) -> tuple[str, ...]:
