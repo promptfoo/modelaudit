@@ -1,11 +1,13 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import ast
+import codecs
 import hashlib
 import io
 import keyword
 import os
 import re
+import stat
 import token
 import tokenize
 from array import array
@@ -13,7 +15,7 @@ from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from functools import lru_cache
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
@@ -25,6 +27,7 @@ from modelaudit.detectors.network_comm import (
 from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from modelaudit.scanners._archive_config import EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
@@ -59,6 +62,7 @@ DOCUMENTATION_TEXT_FILENAMES = frozenset(
         "readme.txt",
     }
 )
+_BINARY_CONTROL_BYTE = re.compile(rb"[\x00-\x08\x0b\x0e-\x1f\x7f]")
 DOCUMENTATION_IMAGE_EXAMPLE_TOKENS: dict[tuple[str, str], bytes] = {
     ("network_function", "urlopen"): b"urlopen",
     ("network_library", "urllib"): b"from urllib",
@@ -901,6 +905,37 @@ class TextScanner(BaseScanner):
         return filename == "readme" or (
             filename.startswith("readme.") and os.path.splitext(filename)[1].lower() in cls.supported_extensions
         )
+
+    @classmethod
+    def _is_regular_readme(cls, path: str, source: BinaryIO) -> bool:
+        filename = os.path.basename(path).lower()
+        if not cls._is_readme_documentation_filename(filename) or filename.endswith(".env"):
+            return False
+        try:
+            entry = os.lstat(path)
+            return (
+                stat.S_ISREG(entry.st_mode)
+                and not (entry.st_mode & 0o111)
+                and os.path.samestat(entry, os.fstat(source.fileno()))
+            )
+        except OSError:
+            return False
+
+    @staticmethod
+    def _is_readme_text(payload: bytes) -> bool:
+        if payload.startswith((b"#!", codecs.BOM_UTF8 + b"#!")) or _BINARY_CONTROL_BYTE.search(payload):
+            return False
+        if not payload.isascii():
+            # Validate the already-read bytes without allocating a second full-size document.
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            view = memoryview(payload)
+            try:
+                for start in range(0, len(view), 64 * 1024):
+                    decoder.decode(view[start : start + 64 * 1024])
+                decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                return False
+        return True
 
     @classmethod
     def _is_model_card_documentation_filename(cls, filename: str) -> bool:
@@ -3911,6 +3946,10 @@ class TextScanner(BaseScanner):
             severity = cls._highest_documentation_network_severity([entry[1] for entry in entries])
             if str(representative.get("severity", "WARNING")).upper() != severity:
                 representative = {**representative, "severity": severity}
+            if any(entry[1].get("contains_credentials") for entry in entries):
+                representative = {**representative, "contains_credentials": True}
+            elif any(entry[1].get("url_credential_check_incomplete") for entry in entries):
+                representative = {**representative, "url_credential_check_incomplete": True}
             related_findings = [
                 cls._documentation_network_related_finding(related)
                 for related_index, related, _evidence in entries
@@ -4205,6 +4244,9 @@ class TextScanner(BaseScanner):
         try:
             with open(path, "rb") as file_obj:
                 payload = file_obj.read(read_limit + 1)
+                regular_readme = self.config.get(
+                    EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
+                ) != path and self._is_regular_readme(path, file_obj)
         except OSError as error:
             self._mark_content_security_scan_incomplete(
                 result,
@@ -4225,6 +4267,12 @@ class TextScanner(BaseScanner):
             result.metadata["text_content_sha256"] = hashlib.sha256(payload).hexdigest()
         inspected_payload = payload[:read_limit]
         inspected_bytes = len(inspected_payload)
+        readme_advisories = (
+            regular_readme
+            and not truncated
+            and inspected_bytes == file_size
+            and self._is_readme_text(inspected_payload)
+        )
         _DOCUMENTATION_QUOTE_WINDOWS.set((inspected_payload, {}))
 
         detector_incomplete = False
@@ -4247,7 +4295,12 @@ class TextScanner(BaseScanner):
                 if finding_limit is None:
                     finding_limit = passive_finding_limit
                 if secret_findings or not truncated:
-                    self.add_embedded_secret_findings(secret_findings, result, context=path)
+                    self.add_embedded_secret_findings(
+                        secret_findings,
+                        result,
+                        context=path,
+                        readme_advisories=readme_advisories and finding_limit is None,
+                    )
                 if finding_limit is not None:
                     detector_incomplete = True
                     self._mark_content_security_scan_incomplete(
@@ -4302,7 +4355,12 @@ class TextScanner(BaseScanner):
                     network_findings,
                 )
                 if network_findings or not truncated:
-                    self.add_network_communication_findings(network_findings, result, context=path)
+                    self.add_network_communication_findings(
+                        network_findings,
+                        result,
+                        context=path,
+                        readme_advisories=readme_advisories and not detector_incomplete and finding_limit is None,
+                    )
                 if classification_incomplete:
                     detector_incomplete = True
                     classification_limits = {

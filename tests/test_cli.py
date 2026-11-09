@@ -677,6 +677,29 @@ def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_pat
     assert invocation["properties"]["filesScanned"] == 0
 
 
+def test_readme_network_examples_are_notes_in_json_and_sarif(tmp_path: Path) -> None:
+    readme = tmp_path / "README.en.md"
+    readme.write_text(
+        "# Loading an image\n\n```python\nfrom urllib.request import urlopen\n"
+        'image = urlopen("https://models.example.invalid/sample.png")\n```\n',
+        encoding="utf-8",
+    )
+    args = ["scan", str(readme), "--no-cache", "--no-triage", "--format"]
+    json_result = _run_cli_subprocess([*args, "json"])
+    assert json_result.returncode == 0, json_result.stderr
+    issues = json.loads(json_result.stdout)["issues"]
+    calls = [issue for issue in issues if issue["rule_code"] == "S302"]
+    assert calls and all(issue["severity"] == "info" for issue in calls)
+    assert any(issue["details"]["severity"] == "HIGH" for issue in calls)
+
+    sarif_result = _run_cli_subprocess([*args, "sarif"])
+    assert sarif_result.returncode == 0, sarif_result.stderr
+    run = json.loads(sarif_result.stdout)["runs"][0]
+    signal = [item for item in run["results"] if item["ruleId"] == "S302"]
+    assert signal and all(item["level"] == "note" for item in signal)
+    assert run["invocations"][0]["exitCode"] == 0
+
+
 def test_scan_sarif_subprocess_preserves_modelaudit_rule_codes() -> None:
     """SARIF rule identifiers should match ModelAudit rule codes from JSON output."""
     model_file = Path("tests/assets/samples/pickles/malicious_system_call.pkl").resolve()

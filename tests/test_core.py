@@ -15666,6 +15666,35 @@ def _warm_read_failure_cache(
     return result
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX execute permissions")
+def test_cached_readme_scans_follow_execute_bit_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    directory = tmp_path / "model"
+    directory.mkdir()
+    readme = directory / "README.md"
+    # Exceed the cache's independent 10 KiB cutoff for small Markdown files.
+    readme.write_bytes(
+        b"Model documentation.\n" * 512 + b'import requests\nrequests.get("https://models.example.invalid/image.png")\n'
+    )
+    readme.chmod(0o644)
+    mtime = readme.stat().st_mtime_ns
+    cache_dir = tmp_path / "cache"
+
+    with IsolatedCacheManager(reset_cache_manager):
+        seeded = _warm_read_failure_cache(monkeypatch, readme, cache_dir)
+        assert {i.severity for i in seeded.issues if i.rule_code == "S302"} == {IssueSeverity.INFO}
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        for mode, expected, exit_code in [(0o755, IssueSeverity.CRITICAL, 1), (0o644, IssueSeverity.INFO, 0)]:
+            readme.chmod(mode)
+            assert readme.stat().st_mtime_ns == mtime
+            for target in (readme, directory):
+                result = scan_model_directory_or_file(
+                    str(target), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                )
+                assert {i.severity for i in result.issues if i.rule_code == "S302"} == {expected}
+                assert determine_exit_code(result) == exit_code
+
+
 def _install_cached_read_failure(monkeypatch: pytest.MonkeyPatch, model_path: Path, filename: str, reason: str) -> None:
     real_open = open
 
@@ -17316,3 +17345,95 @@ def test_large_onnx_weight_hash_proof_uses_validated_snapshot_name(
     assert result_after_change is None
     fallback = core_module.scan_file(str(source), {"cache_enabled": False})
     assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in fallback.checks)
+
+
+def test_readme_url_credentials_remain_actionable_next_to_a_public_link(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(
+        "# Resources\n\n"
+        "[Public file](https://docs.example.invalid/download)\n"
+        "[Private file](https://docs.example.invalid/download?api_key=fixture-token)\n",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(path), {"cache_scan_results": False})
+    urls = [issue for issue in result.issues if issue.details.get("type") == "url_detected"]
+    assert len(urls) == 2
+    public, private = sorted(urls, key=lambda issue: issue.details["position"])
+    assert public.severity == IssueSeverity.INFO
+    assert not public.details.get("contains_credentials")
+    assert private.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    assert private.details["contains_credentials"] is True
+
+
+@pytest.mark.parametrize("input_role", ["localized", "dotenv", "script", "binary", "execute_bit", "symlink"])
+def test_readme_network_severity_depends_on_file_role(tmp_path: Path, input_role: str) -> None:
+    from modelaudit.scanners.text_scanner import TextScanner
+
+    body = b'from urllib.request import urlopen\nimage = urlopen("https://models.example.invalid/sample.png")\n'
+    path = tmp_path / ("README.env" if input_role == "dotenv" else "README.en.md")
+    if input_role == "script":
+        body = b"#!/usr/bin/env python3\n" + body
+    elif input_role == "binary":
+        body += b"\x00"
+    if input_role == "symlink":
+        target = tmp_path / "example.py"
+        target.write_bytes(body)
+        try:
+            path.symlink_to(target)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    else:
+        path.write_bytes(body)
+    if input_role == "execute_bit":
+        if os.name == "nt":
+            pytest.skip("POSIX execute bits required")
+        path.chmod(0o755)
+
+    result = TextScanner().scan(str(path))
+    calls = [issue for issue in result.issues if issue.rule_code == "S302"]
+    assert calls
+    assert any(issue.details["severity"] == "HIGH" for issue in calls)
+    if input_role == "localized":
+        assert all(issue.severity == IssueSeverity.INFO for issue in calls)
+    else:
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in calls)
+
+
+def test_readme_in_archives_uses_each_members_own_execute_bits(tmp_path: Path) -> None:
+    payload = b'import requests\nrequests.get("https://models.example.invalid/image.png")\n'
+    nested = io.BytesIO()
+    with tarfile.open(fileobj=nested, mode="w") as tar:
+        for name, mode in [("bin/README.md", 0o755), ("docs/README.md", 0o644)]:
+            member = tarfile.TarInfo(name)
+            member.mode = mode
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+    path = tmp_path / "model.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, system, mode, body in [
+            ("nested.tar", 3, 0o755, nested.getvalue()),
+            ("bin/README.md", 3, 0o755, payload),
+            ("docs/README.md", 3, 0o644, payload),
+            ("dos/README.md", 0, 0o755, payload),
+        ]:
+            info = zipfile.ZipInfo(name)
+            info.create_system = system
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            archive.writestr(info, body)
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+    for member_path, expected in [
+        ("nested.tar:bin/README.md", IssueSeverity.CRITICAL),
+        ("nested.tar:docs/README.md", IssueSeverity.INFO),
+        ("bin/README.md", IssueSeverity.CRITICAL),
+        ("docs/README.md", IssueSeverity.INFO),
+        ("dos/README.md", IssueSeverity.INFO),
+    ]:
+        severities = {
+            issue.severity
+            for issue in result.issues
+            if issue.rule_code == "S302" and issue.location == f"{path}:{member_path}"
+        }
+        assert severities == {expected}, member_path

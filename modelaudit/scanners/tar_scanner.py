@@ -31,6 +31,7 @@ from ..utils.file.detection import (
     is_declared_text_content_filename,
 )
 from ..utils.helpers.assets import asset_from_scan_result
+from ._archive_config import EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
@@ -2375,6 +2376,8 @@ class TarScanner(BaseScanner):
                                     nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
                                     nested_config.pop(TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY, None)
                                     nested_config.pop(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
+                                    if member.mode & 0o111:
+                                        nested_config[EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY] = tmp_path
                                     nested_config["cache_enabled"] = False
                                     nested_config["_archive_depth"] = depth + 1
                                     file_result = self._scan_nested_archive_entry(tmp_path, nested_config)

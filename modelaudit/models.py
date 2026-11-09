@@ -10,7 +10,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
-from .finding_identity import finding_identity
+from .finding_identity import finding_identity, readme_adjusted_occurrence
 from .scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
     Check,
@@ -837,13 +837,17 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         self.failed_checks = sum(1 for c in security_checks if c.status == CheckStatus.FAILED)
 
     def deduplicate_issues(self) -> None:
-        """Remove duplicate issues based on message, severity, and location."""
+        """Remove duplicate issues while preserving individually located README findings with adjusted severity."""
         seen_issues = set()
         deduplicated_issues = []
         for issue in self.issues:
-            # Include location in the deduplication key to avoid hiding issues in different files
             identity = finding_identity(issue)
-            issue_key = (identity.message, identity.severity, identity.location or "")
+            issue_key = (
+                identity.message,
+                identity.severity,
+                identity.location or "",
+                readme_adjusted_occurrence(identity.details),
+            )
             if issue_key not in seen_issues:
                 seen_issues.add(issue_key)
                 deduplicated_issues.append(issue)
