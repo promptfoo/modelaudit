@@ -240,7 +240,7 @@ def get_network_rule_code(network_type: str) -> str | None:
         return _rule("S307")
     elif any(token in net_lower for token in ["ipv4", "ipv6", "ip address"]):
         return _rule("S308")
-    elif any(
+    elif net_lower.partition(" ")[0] == "cc_pattern" or any(
         token in net_lower
         for token in [
             "network_function",
