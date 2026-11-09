@@ -1339,9 +1339,11 @@ class BaseScanner(ABC):
         findings: list[dict[str, Any]],
         result: ScanResult,
         context: str = "",
+        *,
+        reviewed_citations: dict[int, dict[str, Any]] | None = None,
     ) -> int:
         """Emit explicit network communication checks from detector findings and return the count."""
-        for finding in findings:
+        for index, finding in enumerate(findings):
             severity_map = {
                 "CRITICAL": IssueSeverity.CRITICAL,
                 "HIGH": IssueSeverity.CRITICAL,
@@ -1366,6 +1368,14 @@ class BaseScanner(ABC):
                 if part
             )
             network_rule_code = get_network_rule_code(network_indicator)
+            if reviewed_citations and index in reviewed_citations and network_rule_code == "S309":
+                review = reviewed_citations[index]
+                finding = {
+                    **finding,
+                    "reviewed_citation": {**review, "original_severity": severity.value},
+                    "check_consolidation_key": f"S309:{review['sha256']}:{review['position']}:{review['fingerprint']}",
+                }
+                severity = IssueSeverity.INFO
 
             result.add_check(
                 name="Network Communication Detection",
