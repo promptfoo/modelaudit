@@ -17020,3 +17020,56 @@ def _install_hash_read_clock(monkeypatch: pytest.MonkeyPatch, read_seconds: Call
     monkeypatch.setattr(core_module.time, "time", lambda: now)
     monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
     return read_sizes
+
+
+def test_readme_url_credentials_remain_actionable_next_to_a_public_link(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(
+        "# Resources\n\n"
+        "[Public file](https://docs.example.invalid/download)\n"
+        "[Private file](https://docs.example.invalid/download?api_key=fixture-token)\n",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(path), {"cache_scan_results": False})
+    urls = [issue for issue in result.issues if issue.details.get("type") == "url_detected"]
+    assert len(urls) == 2
+    public, private = sorted(urls, key=lambda issue: issue.details["position"])
+    assert public.severity == IssueSeverity.INFO
+    assert not public.details.get("contains_credentials")
+    assert private.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    assert private.details["contains_credentials"] is True
+
+
+@pytest.mark.parametrize("input_role", ["localized", "dotenv", "script", "binary", "execute_bit", "symlink"])
+def test_readme_network_severity_depends_on_file_role(tmp_path: Path, input_role: str) -> None:
+    from modelaudit.scanners.text_scanner import TextScanner
+
+    body = b'from urllib.request import urlopen\nimage = urlopen("https://models.example.invalid/sample.png")\n'
+    path = tmp_path / ("README.env" if input_role == "dotenv" else "README.en.md")
+    if input_role == "script":
+        body = b"#!/usr/bin/env python3\n" + body
+    elif input_role == "binary":
+        body += b"\x00"
+    if input_role == "symlink":
+        target = tmp_path / "example.py"
+        target.write_bytes(body)
+        try:
+            path.symlink_to(target)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    else:
+        path.write_bytes(body)
+    if input_role == "execute_bit":
+        if os.name == "nt":
+            pytest.skip("POSIX execute bits required")
+        path.chmod(0o755)
+
+    result = TextScanner().scan(str(path))
+    calls = [issue for issue in result.issues if issue.rule_code == "S302"]
+    assert calls
+    assert any(issue.details["severity"] == "HIGH" for issue in calls)
+    if input_role == "localized":
+        assert all(issue.severity == IssueSeverity.INFO for issue in calls)
+    else:
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in calls)

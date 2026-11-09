@@ -49,6 +49,11 @@ Some compatibility findings intentionally include a secondary rule-code row for
 dashboards that rely on older rule identifiers; these rows carry `supporting_rule_code=true` in details and
 should be excluded from primary issue counts when de-duplicating.
 
+ModelAudit reports network indicators in ordinary README prose and code examples as
+informational. JSON keeps the detector's severity in the finding details alongside the
+reported severity and source location. Exposed credentials, including credentials in URLs,
+can still produce alerts. An incomplete scan can still exit with code 2.
+
 Exit codes:
 
 - `0`: No issues found

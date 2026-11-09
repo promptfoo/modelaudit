@@ -19,7 +19,7 @@ from modelaudit.core_results import (
     results_have_inconclusive_outcome,
     results_have_operational_error,
 )
-from modelaudit.finding_identity import finding_identity
+from modelaudit.finding_identity import finding_identity, readme_adjusted_occurrence
 from modelaudit.integrations._sarif_identity import (
     redact_source_identifier as _identity_location,
 )
@@ -332,9 +332,11 @@ def _create_results(
                 ).hexdigest()[:16]
         if not fingerprint:
             fingerprint_message = _identity_text(fingerprint_message)
-            fingerprint = hashlib.sha256(
-                f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
-            ).hexdigest()[:16]
+            material = f"{fingerprint_message}{fingerprint_location}{issue.severity}"
+            occurrence = readme_adjusted_occurrence(identity_issue.details)
+            if isinstance(occurrence, int):
+                material += f"\x1f{occurrence}"
+            fingerprint = hashlib.sha256(material.encode()).hexdigest()[:16]
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details

@@ -14,6 +14,68 @@ import pytest
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors import network_comm
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
+from modelaudit.models import ModelAuditResultModel
+from modelaudit.scanner_results import IssueSeverity
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://reader:fixture-value@weights.example/model", True),
+        (f"https://hf_{'A' * 30}@weights.example/model", True),
+        ("https://alice@example.org/project", False),
+        ("https://fixture-value@weights.example/model", False),
+        ("https://github.com/org/repo/blob/main/docs/auth/guide.md", False),
+        ("https://example.org/docs/auth/guide", False),
+        ("https://auth.guide.docs.example/project", False),
+        ("https://weights.example/model?X-Amz-Signature=fixture", True),
+        ("https://weights.example/model?ref=v1&amp;api%5Fkey=fixture", True),
+        ("https://weights.example/model#access_token=fixture", True),
+        ("https://weights.example/model#/callback?access_token=fixture", True),
+        ("https://weights.example/api_key/fixture", True),
+        ("ssh://git@source.example/owner/model", False),
+        ("https://git@source.example/owner/model", False),
+        ("abfss://public@account.dfs.core.windows.net/model", False),
+        ("https://paper.example/Understanding-Multilingual-Transformer-Architectures?ref=main#section-2", False),
+        ("https://weights.example/model?api_key=", False),
+        ("https://github.com/auth/transformers", False),
+        ("https://github.com/EleutherAI/lm-evaluation-harness", False),
+        ("https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/sample_inference_phi4mm.py", False),
+        ("https://gist.github.com/seastar105/d1d8983b27611370528e3b194dcc5577#file-main-py", False),
+        ("https://colab.research.google.com/drive/1KhXT56UePPUHhqitJNUxq63k-pQomz3N?usp=sharing", False),
+        ("https://paper.example/84965eb9-503f-437c-b036-6e886bdf39fe", False),
+    ],
+)
+def test_url_contains_credentials(url: str, expected: bool) -> None:
+    assert network_comm.url_contains_credentials(url) is expected
+
+
+def test_url_credential_evidence_is_scoped_to_its_original_occurrence() -> None:
+    plain = b"https://weights.example/model?ref=main"
+    signed = b"https://weights.example/model?X-Amz-Signature=fixture"
+    payload = plain + b"\n" + signed
+    result = NetworkCommDetector().scan(payload, context="README.md")
+    findings = [finding for finding in result if finding.get("type") == "url_detected"]
+
+    assert [(finding["position"], finding.get("contains_credentials")) for finding in findings] == [
+        (0, None),
+        (len(plain) + 1, True),
+    ]
+    assert all(finding["url"] == "https://weights.example/model" for finding in findings)
+
+
+def test_signed_cloud_uri_records_credential_evidence() -> None:
+    results = NetworkCommDetector().scan(b"s3://weights/model.bin?X-Amz-Signature=fixture", context="README.md")
+    assert any(finding["type"] == "cloud_storage_url" and finding.get("contains_credentials") for finding in results)
+
+
+def _assert_readme_example_retains_network_evidence(aggregate: ModelAuditResultModel) -> None:
+    assert {
+        issue.details["type"]
+        for issue in aggregate.issues
+        if issue.severity == IssueSeverity.INFO and issue.details.get("severity") in {"HIGH", "CRITICAL"}
+    } >= {"network_function", "network_library"}
+    assert determine_exit_code(aggregate) == 0
 
 
 def _onnx_model_with_metadata(entries: dict[str, str]) -> bytes:
@@ -4626,7 +4688,7 @@ class TestNetworkCommDetector:
             for finding in findings
         )
 
-    def test_readme_python_example_dense_named_callable_budget_fails_aggregate_closed(
+    def test_readme_python_example_dense_named_callable_budget_retains_network_evidence(
         self,
         tmp_path: Path,
     ) -> None:
@@ -4636,7 +4698,7 @@ class TestNetworkCommDetector:
 
         aggregate = scan_model_directory_or_file(str(readme_path), cache_enabled=False)
 
-        assert determine_exit_code(aggregate) == 1
+        _assert_readme_example_retains_network_evidence(aggregate)
 
     def test_readme_python_example_dense_named_callable_fallback_bounds_domain_redaction_work(
         self,
@@ -4771,7 +4833,7 @@ class TestNetworkCommDetector:
             finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
             for finding in exhausted_findings
         )
-        assert determine_exit_code(aggregate) == 1
+        _assert_readme_example_retains_network_evidence(aggregate)
         assert not [finding for finding in fresh_findings if finding["type"] in {"network_library", "network_function"}]
 
     def test_readme_python_example_distinguishes_exact_mapping_proof_budget_from_overrun(self) -> None:
@@ -7460,7 +7522,7 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
-        assert determine_exit_code(aggregate) == 1
+        _assert_readme_example_retains_network_evidence(aggregate)
 
     def test_readme_python_example_allows_explicitly_disabled_remote_code_trust(self) -> None:
         data = _readme_model_download_example("AutoModel.from_pretrained('official/model', trust_remote_code=False)\n")

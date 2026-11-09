@@ -1339,6 +1339,8 @@ class BaseScanner(ABC):
         findings: list[dict[str, Any]],
         result: ScanResult,
         context: str = "",
+        *,
+        readme_advisories: bool = False,
     ) -> int:
         """Emit explicit network communication checks from detector findings and return the count."""
         for finding in findings:
@@ -1353,6 +1355,15 @@ class BaseScanner(ABC):
             }
             finding_severity = str(finding.get("severity", "WARNING")).upper()
             severity = severity_map.get(finding_severity, IssueSeverity.WARNING)
+            if readme_advisories:
+                detector_severity = severity
+                if finding.get("contains_credentials"):
+                    if severity in {IssueSeverity.INFO, IssueSeverity.DEBUG}:
+                        severity = IssueSeverity.WARNING
+                elif severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+                    severity = IssueSeverity.INFO
+                if severity != detector_severity:
+                    finding = {**finding, "readme_severity_adjusted": True}
             network_indicator = " ".join(
                 str(part)
                 for part in [
