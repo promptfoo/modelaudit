@@ -4,17 +4,34 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](../../docs/agents/release-process.md#version-scheme-0ver).
 
+## [Unreleased]
+
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+
 ## [0.1.15](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...modelaudit-picklescan-v0.1.15) (2026-11-09)
 
+<!-- release-note-source: f5924ad63acd2ac67359c74e287d149602e6215c -->
+
+<!-- release-note-entries: 1 -->
+
+<details>
+<summary>Other changes</summary>
+
+- Pickle scans avoid a false oversized frame warning when encoded data resembles a nested pickle with an invalid persistent ID.
+
+</details>
+
+<details>
+<summary>All changes</summary>
 
 ### Bug Fixes
 
-* **picklescan:** qualify frame warnings from encoded probes ([#2022](https://github.com/promptfoo/modelaudit/issues/2022)) ([098e156](https://github.com/promptfoo/modelaudit/commit/098e15605af4e789185ee70d9cf7a39f69dba687))
-* **pytorch:** attribute verified legacy TorchScript controls to the native loader ([#2025](https://github.com/promptfoo/modelaudit/issues/2025)) ([78936e3](https://github.com/promptfoo/modelaudit/commit/78936e307bbd71320f9d6e2d8f335dddbc3e3fa5))
+- **picklescan:** qualify frame warnings from encoded probes ([#2022](https://github.com/promptfoo/modelaudit/issues/2022)) ([098e156](https://github.com/promptfoo/modelaudit/commit/098e15605af4e789185ee70d9cf7a39f69dba687))
+- **pytorch:** attribute verified legacy TorchScript controls to the native loader ([#2025](https://github.com/promptfoo/modelaudit/issues/2025)) ([78936e3](https://github.com/promptfoo/modelaudit/commit/78936e307bbd71320f9d6e2d8f335dddbc3e3fa5))
 
-## [Unreleased]
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...modelaudit-picklescan-v0.1.15)
 
-[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+</details>
 
 ## [0.1.14](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.13...modelaudit-picklescan-v0.1.14) (2026-11-09)
 
