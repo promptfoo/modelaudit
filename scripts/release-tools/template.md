@@ -8,7 +8,8 @@
 {% endif %}
 
 {% for text, issues in entries[category].items() %}
-- {{ text }}{{ " " ~ issues|join(", ") if issues else "" }}
+{% set reference_separator = "\n\n  " if "\n" in text else " " %}
+- {{ text.rstrip() }}{{ reference_separator ~ issues|join(", ") if issues else "" }}
 {% endfor %}
 {% if category == 'other' %}
 

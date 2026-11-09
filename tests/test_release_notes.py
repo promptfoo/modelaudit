@@ -40,7 +40,8 @@ def fragment(root: Path, path: str, text: str) -> None:
 
 def raw_section(root: Path, path: str, before: str, after: str, prefix: str) -> None:
     file = root / path / "CHANGELOG.md"
-    header = f"## [{after}](https://example.org/compare/{prefix}{before}...{prefix}{after}) (2026-11-08)"
+    comparison = f"https://github.com/promptfoo/modelaudit/compare/{prefix}{before}...{prefix}{after}"
+    header = f"## [{after}]({comparison}) (2026-11-08)"
     old = file.read_text()
     file.write_text(
         old.replace("## [Unreleased]", f"{header}\n\n### Bug Fixes\n\n- merged change\n\n## [Unreleased]", 1)
@@ -164,6 +165,57 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
     assert (root / "CHANGELOG.md").read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    ("old", "new", "error"),
+    [
+        ("## [0.1.2]", "## [0.1.3]", "expected 0.1.2 immediately after Unreleased"),
+        ("/compare/modelaudit-picklescan-v0.1.1...", "/compare/v0.1.1...", "expected release comparison"),
+        ("<summary>All changes</summary>", "<summary>Miscellaneous</summary>", "missing All changes"),
+        ("</details>\n\n## [0.1.1]", "## [0.1.1]", "incomplete All changes"),
+        ("[Full comparison]", "[Old comparison]", "missing Full comparison"),
+        ("<!-- release-note-source:", "<!-- removed:", "missing release-note-source"),
+        ("<!-- release-note-entries:", "<!-- removed:", "reviewed entry count"),
+        ("### Upgrade notes", "", "missing reviewed category"),
+        ("<summary>Other changes</summary>", "", "missing reviewed category"),
+        ("- First change. [#42]", "- First change. [#43]", "missing reviewed reference for"),
+    ],
+)
+def test_check_rejects_incomplete_release_candidate(repository: Path, old: str, new: str, error: str) -> None:
+    fragment(repository, f"{SIBLING}/changes/42.upgrade.md", "First change.\n")
+    fragment(repository, f"{SIBLING}/changes/43.upgrade.md", "Second change.\n")
+    fragment(repository, f"{SIBLING}/changes/+cli.other.md", "The CLI reports progress.\n")
+    base = commit(repository, "add standalone release notes")
+    write_manifest(repository, "0.2.1", "0.1.2")
+    raw_section(repository, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    run(repository, "render", "--base", base)
+    run(repository, "check", "--base", base)
+    changelog = repository / SIBLING / "CHANGELOG.md"
+    changelog.write_text(changelog.read_text().replace(old, new, 1))
+    rejected = run(repository, "check", "--base", base, check=False)
+    assert rejected.returncode != 0
+    assert f"{Path(SIBLING) / 'CHANGELOG.md'}: {error}" in rejected.stderr
+
+
+@pytest.mark.parametrize("repository_url", ["https://example.org", "https://github.com/another/project"])
+def test_release_comparisons_must_point_to_this_repository(repository: Path, repository_url: str) -> None:
+    base = git(repository, "rev-parse", "HEAD")
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    file = repository / "CHANGELOG.md"
+    comparison = "https://github.com/promptfoo/modelaudit/compare/v0.2.1...v0.2.2"
+    wrong = f"{repository_url}/compare/v0.2.1...v0.2.2"
+    raw = file.read_text()
+    file.write_text(raw.replace(comparison, wrong))
+    assert "expected release comparison" in run(repository, "render", "--base", base, check=False).stderr
+
+    file.write_text(raw)
+    run(repository, "render", "--base", base)
+    reviewed = file.read_text()
+    assert reviewed.count(comparison) == 2  # Heading and full comparison in the inventory.
+    file.write_text(reviewed.replace(comparison, wrong))
+    assert "expected release comparison" in run(repository, "check", "--base", base, check=False).stderr
+
+
 def test_sibling_release_leaves_root_fragments_pending(repository: Path) -> None:
     root = repository
     fragment(root, "changes/42.upgrade.md", "Root callers must migrate.\n")
@@ -194,9 +246,105 @@ def test_shipped_fragment_paths_cannot_be_silently_reused(repository: Path) -> N
     commit(root, "release")
     git(root, "tag", "v0.2.2")
     fragment(root, "changes/46.other.md", "Different.\n")
-    rejected = run(root, "pending", "--package", "modelaudit", check=False)
-    assert rejected.returncode != 0
-    assert "new fragment filename" in rejected.stderr
+    for args in (("check",), ("pending", "--package", "modelaudit")):
+        rejected = run(root, *args, check=False)
+        assert rejected.returncode != 0
+        assert "new fragment filename" in rejected.stderr
+
+
+def test_late_fragments_survive_a_squash_of_an_older_release_candidate(repository: Path) -> None:
+    root = repository
+    git(root, "branch", "-M", "main")
+    fragment(root, "changes/70.other.md", "Reviewed earlier.\n")
+    fragment(root, "changes/71.other.md", "Original instructions.\n")
+    source = commit(root, "review these fragments")
+    git(root, "switch", "-c", "release-pr")
+    write_manifest(root, "0.2.2", "0.1.1")
+    raw_section(root, ".", "0.2.1", "0.2.2", "v")
+    run(root, "render", "--base", source)
+    commit(root, "render reviewed changelog")
+    git(root, "switch", "main")
+    fragment(root, "changes/71.other.md", "Revised instructions.\n")
+    fragment(root, "changes/72.security.md", "Late security fix.\n")
+    late = commit(root, "amend a pending note and add a fix before the bot refreshes")
+    git(root, "merge", "--squash", "release-pr")
+    released = commit(root, "squash release onto a newer main")
+    run(root, "check", "--base", late)
+    git(root, "tag", "v0.2.2")
+    first = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2", "--ref", "v0.2.2").stdout
+    assert f"<!-- release-note-source: {source} -->" in first
+    assert "Late security fix." not in first and "Original instructions." in first
+    pending = run(root, "pending", "--package", "modelaudit").stdout
+    assert "Late security fix." in pending and "Revised instructions." in pending and "Reviewed earlier." not in pending
+
+    write_manifest(root, "0.2.3", "0.1.1")
+    raw_section(root, ".", "0.2.2", "0.2.3", "v")
+    run(root, "render", "--base", released)
+    second = run(root, "extract", "--package", "modelaudit", "--version", "0.2.3").stdout
+    assert pending in second and "Reviewed earlier." not in second
+    commit(root, "ship the late notes")
+    git(root, "tag", "v0.2.3")
+    assert run(root, "pending", "--package", "modelaudit").stdout.strip() == "No pending release notes."
+
+
+def test_render_rejects_fragments_missing_from_or_changed_since_review_base(repository: Path) -> None:
+    root = repository
+    path = "changes/70.other.md"
+    fragment(root, path, "Original.\n")
+    source = commit(root, "release base")
+    write_manifest(root, "0.2.2", "0.1.1")
+    raw_section(root, ".", "0.2.1", "0.2.2", "v")
+    for name in ("changes/71.other.md", path):
+        fragment(root, name, "Candidate-only addition or edit.\n")
+        rejected = run(root, "render", "--base", source, check=False)
+        assert rejected.returncode != 0 and "release candidate fragments differ" in rejected.stderr
+        (root / name).unlink()
+
+
+def test_legacy_and_invalid_tagged_fragment_sources(repository: Path) -> None:
+    root = repository
+    fragment(root, "changes/70.other.md", "Shipped before source markers.\n")
+    base = commit(root, "last release without a snapshot")
+    git(root, "tag", "-f", "v0.2.1", base)
+    assert run(root, "pending", "--package", "modelaudit").stdout.strip() == "No pending release notes."
+    other_history = git(root, "commit-tree", "HEAD^{tree}", "-m", "unrelated history")
+    file = root / "CHANGELOG.md"
+    original = file.read_text()
+    for marker in ("HEAD", other_history):
+        file.write_text(
+            original.replace(
+                "## [0.2.1] - 2026-10-01", f"## [0.2.1] - 2026-10-01\n\n<!-- release-note-source: {marker} -->"
+            )
+        )
+        git(root, "tag", "-f", "v0.2.1", commit(root, "tag with a bad marker"))
+        rejected = run(root, "pending", "--package", "modelaudit", check=False)
+        assert rejected.returncode != 0 and (
+            "Invalid release-note-source" in rejected.stderr or "must be a commit" in rejected.stderr
+        )
+
+
+def test_untagged_release_uses_the_pr_base_but_normal_checkout_requires_its_exact_tag(repository: Path) -> None:
+    fragment(repository, "changes/72.other.md", "Pending release wording.\n")
+    base = commit(repository, "add a fragment before preparing the candidate")
+    git(repository, "update-ref", "refs/remotes/origin/main", base)
+    git(repository, "switch", "-c", "release-please--branches--main")
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    run(repository, "render", "--base", base)
+    commit(repository, "release candidate")
+    run(repository, "check")
+    pending = run(repository, "pending", "--package", "modelaudit").stdout
+    assert "Pending release wording." in pending
+
+    # A detached checkout can specify its PR base. Without it, do not guess
+    # that an older available tag is the latest release in an incomplete clone.
+    git(repository, "switch", "--detach")
+    run(repository, "check", "--base", base)
+    assert run(repository, "pending", "--package", "modelaudit", "--base", base).stdout == pending
+    for args in (("check",), ("pending", "--package", "modelaudit")):
+        missing = run(repository, *args, check=False)
+        assert missing.returncode != 0
+        assert "git fetch origin tag v0.2.2" in missing.stderr
 
 
 def test_extract_from_historical_tags_with_repeated_unreleased_headings(repository: Path) -> None:
@@ -346,3 +494,62 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     assert "Candidate template" not in public
     assert "Unapproved wording." not in public
     assert "Draft instructions." not in public
+
+
+def test_multiline_upgrade_note_keeps_reference_outside_the_code_block(repository: Path) -> None:
+    fragment(repository, "changes/42.upgrade.md", "Scan locally.\n\n```sh\nmodelaudit scan ./model\n```\n")
+    base = commit(repository, "document an upgrade command")
+    expected = (
+        "- Scan locally.\n\n  ```sh\n  modelaudit scan ./model\n  ```\n\n"
+        "  [#42](https://github.com/promptfoo/modelaudit/issues/42)"
+    )
+    preview = run(repository, "pending", "--package", "modelaudit").stdout
+    assert expected in preview
+
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    run(repository, "render", "--base", base)
+    run(repository, "render", "--base", base)
+    ref = commit(repository, "render release notes")
+    public = run(repository, "extract", "--package", "modelaudit", "--version", "0.2.2", "--ref", ref).stdout
+    assert public.count(expected) == 1
+
+
+def test_reviewed_entry_count_preserves_grouping_and_catches_dropped_notes(repository: Path) -> None:
+    fragments = {
+        "80.other.md": "Shared note.",
+        "81.other.md": "Shared note.",
+        "80.other.1.md": "Second note for the same issue.",
+        "+one.upgrade.md": "Unnumbered instructions.",
+        "+two.upgrade.md": "Separate orphan note.",
+        "+multi.upgrade.md": "Run these steps.\n\n- nested list\n\n```text\n- example line\n```",
+    }
+    for name, body in fragments.items():
+        fragment(repository, f"changes/{name}", body)
+    base = commit(repository, "add duplicate, numbered and unnumbered entries")
+    write_manifest(repository, "0.2.2", "0.1.1")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    run(repository, "render", "--base", base)
+    changelog = repository / "CHANGELOG.md"
+    original = changelog.read_text()
+    assert original.count("- Shared note.") == 1
+    assert "<!-- release-note-entries: 5 -->" in original
+    run(repository, "check", "--base", base)
+
+    for missing in ("- Second note for the same issue.", "- Separate orphan note."):
+        changelog.write_text("\n".join(line for line in original.split("\n") if not line.startswith(missing)))
+        result = run(repository, "check", "--base", base, check=False)
+        assert result.returncode != 0 and "reviewed entry count" in result.stderr
+
+    # Reviewers can intentionally give two fragments the same wording. Towncrier
+    # consolidates the resulting entry even though the source texts differ.
+    changelog.write_text(original)
+    reviews = repository.parent / f"{repository.name}-merged-entries.json"
+    reviews.write_text(
+        json.dumps([{"body": "<!-- release-note: changes/+two.upgrade.md -->\nUnnumbered instructions."}])
+    )
+    run(repository, "render", "--base", base, "--reviews", str(reviews))
+    approved = changelog.read_text()
+    assert "<!-- release-note-entries: 4 -->" in approved
+    assert approved.count("- Unnumbered instructions.") == 1
+    run(repository, "check", "--base", base)

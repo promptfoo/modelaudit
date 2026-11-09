@@ -2,7 +2,7 @@
 
 | Workflow                   | File                    | Triggers                                  |
 | -------------------------- | ----------------------- | ----------------------------------------- |
-| **Python CI**              | `test.yml`              | Python, workflow, and dependency changes  |
+| **Python CI**              | `test.yml`              | PRs, pushes to main, merge groups, manual |
 | **Performance Benchmarks** | `perf.yml`              | PRs, pushes to main, manual dispatch      |
 | **Documentation Check**    | `docs-check.yml`        | Markdown/text/RST/license changes         |
 | **Docker Image CI**        | `docker-image-test.yml` | Dockerfile or Python code changes         |
@@ -12,7 +12,7 @@
 | **Release**                | `release-please.yml`    | Pushes to main and manual dispatch        |
 | **Docker Publish**         | `docker-publish.yml`    | Published releases and manual dispatch    |
 
-Python CI ignores documentation-only PRs, which are handled by the documentation check workflow. Code PRs use GitHub's default merge-ref checkout and run fail-fast root tests on Python 3.10, 3.12, 3.13, and 3.14, a single Windows shard on Python 3.11, the reduced NumPy compatibility lane, and the standalone pickle package matrix on Python 3.10-3.14. Python changes also run Python 3.14 native pickle/H5 smoke tests on macOS and Windows. Python 3.14 uses the broad root test profile. Workflow-changing PRs run exhaustive sharded root tests across Python 3.10-3.14. Dependency audit runs on dependency-relevant PR merge refs and again on `merge_group` candidate SHAs, while the optional `run-slow-tests` label remains PR-only because merge-group payloads do not carry pull request label context.
+Python CI validates both packages’ release notes on every PR before reporting the required `CI Success` check. Documentation-only PRs skip the code and package test matrices. The documentation workflow checks formatting and links. Code PRs use GitHub's default merge-ref checkout and run fail-fast root tests on Python 3.10, 3.12, 3.13, and 3.14, a single Windows shard on Python 3.11, the reduced NumPy compatibility lane, and the standalone pickle package matrix on Python 3.10-3.14. Python changes also run Python 3.14 native pickle/H5 smoke tests on macOS and Windows. Python 3.14 uses the broad root test profile. Workflow-changing PRs run exhaustive sharded root tests across Python 3.10-3.14. Dependency audit runs on dependency-relevant PR merge refs and again on `merge_group` candidate SHAs, while the optional `run-slow-tests` label remains PR-only because merge-group payloads do not carry pull request label context.
 
 Pushes to `main` and `merge_group` runs validate the exact integration SHA with the full sharded fast-test matrices across Linux and Windows, the dedicated Python 3.12 slow/integration lane, 10-way coverage sharding, the full NumPy compatibility lane, and the build/package lanes. Merge-group runs intentionally fail closed: they are treated as integration events instead of depending on changed-path classification to decide whether required lanes should run, so `CI Success` cannot go green from skipped or setup-only jobs on the merge queue candidate SHA.
 

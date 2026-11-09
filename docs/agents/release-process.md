@@ -34,11 +34,15 @@ The following upgrade note belongs in `changes/1924.upgrade.md`.
 When an OpenAI API key is set, documentation triage can send eligible findings and document text to OpenAI. Use `--no-triage` to keep the scan local.
 ```
 
-From the repository root, run `python scripts/release_notes.py check` to validate fragments. Run `python scripts/release_notes.py pending --package modelaudit` or `--package modelaudit-picklescan` to preview one package. These commands use uv and the pinned Towncrier environment in `scripts/release-tools/`. Each package uses its preceding tag as its boundary. Shipped fragment files stay in Git, so give later notes new filenames.
+From the repository root, run `python scripts/release_notes.py check` to validate pending fragments and detect edits to shipped files. Run `python scripts/release_notes.py pending --package modelaudit` or `--package modelaudit-picklescan` to preview one package’s source fragments. These commands use uv and the pinned Towncrier environment in `scripts/release-tools/`. Shipped fragment files stay in Git, so give later notes new filenames.
+
+On the rolling release branch, both commands use the merge base with `origin/main` to find the last published versions. For a detached release PR checkout, pass `--base <PR-base-SHA>` to either command. If a package tag is missing locally, the error names the tag to fetch. To see wording supplied by reviewers, read the generated changelog on the release PR.
+
+Each generated version section records the reviewed `main` commit and the number of rendered notes in hidden Markdown comments. Identical notes grouped by Towncrier count as one entry. If another fragment lands or a pending fragment changes before the release PR merges, the next release picks up that addition or revision. Older tags without a source comment keep their original cutoff. If an open release PR is missing these comments, refresh its metadata using the command below.
 
 ### Reviewing the rolling release PR
 
-Inspect the versioned section in each changed changelog. The metadata job uses Towncrier to render the selected fragments beside the Release Please inventory. Later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
+Inspect the versioned section in each changed changelog. CI checks that it follows **Unreleased**, includes the pending categories and numbered issue links, and points to the component’s tag comparison under **All changes**. Later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
 
 ```markdown
 <!-- release-note: changes/1924.upgrade.md -->
@@ -136,7 +140,7 @@ fix(modelaudit-picklescan): bound nested pickle expansion
 Before merging a Release PR:
 
 1. Review the versioned changelog in **Files changed** for each bumped package. Check upgrade actions, public APIs, exit codes, data sent off-device, toolchain requirements, and scanner coverage or severity changes as applicable. If a root note promises a sibling fix, ensure the published minimum delivers it or state exactly which sibling version users must install.
-2. Required checks green: `CI Success`, `Docker CI Success`, docs checks, CodeQL, and — for picklescan bumps — `Standalone Pickle Package (3.10/3.11/3.12/3.13/3.14)`.
+2. Verify `CI Success` on the latest metadata commit, along with the Docker, docs, CodeQL and applicable standalone package checks. A bot refresh can leave workflow runs waiting for approval. If GitHub shows **Action required**, review the latest diff, then use **Approve and run workflows** on the PR. Check the resulting jobs on that commit before merging.
 3. Release-build validation green:
    - `twine check dist/*`
    - exactly one wheel + one sdist for `modelaudit`
