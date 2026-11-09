@@ -8,9 +8,11 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from ..utils.file.safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
 from ..utils.helpers.json_limits import validate_json_structural_limits
 
 _MAX_METADATA_BYTES = 8 * 1024 * 1024
+_MAX_METADATA_TOKENS = 200_000
 _SHA1 = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _COREML_ITEM_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
@@ -62,23 +64,19 @@ def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_metadata(path: Path) -> dict[str, Any] | list[Any] | None:
+def _read_metadata_bytes(path: Path, size_limit: int) -> bytes | None:
     def open_nonblocking(name: str, flags: int) -> int:
         return os.open(name, flags | getattr(os, "O_NONBLOCK", 0))
 
     try:
         with open(path, "rb", opener=open_nonblocking) as source:
             info = os.fstat(source.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_METADATA_BYTES:
+            if not stat.S_ISREG(info.st_mode) or info.st_size > size_limit:
                 return None
             raw = source.read(info.st_size + 1)
-        if len(raw) != info.st_size:
-            return None
-        validate_json_structural_limits(raw, 200_000, "Dataset license metadata")
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
-    except (OSError, ValueError, RecursionError):
+        return raw if len(raw) == info.st_size else None
+    except (OSError, ValueError):
         return None
-    return value if isinstance(value, (dict, list)) else None
 
 
 def _nonnegative_integer(value: object) -> bool:
@@ -244,7 +242,8 @@ def _is_sparse_attention_config(layers: list[Any]) -> bool:
 def is_model_repository_metadata(path: Path) -> bool:
     """Require a complete, bounded document matching a recognized producer schema."""
     name = path.name.lower()
-    is_index = name.endswith((".safetensors.index.json", ".bin.index.json"))
+    is_safetensors_index = name.endswith(".safetensors.index.json")
+    is_index = is_safetensors_index or name.endswith(".bin.index.json")
     is_hub_tree = path.parts[-4:-1] == (".cache", "huggingface", "trees") and _SHA1.fullmatch(path.stem)
     is_coreml_manifest = path.name == "Manifest.json" and path.parent.suffix.lower() == ".mlpackage"
     if not (
@@ -255,7 +254,22 @@ def is_model_repository_metadata(path: Path) -> bool:
         or name in {"chat_template.json", "added_tokens.json", "hf_quant_config.json", "sparse_attention_config.json"}
     ):
         return False
-    data = _read_metadata(path)
+    size_limit = INDEX_PROBE_BYTES if is_safetensors_index else _MAX_METADATA_BYTES
+    raw = _read_metadata_bytes(path, size_limit)
+    if raw is None:
+        return False
+    if len(raw) > _MAX_METADATA_BYTES:
+        # Only SafeTensors index candidates are read beyond the ordinary metadata budget.
+        return is_plain_safetensors_index(raw)
+    try:
+        validate_json_structural_limits(raw, _MAX_METADATA_TOKENS, "Dataset license metadata")
+    except ValueError:
+        # A compact weight map can hit the generic token limit before the byte limit.
+        return is_safetensors_index and is_plain_safetensors_index(raw)
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
+    except (ValueError, RecursionError):
+        return False
     if name == "sparse_attention_config.json":
         return isinstance(data, list) and _is_sparse_attention_config(data)
     if not isinstance(data, dict) or not data:
@@ -269,7 +283,7 @@ def is_model_repository_metadata(path: Path) -> bool:
     if is_index:
         weights = data.get("weight_map")
         metadata = data.get("metadata", {})
-        suffix = ".safetensors" if name.endswith(".safetensors.index.json") else ".bin"
+        suffix = ".safetensors" if is_safetensors_index else ".bin"
         return (
             data.keys() <= {"metadata", "weight_map"}
             and isinstance(metadata, dict)
