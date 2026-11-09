@@ -5,11 +5,20 @@ Supports TOML-based configuration for suppressing rules and adjusting severity.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
+import stat
+from collections.abc import Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 try:
     import tomllib
@@ -21,6 +30,105 @@ from ..rules import RuleRegistry, Severity
 logger = logging.getLogger(__name__)
 
 RULE_RANGE_PATTERN = re.compile(r"^S(\d+)-S(\d+)$")
+
+
+DISABLE_REVIEWED_CITATIONS_CONFIG_KEY = "_disable_reviewed_citations"
+_MAX_REVIEWED_CITATION_BYTES = 2 * 1024 * 1024
+_MAX_REVIEWED_CITATION_SITES = 4096
+_Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+_NonemptyText = Annotated[str, Field(min_length=1)]
+
+
+class _ReviewedCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    rule: Literal["S309"]
+    type: Literal["url_detected"]
+    role: Literal["readme_documentation"]
+    sha256: _Sha256
+    position: int = Field(ge=0)
+    fingerprint: str = Field(pattern=r"^text-doc-network:[0-9a-f]{24}$")
+    url: _NonemptyText
+    raw_span: _NonemptyText
+    related_sha256: _Sha256
+    reason: _NonemptyText
+
+
+class _ReviewedCitationFile(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: int = Field(ge=1, le=1)
+    sites: list[_ReviewedCitation] = Field(max_length=_MAX_REVIEWED_CITATION_SITES)
+
+
+def _unique_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("duplicate JSON object member")
+    return obj
+
+
+CitationKey = tuple[str, int, str]
+CitationIndex = Mapping[CitationKey, dict[str, Any]]
+
+
+@dataclass(frozen=True, eq=False)
+class _LoadedReviewedCitations(Mapping[CitationKey, dict[str, Any]]):
+    """A validated policy owns its stored rows and returns independent evidence dictionaries."""
+
+    _sites: Mapping[CitationKey, Mapping[str, Any]]
+    digest: str
+
+    def __getitem__(self, key: CitationKey) -> dict[str, Any]:
+        return dict(self._sites[key])
+
+    def __iter__(self) -> Iterator[CitationKey]:
+        return iter(self._sites)
+
+    def __len__(self) -> int:
+        return len(self._sites)
+
+
+def reviewed_citation_digest(sites: CitationIndex) -> str:
+    if isinstance(sites, _LoadedReviewedCitations):
+        return sites.digest
+    encoded = json.dumps(sorted(sites.items()), sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_reviewed_citations(path: Path) -> CitationIndex:
+    """Load an explicitly selected, versioned set of operator-reviewed documentation findings."""
+
+    def open_nonblocking(name: str, flags: int) -> int:
+        return os.open(name, flags | getattr(os, "O_NONBLOCK", 0))
+
+    try:
+        with open(path, "rb", opener=open_nonblocking) as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("expected a regular decision file")
+            data = source.read(_MAX_REVIEWED_CITATION_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"cannot read decision file: {exc.strerror}") from exc
+    if len(data) > _MAX_REVIEWED_CITATION_BYTES:
+        raise ValueError("decision file exceeds the 2 MiB limit")
+    try:
+        document = _ReviewedCitationFile.model_validate(json.loads(data, object_pairs_hook=_unique_json_keys))
+    except ValidationError as exc:
+        error = exc.errors(include_input=False, include_context=False)[0]
+        location = ".".join(str(part) for part in error["loc"])
+        raise ValueError(f"invalid decision file at {location or 'root'}: {error['msg']}") from exc
+    except (UnicodeError, RecursionError, ValueError) as exc:
+        raise ValueError(f"invalid decision JSON: {exc}") from exc
+
+    indexed: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for index, site in enumerate(document.sites):
+        key = (site.sha256, site.position, site.fingerprint)
+        row = site.model_dump()
+        if key in indexed and indexed[key] != row:
+            raise ValueError(f"sites.{index} conflicts with an earlier decision for the same citation")
+        indexed[key] = row
+    frozen = MappingProxyType({key: MappingProxyType(row) for key, row in indexed.items()})
+    return _LoadedReviewedCitations(frozen, reviewed_citation_digest(indexed))
 
 
 def _expand_rule_codes(codes: list[str]) -> list[str]:
@@ -57,6 +165,9 @@ class ModelAuditConfig:
     severity: dict[str, Severity] = field(default_factory=dict)
     ignore: dict[str, list[str]] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=dict)
+    reviewed_citations: CitationIndex = field(default_factory=dict)
+
+    reviewed_citation_aliases: frozenset[Path] = frozenset()
 
     def copy(self) -> ModelAuditConfig:
         """Return a shallow copy of this configuration."""
@@ -65,6 +176,8 @@ class ModelAuditConfig:
             severity=dict(self.severity),
             ignore={pattern: list(rules) for pattern, rules in self.ignore.items()},
             options=dict(self.options),
+            reviewed_citations={key: row.copy() for key, row in self.reviewed_citations.items()},
+            reviewed_citation_aliases=self.reviewed_citation_aliases,
         )
 
     @classmethod
@@ -247,8 +360,20 @@ class ModelAuditConfig:
 _global_config: ModelAuditConfig | None = None
 
 
+_scan_rule_config: ContextVar[ModelAuditConfig | None] = ContextVar("scan_rule_config", default=None)
+
+
+def bind_scan_rule_config(config: ModelAuditConfig) -> Callable[[], None]:
+    """Bind operator decisions to this scan and return its context cleanup."""
+    token = _scan_rule_config.set(config)
+    return lambda: _scan_rule_config.reset(token)
+
+
 def get_config() -> ModelAuditConfig:
-    """Get the global configuration instance."""
+    """Get the active scan configuration or the process default."""
+    scan_config = _scan_rule_config.get()
+    if scan_config is not None:
+        return scan_config
     global _global_config
     if _global_config is None:
         _global_config = ModelAuditConfig.load(discover_local=False)

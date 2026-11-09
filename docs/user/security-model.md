@@ -35,6 +35,40 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 - Remembered trust is stored in the local ModelAudit cache and is invalidated automatically if the config file changes.
 - CI and other non-interactive scans should use explicit configuration rather than relying on remembered local trust.
 
+### Reviewed README citations
+
+An operator can attach a review reason to an exact S309 URL occurrence in a complete, non-executable `README.md`. Ordinary README links already report as informational. A matched review records the original detector severity and the operator’s decision in JSON and SARIF. URLs flagged for credential material or incomplete credential inspection stay ineligible. Supply the decision file explicitly in interactive scans and CI.
+
+```bash
+modelaudit scan README.md --reviewed-citations /path/to/reviews.json --format json
+```
+
+The following decision applies to a one-line README containing `Source (PDF [paper](https://docs.example.com/citation))` and a final LF. The check and its issue retain the URL, detector evidence, original severity and operator's reason. The decision applies to that occurrence in any byte-identical standalone file named `README.md` included in the opted-in scan. A different file role, changed bytes or another URL occurrence requires a separate review. An explicit S309 severity override takes precedence.
+
+Hugging Face repository scans with `--stream` stage regular files under their repository names. A direct download may return a cache symlink. To apply a review locally, copy the complete source to a regular `README.md` and verify its SHA-256 against the decision.
+
+```json
+{
+  "version": 1,
+  "sites": [
+    {
+      "rule": "S309",
+      "type": "url_detected",
+      "role": "readme_documentation",
+      "sha256": "d982c9db70ea770328a25b55c731195d83bfd9356a31285df049aa204b1daff0",
+      "position": 20,
+      "fingerprint": "text-doc-network:07eead2d17310844bb73e553",
+      "url": "https://docs.example.com/citation",
+      "raw_span": "https://docs.example.com/citation))",
+      "related_sha256": "a39f4bd227e644d7dcd5072c527ff793596a2fd3b1a59db3a8aac25c877c0989",
+      "reason": "Reviewed the paper citation and its associated domain observation."
+    }
+  ]
+}
+```
+
+Use the SHA-256 of the complete README bytes. In the JSON report, copy `position`, `evidence_fingerprint` and `url` from the selected S309 check's `details`. Read `raw_span` from those bytes at `evidence_location.span_start:span_end`, including any Markdown punctuation, and decode it as UTF-8. To bind the associated observations, set `related` to `details.get("deduplicated_related_findings", [])` and compute `hashlib.sha256(json.dumps(related, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()`.
+
 ## Interpreting scan results
 
 - `CRITICAL`: High-confidence risk indicator. Block release/use by default.

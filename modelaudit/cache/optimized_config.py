@@ -154,10 +154,10 @@ def normalize_material_scan_config(config: dict[str, Any] | None) -> dict[str, A
 def _get_rule_config_snapshot() -> dict[str, Any]:
     """Capture the active rule configuration that affects emitted findings."""
     try:
-        from ..config.rule_config import get_config
+        from ..config.rule_config import get_config, reviewed_citation_digest
 
         rule_config = get_config()
-        return {
+        snapshot: dict[str, Any] = {
             "ignore": {
                 pattern: sorted(codes)
                 for pattern, codes in sorted(rule_config.ignore.items(), key=lambda item: item[0])
@@ -169,6 +169,9 @@ def _get_rule_config_snapshot() -> dict[str, Any]:
             },
             "suppress": sorted(rule_config.suppress),
         }
+        if rule_config.reviewed_citations:
+            snapshot["reviewed_citations_sha256"] = reviewed_citation_digest(rule_config.reviewed_citations)
+        return snapshot
     except Exception:
         return {"ignore": {}, "options": {}, "severity": {}, "suppress": []}
 

@@ -842,11 +842,15 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         deduplicated_issues = []
         for issue in self.issues:
             identity = finding_identity(issue)
+            # Keep a citation's review attached to its own occurrence in JSON and SARIF.
+            review_key = issue.details.get("check_consolidation_key")
+            reviewed_site = review_key if issue.rule_code == "S309" and isinstance(review_key, str) else None
             issue_key = (
                 identity.message,
                 identity.severity,
                 identity.location or "",
                 readme_adjusted_occurrence(identity.details),
+                reviewed_site,
             )
             if issue_key not in seen_issues:
                 seen_issues.add(issue_key)

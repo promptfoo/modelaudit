@@ -14,6 +14,7 @@ import sys
 import types
 import zipfile
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import partial
@@ -26,6 +27,8 @@ from click.testing import CliRunner, Result
 
 from modelaudit import __version__
 from modelaudit import cli as cli_module
+from modelaudit.cache import get_cache_manager
+from modelaudit.cache.optimized_config import build_cache_version_context
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.cli import (
     _create_path_progress_callback,
@@ -41,6 +44,7 @@ from modelaudit.cli import (
     expand_paths,
     format_text_output,
 )
+from modelaudit.config.rule_config import ModelAuditConfig, get_config, load_reviewed_citations, set_config
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.file import detection as file_detection
@@ -483,6 +487,555 @@ def test_scan_command_help():
     assert "--no-whitelist" in result.output
     assert "--dry-run" in result.output  # New flag
     assert "Defaults:" in result.output or "Automatic defaults:" in result.output
+
+
+@pytest.fixture
+def reviewed_site() -> dict[str, Any]:
+    url = "https://docs.example.org/reference"
+    return {
+        "rule": "S309",
+        "type": "url_detected",
+        "role": "readme_documentation",
+        "sha256": hashlib.sha256(f'url = "{url}"\n'.encode()).hexdigest(),
+        "position": 7,
+        "fingerprint": "text-doc-network:ba9b6dec5b2ceec399be5a8c",
+        "url": url,
+        "raw_span": url,
+        "related_sha256": "b82fb512eeca192fbb637be7fc489ee6e4230cdb4efbb32f4a9db320382752ed",
+        "reason": "Reviewed documentation citation.",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("rule", "S310"),
+        ("type", "network_command"),
+        ("role", "model"),
+        ("sha256", "A" * 64),
+        ("position", True),
+        ("position", -1),
+        ("position", 1.0),
+        ("fingerprint", "text-doc-network:" + "b" * 23),
+        ("url", ""),
+        ("raw_span", None),
+        ("related_sha256", "xyz"),
+        ("reason", ""),
+        ("unknown_key", "value"),
+    ],
+)
+def test_reviewed_citations_reject_invalid_site(
+    tmp_path: Path, reviewed_site: dict[str, Any], field: str, value: object
+) -> None:
+    path = tmp_path / "decisions.json"
+    path.write_text(json.dumps({"version": 1, "sites": [{**reviewed_site, field: value}]}))
+    with pytest.raises(ValueError):
+        load_reviewed_citations(path)
+
+
+def test_reviewed_citations_reject_invalid_file(tmp_path: Path, reviewed_site: dict[str, Any]) -> None:
+    path = tmp_path / "decisions.json"
+    missing_reason = {key: value for key, value in reviewed_site.items() if key != "reason"}
+    for obj in (
+        {"version": True, "sites": []},
+        {"version": 1.0, "sites": []},
+        {"version": 2, "sites": []},
+        {"version": 1, "sites": {}},
+        {"version": 1, "sites": [], "unexpected": True},
+        {"version": 1, "sites": [missing_reason]},
+        {"version": 1, "sites": [reviewed_site, {**reviewed_site, "reason": "Conflicting review."}]},
+        {"version": 1, "sites": [reviewed_site] * 4097},
+    ):
+        path.write_text(json.dumps(obj))
+        with pytest.raises(ValueError):
+            load_reviewed_citations(path)
+
+    path.write_bytes(b'{"version":1,"sites":[]}' + b" " * (2 * 1024 * 1024))
+    with pytest.raises(ValueError):
+        load_reviewed_citations(path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"), reason="requires POSIX FIFO support")
+def test_reviewed_citations_reject_fifo_open_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "decisions.json"
+    path.write_text('{"version":1,"sites":[]}')
+    original_open = os.open
+    opened: list[int] = []
+
+    def open_after_swap(
+        name: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(os.fsdecode(name)) == path:
+            assert flags & os.O_NONBLOCK, "a substituted FIFO must not block waiting for a writer"
+            path.unlink()
+            os.mkfifo(path)
+            fd = original_open(name, flags, mode, dir_fd=dir_fd)
+            opened.append(fd)
+            assert stat.S_ISFIFO(os.fstat(fd).st_mode)
+            return fd
+        return original_open(name, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "open", open_after_swap)
+        with pytest.raises(ValueError, match="regular"):
+            load_reviewed_citations(path)
+
+    assert len(opened) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(opened[0])
+    assert closed.value.errno == errno.EBADF
+
+
+def test_reviewed_citations_allow_symlink_to_regular_file(
+    tmp_path: Path, reviewed_site: dict[str, Any], requires_symlinks: None
+) -> None:
+    path = tmp_path / "decisions.json"
+    path.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+    link = tmp_path / "active-review.json"
+    link.symlink_to(path)
+    assert list(load_reviewed_citations(link).values()) == [reviewed_site]
+
+
+def test_reviewed_citations_reject_directory(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        load_reviewed_citations(tmp_path)
+
+
+def test_reviewed_citations_identity_and_cache(tmp_path: Path, reviewed_site: dict[str, Any]) -> None:
+    path = tmp_path / "decisions.json"
+    other_site = {**reviewed_site, "position": 9}
+    key = (reviewed_site["sha256"], reviewed_site["position"], reviewed_site["fingerprint"])
+    config = ModelAuditConfig()
+    set_config(config)
+    baseline = build_cache_version_context()
+    path.write_text(json.dumps({"version": 1, "sites": [reviewed_site, other_site, reviewed_site]}))
+    config.reviewed_citations = load_reviewed_citations(path)
+    assert len(config.reviewed_citations) == 2
+    exported = config.reviewed_citations[key]
+    exported["reason"] = "Changed after export."
+    assert config.reviewed_citations[key] == reviewed_site
+    with_decisions = build_cache_version_context()
+    assert with_decisions != baseline
+    with patch.object(json, "dumps", side_effect=AssertionError("Loaded policy digest should be reused")) as dumps:
+        assert build_cache_version_context() == with_decisions
+        assert build_cache_version_context() == with_decisions
+        dumps.assert_not_called()
+
+    path.write_text(json.dumps({"version": 1, "sites": [other_site, reviewed_site]}))
+    config.reviewed_citations = load_reviewed_citations(path)
+    assert build_cache_version_context() == with_decisions
+    copy = config.copy()
+    copy.reviewed_citations[key]["reason"] = "Updated decision."
+    assert config.reviewed_citations[key]["reason"] == reviewed_site["reason"]
+    set_config(copy)
+    assert build_cache_version_context() != with_decisions
+
+
+@pytest.fixture
+def reviewed_readme(tmp_path: Path, reviewed_site: dict[str, Any]) -> Path:
+    target = tmp_path.resolve() / "README.md"
+    target.write_bytes(f'url = "{reviewed_site["url"]}"\n'.encode())
+    return target
+
+
+def test_scan_reviewed_citations_explicit_json(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy = reviewed_readme.parent / "decisions.json"
+    policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+    args = ["scan", "--format", "json", "--no-cache", "--no-triage"]
+
+    def programmatic_findings() -> list[tuple[str, bool]]:
+        result = scan_model_directory_or_file(str(reviewed_readme), cache_enabled=False)
+        return [
+            (issue.severity.value, "reviewed_citation" in issue.details)
+            for issue in result.issues
+            if issue.rule_code == "S309"
+        ]
+
+    # Use an already-running API caller so its context is independent of Click's.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(programmatic_findings).result() == [("info", False)]
+
+        def scan_while_peer_is_active(path: str, **kwargs: Any) -> ModelAuditResultModel:
+            assert list(get_config().reviewed_citations.values()) == [reviewed_site]
+            assert pool.submit(programmatic_findings).result() == [("info", False)]
+            return scan_model_directory_or_file(path, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(cli_module, "scan_model_directory_or_file", scan_while_peer_is_active)
+            reviewed = CliRunner().invoke(
+                cli, [*args, "--reviewed-citations", str(policy), str(reviewed_readme)], catch_exceptions=False
+            )
+
+    assert reviewed.exit_code == 0, reviewed.output
+    report = parse_click_json_output(reviewed.output)
+    assert [
+        (i["severity"], i["details"]["reviewed_citation"]["reason"])
+        for i in report["issues"]
+        if i.get("rule_code") == "S309"
+    ] == [("info", reviewed_site["reason"])]
+    assert not get_config().reviewed_citations
+    assert programmatic_findings() == [("info", False)]
+
+    ordinary = CliRunner().invoke(cli, [*args, str(reviewed_readme)], catch_exceptions=False)
+    assert ordinary.exit_code == 0, ordinary.output
+    report = parse_click_json_output(ordinary.output)
+    assert [
+        (i["severity"], "reviewed_citation" in i["details"]) for i in report["issues"] if i.get("rule_code") == "S309"
+    ] == [("info", False)]
+
+
+@pytest.mark.parametrize(
+    "target_args",
+    [
+        ("entry.rb",),
+        ("linked-directory/README.md",),
+        ("linked-directory",),
+        ("link*/README.md",),
+        ("link*",),
+        ("real/README.md", "entry.rb"),
+        ("entry.rb", "real/README.md"),
+    ],
+)
+def test_scan_reviewed_citations_keeps_alias_warnings(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], requires_symlinks: None, target_args: tuple[str, ...]
+) -> None:
+    root = reviewed_readme.parent
+    directory = root / "real"
+    directory.mkdir()
+    target = reviewed_readme.rename(directory / "README.md")
+    (root / "entry.rb").symlink_to(target)
+    (root / "linked-directory").symlink_to(directory, target_is_directory=True)
+    independent = root / "other" / "README.md"
+    independent.parent.mkdir()
+    independent.write_bytes(target.read_bytes())
+    policy = root / "review.json"
+    policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--no-cache",
+            "--no-triage",
+            "--format",
+            "json",
+            "--reviewed-citations",
+            str(policy),
+            *(str(root / arg) for arg in target_args),
+            str(independent),
+        ],
+        catch_exceptions=False,
+    )
+    issues = [issue for issue in parse_click_json_output(result.output)["issues"] if issue.get("rule_code") == "S309"]
+    assert result.exit_code == 1, [(issue["location"], issue["severity"]) for issue in issues]
+    assert any(
+        Path(issue["location"]).resolve() == target
+        and issue["severity"] == "warning"
+        and "reviewed_citation" not in issue["details"]
+        for issue in issues
+    )
+    assert any(
+        Path(issue["location"]).resolve() == independent
+        and issue["severity"] == "info"
+        and issue["details"].get("reviewed_citation", {}).get("reason") == reviewed_site["reason"]
+        for issue in issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "alias_name"),
+    [
+        ("cli-directory", "A.rb"),
+        ("cli-directory", "Z.rb"),
+        ("api-directory", "A.rb"),
+        ("api-directory", "Z.rb"),
+        ("cli-dvc", "entry.rb"),
+        ("api-dvc", "entry.rb"),
+        ("stream", "entry.rb"),
+        ("stream-reverse", "entry.rb"),
+    ],
+)
+def test_reviewed_citations_preserve_discovered_alias_warning(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], requires_symlinks: None, entrypoint: str, alias_name: str
+) -> None:
+    from modelaudit.core import scan_model_streaming
+    from modelaudit.core_results import determine_exit_code
+
+    root = reviewed_readme.parent
+    bundle = root / "bundle"
+    bundle.mkdir()
+    target = bundle / "README.md"
+    alias = bundle / alias_name
+    if alias_name < target.name:
+        alias.symlink_to(target)
+        reviewed_readme.rename(target)
+    else:
+        reviewed_readme.rename(target)
+        alias.symlink_to(target)
+    independent = bundle / "independent" / "README.md"
+    independent.parent.mkdir()
+    independent.write_bytes(target.read_bytes())
+    pointer = root / "model.dvc"
+    pointer.write_text(f"outs:\n- path: bundle/{alias_name}\n- path: bundle/independent/README.md\n")
+    policy = root / "review.json"
+    policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+    source = pointer if entrypoint.endswith("-dvc") else bundle
+
+    for reviewed in (False, True):
+        if entrypoint.startswith("cli-"):
+            flags = ["--reviewed-citations", str(policy)] if reviewed else []
+            run = CliRunner().invoke(
+                cli,
+                ["scan", "--format", "json", "--no-cache", "--no-triage", *flags, str(source)],
+                catch_exceptions=False,
+            )
+            report = parse_click_json_output(run.output)
+            exit_code = run.exit_code
+        else:
+            set_config(ModelAuditConfig(reviewed_citations=load_reviewed_citations(policy) if reviewed else {}))
+            if entrypoint.startswith("stream"):
+                paths = [target, alias, independent] if entrypoint == "stream" else [alias, target, independent]
+                scan = scan_model_streaming(
+                    ((path, False) for path in paths),
+                    delete_after_scan=False,
+                    scan_root=str(bundle),
+                    cache_enabled=False,
+                )
+            else:
+                scan = scan_model_directory_or_file(str(source), cache_enabled=False)
+            report = scan.model_dump(mode="json")
+            exit_code = determine_exit_code(scan)
+
+        assert exit_code == 1
+        for field in ("checks", "issues"):
+            observations = [item for item in report[field] if item.get("rule_code") == "S309"]
+            if field == "checks":
+                assert all(item["status"] == "failed" for item in observations)
+            assert any(
+                Path(item["location"]).resolve() == target
+                and item["severity"] == "warning"
+                and "reviewed_citation" not in item["details"]
+                for item in observations
+            )
+            assert all(
+                item["severity"] == "warning" and "reviewed_citation" not in item["details"]
+                for item in observations
+                if Path(item["location"]) == alias
+            )
+            assert [
+                (item["severity"], "reviewed_citation" in item["details"])
+                for item in observations
+                if Path(item["location"]).resolve() == independent
+            ] == [("info", reviewed)]
+
+
+def test_reviewed_citations_direct_dvc_output_remains_eligible(
+    reviewed_readme: Path, reviewed_site: dict[str, Any]
+) -> None:
+    root = reviewed_readme.parent
+    pointer = root / "model.dvc"
+    pointer.write_text("outs:\n- path: README.md\n")
+    policy = root / "reviews.json"
+    policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+    args = ["scan", "--format", "json", "--no-cache", "--no-triage", "--reviewed-citations", str(policy), str(pointer)]
+    run = CliRunner().invoke(cli, args, catch_exceptions=False)
+    assert run.exit_code == 0, run.output
+    report = parse_click_json_output(run.output)
+    for field in ("checks", "issues"):
+        assert [
+            (item["location"], item["severity"], item["details"].get("reviewed_citation", {}).get("reason"))
+            for item in report[field]
+            if item.get("rule_code") == "S309"
+        ] == [(str(reviewed_readme), "info", reviewed_site["reason"])]
+
+
+@pytest.mark.parametrize("first", ["directory", "pointer", "file"])
+def test_reviewed_citations_external_dvc_alias_in_mixed_cli_inputs(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], requires_symlinks: None, first: str
+) -> None:
+    root = reviewed_readme.parent
+    bundle = root / "bundle"
+    bundle.mkdir()
+    target = reviewed_readme.rename(bundle / "README.md")
+    alias = root / "source.rb"
+    alias.symlink_to(target)
+    independent = root / "other" / "README.md"
+    independent.parent.mkdir()
+    independent.write_bytes(target.read_bytes())
+    pointer = root / "model.dvc"
+    pointer.write_text("outs:\n- path: source.rb\n")
+    policy = root / "review.json"
+    policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+    inputs = {"file": [target, pointer], "directory": [bundle, pointer], "pointer": [pointer, bundle]}[first]
+    inputs.append(independent)
+    args = ["scan", "--format", "json", "--no-cache", "--no-triage", "--reviewed-citations", str(policy)]
+    run = CliRunner().invoke(cli, [*args, *map(str, inputs)], catch_exceptions=False)
+    assert run.exit_code == 1, run.output
+    report = parse_click_json_output(run.output)
+    for field in ("checks", "issues"):
+        assert {
+            (Path(item["location"]).resolve(), item["severity"], "reviewed_citation" in item["details"])
+            for item in report[field]
+            if item.get("rule_code") == "S309"
+        } == {(target, "warning", False), (independent, "info", True)}
+
+
+@pytest.mark.parametrize("alias_name", ["alias.dvc", "not-a-pointer.rb"])
+def test_reviewed_citations_do_not_follow_aliased_dvc_pointer(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], requires_symlinks: None, alias_name: str
+) -> None:
+    root = reviewed_readme.parent
+    pointer = root / "model.dvc"
+    pointer.write_text("outs:\n- path: README.md\n")
+    alias = root / alias_name
+    alias.symlink_to(pointer)
+    independent = root / "independent" / "README.md"
+    independent.parent.mkdir()
+    independent.write_bytes(reviewed_readme.read_bytes())
+    policy = root / "decisions.json"
+    policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+
+    for reviewed in (False, True):
+        set_config(ModelAuditConfig(reviewed_citations=load_reviewed_citations(policy) if reviewed else {}))
+        api_report = scan_model_directory_or_file(str(alias), cache_enabled=False)
+        assert api_report.files_scanned == 1
+        # The API only routes an explicitly named .dvc input to its declared outputs.
+        expected = [(str(reviewed_readme), "warning")] if alias.suffix == ".dvc" else []
+        assert [(i.location, i.severity.value) for i in api_report.issues if i.rule_code == "S309"] == expected
+
+        flags = ["--reviewed-citations", str(policy)] if reviewed else []
+        run = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--no-triage", "--format", "json", *flags, str(alias), str(independent)],
+            catch_exceptions=False,
+        )
+        assert run.exit_code == 1, run.output
+        report = parse_click_json_output(run.output)
+        for field in ("checks", "issues"):
+            assert {
+                (Path(item["location"]), item["severity"], "reviewed_citation" in item["details"])
+                for item in report[field]
+                if item.get("rule_code") == "S309"
+            } == {
+                (reviewed_readme, "warning", False),
+                (independent, "info", reviewed),
+            }
+
+
+def test_scan_reviewed_citations_warm_cache_isolates_alias(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], requires_symlinks: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pickle
+
+    from modelaudit.scanners.base import ScanResult
+    from modelaudit.scanners.text_scanner import TextScanner
+
+    # Exceed the 10 KiB minimum for text so the scanner's read-failure safeguard decides cache eligibility.
+    payload = reviewed_readme.read_bytes() + b"Additional documentation.\n" * 512
+    reviewed_readme.write_bytes(payload)
+    policy = reviewed_readme.parent / "review.json"
+    row = {**reviewed_site, "sha256": hashlib.sha256(payload).hexdigest()}
+    policy.write_text(json.dumps({"version": 1, "sites": [row]}))
+    alias = reviewed_readme.parent / "entry.rb"
+    alias.symlink_to(reviewed_readme)
+    cache = str(reviewed_readme.parent / "cache")
+    args = ["scan", "--format", "json", "--cache-dir", cache, "--no-triage", "--reviewed-citations", str(policy)]
+    runner = CliRunner()
+
+    # Confirm the shared result cache is live using a cache-eligible input.
+    cacheable = reviewed_readme.parent / "benign.pkl"
+    cacheable.write_bytes(pickle.dumps(list(range(8000)), protocol=4))
+    assert runner.invoke(cli, [*args, str(cacheable)], catch_exceptions=False).exit_code == 0
+    hits = get_cache_manager(cache, enabled=True).get_stats()["cache_hits"]
+    assert runner.invoke(cli, [*args, str(cacheable)], catch_exceptions=False).exit_code == 0
+    assert get_cache_manager(cache, enabled=True).get_stats()["cache_hits"] > hits
+
+    scanned: list[str] = []
+    scan_text = TextScanner.scan
+
+    def observe_text_scan(self: TextScanner, path: str) -> ScanResult:
+        scanned.append(path)
+        return scan_text(self, path)
+
+    monkeypatch.setattr(TextScanner, "scan", observe_text_scan)
+    for path, expected in [(reviewed_readme, "info"), (alias, "warning"), (reviewed_readme, "info")]:
+        scanned.clear()
+        result = runner.invoke(cli, [*args, str(path)], catch_exceptions=False)
+        report = parse_click_json_output(result.output)
+        assert [issue["severity"] for issue in report["issues"] if issue.get("rule_code") == "S309"] == [expected]
+        assert result.exit_code == (1 if expected == "warning" else 0)
+        assert any(Path(name).resolve() == reviewed_readme for name in scanned)
+
+
+def test_scan_reviewed_citations_cleanup_on_error(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = reviewed_readme.parent / "decisions.json"
+    path.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+
+    def fail_after_loading(*args: Any, **kwargs: Any) -> None:
+        assert list(get_config().reviewed_citations.values()) == [reviewed_site]
+        raise RuntimeError("interrupted after policy load")
+
+    monkeypatch.setattr(cli_module, "_show_scan_runtime_defaults", fail_after_loading)
+    args = ["scan", "--format", "json", "--reviewed-citations", str(path), str(reviewed_readme)]
+    result = CliRunner().invoke(cli, args)
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == "interrupted after policy load"
+    assert not get_config().reviewed_citations
+
+    early = CliRunner().invoke(
+        cli, ["scan", "--dry-run", "--format", "sarif", "--reviewed-citations", str(path), "hf://test/fixture"]
+    )
+    assert early.exit_code == 2
+    assert "Hugging Face dry-run previews support text or json output" in early.output
+    assert not get_config().reviewed_citations
+
+    path.write_text("{")
+    invalid = CliRunner().invoke(cli, args)
+    assert invalid.exit_code == 2
+    assert "--reviewed-citations" in invalid.output
+    assert not get_config().reviewed_citations
+
+
+@pytest.mark.parametrize("filename", [".modelaudit.toml", "pyproject.toml"])
+@pytest.mark.parametrize("inline", [True, False], ids=["inline", "path"])
+def test_scan_local_config_cannot_enable_reviewed_citations(
+    reviewed_readme: Path, reviewed_site: dict[str, Any], monkeypatch: pytest.MonkeyPatch, filename: str, inline: bool
+) -> None:
+    root = reviewed_readme.parent
+    policy = root / "decisions.json"
+    policy.write_text(json.dumps({"version": 1, "sites": [reviewed_site]}))
+    header = "[tool.modelaudit]\n" if filename == "pyproject.toml" else ""
+    row = ", ".join(f"{key} = {json.dumps(value)}" for key, value in reviewed_site.items())
+    value = f"{{ version = 1, sites = [{{{row}}}] }}" if inline else json.dumps(str(policy))
+    (root / filename).write_text(f"{header}reviewed_citations = {value}\n")
+    store = TrustedConfigStore(root / "trust" / "local.json")
+    monkeypatch.setattr(cli_module, "can_use_trusted_local_config", lambda output_format: output_format == "text")
+    monkeypatch.setattr(cli_module, "get_trusted_config_store", lambda: store)
+
+    def scan_without_local_reviews(path: str, **kwargs: Any) -> ModelAuditResultModel:
+        assert not get_config().reviewed_citations
+        return scan_model_directory_or_file(path, **kwargs)
+
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_without_local_reviews)
+    runner = CliRunner()
+    args = ["scan", "--format", "text", "--no-cache", "--no-triage", str(reviewed_readme)]
+    declined = runner.invoke(cli, args, input="n\n", catch_exceptions=False)
+    assert declined.exit_code == 0, declined.output
+    assert "Found local ModelAudit config" in strip_ansi(declined.output)
+    assert reviewed_site["reason"] not in declined.output
+    trusted = runner.invoke(cli, args, input="a\n", catch_exceptions=False)
+    assert trusted.exit_code == 0, trusted.output
+    assert "Using local ModelAudit config" in strip_ansi(trusted.output)
+    assert reviewed_site["reason"] not in trusted.output
+    assert store.store_path.exists()
 
 
 def test_scan_invalid_severity_level_option(tmp_path):
