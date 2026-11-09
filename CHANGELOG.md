@@ -6,7 +6,59 @@ Features and fixes increment the patch version. Breaking changes increment the m
 
 ## [Unreleased]
 
-[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.56...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.57...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
+
+## [0.2.57](https://github.com/promptfoo/modelaudit/compare/v0.2.56...v0.2.57) (2026-11-09)
+
+<!-- release-note-source: f5924ad63acd2ac67359c74e287d149602e6215c -->
+
+<!-- release-note-entries: 9 -->
+
+### Security
+
+- Avoid CVE-2026-112940 and CVE-2026-112914 in the filelock dependency. Python 3.11 and later require filelock 4.2.9 or newer. Python 3.10 uses 3.20.3, which remains affected by CVE-2026-112909 and CVE-2026-112910. [#2024](https://github.com/promptfoo/modelaudit/issues/2024)
+
+<details>
+<summary>Other changes</summary>
+
+- Avoid incomplete Flax routing warnings on large ONNX weight sidecars when an existing full-file hash read rules out Flax checkpoint keys. The scanner retains coverage limits for unread bytes and independently verifies ONNX references. Direct scans can also rule out an impossible MessagePack length within a bounded prefix of a large external weight. [#2021](https://github.com/promptfoo/modelaudit/issues/2021)
+- License reports give ambiguous `.pkl` files an informational reminder to check usage rights. CycloneDX includes the dataset property for a complete, statically verified sequence of training-example records. [#2023](https://github.com/promptfoo/modelaudit/issues/2023)
+- Skops archives report pickle, joblib, and scikit-learn references in plain README documentation as informational. The CVE-2025-54886 finding for loader evidence recommends the upstream fix in skops 0.13.0. [#2028](https://github.com/promptfoo/modelaudit/issues/2028)
+- Network references, example code, and public cryptocurrency receiving addresses in text READMEs are informational by default. Exposed credentials still produce alerts, and reports retain the underlying evidence. [#2030](https://github.com/promptfoo/modelaudit/issues/2030)
+- ModelAudit reports a UUIDv4 used as a Bearer credential in a literal Authorization or Proxy-Authorization header, including headers quoted in README examples and configuration files. [#2032](https://github.com/promptfoo/modelaudit/issues/2032)
+- ModelAudit distinguishes native TorchScript module and tensor reconstruction from Python imports after verifying the archive’s declaration and tensor state. A storage constructor’s installed call graph is reported as conditional in this context. Standalone pickles and unverified archives retain their security findings. If you upgrade an existing environment to `modelaudit==0.2.57`, install `modelaudit-picklescan==0.1.15` alongside it to receive this change.
+- PyTorch scans avoid a false oversized pickle frame warning when tensor bytes resemble an encoded pickle with an invalid persistent ID. When upgrading an existing environment to `modelaudit==0.2.57`, install `modelaudit-picklescan==0.1.15` alongside it to receive this fix.
+- Report when a manifest matches the Hugging Face download metadata format and the record cannot verify its associated artifact.
+
+</details>
+
+<details>
+<summary>All changes</summary>
+
+### Features
+
+- support operator-reviewed README citations ([#2027](https://github.com/promptfoo/modelaudit/issues/2027)) ([593fc12](https://github.com/promptfoo/modelaudit/commit/593fc12661c7d81d79cbe6d3c6987633505c72fd))
+
+### Bug Fixes
+
+- **deps:** avoid affected filelock releases on Python 3.10–3.14 ([#2024](https://github.com/promptfoo/modelaudit/issues/2024)) ([7789737](https://github.com/promptfoo/modelaudit/commit/77897370647d5f2c7872b104430830b275129434))
+- **licenses:** qualify rights notices for pickle files ([#2023](https://github.com/promptfoo/modelaudit/issues/2023)) ([2e41982](https://github.com/promptfoo/modelaudit/commit/2e419823e3c8875857142b048016f0bb82d9fc9f))
+- **manifest:** identify Hugging Face download records ([#2026](https://github.com/promptfoo/modelaudit/issues/2026)) ([8cd89b4](https://github.com/promptfoo/modelaudit/commit/8cd89b44c2fb1c5d1ca481dbbc14b9588c0b6c86))
+- **picklescan:** qualify frame warnings from encoded probes ([#2022](https://github.com/promptfoo/modelaudit/issues/2022)) ([098e156](https://github.com/promptfoo/modelaudit/commit/098e15605af4e789185ee70d9cf7a39f69dba687))
+- **pytorch:** attribute verified legacy TorchScript controls to the native loader ([#2025](https://github.com/promptfoo/modelaudit/issues/2025)) ([78936e3](https://github.com/promptfoo/modelaudit/commit/78936e307bbd71320f9d6e2d8f335dddbc3e3fa5))
+- **release:** generate release metadata from protected inputs ([#2031](https://github.com/promptfoo/modelaudit/issues/2031)) ([fd1e50c](https://github.com/promptfoo/modelaudit/commit/fd1e50cc02d7235a40aed311542455ee997d6ddc))
+- **routing:** rule out Flax while hashing large ONNX weights ([#2021](https://github.com/promptfoo/modelaudit/issues/2021)) ([57d052f](https://github.com/promptfoo/modelaudit/commit/57d052f0ff83cd26d688923f61ddcfbaef080be8))
+- **secrets:** recognize UUIDv4 credentials in explicit Bearer headers ([#2032](https://github.com/promptfoo/modelaudit/issues/2032)) ([a8f900f](https://github.com/promptfoo/modelaudit/commit/a8f900fd42c14adf37c1f6c377ed215503eb4945))
+- **skops:** report README loader references as informational ([#2028](https://github.com/promptfoo/modelaudit/issues/2028)) ([9374fc7](https://github.com/promptfoo/modelaudit/commit/9374fc78bccd8fa6d15ec212f09566c738168c73))
+- **text:** report README examples and public addresses as informational ([#2030](https://github.com/promptfoo/modelaudit/issues/2030)) ([3fc0883](https://github.com/promptfoo/modelaudit/commit/3fc0883046ddaf30d987f6e8988b632839eac62a))
+
+### Reverts
+
+- remove operator-reviewed README citations ([f5924ad](https://github.com/promptfoo/modelaudit/commit/f5924ad63acd2ac67359c74e287d149602e6215c))
+
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/v0.2.56...v0.2.57)
+
+</details>
 
 ## [0.2.56](https://github.com/promptfoo/modelaudit/compare/v0.2.55...v0.2.56) (2026-11-09)
 
