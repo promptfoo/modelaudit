@@ -30,6 +30,14 @@ def _priority_snippet_padding(padding_line: bytes) -> bytes:
     return padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
 
 
+def _ctypes_alias_case(source: bytes) -> tuple[bytes, bytes, str]:
+    return b"import ctypes as c\n", source, "Native library loading detected"
+
+
+def _webbrowser_alias_case(source: bytes) -> tuple[bytes, bytes, str]:
+    return b"import webbrowser as wb\n", source, "Web browser launch detected"
+
+
 class _CountingAliasMapping(Mapping[str, str]):
     def __init__(self, aliases: Mapping[str, str]) -> None:
         self._aliases = aliases
@@ -1768,37 +1776,29 @@ class TestJITScriptDetector:
         ("priority_import", "call_line", "expected_pattern"),
         [
             (b"import runpy as rp\n", b"rp.run_path.__call__('payload.py')\n", "Dynamic module execution detected"),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"wb.open.__call__('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (b"import ctypes as c\n", b"c.CDLL.__call__('payload.so')\n", "Native library loading detected"),
+            _ctypes_alias_case(b"c.CDLL.__call__('payload.so')\n"),
             (
                 b"import runpy as rp\n",
                 b"(rp.run_path).__call__('payload.py')\n",
                 "Dynamic module execution detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"(wb.open).__call__('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (b"import ctypes as c\n", b"(c.CDLL).__call__('payload.so')\n", "Native library loading detected"),
+            _ctypes_alias_case(b"(c.CDLL).__call__('payload.so')\n"),
             (
                 b"import runpy as rp\n",
                 b"(\n rp.run_path\n).__call__('payload.py')\n",
                 "Dynamic module execution detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"(\n wb.open\n).__call__('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"(\n c.CDLL\n).__call__('payload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import runpy as rp\n",
@@ -1845,35 +1845,23 @@ class TestJITScriptDetector:
                 b"getattr(\n    rp.run_path,\n    '__call__'\n)(\n    'payload.py'\n)\n",
                 "Dynamic module execution detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"getattr(c, 'CDLL').__call__('payload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"vars(c)['CDLL'].__call__('payload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"object.__getattribute__(c, 'CDLL')('payload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"type(c).__getattribute__(c, 'CDLL')('payload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"vars(c).get('CDLL')('payload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"dict.get(vars(c), 'CDLL')('payload.so')\n",
-                "Native library loading detected",
             ),
         ],
     )
@@ -2394,41 +2382,29 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         ("prefix", "late_state", "expected_pattern"),
         [
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
                 b"opener = print or wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"import builtins\nvars(builtins).update(**{'print': False})\n"
                 b"opener = print or wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
                 b"loader = print or c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins\nvars(builtins).update(**{'print': False})\n"
                 b"loader = print or c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nfor b.print in [False]:\n    pass\n"
                 b"loader = print or c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nns = b.vars(b)\nupdate = ns.update\n"
                 b"update({'print': False})\nloader = print or c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
         ],
     )
@@ -2445,15 +2421,11 @@ class TestJITScriptDetector:
                 b"runner = print or rp.run_path\nrunner('safe')\n",
                 "Dynamic module execution detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"opener = print or wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"loader = print or c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
         ],
     )
@@ -2472,215 +2444,137 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         ("prefix", "late_state", "unexpected_pattern"),
         [
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"wb.open = print\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.cdll = print\nloader = c.cdll\nloader.msvcrt\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"vars(wb).update(open=print)\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"setattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.__dict__['CDLL'] = print\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nb.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nfor b.setattr in []:\n    pass\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nfor b.list in ():\n    pass\n"
                 b"list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"wb.__dict__.update({'open': print})\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"vars(wb).update(**{'open': print})\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.__dict__.__setitem__('CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"dict.update(c.__dict__, CDLL=print)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"dict.update(c.__dict__, [('CDLL', print)])\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.__dict__.update([('CDLL', print)])\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.__dict__.__ior__({'CDLL': print})\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"dict.__ior__(c.__dict__, {'CDLL': print})\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.CDLL = print\ndel c.CDLL\nc.__dict__.setdefault('CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.CDLL = print\ndel c.CDLL\ndict.setdefault(c.__dict__, 'CDLL', print)\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.CDLL = print\ndel c.__dict__['CDLL']\nc.__dict__.setdefault('CDLL', print)\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.CDLL = print\nc.__dict__.pop('CDLL')\nc.__dict__.setdefault('CDLL', print)\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL; c.__dict__.setdefault('CDLL', print)\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
                 b"dict.__setitem__(c.__dict__, 'CDLL', print)\nc.__dict__.setdefault('CDLL', original)\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.CDLL = print\ndict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', print)\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"c.CDLL = print\ndelattr(c, 'CDLL')\nc.__dict__.setdefault('CDLL', print)\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"import builtins\nbuiltins.setattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"wb.__dict__['op' + 'en'] = print\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"vars(c).update(**{'CD' + 'LL': print})\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = original\noriginal = print\nwb.open = original\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"wb.open: object = print\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"namespace = wb.__dict__\nnamespace.update(open=print)\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"namespace, unused = wb.__dict__, None\nnamespace.update(open=print)\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\ntry:\n    pass\nfinally:\n    wb.open = print\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"wb.open = print\nwb.open = wb.open\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"changed = setattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nnamespace = wb.__dict__\nnamespace |= {'open': print}\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\ntry:\n    wb.open = print\nexcept Exception:\n    pass\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nfor _ in [0]:\n    wb.open = print\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
             (
                 b"import webbrowser as wb\nimport builtins\n",
@@ -2688,93 +2582,61 @@ class TestJITScriptDetector:
                 b"opener = wb.open\nopener('safe')\n",
                 "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"changed = (setattr(wb, 'open', print) is None)\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"noop = lambda arg=setattr(wb, 'open', print): arg\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"def noop(arg: wb.__dict__.update(open=print)):\n    pass\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nFalse and (print := original)\nwb.open = print\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"False and (setattr := print)\nsetattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\ntry:\n    raise RuntimeError()\n"
                 b"    wb.open = original\nexcept RuntimeError:\n    pass\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"try:\n    raise RuntimeError()\nexcept RuntimeError:\n    wb.open = print\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\ntry:\n    1 / 0\n    wb.open = original\n"
                 b"except ZeroDivisionError:\n    pass\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"for _ in [0]:\n    pass\nelse:\n    wb.open = print\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nwhile False:\n    wb.open = original\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"try:\n    raise FileNotFoundError()\nexcept OSError:\n    wb.open = print\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"try:\n    raise PermissionError()\nexcept OSError:\n    c.CDLL = print\n"
                 b"loader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"list(wb.__dict__.update(open=print) for _ in [0])\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"sorted(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"for _ in [0]:\n    try:\n        raise RuntimeError()\n    except RuntimeError:\n        pass\n"
                 b"    c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"if c.__dict__.update(CDLL=print) is None:\n    pass\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins\n",
@@ -2786,23 +2648,17 @@ class TestJITScriptDetector:
                 b"b.list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"RuntimeError = ValueError\ntry:\n    raise RuntimeError()\nexcept ValueError:\n"
                 b"    c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"ValueError = RuntimeError\ntry:\n    raise RuntimeError()\nexcept ValueError:\n"
                 b"    c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"try:\n    raise RuntimeError(c.__dict__.update(CDLL=print))\nexcept RuntimeError:\n"
                 b"    pass\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport contextlib\n",
@@ -2810,27 +2666,19 @@ class TestJITScriptDetector:
                 b"    pass\nloader = c.CDLL\nloader('safe')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"match c.__dict__.update(CDLL=print):\n    case _:\n        pass\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"for c.CDLL in [print]:\n    pass\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"match 0:\n    case 0 if c.__dict__.update(CDLL=print) is None:\n"
                 b"        pass\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"subject = 0\nmatch subject:\n    case _ if c.__dict__.update(CDLL=print) is None:\n"
                 b"        pass\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins\n",
@@ -2850,26 +2698,20 @@ class TestJITScriptDetector:
                 b"list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n"
                 b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
                 b"else:\n    real_vars = lambda obj: {}\n"
                 b"real_vars(b).update({'setattr': lambda *args: None})\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nfor _ in [0]:\n    continue\n"
                 b"    wb.open = original\nopener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"for _ in [0]:\n    if False:\n        continue\n    wb.open = print\n"
                 b"opener = wb.open\nopener('safe')\n",
-                "Web browser launch detected",
             ),
             (
                 b"import ctypes as c\nimport builtins\nclass Safe:\n"
@@ -2888,50 +2730,40 @@ class TestJITScriptDetector:
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
                 b"real_dict = Safe\nenabled = True\nif enabled:\n"
                 b"    from builtins import dict as real_dict\n    real_dict = Safe\n"
                 b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
                 b"real_dict = Safe\nenabled = True\nglobals()['enabled'] = False\nif enabled:\n"
                 b"    from builtins import dict as real_dict\n"
                 b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
                 b"real_dict = Safe\nenabled = False\nglobals = lambda: {}\n"
                 b"globals()['enabled'] = True\nif enabled:\n    from builtins import dict as real_dict\n"
                 b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
                 b"real_dict = Safe\nenabled = True\nglobals = lambda: {}\ndel globals\n"
                 b"globals()['enabled'] = False\nif enabled:\n    from builtins import dict as real_dict\n"
                 b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
                 b"real_dict = Safe\nenabled = True\nglobals()['globals'] = lambda: {}\ndel globals\n"
                 b"globals()['enabled'] = False\nif enabled:\n    from builtins import dict as real_dict\n"
                 b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
-                "Native library loading detected",
             ),
         ],
     )
@@ -2946,219 +2778,145 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         ("prefix", "late_state", "expected_pattern"),
         [
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"opener = wb.open\nwb.open = print\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"loader = c.CDLL\nc.CDLL = print\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"loader = c.cdll\nc.cdll = print\nloader.msvcrt\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nwb.open = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nc.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nprint = original\nwb.open = print\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nprint = original\nc.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nsetattr = print\nsetattr(wb, 'open', print)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"import builtins\noriginal = wb.open\nbuiltins.setattr = print\nsetattr(wb, 'open', print)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"False and vars(wb).update(open=print)\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"False and c.__dict__.__setitem__('CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"noop = lambda: vars(wb).update(open=print)\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"import builtins\noriginal = wb.open\nwb.open = print\nbuiltins.setattr(wb, 'open', original)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nwb.__dict__['op' + 'en'] = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nvars(c).update(**{'CD' + 'LL': original})\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nc.__dict__.update([('CDLL', original)])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndict.update(c.__dict__, [('CDLL', original)])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nc.__dict__.__ior__({'CDLL': original})\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndict.__ior__(c.__dict__, {'CDLL': original})\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
                 b"dict.setdefault(c.__dict__, 'CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.__dict__['CDLL']\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nc.__dict__.pop('CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
                 b"put = c.__dict__.setdefault\nput('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL; c.__dict__.setdefault('CDLL', original)\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndict.__setitem__(c.__dict__, 'CDLL', original)\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nrestore = c.__dict__.update\n"
                 b"restore(CDLL=original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nput = c.__dict__.__setitem__\n"
                 b"put('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel vars(c)['CDLL']\n"
                 b"vars(c).setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\nput = dict.setdefault\n"
                 b"put(c.__dict__, 'CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nput = wb.__dict__.__setitem__\n"
                 b"put('open', original)\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndict.pop(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndict.__delitem__(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nremove = c.__dict__.pop\nremove('CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nremove = vars(c).pop\nremove('CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nremove = dict.pop\nremove(c.__dict__, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ndelattr(c, 'CDLL')\n"
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\ndict.pop(c.__dict__, 'CDLL')\n",
@@ -3361,65 +3119,45 @@ class TestJITScriptDetector:
                 b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nprint = original\nwb.open = print\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"import builtins\noriginal = wb.open\nwb.open = print\nbuiltins.setattr(\n"
                 b"    wb, 'open', original\n)\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nvars(c).update(\n"
                 b"    **{'CDLL': original}\n)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nif True:\n    wb.open = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nwb.open: object = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nnamespace = wb.__dict__\n"
                 b"namespace.update(open=original)\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nprint, unused = original, None\nwb.open = print\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nsetattr, unused = print, None\nsetattr(wb, 'open', print)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"import builtins\noriginal = wb.open\nbuiltins.setattr, unused = print, None\n"
                 b"setattr(wb, 'open', print)\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"namespace = wb.__dict__\nnamespace, unused = {}, None\nnamespace.update(open=print)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
             (
                 b"import webbrowser as wb\nimport ctypes as c\n",
@@ -3427,35 +3165,25 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.cdll\nc.cdll = print\nvars(c).update(CDLL=print, cdll=original)\n"
                 b"loader = c.cdll\nloader.msvcrt\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nif False:\n    wb.open = print\nelse:\n    wb.open = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\ntry:\n    pass\nfinally:\n    wb.open = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nchanged = setattr(wb, 'open', original)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nchanged = vars(wb).update(open=original)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
             (
                 b"import ctypes as c\nimport webbrowser as wb\n",
@@ -3463,41 +3191,29 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nnamespace = wb.__dict__\nnamespace |= {'open': original}\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\ntry:\n    wb.open = original\nexcept Exception:\n    pass\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nfor _ in [0]:\n    wb.open = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nchanged = (setattr(wb, 'open', original) is None)\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nnoop = lambda arg=setattr(wb, 'open', original): arg\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\ndef noop(arg: wb.__dict__.update(open=original)):\n"
                 b"    pass\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
             (
                 b"from __future__ import annotations\nimport webbrowser as wb\n",
@@ -3505,107 +3221,73 @@ class TestJITScriptDetector:
                 b"opener('https://example.invalid')\n",
                 "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"[setattr(wb, 'open', print) for _ in []]\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"[setattr(wb, 'open', print) for _ in [0] if False]\nopener = wb.open\n"
                 b"opener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\n(1 == 1) and setattr(c, 'CDLL', original)\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nif 1 == 1:\n    wb.open = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nfor _ in [0, 1]:\n    wb.open = original\n"
                 b"opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"try:\n    1 / 0\n    c.CDLL = print\nexcept ZeroDivisionError:\n    pass\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"value = wb.__dict__.update(open=print) if "
                 + (b"not " * 1_000)
                 + b"False else None\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"try:\n    raise RuntimeError()\nexcept (ValueError, TypeError):\n    c.CDLL = print\n"
                 b"except RuntimeError:\n    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ntry:\n    raise FileNotFoundError()\n"
                 b"except OSError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"try:\n    raise RuntimeError()\nexcept Exception:\n    pass\nexcept RuntimeError:\n"
                 b"    c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ntry:\n    raise PermissionError()\n"
                 b"except OSError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"try:\n    for _ in [1 / 0]:\n        c.CDLL = print\nexcept ZeroDivisionError:\n    pass\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"try:\n    if True:\n        raise RuntimeError()\n    c.CDLL = print\n"
                 b"except RuntimeError:\n    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"for _ in [0, 1]:\n    if True:\n        continue\n    c.CDLL = print\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"0 == 1 == (wb.__dict__.update(open=print) is None)\nopener = wb.open\n"
                 b"opener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nlist(c.__dict__.update(CDLL=original) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"list = lambda iterable: None\nlist(c.__dict__.update(CDLL=print) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b'import webbrowser as wb\n"""\nfrom __future__ import annotations\n"""\n',
@@ -3613,17 +3295,13 @@ class TestJITScriptDetector:
                 b"    pass\nopener = wb.open\nopener('https://example.invalid')\n",
                 "Web browser launch detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nif c.__dict__.update(CDLL=original) is None:\n"
                 b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nfor _ in [c.__dict__.update(CDLL=original)]:\n"
                 b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins\n",
@@ -3631,11 +3309,9 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"consume = list\noriginal = c.CDLL\nc.CDLL = print\n"
                 b"consume(c.__dict__.update(CDLL=original) for _ in [0])\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nfrom builtins import list as consume\n",
@@ -3676,24 +3352,18 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nRuntimeError = ValueError\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nValueError = RuntimeError\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\ntry:\n"
                 b"    raise RuntimeError(c.__dict__.update(CDLL=original))\nexcept RuntimeError:\n"
                 b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport contextlib\n",
@@ -3702,11 +3372,9 @@ class TestJITScriptDetector:
                 b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nmatch c.__dict__.update(CDLL=original):\n"
                 b"    case _:\n        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport contextlib\n",
@@ -3722,33 +3390,25 @@ class TestJITScriptDetector:
                 b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nfor c.CDLL in [original]:\n"
                 b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nmatch 0:\n"
                 b"    case 0 if c.__dict__.update(CDLL=original) is None:\n"
                 b"        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nsubject = 0\nmatch subject:\n"
                 b"    case _ if c.__dict__.update(CDLL=original) is None:\n"
                 b"        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nsubject = 0\nmatch subject:\n"
                 b"    case _ if False:\n        pass\n"
                 b"    case _ if c.__dict__.update(CDLL=original) is None:\n"
                 b"        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins\n",
@@ -3757,12 +3417,10 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\n"
                 b"for ValueError in [RuntimeError]:\n    pass\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport contextlib\n",
@@ -3772,12 +3430,10 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\n"
                 b"if globals().get('enabled'):\n    ValueError = RuntimeError\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins\n",
@@ -3800,12 +3456,10 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"for list in [lambda iterable: None]:\n    pass\n"
                 b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport contextlib\n",
@@ -3814,12 +3468,10 @@ class TestJITScriptDetector:
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"match (lambda iterable: None):\n    case list:\n        pass\n"
                 b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins as b\n",
@@ -3843,59 +3495,43 @@ class TestJITScriptDetector:
                 b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nfor b.setattr in [lambda *args: None]:\n    pass\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nfor b.list in [lambda iterable: None]:\n    pass\n"
                 b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nnamespace = b.vars(b)\n"
                 b"for namespace['list'] in [lambda iterable: None]:\n    pass\n"
                 b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nimport contextlib\n"
                 b"with contextlib.nullcontext(lambda *args: None) as b.setattr:\n    pass\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nb.setattr(b, 'setattr', lambda *args: None)\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nb.setattr(b, 'vars', lambda obj: {})\n"
                 b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n"
                 b"real_vars(b).update({'setattr': lambda *args: None})\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_setattr = b.setattr\nb.setattr = lambda *args: None\n"
                 b"real_setattr(b, 'vars', lambda obj: {})\n"
                 b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n",
@@ -3939,12 +3575,10 @@ class TestJITScriptDetector:
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_vars = b.vars\nenabled = True\n"
                 b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
                 b"real_vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins as b\nreal_vars = b.vars\nenabled = True\n"
@@ -3952,12 +3586,10 @@ class TestJITScriptDetector:
                 b"real_vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_setattr = b.setattr\nenabled = True\n"
                 b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n"
                 b"real_setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins as b\nreal_setattr = b.setattr\nenabled = True\n"
@@ -3965,14 +3597,12 @@ class TestJITScriptDetector:
                 b"real_setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_setattr = b.setattr\nreal_vars = b.vars\n"
                 b"b.vars = lambda obj: {}\nenabled = True\n"
                 b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n"
                 b"real_setattr(b, 'vars', real_vars)\n"
                 b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins as b\nreal_setattr = b.setattr\n"
@@ -3982,59 +3612,45 @@ class TestJITScriptDetector:
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nns = b.vars(b)\nupdate = ns.update\n"
                 b"update({'setattr': lambda *args: None})\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nns = b.vars(b)\nupdate = ns.update\n"
                 b"update({'list': lambda iterable: None})\n"
                 b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nns = b.vars(b)\nsetitem = ns.__setitem__\n"
                 b"setitem('setattr', lambda *args: None)\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_vars = b.vars\nreal_setattr = b.setattr\n"
                 b"b.setattr = lambda *args: None\nenabled = True\n"
                 b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
                 b"namespace = real_vars(b)\nput = namespace.__setitem__\n"
                 b"put('setattr', real_setattr)\nb.setattr(c, 'CDLL', print)\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_vars = b.vars\nreal_setattr = b.setattr\n"
                 b"b.setattr = lambda *args: None\nenabled = True\n"
                 b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
                 b"namespace = real_vars(b)\nput = namespace.__setitem__\nrelay = put\n"
                 b"relay('setattr', real_setattr)\nb.setattr(c, 'CDLL', print)\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\ndict.update(b.__dict__, {'setattr': lambda *args: None})\n"
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nfor print in [original]:\n    pass\n"
                 b"c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport contextlib\n",
@@ -4042,11 +3658,9 @@ class TestJITScriptDetector:
                 b"c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nmatch original:\n    case print:\n        pass\n"
                 b"c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
             (
                 b"import ctypes as c\nimport builtins\n",
@@ -4066,81 +3680,59 @@ class TestJITScriptDetector:
                 b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
                 "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"match (lambda iterable: None):\n    case _ if False:\n        pass\n"
                 b"    case list:\n        pass\nlist(c.__dict__.update(CDLL=print) for _ in [0])\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\nmatch RuntimeError:\n"
                 b"    case ValueError:\n        pass\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\n"
                 b"for (ValueError,) in [(RuntimeError,)]:\n    pass\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_setattr = b.setattr\nenabled = True\n"
                 b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n"
                 b"real_setattr(b, 'ValueError', RuntimeError)\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = print\nexcept RuntimeError:\n    pass\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import ctypes as c\n",
+            _ctypes_alias_case(
                 b"import builtins as b\nreal_vars = b.vars\nenabled = True\n"
                 b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
                 b"namespace = real_vars(b)\nput = namespace.__setitem__\n"
                 b"put('ValueError', RuntimeError)\ntry:\n    raise RuntimeError()\n"
                 b"except ValueError:\n    c.CDLL = print\nexcept RuntimeError:\n    pass\n"
                 b"loader = c.CDLL\nloader('libpayload.so')\n",
-                "Native library loading detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\ntry:\n    raise RuntimeError()\nexcept RuntimeError:\n"
                 b"    wb.open = original\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nfor _ in [0]:\n    continue\nelse:\n"
                 b"    wb.open = original\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\ntry:\n    1 / 0\nexcept ZeroDivisionError:\n"
                 b"    wb.open = original\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"try:\n    raise RuntimeError()\nexcept ValueError:\n    wb.open = print\n"
                 b"except RuntimeError:\n    pass\nopener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nif condition:\n    wb = Holder\n"
                 b"else:\n    wb.open = original\nwb.open('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
-            (
-                b"import webbrowser as wb\n",
+            _webbrowser_alias_case(
                 b"original = wb.open\nwb.open = print\nif condition:\n    wb.open = original\n"
                 b"    opener = wb.open\nopener('https://example.invalid')\n",
-                "Web browser launch detected",
             ),
             (
                 b"",
