@@ -43,7 +43,7 @@ from importlib.util import cache_from_source
 from pathlib import Path, PurePosixPath
 from types import CodeType, ModuleType, TracebackType
 from typing import Any, Literal, cast
-from unittest.mock import create_autospec
+from unittest.mock import create_autospec, patch
 
 import pytest
 from framework_fixtures import (
@@ -12491,6 +12491,35 @@ print(json.dumps({{"before_loaded": before_loaded, "before": summarize(before), 
     assert expected_finding in summary["before"]["findings"]
     assert summary["after"]["verdict"] == SafetyVerdict.SUSPICIOUS.value
     assert expected_finding in summary["after"]["findings"]
+
+
+def test_safe_numpy_dataflow_bounds_byte_slices_across_follow_on_streams() -> None:
+    payload = b"N." * 64 + _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD
+    with patch.object(package_api.pickletools, "genops", wraps=package_api.pickletools.genops) as genops:
+        assert package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+
+    inputs = [call.args[0] for call in genops.call_args_list]
+    assert sum(len(data) for data in inputs if isinstance(data, bytes)) <= len(payload)
+
+
+def test_scan_bytes_respects_subclass_slices_for_numpy_proof() -> None:
+    slices: list[slice] = []
+
+    class PickleBytes(bytes):
+        def __bytes__(self) -> bytes:
+            return self
+
+        def __getitem__(self, key: Any) -> Any:
+            if isinstance(key, slice):
+                slices.append(key)
+                if key.start == 2:
+                    raise IndexError("follow-on slice unavailable")
+            return super().__getitem__(key)
+
+    payload = PickleBytes(b"N." + _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD)
+    assert scan_bytes(payload).coverage.bytes_scanned == len(payload)
+    assert slices == [slice(0, None), slice(2, None)]
+    assert not package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
 
 
 def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_after_opcode_cap(

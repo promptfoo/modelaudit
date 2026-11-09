@@ -17,6 +17,7 @@ from _collections import OrderedDict as _CANONICAL_COLLECTIONS_ORDERED_DICT
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from enum import Enum, auto
 from importlib import import_module
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -382,24 +383,11 @@ class _AbstractGlobal:
     name: str
 
 
-@dataclass(frozen=True)
-class _AbstractBytes:
-    pass
-
-
-@dataclass(frozen=True)
-class _AbstractNumpyDType:
-    pass
-
-
-@dataclass(frozen=True)
-class _AbstractNumpyArraySeed:
-    pass
-
-
-@dataclass(frozen=True)
-class _AbstractNumpyArray:
-    pass
+class _AbstractValue(Enum):
+    BYTES = auto()
+    NUMPY_DTYPE = auto()
+    NUMPY_ARRAY_SEED = auto()
+    NUMPY_ARRAY = auto()
 
 
 @dataclass(frozen=True)
@@ -1009,14 +997,10 @@ def _validated_pytorch_storage_entry_ids(
     options: ScanOptions,
     deadline: float,
 ) -> tuple[_PytorchZipStorageEntries, tuple[Notice, ...]]:
-    members = [
-        (entry.filename, entry)
-        for entry in entries
-        if not entry.is_dir() and _is_canonical_pytorch_zip_member_name(entry.filename)
-    ]
     entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
-    for name, entry in members:
-        entries_by_name.setdefault(name, []).append(entry)
+    for entry in entries:
+        if not entry.is_dir() and _is_canonical_pytorch_zip_member_name(entry.filename):
+            entries_by_name.setdefault(entry.filename, []).append(entry)
 
     trusted_entry_ids: set[int] = set()
     expanded_trust_entry_ids: set[int] = set()
@@ -3725,27 +3709,19 @@ def _canonical_pytorch_tensor_rebuild_invocations_match(
 
 def _complete_pickle_stream_payloads(payload: bytes) -> tuple[tuple[int, bytes], ...] | None:
     streams: list[tuple[int, bytes]] = []
-    offset = 0
     opcode_count = 0
     stream = io.BytesIO(payload)
     try:
-        while offset < len(payload):
-            stream_end: int | None = None
-            stream.seek(offset)
-            for opcode, _arg, position in pickletools.genops(stream):
+        while (start := stream.tell()) < len(payload):
+            for opcode, _arg, _position in pickletools.genops(stream):
                 opcode_count += 1
                 if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
                     return None
-                if opcode.name != "STOP":
-                    continue
-                if type(position) is not int:
-                    return None
-                stream_end = position + 1
-                break
-            if stream_end is None:
+                if opcode.name == "STOP":
+                    break
+            else:
                 return None
-            streams.append((offset, payload[offset:stream_end]))
-            offset = stream_end
+            streams.append((start, payload[start : stream.tell()]))
     except Exception:
         return None
     return tuple(streams)
@@ -6326,12 +6302,14 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
         return None
 
     try:
+        # A bytes subclass can preserve its own slicing behavior through scan_bytes.
+        stream = io.BytesIO(payload) if type(payload) is bytes else None
         offset = 0
         opcode_count = 0
-        while offset < len(payload):
+        # genops consumes one stream through STOP. Only the memo carries over.
+        while (stream.tell() if stream is not None else offset) < len(payload):
             stack = []
-            stream_saw_stop = False
-            for opcode, arg, pos in pickletools.genops(payload[offset:]):
+            for opcode, arg, position in pickletools.genops(stream if stream is not None else payload[offset:]):
                 opcode_count += 1
                 if opcode_count > _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES:
                     return False
@@ -6341,10 +6319,10 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                 if opcode_name in {"PROTO", "FRAME"}:
                     continue
                 if opcode_name == "STOP":
-                    if pos is None:
+                    if position is None:
                         return False
-                    offset += pos + 1
-                    stream_saw_stop = True
+                    if stream is None:
+                        offset += position + 1
                     break
                 if opcode_name == "MARK":
                     stack.append(_ABSTRACT_MARK)
@@ -6370,7 +6348,7 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                 }:
                     stack.append(str(arg))
                 elif opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
-                    stack.append(_AbstractBytes())
+                    stack.append(_AbstractValue.BYTES)
                 elif opcode_name in {
                     "BININT",
                     "BININT1",
@@ -6452,20 +6430,20 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                     function = pop_value()
                     if _abstract_global_is(function, _CODECS_ENCODE_REFERENCES):
                         stack.append(
-                            _AbstractBytes()
+                            _AbstractValue.BYTES
                             if _codecs_encode_args_are_safe(args)
                             else _AbstractCallResult(function, args)
                         )
                     elif _abstract_global_is(function, _NUMPY_DTYPE_REFERENCES):
                         stack.append(
-                            _AbstractNumpyDType()
+                            _AbstractValue.NUMPY_DTYPE
                             if _numpy_dtype_reduce_args_are_safe(args)
                             else _AbstractCallResult(function, args)
                         )
                     elif _abstract_global_is(function, _NUMPY_RECONSTRUCT_REFERENCES):
                         saw_numpy_reconstruct = True
                         if _numpy_reconstruct_args_are_safe(args):
-                            stack.append(_AbstractNumpyArraySeed())
+                            stack.append(_AbstractValue.NUMPY_ARRAY_SEED)
                         else:
                             unsafe_numpy_reconstruct = True
                             stack.append(_AbstractCallResult(function, args))
@@ -6474,13 +6452,13 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                 elif opcode_name == "BUILD":
                     state = pop_value()
                     obj = pop_value()
-                    if isinstance(obj, _AbstractNumpyArraySeed):
+                    if obj is _AbstractValue.NUMPY_ARRAY_SEED:
                         if _numpy_ndarray_build_state_is_safe(state):
-                            stack.append(_AbstractNumpyArray())
+                            stack.append(_AbstractValue.NUMPY_ARRAY)
                         else:
                             unsafe_numpy_reconstruct = True
                             stack.append(_ABSTRACT_UNKNOWN)
-                    elif isinstance(obj, _AbstractNumpyDType):
+                    elif obj is _AbstractValue.NUMPY_DTYPE:
                         stack.append(obj if _abstract_value_is_inert(state) else _ABSTRACT_UNKNOWN)
                     else:
                         stack.append(obj)
@@ -6491,11 +6469,9 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                     pop_marked_items()
                 elif opcode_name == "DUP":
                     stack.append(stack[-1] if stack else _ABSTRACT_UNKNOWN)
-                elif opcode_name in {"PERSID", "BINPERSID"}:
-                    stack.append(_ABSTRACT_UNKNOWN)
                 else:
                     stack.append(_ABSTRACT_UNKNOWN)
-            if not stream_saw_stop:
+            else:
                 return False
     except Exception:
         return False
@@ -6539,7 +6515,7 @@ def _numpy_reconstruct_args_are_safe(args: object) -> bool:
         and len(args) == 3
         and _abstract_global_is(args[0], _NUMPY_NDARRAY_REFERENCES)
         and _abstract_int_tuple_is_safe(args[1])
-        and isinstance(args[2], (str, bytes, bytearray, _AbstractBytes))
+        and (isinstance(args[2], (str, bytes, bytearray)) or args[2] is _AbstractValue.BYTES)
     )
 
 
@@ -6550,9 +6526,9 @@ def _numpy_ndarray_build_state_is_safe(state: object) -> bool:
         and isinstance(state[0], int)
         and not isinstance(state[0], bool)
         and _abstract_int_tuple_is_safe(state[1])
-        and isinstance(state[2], _AbstractNumpyDType)
+        and state[2] is _AbstractValue.NUMPY_DTYPE
         and isinstance(state[3], bool)
-        and (isinstance(state[4], (str, bytes, bytearray, _AbstractBytes)) or _abstract_value_is_inert(state[4]))
+        and _abstract_value_is_inert(state[4])
     )
 
 
@@ -6590,12 +6566,8 @@ def _pytorch_tensor_view_fits_storage(
 
 
 def _abstract_value_is_inert(value: object) -> bool:
-    if value is _ABSTRACT_UNKNOWN or value is _ABSTRACT_MARK:
-        return False
-    if isinstance(value, (_AbstractGlobal, _AbstractCallResult, _AbstractNumpyArraySeed)):
-        return False
-    if isinstance(value, (_AbstractBytes, _AbstractNumpyDType, _AbstractNumpyArray)):
-        return True
+    if isinstance(value, _AbstractValue):
+        return value in (_AbstractValue.BYTES, _AbstractValue.NUMPY_DTYPE, _AbstractValue.NUMPY_ARRAY)
     if value is None or isinstance(value, (str, bytes, bytearray, int, float, bool)):
         return True
     if isinstance(value, (tuple, list)):
