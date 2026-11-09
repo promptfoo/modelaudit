@@ -30,6 +30,7 @@ from modelaudit.utils.file.handlers import (
     should_use_advanced_handler,
 )
 from tests.cache_lifecycle import IsolatedCacheManager
+from tests.helpers.cache import scope_cache_ancestor_identity_to_tree
 
 
 def _assert_suspect_shard_family_not_cacheable(tmp_path: Path, field: str, value: object) -> None:
@@ -2287,6 +2288,9 @@ class TestAdvancedFileHandler:
         )
 
         with IsolatedCacheManager(lambda: reset_cache_manager()):
+            cache = get_cache_manager(str(cache_dir), enabled=True).cache
+            assert cache is not None
+            scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
             first = scan_advanced_large_file(str(shard_one), scanner)
             first_scan_paths = list(scanned_paths)
             cached = scan_advanced_large_file(str(shard_one), scanner)
