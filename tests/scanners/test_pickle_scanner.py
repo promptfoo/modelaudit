@@ -337,6 +337,24 @@ def test_legacy_pytorch_storage_records_accept_memoized_protocols(protocol: int)
     assert records[0].element_size == 1
 
 
+@pytest.mark.parametrize("oversized_tuple", [False, True], ids=["opcode-budget", "oversized-tuple"])
+def test_legacy_pytorch_partial_storage_evidence_is_not_layout_proof(
+    monkeypatch: pytest.MonkeyPatch, oversized_tuple: bool
+) -> None:
+    # Popping an oversized tuple can expose the older ID to partial annotation.
+    padding = b"(" + b"N" * 17 + b"t0" if oversized_tuple else b""
+    prefix = b"\x80\x02" + _legacy_pytorch_storage_pid_tuple("0", 1) + padding
+    payload = prefix + b"Q."
+    if not oversized_tuple:
+        # The ID was read, but the strict pass cannot reach STOP within the budget.
+        monkeypatch.setattr(
+            pickle_scanner, "_PYTORCH_LEGACY_MAX_CONTROL_OPCODES", len(list(pickletools.genops(payload))) - 1
+        )
+    assert pickle_scanner._legacy_pytorch_storage_records(payload, ("0",)) is None
+    evidence = pickle_scanner._legacy_pytorch_storage_persistent_id_records(payload)
+    assert [(item.position, item.record.key) for item in evidence] == [(len(prefix), "0")]
+
+
 def test_legacy_pytorch_storage_records_reject_missing_memo_reference() -> None:
     payload = b"\x80\x02(" + _binunicode(b"storage") + b"ctorch\nByteStorage\n"
     payload += _binunicode(b"0") + _binunicode(b"cpu") + b"K\x01h\xfa" + b"tQ."
