@@ -4068,6 +4068,7 @@ def test_scan_cache_revalidates_sources_when_namespace_precedence_changes(
     }
     file_path = _make_cacheable_file(tmp_path, "namespace-precedence.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
+    scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
     version_context = build_cache_version_context({})
     scan_result = _private_fingerprint_result(fingerprint_metadata)
     assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
