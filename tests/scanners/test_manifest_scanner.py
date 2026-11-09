@@ -165,7 +165,7 @@ def test_manifest_blacklist_invalid_utf8_is_operational_not_security_finding(tmp
     cache_dir = tmp_path / "cache"
 
     direct = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregates = [
             scan_model_directory_or_file(
                 str(test_file),
@@ -248,7 +248,7 @@ def test_manifest_blacklist_read_failure_bypasses_stale_clean_cache(
     _write_json_manifest(test_file, model_type="bert", padding="x" * 11_000)
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -299,7 +299,7 @@ def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
     _write_json_manifest(test_file, model_type="bert", padding="x" * 11_000)
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -406,7 +406,7 @@ def test_manifest_cloud_storage_read_failure_bypasses_stale_clean_cache(
     )
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -1984,7 +1984,7 @@ def test_manifest_scanner_timeout_preserves_weak_hash_finding_and_is_not_cached(
         "should_bypass_cache_for_read_failure_aware_file",
         lambda _path: False,
     )
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregates = [
             scan_model_directory_or_file(
                 str(test_file),

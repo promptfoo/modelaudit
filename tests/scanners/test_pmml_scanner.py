@@ -372,6 +372,8 @@ def test_pmml_scanner_unrecognized_root_namespace_documentation_urls_warn(tmp_pa
     result = _scan_pmml_fixture(path, pmml)
 
     external_issues = _external_resource_issues(result)
+    assert any(issue.details.get("context") == "text" for issue in external_issues)
+    assert any(issue.details.get("attribute") == "description" for issue in external_issues)
 
 
 def test_pmml_scanner_unrecognized_root_namespace_documentation_attributes_warn(tmp_path: Path) -> None:

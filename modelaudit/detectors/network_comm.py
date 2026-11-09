@@ -2896,14 +2896,6 @@ def _is_valid_official_readme_sample_image_example(
         reference_statement = reference_membership[3]
         return binding_precedes_reference_in_supported_body(reference_statement, operation_statement)
 
-    def is_direct_expression_call(call: ast.Call) -> bool:
-        call_membership = direct_statement_membership(call)
-        return (
-            call_membership is not None
-            and isinstance(call_membership[3], ast.Expr)
-            and call_membership[3].value is call
-        )
-
     def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
         if is_supported_direct_eager_call(call) and operation_definitely_follows_reference(operation, call):
             return False

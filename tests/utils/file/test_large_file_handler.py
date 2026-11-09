@@ -107,7 +107,7 @@ def test_large_handler_cache_bypasses_oversized_safetensors_hashing(
         lambda _self, _path: pytest.fail("bounded SafeTensors failure must not hash inside the scanner"),
     )
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         result = scan_func(str(payload), scanner)
 
         assert result.success is False
@@ -212,7 +212,7 @@ def test_large_handler_cache_preserves_private_metadata_for_internal_results(
         return result
 
     monkeypatch.setattr(module, internal_name, scan_internal)
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         first = scan_func(str(payload), CachedScanner())
         second = scan_func(str(payload), CachedScanner())
 
@@ -279,7 +279,7 @@ def test_large_handler_cache_bypasses_zip_entry_preflight(
     monkeypatch.setattr(handler_module, "should_bypass_cache_for_zip_entry_preflight", lambda _path, _config: True)
     monkeypatch.setattr(handler_module, internal_name, record_internal)
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         result = scan_func(str(payload), scanner)
 
         assert result.success is True
@@ -327,7 +327,7 @@ def test_large_handler_missing_h5py_does_not_return_stale_clean_cache(
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
     scanner = KerasH5Scanner(config=config)
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         clean_result = large_file_handler.scan_large_file(str(model_path), scanner)
         assert clean_result.success is True
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)
@@ -357,7 +357,7 @@ def test_advanced_handler_missing_h5py_preserves_shard_coverage_without_stale_ca
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
     scanner = KerasH5Scanner(config=config)
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         clean_result = advanced_handlers.scan_advanced_large_file(str(shard_paths[0]), scanner)
         assert clean_result.success is True
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)

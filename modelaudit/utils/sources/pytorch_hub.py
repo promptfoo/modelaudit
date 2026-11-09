@@ -678,9 +678,8 @@ def _commit_staged_weight_files_secure(
     """Commit staged files through pinned cache directories."""
     committed: list[tuple[int, str, Path, bool]] = []
     created_dirs: list[tuple[int, str]] = []
-    with ExitStack() as fd_stack:
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        root_fd = fd_stack.enter_context(_open_directory_fd(dest_dir, directory_flags))
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with _open_directory_fd(dest_dir, directory_flags) as root_fd, ExitStack() as fd_stack:
         try:
             for _, relative_path in artifacts:
                 staged_file = _safe_destination_path(files_dir, relative_path)

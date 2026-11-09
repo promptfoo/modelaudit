@@ -885,7 +885,7 @@ def test_large_file_backed_hdf5_bypasses_cache_content_hash(
         lambda self, path, _stat: fail_if_cache_hashes_hdf5(self, path),
     )
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         audit_result = core_module.scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
@@ -1821,7 +1821,7 @@ def test_missing_h5py_invalidates_stale_cache_entries(
     cache_dir = tmp_path / "stale-missing-h5py-cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)
         for cached_path in (model_path, extensionless_model_path):
             version_context = build_cache_version_context(config)
@@ -2070,7 +2070,7 @@ def test_h5py_runtime_failure_bypasses_stale_clean_cache(
     cache_dir = tmp_path / "runtime-h5py-failure-cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         clean_result = KerasH5Scanner(config=config).scan_with_cache(str(model_path))
         assert clean_result.success is True
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)

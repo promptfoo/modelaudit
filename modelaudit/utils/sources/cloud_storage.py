@@ -1826,6 +1826,7 @@ def _protocol_less_cloud_relative_path(base_url: str, file_url: str) -> str:
             _protocol, canonical_url, _fs_args = get_cloud_filesystem_config(base_url)
             base = urlsplit(canonical_url)
         except ValueError:
+            # Fall back to the original HTTP host and path for unrecognized provider URLs.
             pass
     provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
     if provider_prefix and file_path.startswith(f"{provider_prefix}/"):

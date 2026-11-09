@@ -268,7 +268,7 @@ def test_text_scanner_truncated_verified_huggingface_readme_preserves_actionable
     cache_dir = tmp_path / "cache"
 
     result = TextScanner(config).scan(str(path))
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregates = [
             scan_model_directory_or_file(
                 str(path),
@@ -4764,8 +4764,10 @@ def test_text_scanner_misuse_exemption_keeps_surrounding_harmful_claims(tmp_path
         "The model will not execute code.",
         "Some models may exfiltrate inputs.",
         'The phrase "This model steals user data" is a warning example.',
-        "* **Generation of Harmful Content:** Developers should assess outputs for their context and use available "
-        "safety classifiers or custom solutions appropriate for their use case.",
+        (
+            "* **Generation of Harmful Content:** Developers should assess outputs for their context and use available "
+            "safety classifiers or custom solutions appropriate for their use case."
+        ),
     ],
 )
 def test_text_scanner_misuse_exemption_keeps_surrounding_safety_guidance_informational(
@@ -6445,7 +6447,7 @@ def test_text_metadata_read_failure_is_inconclusive_not_security_finding(
     monkeypatch.setattr(TextScanner, "_get_file_size", staticmethod(raise_os_error))
 
     direct = TextScanner().scan(str(text_path))
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         aggregates = [
             scan_model_directory_or_file(
                 str(text_path),
@@ -6530,7 +6532,7 @@ def test_text_metadata_read_failure_bypasses_stale_clean_cache(
     text_path.write_text("token\n" + "x" * 11_000, encoding="utf-8")
     cache_dir = tmp_path / "cache"
 
-    with IsolatedCacheManager(lambda: reset_cache_manager()):
+    with IsolatedCacheManager(reset_cache_manager):
         with monkeypatch.context() as warm_cache:
             warm_cache.setattr(
                 cache_decorator,
@@ -6681,11 +6683,15 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
 @pytest.mark.parametrize(
     "content",
     [
-        "```bash\ngit clone https://github.com/ggml-org/llama.cpp.git  # build locally\n"
-        "# git clone --branch support https://github.com/example/llama.cpp.git\n"
-        "cd llama.cpp\ncmake -B build -DGGML_CUDA=ON\ncmake --build build --config Release -j\n```\n",
-        "```shell\nconda create -n demo python=3.12\nconda activate demo\n"
-        "git clone https://github.com/example/model.git\ncd model\npip install -e .\n```\n",
+        (
+            "```bash\ngit clone https://github.com/ggml-org/llama.cpp.git  # build locally\n"
+            "# git clone --branch support https://github.com/example/llama.cpp.git\n"
+            "cd llama.cpp\ncmake -B build -DGGML_CUDA=ON\ncmake --build build --config Release -j\n```\n"
+        ),
+        (
+            "```shell\nconda create -n demo python=3.12\nconda activate demo\n"
+            "git clone https://github.com/example/model.git\ncd model\npip install -e .\n```\n"
+        ),
         "```bash\ngit clone https://github.com/owner/repo.git repo\n```\n",
         "```console\ngit clone https://github.com/owner/repo.git\n```\n",
         "```terminal\n$ git clone https://github.com/owner/repo.git\n```\n",
@@ -6702,23 +6708,29 @@ def _assert_requirements_actionable(tmp_path: Path, requirement_line: str) -> No
         "```bash\npython3 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
         "```bash\npython3.12 -m pip install --index-url=https://pypi.org/simple/ torch\n```\n",
         "```bash\ngit clone https://github.com/owner/repo.git\ncmake -B build -DAPP_INCLUDE_TESTS=ON\n```\n",
-        "```bash\nuv pip install --pre vllm==0.10.1+gptoss \\\n"
-        "  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \\\n"
-        "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
-        "  --index-strategy unsafe-best-match\nvllm serve openai/gpt-oss-20b\n```\n",
+        (
+            "```bash\nuv pip install --pre vllm==0.10.1+gptoss \\\n"
+            "  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \\\n"
+            "  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \\\n"
+            "  --index-strategy unsafe-best-match\nvllm serve openai/gpt-oss-20b\n```\n"
+        ),
         '```python\nfrom openai import OpenAI\nclient = OpenAI(\nbase_url="http://localhost:8000/v1",\napi_key="EMPTY",\n)\n```\n',
         '```\nfrom openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")\n```\n',
         '```\n# client setup\nimport openai\nclient = openai.OpenAI(base_url="http://localhost:8000/v1")\n```\n',
         '~~~py\nclient = OpenAI(base_url="http://127.0.0.1:8001/v1/")\n~~~\n',
         '```python\nclient = OpenAI(base_url="http://[::1]:8000/v1")\n```\n',
         '> ```python\n> client = OpenAI(base_url="http://localhost:8000/v1")\n> ```\n',
-        '```python\nsystem = "You are helpful"\nclient = OpenAI(base_url="http://localhost:8000/v1")\n'
-        'messages = [{"role": "system", "content": system}]\n```\n',
+        (
+            '```python\nsystem = "You are helpful"\nclient = OpenAI(base_url="http://localhost:8000/v1")\n'
+            'messages = [{"role": "system", "content": system}]\n```\n'
+        ),
         '```python\nclient = OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"))\n```\n',
         '```python\nllm_cfg = {"model": "demo", "model_server": "http://localhost:8000/v1", "api_key": "EMPTY"}\n```\n',
-        '```python\nmessages = [{"role": "user", "content": '
-        '"https://qwenlm.github.io/blog/ Introduce Qwen developments"}]\n'
-        "for response in bot.run(messages=messages):\n    pass\n```\n",
+        (
+            '```python\nmessages = [{"role": "user", "content": '
+            '"https://qwenlm.github.io/blog/ Introduce Qwen developments"}]\n'
+            "for response in bot.run(messages=messages):\n    pass\n```\n"
+        ),
     ],
 )
 def test_routine_documented_examples_are_informational(tmp_path: Path, content: str, crlf: bool) -> None:
@@ -6974,8 +6986,10 @@ def test_documented_setup_preserves_suspicious_commands(tmp_path: Path, command:
         "Run the following command: python repo/install.py\n",
         "Next: `./repo/install`\n",
         "~~~bash\nsh -h\n~~~\n",
-        "~~~python\nfrom importlib.machinery import SourceFileLoader\n"
-        "SourceFileLoader('setup', 'repo/setup.py').load_module()\n~~~\n",
+        (
+            "~~~python\nfrom importlib.machinery import SourceFileLoader\n"
+            "SourceFileLoader('setup', 'repo/setup.py').load_module()\n~~~\n"
+        ),
         "~~~python\nimport site\nsite.addsitedir('repo')\n~~~\n",
         "~~~python\nimport torch\ntorch.hub.load('repo', 'model', source='local')\n~~~\n",
         "~~~python\nimport torch\ntorch.load('repo/weights', **options)\n~~~\n",
@@ -7279,13 +7293,19 @@ def test_documented_client_preserves_suspicious_endpoints(tmp_path: Path, url: s
         'client = OpenAI(base_url="http://localhost:8000/v1")\nexec(source)',
         'system = exec\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
         'system = "data"\nsystem = os.system\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsystem(source)',
-        'system = "data"\ndef run(system):\n    executor = system\n    executor(source)\n'
-        'client = OpenAI(base_url="http://localhost:8000/v1")',
-        'system = "data"\nglobals()["system"] = callback\nexecutor = system\nexecutor(source)\n'
-        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        (
+            'system = "data"\ndef run(system):\n    executor = system\n    executor(source)\n'
+            'client = OpenAI(base_url="http://localhost:8000/v1")'
+        ),
+        (
+            'system = "data"\nglobals()["system"] = callback\nexecutor = system\nexecutor(source)\n'
+            'client = OpenAI(base_url="http://localhost:8000/v1")'
+        ),
         'executor = system\nsystem = "data"\nexecutor(source)\nclient = OpenAI(base_url="http://localhost:8000/v1")',
-        'def prompt():\n    system = "data"\nexecutor = system\nexecutor(source)\n'
-        'client = OpenAI(base_url="http://localhost:8000/v1")',
+        (
+            'def prompt():\n    system = "data"\nexecutor = system\nexecutor(source)\n'
+            'client = OpenAI(base_url="http://localhost:8000/v1")'
+        ),
         'import subprocess as sp\nclient = OpenAI(base_url="http://localhost:8000/v1")\nsp.run(command)',
         'client = OpenAI(base_url="http://localhost:8000/v1"',
         'messages = [{"role": "user", "content": "https://qwenlm.github.io/blog/"}]\nexec(messages[0]["content"])',

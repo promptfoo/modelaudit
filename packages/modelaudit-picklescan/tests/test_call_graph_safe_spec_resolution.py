@@ -4074,10 +4074,13 @@ def test_call_graph_stability_error_details_carry_the_reason_without_changing_th
 
 
 def test_call_graph_error_details_do_not_read_arbitrary_exception_attributes() -> None:
+    attribute_reads: list[str] = []
+
     class HostileError(RuntimeError):
         def __getattribute__(self, name: str) -> object:
             if name == "stability_reason":
-                raise RuntimeError("boom")
+                attribute_reads.append(name)
+                raise AttributeError(name)
             return super().__getattribute__(name)
 
     report = package_api._with_call_graph_enrichment_errors(
@@ -4085,6 +4088,7 @@ def test_call_graph_error_details_do_not_read_arbitrary_exception_attributes() -
         (("python_call_graph", HostileError("unrelated")),),
     )
 
+    assert attribute_reads == []
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert report.errors[-1].details == {
@@ -4159,11 +4163,11 @@ def test_frozen_invoked_reference_requires_callable_body_coverage(
         "native_class": (True, object),
         "native": (True, len),
     }
-    monkeypatch.setattr(
-        call_graph,
-        "_call_graph_entrypoints_for_reference",
-        lambda *_args: ("ntpath.abspath",) if source_available else (),
-    )
+
+    def entrypoints_for_reference(*_args: object) -> tuple[str, ...]:
+        return ("ntpath.abspath",) if source_available else ()
+
+    monkeypatch.setattr(call_graph, "_call_graph_entrypoints_for_reference", entrypoints_for_reference)
     monkeypatch.setattr(call_graph, "_call_graph_source_unavailable_reason", lambda _module: None)
     monkeypatch.setattr(call_graph, "_interpreter_module_origin_without_import_hooks", lambda _module: "frozen")
     monkeypatch.setattr(

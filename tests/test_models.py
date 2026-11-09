@@ -54,8 +54,10 @@ def test_public_modules_import_independently(module: str) -> None:
         [
             sys.executable,
             "-c",
-            "import importlib, pathlib, sys; module = importlib.import_module(sys.argv[1]); "
-            "assert pathlib.Path(module.__file__).resolve().is_relative_to(pathlib.Path.cwd())",
+            (
+                "import importlib, pathlib, sys; module = importlib.import_module(sys.argv[1]); "
+                "assert pathlib.Path(module.__file__).resolve().is_relative_to(pathlib.Path.cwd())"
+            ),
             module,
         ],
         cwd=Path(__file__).resolve().parents[1],

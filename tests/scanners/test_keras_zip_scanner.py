@@ -1090,7 +1090,7 @@ class TestKerasZipScanner:
         keras_path = _keras_zip_with_embedded_weights(tmp_path, weights_path=create_regular_weights_h5(tmp_path))
         cache_dir = tmp_path / "embedded-hdf5-cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first = scan_model_directory_or_file(
                 str(keras_path),
                 cache_enabled=True,
@@ -1143,7 +1143,7 @@ class TestKerasZipScanner:
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
         cache_dir = tmp_path / "missing-h5py-cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             first_result = scan_model_directory_or_file(
                 str(keras_path),
                 cache_enabled=True,
@@ -1178,7 +1178,7 @@ class TestKerasZipScanner:
         keras_path = _keras_zip_with_embedded_weights(tmp_path, weights_path=create_regular_weights_h5(tmp_path))
         cache_dir = tmp_path / "stale-missing-h5py-cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
             monkeypatch.setattr(
                 cache_decorator_module,
@@ -1222,7 +1222,7 @@ class TestKerasZipScanner:
         keras_path = _keras_zip_with_embedded_weights(tmp_path, weights_path=create_regular_weights_h5(tmp_path))
         cache_dir = tmp_path / "runtime-h5py-failure-cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
             monkeypatch.setattr(
                 cache_decorator_module,
@@ -1275,7 +1275,7 @@ class TestKerasZipScanner:
             archive.write(weights_path, "./model.weights.h5")
         cache_dir = tmp_path / "normalized-members-cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
             monkeypatch.setattr(
                 cache_decorator_module,

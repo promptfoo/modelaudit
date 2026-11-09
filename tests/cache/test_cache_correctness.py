@@ -10,7 +10,7 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from importlib.abc import MetaPathFinder
 from importlib.machinery import (
@@ -1370,9 +1370,9 @@ def test_clear_cache_waits_for_active_identity_capture(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     capture_hash_entered = threading.Event()
     allow_capture_hash = threading.Event()
+    capture_completed = threading.Event()
     clear_started = threading.Event()
     clear_completed = threading.Event()
-    worker_errors: list[BaseException] = []
     original_hash = cache.hasher.hash_file_with_stat
 
     def block_identity_hash(path: str, file_stat: os.stat_result) -> str:
@@ -1382,20 +1382,14 @@ def test_clear_cache_waits_for_active_identity_capture(
         return original_hash(path, file_stat)
 
     def capture_identity() -> None:
-        try:
-            identity = cache.capture_file_identity(str(file_path))
-            cache.release_ancestor_identity(identity[-1])
-        except BaseException as exc:
-            worker_errors.append(exc)
+        identity = cache.capture_file_identity(str(file_path))
+        cache.release_ancestor_identity(identity[-1])
+        capture_completed.set()
 
     def clear_identity_cache() -> None:
         clear_started.set()
-        try:
-            cache.clear_cache()
-        except BaseException as exc:
-            worker_errors.append(exc)
-        finally:
-            clear_completed.set()
+        cache.clear_cache()
+        clear_completed.set()
 
     monkeypatch.setattr(cache.hasher, "hash_file_with_stat", block_identity_hash)
     capture_thread = threading.Thread(target=capture_identity, daemon=True)
@@ -1415,7 +1409,7 @@ def test_clear_cache_waits_for_active_identity_capture(
 
     assert not capture_thread.is_alive()
     assert not clear_thread.is_alive()
-    assert worker_errors == []
+    assert capture_completed.is_set()
     assert clear_completed.is_set()
     assert cache._active_identity_captures == 0
     assert cache.metadata_file.exists()
@@ -5887,16 +5881,14 @@ def test_darwin_read_attribute_queue_tracks_new_descriptor_after_capture_retry(
     original_monitor = ScanResultsCache._monitor_ancestor_identity
     original_matches = ScanResultsCache._ancestor_identity_matches
     monitor_descriptors: list[int] = []
-    held_descriptors: list[int] = []
     pending_ancestor_change = False
     injected_changes = 0
 
     def monitor_with_descriptor_reuse(file_path: str, identity: AncestorIdentity) -> AncestorIdentity:
         nonlocal pending_ancestor_change
-        if len(monitor_descriptors) == 1:
-            # Occupy the released descriptor as another concurrent reader could.
-            held_descriptors.append(os.open(file_path, os.O_RDONLY))
-        monitored = original_monitor(file_path, identity)
+        # Occupy the released descriptor while the retry opens its replacement.
+        with Path(file_path).open("rb") if len(monitor_descriptors) == 1 else nullcontext():
+            monitored = original_monitor(file_path, identity)
         descriptor = getattr(monitored.monitor, "_file_descriptor", None)
         assert isinstance(descriptor, int)
         monitor_descriptors.append(descriptor)
@@ -5914,11 +5906,7 @@ def test_darwin_read_attribute_queue_tracks_new_descriptor_after_capture_retry(
 
     monkeypatch.setattr(ScanResultsCache, "_monitor_ancestor_identity", staticmethod(monitor_with_descriptor_reuse))
     monkeypatch.setattr(ScanResultsCache, "_ancestor_identity_matches", staticmethod(matches_after_transient_change))
-    try:
-        test_darwin_path_monitor_allows_read_between_capture_and_store(tmp_path, monkeypatch)
-    finally:
-        for descriptor in held_descriptors:
-            os.close(descriptor)
+    test_darwin_path_monitor_allows_read_between_capture_and_store(tmp_path, monkeypatch)
 
     assert injected_changes == 1
     assert len(monitor_descriptors) >= 2

@@ -139,7 +139,7 @@ class TestMetadataScanner:
         metadata_path.write_text("model-index:\n- name: clean-model\n" + "x" * 11_000, encoding="utf-8")
         cache_dir = tmp_path / "cache"
 
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
+        with IsolatedCacheManager(reset_cache_manager):
             with monkeypatch.context() as warm_cache:
                 warm_cache.setattr(
                     cache_decorator,

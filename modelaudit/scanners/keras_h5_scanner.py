@@ -36,7 +36,7 @@ from ._evidence_redaction import (
 )
 from .base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
-    _DANGEROUS_CONFIG_MODULE_ROOTS,
+    DANGEROUS_CONFIG_MODULE_ROOTS,
     _keras_exact_module_policy,
     check_custom_loss_config,
     check_custom_metric_config,
@@ -2713,7 +2713,7 @@ class KerasH5Scanner(BaseScanner):
         is_dangerous = (
             self._is_dangerous_exact_module_reference(source, module_value, object_class)
             or bool(symbol_tokens & self._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES)
-            or top_module in _DANGEROUS_CONFIG_MODULE_ROOTS
+            or top_module in DANGEROUS_CONFIG_MODULE_ROOTS
         )
         is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
         is_untrusted_callable = is_callable_reference and not self._is_allowlisted_config_callable(
