@@ -4,6 +4,30 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](../../docs/agents/release-process.md#version-scheme-0ver).
 
+## [0.1.14](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.13...modelaudit-picklescan-v0.1.14) (2026-11-09)
+
+
+### Features
+
+* **release:** build reviewed package notes with Towncrier ([#1981](https://github.com/promptfoo/modelaudit/issues/1981)) ([828ee0a](https://github.com/promptfoo/modelaudit/commit/828ee0ac4ca180b40357c0fb3cc68b3d19b70652))
+
+
+### Bug Fixes
+
+* **picklescan:** describe non-allowlisted globals used in invocations ([#1951](https://github.com/promptfoo/modelaudit/issues/1951)) ([4b7cd0a](https://github.com/promptfoo/modelaudit/commit/4b7cd0ab91d5daca7f7ce3c6ee3e008963bd3de4))
+* **picklescan:** preserve reference positions across the opcode budget ([#1997](https://github.com/promptfoo/modelaudit/issues/1997)) ([c700103](https://github.com/promptfoo/modelaudit/commit/c700103b8026998a640280c9d4c703758d4ed0dc))
+* **picklescan:** refresh report context and explain stability failures ([#1931](https://github.com/promptfoo/modelaudit/issues/1931)) ([f9d9fff](https://github.com/promptfoo/modelaudit/commit/f9d9fffba0fad3e3cfbbebb3596f33773b238273))
+* **picklescan:** reject non-ASCII protocol 0 persistent IDs ([#1956](https://github.com/promptfoo/modelaudit/issues/1956)) ([e4cfd66](https://github.com/promptfoo/modelaudit/commit/e4cfd667dea45175f0cb87e63c4c490d53d502f5))
+* **picklescan:** report observed Latin-1 codec requests ([#1969](https://github.com/promptfoo/modelaudit/issues/1969)) ([76e1a8c](https://github.com/promptfoo/modelaudit/commit/76e1a8c9b754070e002893445fcf4cc868e6736f))
+* **picklescan:** validate storage IDs in large PyTorch checkpoints ([#1957](https://github.com/promptfoo/modelaudit/issues/1957)) ([adc0dc4](https://github.com/promptfoo/modelaudit/commit/adc0dc47eea2e5843221143b07062cdd9ced4c44))
+
+
+### Performance Improvements
+
+* **picklescan:** avoid redundant work when building reports ([#2001](https://github.com/promptfoo/modelaudit/issues/2001)) ([a5ef97b](https://github.com/promptfoo/modelaudit/commit/a5ef97b1121147a5b1f88c2de89b7b76eafff332))
+* **picklescan:** avoid repeated copies while traversing pickle streams ([#2019](https://github.com/promptfoo/modelaudit/issues/2019)) ([e4230d6](https://github.com/promptfoo/modelaudit/commit/e4230d65d09fd7eefc96b50b19a68be353704cb1))
+* **picklescan:** bound reference tracking and avoid reducer operand copies ([#2018](https://github.com/promptfoo/modelaudit/issues/2018)) ([31d8520](https://github.com/promptfoo/modelaudit/commit/31d85203686d18affc3dfb664d683b9956c46a8d))
+
 ## [Unreleased]
 
 [Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.13...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.

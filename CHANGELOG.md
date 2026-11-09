@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](docs/agents/release-process.md#version-scheme-0ver).
 
+## [0.2.56](https://github.com/promptfoo/modelaudit/compare/v0.2.55...v0.2.56) (2026-11-09)
+
+
+### Features
+
+* **release:** build reviewed package notes with Towncrier ([#1981](https://github.com/promptfoo/modelaudit/issues/1981)) ([828ee0a](https://github.com/promptfoo/modelaudit/commit/828ee0ac4ca180b40357c0fb3cc68b3d19b70652))
+* triage documentation findings when an API key is set ([#1924](https://github.com/promptfoo/modelaudit/issues/1924)) ([ef6335d](https://github.com/promptfoo/modelaudit/commit/ef6335de8deda9724602c285a85b75ccbd33d17a))
+
+
+### Bug Fixes
+
+* attribute license warnings to declared restrictions ([#1960](https://github.com/promptfoo/modelaudit/issues/1960)) ([195a5d1](https://github.com/promptfoo/modelaudit/commit/195a5d17888629bec858f89e2165ba7f4e8b065d))
+* classify routine README examples as informational ([#1913](https://github.com/promptfoo/modelaudit/issues/1913)) ([5d2ae48](https://github.com/promptfoo/modelaudit/commit/5d2ae48f91f61065bc2c7e5b34ab5ff68f12c667))
+* **deps:** bump brotlicffi from 1.2.0.2 to 1.2.1.0 ([#1929](https://github.com/promptfoo/modelaudit/issues/1929)) ([6f28a21](https://github.com/promptfoo/modelaudit/commit/6f28a21d85668aef5b1d12765c04ddca9913bb3a))
+* **deps:** update dependency towncrier to v26 ([#1995](https://github.com/promptfoo/modelaudit/issues/1995)) ([adbe769](https://github.com/promptfoo/modelaudit/commit/adbe76929df860e8e127b9f88d52dc0d3f3f1d09))
+* distinguish documented network references from model behavior ([#1963](https://github.com/promptfoo/modelaudit/issues/1963)) ([032e33b](https://github.com/promptfoo/modelaudit/commit/032e33bf263c3ffefe3bc07b8d68d37c9809d265))
+* distinguish network endpoints from version, clock, and CSS literals ([#1950](https://github.com/promptfoo/modelaudit/issues/1950)) ([8f2aae3](https://github.com/promptfoo/modelaudit/commit/8f2aae374dd395ba4f706cc26eb4ccc3d2e74e8c))
+* distinguish prompt prose from oversized GGUF template injection ([#1968](https://github.com/promptfoo/modelaudit/issues/1968)) ([850f24a](https://github.com/promptfoo/modelaudit/commit/850f24a7c0a541e68f6528ae8bdeda3d817b266e))
+* **docker:** upgrade zlib in runtime images ([#1939](https://github.com/promptfoo/modelaudit/issues/1939)) ([5923bb5](https://github.com/promptfoo/modelaudit/commit/5923bb5a92bf6fc209e63d4ce6d17c824b3d450f))
+* **gguf:** recognize F8_E4M3 tensors ([#1970](https://github.com/promptfoo/modelaudit/issues/1970)) ([17b685a](https://github.com/promptfoo/modelaudit/commit/17b685ae8dfd2a6d6a11cce6375826b27efb125e))
+* handle Windows file timestamps across paths and descriptors ([#1971](https://github.com/promptfoo/modelaudit/issues/1971)) ([1d69b9f](https://github.com/promptfoo/modelaudit/commit/1d69b9f942f5950bc53fd62408bf2f29d69ab1f7))
+* **jinja:** stop flagging formatter macro declarations ([#1961](https://github.com/promptfoo/modelaudit/issues/1961)) ([d20ea2c](https://github.com/promptfoo/modelaudit/commit/d20ea2ccf19c6866a031dc9463c7f8df5dd87523))
+* **licenses:** recognize corroborated ModelScope generation descriptors ([#2009](https://github.com/promptfoo/modelaudit/issues/2009)) ([b91e786](https://github.com/promptfoo/modelaudit/commit/b91e786a93a72618ab9bf12858462ba793a3da2b))
+* **licenses:** recognize model repository JSON metadata ([#1964](https://github.com/promptfoo/modelaudit/issues/1964)) ([2b3b090](https://github.com/promptfoo/modelaudit/commit/2b3b09029575e2c32337a4e9c318f770bd516b7b))
+* **metadata:** continue scanning after malformed URLs ([#1948](https://github.com/promptfoo/modelaudit/issues/1948)) ([5be6d04](https://github.com/promptfoo/modelaudit/commit/5be6d04d663efb83046c6c59abe44f5e88459599))
+* **pickle:** retain findings with oversized display positions ([#2012](https://github.com/promptfoo/modelaudit/issues/2012)) ([8580203](https://github.com/promptfoo/modelaudit/commit/8580203074372f6749ce018943bf5710c78eab0f))
+* **picklescan:** describe non-allowlisted globals used in invocations ([#1951](https://github.com/promptfoo/modelaudit/issues/1951)) ([4b7cd0a](https://github.com/promptfoo/modelaudit/commit/4b7cd0ab91d5daca7f7ce3c6ee3e008963bd3de4))
+* **picklescan:** preserve reference positions across the opcode budget ([#1997](https://github.com/promptfoo/modelaudit/issues/1997)) ([c700103](https://github.com/promptfoo/modelaudit/commit/c700103b8026998a640280c9d4c703758d4ed0dc))
+* **picklescan:** refresh report context and explain stability failures ([#1931](https://github.com/promptfoo/modelaudit/issues/1931)) ([f9d9fff](https://github.com/promptfoo/modelaudit/commit/f9d9fffba0fad3e3cfbbebb3596f33773b238273))
+* **picklescan:** reject non-ASCII protocol 0 persistent IDs ([#1956](https://github.com/promptfoo/modelaudit/issues/1956)) ([e4cfd66](https://github.com/promptfoo/modelaudit/commit/e4cfd667dea45175f0cb87e63c4c490d53d502f5))
+* **picklescan:** report observed Latin-1 codec requests ([#1969](https://github.com/promptfoo/modelaudit/issues/1969)) ([76e1a8c](https://github.com/promptfoo/modelaudit/commit/76e1a8c9b754070e002893445fcf4cc868e6736f))
+* **picklescan:** validate storage IDs in large PyTorch checkpoints ([#1957](https://github.com/promptfoo/modelaudit/issues/1957)) ([adc0dc4](https://github.com/promptfoo/modelaudit/commit/adc0dc47eea2e5843221143b07062cdd9ced4c44))
+* preserve text routing for requirements manifests ([#1955](https://github.com/promptfoo/modelaudit/issues/1955)) ([ec2adab](https://github.com/promptfoo/modelaudit/commit/ec2adabb7223b6378f432d2be22e0e9d914d290d))
+* **pytorch:** recognize legacy TorchScript declaration-only source ([#1967](https://github.com/promptfoo/modelaudit/issues/1967)) ([27f33f4](https://github.com/promptfoo/modelaudit/commit/27f33f44ff734082b1866430bd5435e839b10f79))
+* **pytorch:** scope weights-only CVE attribution to the legacy TAR loader ([#1953](https://github.com/promptfoo/modelaudit/issues/1953)) ([7a89b2e](https://github.com/promptfoo/modelaudit/commit/7a89b2e673fb7296ba525a25022d202f409ca508))
+* recognize legacy Tekken and large SafeTensors index JSON ([#1962](https://github.com/promptfoo/modelaudit/issues/1962)) ([4d01d9e](https://github.com/promptfoo/modelaudit/commit/4d01d9e9b7092e94300a80900567dfdf41a570db))
+* **release:** keep late fragments pending and validate reviewed notes ([#2004](https://github.com/promptfoo/modelaudit/issues/2004)) ([5bdb30b](https://github.com/promptfoo/modelaudit/commit/5bdb30b549a888c36eb13eb503e8eaada16dc333))
+* **release:** preserve reviewed notes on metadata retries ([#2005](https://github.com/promptfoo/modelaudit/issues/2005)) ([0def9d8](https://github.com/promptfoo/modelaudit/commit/0def9d8c41906b82fd98ae499c18212bf76cd37b))
+* **results:** preserve severity and evidence in consolidated checks ([#1949](https://github.com/promptfoo/modelaudit/issues/1949)) ([3bc0474](https://github.com/promptfoo/modelaudit/commit/3bc04748a19654c706c99b7524b136eef3e43ae3))
+* **routing:** distinguish SafeTensors lengths from pickle streams ([#1965](https://github.com/promptfoo/modelaudit/issues/1965)) ([1560c53](https://github.com/promptfoo/modelaudit/commit/1560c53241fd1090e8dac05ee2b2022ac4ec5308))
+* **routing:** recognize validated tokenizer model files ([#1952](https://github.com/promptfoo/modelaudit/issues/1952)) ([d2fa4f9](https://github.com/promptfoo/modelaudit/commit/d2fa4f96976d3872c76b8f9dc45439074cb79d55))
+* **routing:** reject invalid CoreML wire types in large native archives ([#1954](https://github.com/promptfoo/modelaudit/issues/1954)) ([0eda93a](https://github.com/promptfoo/modelaudit/commit/0eda93aea02cfad383c0f1e885e160af25a3403c))
+* **routing:** rule out checkpoint formats on auxiliary files ([#1959](https://github.com/promptfoo/modelaudit/issues/1959)) ([5b12a90](https://github.com/promptfoo/modelaudit/commit/5b12a9004a4e2efb2d9e189245bc7af1ed8d0f85))
+* **routing:** rule out Flax on bounded ONNX external weights ([#2008](https://github.com/promptfoo/modelaudit/issues/2008)) ([4c12818](https://github.com/promptfoo/modelaudit/commit/4c12818761dddfef78ff7db8695b5e932f9ba51b))
+* **scanners:** classify large shard indexes and describe documented ports ([#2000](https://github.com/promptfoo/modelaudit/issues/2000)) ([8514611](https://github.com/promptfoo/modelaudit/commit/8514611b575eb596cb8ce5de76a94fbd2f7353db))
+* **scanners:** distinguish parse limits and safe loader failures from invalid syntax ([#1958](https://github.com/promptfoo/modelaudit/issues/1958)) ([3998b8a](https://github.com/promptfoo/modelaudit/commit/3998b8aa87b103241d2e0b2a0e204c04295a8839))
+* **scanners:** recognize reviewed Flint NUL removal and clarify model-card findings ([#1992](https://github.com/promptfoo/modelaudit/issues/1992)) ([8dc0a00](https://github.com/promptfoo/modelaudit/commit/8dc0a0081dea8188900375f530768840a442fcb9))
+* **secrets:** validate legacy Bitcoin address checksums ([#1947](https://github.com/promptfoo/modelaudit/issues/1947)) ([62f6b2c](https://github.com/promptfoo/modelaudit/commit/62f6b2c34634c4ed45f4a600b6b6b71ee1a7cf16))
+* **text:** distinguish responsible AI misuse disclosures from malware behavior ([#2003](https://github.com/promptfoo/modelaudit/issues/2003)) ([70810c1](https://github.com/promptfoo/modelaudit/commit/70810c1d065e2ffa494de3e2d1bd4e353472f772))
+* **text:** reduce model-card false positives ([#1912](https://github.com/promptfoo/modelaudit/issues/1912)) ([c48e5f7](https://github.com/promptfoo/modelaudit/commit/c48e5f7584716f4d703a5e8a4b6134856d99acac))
+* verify SafeTensors shard coverage against observed members ([#1966](https://github.com/promptfoo/modelaudit/issues/1966)) ([6eed2b6](https://github.com/promptfoo/modelaudit/commit/6eed2b68a3608c85d36bb954f50de5553bed91f7))
+
+
+### Performance Improvements
+
+* **picklescan:** avoid redundant work when building reports ([#2001](https://github.com/promptfoo/modelaudit/issues/2001)) ([a5ef97b](https://github.com/promptfoo/modelaudit/commit/a5ef97b1121147a5b1f88c2de89b7b76eafff332))
+* **picklescan:** avoid repeated copies while traversing pickle streams ([#2019](https://github.com/promptfoo/modelaudit/issues/2019)) ([e4230d6](https://github.com/promptfoo/modelaudit/commit/e4230d65d09fd7eefc96b50b19a68be353704cb1))
+* **picklescan:** bound reference tracking and avoid reducer operand copies ([#2018](https://github.com/promptfoo/modelaudit/issues/2018)) ([31d8520](https://github.com/promptfoo/modelaudit/commit/31d85203686d18affc3dfb664d683b9956c46a8d))
+
 ## [Unreleased]
 
 [Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.55...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
