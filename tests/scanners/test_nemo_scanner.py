@@ -1558,9 +1558,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_detects_writer_symlink_installed_through_parent_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-writer-symlinked-parent.nemo"
@@ -1591,9 +1589,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_fresh_hardlink_symlink_fallback_safe_replacement_fails_closed(
         self, tmp_path: Path
@@ -1608,9 +1604,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_ignores_unrelated_post_source_fallback_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-unrelated-post-source-fallback-alias.nemo"
@@ -1641,9 +1635,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_ignores_unrelated_pre_source_fallback_alias(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-unrelated-pre-source-fallback-alias.nemo"
@@ -1678,9 +1670,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_ignores_payload_replaced_after_fallback_parent_symlink(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-parent-symlink-hardlink-fallback-safe.nemo"
@@ -1698,9 +1688,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_source_rebound_before_load_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-source-rebound-before-load.nemo"
@@ -1713,9 +1701,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_alias_detects_colliding_hardlink_fallback_write(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-hardlink-collision-write.nemo"
@@ -1784,9 +1770,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_duplicate_checkpoint_symlink_uses_final_malicious_target(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-duplicate-symlink-final-target.nemo"
@@ -1954,9 +1938,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+        _assert_unsupported_link_without_cve_2025_23249(result)
 
     def test_hardlink_checkpoint_alias_detects_unknown_type_write_through(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-unknown-type-write.nemo"
@@ -2685,13 +2667,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_routes_forward_hardlink_root_config_for_fail_closed_scan(self, tmp_path: Path) -> None:
         path = tmp_path / "forward-hardlink-config.jpg"
@@ -2741,13 +2717,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_routes_forward_symlink_root_config_chain(self, tmp_path: Path) -> None:
         path = tmp_path / "forward-symlink-config-chain.jpg"
@@ -2758,13 +2728,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_does_not_report_shadowed_malicious_hardlink_chain_target(self, tmp_path: Path) -> None:
         path = tmp_path / "shadowed-hardlink-config-chain.jpg"
@@ -2788,13 +2752,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_does_not_report_later_safe_hardlink_target_replacement(self, tmp_path: Path) -> None:
         path = tmp_path / "later-safe-hardlink-config-replacement.jpg"
@@ -2819,13 +2777,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_write_through_later_hardlink_alias(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-later-alias-write.jpg"
@@ -2837,13 +2789,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_write_through_later_symlink_alias(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-later-symlink-write.jpg"
@@ -2855,13 +2801,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_colliding_hardlink_fallback_write(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-collision-write.jpg"
@@ -2874,13 +2814,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_nested_hardlink_fallback_write(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-nested-collision-write.jpg"
@@ -2895,13 +2829,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_preserves_hardlink_content_when_collision_falls_back_to_symlink(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-collision-symlink-fallback.jpg"
@@ -2915,13 +2843,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_fallback_symlink_back_to_hardlink_inode_fails_closed(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-config-symlink-back-to-inode.jpg"
@@ -2949,13 +2871,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_uses_final_colliding_hardlink_root_config(self, tmp_path: Path) -> None:
         path = tmp_path / "final-colliding-hardlink-root-config.jpg"
@@ -2967,13 +2883,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_outer_symlink_detects_colliding_hardlink_mutation(self, tmp_path: Path) -> None:
         path = tmp_path / "outer-symlink-hardlink-mutation.jpg"
@@ -2987,13 +2897,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_outer_symlink_does_not_report_rebound_safe_content(self, tmp_path: Path) -> None:
         path = tmp_path / "outer-symlink-hardlink-safe-rebinding.jpg"
@@ -3024,13 +2928,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_direct_unknown_type_root_config(self, tmp_path: Path) -> None:
         path = tmp_path / "direct-unknown-type-root-config.jpg"
@@ -3044,13 +2942,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_reports_multi_hop_symlink_write_through(self, tmp_path: Path) -> None:
         path = tmp_path / "multi-hop-symlink-write-through.jpg"
@@ -3064,13 +2956,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_hardlink_to_symlink_source_fails_closed(self, tmp_path: Path) -> None:
         path = tmp_path / "hardlink-to-symlink-source.jpg"
@@ -3430,13 +3316,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_core_scans_duplicate_root_config_replacement(self, tmp_path: Path) -> None:
         path = tmp_path / "duplicate-root-config.jpg"
@@ -3445,13 +3325,7 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_reports_os_system_target(result)
 
     def test_renamed_nemo_root_config_within_route_budget_is_scanned(
         self,
@@ -7995,6 +7869,22 @@ def _assert_hydra_target_critical_without_review(tmp_path: Path, target: str) ->
     )
 
 
+def _assert_nemo_reports_os_system_target(result: ScanResult) -> None:
+    assert result.scanner_name == "nemo"
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
+
+
+def _assert_unsupported_link_without_cve_2025_23249(result: ScanResult) -> None:
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "nemo_link_resolution_unsupported" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.details.get("cve_id") == "CVE-2025-23249" for check in result.checks)
+
+
 def _assert_nemo_root_config_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_limit: int, filename: str
 ) -> None:
@@ -8007,13 +7897,7 @@ def _assert_nemo_root_config_scan(
 
     result = scan_file(str(path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "nemo"
-    assert any(
-        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-        and check.status == CheckStatus.FAILED
-        and check.details["target"] == "os.system"
-        for check in result.checks
-    )
+    _assert_nemo_reports_os_system_target(result)
 
 
 def _assert_nemo_torch7_checkpoint_cve(tmp_path: Path, filename: str, payload: bytes) -> None:
@@ -8039,13 +7923,7 @@ def _assert_core_routes_renamed_nemo(
 
     result = scan_file(str(path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "nemo"
-    assert any(
-        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-        and check.status == CheckStatus.FAILED
-        and check.details["target"] == "os.system"
-        for check in result.checks
-    )
+    _assert_nemo_reports_os_system_target(result)
 
 
 def _assert_nemo_suspicious_target(tmp_path: Path, target: str, pattern: str) -> None:

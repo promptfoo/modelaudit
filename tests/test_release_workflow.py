@@ -177,6 +177,12 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     evidence = _step_by_name(steps, "Preserve Windows standalone test evidence")
     assert evidence["if"] == "always() && runner.os == 'Windows'"
     assert evidence["uses"].startswith("actions/upload-artifact@")
+    build = _step_by_name(steps, "Build standalone package")
+    output_dir = "/tmp/modelaudit-picklescan-dist"
+    primary, retry = build["run"].split("||")
+    assert shlex.split(primary, comments=True) == ["uv", "build", "--out-dir", output_dir]
+    assert shlex.split(retry) == ["uv", "build", "--offline", "--out-dir", output_dir]
+    assert not build.get("continue-on-error")
     smoke = _step_by_name(steps, "Smoke test standalone package wheel install")["run"]
     assert 'uv pip install --python "$SMOKE_PYTHON"' in smoke
     assert "/Scripts/python.exe" in smoke
@@ -309,15 +315,14 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
         == "steps.manual.outputs.manual_release != 'true' && github.event_name != 'repository_dispatch'"
     )
 
-    ensure_release_step = _step_by_name(release_steps, "Ensure manual GitHub releases exist")
-    assert ensure_release_step["if"] == (
-        "steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.root_provenance_recovery != 'true'"
-    )
-    ensure_release_run = ensure_release_step["run"]
-    assert 'gh release view "$ROOT_TAG"' in ensure_release_run
-    assert 'gh release view "$PICKLESCAN_TAG"' in ensure_release_run
-    assert 'gh release create "$ROOT_TAG"' in ensure_release_run
-    assert 'gh release create "$PICKLESCAN_TAG"' in ensure_release_run
+    publish_notes = _step_by_name(release_steps, "Publish notes from the tagged changelogs")
+    assert "root_provenance_recovery != 'true'" in publish_notes["if"]
+    notes_run = publish_notes["run"]
+    assert 'extract --package "$package" --version "$version" --ref "$source"' in notes_run
+    assert 'gh release create "$tag" --verify-tag' in notes_run
+    assert 'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"' in notes_run
+    assert 'publish_notes modelaudit "$ROOT_VERSION" v' in notes_run
+    assert 'publish_notes modelaudit-picklescan "$PICKLESCAN_VERSION" modelaudit-picklescan-v' in notes_run
 
     check_pr_step = _step_by_name(release_steps, "Check if PR exists")
     assert check_pr_step["env"] == {
@@ -600,7 +605,7 @@ def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     workflow = _load_release_workflow()
     sync_job = _jobs(workflow)["sync-release-metadata"]
     assert isinstance(sync_job, dict)
-    assert sync_job["permissions"] == {"contents": "read"}
+    assert sync_job["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert sync_job["needs"] == "release-please"
     assert sync_job["if"] == "needs.release-please.outputs.pr_branch != ''"
     assert sync_job["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
@@ -622,6 +627,7 @@ def test_release_changelogs_keep_one_unreleased_section() -> None:
 
     for changelog in changelogs:
         headings = [line for line in changelog.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
+        assert headings[0] == "## [Unreleased]"
         assert headings.count("## [Unreleased]") == 1
 
 
@@ -630,6 +636,8 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
     sync_steps = _job_steps(workflow, "sync-release-metadata")
     checkout_step = next(step for step in sync_steps if step.get("uses", "").startswith("actions/checkout@"))
     assert checkout_step["with"]["persist-credentials"] is False
+    assert _step_by_name(sync_steps, "Install uv")["with"]["enable-cache"] is False
+    assert _step_by_name(sync_steps, "Setup Node.js")["with"]["package-manager-cache"] is False
 
     source_step = _step_by_name(sync_steps, "Record release metadata source")
     assert source_step["id"] == "source"
