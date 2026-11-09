@@ -62,6 +62,8 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
 }
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
+# Every supported Python integer-string limit permits at least 640 decimal digits.
+_MAX_DISPLAY_POSITION_DIGITS = 640
 _LOCATION_POSITION_RE = re.compile(r"\(pos\s+(?P<position>\d+)\)\s*$")
 _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
     {
@@ -714,18 +716,33 @@ def _finding_reference_keys(findings: tuple[Finding, ...]) -> set[tuple[str, int
 
         positions = {
             value
-            for value in (
-                finding.details.get("global_position"),
-                finding.details.get("position"),
-                _location_position(finding.location),
-            )
+            for value in (finding.details.get("global_position"), finding.details.get("position"))
             if isinstance(value, int)
         }
+        location = finding.location if finding.location is not None else ""
+        display_position = _LOCATION_POSITION_RE.search(location)
+        if display_position:
+            # Read the matched text without invoking indexing hooks on a provider's label.
+            start, end = display_position.span("position")
+            tail = max(start, end - _MAX_DISPLAY_POSITION_DIGITS)
+            if start == tail or _only_zero_padding(location, start, tail):
+                positions.add(int(str.__getitem__(location, slice(tail, end))))
         if positions:
             keys.update((reference, position) for reference in import_references for position in positions)
-        else:
+        elif display_position is None:
             keys.update((reference, None) for reference in import_references)
     return keys
+
+
+def _only_zero_padding(text: str, start: int, end: int) -> bool:
+    first = str.__getitem__(text, start)
+    if int(first):
+        return False
+    # Count a run of one zero glyph without allocating a substring. Mixed scripts
+    # can also represent decimal zero, so check their digits individually.
+    return str.count(text, first, start, end) == end - start or all(
+        int(str.__getitem__(text, index)) == 0 for index in range(start, end)
+    )
 
 
 def _reference_has_finding(
@@ -735,15 +752,6 @@ def _reference_has_finding(
 ) -> bool:
     position_key = position if isinstance(position, int) else None
     return (import_reference, position_key) in finding_ref_keys or (import_reference, None) in finding_ref_keys
-
-
-def _location_position(location: str | None) -> int | None:
-    if not location:
-        return None
-    match = _LOCATION_POSITION_RE.search(location)
-    if match is None:
-        return None
-    return int(match.group("position"))
 
 
 def _add_legacy_detail_aliases(details: dict[str, Any]) -> dict[str, Any]:
