@@ -259,15 +259,16 @@ class TestSkopsScannerCVE2025_54886:
         self, tmp_path: Path, filename: str, content: str, pattern: str
     ) -> None:
         archive = tmp_path / "documentation.skops"
+        member = zipfile.ZipInfo(filename)
         with zipfile.ZipFile(archive, "w") as files:
-            files.writestr(filename, content)
+            files.writestr(member, content)
             files.writestr("schema.json", '{"version": "1.0"}')
 
         result = SkopsScanner().scan(str(archive))
         assert result.success
         [reference] = [check for check in result.checks if check.name == "Skops README Loader Reference"]
         assert reference.severity == IssueSeverity.INFO
-        assert reference.details["references"] == [{"file": filename, "pattern": pattern}]
+        assert reference.details["references"] == [{"file": member.filename, "pattern": pattern}]
         assert not result.has_warnings
 
     def test_mixed_readme_and_loader_keep_independent_findings(self, tmp_path: Path) -> None:
