@@ -904,44 +904,21 @@ def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence
     result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
     result.metadata["pickle_report_status"] = "inconclusive"
     result.metadata["pickle_verdict"] = "suspicious"
-    validated_details = {"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 10}
-    unvalidated_details = {"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 99}
-    result.checks.extend(
-        [
+    for message, position in (("validated dtype", 10), ("unvalidated dtype", 99)):
+        details = {"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": position}
+        result.checks.append(
             Check(
                 name="Standalone Pickle Finding",
                 status=CheckStatus.FAILED,
-                message="validated dtype",
+                message=message,
                 severity=IssueSeverity.WARNING,
-                details=validated_details,
+                details=details,
                 rule_code="NON_ALLOWLISTED_GLOBAL",
-            ),
-            Check(
-                name="Standalone Pickle Finding",
-                status=CheckStatus.FAILED,
-                message="unvalidated dtype",
-                severity=IssueSeverity.WARNING,
-                details=unvalidated_details,
-                rule_code="NON_ALLOWLISTED_GLOBAL",
-            ),
-        ]
-    )
-    result.issues.extend(
-        [
-            Issue(
-                message="validated dtype",
-                severity=IssueSeverity.WARNING,
-                details=validated_details,
-                rule_code="NON_ALLOWLISTED_GLOBAL",
-            ),
-            Issue(
-                message="unvalidated dtype",
-                severity=IssueSeverity.WARNING,
-                details=unvalidated_details,
-                rule_code="NON_ALLOWLISTED_GLOBAL",
-            ),
-        ]
-    )
+            )
+        )
+        result.issues.append(
+            Issue(message=message, severity=IssueSeverity.WARNING, details=details, rule_code="NON_ALLOWLISTED_GLOBAL")
+        )
 
     JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, {"numpy.dtype": frozenset({1})})
 
@@ -954,8 +931,21 @@ def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence
     assert result.metadata["pickle_verdict"] == "suspicious"
 
 
+@pytest.mark.parametrize(
+    ("source_notice", "messages", "retained"),
+    [
+        (False, ["validated dtype", "ambiguous dtype"], ["ambiguous dtype"]),
+        (False, ["duplicate", "duplicate"], ["duplicate", "duplicate"]),
+        (True, ["validated dtype"], []),
+        (True, ["first", "second"], ["first", "second"]),
+        (True, ["duplicate", "duplicate"], ["duplicate", "duplicate"]),
+    ],
+)
 def test_validated_joblib_wrapper_cleanup_preserves_ambiguous_no_position_dtype_occurrences(
     monkeypatch: pytest.MonkeyPatch,
+    source_notice: bool,
+    messages: list[str],
+    retained: list[str],
 ) -> None:
     monkeypatch.setattr(
         "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
@@ -968,22 +958,34 @@ def test_validated_joblib_wrapper_cleanup_preserves_ambiguous_no_position_dtype_
     result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
     result.metadata["pickle_report_status"] = "inconclusive"
     result.metadata["pickle_verdict"] = "suspicious"
-    for message in ("validated dtype", "ambiguous dtype"):
+    details = {"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype"}
+    if source_notice:
+        result.metadata["import_references"] = [{**details, "requires_origin_verification": True}]
+        details["notice_code"] = "call_graph_source_unavailable"
+    for message in messages:
         result.add_check(
-            name="Standalone Pickle Finding",
+            name="Standalone Pickle Notice" if source_notice else "Standalone Pickle Finding",
             passed=False,
             message=message,
-            severity=IssueSeverity.WARNING,
-            details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype"},
-            rule_code="NON_ALLOWLISTED_GLOBAL",
+            severity=IssueSeverity.INFO if source_notice else IssueSeverity.WARNING,
+            details=details,
+            rule_code=None if source_notice else "NON_ALLOWLISTED_GLOBAL",
         )
-    assert len(result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]) == 2
+    if not source_notice:
+        assert len(result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]) == len(messages)
 
     JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, {"numpy.dtype": frozenset({1})})
 
-    assert [check.message for check in result.checks] == ["ambiguous dtype"]
-    assert [issue.message for issue in result.issues] == ["ambiguous dtype"]
-    assert len(result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]) == 1
+    assert [check.message for check in result.checks] == retained
+    assert [issue.message for issue in result.issues] == retained
+    assert len(result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, [])) == (
+        0 if source_notice else len(retained)
+    )
+    if not retained:
+        assert "scan_outcome" not in result.metadata
+        assert result.metadata["pickle_report_status"] == "complete"
+        assert result.metadata["pickle_verdict"] == "clean"
+        return
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["pickle_report_status"] == "inconclusive"
     assert result.metadata["pickle_verdict"] == "suspicious"
