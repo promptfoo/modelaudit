@@ -17210,7 +17210,7 @@ def test_changed_onnx_weight_hardlinks_invalidate_only_their_inode(
         return _stat_result_with(info, ctime=1.0) if os.path.samestat(info, initial) else info
 
     monkeypatch.setattr(os, "stat", lambda *args, **kwargs: creation_time_view(real_stat(*args, **kwargs)))
-    monkeypatch.setattr(os, "lstat", lambda *args, **kwargs: creation_time_view(real_lstat(*args, **kwargs)))
+    monkeypatch.setattr(Path, "lstat", lambda path: creation_time_view(real_lstat(path)))
     monkeypatch.setattr(os, "fstat", lambda fd: creation_time_view(real_fstat(fd)))
     monkeypatch.setattr(
         ScanResultsCache,
