@@ -28,7 +28,10 @@ from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclus
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
-from modelaudit.scanners.text_scanner_support.model_card_policy import model_card_policy_evidence
+from modelaudit.scanners.text_scanner_support.model_card_policy import (
+    disclosure_has_harmful_claim,
+    model_card_policy_evidence,
+)
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
@@ -792,6 +795,25 @@ DOCUMENTATION_CLASSIFIER_LIMITATION_PATTERN = re.compile(
     + rb"\b(?=[.!]?\s*$)"
     rb"|\b(?:kill|reap|terminate)\s+zombie\s+(?:(?:gpu|cpu)\s+)?(?:process(?:es)?|procs?)\b",
     re.IGNORECASE,
+)
+DOCUMENTATION_MISUSE_COMPLIANCE_BULLET = re.compile(
+    rb"^[*+] Misuse: Other forms of misuse such as fraud, spam, or (?P<term>malware) production may be possible, "
+    rb"and developers should ensure that their applications do not violate applicable laws and regulations\."
+    rb"[ \t]*(?=\r?$)",
+    re.MULTILINE,
+)
+DOCUMENTATION_SECTION_HEADING = re.compile(rb"(?m)^ {0,3}(?:#{1,6}(?:[ \t][^\r\n]*|(?=\r?$))|(?:=+|-+)[ \t]*(?=\r?$))")
+DOCUMENTATION_MISUSE_LITERAL_MARKER = re.compile(
+    rb"(?P<closed><!--(?s:.*?)-->|<!\[CDATA\[(?s:.*?)\]\]>"
+    rb"|<(?P<tag>code|pre|script|style|textarea)[ \t]*>[^<]*</(?P=tag)[ \t]*>)"
+    rb"|<!--|<!\[CDATA\[|<(?:code|pre|script|style|textarea)(?=[\s/>])"
+    rb"|^ {0,3}(?:`{3,}|~{3,})|<<-?[ \t]*[a-z_'\"\\]|'{3}|\"{3}",
+    re.IGNORECASE | re.MULTILINE,
+)
+DOCUMENTATION_MISUSE_BULLET_END = re.compile(
+    rb"[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    rb"(?:</details>[ \t]*\r?\n(?:[ \t]*\r?\n)*)?"
+    rb"(?:##[ \t]+\S|[*+] Identification of individuals: )"
 )
 BENIGN_DOCUMENTATION_MISUSE_PATTERN = re.compile(
     rb"^\s*(?:\#{1,6}[ \t]+(?:misuse|safety|limitations)[ \t]*\#*[ \t]*\r?\n\s*)?"
@@ -2318,11 +2340,12 @@ class TextScanner(BaseScanner):
 
     @classmethod
     @lru_cache(maxsize=4)
-    def _documentation_fence_boundaries(cls, context: bytes) -> tuple[tuple[int, ...], int]:
+    def _documentation_fence_boundaries(cls, context: bytes) -> tuple[tuple[tuple[int, int], ...], int]:
         cursor = 0
         boundary = 0
-        boundaries: list[int] = []
+        boundaries: list[tuple[int, int]] = []
         opening: bytes | None = None
+        opening_start = 0
         markers = 0
         for line in context.splitlines(keepends=True):
             fence = re.fullmatch(rb" {0,3}(`{3,}|~{3,})([^\r\n]*)\r?\n?", line)
@@ -2336,9 +2359,10 @@ class TextScanner(BaseScanner):
                         context[max(boundary, cursor - MAX_TEXT_FINDING_CONTEXT_BYTES) : cursor]
                     ):
                         opening = delimiter
+                        opening_start = cursor
                 elif delimiter[:1] == opening[:1] and len(delimiter) >= len(opening) and not info.strip():
                     boundary = cursor + len(line)
-                    boundaries.append(boundary)
+                    boundaries.append((opening_start, boundary))
                     opening = None
             cursor += len(line)
         return tuple(boundaries), len(context)
@@ -2350,8 +2374,8 @@ class TextScanner(BaseScanner):
         boundaries, parsed_end = cls._documentation_fence_boundaries(payload[:MAX_TEXT_FENCE_CONTEXT_BYTES])
         if end > parsed_end:
             return start
-        index = bisect_right(boundaries, end)
-        return max(start, boundaries[index - 1] if index else 0)
+        index = bisect_right(boundaries, end, key=lambda span: span[1])
+        return max(start, boundaries[index - 1][1] if index else 0)
 
     @classmethod
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
@@ -2794,6 +2818,48 @@ class TextScanner(BaseScanner):
     @lru_cache(maxsize=4)
     def _bounded_documentation_has_harmful_behavior_claim(payload: bytes) -> bool:
         return DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN.search(payload) is not None
+
+    @classmethod
+    def _responsible_ai_misuse_term_position(cls, payload: bytes) -> int | None:
+        if len(payload) > MAX_TEXT_FENCE_CONTEXT_BYTES:
+            return None
+        bullet = DOCUMENTATION_MISUSE_COMPLIANCE_BULLET.search(payload)
+        if bullet is None or disclosure_has_harmful_claim(payload, DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN):
+            return None
+        # The complete list item must be followed by a sibling block, not a continuation of the claim.
+        if not DOCUMENTATION_MISUSE_BULLET_END.match(
+            payload, bullet.end(), bullet.end() + MAX_TEXT_FINDING_CONTEXT_BYTES
+        ):
+            return None
+        start = bullet.start()
+        heading = None
+        for match in DOCUMENTATION_SECTION_HEADING.finditer(
+            payload, max(0, start - MAX_DOCUMENTATION_CALL_CONTEXT_BYTES), start
+        ):
+            heading = match
+        if heading is None or heading.group().rstrip() != b"## Responsible AI Considerations":
+            return None
+
+        # Skip proven closed literals. A heading inside their contents is not a Markdown heading.
+        fences, parsed_end = cls._documentation_fence_boundaries(payload)
+        if start > parsed_end:
+            return None
+        fence_ends = dict(fences)
+        cursor = 0
+        while marker := DOCUMENTATION_MISUSE_LITERAL_MARKER.search(payload, cursor, start):
+            if marker.start("closed") >= 0:
+                cursor = marker.end()
+                if marker.start() <= heading.start() < cursor:
+                    return None
+            else:
+                fence_end = fence_ends.get(marker.start())
+                if fence_end is None or fence_end > heading.start():
+                    return None
+                cursor = fence_end
+        position = bullet.start("term")
+        if cls._documentation_policy_reference_actionability(payload, position) is False:
+            return position
+        return None
 
     @classmethod
     def _documentation_cc_finding_is_benign_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
@@ -3920,6 +3986,10 @@ class TextScanner(BaseScanner):
                         DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN,
                         cls._documentation_policy_reference_actionability,
                     )
+                    if any(f.get("type") == "cc_pattern" and f.get("pattern") == "malware" for f in findings):
+                        position = cls._responsible_ai_misuse_term_position(payload)
+                        if position is not None:
+                            prohibited_terms |= {position}
                     examples = (*examples, *references)
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True
