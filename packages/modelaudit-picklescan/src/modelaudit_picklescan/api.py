@@ -3713,27 +3713,19 @@ def _canonical_pytorch_tensor_rebuild_invocations_match(
 
 def _complete_pickle_stream_payloads(payload: bytes) -> tuple[tuple[int, bytes], ...] | None:
     streams: list[tuple[int, bytes]] = []
-    offset = 0
     opcode_count = 0
     stream = io.BytesIO(payload)
     try:
-        while offset < len(payload):
-            stream_end: int | None = None
-            stream.seek(offset)
-            for opcode, _arg, position in pickletools.genops(stream):
+        while (start := stream.tell()) < len(payload):
+            for opcode, _arg, _position in pickletools.genops(stream):
                 opcode_count += 1
                 if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
                     return None
-                if opcode.name != "STOP":
-                    continue
-                if type(position) is not int:
-                    return None
-                stream_end = position + 1
-                break
-            if stream_end is None:
+                if opcode.name == "STOP":
+                    break
+            else:
                 return None
-            streams.append((offset, payload[offset:stream_end]))
-            offset = stream_end
+            streams.append((start, payload[start : stream.tell()]))
     except Exception:
         return None
     return tuple(streams)
