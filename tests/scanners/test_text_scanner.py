@@ -78,6 +78,39 @@ class _FailingNetworkDetectorTextScanner(TextScanner):
         raise RuntimeError("controlled trusted-documentation network detector failure")
 
 
+def _timm_model_card_payload(model_name: str, *, crlf: bool) -> bytes:
+    example = (
+        "# Model card\n\n"
+        "```python\n"
+        "from urllib.request import urlopen\n"
+        "from PIL import Image\n"
+        "import timm\n\n"
+        "img = Image.open(urlopen(\n"
+        '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
+        'beignets-task-guide.png"\n'
+        "))\n"
+        f"model = timm.create_model('{model_name}', pretrained=True)\n"
+        "```\n"
+    )
+    return example.replace("\n", "\r\n").encode() if crlf else example.encode()
+
+
+def _assert_documentation_image_urlopen_rejected(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def _real_huggingface_image_readme_payload(fixture_name: str, *, crlf: bool) -> bytes:
     fixture_path = Path(__file__).resolve().parents[1] / "assets" / "huggingface_model_cards" / fixture_name
     original = fixture_path.read_bytes()
@@ -429,20 +462,7 @@ def test_text_scanner_unpinned_model_cards_are_informational(
     The generator that emits this snippet produces byte-identical code across every card it
     writes, so recognition must not depend on having seen a particular card before.
     """
-    example = (
-        "# Model card\n\n"
-        "```python\n"
-        "from urllib.request import urlopen\n"
-        "from PIL import Image\n"
-        "import timm\n\n"
-        "img = Image.open(urlopen(\n"
-        '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
-        'beignets-task-guide.png"\n'
-        "))\n"
-        f"model = timm.create_model('{model_name}', pretrained=True)\n"
-        "```\n"
-    )
-    payload = example.replace("\n", "\r\n").encode() if crlf else example.encode()
+    payload = _timm_model_card_payload(model_name, crlf=crlf)
     path = tmp_path / "README.md"
     path.write_bytes(payload)
 
@@ -474,33 +494,8 @@ def test_text_scanner_documentation_image_rejects_timm_source_prefixes(
     model_name: str,
     crlf: bool,
 ) -> None:
-    example = (
-        "# Model card\n\n"
-        "```python\n"
-        "from urllib.request import urlopen\n"
-        "from PIL import Image\n"
-        "import timm\n\n"
-        "img = Image.open(urlopen(\n"
-        '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
-        'beignets-task-guide.png"\n'
-        "))\n"
-        f"model = timm.create_model('{model_name}', pretrained=True)\n"
-        "```\n"
-    )
-    payload = example.replace("\n", "\r\n").encode() if crlf else example.encode()
-    path = tmp_path / "README.md"
-    path.write_bytes(payload)
-
-    result = TextScanner().scan(str(path))
-    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
-
-    assert result.success is False
-    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
-    assert any(
-        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
-        for check in _failed_network_detection_checks(result)
-    )
-    assert determine_exit_code(aggregate) == 1
+    payload = _timm_model_card_payload(model_name, crlf=crlf)
+    _assert_documentation_image_urlopen_rejected(tmp_path, payload)
 
 
 @pytest.mark.parametrize(
@@ -711,19 +706,7 @@ def test_text_scanner_documentation_image_rejects_side_effectful_code(
         "))\n```\n",
         f"))\n{injected_code}\n```\n",
     ).encode()
-    path = tmp_path / "README.md"
-    path.write_bytes(payload)
-
-    result = TextScanner().scan(str(path))
-    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
-
-    assert result.success is False
-    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
-    assert any(
-        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
-        for check in _failed_network_detection_checks(result)
-    )
-    assert determine_exit_code(aggregate) == 1
+    _assert_documentation_image_urlopen_rejected(tmp_path, payload)
 
 
 def test_text_scanner_documentation_image_rejects_timm_checkpoint_load(tmp_path: Path) -> None:
@@ -738,19 +721,7 @@ def test_text_scanner_documentation_image_rejects_timm_checkpoint_load(tmp_path:
         )
         .encode()
     )
-    path = tmp_path / "README.md"
-    path.write_bytes(payload)
-
-    result = TextScanner().scan(str(path))
-    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
-
-    assert result.success is False
-    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
-    assert any(
-        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
-        for check in _failed_network_detection_checks(result)
-    )
-    assert determine_exit_code(aggregate) == 1
+    _assert_documentation_image_urlopen_rejected(tmp_path, payload)
 
 
 @pytest.mark.parametrize(
