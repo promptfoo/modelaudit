@@ -25884,3 +25884,27 @@ def test_torchscript_native_format_selectors_keep_pickle_findings(tmp_path: Path
         and issue.details.get("position") == 2
         for issue in result.issues
     )
+
+
+def test_ordinary_archive_skips_torchscript_storage_probes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit_picklescan import api as picklescan_api
+
+    path = tmp_path / "checkpoint.ot"
+    members = _legacy_torchscript_archive_members(1)
+    del members["model/code/__torch__.py"]
+    _write_legacy_torchscript_archive(path, members)
+    scanner = PyTorchZipScanner()
+
+    def unexpected_probe(_archive: zipfile.ZipFile, _entry: zipfile.ZipInfo) -> bool:
+        pytest.fail("Missing TorchScript controls should be rejected before probing ZIP records")
+
+    monkeypatch.setattr(scanner, "_zip_payload_bounds_match", unexpected_probe)
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo("model/data.pkl")
+        assert not scanner._legacy_torchscript_global_positions(
+            archive,
+            info,
+            "model/code/__torch__.py",
+            members["model/data.pkl"],
+            picklescan_api._declared_torchscript_global_positions,
+        )

@@ -7831,6 +7831,8 @@ class PyTorchZipScanner(BaseScanner):
             source_name,
             source_name + ".debug_pkl",
         }
+        if any(name not in archive.NameToInfo for name in control_names):
+            return frozenset()
         storage_prefix = root + "data/"
         entries = archive.infolist()
         if (
