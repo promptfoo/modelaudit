@@ -467,6 +467,18 @@ def test_publication_sends_the_exact_tagged_section(
     assert (scratch / "created-tag").exists() == (not tagged)
 
 
+def write_project_versions(root: Path, root_version: str, sibling_version: str, bounds: str = "") -> None:
+    for path, version in [
+        (root / "pyproject.toml", root_version),
+        (root / SIBLING / "pyproject.toml", sibling_version),
+        (root / SIBLING / "Cargo.toml", sibling_version),
+    ]:
+        table = "package" if path.name == "Cargo.toml" else "project"
+        dependencies = f'dependencies = ["modelaudit-picklescan{bounds}"]\n' if bounds and path.parent == root else ""
+        name = "modelaudit" if path.parent == root else "modelaudit-picklescan"
+        path.write_text(f'[{table}]\nname = "{name}"\nversion = "{version}"\n{dependencies}')
+
+
 @pytest.mark.skipif(os.name == "nt" or shutil.which("jq") is None, reason="metadata job uses Bash and jq on Ubuntu")
 def test_metadata_job_accepts_only_review_comments_from_writers(
     repository: Path, tmp_path_factory: pytest.TempPathFactory
@@ -480,15 +492,27 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     tools.mkdir()
     for filename in ("towncrier.toml", "template.md", "uv.lock", "pyproject.toml"):
         shutil.copyfile(SCRIPT.parent / "release-tools" / filename, tools / filename)
+    helper = Path(".github/scripts/prepare-release-metadata.py")
+    (root / helper.parent).mkdir(parents=True)
+    shutil.copyfile(SCRIPT.parents[1] / helper, root / helper)
+    # A component can already be versioned on main before the release manifest catches up.
+    write_project_versions(root, "0.2.1", "0.1.2", ">=0.1.1,<0.2.0")
+    (root / "package-lock.json").write_text("protected dependency lock")
     fragment(root, notes, "Draft instructions.\n")
     base = commit(root, "pending change")
     git(root, "update-ref", "refs/remotes/origin/main", base)
     (root / "scripts" / SCRIPT.name).write_text("raise SystemExit('candidate code was executed')\n")
     (tools / "template.md").write_text("Candidate template was executed.\n")
     (tools / "uv.lock").write_text("invalid-lock\n")
-    write_manifest(root, "0.2.2", "0.1.1")
+    (root / "package-lock.json").write_text("unreviewed dependency lock")
+    (root / ".npmrc").write_text("candidate-only configuration")
+    write_manifest(root, "0.2.2", "0.1.2")
+    write_project_versions(root, "0.2.2", "0.1.2", ">=0.1.2,<0.2.0")
     raw_section(root, ".", "0.2.1", "0.2.2", "v")
+    raw_section(root, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
     head = commit(root, "release proposal")
+    git(root, "update-ref", "refs/remotes/origin/release-please--branches--main", head)
+    git(root, "switch", "--detach", base)
     marker = f"<!-- release-note: {notes} -->\n\n"
     comments = [
         {"id": 1, "user": {"login": "editor"}, "body": marker + "Earlier wording."},
@@ -500,10 +524,8 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     gh.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, pathlib, sys\n"
-        "if sys.argv[1:3] == ['pr', 'view']:\n"
-        " print(json.dumps(dict(state='OPEN', number=7, isCrossRepository=False, baseRefName='main',"
-        " headRefOid=os.environ['MOCK_HEAD'])))\n"
-        "elif '--paginate' in sys.argv: print(pathlib.Path(os.environ['RUNNER_TEMP'],'comments.json').read_text())\n"
+        "if '--paginate' in sys.argv and '/issues/7/comments?' in sys.argv[-1]:\n"
+        " print(pathlib.Path(os.environ['RUNNER_TEMP'],'comments.json').read_text())\n"
         "elif sys.argv[2].endswith('/editor/permission'): print('write')\n"
         "elif sys.argv[2].endswith('/visitor/permission'): print('read')\n"
         "else: sys.exit(2)\n"
@@ -511,22 +533,159 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     gh.chmod(0o755)
     workflow = yaml.safe_load((SCRIPT.parents[1] / ".github/workflows/release-please.yml").read_text())
     steps = workflow["jobs"]["sync-release-metadata"]["steps"]
-    shell = next(step["run"] for step in steps if step.get("name") == "Assemble reviewed package notes")
+    prepare = next(step["run"] for step in steps if step.get("name") == "Prepare release metadata inputs")
+    assemble = next(step["run"] for step in steps if step.get("name") == "Assemble reviewed package notes")
     env = {
         **os.environ,
         "PATH": str(scratch) + os.pathsep + os.environ["PATH"],
         "GITHUB_REPOSITORY": "example/modelaudit",
-        "PR_BRANCH": "release-please--branches--main",
+        "GITHUB_OUTPUT": str(scratch / "output"),
+        "PR_NUMBER": "7",
+        "EXPECTED_HEAD": head,
         "RUNNER_TEMP": str(scratch),
-        "MOCK_HEAD": head,
     }
-    subprocess.run(["bash", "-c", shell], cwd=root, env=env, check=True, capture_output=True)
+    moved = subprocess.run(["bash", "-c", prepare], cwd=root, env={**env, "EXPECTED_HEAD": base}, capture_output=True)
+    assert moved.returncode != 0 and b"changed before metadata generation" in moved.stdout
+    subprocess.run(["bash", "-c", prepare], cwd=root, env=env, check=True, capture_output=True)
+    assert (scratch / "output").read_text().strip() == f"sha={head}"
+    assert (root / "package-lock.json").read_text() == "protected dependency lock"
+    assert not (root / ".npmrc").exists()
+    assert 'version = "0.1.2"' in (root / SIBLING / "Cargo.toml").read_text()
+    assert "modelaudit-picklescan>=0.1.2,<0.2.0" in (root / "pyproject.toml").read_text()
+    rendered = subprocess.run(["bash", "-c", assemble], cwd=root, env=env, capture_output=True, text=True)
+    assert rendered.returncode == 0, rendered.stderr
     public = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2").stdout
     assert "Approved wording." in public
     assert "Earlier wording." not in public
     assert "Candidate template" not in public
     assert "Unapproved wording." not in public
     assert "Draft instructions." not in public
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Release metadata runs on Ubuntu")
+@pytest.mark.parametrize("mutation", ["manifest", "dependency", "fragment", "symlink"])
+def test_release_metadata_rejects_unexpected_candidate_inputs(repository: Path, mutation: str) -> None:
+    root = repository
+    write_project_versions(root, "0.2.1", "0.1.1")
+    base = commit(root, "release base")
+    write_manifest(root, "0.2.2", "0.1.1")
+    write_project_versions(root, "0.2.2", "0.1.1")
+    if mutation == "manifest":
+        write_manifest(root, "unexpected version", "0.1.1")
+    elif mutation == "dependency":
+        (root / SIBLING / "Cargo.toml").write_text('[package]\nversion = "0.1.1"\n[dependencies]\n')
+    elif mutation == "fragment":
+        fragment(root, "changes/+extra.other.md", "Only in candidate.")
+    else:
+        (root / "CHANGELOG.md").unlink()
+        (root / "CHANGELOG.md").symlink_to("pyproject.toml")
+    head = commit(root, "release proposal")
+    git(root, "switch", "--detach", base)
+
+    helper = SCRIPT.parents[1] / ".github/scripts/prepare-release-metadata.py"
+    result = subprocess.run([sys.executable, "-I", str(helper), base, head], cwd=root, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert {
+        "manifest": "Invalid release version",
+        "dependency": "Unexpected release configuration change",
+        "fragment": "Release candidate fragments differ",
+        "symlink": "Expected a regular release file",
+    }[mutation] in result.stderr
+
+
+def test_root_only_release_preserves_preversioned_sibling(repository: Path) -> None:
+    root = repository
+    write_project_versions(root, "0.2.1", "0.1.2", ">=0.1.0,<0.2.0")
+    base = commit(root, "preversion the standalone package")
+    write_manifest(root, "0.2.2", "0.1.1")
+    write_project_versions(root, "0.2.2", "0.1.2", ">=0.1.1,<0.2.0")
+    head = commit(root, "root-only release updating the sibling dependency floor")
+    git(root, "switch", "--detach", base)
+
+    helper = SCRIPT.parents[1] / ".github/scripts/prepare-release-metadata.py"
+    result = subprocess.run([sys.executable, "-I", str(helper), base, head], cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert git(root, "diff", base, "--", f"{SIBLING}/Cargo.toml", f"{SIBLING}/pyproject.toml") == ""
+    assert (root / "pyproject.toml").read_text().strip() == git(root, "show", f"{head}:pyproject.toml")
+
+
+@pytest.mark.parametrize(("ceiling", "valid"), [("0.3.0", True), ("9.0.0", False)])
+def test_release_metadata_sibling_floor_keeps_compatibility_bound(repository: Path, ceiling: str, valid: bool) -> None:
+    root = repository
+    write_project_versions(root, "0.2.1", "0.1.1", ">=0.1.1,<0.2.0")
+    base = commit(root, "release base")
+    write_manifest(root, "0.2.2", "0.2.0")
+    bounds = f">=0.2.0,<{ceiling}"
+    write_project_versions(root, "0.2.2", "0.2.0", bounds)
+    head = commit(root, "release proposal")
+    git(root, "switch", "--detach", base)
+
+    helper = SCRIPT.parents[1] / ".github/scripts/prepare-release-metadata.py"
+    result = subprocess.run([sys.executable, "-I", str(helper), base, head], cwd=root, capture_output=True, text=True)
+    if valid:
+        assert result.returncode == 0, result.stderr
+        assert bounds in (root / "pyproject.toml").read_text()
+    else:
+        assert result.returncode != 0 and "Unexpected release configuration change" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt" or shutil.which("jq") is None, reason="Metadata writer uses Bash and jq on Ubuntu")
+def test_metadata_writer_preserves_candidate_and_compares_remote_head(
+    repository: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    root = repository
+    scratch = tmp_path_factory.mktemp("writer")
+    files = ("uv.lock", "CHANGELOG.md", f"{SIBLING}/uv.lock", f"{SIBLING}/Cargo.lock", f"{SIBLING}/CHANGELOG.md")
+    for path in files:
+        (root / path).write_text("base metadata")
+        artifact = scratch / "modelaudit-release-metadata" / path
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(f"generated {path}")
+    base = commit(root, "release base")
+    (root / ".npmrc").write_text("candidate configuration")
+    head = commit(root, "release proposal")
+    git(root, "switch", "--detach", base)
+
+    branch = "release-please--branches--main"
+    remote = scratch / "remote.git"
+    git(root, "init", "--bare", str(remote))
+    git(root, "push", str(remote), f"{head}:refs/heads/{branch}")
+    git(root, "update-ref", f"refs/remotes/origin/{branch}", head)
+    git(root, "config", f"url.{remote}.insteadOf", "https://x-access-token:fixture@github.com/test/modelaudit.git")
+    workflow = yaml.safe_load((SCRIPT.parents[1] / ".github/workflows/release-please.yml").read_text())
+    steps = workflow["jobs"]["push-release-metadata"]["steps"]
+    shell = next(step["run"] for step in steps if step.get("name") == "Push release metadata updates")
+    gh = scratch / "gh"
+    gh.write_text('#!/bin/sh\n[ "$1 $2 $3" = "pr view 7" ] && cat "$MOCK_PR"\n')
+    gh.chmod(0o755)
+    pr = {"state": "OPEN", "isCrossRepository": False, "baseRefName": "main", "headRefName": branch, "headRefOid": head}
+    env = {
+        **os.environ,
+        "PATH": str(scratch) + os.pathsep + os.environ["PATH"],
+        "PR_NUMBER": "7",
+        "MOCK_PR": str(scratch / "pr.json"),
+        "PR_BRANCH": branch,
+        "EXPECTED_HEAD": head,
+        "GH_TOKEN": "fixture",
+        "GITHUB_REPOSITORY": "test/modelaudit",
+        "RUNNER_TEMP": str(scratch),
+    }
+    for override in ({"state": "CLOSED"}, {"baseRefName": "other"}, {"headRefOid": base}):
+        (scratch / "pr.json").write_text(json.dumps({**pr, **override}))
+        assert subprocess.run(["bash", "-c", shell], cwd=root, env=env, capture_output=True).returncode != 0
+        assert git(remote, "rev-parse", f"refs/heads/{branch}") == head
+    (scratch / "pr.json").write_text(json.dumps(pr))
+    subprocess.run(["bash", "-c", shell], cwd=root, env=env, check=True, capture_output=True)
+    updated = git(remote, "rev-parse", f"refs/heads/{branch}")
+    assert git(remote, "rev-parse", f"{updated}^") == head
+    assert set(git(remote, "diff", "--name-only", head, updated).splitlines()) == set(files)
+    for path in files:
+        assert git(remote, "show", f"{updated}:{path}") == f"generated {path}"
+    assert not (root / ".npmrc").exists()
+    # A writer with the old fetched ref must also fail if the remote moves after checkout.
+    (scratch / "modelaudit-release-metadata/uv.lock").write_text("different generated metadata")
+    stale = subprocess.run(["bash", "-c", shell], cwd=root, env=env, capture_output=True)
+    assert stale.returncode != 0 and git(remote, "rev-parse", f"refs/heads/{branch}") == updated
 
 
 def test_multiline_upgrade_note_keeps_reference_outside_the_code_block(repository: Path) -> None:
