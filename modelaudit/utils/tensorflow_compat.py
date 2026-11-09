@@ -85,37 +85,42 @@ DTYPE_MAP: dict[int, np.dtype[Any]] = {
 OBJECT_POINTER_SIZE = np.dtype(object).itemsize
 
 
+# TensorProto fields and their storage types. Signed int_val tensors use their mapped dtype.
+_TYPED_STORAGE: dict[int, tuple[str, type[np.generic] | None]] = {
+    DataType.DT_STRING: ("string_val", np.object_),
+    DataType.DT_FLOAT: ("float_val", np.float32),
+    DataType.DT_DOUBLE: ("double_val", np.float64),
+    DataType.DT_INT32: ("int_val", None),
+    DataType.DT_INT16: ("int_val", None),
+    DataType.DT_INT8: ("int_val", None),
+    DataType.DT_INT64: ("int64_val", np.int64),
+    DataType.DT_UINT8: ("int_val", np.uint8),
+    DataType.DT_QUINT8: ("int_val", np.uint8),
+    DataType.DT_UINT16: ("int_val", np.uint16),
+    DataType.DT_QUINT16: ("int_val", np.uint16),
+    DataType.DT_UINT32: ("uint32_val", np.uint32),
+    DataType.DT_UINT64: ("uint64_val", np.uint64),
+    DataType.DT_BOOL: ("bool_val", np.bool_),
+    DataType.DT_COMPLEX64: ("scomplex_val", np.float32),
+    DataType.DT_COMPLEX128: ("dcomplex_val", np.float64),
+    DataType.DT_HALF: ("half_val", np.uint16),
+    DataType.DT_BFLOAT16: ("half_val", np.uint16),
+    DataType.DT_FLOAT8_E5M2: ("float8_val", np.uint8),
+    DataType.DT_FLOAT8_E4M3FN: ("float8_val", np.uint8),
+}
+
+
 def _get_tensor_field_materialization_bytes(tensor_proto: Any, dtype_enum: int) -> int:
     """Estimate bytes allocated when materializing typed TensorProto fields."""
-    if dtype_enum == DataType.DT_STRING:
-        return len(tensor_proto.string_val) * OBJECT_POINTER_SIZE
-    if dtype_enum == DataType.DT_FLOAT:
-        return len(tensor_proto.float_val) * np.dtype(np.float32).itemsize
-    if dtype_enum == DataType.DT_DOUBLE:
-        return len(tensor_proto.double_val) * np.dtype(np.float64).itemsize
-    if dtype_enum in (DataType.DT_INT32, DataType.DT_INT16, DataType.DT_INT8):
-        return len(tensor_proto.int_val) * DTYPE_MAP[dtype_enum].itemsize
-    if dtype_enum == DataType.DT_INT64:
-        return len(tensor_proto.int64_val) * np.dtype(np.int64).itemsize
-    if dtype_enum in (DataType.DT_UINT8, DataType.DT_QUINT8):
-        return len(tensor_proto.int_val) * np.dtype(np.uint8).itemsize
-    if dtype_enum in (DataType.DT_UINT16, DataType.DT_QUINT16):
-        return len(tensor_proto.int_val) * np.dtype(np.uint16).itemsize
-    if dtype_enum == DataType.DT_UINT32:
-        return len(tensor_proto.uint32_val) * np.dtype(np.uint32).itemsize
-    if dtype_enum == DataType.DT_UINT64:
-        return len(tensor_proto.uint64_val) * np.dtype(np.uint64).itemsize
-    if dtype_enum == DataType.DT_BOOL:
-        return len(tensor_proto.bool_val) * np.dtype(np.bool_).itemsize
-    if dtype_enum == DataType.DT_COMPLEX64:
-        return len(tensor_proto.scomplex_val) * np.dtype(np.float32).itemsize
-    if dtype_enum == DataType.DT_COMPLEX128:
-        return len(tensor_proto.dcomplex_val) * np.dtype(np.float64).itemsize
-    if dtype_enum in (DataType.DT_HALF, DataType.DT_BFLOAT16):
-        return len(tensor_proto.half_val) * np.dtype(np.uint16).itemsize
-    if dtype_enum in (DataType.DT_FLOAT8_E5M2, DataType.DT_FLOAT8_E4M3FN):
-        return len(tensor_proto.float8_val) * np.dtype(np.uint8).itemsize
-    return 0
+    storage = _TYPED_STORAGE.get(dtype_enum)
+    if storage is None:
+        return 0
+    field_name, component_type = storage
+    count = len(getattr(tensor_proto, field_name))
+    if field_name == "string_val":
+        return count * OBJECT_POINTER_SIZE
+    dtype = DTYPE_MAP[dtype_enum] if component_type is None else np.dtype(component_type)
+    return count * dtype.itemsize
 
 
 def tensor_proto_to_ndarray(tensor_proto: Any, *, max_tensor_bytes: int | None = None) -> np.ndarray[Any, Any]:
@@ -205,64 +210,24 @@ def tensor_proto_to_ndarray(tensor_proto: Any, *, max_tensor_bytes: int | None =
         if source_bytes > max_tensor_bytes:
             raise ValueError(f"Tensor materialization size {source_bytes} exceeds configured limit {max_tensor_bytes}")
 
+    storage = _TYPED_STORAGE.get(dtype_enum)
+    if storage is None:
+        raise ValueError(f"Unsupported TensorFlow dtype for typed field extraction: {dtype_enum}")
+    field_name, component_type = storage
+
     if dtype_enum == DataType.DT_STRING:
-        # String tensors use string_val field
         values = np.array(list(tensor_proto.string_val), dtype=object)
-
-    elif dtype_enum == DataType.DT_FLOAT:
-        values = np.array(tensor_proto.float_val, dtype=np.float32)
-
-    elif dtype_enum == DataType.DT_DOUBLE:
-        values = np.array(tensor_proto.double_val, dtype=np.float64)
-
-    elif dtype_enum in (DataType.DT_INT32, DataType.DT_INT16, DataType.DT_INT8):
-        values = np.array(tensor_proto.int_val, dtype=dtype)
-
-    elif dtype_enum == DataType.DT_INT64:
-        values = np.array(tensor_proto.int64_val, dtype=np.int64)
-
-    elif dtype_enum in (DataType.DT_UINT8, DataType.DT_QUINT8):
-        values = np.array(tensor_proto.int_val, dtype=np.uint8)
-
-    elif dtype_enum in (DataType.DT_UINT16, DataType.DT_QUINT16):
-        values = np.array(tensor_proto.int_val, dtype=np.uint16)
-
-    elif dtype_enum == DataType.DT_UINT32:
-        values = np.array(tensor_proto.uint32_val, dtype=np.uint32)
-
-    elif dtype_enum == DataType.DT_UINT64:
-        values = np.array(tensor_proto.uint64_val, dtype=np.uint64)
-
-    elif dtype_enum == DataType.DT_BOOL:
-        values = np.array(tensor_proto.bool_val, dtype=np.bool_)
-
-    elif dtype_enum == DataType.DT_COMPLEX64:
-        # Complex stored as pairs of floats
-        float_vals = np.array(tensor_proto.scomplex_val, dtype=np.float32)
-        values = float_vals[0::2] + 1j * float_vals[1::2]
-        values = values.astype(np.complex64)
-
-    elif dtype_enum == DataType.DT_COMPLEX128:
-        # Complex stored as pairs of doubles
-        double_vals = np.array(tensor_proto.dcomplex_val, dtype=np.float64)
-        values = double_vals[0::2] + 1j * double_vals[1::2]
-        values = values.astype(np.complex128)
-
+    elif dtype_enum in (DataType.DT_COMPLEX64, DataType.DT_COMPLEX128):
+        # Complex fields contain alternating real and imaginary components.
+        components: np.ndarray[Any, Any] = np.array(getattr(tensor_proto, field_name), dtype=component_type)
+        values = components[0::2] + 1j * components[1::2]
+        values = values.astype(np.complex64 if field_name == "scomplex_val" else np.complex128)
     elif dtype_enum == DataType.DT_HALF:
         # Half precision stored in half_val as uint16
         half_vals = np.array(tensor_proto.half_val, dtype=np.uint16)
         values = half_vals.view(np.float16)
-
-    elif dtype_enum == DataType.DT_BFLOAT16:
-        # bfloat16 stored in half_val as uint16
-        values = np.array(tensor_proto.half_val, dtype=np.uint16)
-
-    elif dtype_enum in (DataType.DT_FLOAT8_E5M2, DataType.DT_FLOAT8_E4M3FN):
-        # float8 stored in float8_val as uint8
-        values = np.array(tensor_proto.float8_val, dtype=np.uint8)
-
     else:
-        raise ValueError(f"Unsupported TensorFlow dtype for typed field extraction: {dtype_enum}")
+        values = np.array(getattr(tensor_proto, field_name), dtype=dtype if component_type is None else component_type)
 
     # Handle scalar broadcasting (TensorFlow pads with last value)
     if values.size > 0 and values.size < num_elements:

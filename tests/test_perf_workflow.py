@@ -392,6 +392,7 @@ def test_dependency_audit_covers_installed_ci_extras() -> None:
     audit_step = _step_by_name(steps, "Audit dependencies for vulnerabilities")
 
     assert "uv export --frozen --extra all-ci --no-hashes --no-emit-project" in audit_step["run"]
+    assert "uv export --project scripts/release-tools --frozen --no-dev" in audit_step["run"]
     assert "pip-audit --strict --no-deps --disable-pip" in audit_step["run"]
 
 
@@ -563,7 +564,9 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     assert coverage_job["permissions"] == {"contents": "read", "id-token": "write"}
     assert coverage_job["strategy"]["matrix"]["shard"] == list(range(10))
     coverage_steps = coverage_job["steps"]
-    coverage_run = _step_by_name(coverage_steps, "Run branch coverage shard")["run"]
+    coverage_step = _step_by_name(coverage_steps, "Run branch coverage shard")
+    assert coverage_step["env"]["COVERAGE_FILE"] == "${{ runner.temp }}/.coverage"
+    coverage_run = coverage_step["run"]
     assert "--modelaudit-shard-count 10" in coverage_run
     assert "--modelaudit-shard-index ${{ matrix.shard }}" in coverage_run
     assert "--cov-report=xml:coverage.xml" in coverage_run
