@@ -15,7 +15,7 @@ import zipfile
 import zlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Any, Literal, cast
+from typing import IO, Any, BinaryIO, Literal, cast
 
 import pytest
 
@@ -449,6 +449,92 @@ def test_onnx_data_flax_exclusion_requires_a_complete_key_search(
     assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
 
     path.write_bytes(bytes(32) + b"\x81\xa6params\x80")
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # A checkpoint root is reachable before the impossible bin32.
+        b"\x81\xa6params\x80\xc6\xff\xff\xff\xff",
+        # The bin32 marker appears inside a complete bin8 payload.
+        b"\xc4\x05\xc6\xff\xff\xff\xff\x81\xa6params\x80",
+        # An unparseable object blocks proof of the following object's boundary.
+        b"\xc1\xc6\xff\xff\xff\xff",
+    ],
+    ids=["checkpoint-before-impossible-length", "marker-inside-bytes", "invalid-object"],
+)
+def test_onnx_data_unproven_object_boundary_keeps_flax_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tail: bytes
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_NODES", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 256)
+    path = tmp_path / "model_fp16.onnx_data"
+    path.write_bytes(b"\xdc\x00\x41" + bytes(65) + tail + bytes(256))
+
+    assert file_detection.is_flax_msgpack_checkpoint_file(path)
+
+
+def test_onnx_data_ext32_payload_cannot_supply_a_top_level_bin32_boundary() -> None:
+    from modelaudit.utils.sources.huggingface import _SparseRangeReader
+
+    leading_array = b"\xdc\x10\x01" + bytes(4097)
+    extension_size = 0xFFFFFFFF
+    extension_header = b"\xc9" + struct.pack(">I", extension_size) + b"\x01"
+    payload_start = len(leading_array) + len(extension_header)
+    checkpoint = b"\x81\xa6params\x81\xa3jit\xa9os.system"
+    checkpoint_offset = payload_start + extension_size
+    file_size = checkpoint_offset + len(checkpoint)
+    stream = _SparseRangeReader(
+        file_size,
+        [
+            (0, leading_array + extension_header),
+            (payload_start + 64, b"\xc6\xff\xff\xff\xff"),
+            (checkpoint_offset, checkpoint),
+        ],
+    )
+
+    # The bin32 marker is inside the EXT32 value. Only its real endpoint starts another object.
+    assert (
+        file_detection._probe_flax_msgpack_checkpoint_stream(
+            cast(BinaryIO, stream), file_size, prove_impossible_extent=True
+        )
+        is True
+    )
+
+
+def test_onnx_data_replaced_or_modified_file_cannot_inherit_extent_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_NODES", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 256)
+    source = tmp_path / "old.onnx_data"
+    source.write_bytes(b"\xdc\x00\x41" + bytes(65) + b"\xc6\xff\xff\xff\xff" + bytes(256))
+    size = source.stat().st_size
+    replacement = tmp_path / "model_fp16.onnx_data"
+    replacement.write_bytes(bytes(size))
+    with source.open("rb") as original_file:
+        assert file_detection._probe_large_onnx_data_flax_extent(source, original_file, size) is False
+        # A pathname replacement leaves the original descriptor bound to its previous inode.
+        assert file_detection._probe_large_onnx_data_flax_extent(replacement, original_file, size) is None
+
+        # A modification generation can change even when a file retains its timestamps.
+        from modelaudit.cache.scan_results_cache import ScanResultsCache
+
+        tokens = iter((1, 2))
+        monkeypatch.setattr(ScanResultsCache, "_get_file_change_token", lambda *_: next(tokens))
+        assert file_detection._probe_large_onnx_data_flax_extent(source, original_file, size) is None
+
+
+def test_onnx_data_length_header_crossing_probe_limit_keeps_flax_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_NODES", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 256)
+    path = tmp_path / "model_fp16.onnx_data"
+    # The bin32 marker is the last byte of the inspected prefix.
+    path.write_bytes(b"\xdc\x00\xfc" + bytes(252) + b"\xc6\xff\xff\xff\xff" + bytes(256))
+
     assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
 
 

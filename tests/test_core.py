@@ -28,6 +28,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -3309,6 +3310,8 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
         config: dict[str, Any] | None = None,
         routing_paths: dict[str, str] | None = None,
         hashed_identities: dict[str, dict[str, int]] | None = None,
+        onnx_weight_proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] | None = None,
+        onnx_weight_aliases: dict[str, Path] | None = None,
         deadline: float | None = None,
     ) -> dict[str, str]:
         assert set(file_paths) == {str(blob_one), str(blob_two)}
@@ -3318,6 +3321,8 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
             config=config,
             routing_paths=routing_paths,
             hashed_identities=hashed_identities,
+            onnx_weight_aliases=onnx_weight_aliases,
+            onnx_weight_proofs=onnx_weight_proofs,
             deadline=deadline,
         )
         shard_one.unlink()
@@ -17049,6 +17054,265 @@ def _install_hash_read_clock(monkeypatch: pytest.MonkeyPatch, read_seconds: Call
     monkeypatch.setattr(core_module.time, "time", lambda: now)
     monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
     return read_sizes
+
+
+@pytest.mark.parametrize("as_directory", [False, True])
+def test_onnx_weight_hash_resolves_only_inconclusive_flax_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, as_directory: bool
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    sidecar = tmp_path / "weights.onnx_data"
+    sidecar.write_bytes(b"\x00\x3c" * 128)
+    target = tmp_path if as_directory else sidecar
+
+    result = scan_model_directory_or_file(str(target), cache_enabled=False)
+    assert result.success
+    assert [asset.type for asset in result.assets] == ["unknown"]
+    assert result.bytes_scanned == sidecar.stat().st_size
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(sidecar)
+
+    limited = scan_model_directory_or_file(str(target), cache_enabled=False, max_file_read_size=64)
+    assert not limited.success
+    assert any(check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in limited.checks)
+
+
+@pytest.mark.parametrize("key_encoding", [b"\xa6params", b"\xd9\x06params", b"\xc4\x06params"])
+def test_onnx_weight_hash_preserves_split_late_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key_encoding: bytes
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(core_module, "DEFAULT_READ_CHUNK_SIZE", 32)
+    path = tmp_path / "weights.onnx_data"
+    payload = bytes(28) + b"\x81" + key_encoding + b"\x80"
+    path.write_bytes(payload)
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    assert core_module._calculate_file_hash(str(path), onnx_weight_proofs=proofs) == hashlib.sha256(payload).hexdigest()
+    assert not proofs
+
+
+def test_onnx_weight_hash_rechecks_change_token_on_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.cache.scan_results_cache import ScanResultsCache
+
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    path = tmp_path / "weights.onnx_data"
+    path.write_bytes(b"\x00\x3c" * 128)
+    generation = 1
+    monkeypatch.setattr(ScanResultsCache, "_get_file_change_token", staticmethod(lambda path, stat: generation))
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    core_module._calculate_file_hash(str(path), onnx_weight_proofs=proofs)
+    assert (path.stat().st_dev, path.stat().st_ino) in proofs
+    generation += 1
+    assert core_module._scan_with_onnx_weight_proof(str(path), {"cache_enabled": False}, proofs) is None
+    result = core_module.scan_file(str(path), {"cache_enabled": False})
+    assert not result.success
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+def test_onnx_weight_hash_keeps_independent_json_ambiguity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "_probe_complete_structured_json_document", lambda path, size: None)
+    path = tmp_path / "weights.onnx_data"
+    path.write_bytes(b"\x00\x3c" * 128)
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    core_module._calculate_file_hash(str(path), onnx_weight_proofs=proofs)
+    with file_detection.onnx_weight_routing_proof(str(path), proofs[(path.stat().st_dev, path.stat().st_ino)]):
+        assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+        assert file_detection.is_flax_msgpack_checkpoint_file(path)
+
+
+def test_large_onnx_weight_hash_proof_covers_named_hardlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    first = tmp_path / "a.onnx_data"
+    second = tmp_path / "b.onnx_data"
+    first.write_bytes(b"\x00\x3c" * 128)
+    try:
+        second.hardlink_to(first)
+    except OSError:
+        pytest.skip("Hard links unavailable")
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    assert result.success
+    assert {(Path(asset.path).name, asset.type) for asset in result.assets} == {
+        ("a.onnx_data", "unknown"),
+        ("b.onnx_data", "unknown"),
+    }
+
+
+@pytest.mark.parametrize("weight_first", [False, True])
+@pytest.mark.parametrize("late_key", [False, True])
+def test_directory_onnx_weight_proof_does_not_depend_on_hardlink_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, weight_first: bool, late_key: bool
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    names = ("a.onnx_data", "b.bin") if weight_first else ("a.bin", "b.onnx_data")
+    paths = [tmp_path / name for name in (*names, "c.onnx_data")]
+    payload = b"\x00\x3c" * 128
+    if late_key:
+        payload += b"\x81\xa6params\x81\xa3jit\xa9os.system"
+    paths[0].write_bytes(payload)
+    try:
+        for alias in paths[1:]:
+            alias.hardlink_to(paths[0])
+    except OSError:
+        pytest.skip("Hard links unavailable")
+
+    with patch.object(core_module, "_calculate_file_hash", wraps=core_module._calculate_file_hash) as calculate:
+        proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+        hashes = core_module._hash_files_by_path([str(path) for path in paths], onnx_weight_proofs=proofs)
+    assert hashes == dict.fromkeys(map(str, paths), hashlib.sha256(payload).hexdigest())
+    assert calculate.call_count == 1
+    assert bool(proofs) is (not late_key)
+
+    with patch.object(core_module, "_calculate_file_hash", wraps=core_module._calculate_file_hash) as limited_calculate:
+        proofs.clear()
+        limited_hashes = core_module._hash_files_by_path(
+            [str(path) for path in paths], config={"max_total_size": len(payload)}, onnx_weight_proofs=proofs
+        )
+    assert limited_hashes == hashes
+    assert limited_calculate.call_count == 1
+    assert bool(proofs) is (not late_key)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    weight_paths = {str(path) for path in paths if path.suffix == ".onnx_data"}
+    incomplete_paths = {
+        check.location for check in result.checks if check.name == "MessagePack Routing Analysis Incomplete"
+    }
+    assert incomplete_paths & weight_paths == (weight_paths if late_key else set())
+    assert {asset.path for asset in result.assets} == set(map(str, paths))
+
+
+def test_onnx_hardlink_proof_preserves_budget_for_other_hashes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    paths = [tmp_path / name for name in ("a.bin", "b.onnx_data", "c.bin", "d.bin")]
+    paths[0].write_bytes(b"\x00\x3c" * 128)
+    try:
+        paths[1].hardlink_to(paths[0])
+    except OSError:
+        pytest.skip("Hard links unavailable")
+    paths[2].write_bytes(bytes(228))
+    paths[3].write_bytes(bytes(116))
+    expected = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    with patch.object(core_module, "_calculate_file_hash", wraps=core_module._calculate_file_hash) as calculate:
+        hashes = core_module._hash_files_by_path(
+            list(expected), config={"max_total_size": 600}, onnx_weight_proofs=proofs
+        )
+    assert hashes == expected
+    assert calculate.call_count == 3
+    assert len(proofs) == 1
+
+
+def test_changed_onnx_weight_hardlinks_invalidate_only_their_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from modelaudit.cache.scan_results_cache import ScanResultsCache
+
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    aliases = [tmp_path / name for name in ("a.bin", "b.onnx_data", "c.onnx_data")]
+    original = b"\x00\x3c" * 128
+    replacement = b"\x00\x3d" * 128
+    aliases[0].write_bytes(original)
+    try:
+        for alias in aliases[1:]:
+            alias.hardlink_to(aliases[0])
+    except OSError:
+        pytest.skip("Hard links unavailable")
+    unrelated = tmp_path / "d.bin"
+    unrelated.write_bytes(original)
+    initial = aliases[0].stat()
+    physical_id = (initial.st_dev, initial.st_ino)
+    real_stat, real_lstat, real_fstat = os.stat, os.lstat, os.fstat
+    original_token = ScanResultsCache._get_file_change_token
+    original_hash = core_module._calculate_file_hash
+    generation = 1
+    physical_reads = 0
+
+    # Windows exposes creation time in st_ctime even after the native change token advances.
+    def creation_time_view(info: os.stat_result) -> os.stat_result:
+        return _stat_result_with(info, ctime=1.0) if os.path.samestat(info, initial) else info
+
+    monkeypatch.setattr(os, "stat", lambda *args, **kwargs: creation_time_view(real_stat(*args, **kwargs)))
+    monkeypatch.setattr(Path, "lstat", lambda path: creation_time_view(real_lstat(path)))
+    monkeypatch.setattr(os, "fstat", lambda fd: creation_time_view(real_fstat(fd)))
+    monkeypatch.setattr(
+        ScanResultsCache,
+        "_get_file_change_token",
+        staticmethod(lambda path, info: generation if os.path.samestat(info, initial) else original_token(path, info)),
+    )
+
+    def mutate_after_hash(path: str, **kwargs: Any) -> str:
+        nonlocal generation, physical_reads
+        digest = original_hash(path, **kwargs)
+        if os.path.samestat(real_stat(path), initial):
+            physical_reads += 1
+            if generation == 1:
+                assert physical_id in kwargs["onnx_weight_proofs"]
+                aliases[0].write_bytes(replacement)
+                os.utime(aliases[0], ns=(initial.st_atime_ns, initial.st_mtime_ns))
+                generation += 1
+        return digest
+
+    monkeypatch.setattr(core_module, "_calculate_file_hash", mutate_after_hash)
+    identities: dict[str, dict[str, int]] = {}
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    hashes = core_module._hash_files_by_path(
+        [str(path) for path in [*aliases, unrelated]], hashed_identities=identities, onnx_weight_proofs=proofs
+    )
+    assert generation == 2 and physical_reads == 1
+    assert all(alias.read_bytes() == replacement for alias in aliases)
+    assert all(hashes[str(alias)].startswith("unhashable_") for alias in aliases)
+    assert len({hashes[str(alias)] for alias in aliases}) == len(aliases)
+    assert hashes[str(unrelated)] == hashlib.sha256(original).hexdigest()
+    assert set(identities) == {str(unrelated)}
+    assert physical_id not in proofs
+
+    aliases[0].write_bytes(original)
+    os.utime(aliases[0], ns=(initial.st_atime_ns, initial.st_mtime_ns))
+    generation = 1
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    assert generation == 2
+    assert result.content_hash is None
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_large_onnx_weight_hash_proof_uses_validated_snapshot_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, snapshot, blobs = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    source = blobs / "sidecar-blob"
+    source.write_bytes(b"\x00\x3c" * 128)
+    alias = snapshot / "model.onnx_data"
+    alias.symlink_to(os.path.relpath(source, alias.parent))
+
+    result = scan_model_directory_or_file(str(snapshot), cache_enabled=False)
+    assert result.success
+    assert len(result.assets) == 1
+    assert result.assets[0].type == "unknown"
+    assert result.bytes_scanned == source.stat().st_size
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(source)
+
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    core_module._calculate_file_hash(str(source), onnx_weight_proofs=proofs, onnx_weight_alias=alias)
+    other = blobs / "different-blob"
+    source.rename(other)
+    source.write_bytes(other.read_bytes())
+    alias.unlink()
+    alias.symlink_to(os.path.relpath(other, alias.parent))
+    result_after_change = core_module._scan_with_onnx_weight_proof(
+        str(source), {"cache_enabled": False}, proofs, onnx_weight_alias=alias
+    )
+    assert result_after_change is None
+    fallback = core_module.scan_file(str(source), {"cache_enabled": False})
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in fallback.checks)
 
 
 def test_readme_url_credentials_remain_actionable_next_to_a_public_link(tmp_path: Path) -> None:

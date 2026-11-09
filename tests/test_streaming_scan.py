@@ -1929,6 +1929,48 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash != second_result.content_hash
 
 
+@pytest.mark.parametrize("weights_first", [False, True])
+@pytest.mark.parametrize("late_flax_key", [False, True])
+@pytest.mark.parametrize("hf_snapshot", [False, True])
+def test_streamed_onnx_weights_require_a_complete_flax_key_exclusion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    weights_first: bool,
+    late_flax_key: bool,
+    hf_snapshot: bool,
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 16)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 1024)
+    if hf_snapshot:
+        request.getfixturevalue("requires_symlinks")
+        cache = tmp_path / "hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+        root, _, _ = _write_onnx_cache_snapshot(tmp_path, cache / "models--test--model")
+    else:
+        root = tmp_path
+        (root / "model.onnx").write_bytes(create_external_onnx_payload(tmp_path))
+    model = root / "model.onnx"
+    weights = root / "model.onnx_data"
+    contents = b"\x00\x3c" * 4096
+    if late_flax_key:
+        contents += b"\x81\xa6params\x80"
+    weights.write_bytes(contents)
+    paths = [weights, model] if weights_first else [model, weights]
+
+    result = scan_model_streaming(
+        _file_generator(paths), timeout=30, delete_after_scan=False, cache_enabled=False, scan_root=str(root)
+    )
+
+    assert result.content_hash == compute_aggregate_hash([compute_sha256_hash(path) for path in paths])
+    assert any(
+        check.name == "External Data Reference Check" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks) == late_flax_key
+    asset = next(asset for asset in result.assets if asset.path == str(weights))
+    assert asset.type == ("flax_msgpack" if late_flax_key else "unknown")
+
+
 def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3255,10 +3297,99 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_
     assert determine_exit_code(result) == 0
 
 
-def test_scan_model_streaming_scans_consumed_scannable_onnx_external_data_alias(tmp_path: Path) -> None:
+def _write_external_onnx_pair_with_impossible_msgpack_length(model: Path, sidecar: Path) -> None:
+    onnx = pytest.importorskip("onnx")
+    # A complete array spends the node budget before an impossible 32-bit byte length.
+    # The key spelling in the unreachable payload precludes a full-hash key-absence proof.
+    sidecar.write_bytes(b"\xdc\x00\x41" + bytes(65) + b"\xc6\xff\xff\xff\xff" + b"\xa6params" + bytes(250))
+    byte_count = sidecar.stat().st_size
+    tensor = onnx.TensorProto(
+        name="W", data_type=onnx.TensorProto.FLOAT16, dims=[byte_count // 2], data_location=onnx.TensorProto.EXTERNAL
+    )
+    for key, value in (("location", sidecar.name), ("offset", "0"), ("length", str(byte_count))):
+        tensor.external_data.add(key=key, value=value)
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Identity", ["W"], ["Y"])],
+        "external_weight",
+        [],
+        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, tensor.dims)],
+        initializer=[tensor],
+    )
+    model.write_bytes(onnx.helper.make_model(graph).SerializeToString())
+
+
+def test_scan_external_onnx_tensor_with_impossible_msgpack_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_NODES", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 256)
+    sidecar = tmp_path / "model_fp16.onnx_data"
+    _write_external_onnx_pair_with_impossible_msgpack_length(tmp_path / "model_fp16.onnx", sidecar)
+
+    direct = scan_file(str(sidecar), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=False)
+
+    assert direct.success
+    assert direct.scanner_name != "flax_msgpack"
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in aggregate.checks)
+    assert any(
+        check.name == "External Data Size Validation" and check.status == CheckStatus.PASSED
+        for check in aggregate.checks
+    )
+    assert_only_onnx_external_schema_validation_skipped(aggregate)
+
+
+def test_hf_snapshot_onnx_data_alias_keeps_its_routing_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requires_symlinks: None
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_NODES", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 256)
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    snapshot, _, _ = _write_onnx_cache_snapshot(tmp_path, cache_hub / "models--test--model")
+    model = snapshot / "model.onnx"
+    sidecar = snapshot / "model.onnx_data"
+    _write_external_onnx_pair_with_impossible_msgpack_length(model, sidecar)
+
+    standalone = scan_model_directory_or_file(str(sidecar), cache_enabled=False)
+    assert standalone.success
+    assert determine_exit_code(standalone) == 0
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in standalone.checks)
+
+    directory = scan_model_directory_or_file(str(snapshot), cache_enabled=False, skip_file_types=False)
+    streaming = scan_model_streaming(
+        iterate_files_streaming(snapshot), scan_root=str(snapshot), delete_after_scan=False, cache_enabled=False
+    )
+
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model), compute_sha256_hash(sidecar)])
+    for result in (directory, streaming):
+        assert result.content_hash == expected_hash
+        assert any(
+            check.name == "External Data Size Validation" and check.status == CheckStatus.PASSED
+            for check in result.checks
+        )
+        assert_only_onnx_external_schema_validation_skipped(result)
+
+
+def test_onnx_data_flax_checkpoint_before_impossible_length_keeps_security_finding(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    checkpoint = msgpack.packb({"params": {}, "__reduce__": "os.system"}, use_bin_type=True)
+    sidecar = tmp_path / "model_fp16.onnx_data"
+    sidecar.write_bytes(checkpoint + b"\xc6\xff\xff\xff\xff")
+
+    result = scan_file(str(sidecar), config={"cache_enabled": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("sidecar_name", ["payload.bin", "model.onnx_data"])
+def test_scan_model_streaming_scans_consumed_scannable_onnx_external_data_alias(
+    tmp_path: Path, sidecar_name: str
+) -> None:
     """A consumed ONNX sidecar alias must still dispatch to an enabled scanner."""
     model_path = tmp_path / "model.onnx"
-    sidecar_path = tmp_path / "payload.bin"
+    sidecar_path = tmp_path / sidecar_name
     model_path.write_bytes(create_external_onnx_payload(tmp_path, external_path=sidecar_path.name))
     create_malicious_pickle(sidecar_path)
     expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
