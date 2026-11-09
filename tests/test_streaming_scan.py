@@ -1385,11 +1385,14 @@ def test_cross_directory_shard_reconciliation_bounds_untrusted_expected_total() 
     """An attacker-controlled shard count must not allocate the declared range."""
     script = "\n".join(
         (
+            "import faulthandler",
             "from modelaudit.core import _complete_validated_shard_family_sources",
             "total = '9' * 100",
             "source = f'/tmp/part-1/model-00001-of-{total}.safetensors'",
             "targets = {source: {'resolved_path': '/tmp/one', 'device': 1, 'inode': 1}}",
+            "faulthandler.dump_traceback_later(5, exit=True)",
             "assert _complete_validated_shard_family_sources(targets) == set()",
+            "faulthandler.cancel_dump_traceback_later()",
         )
     )
 
@@ -1398,7 +1401,7 @@ def test_cross_directory_shard_reconciliation_bounds_untrusted_expected_total() 
         capture_output=True,
         check=False,
         text=True,
-        timeout=5,
+        timeout=60,  # The outer deadline includes interpreter startup and scanner imports.
     )
 
     assert completed.returncode == 0, completed.stderr
