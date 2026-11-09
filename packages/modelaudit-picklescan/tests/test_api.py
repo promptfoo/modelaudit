@@ -12505,7 +12505,7 @@ def test_scan_bytes_respects_subclass_slices_for_numpy_proof() -> None:
             if isinstance(key, slice):
                 slices.append(key)
                 if key.start == 2:
-                    raise ValueError("follow-on slice unavailable")
+                    raise IndexError("follow-on slice unavailable")
             return super().__getitem__(key)
 
     payload = PickleBytes(b"N." + _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD)
