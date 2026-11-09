@@ -50,7 +50,7 @@ Inspect the versioned section in each changed changelog. CI checks that it follo
 When an OpenAI API key is set, use `--no-triage` to keep documentation findings and document text local.
 ```
 
-The most recently updated matching comment from a current writer wins for that filename. Edit that comment to revise the wording, or remove its marker and any earlier overrides for the same file to restore the fragment. New fragments appear independently. To apply edits before the next automatic refresh, run the existing metadata retry and check the resulting changelog diff before merging.
+The most recently updated matching comment from a current writer wins for that filename. Edit it to revise the wording. To restore the fragment, remove the markers from all overrides for that file. Run the command below to apply edits before the next automatic refresh, then check the changelog diff. If a retry reports a missing **All changes** section, restore that disclosure from the last generated changelog before retrying.
 
 ```bash
 gh api repos/promptfoo/modelaudit/dispatches -f event_type=release-metadata-retry \

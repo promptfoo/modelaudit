@@ -74,12 +74,16 @@ def review_overrides(file: Path | None) -> dict[str, str]:
     return overrides
 
 
-def base_versions(base: str | None) -> dict[str, str]:
+def default_base() -> str:
     # An uncommitted version bump still uses HEAD's published versions. On the
     # rolling release branch, the bump is committed but its tags do not exist yet.
-    if base is None and git("branch", "--show-current").strip() == "release-please--branches--main":
-        base = git("merge-base", "HEAD", "refs/remotes/origin/main").strip()
-    versions: dict[str, str] = json.loads(git("show", f"{base or 'HEAD'}:.release-please-manifest.json"))
+    if git("branch", "--show-current").strip() == "release-please--branches--main":
+        return git("merge-base", "HEAD", "refs/remotes/origin/main").strip()
+    return "HEAD"
+
+
+def base_versions(base: str) -> dict[str, str]:
+    versions: dict[str, str] = json.loads(git("show", f"{base}:.release-please-manifest.json"))
     return versions
 
 
@@ -103,11 +107,13 @@ def reviewed_source(section: str, ancestor: str) -> str | None:
 
 
 def fragment_tree(folder: Path, ref: str) -> set[Path]:
-    return {
-        Path(name)
-        for name in git("ls-tree", "-r", "--name-only", "-z", ref, "--", folder.as_posix()).split("\0")
-        if name
-    }
+    names = git("ls-tree", "-r", "--name-only", "-z", ref, "--", folder.as_posix())
+    return {Path(name) for name in names.split("\0") if name}
+
+
+def changed_fragments(folder: Path, *revisions: str) -> set[Path]:
+    names = git("diff", "--no-renames", "--name-only", "-z", *revisions, "--", folder.as_posix())
+    return {Path(name) for name in names.split("\0") if name}
 
 
 def shipped_fragments(folder: Path, prefix: str, version: str) -> set[Path]:
@@ -122,12 +128,10 @@ def shipped_fragments(folder: Path, prefix: str, version: str) -> set[Path]:
         source = reviewed_source(section, ref)
         if source:
             # A squash can include new or revised fragments merged after review.
-            late = git("diff", "--no-renames", "--name-only", "-z", source, ref, "--", folder.as_posix())
-            shipped.difference_update(Path(name) for name in late.split("\0") if name)
-    changed = git("diff", "--no-renames", "--name-only", "-z", ref, "--", folder.as_posix())
-    reused = sorted(shipped.intersection(Path(name) for name in changed.split("\0") if name))
+            shipped -= changed_fragments(folder, source, ref)
+    reused = shipped & changed_fragments(folder, ref)
     if reused:
-        raise ValueError(f"{reused[0]}: this release note has shipped; use a new fragment filename")
+        raise ValueError(f"{min(reused)}: this release note has shipped; use a new fragment filename")
     return shipped
 
 
@@ -141,7 +145,7 @@ def pending_fragments(folder: Path, shipped: set[Path]) -> list[Path]:
     return [path for path in paths if path not in shipped]
 
 
-def towncrier_summary(paths: list[Path], version: str, reviews: dict[str, str], *, source: str | None = None) -> str:
+def towncrier_summary(paths: list[Path], version: str, reviews: dict[str, str]) -> str:
     if not paths:
         return ""
     # Stage only this component's pending fragments. Review comments replace prose,
@@ -155,7 +159,7 @@ def towncrier_summary(paths: list[Path], version: str, reviews: dict[str, str], 
         for path in paths:
             body = reviews.get(path.as_posix())
             if body is None:
-                body = git("show", f"{source}:{path.as_posix()}") if source else path.read_text(encoding="utf-8")
+                body = path.read_text(encoding="utf-8")
             if not body.strip():
                 raise ValueError(f"{path}: empty release note")
             (changes / path.name).write_text(body, encoding="utf-8", newline="\n")
@@ -185,23 +189,28 @@ def towncrier_summary(paths: list[Path], version: str, reviews: dict[str, str], 
 
 
 def candidate_inventory(
-    section: str, changelog: Path, prefix: str, before: str, after: str, *, require_reviewed: bool
+    sections: dict[str, str], changelog: Path, prefix: str, before: str, after: str
 ) -> tuple[str, str]:
-    heading, _, body = section.partition("\n")
+    heading, _, body = sections[after].partition("\n")
     comparison = f"{REPOSITORY_URL}/compare/{prefix}{before}...{prefix}{after}"
     if not heading.startswith(f"## [{after}]({comparison})"):
         raise ValueError(f"{changelog}: expected release comparison {comparison}")
     link = f"[Full comparison]({comparison})"
-    _, disclosure, inventory = body.rpartition(INVENTORY)
+    _, disclosure, inventory = body.partition(INVENTORY)
     if disclosure:
+        if INVENTORY in inventory:
+            raise ValueError(f"{changelog}: multiple All changes disclosures; restore the generated inventory")
         inventory = inventory.rstrip()
         if not inventory.endswith("</details>"):
             raise ValueError(f"{changelog}: incomplete All changes disclosure")
         inventory = inventory.removesuffix("</details>").strip()
         if link not in inventory.splitlines():
             raise ValueError(f"{changelog}: missing Full comparison link in All changes")
-    elif require_reviewed:
-        raise ValueError(f"{changelog}: missing All changes disclosure; run the release metadata refresh")
+    elif next(iter(sections)) != after or body.lstrip().startswith(SOURCE_MARKER):
+        # Only Release Please's newly prepended version can contain a raw inventory.
+        raise ValueError(
+            f"{changelog}: missing All changes disclosure; restore the generated inventory before retrying"
+        )
     else:
         inventory = body.strip() + "\n\n" + link
     return heading, inventory
@@ -214,12 +223,12 @@ def entry_count_marker(summary: str) -> str:
 
 
 def check_candidate(
-    changelog: Path, section: str, prefix: str, before: str, after: str, paths: list[Path], summary: str
+    changelog: Path, sections: dict[str, str], prefix: str, before: str, after: str, paths: list[Path], summary: str
 ) -> None:
-    candidate_inventory(section, changelog, prefix, before, after, require_reviewed=True)
+    candidate_inventory(sections, changelog, prefix, before, after)
     # Review comments can replace the prose. The categories and numbered references
     # still come from the fragment filenames and belong above the generated inventory.
-    reviewed, _, _ = section.rpartition(INVENTORY)
+    reviewed, _, _ = sections[after].partition(INVENTORY)
     reviewed_lines = set(reviewed.splitlines())
     for line in summary.splitlines():
         if line.startswith(("### ", "<summary>")) and line not in reviewed_lines:
@@ -248,16 +257,14 @@ def render(base: str, reviews: dict[str, str]) -> None:
         validate_unreleased(sections, package, prefix + before)
         if after in sections:
             raise ValueError(f"{changelog}: invalid changelog at release base")
-        candidate = versioned_sections(changelog.read_text(encoding="utf-8")).get(after)
-        if not candidate:
+        candidate = versioned_sections(changelog.read_text(encoding="utf-8"))
+        if after not in candidate:
             raise ValueError(f"{changelog}: Release Please did not generate {after}")
-        heading, inventory = candidate_inventory(candidate, changelog, prefix, before, after, require_reviewed=False)
+        heading, inventory = candidate_inventory(candidate, changelog, prefix, before, after)
         folder = Path(path) / "changes"
         shipped = shipped_fragments(folder, prefix, before)
         paths = pending_fragments(folder, shipped)
-        if set(paths) != fragment_tree(folder, base) - shipped or git(
-            "diff", "--name-only", base, "--", folder.as_posix()
-        ):
+        if set(paths) != fragment_tree(folder, base) - shipped or changed_fragments(folder, base):
             raise ValueError(
                 f"{folder}: release candidate fragments differ from {base}; merge fragment edits on main first"
             )
@@ -272,6 +279,38 @@ def render(base: str, reviews: dict[str, str]) -> None:
         writes[changelog] = preamble + "\n\n" + next_section + "\n\n" + original[position:].lstrip("\n")
     for changelog, text in writes.items():
         changelog.write_text(text, encoding="utf-8", newline="\n")
+
+
+def check(base: str) -> None:
+    previous = base_versions(base)
+    current = json.loads(Path(".release-please-manifest.json").read_text())
+    for package, (path, prefix) in PACKAGES.items():
+        before, after = previous[path], current[path]
+        root = Path(path)
+        changelog = root / "CHANGELOG.md"
+        sections = versioned_sections(changelog.read_text(encoding="utf-8"))
+        validate_unreleased(sections, package, prefix + after)
+        folder = root / "changes"
+        shipped = shipped_fragments(folder, prefix, before)
+        paths = pending_fragments(folder, shipped)
+        summary = towncrier_summary(paths, after, {})
+        if before == after:
+            continue
+        if list(sections)[1:2] != [after]:
+            raise ValueError(f"{changelog}: expected {after} immediately after Unreleased")
+        section = sections[after]
+        source = reviewed_source(section, base)
+        if source is None:
+            raise ValueError(f"{changelog}: missing release-note-source; refresh the release PR metadata")
+        if base_versions(source)[path] != before:
+            raise ValueError(f"{changelog}: source {source} does not belong to this release")
+        reviewed_paths = sorted(fragment_tree(folder, source) - shipped)
+        if reviewed_paths != paths:
+            # Only the categories are needed here. Towncrier derives them from
+            # the reviewed filenames, including those removed from the checkout.
+            placeholders = {path.as_posix(): path.name for path in reviewed_paths}
+            summary = towncrier_summary(reviewed_paths, after, placeholders)
+        check_candidate(changelog, sections, prefix, before, after, reviewed_paths, summary)
 
 
 def main() -> None:
@@ -298,34 +337,11 @@ def main() -> None:
     if args.op == "render":
         render(args.base, review_overrides(args.reviews))
     elif args.op == "check":
-        previous = base_versions(args.base)
-        current = json.loads(Path(".release-please-manifest.json").read_text())
-        for package, (path, prefix) in PACKAGES.items():
-            root = Path(path)
-            changelog = root / "CHANGELOG.md"
-            sections = versioned_sections(changelog.read_text(encoding="utf-8"))
-            validate_unreleased(sections, package, prefix + current[path])
-            folder = root / "changes"
-            shipped = shipped_fragments(folder, prefix, previous[path])
-            paths = pending_fragments(folder, shipped)
-            summary = towncrier_summary(paths, current[path], {})
-            if current[path] != previous[path]:
-                if list(sections)[1:2] != [current[path]]:
-                    raise ValueError(f"{changelog}: expected {current[path]} immediately after Unreleased")
-                section = sections[current[path]]
-                source = reviewed_source(section, args.base or "HEAD")
-                if source is None:
-                    raise ValueError(f"{changelog}: missing release-note-source; refresh the release PR metadata")
-                if base_versions(source)[path] != previous[path]:
-                    raise ValueError(f"{changelog}: source {source} does not belong to this release")
-                reviewed_paths = sorted(fragment_tree(folder, source) - shipped)
-                if reviewed_paths != paths:
-                    summary = towncrier_summary(reviewed_paths, current[path], {}, source=source)
-                check_candidate(changelog, section, prefix, previous[path], current[path], reviewed_paths, summary)
+        check(args.base or default_base())
     else:
         path, prefix = PACKAGES[args.package]
         if args.op == "pending":
-            version = base_versions(args.base)[path]
+            version = base_versions(args.base or default_base())[path]
             folder = Path(path) / "changes"
             paths = pending_fragments(folder, shipped_fragments(folder, prefix, version))
             print(towncrier_summary(paths, version, {}) or "No pending release notes.")

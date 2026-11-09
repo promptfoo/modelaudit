@@ -8,6 +8,7 @@ on:
       - ".dockerignore"
       - "modelaudit/**"
       - "packages/modelaudit-picklescan/**"
+      - "!packages/modelaudit-picklescan/changes/**"
       - "pyproject.toml"
       - "requirements-tensorflow.txt"
       - "uv.lock"
@@ -42,7 +43,7 @@ jobs:
               - 'docker-install-rust.sh'
               - '.dockerignore'
               - 'modelaudit/**'
-              - 'packages/modelaudit-picklescan/**'
+              - 'packages/modelaudit-picklescan/!(changes/**)'
               - 'pyproject.toml'
               - 'uv.lock'
               - '.github/workflows/docker-image-test.yml'
@@ -50,7 +51,7 @@ jobs:
             full-image:
               - 'Dockerfile.full'
               - 'docker-install-rust.sh'
-              - 'packages/modelaudit-picklescan/**'
+              - 'packages/modelaudit-picklescan/!(changes/**)'
               - '.github/workflows/docker-image-test.yml'
               - '.github/scripts/fetch-verified-release.sh'
             tensorflow-image:
@@ -58,7 +59,7 @@ jobs:
               - 'docker-install-rust.sh'
               - 'requirements-tensorflow.txt'
               - 'modelaudit/**'
-              - 'packages/modelaudit-picklescan/**'
+              - 'packages/modelaudit-picklescan/!(changes/**)'
               - 'pyproject.toml'
               - '.github/workflows/docker-image-test.yml'
               - '.github/scripts/fetch-verified-release.sh'

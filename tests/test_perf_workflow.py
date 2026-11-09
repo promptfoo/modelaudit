@@ -96,6 +96,21 @@ def _run_node_script(script: str, repo: Path, env: dict[str, str]) -> subprocess
     )
 
 
+def test_release_fragments_are_excluded_from_docker_prs_and_benchmark_triggers() -> None:
+    sibling = "packages/modelaudit-picklescan/**"
+    fragments = "!packages/modelaudit-picklescan/changes/**"
+    for filename in ("perf.yml", "docker-image-test.yml"):
+        triggers = _workflow_triggers(_load_workflow(filename))
+        paths = triggers["pull_request"]["paths"]
+        assert paths.index(sibling) < paths.index(fragments)
+        assert "modelaudit/**" in paths
+        assert "workflow_dispatch" in triggers
+        if filename == "perf.yml":
+            assert triggers["push"]["paths"] == paths
+        else:
+            assert triggers["push"] == {"branches": ["main"]}
+
+
 def test_perf_workflow_compares_against_detached_base_worktree() -> None:
     workflow = _load_perf_workflow()
     steps = _job_steps(workflow)

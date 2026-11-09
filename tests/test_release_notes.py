@@ -164,6 +164,22 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
     assert "### Highlights" not in public
     assert (root / "CHANGELOG.md").read_bytes() == before
 
+    changelog = root / SIBLING / "CHANGELOG.md"
+    original = changelog.read_text()
+    comparison = next(line for line in public.splitlines() if line.startswith("[Full comparison]"))
+    extra = f"\n<details>\n<summary>All changes</summary>\n\n{comparison}\n\n</details>\n"
+    for damaged in (
+        original.replace("<summary>All changes</summary>", "<summary>Changed label</summary>"),
+        original.replace(public, public + extra),
+    ):
+        # Treating the text as raw or choosing the last disclosure loses reviewed inventory.
+        changelog.write_text(damaged)
+        for operation in ("check", "render"):
+            retry = run(root, operation, "--base", base, check=False)
+            assert retry.returncode != 0 and "restore the generated inventory" in retry.stderr
+        assert changelog.read_text() == damaged
+        assert (root / "CHANGELOG.md").read_bytes() == before
+
 
 @pytest.mark.parametrize(
     ("old", "new", "error"),
@@ -257,6 +273,7 @@ def test_late_fragments_survive_a_squash_of_an_older_release_candidate(repositor
     git(root, "branch", "-M", "main")
     fragment(root, "changes/70.other.md", "Reviewed earlier.\n")
     fragment(root, "changes/71.other.md", "Original instructions.\n")
+    fragment(root, "changes/73.upgrade.md", "Reviewed migration instructions.\n")
     source = commit(root, "review these fragments")
     git(root, "switch", "-c", "release-pr")
     write_manifest(root, "0.2.2", "0.1.1")
@@ -264,6 +281,7 @@ def test_late_fragments_survive_a_squash_of_an_older_release_candidate(repositor
     run(root, "render", "--base", source)
     commit(root, "render reviewed changelog")
     git(root, "switch", "main")
+    (root / "changes/73.upgrade.md").unlink()
     fragment(root, "changes/71.other.md", "Revised instructions.\n")
     fragment(root, "changes/72.security.md", "Late security fix.\n")
     late = commit(root, "amend a pending note and add a fix before the bot refreshes")
@@ -274,6 +292,7 @@ def test_late_fragments_survive_a_squash_of_an_older_release_candidate(repositor
     first = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2", "--ref", "v0.2.2").stdout
     assert f"<!-- release-note-source: {source} -->" in first
     assert "Late security fix." not in first and "Original instructions." in first
+    assert "Reviewed migration instructions." in first
     pending = run(root, "pending", "--package", "modelaudit").stdout
     assert "Late security fix." in pending and "Revised instructions." in pending and "Reviewed earlier." not in pending
 
@@ -328,6 +347,8 @@ def test_untagged_release_uses_the_pr_base_but_normal_checkout_requires_its_exac
     base = commit(repository, "add a fragment before preparing the candidate")
     git(repository, "update-ref", "refs/remotes/origin/main", base)
     git(repository, "switch", "-c", "release-please--branches--main")
+    git(repository, "commit", "-q", "--allow-empty", "-m", "release branch metadata")
+    branch_only = git(repository, "rev-parse", "HEAD")
     write_manifest(repository, "0.2.2", "0.1.1")
     raw_section(repository, ".", "0.2.1", "0.2.2", "v")
     run(repository, "render", "--base", base)
@@ -335,6 +356,16 @@ def test_untagged_release_uses_the_pr_base_but_normal_checkout_requires_its_exac
     run(repository, "check")
     pending = run(repository, "pending", "--package", "modelaudit").stdout
     assert "Pending release wording." in pending
+
+    changelog = repository / "CHANGELOG.md"
+    changelog.write_text(
+        changelog.read_text().replace(f"release-note-source: {base}", f"release-note-source: {branch_only}")
+    )
+    for flags in ((), ("--base", base)):
+        rejected = run(repository, "check", *flags, check=False)
+        assert rejected.returncode != 0
+        assert f"{branch_only} must be a commit in {base}'s history" in rejected.stderr
+    git(repository, "restore", "CHANGELOG.md")
 
     # A detached checkout can specify its PR base. Without it, do not guess
     # that an older available tag is the latest release in an incomplete clone.
@@ -460,10 +491,11 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     head = commit(root, "release proposal")
     marker = f"<!-- release-note: {notes} -->\n\n"
     comments = [
-        {"id": 1, "user": {"login": "editor"}, "body": marker + "Approved wording."},
+        {"id": 1, "user": {"login": "editor"}, "body": marker + "Earlier wording."},
         {"id": 2, "user": {"login": "visitor"}, "body": marker + "Unapproved wording."},
+        {"id": 3, "user": {"login": "editor"}, "body": marker + "Approved wording."},
     ]
-    (scratch / "comments.json").write_text(json.dumps([[comments[0]], [comments[1]]]))
+    (scratch / "comments.json").write_text(json.dumps([comments[:2], comments[2:]]))
     gh = scratch / "gh"
     gh.write_text(
         "#!/usr/bin/env python3\n"
@@ -491,6 +523,7 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     subprocess.run(["bash", "-c", shell], cwd=root, env=env, check=True, capture_output=True)
     public = run(root, "extract", "--package", "modelaudit", "--version", "0.2.2").stdout
     assert "Approved wording." in public
+    assert "Earlier wording." not in public
     assert "Candidate template" not in public
     assert "Unapproved wording." not in public
     assert "Draft instructions." not in public

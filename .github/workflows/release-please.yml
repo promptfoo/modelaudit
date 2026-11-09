@@ -271,15 +271,12 @@ jobs:
           jq -e --arg head "$(git rev-parse HEAD)" '.state == "OPEN" and .baseRefName == "main" and (.isCrossRepository | not) and .headRefOid == $head' <<< "$pr" >/dev/null
           number=$(jq -r '.number' <<< "$pr")
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$number/comments?per_page=100" \
-            | jq '[.[][] | select((.body // "") | startswith("<!-- release-note: "))]' > "$RUNNER_TEMP/candidates.json"
-          : > "$RUNNER_TEMP/note-editors"
-          while IFS= read -r author; do
-            permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$author/permission" --jq '.permission')
-            case "$permission" in admin|maintain|write) printf '%s\n' "$author" >> "$RUNNER_TEMP/note-editors" ;; esac
-          done < <(jq -r '[.[] | .user.login // empty] | unique[]' "$RUNNER_TEMP/candidates.json")
-          jq --rawfile editors "$RUNNER_TEMP/note-editors" \
-            '[.[] | select(.user.login as $author | ($editors | split("\n") | index($author)) != null)]' \
-            "$RUNNER_TEMP/candidates.json" > "$RUNNER_TEMP/reviewed-notes.json"
+            | jq -c '[.[][] | select(.user.login and ((.body // "") | startswith("<!-- release-note: ")))] | group_by(.user.login)[]' \
+            | while IFS= read -r comments; do
+                author=$(jq -r '.[0].user.login' <<< "$comments")
+                permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$author/permission" --jq '.permission')
+                case "$permission" in admin|maintain|write) printf '%s\n' "$comments" ;; esac
+              done | jq -s 'add // []' > "$RUNNER_TEMP/reviewed-notes.json"
           unset GH_TOKEN
           base=$(git merge-base HEAD refs/remotes/origin/main)
           # Run the renderer, template, and dependency lock from protected main.
