@@ -120,64 +120,33 @@ def _parse_min_int(value: Any, default: int, *, minimum: int) -> int:
 
 def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
     """Translate generic scanner config into standalone pickle scan options."""
+    defaults = _DEFAULT_SCAN_OPTIONS
+
+    def integer_option(key: str, default: int, *, minimum: int) -> int:
+        return _parse_min_int(config.get(key, default), default, minimum=minimum)
+
     return ScanOptions(
-        timeout_s=_parse_positive_float(
-            config.get("timeout", _DEFAULT_SCAN_OPTIONS.timeout_s),
-            _DEFAULT_SCAN_OPTIONS.timeout_s,
-        ),
-        max_opcodes=_parse_min_int(
-            config.get("max_opcodes", _DEFAULT_SCAN_OPTIONS.max_opcodes),
-            _DEFAULT_SCAN_OPTIONS.max_opcodes,
-            minimum=1,
-        ),
+        timeout_s=_parse_positive_float(config.get("timeout", defaults.timeout_s), defaults.timeout_s),
+        max_opcodes=integer_option("max_opcodes", defaults.max_opcodes, minimum=1),
         post_budget_scan_bytes=_parse_min_int(
             config.get(
                 "post_budget_global_scan_limit_bytes",
-                config.get("post_budget_expansion_scan_limit_bytes", _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes),
+                config.get("post_budget_expansion_scan_limit_bytes", defaults.post_budget_scan_bytes),
             ),
-            _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
+            defaults.post_budget_scan_bytes,
             minimum=0,
         ),
-        max_unbounded_stream_read_bytes=_parse_min_int(
-            config.get(
-                "max_unbounded_stream_read_bytes",
-                _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
-            ),
-            _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
-            minimum=1,
+        max_unbounded_stream_read_bytes=integer_option(
+            "max_unbounded_stream_read_bytes", defaults.max_unbounded_stream_read_bytes, minimum=1
         ),
-        max_known_stream_read_bytes=_parse_min_int(
-            config.get(
-                "max_known_stream_read_bytes",
-                _DEFAULT_SCAN_OPTIONS.max_known_stream_read_bytes,
-            ),
-            _DEFAULT_SCAN_OPTIONS.max_known_stream_read_bytes,
-            minimum=1,
+        max_known_stream_read_bytes=integer_option(
+            "max_known_stream_read_bytes", defaults.max_known_stream_read_bytes, minimum=1
         ),
-        max_string_literal_scan_chars=_parse_min_int(
-            config.get(
-                "max_string_literal_scan_chars",
-                _DEFAULT_SCAN_OPTIONS.max_string_literal_scan_chars,
-            ),
-            _DEFAULT_SCAN_OPTIONS.max_string_literal_scan_chars,
-            minimum=0,
+        max_string_literal_scan_chars=integer_option(
+            "max_string_literal_scan_chars", defaults.max_string_literal_scan_chars, minimum=0
         ),
-        max_nested_pickle_bytes=_parse_min_int(
-            config.get(
-                "max_nested_pickle_bytes",
-                _DEFAULT_SCAN_OPTIONS.max_nested_pickle_bytes,
-            ),
-            _DEFAULT_SCAN_OPTIONS.max_nested_pickle_bytes,
-            minimum=2,
-        ),
-        max_nested_depth=_parse_min_int(
-            config.get(
-                "max_nested_depth",
-                _DEFAULT_SCAN_OPTIONS.max_nested_depth,
-            ),
-            _DEFAULT_SCAN_OPTIONS.max_nested_depth,
-            minimum=0,
-        ),
+        max_nested_pickle_bytes=integer_option("max_nested_pickle_bytes", defaults.max_nested_pickle_bytes, minimum=2),
+        max_nested_depth=integer_option("max_nested_depth", defaults.max_nested_depth, minimum=0),
     )
 
 
