@@ -2217,6 +2217,38 @@ def test_savedmodel_owner_and_child_sources_share_total_size_budget(tmp_path: Pa
     assert determine_exit_code(result) == 2
 
 
+@pytest.mark.parametrize("directory", [False, True], ids=["file", "directory"])
+@pytest.mark.parametrize("limit", ["max_file_size", "max_file_read_size", "max_total_size"])
+def test_pickle_dataset_metadata_obeys_scan_limits(tmp_path: Path, directory: bool, limit: str) -> None:
+    path = tmp_path / "training.pkl"
+    data = pickle.dumps([{"text": "sample row" * 128}])
+    path.write_bytes(data)
+    scan_path = str(tmp_path if directory else path)
+
+    budget: dict[str, Any] = {limit: len(data) - 1}
+    with patch("modelaudit.detectors._metadata.has_pickled_training_rows") as classify_rows:
+        results = scan_model_directory_or_file(scan_path, cache_enabled=False, **budget)
+        classify_rows.assert_not_called()
+    assert str(path) not in results.file_metadata or results.file_metadata[str(path)].is_dataset is None
+
+    budget[limit] = len(data)
+    results = scan_model_directory_or_file(scan_path, cache_enabled=False, **budget)
+    assert results.file_metadata[str(path)].is_dataset is True
+
+
+def test_pickle_dataset_probe_uses_remaining_directory_budget(tmp_path: Path) -> None:
+    total_size = 0
+    for name in ("first", "other"):
+        data = pickle.dumps([{"text": name * 20}])
+        (tmp_path / f"{name}.pkl").write_bytes(data)
+        total_size += len(data)
+
+    results = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_total_size=total_size - 1)
+    roles = [metadata.is_dataset for metadata in results.file_metadata.values()]
+    assert roles.count(True) == 1
+    assert roles.count(None) == 1
+
+
 def test_savedmodel_owner_supplemental_root_file_honors_max_file_size(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -13,7 +13,7 @@ from modelaudit.models import CopyrightNoticeModel as CopyrightInfo
 from modelaudit.models import LicenseInfoModel as LicenseInfo
 
 from ..config.constants import COMMON_MODEL_EXTENSIONS
-from .dataset_license import is_model_repository_metadata
+from .dataset_license import is_model_repository_metadata, is_pickled_training_dataset
 
 _CC_VERSION_4 = r"[\s,]+(?:(?:International|License|Version)[\s,]+)*4\.0"
 
@@ -734,12 +734,14 @@ def collect_license_metadata(
     file_path: str,
     *,
     nearby_license_cache: MutableMapping[str, list[str]] | None = None,
+    pickle_probe_limit: int | None = None,
 ) -> dict[str, Any]:
     """
     Collect comprehensive license metadata for a file.
 
     Args:
         file_path: Path to the file to analyze
+        pickle_probe_limit: Maximum bytes admitted for pickle dataset evidence in this scan.
 
     Returns:
         Dictionary containing license metadata
@@ -756,7 +758,7 @@ def collect_license_metadata(
     ext = Path(file_path).suffix.lower()
     if ext == ".pkl":
         # A pickle can contain model state, training data, or other Python objects.
-        metadata["is_dataset"] = None
+        metadata["is_dataset"] = True if is_pickled_training_dataset(Path(file_path), pickle_probe_limit) else None
     else:
         metadata["is_dataset"] = ext in DATASET_EXTENSIONS and not (
             ext == ".json" and is_model_repository_metadata(Path(file_path))

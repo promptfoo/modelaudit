@@ -97,7 +97,7 @@ def example():
         assert set(pickles.details["files"]) == {str(model_file), str(pickled_rows)}
         assert pickles.details["total_count"] == 2
         assert any("REDUCE" in issue.message and "posix.system" in issue.message for issue in results.issues)
-        assert results.file_metadata[str(pickled_rows)].is_dataset is None
+        assert results.file_metadata[str(pickled_rows)].is_dataset is True
 
         sbom_data = json.loads(generate_sbom([str(tmp_path)], results))
 
@@ -126,7 +126,7 @@ def example():
         assert is_model_prop["value"] == "true"
         assert _find_property(model_component, "ml:is_dataset") is None
         pickled_component = next(comp for comp in components if comp["name"].endswith("training.pkl"))
-        assert _find_property(pickled_component, "ml:is_dataset") is None
+        assert _find_property(pickled_component, "ml:is_dataset") == {"name": "ml:is_dataset", "value": "true"}
 
     def test_sbom_includes_risk_score_with_license_issues(self, tmp_path: Path) -> None:
         """Test that SBOM includes updated risk scores based on license issues."""
