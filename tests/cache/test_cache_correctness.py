@@ -4022,6 +4022,7 @@ def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
         }
     }
     file_path, cache, version_context = _pickle_cache_context(tmp_path)
+    scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
     scan_result = _private_fingerprint_result(fingerprint_metadata)
 
     assert _store_and_lookup(cache, file_path, scan_result, version_context) is not None
