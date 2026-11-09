@@ -275,6 +275,7 @@ def pytest_runtest_setup(item):
             "test_xdist_status.py",  # xdist worker progress reporting tests
             "test_hooks_egress.py",  # progress hook egress allowlist regressions
             "test_release_workflow.py",  # release workflow regression tests
+            "test_release_notes.py",  # per-package release note assembly and review
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_sbom_symlink_containment.py",  # SBOM symlink containment regression tests
             "test_sbom_url_fixes.py",  # SBOM URL handling and credential-redaction regressions

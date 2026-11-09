@@ -1,0 +1,30 @@
+[tool.towncrier]
+directory = "changes"
+template = "template.md"
+filename = "CHANGELOG.md"
+title_format = false
+wrap = false
+ignore = []
+issue_pattern = "[1-9][0-9]*"
+orphan_prefix = "+"
+issue_format = "[#{issue}](https://github.com/promptfoo/modelaudit/issues/{issue})"
+
+[[tool.towncrier.type]]
+directory = "highlight"
+name = "Highlights"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "upgrade"
+name = "Upgrade notes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "security"
+name = "Security"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "other"
+name = "Other changes"
+showcontent = true
