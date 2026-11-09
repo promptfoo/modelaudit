@@ -738,6 +738,30 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
     assert result.issues[0].rule_code == "S203"
 
 
+def test_pickle_report_preserves_finding_with_oversized_display_position() -> None:
+    location = f"sample.pkl (pos {'1' * 5000})"
+    reference = {"import_reference": "collections.Counter"}
+    report = PickleReport(
+        source="sample.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Sample finding",
+                severity=Severity.WARNING,
+                location=location,
+                details={**reference, "position": 7},
+            ),
+        ),
+        metadata={"import_references": [{**reference, "position": 7}, {**reference, "position": 8}]},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert [issue.location for issue in result.issues] == [location]
+    assert [check.details["position"] for check in result.checks if check.name == "Standalone Pickle Import"] == [8]
+
+
 def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_module_name_findings() -> None:
     report = PickleReport(
         source="danger.pkl",

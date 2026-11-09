@@ -743,7 +743,10 @@ def _location_position(location: str | None) -> int | None:
     match = _LOCATION_POSITION_RE.search(location)
     if match is None:
         return None
-    return int(match.group("position"))
+    try:
+        return int(match.group("position"))
+    except ValueError:
+        return None
 
 
 def _add_legacy_detail_aliases(details: dict[str, Any]) -> dict[str, Any]:
