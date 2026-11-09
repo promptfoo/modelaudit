@@ -1377,7 +1377,7 @@ def test_manifest_scanner_container_schemes_redact_userinfo(tmp_path: Path) -> N
         assert "frag" not in check.message
 
 
-def test_manifest_scanner_tunnel_service_flagged(tmp_path):
+def test_manifest_scanner_tunnel_service_flagged(tmp_path: Path) -> None:
     """Test that tunnel services (ngrok, localtunnel) are flagged (not in allowlist)."""
     test_file = tmp_path / "config.json"
     config_with_tunnel = {
@@ -1397,7 +1397,7 @@ def test_manifest_scanner_tunnel_service_flagged(tmp_path):
     url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
     failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) == 1
-    assert "ngrok.io" in failed_url_checks[0].details.get("url", "")
+    assert failed_url_checks[0].details["url"] == config_with_tunnel["callback_url"]
 
 
 def test_manifest_scanner_trusted_urls_not_flagged(tmp_path):
@@ -1564,7 +1564,7 @@ def test_manifest_scanner_broad_hosting_subdomains_flagged(tmp_path):
     assert "https://evil.googleusercontent.com/model.bin" in detected_urls
 
 
-def test_manifest_scanner_untrusted_domain_flagged(tmp_path):
+def test_manifest_scanner_untrusted_domain_flagged(tmp_path: Path) -> None:
     """Test that URLs from untrusted/unknown domains ARE flagged."""
     test_file = tmp_path / "config.json"
     config_with_untrusted_url = {
@@ -1585,10 +1585,10 @@ def test_manifest_scanner_untrusted_domain_flagged(tmp_path):
     failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) == 2, f"Expected 2 untrusted URLs, got {len(failed_url_checks)}"
 
-    # Verify URLs were detected
-    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
-    assert any("totally-legit-models.com" in url for url in detected_urls)
-    assert any("unknown-server.net" in url for url in detected_urls)
+    assert {c.details["url"] for c in failed_url_checks} == {
+        config_with_untrusted_url["download_url"],
+        config_with_untrusted_url["callback"],
+    }
 
 
 def test_manifest_scanner_domain_substring_bypass_flagged(tmp_path):
@@ -1615,18 +1615,20 @@ def test_manifest_scanner_domain_substring_bypass_flagged(tmp_path):
     assert any("huggingface.co.evil.example" in url for url in detected_urls)
 
 
-def test_manifest_scanner_nested_untrusted_url(tmp_path):
+def test_manifest_scanner_nested_untrusted_url(tmp_path: Path) -> None:
     """Test that untrusted URLs in nested config structures are detected."""
     test_file = tmp_path / "config.json"
+    webhook_url = "https://tinyurl.com/malicious"
+    inference_url = "https://localtunnel.me/api"
     config_with_nested_url = {
         "model_type": "bert",
         "training": {
             "callbacks": {
-                "webhook_url": "https://tinyurl.com/malicious",
+                "webhook_url": webhook_url,
             }
         },
         "pipelines": [
-            {"name": "inference", "endpoint": "https://localtunnel.me/api"},
+            {"name": "inference", "endpoint": inference_url},
         ],
     }
 
@@ -1642,10 +1644,7 @@ def test_manifest_scanner_nested_untrusted_url(tmp_path):
     failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) == 2
 
-    # Verify both URLs were detected
-    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
-    assert any("tinyurl.com" in url for url in detected_urls)
-    assert any("localtunnel.me" in url for url in detected_urls)
+    assert {c.details["url"] for c in failed_url_checks} == {webhook_url, inference_url}
 
 
 def test_manifest_scanner_duplicate_urls_not_repeated(tmp_path):
