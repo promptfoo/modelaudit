@@ -47,12 +47,28 @@ jobs:
           rustup default stable
 
       - name: Sync dependencies
+        id: sync
         run: |
           uv sync --extra ${{ matrix.os == 'windows-latest' && 'all-ci-windows' || 'all-ci' }}
 
       - name: Run correctness shard (fast + slow + integration)
         run: |
           uv run pytest -n auto -m "not performance" --modelaudit-shard-count 3 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
+
+      - name: Capture ProcessProvider native diagnostic
+        id: capture-native
+        if: ${{ always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && matrix.shard == 0 && steps.sync.outcome == 'success' }}
+        shell: bash
+        run: .venv/bin/python scripts/capture_process_provider_diagnostic.py
+
+      - name: Upload ProcessProvider native diagnostic
+        if: ${{ always() && steps.capture-native.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: picklescan-process-provider-native-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/picklescan-process-provider-diagnostic/
+          if-no-files-found: error
+          retention-days: 7
 
   performance:
     name: Performance Tests (Python 3.11, single process)

@@ -38,7 +38,11 @@ from modelaudit.scanners.text_scanner_support.model_card_policy import (
     disclosure_has_harmful_claim,
     model_card_policy_evidence,
 )
-from modelaudit.scanners.text_scanner_support.reviewed_citations import match_reviewed_citations, reviewed_readme_stat
+from modelaudit.scanners.text_scanner_support.reviewed_citations import (
+    match_reviewed_citations,
+    reviewed_readme_stat,
+    unaliased_regular_file_stat,
+)
 from modelaudit.utils._path_hardening import _file_stat_matches
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
@@ -912,16 +916,17 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _is_regular_readme(cls, path: str, source: BinaryIO) -> bool:
+    def _is_regular_readme(cls, path: str, source: BinaryIO, *, archive_member: bool = False) -> bool:
         filename = os.path.basename(path).lower()
         if not cls._is_readme_documentation_filename(filename) or filename.endswith(".env"):
             return False
         try:
-            entry = os.lstat(path)
+            # The logical member name is independent of the staging directory spelling.
+            entry = os.lstat(path) if archive_member else unaliased_regular_file_stat(path)
             return (
-                stat.S_ISREG(entry.st_mode)
+                entry is not None
+                and stat.S_ISREG(entry.st_mode)
                 and not (entry.st_mode & 0o111)
-                and os.path.abspath(path) == os.path.realpath(path)
                 and os.path.samestat(entry, os.fstat(source.fileno()))
             )
         except OSError:
@@ -4269,7 +4274,9 @@ class TextScanner(BaseScanner):
                             source_stat = descriptor_stat
                 regular_readme = self.config.get(
                     EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
-                ) != path and self._is_regular_readme(path, file_obj)
+                ) != path and self._is_regular_readme(
+                    path, file_obj, archive_member=bool(get_archive_depth(self.config))
+                )
         except OSError as error:
             self._mark_content_security_scan_incomplete(
                 result,

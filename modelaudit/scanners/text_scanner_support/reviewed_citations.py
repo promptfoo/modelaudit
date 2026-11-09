@@ -17,8 +17,13 @@ from modelaudit.utils._path_hardening import _file_stat_matches
 
 def reviewed_readme_stat(path: str) -> os.stat_result | None:
     """Keep the ordinary scan when the logical README name or its path cannot be verified."""
+    return unaliased_regular_file_stat(path) if os.path.basename(path) == "README.md" else None
+
+
+def unaliased_regular_file_stat(path: str) -> os.stat_result | None:
+    """Validate the source components without comparing platform-specific path spellings."""
     source = Path(path)
-    if source.name != "README.md" or ".." in source.parts:
+    if ".." in source.parts:
         return None
     try:
         source = source.absolute()

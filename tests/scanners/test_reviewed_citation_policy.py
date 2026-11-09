@@ -151,6 +151,25 @@ def test_review_decision_requires_standalone_readme(tmp_path: Path, role: str) -
     assert all(i.severity == expected and "reviewed_citation" not in i.details for i in matching)
 
 
+def test_archive_readme_uses_member_role_through_aliased_temp_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requires_symlinks: None
+) -> None:
+    import tempfile
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    alias = tmp_path / "temp"
+    alias.symlink_to(staging, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(alias))
+    path = tmp_path / "archive.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("README.md", CITATION)
+    result = scan_file(str(path), {"cache_enabled": False})
+    matching = [i for i in result.issues if i.rule_code == "S309" and i.details.get("url") == CITATION_URL]
+    assert matching
+    assert all(i.severity == IssueSeverity.INFO and "reviewed_citation" not in i.details for i in matching)
+
+
 def test_incomplete_read_preserves_citation_warning_and_coverage_error(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
     readme.write_text(CITATION + "Model notes.\n" * 100)
