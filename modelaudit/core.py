@@ -5016,12 +5016,14 @@ def scan_model_directory_or_file(
                                 and _openvino_xml_companion_key(openvino_owner) in covered_openvino_xml_companions
                             ):
                                 file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
-                            file_result = _scan_hashed_file(
+                            file_result = _scan_with_onnx_weight_proof(
                                 representative_file,
                                 file_config,
                                 onnx_weight_proofs,
                                 onnx_weight_alias=weight_snapshot_aliases.get(representative_file),
                             )
+                            if file_result is None:
+                                file_result = scan_file(representative_file, file_config)
                             file_result.bytes_scanned += covered_openvino_companion_sizes.get(
                                 _openvino_xml_companion_key(Path(representative_file)),
                                 0,
@@ -5502,7 +5504,9 @@ def scan_model_directory_or_file(
 
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
-                    file_result = _scan_hashed_file(target, target_config, onnx_weight_proofs)
+                    file_result = _scan_with_onnx_weight_proof(target, target_config, onnx_weight_proofs)
+                    if file_result is None:
+                        file_result = scan_file(target, target_config)
                 finally:
                     _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -6088,31 +6092,32 @@ def _preserve_hf_download_sidecar_asset(
     return _has_hf_download_metadata_sidecar(path)
 
 
-def _scan_hashed_file(
+def _scan_with_onnx_weight_proof(
     path: str,
     config: dict[str, Any],
     onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity],
     *,
     onnx_weight_alias: Path | None = None,
-) -> ScanResult:
+) -> ScanResult | None:
+    """Scan with verified weight evidence, or leave dispatch to the caller."""
     file_path = Path(path)
     if not onnx_weight_proofs or (onnx_weight_alias is None and file_path.suffix.lower() != ".onnx_data"):
-        return scan_file(path, config=config)
+        return None
     if onnx_weight_alias is not None and not _weight_snapshot_alias_matches_blob(file_path, onnx_weight_alias):
-        return scan_file(path, config=config)
+        return None
     try:
         path_stat = file_path.lstat()
     except OSError:
-        return scan_file(path, config=config)
+        return None
     identity = onnx_weight_proofs.get((path_stat.st_dev, path_stat.st_ino))
     if identity is None:
-        return scan_file(path, config=config)
+        return None
     if not _onnx_weight_proof_allowed(
         onnx_weight_alias or file_path, identity.stat.st_size, config
     ) or not identity.matches(file_path):
-        return scan_file(path, config=config)
+        return None
     with onnx_weight_routing_proof(path, identity):
-        result = scan_file(path, config=config)
+        result = scan_file(path, config)
     if not identity.matches(file_path) or (
         onnx_weight_alias is not None and not _weight_snapshot_alias_matches_blob(file_path, onnx_weight_alias)
     ):
@@ -8049,9 +8054,11 @@ def scan_model_streaming(
                 if progress_callback:
                     progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
-                scan_result = _scan_hashed_file(
+                scan_result = _scan_with_onnx_weight_proof(
                     str(scan_path), scan_config, onnx_weight_proofs, onnx_weight_alias=onnx_weight_alias
                 )
+                if scan_result is None:
+                    scan_result = scan_file(str(scan_path), config=scan_config)
                 if suppress_consumed_onnx_external_data_accounting:
                     scan_result.bytes_scanned = 0
                 openvino_sidecar_needs_independent_scan = (

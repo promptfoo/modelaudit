@@ -17075,7 +17075,8 @@ def test_onnx_weight_hash_rechecks_change_token_on_dispatch(tmp_path: Path, monk
     core_module._calculate_file_hash(str(path), onnx_weight_proofs=proofs)
     assert (path.stat().st_dev, path.stat().st_ino) in proofs
     generation += 1
-    result = core_module._scan_hashed_file(str(path), {"cache_enabled": False}, proofs)
+    assert core_module._scan_with_onnx_weight_proof(str(path), {"cache_enabled": False}, proofs) is None
+    result = core_module.scan_file(str(path), {"cache_enabled": False})
     assert not result.success
     assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
 
@@ -17137,7 +17138,9 @@ def test_large_onnx_weight_hash_proof_uses_validated_snapshot_name(
     source.write_bytes(other.read_bytes())
     alias.unlink()
     alias.symlink_to(os.path.relpath(other, alias.parent))
-    result_after_change = core_module._scan_hashed_file(
+    result_after_change = core_module._scan_with_onnx_weight_proof(
         str(source), {"cache_enabled": False}, proofs, onnx_weight_alias=alias
     )
-    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result_after_change.checks)
+    assert result_after_change is None
+    fallback = core_module.scan_file(str(source), {"cache_enabled": False})
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in fallback.checks)
