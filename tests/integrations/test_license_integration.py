@@ -206,7 +206,7 @@ class TestLicenseIntegration:
 
         # Should detect as model file
         assert metadata.get("is_model") is True, "Should detect .pkl as model file"
-        assert metadata.get("is_dataset") is True, "Should also detect .pkl as potential dataset"
+        assert metadata["is_dataset"] is None
 
     def test_agpl_component_detection_function(self, test_data_dir: Any) -> None:
         """Test the specific AGPL detection function."""

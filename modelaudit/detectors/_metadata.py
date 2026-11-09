@@ -14,6 +14,10 @@ from modelaudit.utils.file.detection import (
 
 _MAX_PICKLE_BYTES = 10 * 1024 * 1024
 _MAX_PICKLE_OPS = 100_000
+_MAX_DATASET_PICKLE_OPS = 250_000
+_MAX_DATASET_KEY_CHARS = 128
+_PICKLE_NUMBER_OPS = frozenset({"INT", "BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "FLOAT", "BINFLOAT"})
+_PICKLE_OTHER_SCALAR_OPS = frozenset({"NONE", "NEWTRUE", "NEWFALSE", "BINBYTES", "SHORT_BINBYTES", "BINBYTES8"})
 _MAX_METADATA_VALUE_BYTES = 64 * 1024
 _METADATA_KEYS = frozenset({"docs", "documentation", "license", "licence", "readme"})
 _ONNX_METADATA_KEYS = _METADATA_KEYS | {"repository", "source", "url"}
@@ -61,15 +65,36 @@ def _add_items(target: _PickleValue, values: list[_PickleValue]) -> None:
                 _escape(value)
 
 
-def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+class _DatasetPickleStream(BytesIO):
+    # Protocol 0 encodes integers as decimal lines. Bound conversion even if the
+    # interpreter's optional int-to-string digit limit has been disabled.
+    def readline(self, size: int | None = -1) -> bytes:
+        limit = 4096
+        line = super().readline(min(limit + 1, size) if size is not None and size >= 0 else limit + 1)
+        if len(line) > limit:
+            raise ValueError("Pickle text operand exceeds dataset probe limit")
+        return line
+
+
+def _pickle_structure(data: bytes, *, literal_only: bool = False) -> tuple[_PickleValue, list[_PickleValue]] | None:
+    """Inspect stack and memo references without importing or constructing serialized objects."""
     if len(data) > _MAX_PICKLE_BYTES:
-        return [], []
+        return None
+    max_ops = _MAX_DATASET_PICKLE_OPS if literal_only else _MAX_PICKLE_OPS
     stack: list[_PickleValue] = []
     memo: dict[int, _PickleValue] = {}
     strings: list[_PickleValue] = []
     mark = _PickleValue("mark")
-    stream = BytesIO(data)
+    scalar = _PickleValue("scalar")
+    number = _PickleValue("number")
+    stream = _DatasetPickleStream(data) if literal_only else BytesIO(data)
     frame_end: int | None = None
+
+    def add_items(target: _PickleValue, values: list[_PickleValue]) -> None:
+        if literal_only:
+            target.children.extend(values)
+        else:
+            _add_items(target, values)
 
     def take(count: int) -> list[_PickleValue]:
         if count > len(stack):
@@ -92,32 +117,25 @@ def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int
 
     try:
         for count, (opcode, arg, position) in enumerate(pickletools.genops(stream)):
-            if count >= _MAX_PICKLE_OPS or position is None:
-                return [], []
+            if count >= max_ops or position is None:
+                return None
             name = opcode.name
             end = stream.tell()
             if frame_end == position:
                 frame_end = None
             if frame_end is not None and end > frame_end:
-                return [], []
+                return None
             if name == "FRAME":
                 if not isinstance(arg, int) or frame_end is not None or end + arg > len(data):
-                    return [], []
+                    return None
                 frame_end = end + arg
             elif name == "PROTO":
-                if not isinstance(arg, int) or arg > 5:
-                    return [], []
+                if not isinstance(arg, int) or arg > 5 or (literal_only and position != 0):
+                    return None
             elif name == "STOP":
                 if end != len(data) or len(stack) != 1:
-                    return [], []
-                return (
-                    [value.span for value in strings if value.span is not None],
-                    [
-                        value.span
-                        for value in strings
-                        if value.span is not None and value.metadata and not value.escaped
-                    ],
-                )
+                    return None
+                return stack[0], strings
             elif isinstance(arg, str) and name in {*_STRING_HEADERS, "UNICODE", "STRING"}:
                 if name in _STRING_HEADERS:
                     span = position + _STRING_HEADERS[name], end
@@ -126,7 +144,8 @@ def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int
                 else:
                     span = position + 2, end - 2
                 value = _PickleValue("string", arg, span)
-                strings.append(value)
+                if not literal_only:
+                    strings.append(value)
                 stack.append(value)
             elif name == "MARK":
                 stack.append(mark)
@@ -134,11 +153,11 @@ def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int
                 memo[len(memo)] = stack[-1]
             elif name in {"PUT", "BINPUT", "LONG_BINPUT"}:
                 if not isinstance(arg, int) or arg < 0:
-                    return [], []
+                    return None
                 memo[arg] = stack[-1]
             elif name in {"GET", "BINGET", "LONG_BINGET"}:
                 if not isinstance(arg, int) or arg < 0:
-                    return [], []
+                    return None
                 stack.append(memo[arg])
             elif name == "DUP":
                 stack.append(stack[-1])
@@ -147,14 +166,21 @@ def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int
             elif name in {"DICT", "LIST", "TUPLE", "FROZENSET", "TUPLE1", "TUPLE2", "TUPLE3"}:
                 values = take(int(name[-1])) if name[-1].isdigit() else take_mark()
                 target = _PickleValue("tuple" if name.startswith("TUPLE") else name.lower())
-                _add_items(target, values)
+                add_items(target, values)
                 stack.append(target)
             elif name in {"SETITEM", "SETITEMS", "APPEND", "APPENDS", "ADDITEMS"}:
                 values = take(2 if name == "SETITEM" else 1) if name in {"SETITEM", "APPEND"} else take_mark()
                 expected = "dict" if name.startswith("SETITEM") else "set" if name == "ADDITEMS" else "list"
                 if stack[-1].kind not in {expected, "opaque"}:
-                    return [], []
-                _add_items(stack[-1], values)
+                    return None
+                add_items(stack[-1], values)
+            elif literal_only:
+                if name in _PICKLE_NUMBER_OPS:
+                    stack.append(number)
+                elif name in _PICKLE_OTHER_SCALAR_OPS:
+                    stack.append(scalar)
+                else:
+                    return None
             else:
                 if pickletools.markobject in opcode.stack_before:
                     consumed = take_mark()
@@ -167,8 +193,60 @@ def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int
                 stack.extend(_PickleValue() for _ in opcode.stack_after)
     except (ValueError, IndexError, KeyError, UnicodeError, OverflowError):
         # Incomplete or invalid serialization cannot prove passive ownership.
+        return None
+    return None
+
+
+def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    structure = _pickle_structure(data)
+    if structure is None:
         return [], []
-    return [], []
+    _, strings = structure
+    return (
+        [value.span for value in strings if value.span is not None],
+        [value.span for value in strings if value.span is not None and value.metadata and not value.escaped],
+    )
+
+
+def has_pickled_training_rows(data: bytes) -> bool:
+    """Recognize a complete primitive record sequence with training-example columns."""
+    if not data.startswith((b"\x80", b"]", b"(")):
+        return False
+    structure = _pickle_structure(data, literal_only=True)
+    if structure is None:
+        return False
+    root, _ = structure
+    if root.kind not in {"list", "tuple"} or not root.children:
+        return False
+    schema: set[str] | None = None
+    numeric_vectors: set[_PickleValue] = set()
+    for row in set(root.children):
+        if row.kind != "dict" or not 2 <= len(row.children) <= 128 or len(row.children) % 2:
+            return False
+        fields: dict[str, str] = {}
+        for key, value in zip(row.children[::2], row.children[1::2], strict=True):
+            if key.kind != "string" or key.text is None or len(key.text) > _MAX_DATASET_KEY_CHARS or key.text in fields:
+                return False
+            if value.kind not in {"string", "number", "scalar"}:
+                if key.text != "features" or value.kind not in {"list", "tuple"} or not value.children:
+                    return False
+                if value not in numeric_vectors:
+                    if any(item.kind != "number" for item in value.children):
+                        return False
+                    numeric_vectors.add(value)
+            fields[key.text] = value.kind
+        if schema is None:
+            schema = set(fields)
+        elif fields.keys() != schema:
+            return False
+        if not (
+            fields.get("text") == "string"
+            or (fields.get("prompt") == "string" and fields.get("completion") == "string")
+            or (fields.get("question") == "string" and fields.get("answer") == "string")
+            or (fields.keys() & {"input", "feature", "features"} and fields.keys() & {"label", "target"})
+        ):
+            return False
+    return True
 
 
 def _proto_fields(data: bytes, start: int, end: int, budget: list[int]) -> list[tuple[int, int, int, int]]:

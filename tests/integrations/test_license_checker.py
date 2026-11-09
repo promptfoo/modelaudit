@@ -2,6 +2,7 @@
 
 import json
 import os
+import pickle
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 from pydantic import HttpUrl
 
 from modelaudit.core import scan_model_directory_or_file
+from modelaudit.detectors import _metadata
 from modelaudit.integrations import dataset_license, license_checker
 from modelaudit.integrations.license_checker import (
     _LICENSE_HEADER_MAX_BYTES,
@@ -818,6 +820,16 @@ class TestSpdxLicenseChecks:
         else:
             assert warnings == []
 
+    def test_pickle_license_warning_from_legacy_dataset_flag(self, tmp_path: Path) -> None:
+        path = tmp_path / "checkpoint.PKL"
+        path.write_bytes(b"x" * (100 * 1024 + 1))
+        warnings = check_commercial_use_warnings({"file_metadata": {str(path): {"is_dataset": True}}})
+
+        assert len(warnings) == 1
+        assert warnings[0]["message"].startswith(".pkl files with unspecified licenses")
+        assert warnings[0]["severity"] == "info"
+        assert warnings[0]["details"]["files"] == [str(path)]
+
     @pytest.mark.parametrize("strict", [False, True])
     def test_deprecated_identifiers_count_each_file_once(self, tmp_path: Path, strict: bool) -> None:
         paths = [str(tmp_path / name) for name in ("first.py", "second.py")]
@@ -870,15 +882,64 @@ Bob,30
         assert metadata["is_dataset"] is True
         assert metadata["is_model"] is False
 
-    def test_collect_license_metadata_model(self, tmp_path):
+    def test_collect_license_metadata_model(self, tmp_path: Path) -> None:
         """Test license metadata for model file."""
         test_file = tmp_path / "model.pkl"
         test_file.write_bytes(b"dummy model content")
 
         metadata = collect_license_metadata(str(test_file))
 
-        assert metadata["is_dataset"] is True  # .pkl is both dataset and model extension
+        assert metadata["is_dataset"] is None
         assert metadata["is_model"] is True
+
+    @pytest.mark.parametrize("protocol", range(6))
+    def test_pickled_examples_keep_dataset_role(self, tmp_path: Path, protocol: int) -> None:
+        path = tmp_path / "artifact.PKL"
+        path.write_bytes(pickle.dumps([{"text": "example", "label": 1}], protocol=protocol))
+
+        assert collect_license_metadata(str(path))["is_dataset"] is True
+
+    def test_numeric_feature_records_keep_dataset_role(self, tmp_path: Path) -> None:
+        path = tmp_path / "examples.pkl"
+        features = [3.0, 7.0]
+        path.write_bytes(pickle.dumps([{"features": features, "target": 0}, {"features": features, "target": 1}]))
+        assert collect_license_metadata(str(path))["is_dataset"] is True
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pickle.dumps({"text": "classifier metadata"}),
+            pickle.dumps([{"name": "classifier", "depth": 3}]),
+            pickle.dumps([{"text": "example"}, {"model": "state"}]),
+            pickle.dumps([{"text": "example"}, {"question": "q", "answer": "a"}]),
+            pickle.dumps([{"text": ["nested content"]}]),
+            pickle.dumps([{"features": ["named estimator"], "label": 1}]),
+            pickle.dumps([{"text": "example", "model": complex(1, 2)}]),
+            pickle.dumps([{"text": "example"}])[:-1],
+            pickle.dumps([{"text": "word " * 1000}], protocol=0),
+            pickle.dumps([{"text": "example"}]) + pickle.dumps(None),
+        ],
+    )
+    def test_unknown_pickles_keep_qualified_notice(self, tmp_path: Path, payload: bytes) -> None:
+        path = tmp_path / "training.pkl"
+        path.write_bytes(payload)
+
+        assert collect_license_metadata(str(path))["is_dataset"] is None
+
+    def test_batched_pickled_rows_and_probe_limits(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = tmp_path / "artifact.pkl"
+        path.write_bytes(pickle.dumps([{"text": f"row {i}", "label": i % 2} for i in range(16_000)]))
+        assert collect_license_metadata(str(path))["is_dataset"] is True
+
+        monkeypatch.setattr(dataset_license, "_MAX_METADATA_BYTES", 1024)
+        assert collect_license_metadata(str(path))["is_dataset"] is None
+
+    def test_pickle_opcode_budget_keeps_role_unknown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = tmp_path / "examples.pkl"
+        path.write_bytes(pickle.dumps([{"text": "sample"}]))
+        monkeypatch.setattr(_metadata, "_MAX_DATASET_PICKLE_OPS", 5)
+
+        assert collect_license_metadata(str(path))["is_dataset"] is None
 
     def test_collect_license_metadata_reuses_lowered_header(
         self,

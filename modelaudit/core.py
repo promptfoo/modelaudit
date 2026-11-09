@@ -2682,6 +2682,25 @@ def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResu
     return result
 
 
+def _pickle_license_probe_limit(
+    path: str, result: ScanResult, config: dict[str, Any], *, over_total_budget: bool
+) -> int:
+    """Admit a complete structural metadata read only within the file's scan coverage."""
+    if (
+        not path.lower().endswith(".pkl")
+        or over_total_budget
+        or _scan_result_has_operational_error(result)
+        or _metadata_has_incomplete_coverage(result.metadata)
+    ):
+        return 0
+    limit = result.bytes_scanned
+    for option in ("max_file_size", "max_file_read_size"):
+        configured = config.get(option)
+        if type(configured) is int and configured > 0:
+            limit = min(limit, configured)
+    return limit
+
+
 def _onnx_weight_proof_allowed(path: Path, size: int, config: dict[str, Any]) -> bool:
     if not should_prove_large_onnx_weights(path, size):
         return False
@@ -5194,6 +5213,12 @@ def scan_model_directory_or_file(
                                 license_metadata = collect_license_metadata(
                                     scanned_file_path,
                                     nearby_license_cache=nearby_license_cache,
+                                    pickle_probe_limit=_pickle_license_probe_limit(
+                                        scanned_file_path,
+                                        file_result,
+                                        file_config,
+                                        over_total_budget=0 < max_total_size < results.bytes_scanned,
+                                    ),
                                 )
                             finally:
                                 _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
@@ -5632,6 +5657,12 @@ def scan_model_directory_or_file(
                     license_metadata = collect_license_metadata(
                         target,
                         nearby_license_cache=nearby_license_cache,
+                        pickle_probe_limit=_pickle_license_probe_limit(
+                            target,
+                            file_result,
+                            target_config,
+                            over_total_budget=0 < max_total_size < results.bytes_scanned,
+                        ),
                     )
                 finally:
                     _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)

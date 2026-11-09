@@ -3,7 +3,6 @@ import json
 import os
 import re
 from collections.abc import Container, Mapping, MutableMapping
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +13,7 @@ from modelaudit.models import CopyrightNoticeModel as CopyrightInfo
 from modelaudit.models import LicenseInfoModel as LicenseInfo
 
 from ..config.constants import COMMON_MODEL_EXTENSIONS
-from .dataset_license import is_model_repository_metadata
+from .dataset_license import is_model_repository_metadata, is_pickled_training_dataset
 
 _CC_VERSION_4 = r"[\s,]+(?:(?:International|License|Version)[\s,]+)*4\.0"
 
@@ -635,29 +634,36 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
         all_files, license_info_by_path=license_info_by_path, known_non_dataset_paths=known_non_dataset_paths
     )
 
-    # Filter out single files that might be tests or simple examples
-    significant_unlicensed_datasets = []
-    if len(all_files) > 1:  # Multiple files - likely a project
-        significant_unlicensed_datasets = unlicensed_datasets
-    else:
-        # Single file case - only warn if it's clearly a substantial dataset
-        for file_path in unlicensed_datasets:
-            with suppress(OSError):
-                file_size = os.path.getsize(file_path)
-                # Only warn about single files that are substantial (>100KB)
-                if file_size > 100 * 1024:
-                    significant_unlicensed_datasets.append(file_path)
+    dataset_files = []
+    pickle_files = []
+    for file_path in unlicensed_datasets:
+        if len(all_files) == 1:
+            # Only report a single candidate when it is substantial.
+            try:
+                if os.path.getsize(file_path) <= 100 * 1024:
+                    continue
+            except OSError:
+                continue
+        if Path(file_path).suffix.lower() == ".pkl":
+            pickle_files.append(file_path)
+        else:
+            dataset_files.append(file_path)
 
-    if significant_unlicensed_datasets:
+    for files, kind, guidance in (
+        (dataset_files, "Datasets", "Verify data usage rights."),
+        (pickle_files, ".pkl files", "Verify usage rights for any data they contain."),
+    ):
+        if not files:
+            continue
+        file_count = "1 file" if len(files) == 1 else f"{len(files)} files"
         warnings.append(
             {
                 "type": "license_warning",
                 "severity": "info",
-                "message": f"Datasets with unspecified licenses detected "
-                f"({len(significant_unlicensed_datasets)} files). Verify data usage rights.",
+                "message": f"{kind} with unspecified licenses detected ({file_count}). {guidance}",
                 "details": {
-                    "files": significant_unlicensed_datasets[:5],  # Show first 5 files
-                    "total_count": len(significant_unlicensed_datasets),
+                    "files": files[:5],
+                    "total_count": len(files),
                     "impact": "May restrict commercial use or redistribution",
                 },
             },
@@ -728,12 +734,14 @@ def collect_license_metadata(
     file_path: str,
     *,
     nearby_license_cache: MutableMapping[str, list[str]] | None = None,
+    pickle_probe_limit: int | None = None,
 ) -> dict[str, Any]:
     """
     Collect comprehensive license metadata for a file.
 
     Args:
         file_path: Path to the file to analyze
+        pickle_probe_limit: Maximum bytes admitted for pickle dataset evidence in this scan.
 
     Returns:
         Dictionary containing license metadata
@@ -748,9 +756,13 @@ def collect_license_metadata(
 
     # Detect file type
     ext = Path(file_path).suffix.lower()
-    metadata["is_dataset"] = ext in DATASET_EXTENSIONS and not (
-        ext == ".json" and is_model_repository_metadata(Path(file_path))
-    )
+    if ext == ".pkl":
+        # A pickle can contain model state, training data, or other Python objects.
+        metadata["is_dataset"] = True if is_pickled_training_dataset(Path(file_path), pickle_probe_limit) else None
+    else:
+        metadata["is_dataset"] = ext in DATASET_EXTENSIONS and not (
+            ext == ".json" and is_model_repository_metadata(Path(file_path))
+        )
     metadata["is_model"] = ext in MODEL_EXTENSIONS
 
     content = _read_header_text(file_path, max_lines=50)

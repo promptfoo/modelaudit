@@ -1,6 +1,7 @@
 """Tests for SBOM integration with license metadata."""
 
 import json
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -79,11 +80,26 @@ def example():
         dataset_file = tmp_path / "data.csv"
         dataset_file.write_text("name,age\nAlice,25\nBob,30")
 
-        # Create model file
         model_file = tmp_path / "model.pkl"
-        model_file.write_bytes(b"dummy model content")
+        model_file.write_bytes(b"cposix\nsystem\n(S'false'\ntR.")
+        pickled_rows = tmp_path / "training.pkl"
+        pickled_rows.write_bytes(pickle.dumps([{"text": "training example"}]))
 
-        sbom_data = _scan_sbom(tmp_path)
+        results = scan_model_directory_or_file(str(tmp_path), use_cache=False)
+        issues = {issue.message: issue for issue in results.issues if issue.type == "license_warning"}
+        datasets = issues["Datasets with unspecified licenses detected (1 file). Verify data usage rights."]
+        pickles = issues[
+            ".pkl files with unspecified licenses detected (2 files). Verify usage rights for any data they contain."
+        ]
+        assert datasets.details["files"] == [str(dataset_file)]
+        assert datasets.details["total_count"] == 1
+        assert pickles.severity.value == datasets.severity.value == "info"
+        assert set(pickles.details["files"]) == {str(model_file), str(pickled_rows)}
+        assert pickles.details["total_count"] == 2
+        assert any("REDUCE" in issue.message and "posix.system" in issue.message for issue in results.issues)
+        assert results.file_metadata[str(pickled_rows)].is_dataset is True
+
+        sbom_data = json.loads(generate_sbom([str(tmp_path)], results))
 
         components = sbom_data["components"]
 
@@ -108,6 +124,9 @@ def example():
         is_model_prop = _find_property(model_component, "ml:is_model")
         assert is_model_prop is not None
         assert is_model_prop["value"] == "true"
+        assert _find_property(model_component, "ml:is_dataset") is None
+        pickled_component = next(comp for comp in components if comp["name"].endswith("training.pkl"))
+        assert _find_property(pickled_component, "ml:is_dataset") == {"name": "ml:is_dataset", "value": "true"}
 
     def test_sbom_includes_risk_score_with_license_issues(self, tmp_path: Path) -> None:
         """Test that SBOM includes updated risk scores based on license issues."""
