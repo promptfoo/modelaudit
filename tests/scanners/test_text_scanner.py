@@ -1213,7 +1213,66 @@ def test_readme_bitcoin_addresses_require_a_valid_base58check_payload(tmp_path: 
         check.details["position"] for check in failed_checks if check.details["secret_type"] == "Bitcoin Address"
     ]
     assert sorted(bitcoin_positions) == [content.index(address) for address in addresses]
-    assert any(check.details["secret_type"] == "RSA Private Key" for check in failed_checks)
+    assert any(
+        check.details["secret_type"] == "RSA Private Key" and check.severity == IssueSeverity.CRITICAL
+        for check in failed_checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "prefix", "expected_severity"),
+    [
+        ("README.md", "", IssueSeverity.INFO),
+        ("README.env", "", IssueSeverity.WARNING),
+        ("README.md", "#!/bin/sh\n", IssueSeverity.WARNING),
+    ],
+)
+def test_public_receiving_addresses_in_readme(
+    tmp_path: Path, filename: str, prefix: str, expected_severity: IssueSeverity
+) -> None:
+    # The ordinary detector emits all three address types in this model context.
+    directory = tmp_path / "token-model"
+    directory.mkdir()
+    path = directory / filename
+    btc = "31hb9kC72UasjkEZGKWfR4nKWsQmqGB7FA"
+    eth = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+    ltc = "LKDyUEtTR1HXamkiEphisSiBJu6o3ZPE34"
+    content = f"{prefix}# Donations\nBitcoin: {btc}\nEthereum: {eth}\nLitecoin: {ltc}\nBitcoin: {btc}\n"
+    path.write_text(content, encoding="utf-8")
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert {(issue.details["secret_type"], issue.details["position"]) for issue in aggregate.issues} == {
+        ("Bitcoin Address", content.index(btc)),
+        ("Bitcoin Address", content.rindex(btc)),
+        ("Ethereum Address", content.index(eth)),
+        ("Litecoin Address", content.index(ltc)),
+    }
+    for issue in aggregate.issues:
+        assert issue.severity == expected_severity
+        assert issue.details["severity"] == "WARNING"
+        assert bool(issue.details.get("readme_severity_adjusted")) == (expected_severity == IssueSeverity.INFO)
+    assert determine_exit_code(aggregate) == (0 if expected_severity == IssueSeverity.INFO else 1)
+
+
+def test_receiving_address_as_a_password_and_seed_phrase_stay_actionable(tmp_path: Path) -> None:
+    directory = tmp_path / "token-model"
+    directory.mkdir()
+    path = directory / "README.md"
+    path.write_text(
+        'password = "31hb9kC72UasjkEZGKWfR4nKWsQmqGB7FA"\n'
+        'seed phrase="plover granite wicker jasmine crayon copper hinge marble saffron"\n',
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert {(issue.details["secret_type"], issue.severity) for issue in aggregate.issues} == {
+        ("Bitcoin Address", IssueSeverity.INFO),
+        ("Hardcoded Password", IssueSeverity.CRITICAL),
+        ("Crypto Seed Phrase", IssueSeverity.WARNING),
+    }
+    assert determine_exit_code(aggregate) == 1
 
 
 @pytest.mark.parametrize(

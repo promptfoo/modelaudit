@@ -4265,6 +4265,12 @@ class TextScanner(BaseScanner):
             result.metadata["text_content_sha256"] = hashlib.sha256(payload).hexdigest()
         inspected_payload = payload[:read_limit]
         inspected_bytes = len(inspected_payload)
+        readme_advisories = (
+            regular_readme
+            and not truncated
+            and inspected_bytes == file_size
+            and self._is_readme_text(inspected_payload)
+        )
         _DOCUMENTATION_QUOTE_WINDOWS.set((inspected_payload, {}))
 
         detector_incomplete = False
@@ -4286,7 +4292,14 @@ class TextScanner(BaseScanner):
                 if finding_limit is None:
                     finding_limit = passive_finding_limit
                 if secret_findings or not truncated:
-                    self.add_embedded_secret_findings(secret_findings, result, context=path)
+                    self.add_embedded_secret_findings(
+                        secret_findings,
+                        result,
+                        context=path,
+                        readme_advisories=readme_advisories
+                        and finding_limit is None
+                        and "patterns" not in (self.config.get("secrets_config") or {}),
+                    )
                 if finding_limit is not None:
                     detector_incomplete = True
                     self._mark_content_security_scan_incomplete(
@@ -4341,17 +4354,11 @@ class TextScanner(BaseScanner):
                     network_findings,
                 )
                 if network_findings or not truncated:
-                    readme_advisories = (
-                        bool(network_findings)
-                        and regular_readme
-                        and not truncated
-                        and len(payload) == file_size
-                        and not detector_incomplete
-                        and finding_limit is None
-                        and self._is_readme_text(inspected_payload)
-                    )
                     self.add_network_communication_findings(
-                        network_findings, result, context=path, readme_advisories=readme_advisories
+                        network_findings,
+                        result,
+                        context=path,
+                        readme_advisories=readme_advisories and not detector_incomplete and finding_limit is None,
                     )
                 if classification_incomplete:
                     detector_incomplete = True

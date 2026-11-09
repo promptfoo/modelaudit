@@ -833,6 +833,8 @@ class BaseScanner(ABC):
         findings: list[dict[str, Any]],
         result: ScanResult,
         context: str = "",
+        *,
+        readme_advisories: bool = False,
     ) -> int:
         """Emit explicit embedded secret checks from detector findings and return the count."""
         for finding in findings:
@@ -846,6 +848,16 @@ class BaseScanner(ABC):
                 finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
             )
             secret_rule_code = get_secret_rule_code(secret_descriptor)
+            why = finding.get("recommendation", "Remove sensitive data from model")
+            if readme_advisories and finding.get("secret_type") in {
+                "Bitcoin Address",
+                "Ethereum Address",
+                "Litecoin Address",
+            }:
+                if severity != IssueSeverity.INFO:
+                    severity = IssueSeverity.INFO
+                    finding = {**finding, "readme_severity_adjusted": True}
+                why = "This is a public receiving address. Spending requires the corresponding private key."
 
             result.add_check(
                 name="Embedded Secrets Detection",
@@ -855,7 +867,7 @@ class BaseScanner(ABC):
                 severity=severity,
                 location=finding.get("context", context),
                 details=finding,
-                why=finding.get("recommendation", "Remove sensitive data from model"),
+                why=why,
             )
 
         if not findings and context and not self._raw_detector_failed(result, "embedded_secrets"):
