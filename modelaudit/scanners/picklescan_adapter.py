@@ -719,7 +719,7 @@ def _finding_reference_keys(findings: tuple[Finding, ...]) -> set[tuple[str, int
             for value in (finding.details.get("global_position"), finding.details.get("position"))
             if isinstance(value, int)
         }
-        location = finding.location or ""
+        location = finding.location if finding.location is not None else ""
         display_position = _LOCATION_POSITION_RE.search(location)
         if display_position:
             # Read the matched text without invoking indexing hooks on a provider's label.

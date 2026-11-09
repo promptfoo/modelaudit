@@ -739,6 +739,9 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
 
 
 class _OpaqueDisplayLocation(str):
+    def __len__(self) -> int:
+        raise TypeError("display label does not support measuring its length")
+
     def __getitem__(self, key: object, /) -> str:
         raise IndexError("display label does not support indexing")
 
