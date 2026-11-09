@@ -997,14 +997,10 @@ def _validated_pytorch_storage_entry_ids(
     options: ScanOptions,
     deadline: float,
 ) -> tuple[_PytorchZipStorageEntries, tuple[Notice, ...]]:
-    members = [
-        (entry.filename, entry)
-        for entry in entries
-        if not entry.is_dir() and _is_canonical_pytorch_zip_member_name(entry.filename)
-    ]
     entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
-    for name, entry in members:
-        entries_by_name.setdefault(name, []).append(entry)
+    for entry in entries:
+        if not entry.is_dir() and _is_canonical_pytorch_zip_member_name(entry.filename):
+            entries_by_name.setdefault(entry.filename, []).append(entry)
 
     trusted_entry_ids: set[int] = set()
     expanded_trust_entry_ids: set[int] = set()
