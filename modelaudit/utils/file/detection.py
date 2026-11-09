@@ -30,6 +30,7 @@ from ...scanner_registry_metadata import (
     get_extension_format_map,
     get_registered_scanner_extensions,
 )
+from .._path_hardening import _file_stat_matches
 from ..helpers.json_limits import validate_json_structural_limits
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
@@ -350,6 +351,7 @@ _FLAX_ROUTING_KEY_ENDINGS = tuple(
     for key in _FLAX_MSGPACK_ROUTING_KEYS
     for length_prefix in (0, 0xA0)
 )
+_FLAX_ROUTING_KEY_OVERLAP = max(map(len, _FLAX_ROUTING_KEY_ENDINGS)) - 1
 _FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
 _FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
 _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
@@ -8312,13 +8314,102 @@ def _probe_flax_msgpack_checkpoint_stream(
     return False
 
 
+def should_prove_large_onnx_weights(path: Path, file_size: int) -> bool:
+    """Collect hash-pass evidence only beyond the normal auxiliary routing limit."""
+    return path.suffix.lower() == ".onnx_data" and file_size > _FLAX_AUXILIARY_KEY_SCAN_BYTES
+
+
+@dataclass
+class FlaxKeyAbsenceProbe:
+    """Observe all supported checkpoint key encodings across existing hash-read chunks."""
+
+    bytes_read: int = 0
+    tail: bytes | None = b""
+
+    @classmethod
+    def for_hash_stream(cls, source: BinaryIO, file_size: int) -> "FlaxKeyAbsenceProbe | None":
+        """Search hash chunks only when the normal structural probe cannot decide."""
+        try:
+            return cls() if _probe_flax_msgpack_checkpoint_stream(source, file_size) is None else None
+        finally:
+            source.seek(0)
+
+    def observe(self, chunk: bytes) -> None:
+        if self.tail is None:
+            return
+        self.bytes_read += len(chunk)
+        boundary = self.tail + chunk[:_FLAX_ROUTING_KEY_OVERLAP]
+        if any(ending in chunk or ending in boundary for ending in _FLAX_ROUTING_KEY_ENDINGS):
+            self.tail = None
+        else:
+            suffix = chunk if len(chunk) >= _FLAX_ROUTING_KEY_OVERLAP else boundary
+            self.tail = suffix[-_FLAX_ROUTING_KEY_OVERLAP:]
+
+    def excludes_keys(self, size: int) -> bool:
+        return self.tail is not None and self.bytes_read == size
+
+
+@dataclass(frozen=True)
+class OnnxWeightProofIdentity:
+    stat: os.stat_result
+    change_token: int
+
+    @classmethod
+    def capture(cls, path: Path, path_stat: os.stat_result) -> "OnnxWeightProofIdentity | None":
+        from ...cache.scan_results_cache import ScanResultsCache
+
+        if not path_stat.st_ino:
+            return None
+        try:
+            token = ScanResultsCache._get_file_change_token(str(path), path_stat)
+        except OSError:
+            return None
+        return cls(path_stat, token)
+
+    def matches(self, path: Path) -> bool:
+        try:
+            current = path.lstat()
+        except OSError:
+            return False
+        if not stat.S_ISREG(current.st_mode) or not _file_stat_matches(current, self.stat):
+            return False
+        observed = self.capture(path, current)
+        return observed is not None and observed.change_token == self.change_token
+
+
+_ONNX_WEIGHT_PROOF: ContextVar[tuple[str, OnnxWeightProofIdentity] | None] = ContextVar(
+    "onnx_weight_proof", default=None
+)
+
+
+@contextmanager
+def onnx_weight_routing_proof(path: str, identity: OnnxWeightProofIdentity) -> Iterator[None]:
+    """Make an already completed hash read available only for this path's dispatch."""
+    token = _ONNX_WEIGHT_PROOF.set((os.path.abspath(path), identity))
+    try:
+        yield
+    finally:
+        _ONNX_WEIGHT_PROOF.reset(token)
+
+
 def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
     """Inspect streamed maps, returning None when safe routing cannot complete."""
     try:
         with path.open("rb") as stream:
             outcome = _probe_flax_msgpack_checkpoint_stream(stream, file_size)
-            if outcome is not None or file_size > _FLAX_AUXILIARY_KEY_SCAN_BYTES:
+            if outcome is not None:
                 return outcome
+            if file_size > _FLAX_AUXILIARY_KEY_SCAN_BYTES:
+                proof = _ONNX_WEIGHT_PROOF.get()
+                if (
+                    proof is not None
+                    and os.path.abspath(path) == proof[0]
+                    and _file_stat_matches(os.fstat(stream.fileno()), proof[1].stat, cross_view=True)
+                    and proof[1].matches(path)
+                    and _probe_complete_structured_json_document(path, file_size) is False
+                ):
+                    return False
+                return None
             if path.suffix.lower() not in _FLAX_AUXILIARY_SUFFIXES:
                 stream.seek(0)
                 if not stream.read(4).startswith(b"\x7fELF"):
@@ -8328,16 +8419,14 @@ def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | 
             # Exclude it only if every byte rules out all supported routing keys.
             stream.seek(0)
             remaining = file_size
-            overlap = max(map(len, _FLAX_ROUTING_KEY_ENDINGS)) - 1
-            tail = b""
+            probe = FlaxKeyAbsenceProbe()
             while remaining:
                 chunk = stream.read(min(remaining, FLAX_MSGPACK_STRUCTURE_READ_BYTES))
                 if not chunk:
                     return None
-                window = tail + chunk
-                if any(ending in window for ending in _FLAX_ROUTING_KEY_ENDINGS):
+                probe.observe(chunk)
+                if probe.tail is None:
                     return None
-                tail = window[-overlap:]
                 remaining -= len(chunk)
             return None if stream.read(1) else False
     except OSError:

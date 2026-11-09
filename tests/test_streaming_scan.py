@@ -1929,6 +1929,48 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash != second_result.content_hash
 
 
+@pytest.mark.parametrize("weights_first", [False, True])
+@pytest.mark.parametrize("late_flax_key", [False, True])
+@pytest.mark.parametrize("hf_snapshot", [False, True])
+def test_streamed_onnx_weights_require_a_complete_flax_key_exclusion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    weights_first: bool,
+    late_flax_key: bool,
+    hf_snapshot: bool,
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 16)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 1024)
+    if hf_snapshot:
+        request.getfixturevalue("requires_symlinks")
+        cache = tmp_path / "hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+        root, _, _ = _write_onnx_cache_snapshot(tmp_path, cache / "models--test--model")
+    else:
+        root = tmp_path
+        (root / "model.onnx").write_bytes(create_external_onnx_payload(tmp_path))
+    model = root / "model.onnx"
+    weights = root / "model.onnx_data"
+    contents = b"\x00\x3c" * 4096
+    if late_flax_key:
+        contents += b"\x81\xa6params\x80"
+    weights.write_bytes(contents)
+    paths = [weights, model] if weights_first else [model, weights]
+
+    result = scan_model_streaming(
+        _file_generator(paths), timeout=30, delete_after_scan=False, cache_enabled=False, scan_root=str(root)
+    )
+
+    assert result.content_hash == compute_aggregate_hash([compute_sha256_hash(path) for path in paths])
+    assert any(
+        check.name == "External Data Reference Check" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks) == late_flax_key
+    asset = next(asset for asset in result.assets if asset.path == str(weights))
+    assert asset.type == ("flax_msgpack" if late_flax_key else "unknown")
+
+
 def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

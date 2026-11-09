@@ -3309,6 +3309,8 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
         config: dict[str, Any] | None = None,
         routing_paths: dict[str, str] | None = None,
         hashed_identities: dict[str, dict[str, int]] | None = None,
+        onnx_weight_proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] | None = None,
+        onnx_weight_aliases: dict[str, Path] | None = None,
         deadline: float | None = None,
     ) -> dict[str, str]:
         assert set(file_paths) == {str(blob_one), str(blob_two)}
@@ -3318,6 +3320,8 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
             config=config,
             routing_paths=routing_paths,
             hashed_identities=hashed_identities,
+            onnx_weight_aliases=onnx_weight_aliases,
+            onnx_weight_proofs=onnx_weight_proofs,
             deadline=deadline,
         )
         shard_one.unlink()
@@ -17020,3 +17024,120 @@ def _install_hash_read_clock(monkeypatch: pytest.MonkeyPatch, read_seconds: Call
     monkeypatch.setattr(core_module.time, "time", lambda: now)
     monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
     return read_sizes
+
+
+@pytest.mark.parametrize("as_directory", [False, True])
+def test_onnx_weight_hash_resolves_only_inconclusive_flax_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, as_directory: bool
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    sidecar = tmp_path / "weights.onnx_data"
+    sidecar.write_bytes(b"\x00\x3c" * 128)
+    target = tmp_path if as_directory else sidecar
+
+    result = scan_model_directory_or_file(str(target), cache_enabled=False)
+    assert result.success
+    assert [asset.type for asset in result.assets] == ["unknown"]
+    assert result.bytes_scanned == sidecar.stat().st_size
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(sidecar)
+
+    limited = scan_model_directory_or_file(str(target), cache_enabled=False, max_file_read_size=64)
+    assert not limited.success
+    assert any(check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in limited.checks)
+
+
+@pytest.mark.parametrize("key_encoding", [b"\xa6params", b"\xd9\x06params", b"\xc4\x06params"])
+def test_onnx_weight_hash_preserves_split_late_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key_encoding: bytes
+) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 8)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(core_module, "DEFAULT_READ_CHUNK_SIZE", 32)
+    path = tmp_path / "weights.onnx_data"
+    payload = bytes(28) + b"\x81" + key_encoding + b"\x80"
+    path.write_bytes(payload)
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    assert core_module._calculate_file_hash(str(path), onnx_weight_proofs=proofs) == hashlib.sha256(payload).hexdigest()
+    assert not proofs
+
+
+def test_onnx_weight_hash_rechecks_change_token_on_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.cache.scan_results_cache import ScanResultsCache
+
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    path = tmp_path / "weights.onnx_data"
+    path.write_bytes(b"\x00\x3c" * 128)
+    generation = 1
+    monkeypatch.setattr(ScanResultsCache, "_get_file_change_token", staticmethod(lambda path, stat: generation))
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    core_module._calculate_file_hash(str(path), onnx_weight_proofs=proofs)
+    assert (path.stat().st_dev, path.stat().st_ino) in proofs
+    generation += 1
+    result = core_module._scan_hashed_file(str(path), {"cache_enabled": False}, proofs)
+    assert not result.success
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+def test_onnx_weight_hash_keeps_independent_json_ambiguity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    monkeypatch.setattr(file_detection, "_probe_complete_structured_json_document", lambda path, size: None)
+    path = tmp_path / "weights.onnx_data"
+    path.write_bytes(b"\x00\x3c" * 128)
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    core_module._calculate_file_hash(str(path), onnx_weight_proofs=proofs)
+    with file_detection.onnx_weight_routing_proof(str(path), proofs[(path.stat().st_dev, path.stat().st_ino)]):
+        assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(path)
+        assert file_detection.is_flax_msgpack_checkpoint_file(path)
+
+
+def test_large_onnx_weight_hash_proof_covers_named_hardlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    first = tmp_path / "a.onnx_data"
+    second = tmp_path / "b.onnx_data"
+    first.write_bytes(b"\x00\x3c" * 128)
+    try:
+        second.hardlink_to(first)
+    except OSError:
+        pytest.skip("Hard links unavailable")
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    assert result.success
+    assert {(Path(asset.path).name, asset.type) for asset in result.assets} == {
+        ("a.onnx_data", "unknown"),
+        ("b.onnx_data", "unknown"),
+    }
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_large_onnx_weight_hash_proof_uses_validated_snapshot_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, snapshot, blobs = _create_hf_snapshot_dirs(tmp_path, monkeypatch)
+    monkeypatch.setattr(file_detection, "_FLAX_AUXILIARY_KEY_SCAN_BYTES", 64)
+    monkeypatch.setattr(file_detection, "_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS", 8)
+    source = blobs / "sidecar-blob"
+    source.write_bytes(b"\x00\x3c" * 128)
+    alias = snapshot / "model.onnx_data"
+    alias.symlink_to(os.path.relpath(source, alias.parent))
+
+    result = scan_model_directory_or_file(str(snapshot), cache_enabled=False)
+    assert result.success
+    assert len(result.assets) == 1
+    assert result.assets[0].type == "unknown"
+    assert result.bytes_scanned == source.stat().st_size
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(source)
+
+    proofs: dict[tuple[int, int], file_detection.OnnxWeightProofIdentity] = {}
+    core_module._calculate_file_hash(str(source), onnx_weight_proofs=proofs, onnx_weight_alias=alias)
+    other = blobs / "different-blob"
+    source.rename(other)
+    source.write_bytes(other.read_bytes())
+    alias.unlink()
+    alias.symlink_to(os.path.relpath(other, alias.parent))
+    result_after_change = core_module._scan_hashed_file(
+        str(source), {"cache_enabled": False}, proofs, onnx_weight_alias=alias
+    )
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result_after_change.checks)
