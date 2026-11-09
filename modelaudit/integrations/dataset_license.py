@@ -8,11 +8,13 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from ..utils._path_hardening import _file_stat_matches
 from ..utils.file.safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
 from ..utils.helpers.json_limits import validate_json_structural_limits
 
 _MAX_METADATA_BYTES = 8 * 1024 * 1024
 _MAX_METADATA_TOKENS = 200_000
+_MAX_MODEL_CONFIG_BYTES = 64 * 1024
 _SHA1 = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _COREML_ITEM_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
@@ -64,16 +66,28 @@ def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_metadata_bytes(path: Path, size_limit: int) -> bytes | None:
+def _read_metadata_bytes(path: Path, size_limit: int, *, follow_symlinks: bool = True) -> bytes | None:
     def open_nonblocking(name: str, flags: int) -> int:
+        if not follow_symlinks:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
         return os.open(name, flags | getattr(os, "O_NONBLOCK", 0))
 
     try:
+        expected = None if follow_symlinks else path.lstat()
+        if expected is not None and not stat.S_ISREG(expected.st_mode):
+            return None
         with open(path, "rb", opener=open_nonblocking) as source:
             info = os.fstat(source.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > size_limit:
                 return None
+            if expected is not None and not _file_stat_matches(expected, info, cross_view=True):
+                return None
             raw = source.read(info.st_size + 1)
+            if expected is not None and (
+                not _file_stat_matches(info, os.fstat(source.fileno()))
+                or not _file_stat_matches(info, path.lstat(), cross_view=True)
+            ):
+                return None
         return raw if len(raw) == info.st_size else None
     except (OSError, ValueError):
         return None
@@ -239,23 +253,55 @@ def _is_sparse_attention_config(layers: list[Any]) -> bool:
     return True
 
 
+def _has_causal_lm_companion(descriptor: Path) -> bool:
+    raw = _read_metadata_bytes(descriptor.with_name("config.json"), _MAX_MODEL_CONFIG_BYTES, follow_symlinks=False)
+    if raw is None:
+        return False
+    try:
+        validate_json_structural_limits(raw, _MAX_METADATA_TOKENS, "Transformers configuration")
+        config = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
+    except (ValueError, RecursionError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    model_type = config.get("model_type")
+    architectures = config.get("architectures")
+    return bool(
+        isinstance(model_type, str)
+        and re.fullmatch(r"[a-z][a-z0-9_]*", model_type)
+        and isinstance(architectures, list)
+        and len(architectures) == 1
+        and isinstance(architectures[0], str)
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*ForCausalLM", architectures[0])
+        and all(
+            type(config.get(key)) is int and config[key] > 0
+            for key in ("hidden_size", "num_attention_heads", "num_hidden_layers", "vocab_size")
+        )
+    )
+
+
 def is_model_repository_metadata(path: Path) -> bool:
     """Require a complete, bounded document matching a recognized producer schema."""
     name = path.name.lower()
     is_safetensors_index = name.endswith(".safetensors.index.json")
     is_index = is_safetensors_index or name.endswith(".bin.index.json")
     is_hub_tree = path.parts[-4:-1] == (".cache", "huggingface", "trees") and _SHA1.fullmatch(path.stem)
+    is_modelscope_descriptor = path.name == "configuration.json"
     is_coreml_manifest = path.name == "Manifest.json" and path.parent.suffix.lower() == ".mlpackage"
     if not (
         is_index
         or is_hub_tree
         or is_coreml_manifest
+        or is_modelscope_descriptor
         or name in _PROCESSOR_CONFIG_NAMES
         or name in {"chat_template.json", "added_tokens.json", "hf_quant_config.json", "sparse_attention_config.json"}
     ):
         return False
     size_limit = INDEX_PROBE_BYTES if is_safetensors_index else _MAX_METADATA_BYTES
-    raw = _read_metadata_bytes(path, size_limit)
+    if is_modelscope_descriptor:
+        raw = _read_metadata_bytes(path, _MAX_MODEL_CONFIG_BYTES, follow_symlinks=False)
+    else:
+        raw = _read_metadata_bytes(path, size_limit)
     if raw is None:
         return False
     if len(raw) > _MAX_METADATA_BYTES:
@@ -274,6 +320,14 @@ def is_model_repository_metadata(path: Path) -> bool:
         return isinstance(data, list) and _is_sparse_attention_config(data)
     if not isinstance(data, dict) or not data:
         return False
+    if is_modelscope_descriptor:
+        # A framework/task record alone can also be dataset content.
+        return (
+            data.keys() == {"framework", "task"}
+            and data["framework"] in ("Pytorch", "pytorch", "PyTorch")
+            and data["task"] == "text-generation"
+            and _has_causal_lm_companion(path)
+        )
     if name in _PROCESSOR_CONFIG_NAMES:
         return _is_transformers_processor(name, data)
     if name == "hf_quant_config.json":
