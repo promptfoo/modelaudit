@@ -482,10 +482,13 @@ impl ScanVerdict {
 
 fn global_ref_details(
     reference: &GlobalRef,
-    symbol: &str,
+    symbol: String,
     op_name: &'static str,
+    position_field: &str,
+    extra: Option<(&str, DetailValue)>,
 ) -> Vec<(String, DetailValue)> {
-    vec![
+    let mut details = Vec::with_capacity(5 + usize::from(extra.is_some()));
+    details.extend([
         (
             "opcode".to_string(),
             DetailValue::String(op_name.to_string()),
@@ -498,15 +501,16 @@ fn global_ref_details(
             "name".to_string(),
             DetailValue::String(reference.name.clone()),
         ),
+        ("import_reference".to_string(), DetailValue::String(symbol)),
         (
-            "import_reference".to_string(),
-            DetailValue::String(symbol.to_string()),
-        ),
-        (
-            "position".to_string(),
+            position_field.to_string(),
             DetailValue::UInt(reference.position as u64),
         ),
-    ]
+    ]);
+    if let Some((key, value)) = extra {
+        details.push((key.to_string(), value));
+    }
+    details
 }
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
@@ -1760,178 +1764,8 @@ impl<'a> ScanState<'a> {
                     self.mark_non_allowlisted_global_invoked(invocation);
                     self.push_callable_invocation(invocation);
                 }
-                if let Some(primary_invocation) = invocations.first() {
-                    let callable_ref = &primary_invocation.reference;
-                    if callable_ref.module == "copyreg.extension" {
-                        self.add_finding(Finding {
-                            message: format!(
-                                "Found {} opcode invoking opaque copyreg extension: {}",
-                                opcode.name,
-                                callable_ref.symbol()
-                            ),
-                            severity: "critical",
-                            location: Some(format!("{} (pos {})", self.source, position)),
-                            rule_code: Some("DANGEROUS_CALL"),
-                            details: vec![
-                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
-                                (
-                                    "module".to_string(),
-                                    DetailValue::String(callable_ref.module.clone()),
-                                ),
-                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
-                                (
-                                    "import_reference".to_string(),
-                                    DetailValue::String(callable_ref.symbol()),
-                                ),
-                                (
-                                    "global_position".to_string(),
-                                    DetailValue::UInt(callable_ref.position as u64),
-                                ),
-                                ("opaque_extension".to_string(), DetailValue::Bool(true)),
-                            ],
-                            why: Some(
-                                "Copyreg extension opcodes resolve through process-local state and become executable when consumed by REDUCE-like opcodes.",
-                            ),
-                        });
-                    } else if callable_ref.module == "__main__" {
-                        self.add_finding(Finding {
-                            message: format!(
-                                "Found {} opcode invoking __main__ global: {}",
-                                opcode.name,
-                                callable_ref.symbol()
-                            ),
-                            severity: "critical",
-                            location: Some(format!("{} (pos {})", self.source, position)),
-                            rule_code: Some("DANGEROUS_CALL"),
-                            details: vec![
-                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
-                                (
-                                    "module".to_string(),
-                                    DetailValue::String(callable_ref.module.clone()),
-                                ),
-                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
-                                (
-                                    "import_reference".to_string(),
-                                    DetailValue::String(callable_ref.symbol()),
-                                ),
-                                (
-                                    "global_position".to_string(),
-                                    DetailValue::UInt(callable_ref.position as u64),
-                                ),
-                            ],
-                            why: Some(
-                                "__main__ references depend on arbitrary application code and become executable when consumed by REDUCE-like opcodes.",
-                            ),
-                        });
-                    } else if let Some(mutation_target) =
-                        sensitive_mutator_invocation_target(callable_ref, &primary_invocation.args)
-                    {
-                        self.add_finding(Finding {
-                            message: format!(
-                                "Found {} opcode mutating process-global state: {}",
-                                opcode.name,
-                                callable_ref.symbol()
-                            ),
-                            severity: "critical",
-                            location: Some(format!("{} (pos {})", self.source, position)),
-                            rule_code: Some("DANGEROUS_CALL"),
-                            details: vec![
-                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
-                                (
-                                    "module".to_string(),
-                                    DetailValue::String(callable_ref.module.clone()),
-                                ),
-                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
-                                (
-                                    "import_reference".to_string(),
-                                    DetailValue::String(callable_ref.symbol()),
-                                ),
-                                (
-                                    "global_position".to_string(),
-                                    DetailValue::UInt(callable_ref.position as u64),
-                                ),
-                                (
-                                    "mutation_target".to_string(),
-                                    DetailValue::String(mutation_target.to_string()),
-                                ),
-                            ],
-                            why: Some(
-                                "This pickle opcode mutates process-global registries or diagnostic policy during deserialization.",
-                            ),
-                        });
-                    } else if let Some(protocol_target) =
-                        operator_mutator_protocol_target(callable_ref, &primary_invocation.args)
-                    {
-                        self.add_finding(Finding {
-                            message: format!(
-                                "Found {} opcode invoking object mutation protocol: {}",
-                                opcode.name,
-                                callable_ref.symbol()
-                            ),
-                            severity: "critical",
-                            location: Some(format!("{} (pos {})", self.source, position)),
-                            rule_code: Some("DANGEROUS_CALL"),
-                            details: vec![
-                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
-                                (
-                                    "module".to_string(),
-                                    DetailValue::String(callable_ref.module.clone()),
-                                ),
-                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
-                                (
-                                    "import_reference".to_string(),
-                                    DetailValue::String(callable_ref.symbol()),
-                                ),
-                                (
-                                    "global_position".to_string(),
-                                    DetailValue::UInt(callable_ref.position as u64),
-                                ),
-                                (
-                                    "mutation_target".to_string(),
-                                    DetailValue::String(protocol_target.to_string()),
-                                ),
-                            ],
-                            why: Some(
-                                "Operator mutators dispatch to target object protocol methods, which can execute attacker-controlled methods during deserialization.",
-                            ),
-                        });
-                    } else if let Some(severity) =
-                        callable_severity(&callable_ref.module, &callable_ref.name)
-                    {
-                        self.add_finding(Finding {
-                            message: format!(
-                                "Found {} opcode invoking dangerous global: {}",
-                                opcode.name,
-                                callable_ref.symbol()
-                            ),
-                            severity,
-                            location: Some(format!("{} (pos {})", self.source, position)),
-                            rule_code: Some("DANGEROUS_CALL"),
-                            details: vec![
-                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
-                                (
-                                    "module".to_string(),
-                                    DetailValue::String(callable_ref.module.clone()),
-                                ),
-                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
-                                (
-                                    "import_reference".to_string(),
-                                    DetailValue::String(callable_ref.symbol()),
-                                ),
-                                (
-                                    "global_position".to_string(),
-                                    DetailValue::UInt(callable_ref.position as u64),
-                                ),
-                                (
-                                    "opcode_position".to_string(),
-                                    DetailValue::UInt(position as u64),
-                                ),
-                            ],
-                            why: Some(
-                                "This pickle opcode can invoke attacker-controlled callables during deserialization.",
-                            ),
-                        });
-                    }
+                if let Some(invocation) = invocations.first() {
+                    self.record_primary_invocation_finding(invocation, opcode.name, position);
                 }
             }
             "PERSID" | "BINPERSID" => {
@@ -1940,6 +1774,66 @@ impl<'a> ScanState<'a> {
             "FRAME" | "STOP" => {}
             _ => {}
         }
+    }
+
+    fn record_primary_invocation_finding(
+        &mut self,
+        invocation: &CallableInvocation,
+        op_name: &'static str,
+        position: usize,
+    ) {
+        let reference = &invocation.reference;
+        let (action, why, severity, detail) = if reference.module == "copyreg.extension" {
+            (
+                "invoking opaque copyreg extension",
+                "Copyreg extension opcodes resolve through process-local state and become executable when consumed by REDUCE-like opcodes.",
+                "critical",
+                Some(("opaque_extension", DetailValue::Bool(true))),
+            )
+        } else if reference.module == "__main__" {
+            (
+                "invoking __main__ global",
+                "__main__ references depend on arbitrary application code and become executable when consumed by REDUCE-like opcodes.",
+                "critical",
+                None,
+            )
+        } else if let Some(target) =
+            sensitive_mutator_invocation_target(reference, &invocation.args)
+        {
+            (
+                "mutating process-global state",
+                "This pickle opcode mutates process-global registries or diagnostic policy during deserialization.",
+                "critical",
+                Some(("mutation_target", DetailValue::String(target.to_string()))),
+            )
+        } else if let Some(target) = operator_mutator_protocol_target(reference, &invocation.args) {
+            (
+                "invoking object mutation protocol",
+                "Operator mutators dispatch to target object protocol methods, which can execute attacker-controlled methods during deserialization.",
+                "critical",
+                Some(("mutation_target", DetailValue::String(target.to_string()))),
+            )
+        } else if let Some(severity) = callable_severity(&reference.module, &reference.name) {
+            (
+                "invoking dangerous global",
+                "This pickle opcode can invoke attacker-controlled callables during deserialization.",
+                severity,
+                Some(("opcode_position", DetailValue::UInt(position as u64))),
+            )
+        } else {
+            return;
+        };
+        let symbol = reference.symbol();
+        let message = format!("Found {op_name} opcode {action}: {symbol}");
+        let details = global_ref_details(reference, symbol, op_name, "global_position", detail);
+        self.add_finding(Finding {
+            message,
+            severity,
+            location: Some(format!("{} (pos {})", self.source, position)),
+            rule_code: Some("DANGEROUS_CALL"),
+            details,
+            why: Some(why),
+        });
     }
 
     fn readonly_buffer_operand_is_definitely_invalid(value: Option<&StackValue>) -> bool {
@@ -6677,7 +6571,7 @@ impl<'a> ScanState<'a> {
         }
 
         self.global_count += 1;
-        let details = global_ref_details(reference, &symbol, op_name);
+        let details = global_ref_details(reference, symbol.clone(), op_name, "position", None);
         if self.seen_global_reference_keys.insert(key) {
             let mut import_reference_details = details.clone();
             import_reference_details
@@ -7027,30 +6921,16 @@ impl<'a> ScanState<'a> {
         }
         self.callable_invocation_keys.insert(dedupe_key);
 
-        let symbol = invocation.reference.symbol();
-        let mut details = vec![
-            (
-                "opcode".to_string(),
-                DetailValue::String(invocation.op_name.to_string()),
-            ),
-            (
-                "module".to_string(),
-                DetailValue::String(invocation.reference.module.clone()),
-            ),
-            (
-                "name".to_string(),
-                DetailValue::String(invocation.reference.name.clone()),
-            ),
-            ("import_reference".to_string(), DetailValue::String(symbol)),
-            (
-                "global_position".to_string(),
-                DetailValue::UInt(invocation.reference.position as u64),
-            ),
-            (
-                "opcode_position".to_string(),
+        let mut details = global_ref_details(
+            &invocation.reference,
+            invocation.reference.symbol(),
+            invocation.op_name,
+            "global_position",
+            Some((
+                "opcode_position",
                 DetailValue::UInt(invocation.opcode_position as u64),
-            ),
-        ];
+            )),
+        );
         if let Some(proven) = template_receiver_state_unmodified {
             details.push((
                 "template_receiver_state_unmodified".to_string(),
