@@ -21,7 +21,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
-from io import BytesIO, StringIO
+from io import BufferedReader, BytesIO, FileIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, ClassVar, Literal, cast
 
@@ -361,6 +361,7 @@ _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES = frozenset(
 _FLAX_MSGPACK_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
 _FLAX_MSGPACK_NATIVE_SUFFIXES = _FLAX_MSGPACK_SCANNER_SUFFIXES
 _FLAX_MSGPACK_PROBE_MAX_NODES = 4096
+_FLAX_ONNX_DATA_PROBE_MAX_NODES = 256 * 1024
 _FLAX_MSGPACK_PROBE_MAX_DEPTH = 32
 _FLAX_MSGPACK_PROBE_MAX_KEY_BYTES = 64
 # Keep cheap top-level padding bounded without treating ordinary 1 MiB data
@@ -8105,6 +8106,10 @@ class _MsgpackProbeIncomplete(_MsgpackProbeInvalid):
     """Raised when a bounded MessagePack prefix ends inside a valid value."""
 
 
+class _MsgpackExtentPastEOF(_MsgpackProbeIncomplete):
+    """A complete MessagePack length field declares bytes beyond the real file."""
+
+
 class _MsgpackProbeLimit(ValueError):
     """Raised when bounded MessagePack structure probing cannot finish safely."""
 
@@ -8122,7 +8127,7 @@ def _read_msgpack_probe_uint(stream: BinaryIO, size: int) -> int:
 
 def _skip_msgpack_probe_bytes(stream: BinaryIO, size: int, file_size: int) -> None:
     if size < 0 or stream.tell() + size > file_size:
-        raise _MsgpackProbeIncomplete
+        raise _MsgpackExtentPastEOF
     stream.seek(size, 1)
 
 
@@ -8261,9 +8266,10 @@ def _probe_flax_msgpack_checkpoint_stream(
     *,
     sample_is_prefix: bool = False,
     incomplete_prefix_is_inconclusive: bool = False,
+    prove_impossible_extent: bool = False,
 ) -> bool | None:
     """Inspect streamed maps, preserving recognized roots in truncated prefixes."""
-    remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
+    remaining_nodes = [_FLAX_ONNX_DATA_PROBE_MAX_NODES if prove_impossible_extent else _FLAX_MSGPACK_PROBE_MAX_NODES]
     inline_scalars_seen = 0
     recognized_checkpoint_root = [False]
     try:
@@ -8305,13 +8311,28 @@ def _probe_flax_msgpack_checkpoint_stream(
         return True if recognized_checkpoint_root[0] else None
     except OSError:
         return None
-    except _MsgpackProbeIncomplete:
+    except _MsgpackProbeIncomplete as exc:
+        if prove_impossible_extent:
+            if recognized_checkpoint_root[0]:
+                return True
+            return False if isinstance(exc, _MsgpackExtentPastEOF) else None
         if incomplete_prefix_is_inconclusive:
             return None if sample_is_prefix else False
         return sample_is_prefix and recognized_checkpoint_root[0]
     except _MsgpackProbeInvalid:
+        if prove_impossible_extent:
+            return True if recognized_checkpoint_root[0] else None
         return False
-    return False
+    return None if prove_impossible_extent else False
+
+
+class _FlaxAuxiliaryPrefixReader(BufferedReader):
+    """Allow structural seeks, but never read a marker outside the auxiliary prefix."""
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if size is None or size < 0 or self.tell() + size > _FLAX_AUXILIARY_KEY_SCAN_BYTES:
+            raise _MsgpackProbeLimit
+        return super().read(size)
 
 
 def should_prove_large_onnx_weights(path: Path, file_size: int) -> bool:
@@ -8366,15 +8387,43 @@ class OnnxWeightProofIdentity:
             return None
         return cls(path_stat, token)
 
-    def matches(self, path: Path) -> bool:
+    def matches(self, path: Path, *, follow_symlinks: bool = False) -> bool:
         try:
-            current = path.lstat()
+            current = path.stat() if follow_symlinks else path.lstat()
         except OSError:
             return False
         if not stat.S_ISREG(current.st_mode) or not _file_stat_matches(current, self.stat):
             return False
         observed = self.capture(path, current)
         return observed is not None and observed.change_token == self.change_token
+
+
+def _probe_large_onnx_data_flax_extent(path: Path, source: BinaryIO, file_size: int) -> bool | None:
+    # Cache snapshots can present a named external tensor as a suffixless blob.
+    # The path only selects the extra bounded probe; the bytes must prove the result.
+    if path.suffix.lower() != ".onnx_data":
+        if path.parent.name != "blobs":
+            return None
+        from ..sources.huggingface_paths import is_huggingface_cache_path
+
+        if not is_huggingface_cache_path(path):
+            return None
+    # A fresh buffer on the original descriptor avoids reopening a replaced path
+    # or reusing bytes buffered before the stability check.
+    with _FlaxAuxiliaryPrefixReader(FileIO(os.dup(source.fileno()), "r")) as stream:
+        before = path.stat()
+        if (
+            before.st_size != file_size
+            or not stat.S_ISREG(before.st_mode)
+            or not _file_stat_matches(os.fstat(stream.fileno()), before, cross_view=True)
+        ):
+            return None
+        identity = OnnxWeightProofIdentity.capture(path, before)
+        if identity is None:
+            return None
+        stream.seek(0)
+        result = _probe_flax_msgpack_checkpoint_stream(stream, file_size, prove_impossible_extent=True)
+        return result if identity.matches(path, follow_symlinks=True) else None
 
 
 _ONNX_WEIGHT_PROOF: ContextVar[tuple[str, OnnxWeightProofIdentity] | None] = ContextVar(
@@ -8409,7 +8458,7 @@ def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | 
                     and _probe_complete_structured_json_document(path, file_size) is False
                 ):
                     return False
-                return None
+                return _probe_large_onnx_data_flax_extent(path, stream, file_size)
             if path.suffix.lower() not in _FLAX_AUXILIARY_SUFFIXES:
                 stream.seek(0)
                 if not stream.read(4).startswith(b"\x7fELF"):

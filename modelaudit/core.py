@@ -2704,12 +2704,47 @@ def _weight_snapshot_alias_matches_blob(path: Path, alias: Path) -> bool:
         return False
 
 
+@dataclass
+class _OnnxWeightHardlinks:
+    weight_path: Path
+    identity: OnnxWeightProofIdentity
+    hashed_paths: list[str]
+
+
+def _find_onnx_weight_hardlinks(
+    paths: list[str], config: dict[str, Any], aliases: dict[str, Path], deadline: float | None
+) -> dict[tuple[int, int], _OnnxWeightHardlinks]:
+    groups: dict[tuple[int, int], _OnnxWeightHardlinks] = {}
+    for name in paths:
+        if deadline is not None and deadline - time.time() <= _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS:
+            break
+        path = Path(name)
+        alias = aliases.get(name)
+        if (alias or path).suffix.lower() != ".onnx_data":
+            continue
+        with suppress(OSError):
+            info = path.lstat()
+            key = (info.st_dev, info.st_ino)
+            if (
+                info.st_nlink > 1
+                and stat.S_ISREG(info.st_mode)
+                and key not in groups
+                and _onnx_weight_proof_allowed(alias or path, info.st_size, config)
+                and (alias is None or _weight_snapshot_alias_matches_blob(path, alias))
+            ):
+                identity = OnnxWeightProofIdentity.capture(path, info)
+                if identity is not None:
+                    groups[key] = _OnnxWeightHardlinks(path, identity, [])
+    return groups
+
+
 def _calculate_file_hash(
     file_path: str,
     *,
     deadline: float | None = None,
     onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity] | None = None,
     onnx_weight_alias: Path | None = None,
+    weight_hardlinks: _OnnxWeightHardlinks | None = None,
 ) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
@@ -2739,13 +2774,19 @@ def _calculate_file_hash(
                 raise OSError(f"File changed before hashing: {file_path}")
 
             proof_identity = None
+            weight_path = weight_hardlinks.weight_path if weight_hardlinks is not None else Path(file_path)
             if (
                 onnx_weight_proofs is not None
-                and should_prove_large_onnx_weights(onnx_weight_alias or Path(file_path), opened_stat.st_size)
-                and (deadline is None or deadline - time.time() > _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS)
+                and should_prove_large_onnx_weights(onnx_weight_alias or weight_path, opened_stat.st_size)
                 and (
-                    onnx_weight_alias is None or _weight_snapshot_alias_matches_blob(Path(file_path), onnx_weight_alias)
+                    weight_hardlinks is None
+                    or (
+                        _file_stat_matches(opened_stat, weight_hardlinks.identity.stat, cross_view=True)
+                        and weight_hardlinks.identity.matches(weight_path)
+                    )
                 )
+                and (deadline is None or deadline - time.time() > _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS)
+                and (onnx_weight_alias is None or _weight_snapshot_alias_matches_blob(weight_path, onnx_weight_alias))
             ):
                 proof_identity = OnnxWeightProofIdentity.capture(Path(file_path), path_stat_before)
             key_probe = (
@@ -2874,6 +2915,7 @@ def _should_defer_hash_for_max_total_size(
     return hashed_bytes > max_total_size
 
 
+_CHANGED_WEIGHT_HARDLINK_PREFIX = "unhashable_changed_weight_hardlink_"
 _FILE_BACKED_HDF5_UNHASHABLE_PREFIX = "unhashable_file_backed_hdf5_"
 _FILE_BACKED_ONNX_UNHASHABLE_PREFIX = "unhashable_file_backed_onnx_"
 
@@ -2928,6 +2970,12 @@ def _hash_files_by_path(
     """
     content_hashes: dict[str, str] = {}
     hashes_by_inode: dict[tuple[int, int, int, int, int], str] = {}
+    weight_aliases = onnx_weight_aliases or {}
+    weight_groups = (
+        _find_onnx_weight_hardlinks(file_paths, config or {}, weight_aliases, deadline)
+        if onnx_weight_proofs is not None
+        else {}
+    )
     hashed_bytes = 0
 
     for file_path in file_paths:
@@ -2955,10 +3003,14 @@ def _hash_files_by_path(
             continue
         try:
             inode_key: tuple[int, int, int, int, int] | None = None
+            weight_group = None
             pre_hash_stat: os.stat_result | None = None
             try:
                 pre_hash_stat = os.stat(file_path, follow_symlinks=False)
                 if pre_hash_stat.st_nlink > 1:
+                    weight_group = weight_groups.get((pre_hash_stat.st_dev, pre_hash_stat.st_ino))
+                    if weight_group is not None:
+                        weight_group.hashed_paths.append(file_path)
                     inode_key = (
                         pre_hash_stat.st_dev,
                         pre_hash_stat.st_ino,
@@ -2986,15 +3038,20 @@ def _hash_files_by_path(
                 continue
             with suppress(OSError):
                 hashed_bytes += os.path.getsize(file_path)
-            alias = onnx_weight_aliases.get(file_path) if onnx_weight_aliases else None
+            weight_path = weight_group.weight_path if weight_group is not None else Path(file_path)
+            alias = weight_aliases.get(str(weight_path))
             if (
                 onnx_weight_proofs is not None
                 and pre_hash_stat is not None
-                and _onnx_weight_proof_allowed(alias or Path(file_path), pre_hash_stat.st_size, hash_config)
+                and _onnx_weight_proof_allowed(alias or weight_path, pre_hash_stat.st_size, hash_config)
                 and not _should_defer_hash_for_max_total_size(hash_config, hashed_bytes=hashed_bytes)
             ):
                 content_hashes[file_path] = _calculate_file_hash(
-                    file_path, deadline=deadline, onnx_weight_proofs=onnx_weight_proofs, onnx_weight_alias=alias
+                    file_path,
+                    deadline=deadline,
+                    onnx_weight_proofs=onnx_weight_proofs,
+                    onnx_weight_alias=alias,
+                    weight_hardlinks=weight_group,
                 )
             else:
                 content_hashes[file_path] = _calculate_file_hash(file_path, deadline=deadline)
@@ -3019,6 +3076,16 @@ def _hash_files_by_path(
             logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
             content_hashes[file_path] = f"unhashable_{id(file_path)}"
 
+    for inode, group in weight_groups.items():
+        if all(group.identity.matches(Path(path)) for path in group.hashed_paths):
+            continue
+        logger.warning("ONNX weight hard links changed during hashing; omitting their hashes")
+        for path in group.hashed_paths:
+            content_hashes[path] = f"{_CHANGED_WEIGHT_HARDLINK_PREFIX}{id(path)}"
+            if hashed_identities is not None:
+                hashed_identities.pop(path, None)
+        if onnx_weight_proofs is not None:
+            onnx_weight_proofs.pop(inode, None)
     return content_hashes
 
 
@@ -4935,6 +5002,7 @@ def scan_model_directory_or_file(
                 if any(
                     content_hash.startswith(
                         (
+                            _CHANGED_WEIGHT_HARDLINK_PREFIX,
                             _FILE_BACKED_HDF5_UNHASHABLE_PREFIX,
                             _FILE_BACKED_ONNX_UNHASHABLE_PREFIX,
                             "unhashable_max_file_size_",
