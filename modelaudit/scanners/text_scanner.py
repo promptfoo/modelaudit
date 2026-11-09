@@ -3948,6 +3948,8 @@ class TextScanner(BaseScanner):
                 representative = {**representative, "severity": severity}
             if any(entry[1].get("contains_credentials") for entry in entries):
                 representative = {**representative, "contains_credentials": True}
+            elif any(entry[1].get("url_credential_check_incomplete") for entry in entries):
+                representative = {**representative, "url_credential_check_incomplete": True}
             related_findings = [
                 cls._documentation_network_related_finding(related)
                 for related_index, related, _evidence in entries

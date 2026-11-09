@@ -55,7 +55,11 @@ _SENSITIVE_PATH_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 # A path segment such as "auth" or "session" is also common in documentation URLs.
-_URL_CREDENTIAL_PATH_KEYS = frozenset({"api_key", "apikey", "access_token", "refresh_token", "client_secret"})
+_URL_CREDENTIAL_PATH_KEYS = frozenset(
+    {"api_key", "apikey", "x_api_key", "access_token", "refresh_token", "auth_token", "client_secret", "password"}
+)
+_URL_CREDENTIAL_MAX_CHARS = 64 * 1024
+_URL_CREDENTIAL_MAX_FIELDS = 256
 _URL_ASSIGNMENT_PREFIX_PATTERN = re.compile(
     rb"(?:\"\"\"|'''|[\"'])?\s*[:=]\s*(?:[rRuUbBfF]{0,3})?(?:\"\"\"|'''|[\"'])?\s*"
 )
@@ -1112,12 +1116,14 @@ def redact_url_for_finding(url: str) -> str:
     return urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
 
 
-def url_contains_credentials(url: str, *, redacted_url: str | None = None) -> bool:
-    """Recognize credential evidence in the original URL before its reporting form loses it."""
+def url_contains_credentials(url: str, *, redacted_url: str | None = None) -> bool | None:
+    """Inspect the original URL within fixed budgets. None means credential status is undetermined."""
+    if len(url) > _URL_CREDENTIAL_MAX_CHARS:
+        return None
     try:
         parsed = urlsplit(url)
     except ValueError:
-        return False
+        return None
 
     # A username identifies an account. A password or a recognizable token can authenticate as one.
     username = unquote(parsed.username or "")
@@ -1132,16 +1138,30 @@ def url_contains_credentials(url: str, *, redacted_url: str | None = None) -> bo
         parts = re.split(r"[/;=:]", _decode_path_token(parsed.path))
         if any(_SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(part) for part in (*host.split("."), *parts) if part):
             return True
-        if not _is_public_source_repository_url(host, parsed.path.strip("/").split("/")) and any(
-            part.casefold().replace("-", "_") in _URL_CREDENTIAL_PATH_KEYS and value for part, value in pairwise(parts)
-        ):
-            return True
+        if not _is_public_source_repository_url(host, parsed.path.strip("/").split("/")):
+            for part, value in pairwise(parts):
+                if part.casefold().replace("-", "_") in _URL_CREDENTIAL_PATH_KEYS:
+                    name = value.casefold().rstrip(_TRAILING_PATH_DELIMITERS)
+                    if (
+                        name
+                        and name not in {"readme", "guide"}
+                        and not name.endswith((".md", ".markdown", ".rst", ".txt", ".html", ".htm", ".adoc"))
+                    ):
+                        return True
 
+    complete = True
     for component in (parsed.query, parsed.fragment.replace("?", "&", 1)):
-        for key, value in parse_qsl(_URL_COMPONENT_SEPARATOR_PATTERN.sub("&", component)):
+        try:
+            fields = parse_qsl(
+                _URL_COMPONENT_SEPARATOR_PATTERN.sub("&", component), max_num_fields=_URL_CREDENTIAL_MAX_FIELDS
+            )
+        except ValueError:
+            complete = False
+            continue
+        for key, value in fields:
             if _is_sensitive_path_key(key) or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(value):
                 return True
-    return False
+    return False if complete else None
 
 
 def _redact_network_evidence(text: str) -> str:
@@ -5567,8 +5587,11 @@ class NetworkCommDetector:
         )
 
     def _record_url_evidence(self, url: str, finding: dict[str, Any]) -> bool:
-        if url_contains_credentials(url, redacted_url=finding["url"]):
+        contains_credentials = url_contains_credentials(url, redacted_url=finding["url"])
+        if contains_credentials:
             finding["contains_credentials"] = True
+        elif contains_credentials is None:
+            finding["url_credential_check_incomplete"] = True
         return self._record_finding(finding)
 
     def _url_uses_suspicious_port(self, url: str) -> bool:

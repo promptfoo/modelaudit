@@ -15629,6 +15629,35 @@ def _warm_read_failure_cache(
     return result
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX execute permissions")
+def test_cached_readme_scans_follow_execute_bit_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    directory = tmp_path / "model"
+    directory.mkdir()
+    readme = directory / "README.md"
+    # Exceed the cache's independent 10 KiB cutoff for small Markdown files.
+    readme.write_bytes(
+        b"Model documentation.\n" * 512 + b'import requests\nrequests.get("https://models.example.invalid/image.png")\n'
+    )
+    readme.chmod(0o644)
+    mtime = readme.stat().st_mtime_ns
+    cache_dir = tmp_path / "cache"
+
+    with IsolatedCacheManager(reset_cache_manager):
+        seeded = _warm_read_failure_cache(monkeypatch, readme, cache_dir)
+        assert {i.severity for i in seeded.issues if i.rule_code == "S302"} == {IssueSeverity.INFO}
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        for mode, expected, exit_code in [(0o755, IssueSeverity.CRITICAL, 1), (0o644, IssueSeverity.INFO, 0)]:
+            readme.chmod(mode)
+            assert readme.stat().st_mtime_ns == mtime
+            for target in (readme, directory):
+                result = scan_model_directory_or_file(
+                    str(target), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                )
+                assert {i.severity for i in result.issues if i.rule_code == "S302"} == {expected}
+                assert determine_exit_code(result) == exit_code
+
+
 def _install_cached_read_failure(monkeypatch: pytest.MonkeyPatch, model_path: Path, filename: str, reason: str) -> None:
     real_open = open
 

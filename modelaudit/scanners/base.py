@@ -1376,7 +1376,10 @@ class BaseScanner(ABC):
                 if finding.get("contains_credentials"):
                     if severity in {IssueSeverity.INFO, IssueSeverity.DEBUG}:
                         severity = IssueSeverity.WARNING
-                elif severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+                elif not finding.get("url_credential_check_incomplete") and severity in {
+                    IssueSeverity.WARNING,
+                    IssueSeverity.CRITICAL,
+                }:
                     severity = IssueSeverity.INFO
                 if severity != detector_severity:
                     finding = {**finding, "readme_severity_adjusted": True}

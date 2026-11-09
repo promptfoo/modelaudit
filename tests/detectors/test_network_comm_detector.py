@@ -33,11 +33,19 @@ from modelaudit.scanner_results import IssueSeverity
         ("https://weights.example/model#access_token=fixture", True),
         ("https://weights.example/model#/callback?access_token=fixture", True),
         ("https://weights.example/api_key/fixture", True),
+        ("https://weights.example/x-api-key/fixture", True),
+        ("https://weights.example/password/fixture", True),
+        ("https://weights.example/auth-token/fixture", True),
+        ("https://docs.example/x-api-key/guide.md", False),
+        ("https://docs.example/auth-token/README", False),
+        ("https://docs.example/password/reference.rst", False),
+        ("https://docs.example/session/guide", False),
         ("ssh://git@source.example/owner/model", False),
         ("https://git@source.example/owner/model", False),
         ("abfss://public@account.dfs.core.windows.net/model", False),
         ("https://paper.example/Understanding-Multilingual-Transformer-Architectures?ref=main#section-2", False),
         ("https://weights.example/model?api_key=", False),
+        ("https://[invalid.example/model", None),
         ("https://github.com/auth/transformers", False),
         ("https://github.com/EleutherAI/lm-evaluation-harness", False),
         ("https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/sample_inference_phi4mm.py", False),
@@ -46,8 +54,46 @@ from modelaudit.scanner_results import IssueSeverity
         ("https://paper.example/84965eb9-503f-437c-b036-6e886bdf39fe", False),
     ],
 )
-def test_url_contains_credentials(url: str, expected: bool) -> None:
+def test_url_contains_credentials(url: str, expected: bool | None) -> None:
     assert network_comm.url_contains_credentials(url) is expected
+
+
+def test_url_credential_budget_precedes_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_parse(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("URL parsing should not run beyond the credential inspection budget")
+
+    monkeypatch.setattr(network_comm, "urlsplit", unexpected_parse)
+    for separator in ["?", "#"]:
+        url = "https://weights.example/" + separator + "a" * network_comm._URL_CREDENTIAL_MAX_CHARS
+        assert network_comm.url_contains_credentials(url) is None
+
+
+def test_url_credential_field_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(network_comm, "_URL_CREDENTIAL_MAX_FIELDS", 2)
+    base = "https://weights.example/model"
+    assert network_comm.url_contains_credentials(base + "?ref=v1&amp;source=paper") is False
+    assert network_comm.url_contains_credentials(base + "?ref=v1;source=paper&lang=en") is None
+    assert network_comm.url_contains_credentials(base + "#ref=v1&source=paper&lang=en") is None
+    assert network_comm.url_contains_credentials(base + "?ref=v1&source=paper&lang=en#access_token=fixture") is True
+
+
+def test_readme_uninspected_url_preserves_each_native_severity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(network_comm, "_URL_CREDENTIAL_MAX_FIELDS", 2)
+    url = "https://weights.example/model?ref=v1&source=paper&lang=en"
+    path = tmp_path / "README.md"
+    path.write_text(f"[paper]({url})\n\n```sh\ncurl '{url}'\n```\n", encoding="utf-8")
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    urls = [issue for issue in aggregate.issues if issue.details.get("type") == "url_detected"]
+
+    assert [(issue.severity, issue.details["severity"]) for issue in urls] == [
+        (IssueSeverity.INFO, "INFO"),
+        (IssueSeverity.WARNING, "MEDIUM"),
+    ]
+    for issue in urls:
+        assert issue.details["url_credential_check_incomplete"] is True
+        assert "contains_credentials" not in issue.details
+        assert "readme_severity_adjusted" not in issue.details
 
 
 def test_url_credential_evidence_is_scoped_to_its_original_occurrence() -> None:
