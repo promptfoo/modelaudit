@@ -62,6 +62,7 @@ EXPECTED_JINJA2_FIXTURES = {
     "tests/assets/samples/jinja2/obfuscated/format_bypass.json",
     "tests/assets/samples/jinja2/obfuscated/getattr_bypass.json",
     "tests/assets/samples/jinja2/standalone/benign_chat.j2",
+    "tests/assets/samples/jinja2/standalone/flint_chat_template.jinja",
     "tests/assets/samples/jinja2/standalone/malicious_subprocess.template",
     "tests/assets/samples/jinja2/standalone/malicious_standalone.jinja",
     "tests/assets/samples/jinja2/standalone/suspicious_benign.template",
