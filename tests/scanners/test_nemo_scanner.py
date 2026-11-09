@@ -234,6 +234,19 @@ def _build_malicious_pickle() -> bytes:
     return pickle.dumps(SystemCommandPayload("echo nemo-checkpoint-test", lambda: os_module.system))
 
 
+def _assert_failed_nemo_not_cached(path: Path, cache_dir: Path) -> None:
+    with IsolatedCacheManager(reset_cache_manager):
+        cached_aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        assert cached_aggregate.success is False
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
 class TestNemoScannerBasic:
     """Basic scanner functionality tests."""
 
@@ -446,17 +459,7 @@ class TestNemoScannerBasic:
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
 
-        cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
-            cached_aggregate = scan_model_directory_or_file(
-                str(path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-
-            assert cached_aggregate.success is False
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        _assert_failed_nemo_not_cached(path, tmp_path / "cache")
 
     @pytest.mark.parametrize(
         ("target", "expected_cve"),
@@ -588,17 +591,7 @@ class TestNemoScannerBasic:
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
 
-        cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
-            cached_aggregate = scan_model_directory_or_file(
-                str(path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-
-            assert cached_aggregate.success is False
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        _assert_failed_nemo_not_cached(path, tmp_path / "cache")
 
     def test_concatenated_gzip_nemo_raw_member_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
         """A non-TAR gzip member after TAR EOF must not be hidden by direct NeMo ownership."""
@@ -622,17 +615,7 @@ class TestNemoScannerBasic:
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) != 0
 
-        cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
-            cached_aggregate = scan_model_directory_or_file(
-                str(path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-
-            assert cached_aggregate.success is False
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        _assert_failed_nemo_not_cached(path, tmp_path / "cache")
 
     def test_concatenated_gzip_nemo_detects_nonzero_tail_after_zero_padding(self, tmp_path: Path) -> None:
         """Post-EOF validation must not stop before hidden non-zero gzip member data."""
@@ -1095,17 +1078,7 @@ class TestNemoScannerBasic:
         assert integrity_checks[0].rule_code == "S902"
         assert "could not be fully validated" in integrity_checks[0].message
 
-        cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
-            cached_aggregate = scan_model_directory_or_file(
-                str(path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-
-            assert cached_aggregate.success is False
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        _assert_failed_nemo_not_cached(path, tmp_path / "cache")
 
     def test_corrupt_gzip_crc_nemo_preserves_hydra_finding_without_cache(self, tmp_path: Path) -> None:
         path = _create_nemo_file_from_bytes(
@@ -1174,17 +1147,7 @@ class TestNemoScannerBasic:
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
 
-        cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
-            cached_aggregate = scan_model_directory_or_file(
-                str(path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-
-            assert cached_aggregate.success is False
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        _assert_failed_nemo_not_cached(path, tmp_path / "cache")
 
     def test_truncated_gzip_nemo_keeps_s902_when_magic_route_is_tar(
         self,
@@ -1214,17 +1177,7 @@ class TestNemoScannerBasic:
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
 
-        cache_dir = tmp_path / "cache"
-        with IsolatedCacheManager(lambda: reset_cache_manager()):
-            cached_aggregate = scan_model_directory_or_file(
-                str(path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-
-            assert cached_aggregate.success is False
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        _assert_failed_nemo_not_cached(path, tmp_path / "cache")
 
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""
