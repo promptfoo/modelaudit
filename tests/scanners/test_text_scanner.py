@@ -4324,6 +4324,7 @@ def test_text_scanner_system_maintenance_and_classifier_limitations_are_informat
     result = _scan_text_content(tmp_path / "README.md", content)
     checks = [check for check in result.checks if check.details.get("pattern") == pattern]
     assert checks and all(check.severity == IssueSeverity.INFO for check in checks)
+    assert all(check.message == f"Documentation mentions '{pattern}'" and check.rule_code == "S310" for check in checks)
 
 
 @pytest.mark.parametrize(

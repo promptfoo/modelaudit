@@ -1,9 +1,13 @@
 """Shared result helpers and assertions for fail-closed scan cache behavior."""
 
+import os
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.scan_results_cache import AncestorIdentity, ScanResultsCache
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import (
@@ -13,6 +17,27 @@ from modelaudit.scanner_results import (
     IssueSeverity,
     ScanResult,
 )
+
+
+def scope_cache_ancestor_identity_to_tree(
+    cache: ScanResultsCache,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep cache identity checks within the test tree while other workers change shared ancestors."""
+    original_capture = cache._capture_ancestor_identity
+    root_path = Path(os.path.abspath(root))
+
+    def capture_ancestor_identity(file_path: str) -> AncestorIdentity:
+        identity = original_capture(file_path)
+        entries = tuple(
+            entry
+            for entry in identity
+            if (entry_path := Path(entry[0])) == root_path or root_path in entry_path.parents
+        )
+        return AncestorIdentity(entries)
+
+    monkeypatch.setattr(cache, "_capture_ancestor_identity", capture_ancestor_identity)
 
 
 def assert_inconclusive_not_cached(

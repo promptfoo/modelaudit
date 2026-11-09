@@ -3808,6 +3808,12 @@ class TextScanner(BaseScanner):
                 finding["message"] = f"Documentation mentions port {port}"
             elif finding.get("type") == "url_detected" and isinstance(url := finding.get("url"), str):
                 finding["message"] = f"URL detected in documentation: {url[:100]}"
+            elif (
+                finding.get("type") == "cc_pattern"
+                and finding.get("severity") == "INFO"
+                and (pattern := finding.get("pattern")) in GENERIC_CC_PROSE_PATTERNS
+            ):
+                finding["message"] = f"Documentation mentions '{pattern}'"
             evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences, line_lookup)
             if evidence is None:
                 ordered_items.append(("standalone", index))

@@ -28,6 +28,7 @@ MALICIOUS_STANDALONE_FIXTURES = (
 )
 BENIGN_STANDALONE_FIXTURES = (
     JINJA2_ASSETS_DIR / "standalone" / "benign_chat.j2",
+    JINJA2_ASSETS_DIR / "standalone" / "flint_chat_template.jinja",
     JINJA2_ASSETS_DIR / "standalone" / "suspicious_benign.template",
 )
 MALICIOUS_YAML_FIXTURES = (JINJA2_ASSETS_DIR / "yaml" / "malicious_config.yaml",)
@@ -84,6 +85,100 @@ def test_jinja_ssti_patterns_do_not_match_empty_input() -> None:
     for patterns in JINJA2_SSTI_PATTERNS.values():
         for pattern in patterns:
             assert re.search(pattern, "", re.IGNORECASE | re.MULTILINE) is None, pattern
+
+
+@pytest.mark.parametrize("filename", ["chat_template.jinja", "tokenizer_config.json", "model.gguf"])
+def test_reviewed_flint_nul_removal(tmp_path: Path, filename: str) -> None:
+    template = (JINJA2_ASSETS_DIR / "standalone/flint_chat_template.jinja").read_text()
+    path = tmp_path / filename
+    if path.suffix == ".gguf":
+        create_mock_gguf(path, metadata={"tokenizer.chat_template": template})
+    elif path.suffix == ".json":
+        path.write_text(json.dumps({"chat_template": template}))
+    else:
+        path.write_bytes(template.encode("utf-8"))
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert determine_exit_code(result) == 0
+    assert any(c.name == "Jinja2 NUL Removal" and c.status == CheckStatus.PASSED for c in result.checks)
+    assert not any(c.name == "Jinja2 SSTI Analysis Summary" for c in result.checks)
+
+
+def test_flint_disposition_applies_only_to_reviewed_template(tmp_path: Path) -> None:
+    template = (JINJA2_ASSETS_DIR / "standalone/flint_chat_template.jinja").read_text()
+    changed = template.replace("if tools %}", "if items %}")  # Same length, different template.
+    path = tmp_path / "tokenizer_config.json"
+    path.write_text(json.dumps({"chat_template": template, "custom_chat_template": changed}))
+
+    result = Jinja2TemplateScanner().scan(str(path))
+
+    assert [c.details["template_location"] for c in result.checks if c.name == "Jinja2 NUL Removal"] == [
+        "chat_template"
+    ]
+    assert [
+        (c.details["template_location"], c.details["match_text"])
+        for c in result.checks
+        if c.name == "Jinja2 Template Injection Detection"
+    ] == [("custom_chat_template", r"\x00")]
+    assert next(c.details["total_detections"] for c in result.checks if c.name == "Jinja2 SSTI Analysis Summary") == 1
+
+
+def test_flint_standalone_digest_preserves_line_endings(tmp_path: Path) -> None:
+    original = (JINJA2_ASSETS_DIR / "standalone/flint_chat_template.jinja").read_bytes()
+    path = tmp_path / "chat_template.jinja"
+    path.write_bytes(original.replace(b"\n", b"\r\n"))
+
+    result = Jinja2TemplateScanner().scan(str(path))
+
+    assert any(
+        c.name == "Jinja2 Template Injection Detection" and c.details["match_text"] == r"\x00" for c in result.checks
+    )
+    assert not any(c.name == "Jinja2 NUL Removal" for c in result.checks)
+
+
+def test_complete_flint_field_with_oversized_sibling(tmp_path: Path) -> None:
+    template = (JINJA2_ASSETS_DIR / "standalone/flint_chat_template.jinja").read_text()
+    path = tmp_path / "tokenizer_config.json"
+    path.write_text(json.dumps({"chat_template": template, "custom_chat_template": template + " "}))
+
+    result = Jinja2TemplateScanner(config={"max_template_size": len(template)}).scan(str(path))
+
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert any(c.name == "Template Size Limit" and c.status == CheckStatus.FAILED for c in result.checks)
+    assert any(c.name == "Jinja2 NUL Removal" and c.status == CheckStatus.PASSED for c in result.checks)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        r'{{ labels[key | replace("\x00", "")] }}',
+        r'{% set key %}{{ label | replace("\x00", "") }}{% endset %}{{ labels[key] }}',
+    ],
+)
+def test_nul_removal_in_computed_keys_keeps_warning(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "lookup.jinja"
+    path.write_text(source)
+
+    result = Jinja2TemplateScanner().scan(str(path))
+
+    assert any(c.severity == IssueSeverity.WARNING and c.details.get("match_text") == r"\x00" for c in result.checks)
+
+
+@pytest.mark.parametrize("filename", ["malformed.json", "raw.jinja"])
+def test_flint_raw_patterns_remain_visible(tmp_path: Path, filename: str) -> None:
+    path = tmp_path / filename
+    path.write_bytes((JINJA2_ASSETS_DIR / "standalone/flint_chat_template.jinja").read_bytes())
+    # The malformed JSON fallback happens to contain the entire template.
+    scanner = Jinja2TemplateScanner(config={"skip_common_patterns": filename != "raw.jinja"})
+    result = scanner.scan(str(path))
+
+    assert any(
+        c.name == "Jinja2 Template Injection Detection" and c.details["match_text"] == r"\x00" for c in result.checks
+    )
+    assert not any(c.name == "Jinja2 NUL Removal" for c in result.checks)
+    if filename == "malformed.json":
+        assert result.metadata["scan_outcome"] == "inconclusive"
 
 
 def test_jinja_scanner_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
