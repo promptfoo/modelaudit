@@ -124,6 +124,24 @@ def test_base_install_requires_patched_anyio() -> None:
     assert PATCHED_ANYIO_REQUIREMENT in root_config["project"]["dependencies"]
 
 
+@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14"])
+def test_filelock_requirement_avoids_affected_releases(python_version: str) -> None:
+    project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    (requirement,) = [
+        req
+        for req in map(Requirement, project["dependencies"])
+        if req.name == "filelock" and (req.marker is None or req.marker.evaluate({"python_version": python_version}))
+    ]
+
+    assert Version("4.1.0") not in requirement.specifier
+    if python_version == "3.10":
+        assert Version("3.20.3") in requirement.specifier
+        assert Version("3.20.4") not in requirement.specifier
+    else:
+        assert Version("4.2.8") not in requirement.specifier
+        assert Version("4.2.9") in requirement.specifier
+
+
 @pytest.mark.parametrize("extra", MLFLOW_EXTRAS)
 def test_mlflow_extras_preserve_sql_backed_model_registries(extra: str) -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
