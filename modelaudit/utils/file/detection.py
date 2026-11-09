@@ -341,7 +341,7 @@ _STRUCTURED_JSON_TRAILING_READ_BYTES = 64 * 1024
 FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
 _FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
 _FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
-_FLAX_AUXILIARY_SUFFIXES = frozenset({".a", ".cact", ".dylib", ".jsonl", ".log", ".so", ".vocab", ".wav"})
+_FLAX_AUXILIARY_SUFFIXES = frozenset({".a", ".cact", ".dylib", ".jsonl", ".log", ".onnx_data", ".so", ".vocab", ".wav"})
 _FLAX_AUXILIARY_KEY_SCAN_BYTES = 128 * 1024 * 1024
 # Every supported MessagePack str/bin encoding ends its header with the key length.
 # Fixstr stores the same length in the low five bits of the marker itself.
