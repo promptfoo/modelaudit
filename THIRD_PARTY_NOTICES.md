@@ -6,6 +6,12 @@ package's distribution or at the URLs below.
 
 ## Bundled Components
 
+### Flint chat template regression fixture
+
+The unmodified `tests/assets/samples/jinja2/standalone/flint_chat_template.jinja`
+fixture comes from RecursiveSI's Apache-2.0 licensed Flint GGUF release.
+[Source revision](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf/tree/6ec43e19b565fc8d560e2d04985d7724f20673bf) · [Included Apache License 2.0](modelaudit/protos/LICENSE)
+
 ### TensorFlow Protobuf Definitions
 
 - **Path:** `modelaudit/protos/`

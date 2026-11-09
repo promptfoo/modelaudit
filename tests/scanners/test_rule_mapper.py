@@ -70,6 +70,8 @@ def test_generic_rule_covers_non_network_dispatch_categories(message: str, expec
 def test_network_rule_mapping_prioritizes_exfiltration_patterns() -> None:
     """Explicit exfil/C2 indicators should map to S310."""
     assert get_network_rule_code("blacklisted_domain c2.example beacon") == "S310"
+    assert get_network_rule_code("cc_pattern Documentation mentions 'zombie'") == "S310"
+    assert get_network_rule_code("url_detected https://example.com/cc_pattern") == "S309"
 
 
 def test_generic_rule_does_not_map_protocol_version_to_persistent_id() -> None:

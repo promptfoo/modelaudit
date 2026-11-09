@@ -18,6 +18,7 @@ Key Features:
 - Detailed risk assessment and explanation
 """
 
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -88,6 +89,9 @@ _JINJA_RAW_END = re.compile(r"{%[-+]?\s*endraw\s*[-+]?%}")
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
 _TEMPLATE_FIELD_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+# Complete tokenizer.chat_template from RecursiveSI/flint-nvfp4-gguf at 6ec43e19b565fc8d560e2d04985d7724f20673bf.
+# Its sole hex escape strips NUL from displayed text. The same filter in another template can construct a lookup key.
+_FLINT_TEMPLATE_SHA256 = "7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466"
 JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY = "_jinja_skip_jax_json_overlap"
 _DETECTION_MESSAGE_LABELS = {
     "critical_injection": "critical injection",
@@ -641,6 +645,11 @@ class Jinja2TemplateScanner(BaseScanner):
         file_size: int,
     ) -> ScanResult:
         total_detections = 0
+        # A size limit drops the oversized sibling. Parse failures can yield raw windows instead of complete fields.
+        allow_reviewed_templates = self.skip_common_patterns and all(
+            reason == "jinja2_template_size_limit_exceeded"
+            for reason in result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY, ())
+        )
         for template_location, template_content in templates.items():
             detections, analysis_failures = self._analyze_template(
                 template_content,
@@ -650,9 +659,29 @@ class Jinja2TemplateScanner(BaseScanner):
             for failure in analysis_failures:
                 self._mark_inconclusive_scan_result(result, f"{path}:{template_location}", failure)
 
-            total_detections += len(detections)
-
+            reviewed_flint_template = (
+                allow_reviewed_templates
+                and len(template_content) == 2328
+                and template_content.isascii()
+                and hashlib.sha256(template_content.encode("ascii")).hexdigest() == _FLINT_TEMPLATE_SHA256
+            )
             for detection in detections:
+                if (
+                    reviewed_flint_template
+                    and detection.pattern_type == "obfuscation"
+                    and detection.pattern == r"\\x[0-9a-fA-F]{2}"
+                    and detection.match_text == r"\x00"
+                ):
+                    result.add_check(
+                        name="Jinja2 NUL Removal",
+                        passed=True,
+                        message="The reviewed Flint chat template strips NUL characters from displayed message text",
+                        location=detection.location,
+                        details={"template_sha256": _FLINT_TEMPLATE_SHA256, "template_location": template_location},
+                    )
+                    continue
+
+                total_detections += 1
                 severity = self._get_severity_for_detection(detection, context)
                 why_explanation = self._get_why_explanation(detection, context)
 
@@ -1370,7 +1399,7 @@ class Jinja2TemplateScanner(BaseScanner):
         extraction_failures: list[dict[str, Any]] = []
 
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8", newline="") as f:
                 content = f.read(self.max_template_size + 1)
 
             if len(content) > self.max_template_size:
