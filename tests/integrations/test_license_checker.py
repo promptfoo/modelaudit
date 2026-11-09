@@ -1,6 +1,7 @@
 """Tests for the license checking functionality in ModelAudit."""
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -562,6 +563,89 @@ class TestUnlicensedDatasetDetection:
             config.write_text(json.dumps(rows))
             assert collect_license_metadata(str(config))["is_dataset"] is True
             assert detect_unlicensed_datasets([str(config)]) == [str(config)]
+
+    def test_modelscope_text_generation_descriptor_requires_a_model_companion(self, tmp_path: Path) -> None:
+        descriptor = tmp_path / "configuration.json"
+        descriptor.write_text('{"framework":"Pytorch","task":"text-generation"}')
+        companion = tmp_path / "config.json"
+        config = {
+            "architectures": ["ExampleForCausalLM"],
+            "model_type": "example",
+            "hidden_size": 256,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 8,
+            "vocab_size": 4096,
+        }
+        assert collect_license_metadata(str(descriptor))["is_dataset"] is True
+        for invalid in (
+            b"{invalid",
+            b'{"model_type":"example"}',
+            json.dumps({**config, "num_hidden_layers": True}).encode(),
+            json.dumps({**config, "architectures": ["ExampleForSequenceClassification"]}).encode(),
+            *(
+                json.dumps({**config, "options": [value]}).encode()
+                for value in (float("nan"), float("inf"), -float("inf"))
+            ),
+            json.dumps(config).replace('"vocab_size":', '"vocab_size": 0, "vocab_size":').encode(),
+            json.dumps(config).encode() + b" " * (64 * 1024),
+        ):
+            companion.write_bytes(invalid)
+            assert detect_unlicensed_datasets([str(descriptor)]) == [str(descriptor)]
+
+        companion.write_text(json.dumps(config))
+        training = tmp_path / "training.jsonl"
+        training.write_text('{"prompt":"input","completion":"output"}\n')
+        assert collect_license_metadata(str(descriptor))["is_dataset"] is False
+        assert detect_unlicensed_datasets([str(descriptor), str(training)]) == [str(training)]
+
+        for content in (
+            '{"framework":"Pytorch","task":"text-generation","rows":[]}',
+            '[{"framework":"Pytorch","task":"text-generation"}]',
+            '{"task":"classification","framework":"pytorch"}',
+            '{"task":"classification","task":"text-generation","framework":"pytorch"}',
+        ):
+            descriptor.write_text(content)
+            assert collect_license_metadata(str(descriptor))["is_dataset"] is True
+            assert detect_unlicensed_datasets([str(descriptor)]) == [str(descriptor)]
+
+    def test_modelscope_descriptor_does_not_follow_a_companion_symlink(self, tmp_path: Path) -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        descriptor = model_dir / "configuration.json"
+        descriptor.write_text('{"framework":"pytorch","task":"text-generation"}')
+        external = tmp_path / "external.json"
+        external.write_text(
+            '{"model_type":"example","architectures":["ExampleForCausalLM"],"hidden_size":64,'
+            '"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":128}'
+        )
+        try:
+            (model_dir / "config.json").symlink_to(external)
+        except OSError as exc:
+            pytest.skip(f"Cannot create a symlink here: {exc}")
+        assert collect_license_metadata(str(descriptor))["is_dataset"] is True
+        assert detect_unlicensed_datasets([str(descriptor)]) == [str(descriptor)]
+
+    def test_modelscope_companion_modified_during_read_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        companion = tmp_path / "config.json"
+        original = b'{"model_type":"valid"}'
+        companion.write_bytes(original)
+        actual_lstat = Path.lstat
+        checks = 0
+
+        def changing_lstat(path: Path) -> os.stat_result:
+            nonlocal checks
+            if path == companion:
+                checks += 1
+                if checks == 2:
+                    before = actual_lstat(path)
+                    path.write_bytes(original.replace(b"valid", b"other"))
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
+            return actual_lstat(path)
+
+        monkeypatch.setattr(Path, "lstat", changing_lstat)
+        assert dataset_license._read_metadata_bytes(companion, 1024, follow_symlinks=False) is None
 
     def test_modelopt_quant_config_dataset_evidence(self, tmp_path: Path) -> None:
         config = tmp_path / "hf_quant_config.json"
