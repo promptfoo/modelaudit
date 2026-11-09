@@ -1360,11 +1360,10 @@ class BaseScanner(ABC):
         result: ScanResult,
         context: str = "",
         *,
-        reviewed_citations: dict[int, dict[str, Any]] | None = None,
         readme_advisories: bool = False,
     ) -> int:
         """Emit explicit network communication checks from detector findings and return the count."""
-        for index, finding in enumerate(findings):
+        for finding in findings:
             severity_map = {
                 "CRITICAL": IssueSeverity.CRITICAL,
                 "HIGH": IssueSeverity.CRITICAL,
@@ -1376,8 +1375,8 @@ class BaseScanner(ABC):
             }
             finding_severity = str(finding.get("severity", "WARNING")).upper()
             severity = severity_map.get(finding_severity, IssueSeverity.WARNING)
-            detector_severity = severity
             if readme_advisories:
+                detector_severity = severity
                 if finding.get("contains_credentials"):
                     if severity in {IssueSeverity.INFO, IssueSeverity.DEBUG}:
                         severity = IssueSeverity.WARNING
@@ -1401,14 +1400,6 @@ class BaseScanner(ABC):
                 if part
             )
             network_rule_code = get_network_rule_code(network_indicator)
-            if reviewed_citations and index in reviewed_citations and network_rule_code == "S309":
-                review = reviewed_citations[index]
-                finding = {
-                    **finding,
-                    "reviewed_citation": {**review, "original_severity": detector_severity.value},
-                    "check_consolidation_key": f"S309:{review['sha256']}:{review['position']}:{review['fingerprint']}",
-                }
-                severity = IssueSeverity.INFO
             why = "Models should not contain network communication capabilities"
             if readme_advisories and finding.get("contains_credentials"):
                 why = "This documentation contains a URL with credential material that readers can access."

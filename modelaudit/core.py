@@ -28,7 +28,6 @@ except ImportError:
 
 
 import modelaudit.core_results as core_results
-from modelaudit.config.rule_config import DISABLE_REVIEWED_CITATIONS_CONFIG_KEY, get_config
 from modelaudit.finding_identity import preserve_finding_identity
 from modelaudit.integrations._sarif_identity_urls import (
     redact_cloud_error_for_display,
@@ -419,7 +418,6 @@ _DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY = "_dvc_remaining_total_size"
 _DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY = "_dvc_total_size_limit"
 _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
-_DVC_REVIEWED_CITATION_ALIASES_CONFIG_KEY = "_dvc_reviewed_citation_aliases"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
 _INCOMPLETE_SHARD_CHECK_NAMES = frozenset(
@@ -3399,10 +3397,6 @@ def create_scan_config(**kwargs: Any) -> ScanConfigModel:
     return ScanConfigModel(**kwargs)
 
 
-def _has_reviewed_citation_alias(path: Path, aliases: set[Path] | frozenset[Path]) -> bool:
-    return bool(aliases) and (path in aliases or not aliases.isdisjoint(path.parents))
-
-
 def scan_model_directory_or_file(
     path: FilePath,
     blacklist_patterns: list[str] | None = None,
@@ -3434,9 +3428,6 @@ def scan_model_directory_or_file(
     """
     # Start timer for timeout
     start_time = time.time()
-    rule_config = get_config()
-    reviewed_citation_aliases = set(rule_config.reviewed_citation_aliases)
-    reviewed_citation_aliases.update(Path(alias) for alias in kwargs.pop(_DVC_REVIEWED_CITATION_ALIASES_CONFIG_KEY, ()))
     dvc_parent_file = kwargs.pop(_DVC_PARENT_FILE_CONFIG_KEY, None)
     onnx_weight_proofs: dict[tuple[int, int], OnnxWeightProofIdentity] = {}
     dvc_remaining_total_size = kwargs.pop(_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY, None)
@@ -4038,9 +4029,6 @@ def scan_model_directory_or_file(
                     if repository_member is not None:
                         repository_inventory_files.append(repository_member)
                     snapshot_path = Path(file_path).absolute()
-                    # Record every contributing name before directory deduplication chooses one scan.
-                    if str(snapshot_path) != str(resolved_file):
-                        reviewed_citation_aliases.add(resolved_file)
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
                         is_hf_cache_symlink and resolved_file.exists() and snapshot_shard_family_key is not None
@@ -4089,7 +4077,6 @@ def scan_model_directory_or_file(
                     if file.lower().endswith(".dvc"):
                         dvc_pointer_file = file_path
                         dvc_resolution = resolve_dvc_file_status(file_path)
-                        reviewed_citation_aliases.update(Path(alias) for alias in dvc_resolution.aliased_output_paths)
                         if dvc_resolution.has_non_cap_gap:
                             _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
                             aggregate_hash_complete = False
@@ -5093,10 +5080,6 @@ def scan_model_directory_or_file(
                         file_scan_started_at = _start_phase_timing(phase_timings)
                         try:
                             file_config = dict(config)
-                            if reviewed_citation_aliases and _has_reviewed_citation_alias(
-                                Path(representative_file), reviewed_citation_aliases
-                            ):
-                                file_config[DISABLE_REVIEWED_CITATIONS_CONFIG_KEY] = True
                             file_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_inventory_context
                             file_config.setdefault(REPOSITORY_SCAN_ROOT_CONFIG_KEY, str(base_dir))
                             repository_current_file = repository_member or _repository_member_path_for_scan(
@@ -5354,7 +5337,6 @@ def scan_model_directory_or_file(
             if is_dvc_pointer:
                 dvc_resolution = resolve_dvc_file_status(path)
                 single_dvc_resolution = dvc_resolution
-                reviewed_citation_aliases.update(Path(alias) for alias in dvc_resolution.aliased_output_paths)
                 if dvc_resolution.has_non_cap_gap:
                     _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
                     aggregate_hash_complete = False
@@ -5421,19 +5403,12 @@ def scan_model_directory_or_file(
                     target_config["timeout"] = target_timeout
                     target_config["max_total_size"] = target_max_total_size
 
-                if _has_reviewed_citation_alias(Path(resolved_target), reviewed_citation_aliases):
-                    target_config = {**target_config, DISABLE_REVIEWED_CITATIONS_CONFIG_KEY: True}
-
                 if os.path.isdir(target):
                     nested_kwargs = dict(kwargs)
                     if is_dvc_pointer:
                         nested_kwargs[_DVC_PARENT_FILE_CONFIG_KEY] = path
                         nested_kwargs[_DVC_EXCLUDED_PATHS_CONFIG_KEY] = tuple(scanned_dvc_paths)
                         nested_kwargs[_DVC_COVERAGE_ROOTS_CONFIG_KEY] = dvc_declared_output_roots
-                        if reviewed_citation_aliases:
-                            nested_kwargs[_DVC_REVIEWED_CITATION_ALIASES_CONFIG_KEY] = tuple(
-                                str(alias) for alias in reviewed_citation_aliases
-                            )
                     if is_dvc_pointer and max_total_size > 0:
                         nested_kwargs[_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY] = max_total_size - results.bytes_scanned
                         nested_kwargs[_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY] = max_total_size
@@ -8017,13 +7992,6 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
-                rule_config = get_config()
-                if (
-                    str(source_path.absolute()) != str(scan_path.absolute())
-                    or (reported_source_path is not None and reported_source_path != str(source_path))
-                    or _has_reviewed_citation_alias(scan_path.absolute(), rule_config.reviewed_citation_aliases)
-                ):
-                    scan_config[DISABLE_REVIEWED_CITATIONS_CONFIG_KEY] = True
                 scan_repository_inventory_context = streaming_repository_inventory_context()
                 if scan_repository_inventory_context.files:
                     scan_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = scan_repository_inventory_context

@@ -33,7 +33,6 @@ class DvcResolution:
     unverified_omitted_output_count: int = 0
     source_digest: str | None = None
     tail_verification_truncated: bool = False
-    aliased_output_paths: frozenset[str] = frozenset()
 
     @property
     def targets(self) -> list[str]:
@@ -79,15 +78,15 @@ def _load_dvc_data(pointer_bytes: bytes) -> Any:
     return yaml.load(pointer_bytes, Loader=UniqueKeyLoader) or {}
 
 
-def _matching_resolved_artifact(target: Path, resolved_paths: list[str]) -> str | None:
-    """Return the selected path for another name of the same artifact."""
+def _matches_resolved_artifact(target: Path, resolved_paths: list[str]) -> bool:
+    """Return whether target aliases an artifact already selected for scanning."""
     for resolved_path in resolved_paths:
         try:
             if target.samefile(resolved_path):
-                return resolved_path
+                return True
         except OSError:
             continue
-    return None
+    return False
 
 
 def _declared_output_metadata_gap(output: dict[Any, Any], target: Path) -> str | None:
@@ -224,17 +223,6 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
     bounded_outs = declared_outs[:verification_limit]
     dvc_dir = path.parent.resolve()
 
-    logical_base = pointer_location.parent / data.get("wdir", ".")
-    aliased_outputs: set[str] = set()
-
-    def resolve_declared_output(out_path: str) -> Path | None:
-        target = _canonical_output_target(output_base, dvc_dir, resolved_pointer, out_path)
-        if target is not None and (
-            str(pointer_location) != str(resolved_pointer) or str(logical_base / out_path) != str(target)
-        ):
-            aliased_outputs.add(str(target))
-        return target
-
     resolved: list[str] = []
     resolved_seen: set[str] = set()
     unresolved: list[str] = []
@@ -269,7 +257,7 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
                 unresolved.append("<empty-output-path>")
             continue
 
-        target = resolve_declared_output(out_path)
+        target = _canonical_output_target(output_base, dvc_dir, resolved_pointer, out_path)
         if target is None:
             logger.warning(f"DVC target path is unsafe or points to a pointer: {file_path} -> {out_path}")
             if is_omitted:
@@ -310,14 +298,7 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
                 unresolved.append(str(target))
             continue
         target_str = str(target)
-        selected_alias = (
-            None
-            if target_str in resolved_seen or target_str in omitted_seen
-            else _matching_resolved_artifact(target, resolved)
-        )
-        if selected_alias is not None:
-            aliased_outputs.update((selected_alias, target_str))
-        elif not is_omitted and target_str not in resolved_seen:
+        if not is_omitted and target_str not in resolved_seen and not _matches_resolved_artifact(target, resolved):
             resolved.append(target_str)
             resolved_seen.add(target_str)
 
@@ -334,7 +315,12 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
                 unresolved.append(f"{target} ({metadata_gap})")
             continue
 
-        if is_omitted and target_str not in resolved_seen and target_str not in omitted_seen and selected_alias is None:
+        if (
+            is_omitted
+            and target_str not in resolved_seen
+            and target_str not in omitted_seen
+            and not _matches_resolved_artifact(target, resolved)
+        ):
             omitted_targets.append(target_str)
             omitted_seen.add(target_str)
 
@@ -350,7 +336,7 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
             if not isinstance(out_path, str) or not out_path.strip():
                 invalid_unverified_output_count += 1
             else:
-                target = resolve_declared_output(out_path)
+                target = _canonical_output_target(output_base, dvc_dir, resolved_pointer, out_path)
                 if target is None:
                     invalid_unverified_output_count += 1
                 elif str(target) not in bounded_declared_targets:
@@ -391,7 +377,6 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
         unverified_omitted_output_count=unverified_omitted_output_count,
         source_digest=hashlib.sha256(pointer_bytes).hexdigest(),
         tail_verification_truncated=tail_verification_truncated,
-        aliased_output_paths=frozenset(aliased_outputs),
     )
 
 
