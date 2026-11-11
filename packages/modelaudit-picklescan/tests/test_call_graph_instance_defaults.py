@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+import py_compile
 import shlex
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from pickle_test_helpers import (
     _tuple_payload_operands,
 )
 
-from modelaudit_picklescan import SafetyVerdict, scan_bytes
+from modelaudit_picklescan import SafetyVerdict, call_graph, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import _calls_for_function, _find_sink_path
 
@@ -227,7 +228,7 @@ def _run_process_provider_check(
         )
     script += f"namespace[{check.__name__!r}](Path(sys.argv[1]))\n"
     result = subprocess.run(
-        [sys.executable, "-I", "-B", "-c", script, str(tmp_path)],
+        [sys.executable, "-I", "-B", "-X", f"pycache_prefix={tmp_path / 'bytecode'}", "-c", script, str(tmp_path)],
         cwd=tmp_path,
         check=False,
         capture_output=True,
@@ -247,6 +248,37 @@ def test_botocore_process_provider_check_isolates_warm_parent(tmp_path: Path) ->
     _run_process_provider_check(
         tmp_path, test_scan_bytes_blocks_botocore_process_provider_rce, warm_module="botocore.credentials"
     )
+
+
+def _assert_process_provider_source_cache_isolated(tmp_path: Path) -> None:
+    source = tmp_path / "cache_control.py"
+    source.write_text("value = 7\n", encoding="utf-8")
+    cache_dir = tmp_path / "__pycache__"
+    cache_dir.mkdir()
+    shared_cache = cache_dir / f"cache_control.{sys.implementation.cache_tag}.pyc"
+    selected_cache = call_graph._source_cache_path(source)
+    assert selected_cache is not None
+    selected_cache.parent.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(tmp_path))
+
+    with call_graph.shared_source_sensitive_caches():
+        generation = call_graph._begin_shared_source_report()
+        assert generation is not None
+        call_graph._track_shared_source_candidates(("cache_control",))
+        metadata = call_graph.shared_source_fingerprint_metadata()
+        assert metadata is not None and metadata["reusable"]
+        # Model another worker populating the shared cache while this child scans.
+        py_compile.compile(str(source), cfile=str(shared_cache), doraise=True)
+        assert shared_cache.is_file()
+        call_graph._ensure_shared_source_snapshot_stable(generation)
+        # Mutations to the child's own import candidate must still fail closed.
+        py_compile.compile(str(source), cfile=str(selected_cache), doraise=True)
+        with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="source changed"):
+            call_graph._ensure_shared_source_snapshot_stable(generation)
+
+
+def test_process_provider_check_isolates_shared_bytecode_cache(tmp_path: Path) -> None:
+    _run_process_provider_check(tmp_path, _assert_process_provider_source_cache_isolated)
 
 
 def _assert_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None:
