@@ -3061,11 +3061,12 @@ def _is_valid_official_readme_sample_image_example(
             elif isinstance(
                 parent,
                 (ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp, ast.comprehension),
+            ) or (
+                isinstance(parent, ast.Compare)
+                and current is not parent.left
+                and (not parent.comparators or current is not parent.comparators[0])
             ):
                 return False
-            elif isinstance(parent, ast.Compare):
-                if current is not parent.left and (not parent.comparators or current is not parent.comparators[0]):
-                    return False
             if isinstance(parent, ast.stmt):
                 return not (isinstance(parent, ast.Assert) and current is parent.msg)
             current = parent

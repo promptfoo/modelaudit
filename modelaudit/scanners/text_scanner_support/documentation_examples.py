@@ -207,9 +207,10 @@ def _setup_command_urls(words: list[str]) -> set[str] | None:
             elif arg == "--index-strategy":
                 if next(install_args, "") not in {"first-index", "unsafe-first-match", "unsafe-best-match"}:
                     return None
-            elif arg not in {"--pre", "--upgrade", "-U", "-e"}:
-                if arg.startswith("-") or re.fullmatch(r"[\w.\[\],=+!~-]+", arg) is None:
-                    return None
+            elif arg not in {"--pre", "--upgrade", "-U", "-e"} and (
+                arg.startswith("-") or re.fullmatch(r"[\w.\[\],=+!~-]+", arg) is None
+            ):
+                return None
         return urls
 
     if any(

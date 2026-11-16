@@ -2174,8 +2174,7 @@ def test_directory_can_replace_entries_rejects_linux_access_acl_for_root(
 def test_sticky_directory_replacement_rejects_unowned_output(monkeypatch: pytest.MonkeyPatch) -> None:
     parent_stat = types.SimpleNamespace(st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=1001)
     output_stat = cast(os.stat_result, types.SimpleNamespace(st_uid=1002))
-    monkeypatch.setattr(cli_module.os, "fstat", lambda _fd: parent_stat)
-    monkeypatch.setattr(cli_module.os, "geteuid", lambda: 1003)
+    monkeypatch.setattr(cli_module, "os", types.SimpleNamespace(fstat=lambda _fd: parent_stat, geteuid=lambda: 1003))
 
     with pytest.raises(cli_module._OutputWriteError, match=r"sticky directory.*Permission denied"):
         cli_module._validate_posix_output_replacement_permission("/tmp/report.json", 123, output_stat)
@@ -2193,8 +2192,9 @@ def test_sticky_directory_replacement_allows_privileged_or_owned_output(
 ) -> None:
     parent_stat = types.SimpleNamespace(st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=parent_uid)
     output_stat = cast(os.stat_result, types.SimpleNamespace(st_uid=output_uid))
-    monkeypatch.setattr(cli_module.os, "fstat", lambda _fd: parent_stat)
-    monkeypatch.setattr(cli_module.os, "geteuid", lambda: effective_uid)
+    monkeypatch.setattr(
+        cli_module, "os", types.SimpleNamespace(fstat=lambda _fd: parent_stat, geteuid=lambda: effective_uid)
+    )
 
     cli_module._validate_posix_output_replacement_permission("/tmp/report.json", 123, output_stat)
 
@@ -2572,9 +2572,9 @@ def test_windows_output_encryption_state_comes_from_pinned_handle(
 ) -> None:
     """EFS preservation must inspect the opened file rather than its path."""
     monkeypatch.setattr(
-        cli_module.os,
-        "fstat",
-        lambda fd: types.SimpleNamespace(fd=fd, st_file_attributes=file_attributes),
+        cli_module,
+        "os",
+        types.SimpleNamespace(fstat=lambda fd: types.SimpleNamespace(st_file_attributes=file_attributes)),
     )
 
     assert cli_module._windows_output_is_encrypted(17) is expected

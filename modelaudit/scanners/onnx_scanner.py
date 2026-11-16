@@ -6106,9 +6106,12 @@ def _build_onnx_weight_analysis_plan(
                         str(control_flow_owner.input[parent_input_index])
                     ):
                         return False
-                elif dependency in current_graph_external_names and inherited_independent_value is not None:
-                    if not inherited_independent_value(dependency):
-                        return False
+                elif (
+                    dependency in current_graph_external_names
+                    and inherited_independent_value is not None
+                    and not inherited_independent_value(dependency)
+                ):
+                    return False
             return True
 
         def resolve_reentry_attribute(attribute: Any) -> Any | None:
@@ -15356,12 +15359,16 @@ def _build_onnx_weight_analysis_plan(
                                 len(permutation), (transform_input_shape[index] for index in permutation)
                             )
                             transform_output_rank = len(permutation)
-                    elif transform_input_rank is not None and shape_inference_available(transform_input_rank):
+                    elif (
+                        transform_input_rank is not None
+                        and shape_inference_available(transform_input_rank)
+                        and (
+                            not any(attribute.name == "perm" for attribute in node.attribute)
+                            or transpose_permutation(node, transform_input_rank, resolve_attribute) is not None
+                        )
+                    ):
                         # The default permutation preserves rank without allocating a rank-sized tuple.
-                        if not any(attribute.name == "perm" for attribute in node.attribute) or (
-                            transpose_permutation(node, transform_input_rank, resolve_attribute) is not None
-                        ):
-                            transform_output_rank = transform_input_rank
+                        transform_output_rank = transform_input_rank
                 elif node.op_type == "Flatten" and transform_input_rank is not None:
                     transform_output_rank_proven = transform_input_rank_proven
                     axis = resolved_int_attribute(node, "axis", 1)
