@@ -521,6 +521,34 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("filename", "key", "expression", "expected_exit"),
+    [
+        ("config.yaml", "conv_feature_layers", "[(512, 10, 5)] + [(512, 3, 2)] * 4", 0),
+        ("config.yaml", "conv_feature_layers", "(__import__('os').system('id'), [(512, 10, 5)])[1]", 1),
+        ("hyperparams.yaml", "conv_feature_layers", "[getattr(__builtins__, 'eval')('1')]", 1),
+        ("config.yaml", "description", "__import__('os').system('id')", 0),
+    ],
+)
+def test_scan_cli_fairseq_convolution_expression(
+    tmp_path: Path, filename: str, key: str, expression: str, expected_exit: int
+) -> None:
+    target = tmp_path / filename
+    target.write_text(f"model:\n  _name: wav2vec2\n  {key}: {json.dumps(expression)}\n", encoding="utf-8")
+    result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "json", str(target)], catch_exceptions=False)
+
+    assert result.exit_code == expected_exit
+    output = parse_click_json_output(result.output)
+    assert output["success"] is True
+    findings = [issue for issue in output["issues"] if issue.get("rule_code") == "S104"]
+    if expected_exit:
+        assert len(findings) == 1
+        assert findings[0]["details"]["expression"] == expression
+        assert findings[0]["details"]["key"] == "model.conv_feature_layers"
+    else:
+        assert not findings
+
+
+@pytest.mark.parametrize(
     ("default", "body", "expected_exit", "evidence"),
     [
         ("'text'", "{{ value|trim }}", 0, set()),
