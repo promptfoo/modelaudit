@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
+from modelaudit.config.explanations import get_cve_2026_126974_explanation
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 from modelaudit.utils._path_hardening import _file_stat_matches
 
@@ -69,6 +70,9 @@ _GGML_INTERLEAVED_ROW_GROUPS = {
     33: 8,  # Q4_0_8_8
 }
 _UINT64_MAX: int = 2**64 - 1
+_INT32_MAX: int = 2**31 - 1
+# std::stoi accepts leading whitespace, a plus sign, and trailing non-digits.
+_CONTROL_VECTOR_LAYER = re.compile(r"direction\.[ \t\n\r\f\v]*\+?0*([1-9][0-9]{0,9})(?![0-9])")
 
 # Accepted GGML variant magic bytes
 GGML_VARIANT_MAGICS = {
@@ -740,13 +744,26 @@ class GgufScanner(BaseScanner):
             _GgufTensorLimitExceeded,
         )
         previous_tensor: _GgufTensorInfo | None = None
+        control_vector_candidate = True
+        control_vector_width: int | None = None
         try:
             for _i in range(n_tensors):
                 tensor = self._read_tensor_info(f, validation_budget, result, record_checks=True)
                 if tensor is None:
+                    control_vector_candidate = False
                     continue
                 if tensor_data_section_out_of_bounds:
                     continue
+                if control_vector_candidate:
+                    control_vector = self._control_vector_tensor(tensor, tensor_data_start, file_size)
+                    if control_vector is None or (
+                        control_vector_width is not None and control_vector[0] != control_vector_width
+                    ):
+                        control_vector_candidate = False
+                    else:
+                        control_vector_width, layer_index = control_vector
+                        if control_vector_width * layer_index > _INT32_MAX:
+                            self._report_control_vector_overflow(tensor, control_vector_width, layer_index, result)
                 if previous_tensor is not None:
                     self._validate_tensor_info(
                         previous_tensor,
@@ -970,6 +987,41 @@ class GgufScanner(BaseScanner):
     @staticmethod
     def _tensor_metadata_summary(tensor: _GgufTensorInfo) -> dict[str, Any]:
         return {"name": tensor.name, "type": tensor.tensor_type, "dims": list(tensor.dims)}
+
+    @staticmethod
+    def _control_vector_tensor(tensor: _GgufTensorInfo, data_start: int, file_size: int) -> tuple[int, int] | None:
+        if tensor.tensor_type != 0 or not tensor.dims or any(dim != 1 for dim in tensor.dims[1:]):
+            return None
+        width = tensor.dims[0]
+        match = _CONTROL_VECTOR_LAYER.match(tensor.name)
+        if match is None or not 0 < width <= _INT32_MAX or data_start + tensor.offset + width * 4 > file_size:
+            return None
+        layer_index = int(match.group(1))
+        return (width, layer_index) if layer_index <= _INT32_MAX else None
+
+    def _report_control_vector_overflow(
+        self, tensor: _GgufTensorInfo, width: int, layer_index: int, result: ScanResult
+    ) -> None:
+        description = get_cve_2026_126974_explanation()
+        result.add_check(
+            name="CVE-2026-126974: Control Vector Integer Overflow",
+            passed=False,
+            message=f"CVE-2026-126974: control tensor {tensor.name} overflows the llama.cpp layer buffer calculation",
+            severity=IssueSeverity.CRITICAL,
+            location=self.current_file_path,
+            details={
+                "cve_id": "CVE-2026-126974",
+                "cvss": 7.8,
+                "cwe": "CWE-190",
+                "description": description,
+                "remediation": "Update llama.cpp to include PR #31336. Do not load this GGUF as a control vector.",
+                "tensor_name": tensor.name,
+                "embedding_width": width,
+                "layer_index": layer_index,
+            },
+            why=description,
+            rule_code="S804",
+        )
 
     def _read_tensor_info(
         self,
