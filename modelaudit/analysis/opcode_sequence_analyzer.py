@@ -224,10 +224,8 @@ class OpcodeSequenceAnalyzer:
                 if self.stack_simulation:
                     self.stack_simulation.append(self.stack_simulation[-1])
 
-            elif opcode_name == "POP":
-                # Remove top item
-                if self.stack_simulation:
-                    self.stack_simulation.pop()
+            elif opcode_name == "POP" and self.stack_simulation:
+                self.stack_simulation.pop()
 
         except Exception as e:
             # Stack simulation is best-effort, don't fail analysis on errors
