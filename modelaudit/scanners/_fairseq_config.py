@@ -38,7 +38,7 @@ def check_fairseq_expressions(
             path = f"{prefix}.{key}" if prefix else str(key)
             if key == "conv_feature_layers" and isinstance(item, str):
                 try:
-                    expression = ast.parse(item, mode="eval")
+                    expression = ast.parse(item.lstrip(" \t"), mode="eval")
                 except (SyntaxError, ValueError, RecursionError):
                     continue
                 if any(not isinstance(node, safe_nodes) for node in ast.walk(expression)):

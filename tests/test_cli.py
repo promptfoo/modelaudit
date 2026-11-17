@@ -524,8 +524,13 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     ("filename", "key", "expression", "expected_exit"),
     [
         ("config.yaml", "conv_feature_layers", "[(512, 10, 5)] + [(512, 3, 2)] * 4", 0),
+        ("config.yaml", "conv_feature_layers", " \t[(512, 10, 5)]", 0),
         ("config.yaml", "conv_feature_layers", "(__import__('os').system('id'), [(512, 10, 5)])[1]", 1),
+        ("config.yaml", "conv_feature_layers", " (__import__('os').system('id'), [(512, 10, 5)])[1]", 1),
+        ("config.yaml", "conv_feature_layers", "\t(__import__('os').system('id'), [(512, 10, 5)])[1]", 1),
         ("hyperparams.yaml", "conv_feature_layers", "[getattr(__builtins__, 'eval')('1')]", 1),
+        ("hyperparams.yaml", "conv_feature_layers", " [getattr(__builtins__, 'eval')('1')]", 1),
+        ("hyperparams.yaml", "conv_feature_layers", "\t[getattr(__builtins__, 'eval')('1')]", 1),
         ("config.yaml", "description", "__import__('os').system('id')", 0),
     ],
 )
