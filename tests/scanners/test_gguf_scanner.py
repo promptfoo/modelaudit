@@ -402,6 +402,44 @@ def test_gguf_scanner_basic_scan(tmp_path):
     assert result.metadata["n_tensors"] == 0
 
 
+@pytest.mark.parametrize(
+    ("tensor_name", "tensor_type", "data_size", "expected_exit"),
+    [
+        (b"direction.536870912", 0, 32, 1),
+        (b"direction. +000536870912#comment", 0, 32, 1),
+        (b"direction.1", 0, 32, 0),
+        (b"direction.2147483648", 0, 32, 0),
+        (b"direction.536870912", 1, 16, 0),
+    ],
+)
+def test_gguf_control_vector_overflow_cli(
+    tmp_path: Path, tensor_name: bytes, tensor_type: int, data_size: int, expected_exit: int
+) -> None:
+    path = tmp_path / "control.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type, tensor_name=tensor_name, tensor_data_size=data_size)
+    run = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "json", str(path)], catch_exceptions=False)
+    output = parse_click_json_output(run.output)
+
+    assert run.exit_code == expected_exit
+    assert output["success"] is True
+    findings = [issue for issue in output["issues"] if issue.get("details", {}).get("cve_id") == "CVE-2026-126974"]
+    if expected_exit:
+        assert len(findings) == 1
+        assert findings[0]["details"]["layer_index"] == 536870912
+        assert findings[0]["details"]["embedding_width"] == 8
+        assert findings[0]["details"]["cwe"] == "CWE-190"
+        assert findings[0]["rule_code"] == "S804"
+    else:
+        assert not findings
+
+
+def test_gguf_non_control_tensor_prevents_control_vector_attribution(tmp_path: Path) -> None:
+    path = tmp_path / "weights.gguf"
+    _write_gguf_with_tensor_records(path, [(b"weight", 0, (8,), 32), (b"direction.536870912", 0, (8,), 32)])
+    result = GgufScanner().scan(str(path))
+    assert not any(check.details.get("cve_id") == "CVE-2026-126974" for check in result.checks)
+
+
 @pytest.mark.parametrize("has_tensor", [False, True], ids=["zero-tensor", "one-tensor"])
 def test_gguf_scanner_inspects_embedded_zip_polyglot_members(tmp_path: Path, has_tensor: bool) -> None:
     path = tmp_path / "polyglot.gguf"
