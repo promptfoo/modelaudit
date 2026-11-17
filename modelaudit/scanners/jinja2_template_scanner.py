@@ -50,6 +50,7 @@ from modelaudit.utils.file.detection import (
 )
 
 from . import base as scanner_base
+from ._fairseq_config import check_fairseq_expressions
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
 # Optional GGUF support with graceful fallback
@@ -519,7 +520,7 @@ class Jinja2TemplateScanner(BaseScanner):
             }
 
             # Extract templates based on file type
-            templates, extraction_failures = self._extract_templates(path, context)
+            templates, extraction_failures = self._extract_templates(path, context, result)
             for failure in extraction_failures:
                 self._mark_inconclusive_scan_result(result, path, failure)
 
@@ -879,7 +880,9 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return context
 
-    def _extract_templates(self, path: str, context: MLContext) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    def _extract_templates(
+        self, path: str, context: MLContext, result: ScanResult
+    ) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract Jinja2 templates from various file formats"""
         templates: dict[str, str] = {}
         extraction_failures: list[dict[str, Any]] = []
@@ -894,7 +897,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 templates.update(extracted)
                 extraction_failures.extend(failures)
             elif context.file_type == "yaml":
-                extracted, failures = self._extract_yaml_templates(path)
+                extracted, failures = self._extract_yaml_templates(path, result)
                 templates.update(extracted)
                 extraction_failures.extend(failures)
             elif context.file_type == "template":
@@ -1154,7 +1157,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 current_path = f"{path}[{i}]" if path else f"[{i}]"
                 self._find_json_templates(item, templates, current_path, extraction_failures, config_format)
 
-    def _extract_yaml_templates(self, path: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    def _extract_yaml_templates(self, path: str, result: ScanResult) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract templates from YAML configuration files"""
         templates: dict[str, str] = {}
         extraction_failures: list[dict[str, Any]] = []
@@ -1175,6 +1178,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 data = yaml.safe_load(f)
 
             if data:
+                check_fairseq_expressions(data, result, path, self._check_timeout)
                 self._find_json_templates(data, templates, "", extraction_failures, "yaml")  # Reuse JSON logic
 
         except Exception as e:

@@ -23,6 +23,7 @@ from ..utils.file.safetensors_index import INDEX_PROBE_BYTES, is_plain_safetenso
 from . import base as scanner_base
 from ._archive_config import get_archive_depth
 from ._evidence_redaction import redact_evidence_string
+from ._fairseq_config import check_fairseq_expressions
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 try:
@@ -763,6 +764,9 @@ class ManifestScanner(BaseScanner):
 
                 # Check for blacklisted model names in config values
                 self._check_model_name_policies(content, result)
+                self._check_timeout()
+
+                check_fairseq_expressions(content, result, self.current_file_path, self._check_timeout)
                 self._check_timeout()
 
                 # Check for suspicious URLs in config values
