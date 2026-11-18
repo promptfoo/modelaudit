@@ -1933,6 +1933,7 @@ class PyTorchZipScanner(BaseScanner):
                     break
                 names.append(arg)
         except (ValueError, UnicodeError, OverflowError):
+            # An undecodable operand cannot establish the named callable.
             pass
         return None
 

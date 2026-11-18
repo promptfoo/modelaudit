@@ -73,6 +73,7 @@ def _has_named_stack_global(data: bytes, offset: int) -> bool:
             ):
                 named_operands += 1
     except (ValueError, UnicodeError, OverflowError):
+        # Random tensor bytes often stop decoding before reaching STACK_GLOBAL.
         pass
     return False
 
