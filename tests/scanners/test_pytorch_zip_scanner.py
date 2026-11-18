@@ -2225,6 +2225,7 @@ def test_pytorch_zip_reports_ambiguous_storage_after_reading_the_entire_member(t
     result = _scan_referenced_float_storage(tmp_path / "weights.pt", storage)
     _assert_incomplete_storage_discovery(result)
     check = next(check for check in result.checks if check.name == "Pickle Discovery")
+    assert check.message == "Hidden pickle discovery was inconclusive for 1 PyTorch ZIP member"
     entry = check.details["entries"][0]
     assert entry["reason"] == "ambiguous_nested_pickle"
     assert entry["bytes_read"] == entry["member_size"] == len(storage)
@@ -18444,7 +18445,7 @@ def test_pytorch_zip_persistent_id_parse_budget_failure_is_explicit(tmp_path: Pa
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any("could not be inspected for hidden pickle payloads" in issue.message for issue in result.issues)
+    assert any("Hidden pickle discovery was inconclusive" in issue.message for issue in result.issues)
     _assert_pytorch_zip_inconclusive_not_cached(
         tmp_path / "persistent-id-budget.pt",
         tmp_path / "persistent-id-cache",
@@ -18515,7 +18516,7 @@ def test_pytorch_zip_nested_literal_depth_failure_is_explicit(tmp_path: Path) ->
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any("could not be inspected for hidden pickle payloads" in issue.message for issue in result.issues)
+    assert any("Hidden pickle discovery was inconclusive" in issue.message for issue in result.issues)
     _assert_pytorch_zip_inconclusive_not_cached(
         tmp_path / "nested-depth.pt",
         tmp_path / "nested-depth-cache",
@@ -19494,7 +19495,7 @@ def test_pytorch_zip_literal_boundary_encoded_storage_preserves_outcome(
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
-        assert any("could not be inspected for hidden pickle payloads" in issue.message for issue in result.issues)
+        assert any("Hidden pickle discovery was inconclusive" in issue.message for issue in result.issues)
         assert should_cache_scan_result(result.to_dict()) is False
         _assert_pytorch_zip_inconclusive_not_cached(
             tmp_path / name,

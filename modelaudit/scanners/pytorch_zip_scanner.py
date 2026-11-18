@@ -1811,7 +1811,7 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Pickle Discovery",
                 passed=False,
-                message=f"{count} PyTorch ZIP {noun} could not be inspected for hidden pickle payloads",
+                message=f"Hidden pickle discovery was inconclusive for {count} PyTorch ZIP {noun}",
                 severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={

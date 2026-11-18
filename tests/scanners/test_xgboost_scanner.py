@@ -565,6 +565,12 @@ def test_sentencepiece_extended_vocabulary_with_bracketed_controls(tmp_path: Pat
     path.write_bytes(data + _sentencepiece_piece("[UNK]", 2) + trainer)
     assert not file_detection.is_sentencepiece_model_proto_file(path)
 
+    # This entry has a SentencePiece score and a TensorFlow NodeDef.op on the same field number.
+    node = _proto_field(1, 2, b"\x06lambda") + _proto_field(2, 5, bytes(4)) + _proto_field(2, 2, b"\x06PyFunc")
+    path.write_bytes(data + trainer + _proto_field(1, 2, _proto_varint(len(node)) + node))
+    assert not file_detection.is_sentencepiece_model_proto_file(path)
+    assert not scan_model_directory_or_file(str(path), cache_enabled=False).success
+
 
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""

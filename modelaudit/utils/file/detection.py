@@ -3623,6 +3623,10 @@ def _parse_sentencepiece_piece_proto_stream(
             if parsed_type is None or not 1 <= parsed_type <= 6:
                 return None
             piece_type = parsed_type
+        elif field_number in {1, 2, 3}:
+            # TensorFlow NodeDef.op uses the same field number as the SentencePiece score.
+            # A conflicting wire type prevents exclusive ownership of the payload.
+            return None
         else:
             skip_status = _skip_proto_stream_value(
                 stream,
