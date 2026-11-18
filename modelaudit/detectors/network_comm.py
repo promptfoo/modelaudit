@@ -174,8 +174,10 @@ _DIRECT_AUTH_SCHEME_VALUE_PATTERN = re.compile(
     rb"(?:^|[^A-Za-z0-9])(?:basic|bearer|token)[ \t]+[\"']?\s*$",
     re.IGNORECASE,
 )
-_EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
-_EVIDENCE_MATCH_END_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_END__"
+# URL normalization lowercases hostnames. Markers must survive it to distinguish
+# a visible hostname from a credential removed by the evidence classifier.
+_EVIDENCE_MATCH_START_MARKER = "__modelaudit_endpoint_match_start__"
+_EVIDENCE_MATCH_END_MARKER = "__modelaudit_endpoint_match_end__"
 _SENSITIVE_NESTED_URL = "redacted://redacted.invalid/sensitive-endpoint"
 _OVER_ENCODED_NESTED_URL = "overencoded://redacted.invalid/nested-endpoint"
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
