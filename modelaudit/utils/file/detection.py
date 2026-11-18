@@ -3502,6 +3502,7 @@ def _has_strong_sentencepiece_model_proto_evidence(
     piece_count: int,
     typed_piece_count: int,
     special_identity_piece_count: int,
+    bert_controls: set[str],
     unknown_piece_count: int,
     unknown_piece_index: int | None,
     unknown_piece_text: str | None,
@@ -3528,12 +3529,20 @@ def _has_strong_sentencepiece_model_proto_evidence(
     if (
         trainer_spec is not None
         and trainer_spec.has_core_metadata
-        and trainer_spec.vocab_size == piece_count
         and 0 <= trainer_spec.unk_id < piece_count
         and trainer_spec.unk_id == unknown_piece_index
         and (not trainer_spec.unk_piece_explicit or trainer_spec.unk_piece == unknown_piece_text)
     ):
-        return True
+        if trainer_spec.vocab_size == piece_count:
+            return True
+        # Tokenizers can extend a trained vocabulary without rewriting TrainerSpec.
+        if (
+            trainer_spec.vocab_size is not None
+            and _SENTENCEPIECE_MIN_STRONG_PIECES <= trainer_spec.vocab_size < piece_count
+            and unknown_piece_text == trainer_spec.unk_piece == "[UNK]"
+            and len(bert_controls) == 3
+        ):
+            return True
 
     if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
         return False
@@ -3689,6 +3698,7 @@ def _classify_sentencepiece_model_proto_stream(
     piece_count = 0
     typed_piece_count = 0
     special_identity_piece_count = 0
+    bert_controls: set[str] = set()
     unknown_piece_count = 0
     unknown_piece_index: int | None = None
     unknown_piece_text: str | None = None
@@ -3696,7 +3706,6 @@ def _classify_sentencepiece_model_proto_stream(
     byte_piece_texts: set[str] = set()
     malformed_byte_piece = False
     trainer_spec: _SentencePieceTrainerSpecSignals | None = None
-    strong_match = False
     decoded_piece_text_bytes = 0
 
     def reject_candidate() -> _SentencePieceModelProtoRoute:
@@ -3742,6 +3751,8 @@ def _classify_sentencepiece_model_proto_stream(
             piece_count += 1
             if piece_type is not None:
                 typed_piece_count += 1
+            if piece_type == 3 and piece in ("[PAD]", "[CLS]", "[SEP]"):
+                bert_controls.add(piece)
             if piece is not None and _is_sentencepiece_special_identity_piece(piece):
                 special_identity_piece_count += 1
             if piece_type is not None:
@@ -3807,10 +3818,15 @@ def _classify_sentencepiece_model_proto_stream(
             return reject_candidate()
 
         fields_seen += 1
-        strong_match = _has_strong_sentencepiece_model_proto_evidence(
+
+    if (
+        stream.tell() == file_size
+        and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
+        and _has_strong_sentencepiece_model_proto_evidence(
             piece_count=piece_count,
             typed_piece_count=typed_piece_count,
             special_identity_piece_count=special_identity_piece_count,
+            bert_controls=bert_controls,
             unknown_piece_count=unknown_piece_count,
             unknown_piece_index=unknown_piece_index,
             unknown_piece_text=unknown_piece_text,
@@ -3819,8 +3835,7 @@ def _classify_sentencepiece_model_proto_stream(
             malformed_byte_piece=malformed_byte_piece,
             trainer_spec=trainer_spec,
         )
-
-    if strong_match and stream.tell() == file_size and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+    ):
         return "strong"
     return "malformed_candidate" if piece_count else "unknown"
 

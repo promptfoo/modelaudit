@@ -308,6 +308,12 @@ modelaudit model.pkl --format sarif --output results.sarif
 
 ## Troubleshooting
 
+Pickle opcode scanning works without the model's runtime libraries. To inspect invoked Python callables,
+ModelAudit also reads their installed source. For PyTorch Trainer checkpoints, install the trusted versions
+of `torch`, `transformers`, and `accelerate` used by your deployment in the scanning environment.
+A `call_graph_source_unavailable` notice identifies the unresolved reference. The scan stays inconclusive
+until ModelAudit can inspect it. ModelAudit does not load the checkpoint to resolve these calls.
+
 - Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
 - Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports. Inspect the raw output and remove sensitive values before sharing it.
 - Use `modelaudit cache cleanup --max-age 30` to remove stale cache entries safely.

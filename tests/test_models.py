@@ -1401,3 +1401,16 @@ def test_aggregate_findings_keep_direct_construction(field: str, monkeypatch: py
     record = getattr(result, field)[0]
     assert record.message == "original"
     assert record.timestamp > 0
+
+
+def test_counts_inconclusive_routing_among_failed_checks() -> None:
+    from modelaudit.scanners.archive_dispatch import _make_incomplete_tensorflow_protobuf_routing_result
+
+    scan = _make_incomplete_tensorflow_protobuf_routing_result("spm.model")
+    scan.add_check(name="Informational observation", passed=False, message="Metadata", severity=IssueSeverity.INFO)
+    scan.add_check(name="Read", passed=True, message="File read")
+    aggregate = create_initial_audit_result()
+    aggregate.aggregate_scan_result_direct(scan)
+    aggregate.finalize_statistics()
+    assert not aggregate.success
+    assert (aggregate.total_checks, aggregate.passed_checks, aggregate.failed_checks) == (2, 1, 1)

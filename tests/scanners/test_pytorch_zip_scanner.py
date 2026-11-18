@@ -2217,6 +2217,20 @@ def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_impossible_d
     _assert_incomplete_storage_discovery(result)
 
 
+def test_pytorch_zip_reports_ambiguous_storage_after_reading_the_entire_member(tmp_path: Path) -> None:
+    prefix = b"T" + (0x7FFFFFFF).to_bytes(4, "little")
+    # A raw storage member can have a second pickle entry point even though its first length is impossible.
+    hidden = _malicious_proto0_system_payload()
+    storage = (prefix + b"!" * 92 + hidden).ljust(3072, b"!")
+    result = _scan_referenced_float_storage(tmp_path / "weights.pt", storage)
+    _assert_incomplete_storage_discovery(result)
+    check = next(check for check in result.checks if check.name == "Pickle Discovery")
+    entry = check.details["entries"][0]
+    assert entry["reason"] == "ambiguous_nested_pickle"
+    assert entry["bytes_read"] == entry["member_size"] == len(storage)
+    assert entry["invalid_length_header_end"] == len(prefix)
+
+
 def test_pytorch_zip_discovery_skips_same_sized_benign_unread_tail_after_impossible_prefix(
     tmp_path: Path,
 ) -> None:
@@ -5291,7 +5305,7 @@ def test_pytorch_zip_trusted_storage_fails_closed_after_impossible_binunicode8_p
 
     with zipfile.ZipFile(archive_path, "r") as archive:
         entry = archive.getinfo("archive/data/0")
-        with pytest.raises(ValueError, match="trusted PyTorch storage prefix exceeds pickle discovery probe"):
+        with pytest.raises(ValueError, match="possible embedded pickle"):
             scanner._trusted_storage_entry_looks_like_pickle(
                 archive,
                 entry,
@@ -23599,7 +23613,7 @@ def test_pytorch_zip_native9_global_name_work_is_bounded(
             archive.writestr("archive/data/0", value)
             entry = archive.getinfo("archive/data/0")
             if bound_reached:
-                with pytest.raises(ValueError, match="trusted PyTorch storage prefix exceeds pickle discovery probe"):
+                with pytest.raises(ValueError, match="possible embedded pickle"):
                     scanner._trusted_storage_entry_looks_like_pickle(
                         archive, entry, result, padding_probe_bytes_remaining=[4 * 1024 * 1024]
                     )

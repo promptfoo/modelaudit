@@ -545,6 +545,27 @@ def _xgboost_ubjson_deep_before_counted_null_array_probe() -> bytes:
     return b"{" + _ubjson_key(b"learner") + learner + b"}"
 
 
+def test_sentencepiece_extended_vocabulary_with_bracketed_controls(tmp_path: Path) -> None:
+    path = tmp_path / "spm.model"
+    pieces = [("[PAD]", 3), ("[CLS]", 3), ("[SEP]", 3), ("[UNK]", 2)]
+    pieces.extend((f"<0x{byte:02X}>", 6) for byte in range(256))
+    original_size = len(pieces)
+    pieces.extend([("word", 1), ("▁<extra_id_0>", 4)])
+    trainer = _sentencepiece_trainer_spec(vocab_size=original_size, unk_id=3, unk_piece="[UNK]", byte_fallback=True)
+    data = b"".join(_sentencepiece_piece(piece, kind) for piece, kind in pieces)
+    path.write_bytes(data + trainer)
+    assert file_detection.is_sentencepiece_model_proto_file(path)
+    assert scan_model_directory_or_file(str(path), cache_enabled=False).success
+
+    wrong_type = data.replace(_sentencepiece_piece("[CLS]", 3), _sentencepiece_piece("[CLS]", 1))
+    path.write_bytes(wrong_type + trainer)
+    assert not file_detection.is_sentencepiece_model_proto_file(path)
+
+    # A duplicated unknown piece invalidates the format even with plausible control tokens.
+    path.write_bytes(data + _sentencepiece_piece("[UNK]", 2) + trainer)
+    assert not file_detection.is_sentencepiece_model_proto_file(path)
+
+
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""
 

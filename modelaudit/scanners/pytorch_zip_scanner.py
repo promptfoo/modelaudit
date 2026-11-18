@@ -541,6 +541,17 @@ _InstNameValidation = tuple[bytes, dict[int, tuple[tuple[int, ...], int, int | N
 _GlobalNameInspection = tuple[bytes, list[int]]
 
 
+class _AmbiguousStorageTail(ValueError):
+    """A complete referenced storage member contains an ambiguous nested pickle candidate."""
+
+    def __init__(self, member_size: int, header_end: int) -> None:
+        super().__init__(
+            f"Read all {member_size} storage bytes. A possible embedded pickle follows or overlaps "
+            "an invalid pickle length header."
+        )
+        self.header_end = header_end
+
+
 class PyTorchZipScanner(BaseScanner):
     """Scanner for PyTorch ZIP-based model files (.pt, .pth, .ckpt, .pkl, .bin)."""
 
@@ -1722,6 +1733,23 @@ class PyTorchZipScanner(BaseScanner):
         padding_probe_bytes_remaining = [_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES]
         nul_padding_verify_bytes_remaining = [_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES]
         deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
+
+        def record_probe_failure(entry: zipfile.ZipInfo, exc: Exception) -> None:
+            failure: dict[str, Any] = {
+                "zip_entry": entry.filename,
+                "member_size": entry.file_size,
+                "exception": str(exc),
+                "exception_type": type(exc).__name__,
+                "location": f"{self.current_file_path}:{entry.filename}",
+            }
+            if isinstance(exc, _AmbiguousStorageTail):
+                failure.update(
+                    reason="ambiguous_nested_pickle",
+                    bytes_read=entry.file_size,
+                    invalid_length_header_end=exc.header_end,
+                )
+            probe_failures.append(failure)
+
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             if id(entry) in entries_by_id or entry.is_dir():
@@ -1756,14 +1784,7 @@ class PyTorchZipScanner(BaseScanner):
                     deferred_padding_probe_entries.append(entry)
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
-                probe_failures.append(
-                    {
-                        "zip_entry": entry.filename,
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "location": f"{self.current_file_path}:{entry.filename}",
-                    }
-                )
+                record_probe_failure(entry, exc)
 
         for entry in deferred_padding_probe_entries:
             if id(entry) in entries_by_id or entry.is_dir():
@@ -1781,14 +1802,7 @@ class PyTorchZipScanner(BaseScanner):
                     entries_by_id[id(entry)] = entry
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
-                probe_failures.append(
-                    {
-                        "zip_entry": entry.filename,
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "location": f"{self.current_file_path}:{entry.filename}",
-                    }
-                )
+                record_probe_failure(entry, exc)
 
         if probe_failures:
             mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
@@ -2371,6 +2385,8 @@ class PyTorchZipScanner(BaseScanner):
                 work_budget_remaining=work_budget_remaining,
             ):
                 return charge_deferred_probe_budget_before_skip()
+            if len(sample) == entry.file_size:
+                raise _AmbiguousStorageTail(entry.file_size, impossible_prefix_header_end)
             raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
 
         if entry.file_size > len(data_start):
