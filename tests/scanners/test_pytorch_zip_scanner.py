@@ -2214,7 +2214,23 @@ def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_impossible_d
     storage_blob += b"A" * (storage_size - len(storage_blob))
     result = _scan_referenced_float_storage(model_path, storage_blob)
 
-    _assert_incomplete_storage_discovery(result)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "complete pickle stream" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_validated_tensor_storage_ambiguity_is_informational(tmp_path: Path) -> None:
+    header = b"T" + (0x7FFFFFFF).to_bytes(4, "little")
+    storage = (header.ljust(96, b"!") + b"K\x82t").ljust(3072, b"!")
+    result = _scan_referenced_float_storage(tmp_path / "ambiguous.pt", storage)
+
+    assert result.success is True
+    assert "pytorch_zip_pickle_discovery_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    check = next(check for check in result.checks if check.name == "Tensor Storage Pickle Heuristic")
+    assert check.status == CheckStatus.PASSED
+    assert check.details["best_effort"] is True
+    assert len(check.details["entries"]) == 1
 
 
 def test_pytorch_zip_discovery_skips_same_sized_benign_unread_tail_after_impossible_prefix(
@@ -3570,11 +3586,11 @@ def test_pytorch_zip_discovery_skips_many_padding_only_storages_over_budget(
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    assert result.success is False
-    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.success is True
+    assert "pytorch_zip_pickle_discovery_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
     assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    discovery_check = next(check for check in result.checks if check.name == "Pickle Discovery")
-    assert discovery_check.status == CheckStatus.FAILED
+    discovery_check = next(check for check in result.checks if check.name == "Tensor Storage Pickle Heuristic")
+    assert discovery_check.status == CheckStatus.PASSED
     assert discovery_check.details["entries"][0]["exception_type"] == "ValueError"
     assert "padding probe budget exceeded" in discovery_check.details["entries"][0]["exception"]
     assert not any(
@@ -3648,8 +3664,8 @@ def test_pytorch_zip_discovery_continues_deferred_padding_after_nul_verification
     assert result.success is False
     assert result.metadata["pickle_verdict"] == "malicious"
     assert "archive/data/1" in result.metadata["pickle_files"]
-    discovery_check = next(check for check in result.checks if check.name == "Pickle Discovery")
-    assert discovery_check.status == CheckStatus.FAILED
+    discovery_check = next(check for check in result.checks if check.name == "Tensor Storage Pickle Heuristic")
+    assert discovery_check.status == CheckStatus.PASSED
     assert any(entry["zip_entry"] == "archive/data/0" for entry in discovery_check.details["entries"])
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/1"
@@ -3700,12 +3716,12 @@ def test_pytorch_zip_discovery_marks_oversized_length_operand_incomplete(
     storage_blob = b"N." + b"X" + (70_000).to_bytes(4, "little") + (b"A" * 70_000)
     result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b" ")
 
-    assert result.success is False
-    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.success is True
+    assert "pytorch_zip_pickle_discovery_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
     assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    discovery_check = next(check for check in result.checks if check.name == "Pickle Discovery")
-    assert discovery_check.status == CheckStatus.FAILED
-    assert discovery_check.details["zip_entries"] == ["archive/data/0"]
+    discovery_check = next(check for check in result.checks if check.name == "Tensor Storage Pickle Heuristic")
+    assert discovery_check.status == CheckStatus.PASSED
+    assert [entry["zip_entry"] for entry in discovery_check.details["entries"]] == ["archive/data/0"]
 
 
 def test_pytorch_zip_discovery_scans_frame_header_crossing_trusted_probe_boundary(

@@ -1719,9 +1719,44 @@ class PyTorchZipScanner(BaseScanner):
         # adversarial archive with many unreadable members does not flood the
         # checks list with one INFO finding apiece.
         probe_failures: list[dict[str, Any]] = []
+        storage_diagnostics: list[dict[str, Any]] = []
+        storage_recovery_bytes_remaining = [_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES]
         padding_probe_bytes_remaining = [_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES]
         nul_padding_verify_bytes_remaining = [_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES]
         deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
+
+        def record_probe_failure(entry: zipfile.ZipInfo, exc: Exception) -> None:
+            failure = {
+                "zip_entry": entry.filename,
+                "exception": str(exc),
+                "exception_type": type(exc).__name__,
+                "location": f"{self.current_file_path}:{entry.filename}",
+            }
+            if (
+                self._get_zip_member_name(entry) in trusted_storage_blob_members
+                and isinstance(exc, ValueError)
+                and str(exc)
+                in {
+                    "trusted PyTorch storage prefix exceeds pickle discovery probe",
+                    "trusted PyTorch storage padding probe budget exceeded",
+                    "trusted PyTorch storage literal inspection work allowance exhausted",
+                }
+            ):
+                try:
+                    suspicious = self._report_confirmed_storage_pickle(
+                        zip_file, entry, result, storage_recovery_bytes_remaining
+                    )
+                except Exception as read_exc:
+                    failure.update(exception=str(read_exc), exception_type=type(read_exc).__name__)
+                    probe_failures.append(failure)
+                    return
+                if suspicious:
+                    probe_failures.append(failure)
+                else:
+                    storage_diagnostics.append(failure)
+            else:
+                probe_failures.append(failure)
+
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             if id(entry) in entries_by_id or entry.is_dir():
@@ -1756,14 +1791,7 @@ class PyTorchZipScanner(BaseScanner):
                     deferred_padding_probe_entries.append(entry)
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
-                probe_failures.append(
-                    {
-                        "zip_entry": entry.filename,
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "location": f"{self.current_file_path}:{entry.filename}",
-                    }
-                )
+                record_probe_failure(entry, exc)
 
         for entry in deferred_padding_probe_entries:
             if id(entry) in entries_by_id or entry.is_dir():
@@ -1781,14 +1809,20 @@ class PyTorchZipScanner(BaseScanner):
                     entries_by_id[id(entry)] = entry
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
-                probe_failures.append(
-                    {
-                        "zip_entry": entry.filename,
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "location": f"{self.current_file_path}:{entry.filename}",
-                    }
-                )
+                record_probe_failure(entry, exc)
+
+        if storage_diagnostics:
+            result.add_check(
+                name="Tensor Storage Pickle Heuristic",
+                passed=True,
+                message=(
+                    f"Bounded hidden-pickle inspection was inconclusive for {len(storage_diagnostics)} "
+                    "validated raw tensor storage members"
+                ),
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={"entries": storage_diagnostics, "best_effort": True},
+            )
 
         if probe_failures:
             mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
@@ -1811,6 +1845,53 @@ class PyTorchZipScanner(BaseScanner):
         pickle_files = list(entries_by_id.values())
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
+
+    def _report_confirmed_storage_pickle(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        result: ScanResult,
+        bytes_remaining: list[int],
+    ) -> bool:
+        sample_size = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES, bytes_remaining[0])
+        if sample_size <= 0:
+            return False
+        bytes_remaining[0] -= sample_size
+        sample = self._read_member_prefix(zip_file, entry, sample_size, phase="pickle_discovery", result=result)
+        for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS:
+            offset = sample.find(b"c" + marker)
+            if offset >= 0 and self._has_complete_pickle_stream_without_frame_stop_overrun(sample[offset:]):
+                result.add_check(
+                    name="Embedded Pickle Payload",
+                    passed=False,
+                    message="A complete pickle stream in raw tensor storage references a dangerous callable",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path}:{entry.filename}",
+                    details={"zip_entry": entry.filename, "offset": offset, "callable": marker.decode().strip()},
+                )
+                return True
+        if b"\x93" in sample and any(
+            module in sample and symbol in sample
+            for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS
+            for module, symbol in [marker.rstrip(b"\n").split(b"\n")]
+        ):
+            result.add_check(
+                name="Embedded Pickle Payload",
+                passed=False,
+                message="Raw tensor storage contains a pickle STACK_GLOBAL opcode and a dangerous callable reference",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path}:{entry.filename}",
+                details={"zip_entry": entry.filename},
+            )
+            return True
+        return (
+            self._raw_nested_proto0_global_ref_seen(sample)
+            or self._raw_nested_proto0_inst_ref_seen(sample, [_MAX_RAW_NESTED_PICKLE_CANDIDATES])
+            or b"c!" * (_MAX_RAW_NESTED_PICKLE_CANDIDATES + 1) in sample
+            or b"N." * (_MAX_RAW_NESTED_PICKLE_CANDIDATES + 1) in sample
+            or sample.startswith(b"\x00" * _PICKLE_DISCOVERY_SHORT_PROBE_BYTES)
+            or re.search(rb"P[A-Za-z0-9_.-]{3,8192}\n\.", sample) is not None
+        )
 
     def _scan_nested_zip_members(
         self,
