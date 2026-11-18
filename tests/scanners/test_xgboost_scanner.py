@@ -2083,6 +2083,62 @@ class TestXGBoostFailClosedEndToEnd:
             for check in result.checks
         )
 
+    @pytest.mark.parametrize(
+        ("field_number", "encoded"),
+        [
+            pytest.param(11, b"\xff" * 9 + b"\x7f", id="uint64-overflow"),
+            pytest.param(12, _proto_varint(1 << 31), id="int32-overflow"),
+            pytest.param(19, b"\x02", id="invalid-bool"),
+            pytest.param(40, _proto_varint((1 << 64) - 1), id="negative-unk-id"),
+            pytest.param(40, _proto_varint(1 << 31), id="unk-id-int32-overflow"),
+            pytest.param(40, b"\x01", id="unk-id-refers-to-control"),
+        ],
+    )
+    def test_sentencepiece_rejects_invalid_trainer_values(
+        self, tmp_path: Path, field_number: int, encoded: bytes
+    ) -> None:
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(
+            _sentencepiece_model_proto(include_trainer_spec=True)
+            + _sentencepiece_trainer_spec_field(_proto_field(field_number, 0, encoded))
+        )
+        assert file_detection.is_sentencepiece_model_proto_file(tokenizer)
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
+
+    def test_sentencepiece_rejects_contradictory_unknown_piece_text(self, tmp_path: Path) -> None:
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(
+            _sentencepiece_model_proto() + _sentencepiece_trainer_spec(vocab_size=8, unk_piece="other")
+        )
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
+
+    def test_sentencepiece_accepts_trainer_scalar_boundaries_and_disabled_ids(self, tmp_path: Path) -> None:
+        extra_fields = b"".join(
+            _proto_field(number, 0, _proto_varint(value))
+            for number, value in [
+                (11, (1 << 64) - 1),
+                (52, 0),
+                (13, (1 << 31) - 1),
+                (12, (1 << 64) - (1 << 31)),
+                (19, 1),
+                (21, 0),
+                (41, (1 << 64) - 1),
+                (42, (1 << 64) - 1),
+                (43, (1 << 64) - 1),
+            ]
+        )
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(
+            _sentencepiece_model_proto() + _sentencepiece_trainer_spec(vocab_size=8, extra_fields=extra_fields)
+        )
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert result.success and "sentencepiece" in result.scanner_names
+        assert determine_exit_code(result) == 0
+
     @pytest.mark.parametrize("replacement", [b"<0x0a>", b"<0x0b>"], ids=["duplicate-byte", "lowercase-byte"])
     def test_sentencepiece_rejects_noncanonical_byte_pieces(self, tmp_path: Path, replacement: bytes) -> None:
         tokenizer = _write_official_sentencepiece_fixture(

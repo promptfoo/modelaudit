@@ -134,38 +134,14 @@ _SENTENCEPIECE_BYTE_PIECE_TYPE = 6
 _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT = 256
 _SENTENCEPIECE_IDENTITY_TOKENS = frozenset({"<unk>", "<s>", "</s>", "<pad>", "<bos>", "<eos>"})
 _SENTENCEPIECE_BYTE_FALLBACK_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
-_SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS = frozenset(
-    {
-        3,
-        4,
-        6,
-        11,
-        12,
-        13,
-        14,
-        16,
-        17,
-        18,
-        19,
-        20,
-        21,
-        22,
-        23,
-        24,
-        25,
-        26,
-        32,
-        33,
-        34,
-        35,
-        40,
-        41,
-        42,
-        43,
-        49,
-        50,
-        52,
-    }
+_SENTENCEPIECE_TRAINER_SPEC_BOOL_FIELDS = frozenset({19, 21, 22, 23, 24, 25, 26, 32, 33, 34, 35, 49, 50})
+_SENTENCEPIECE_TRAINER_SPEC_INT32_FIELDS = frozenset({4, 6, 12, 13, 14, 16, 17, 18, 20, 40, 41, 42, 43})
+_SENTENCEPIECE_TRAINER_SPEC_UINT64_FIELDS = frozenset({11, 52})
+_SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS = (
+    _SENTENCEPIECE_TRAINER_SPEC_BOOL_FIELDS
+    | _SENTENCEPIECE_TRAINER_SPEC_INT32_FIELDS
+    | _SENTENCEPIECE_TRAINER_SPEC_UINT64_FIELDS
+    | {3}  # ModelType enum
 )
 _SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS = frozenset({1, 2, 5, 7, 30, 31, 36, 44, 45, 46, 47, 48, 53, 54})
 _SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS = frozenset({10, 15, 51})
@@ -3360,6 +3336,22 @@ def _decode_proto_int32_varint(value: int) -> int:
     return value
 
 
+def _is_valid_sentencepiece_trainer_varint(field_number: int, value: int) -> bool:
+    if value >= 1 << 64:
+        return False
+    if field_number == 3:
+        return 1 <= value <= 4
+    if field_number == 4:  # The vocabulary size must be positive.
+        return 0 < value < (1 << 31)
+    if field_number == 40:  # The unknown piece cannot be disabled.
+        return value < (1 << 31)
+    if field_number in _SENTENCEPIECE_TRAINER_SPEC_BOOL_FIELDS:
+        return value in {0, 1}
+    if field_number in _SENTENCEPIECE_TRAINER_SPEC_INT32_FIELDS:
+        return -(1 << 31) <= _decode_proto_int32_varint(value) < (1 << 31)
+    return True  # Remaining known varints are uint64.
+
+
 def _decode_bounded_proto_string(data: bytes, start: int, end: int, *, max_bytes: int) -> str | None:
     if end < start or end - start > max_bytes:
         return None
@@ -3403,13 +3395,11 @@ def _parse_sentencepiece_trainer_spec_proto(
             if value_result is None:
                 return None
             value, offset = value_result
+            if inspect_values and not _is_valid_sentencepiece_trainer_varint(field_number, value):
+                return None
             if field_number == 3:
-                if inspect_values and not 1 <= value <= 4:
-                    return None
                 signals.model_type = value if 1 <= value <= 4 else None
             elif field_number == 4:
-                if inspect_values and not 0 < value < (1 << 31):
-                    return None
                 signals.vocab_size = value or None
             elif field_number == 35:
                 if value not in {0, 1}:
@@ -3937,6 +3927,12 @@ def _classify_sentencepiece_model_proto_stream(
             return reject_candidate()
 
         fields_seen += 1
+
+    if inspect_values and trainer_spec is not None:
+        if trainer_spec.unk_id_explicit and trainer_spec.unk_id != unknown_piece_index:
+            return reject_candidate()
+        if trainer_spec.unk_piece_explicit and trainer_spec.unk_piece != unknown_piece_text:
+            return reject_candidate()
 
     if (
         stream.tell() == file_size
