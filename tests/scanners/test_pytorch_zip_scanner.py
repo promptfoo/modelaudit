@@ -2231,6 +2231,20 @@ def test_pytorch_zip_reports_ambiguous_storage_after_reading_the_entire_member(t
     assert entry["invalid_length_header_end"] == len(prefix)
 
 
+def test_pytorch_zip_discovery_distinguishes_an_overlapping_extension_in_tensor_bytes(tmp_path: Path) -> None:
+    header = b"T" + (0x7FFFFFFF).to_bytes(4, "little")
+    # At K the following byte is an integer operand. One byte later it starts an EXT1 lookup.
+    prefix = header.ljust(96, b"!")
+    ambiguous = (prefix + b"K\x82t").ljust(3072, b"!")
+    result = _scan_referenced_float_storage(tmp_path / "ambiguous.pt", ambiguous)
+    _assert_incomplete_storage_discovery(result)
+    check = next(check for check in result.checks if check.name == "Pickle Discovery")
+    assert check.details["entries"][0]["reason"] == "ambiguous_nested_pickle"
+
+    near_match = (prefix + b"K!t").ljust(3072, b"!")
+    _assert_storage_probe_skipped_cleanly(_scan_referenced_float_storage(tmp_path / "near-match.pt", near_match))
+
+
 def test_pytorch_zip_discovery_skips_same_sized_benign_unread_tail_after_impossible_prefix(
     tmp_path: Path,
 ) -> None:
