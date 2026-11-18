@@ -42,7 +42,7 @@ Each generated version section records the reviewed `main` commit and the number
 
 ### Reviewing the rolling release PR
 
-Inspect the versioned section in each changed changelog. CI checks that it follows **Unreleased**, includes the pending categories and numbered issue links, and points to the component’s tag comparison under **All changes**. Later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
+Review the **Release notes preview** comment on the release PR. It shows the exact versioned section for each changed component, including the approved wording and the folded commit inventory. Check any listed source changes missing from the notes before merging. For unusually long releases the preview links to the changelogs at the reviewed commit. CI checks that it follows **Unreleased**, includes the pending categories and numbered issue links, and points to the component’s tag comparison under **All changes**. Later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
 
 ```markdown
 <!-- release-note: changes/1924.upgrade.md -->
@@ -57,7 +57,7 @@ gh api repos/promptfoo/modelaudit/dispatches -f event_type=release-metadata-retr
   -f 'client_payload[pr_branch]=release-please--branches--main'
 ```
 
-The publisher uses the approved versioned section from the matching tag for the public GitHub Release. The comparison link and generated pull request inventory are available under **All changes**. A manual retry of an existing historical release retains its release page.
+The publisher uses the approved versioned section from the matching tag for the public GitHub Release. Upgrade, security and other reviewed notes are visible directly. When a release has no fragments, up to three entries from the generated inventory are shown. The comparison link and complete inventory are available under **All changes**. During release preparation CI checks cited commits against Git history, issue and PR numbers against GitHub, and reader-facing links without credentials. The new tag in the comparison is checked against the proposed release manifest and becomes available after merge. A manual retry of an existing historical release retains its release page.
 
 ## Version scheme (0ver)
 
@@ -149,7 +149,7 @@ Before merging a Release PR:
    - project URL metadata checks (`Bug Tracker`, `Changelog`)
    - standalone Rust gates: `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo test`, wheel build, clean-room wheel smoke test
 4. No unreviewed high-severity security findings outstanding.
-5. After merging, verify GitHub Release exists and PyPI publish completed for each bumped component:
+5. After merging, check the per-package comment on the release PR. It links to the exact PyPI version and workflow attempt, and shows the build, upload, install, and provenance job results. A provenance-only recovery posts a separate result. To check the registries directly:
 
    ```bash
    # modelaudit

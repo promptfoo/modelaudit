@@ -216,6 +216,12 @@ def candidate_inventory(
     return heading, inventory
 
 
+def inventory_preview(inventory: str) -> str:
+    # Releases without fragments still need a visible description. Keep the full inventory folded.
+    bullets = [line for line in inventory.splitlines() if line.startswith(("- ", "* "))]
+    return "### Changes\n\n" + "\n".join(bullets[:3]) if bullets else ""
+
+
 def entry_count_marker(summary: str) -> str:
     # Towncrier groups identical reviewed prose and indents all continuation lines.
     entries = sum(line.startswith("- ") for line in summary.splitlines())
@@ -225,7 +231,7 @@ def entry_count_marker(summary: str) -> str:
 def check_candidate(
     changelog: Path, sections: dict[str, str], prefix: str, before: str, after: str, paths: list[Path], summary: str
 ) -> None:
-    candidate_inventory(sections, changelog, prefix, before, after)
+    _, inventory = candidate_inventory(sections, changelog, prefix, before, after)
     # Review comments can replace the prose. The categories and numbered references
     # still come from the fragment filenames and belong above the generated inventory.
     reviewed, _, _ = sections[after].partition(INVENTORY)
@@ -238,7 +244,9 @@ def check_candidate(
         if issue.isdecimal() and f"[#{issue}]({REPOSITORY_URL}/issues/{issue})" not in reviewed:
             raise ValueError(f"{changelog}: missing reviewed reference for {path}")
     markers = [line for line in reviewed.splitlines() if line.startswith("<!-- release-note-entries")]
-    if markers != [entry_count_marker(reviewed)]:
+    if not paths and inventory_preview(inventory) not in reviewed:
+        raise ValueError(f"{changelog}: missing the generated change preview")
+    if markers != [entry_count_marker(reviewed if paths else "")]:
         raise ValueError(f"{changelog}: reviewed entry count differs or is missing; refresh the release PR metadata")
 
 
@@ -271,7 +279,15 @@ def render(base: str, reviews: dict[str, str]) -> None:
         summary = towncrier_summary(paths, after, reviews)
         markers = f"{SOURCE_MARKER} {base} -->\n\n{entry_count_marker(summary)}"
         next_section = "\n\n".join(
-            filter(None, [heading, markers, summary, f"{INVENTORY}\n\n{inventory}\n\n</details>"])
+            filter(
+                None,
+                [
+                    heading,
+                    markers,
+                    summary or inventory_preview(inventory),
+                    f"{INVENTORY}\n\n{inventory}\n\n</details>",
+                ],
+            )
         )
         start = original.index(sections["Unreleased"])
         position = start + len(sections["Unreleased"])
@@ -313,12 +329,49 @@ def check(base: str) -> None:
         check_candidate(changelog, sections, prefix, before, after, reviewed_paths, summary)
 
 
+def release_section(package: str, version: str, ref: str | None = None) -> str:
+    path = Path(PACKAGES[package][0]) / "CHANGELOG.md"
+    text = git("show", f"{ref}:{path.as_posix()}") if ref else path.read_text(encoding="utf-8")
+    return versioned_sections(text, only=version)[version]
+
+
+def preview(base: str, ref: str | None, max_bytes: int | None) -> str:
+    if ref:
+        ref = git("rev-parse", "--verify", f"{ref}^{{commit}}").strip()
+    before = base_versions(base)
+    current = base_versions(ref) if ref else json.loads(Path(".release-please-manifest.json").read_text())
+    sections, summaries, links = [], [], []
+    for package, (path, _) in PACKAGES.items():
+        version = current[path]
+        if before[path] == version:
+            continue
+        section = release_section(package, version, ref).rstrip()
+        sections.append(f"**{package}**\n\n{section}")
+        if max_bytes is not None:
+            if not ref:
+                raise ValueError("A size-limited preview requires a Git ref for its full changelog links")
+            file = (Path(path) / "CHANGELOG.md").as_posix()
+            link = f"[{package} {version} changelog]({REPOSITORY_URL}/blob/{ref}/{file})"
+            links.append(link)
+            reviewed = section.partition(INVENTORY)[0].rstrip()
+            summaries.append(f"**{package}**\n\n{reviewed}\n\n{link}")
+    for parts in (sections, summaries):
+        text = "\n\n".join(parts)
+        if max_bytes is None or len(text.encode("utf-8")) + 1 <= max_bytes:
+            return text
+    return "\n\n".join(links)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="op", required=True)
     base_help = "use the package release boundaries from this Git ref's manifest"
     validate = sub.add_parser("check", help="validate changelogs and package-local fragments")
     validate.add_argument("--base", help=base_help)
+    cmd = sub.add_parser("preview", help="print the reviewed sections for every bumped component")
+    cmd.add_argument("--base", required=True, help=base_help)
+    cmd.add_argument("--ref", help="read the candidate from this commit instead of the working tree")
+    cmd.add_argument("--max-bytes", type=int, help="omit the inventory, then link to the approved files if needed")
     cmd = sub.add_parser("render", help="assemble the bumped components on a Release Please candidate")
     cmd.add_argument("--base", required=True)
     cmd.add_argument("--reviews", type=Path)
@@ -336,6 +389,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.op == "render":
         render(args.base, review_overrides(args.reviews))
+    elif args.op == "preview":
+        print(preview(args.base, args.ref, args.max_bytes))
     elif args.op == "check":
         check(args.base or default_base())
     else:
@@ -346,9 +401,7 @@ def main() -> None:
             paths = pending_fragments(folder, shipped_fragments(folder, prefix, version))
             print(towncrier_summary(paths, version, {}) or "No pending release notes.")
         else:
-            file = Path(path) / "CHANGELOG.md"
-            text = git("show", f"{args.ref}:{file.as_posix()}") if args.ref else file.read_text(encoding="utf-8")
-            print(versioned_sections(text, only=args.version)[args.version], end="")
+            print(release_section(args.package, args.version, args.ref), end="")
 
 
 if __name__ == "__main__":

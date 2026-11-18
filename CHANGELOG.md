@@ -8,11 +8,19 @@ Features and fixes increment the patch version. Breaking changes increment the m
 
 [Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.57...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
 
-## [0.2.57](https://github.com/promptfoo/modelaudit/compare/v0.2.56...v0.2.57) (2026-11-17)
+## [0.2.57](https://github.com/promptfoo/modelaudit/compare/v0.2.56...v0.2.57) (2026-11-18)
 
 <!-- release-note-source: 754c59bb7c0b7de016efa2f0539c87980510db9c -->
 
 <!-- release-note-entries: 11 -->
+
+### Upgrade notes
+
+If you already have ModelAudit installed, upgrade `modelaudit` and `modelaudit-picklescan` together to get both PyTorch fixes, including fewer false frame warnings and more accurate TorchScript findings.
+
+```sh
+python -m pip install --upgrade modelaudit==0.2.57 modelaudit-picklescan==0.1.15
+```
 
 ### Security
 
@@ -28,8 +36,8 @@ Features and fixes increment the patch version. Breaking changes increment the m
 - Skops archives report pickle, joblib, and scikit-learn references in plain README documentation as informational. The CVE-2025-54886 finding for loader evidence recommends the upstream fix in skops 0.13.0. [#2028](https://github.com/promptfoo/modelaudit/issues/2028)
 - Network references, example code, and public cryptocurrency receiving addresses in text READMEs are informational by default. Exposed credentials still produce alerts, and reports retain the underlying evidence. [#2030](https://github.com/promptfoo/modelaudit/issues/2030)
 - ModelAudit reports a UUIDv4 used as a Bearer credential in a literal Authorization or Proxy-Authorization header, including headers quoted in README examples and configuration files. [#2032](https://github.com/promptfoo/modelaudit/issues/2032)
-- ModelAudit distinguishes native TorchScript module and tensor reconstruction from Python imports after verifying the archive’s declaration and tensor state. A storage constructor’s installed call graph is reported as conditional in this context. Standalone pickles and unverified archives retain their security findings. If you upgrade an existing environment to `modelaudit==0.2.57`, install `modelaudit-picklescan==0.1.15` alongside it to receive this change.
-- PyTorch scans avoid a false oversized pickle frame warning when tensor bytes resemble an encoded pickle with an invalid persistent ID. When upgrading an existing environment to `modelaudit==0.2.57`, install `modelaudit-picklescan==0.1.15` alongside it to receive this fix.
+- ModelAudit distinguishes native TorchScript module and tensor reconstruction from Python imports after verifying the archive’s declaration and tensor state. A storage constructor’s installed call graph is reported as conditional in this context. Standalone pickles and unverified archives retain their security findings.
+- PyTorch scans avoid a false oversized pickle frame warning when tensor bytes resemble an encoded pickle with an invalid persistent ID.
 - Report when a manifest matches the Hugging Face download metadata format and the record cannot verify its associated artifact.
 
 </details>
@@ -55,6 +63,10 @@ Features and fixes increment the patch version. Breaking changes increment the m
 - **secrets:** recognize UUIDv4 credentials in explicit Bearer headers ([#2032](https://github.com/promptfoo/modelaudit/issues/2032)) ([a8f900f](https://github.com/promptfoo/modelaudit/commit/a8f900fd42c14adf37c1f6c377ed215503eb4945))
 - **skops:** report README loader references as informational ([#2028](https://github.com/promptfoo/modelaudit/issues/2028)) ([9374fc7](https://github.com/promptfoo/modelaudit/commit/9374fc78bccd8fa6d15ec212f09566c738168c73))
 - **text:** report README examples and public addresses as informational ([#2030](https://github.com/promptfoo/modelaudit/issues/2030)) ([3fc0883](https://github.com/promptfoo/modelaudit/commit/3fc0883046ddaf30d987f6e8988b632839eac62a))
+
+### Dependency updates
+
+- The repository lockfile updates `opentelemetry-api` from 1.45.1 to 1.45.2, which fixes a denial of service in trace context parsing. [#2038](https://github.com/promptfoo/modelaudit/pull/2038) · [Security advisory](https://github.com/advisories/GHSA-mf5v-w3w3-f6cg)
 
 ### Reverts
 
