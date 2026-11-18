@@ -33,6 +33,8 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.models import ModelAuditResultModel
+from modelaudit.scanners import _registry
+from modelaudit.scanners.archive_dispatch import scan_nested_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tar_scanner import TarScanner
 from modelaudit.scanners.xgboost_scanner import XGBOOST_JSON_ROUTING_CHUNK_BYTES, XGBoostScanner
@@ -469,7 +471,7 @@ def _assert_sentencepiece_scans_cleanly(tmp_path: Path, payload: bytes) -> None:
     direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
     assert direct.success is True
-    assert direct.scanner_name == "unknown"
+    assert direct.scanner_name == "sentencepiece"
     _assert_no_xgboost_s1004(aggregate)
     _assert_no_xgboost_s1004(streaming)
     assert cli_result.exit_code == 0
@@ -555,7 +557,9 @@ def test_sentencepiece_extended_vocabulary_with_bracketed_controls(tmp_path: Pat
     data = b"".join(_sentencepiece_piece(piece, kind) for piece, kind in pieces)
     path.write_bytes(data + trainer)
     assert file_detection.is_sentencepiece_model_proto_file(path)
-    assert scan_model_directory_or_file(str(path), cache_enabled=False).success
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert result.success and "sentencepiece" in result.scanner_names
+    assert any(check.name == "SentencePiece Vocabulary Validation" for check in result.checks)
 
     wrong_type = data.replace(_sentencepiece_piece("[CLS]", 3), _sentencepiece_piece("[CLS]", 1))
     path.write_bytes(wrong_type + trainer)
@@ -2028,6 +2032,76 @@ class TestXGBoostFailClosedEndToEnd:
         _assert_inconclusive_metadata(result, binary_file, "xgboost_read_failed")
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
+    @pytest.mark.parametrize(
+        "invalid_piece",
+        [
+            _sentencepiece_piece("tail", 1).replace(b"tail", b"bad\xff"),
+            _sentencepiece_piece("the", 1),
+            _proto_field(1, 2, b"\x0e\x0a\x01\xff\x0a\x02ok\x15" + bytes(4) + b"\x18\x01"),
+            _sentencepiece_piece("tail", 1).replace(struct.pack("<f", 0.0), struct.pack("<f", float("nan"))),
+        ],
+        ids=["invalid-utf8", "duplicate-piece", "shadowed-invalid-utf8", "nonfinite-score"],
+    )
+    def test_sentencepiece_validates_late_piece_values(self, tmp_path: Path, invalid_piece: bytes) -> None:
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(_sentencepiece_model_proto() + invalid_piece)
+
+        assert file_detection.is_sentencepiece_model_proto_file(tokenizer)
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert not result.success
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            _proto_field(3, 2, b"\x06\x12\x04" + bytes.fromhex("ffffffff")),
+            _proto_field(4, 2, b"\x03\x0a\x01\xff"),
+            _proto_field(5, 2, b"\x03\x3a\x01x"),
+            _sentencepiece_trainer_spec_field(_unknown_sentencepiece_field(b"hidden payload")),
+        ],
+        ids=["malformed-compiled-map", "malformed-self-test", "unknown-denormalizer", "unknown-trainer-extension"],
+    )
+    def test_sentencepiece_incomplete_metadata_is_visible(self, tmp_path: Path, metadata: bytes) -> None:
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(_sentencepiece_model_proto() + metadata)
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert "sentencepiece" in result.scanner_names
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
+        assert any(
+            check.name == "SentencePiece Vocabulary Validation" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize("leaf_offset", [0, 1], ids=["valid-map", "out-of-bounds-leaf"])
+    def test_sentencepiece_checks_compiled_normalizer_offsets(self, tmp_path: Path, leaf_offset: int) -> None:
+        # A 256-unit Darts block containing a root and a leaf. Its replacement
+        # table has just one (empty) NUL-terminated string.
+        trie = struct.pack("<256I", 1 << 10, 0x80000000 | leaf_offset, *([0] * 254))
+        charsmap = struct.pack("<I", len(trie)) + trie + b"\0"
+        normalizer = _proto_field(2, 2, _proto_varint(len(charsmap)) + charsmap)
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(
+            _sentencepiece_model_proto() + _proto_field(3, 2, _proto_varint(len(normalizer)) + normalizer)
+        )
+
+        result = scan_file(str(tokenizer), config={"cache_enabled": False})
+        assert result.scanner_name == "sentencepiece"
+        assert result.success is (leaf_offset == 0)
+
+    def test_malformed_model_fails_closed_without_xgboost(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(_sentencepiece_model_proto_with_duplicate_unknown_pieces())
+        monkeypatch.delitem(_registry._scanners, "xgboost")
+
+        for entrypoint in (scan_file, scan_nested_file):
+            result = entrypoint(str(tokenizer), config={"cache_enabled": False})
+            assert not result.success
+            assert "sentencepiece_model_proto_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+
     def test_sentencepiece_with_many_user_defined_symbols(self, tmp_path: Path) -> None:
         tokenizer = tmp_path / "tokenizer.model"
         symbols = b"".join(_proto_field(31, 2, b"\x04" + f"{i:04x}".encode("ascii")) for i in range(1200))
@@ -2037,7 +2111,7 @@ class TestXGBoostFailClosedEndToEnd:
         assert file_detection.is_sentencepiece_model_proto_file(tokenizer)
         direct = scan_file(str(tokenizer), config={"cache_enabled": False})
         assert direct.success
-        assert direct.scanner_name == "unknown"
+        assert direct.scanner_name == "sentencepiece"
 
         tokenizer.write_bytes(payload + _unknown_sentencepiece_field(_small_zip_payload()))
         assert not file_detection.is_sentencepiece_model_proto_file(tokenizer)
@@ -2072,7 +2146,7 @@ class TestXGBoostFailClosedEndToEnd:
         aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
 
         assert direct.success is True
-        assert direct.scanner_name == "unknown"
+        assert direct.scanner_name == "sentencepiece"
         assert "xgboost" not in aggregate.scanner_names
         assert determine_exit_code(aggregate) == 0
         assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
@@ -2121,14 +2195,14 @@ class TestXGBoostFailClosedEndToEnd:
         direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
         aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
 
-        assert detect_file_format(str(tokenizer_model)) == "unknown"
-        assert detect_file_format_from_magic(str(tokenizer_model)) == "unknown"
-        assert detect_file_format_for_skip_filter(str(tokenizer_model)) == "unknown"
+        assert detect_file_format(str(tokenizer_model)) == "sentencepiece"
+        assert detect_file_format_from_magic(str(tokenizer_model)) == "sentencepiece"
+        assert detect_file_format_for_skip_filter(str(tokenizer_model)) == "sentencepiece"
         assert direct.success is True
-        assert direct.scanner_name == "unknown"
+        assert direct.scanner_name == "sentencepiece"
         _assert_no_xgboost_s1004(aggregate)
 
-    def test_sentencepiece_tokenizer_proto_core_is_clean_unknown(self, tmp_path: Path) -> None:
+    def test_sentencepiece_tokenizer_proto_uses_vocabulary_scanner(self, tmp_path: Path) -> None:
         tokenizer_proto = tmp_path / "tokenizer.proto"
         payload = _sentencepiece_model_proto()
         tokenizer_proto.write_bytes(payload)
@@ -2144,13 +2218,13 @@ class TestXGBoostFailClosedEndToEnd:
                 len(payload),
                 tokenizer_proto,
             )
-            == "unknown"
+            == "sentencepiece"
         )
-        assert detect_file_format(str(tokenizer_proto)) == "unknown"
-        assert detect_file_format_from_magic(str(tokenizer_proto)) == "unknown"
-        assert detect_file_format_for_skip_filter(str(tokenizer_proto)) == "unknown"
+        assert detect_file_format(str(tokenizer_proto)) == "sentencepiece"
+        assert detect_file_format_from_magic(str(tokenizer_proto)) == "sentencepiece"
+        assert detect_file_format_for_skip_filter(str(tokenizer_proto)) == "sentencepiece"
         assert direct.success is True
-        assert direct.scanner_name == "unknown"
+        assert direct.scanner_name == "sentencepiece"
         _assert_no_xgboost_s1004(aggregate)
 
     @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
@@ -2274,7 +2348,7 @@ class TestXGBoostFailClosedEndToEnd:
         valid_result = scan_file(str(tokenizer_model), config={"cache_enabled": False})
 
         assert valid_result.success is True
-        assert valid_result.scanner_name == "unknown"
+        assert valid_result.scanner_name == "sentencepiece"
 
         replacement = b"custom xgboost binary gbtree reg:squarederror"
         tokenizer_model.write_bytes(replacement.ljust(len(valid_tokenizer), b"\0"))
@@ -2340,11 +2414,11 @@ class TestXGBoostFailClosedEndToEnd:
         direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert tokenizer_model.stat().st_size > file_detection._SENTENCEPIECE_MODEL_PROTO_READ_BYTES
-        assert detect_file_format(str(tokenizer_model)) == "unknown"
-        assert detect_file_format_from_magic(str(tokenizer_model)) == "unknown"
-        assert detect_file_format_for_skip_filter(str(tokenizer_model)) == "unknown"
+        assert detect_file_format(str(tokenizer_model)) == "sentencepiece"
+        assert detect_file_format_from_magic(str(tokenizer_model)) == "sentencepiece"
+        assert detect_file_format_for_skip_filter(str(tokenizer_model)) == "sentencepiece"
         assert direct.success is True
-        assert direct.scanner_name == "unknown"
+        assert direct.scanner_name == "sentencepiece"
         _assert_no_xgboost_s1004(aggregate)
         _assert_no_xgboost_s1004(streaming)
         assert cli_result.exit_code == 0
@@ -2399,7 +2473,7 @@ class TestXGBoostFailClosedEndToEnd:
         direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
 
         assert direct.success is True
-        assert direct.scanner_name == "unknown"
+        assert direct.scanner_name == "sentencepiece"
         assert calls == 1
 
     @pytest.mark.parametrize("fixture_name", _SENTENCEPIECE_OFFICIAL_FIXTURES)
@@ -2411,7 +2485,7 @@ class TestXGBoostFailClosedEndToEnd:
         direct, aggregate, streaming, cli_result, cli_payload = _scan_tokenizer_directory(tokenizer_model, tmp_path)
 
         assert direct.success is True
-        assert direct.scanner_name == "unknown"
+        assert direct.scanner_name == "sentencepiece"
         _assert_no_xgboost_s1004(aggregate)
         _assert_no_xgboost_s1004(streaming)
         assert cli_result.exit_code == 0

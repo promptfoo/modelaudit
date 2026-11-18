@@ -1415,6 +1415,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         if (
             routed_content_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
             or trusted_content_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+            or malformed_sentencepiece_model_candidate
         ):
             return with_safetensors_overlap(_make_incomplete_sentencepiece_model_proto_result(path))
         if routed_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:

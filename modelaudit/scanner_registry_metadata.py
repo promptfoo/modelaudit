@@ -162,6 +162,13 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = _with_scanner_defaults(
             "dependencies": ["onnx"],
             "numpy_sensitive": True,
         },
+        "sentencepiece": {
+            "class": "SentencePieceScanner",
+            "description": "Validates SentencePiece tokenizer structure and vocabulary",
+            "extensions": [],
+            "content_routed_extensions": [".model", ".proto", ""],
+            "priority": 6,
+        },
         "protobuf_model_candidate": {
             "class": "ProtobufModelCandidateScanner",
             "description": "Tentatively analyzes bounded protobuf model candidates",

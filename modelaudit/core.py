@@ -143,7 +143,6 @@ from modelaudit.utils.file.detection import (
     is_confirmed_jax_json_checkpoint_file,
     is_huggingface_tokenizer_json_file,
     is_jax_json_checkpoint_file,
-    is_sentencepiece_model_proto_file,
     onnx_weight_routing_proof,
     should_defer_safetensors_header_limit_hash,
     should_prove_large_onnx_weights,
@@ -6591,13 +6590,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
-    sentencepiece_model_proto_owned = (
-        format_probe_error is None
-        and ext == ".model"
-        and header_format == "unknown"
-        and magic_format == "unknown"
-        and is_sentencepiece_model_proto_file(path)
-    )
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
@@ -6948,7 +6940,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 and scanner_selection.allows(fallback_scanner_id)
             ):
                 scanner_class = _registry.load_scanner_by_id(fallback_scanner_id)
-        elif scanner_class is None and not sentencepiece_model_proto_owned:
+        elif scanner_class is None:
             scanner_class = _registry.get_scanner_for_path(
                 path,
                 scanner_selection=scanner_selection if scanner_selection.active else None,
@@ -7033,11 +7025,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     kind=SCANNER_SELECTION_PREFERRED_KIND,
                 )
         else:
-            if (
-                unavailable_preferred_scanner_id is None
-                and scanner_selection.active
-                and not sentencepiece_model_proto_owned
-            ):
+            if unavailable_preferred_scanner_id is None and scanner_selection.active:
                 candidate_scanner_id = skipped_preferred_scanner_id
                 if candidate_scanner_id is None:
                     candidate_scanner_class = _registry.get_scanner_for_path(path)
@@ -7089,6 +7077,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_unavailable_recognized_format_result(path, header_format, scanner_id)
             elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_nemo_routing_result(path)
+            elif ext == ".model" and _is_malformed_sentencepiece_model_proto_candidate_file(path):
+                sr = _make_incomplete_sentencepiece_model_proto_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
