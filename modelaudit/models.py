@@ -893,6 +893,7 @@ def create_audit_result_model(aggregated_results: dict[str, Any]) -> ModelAuditR
         files_scanned=aggregated_results.get("files_scanned", 0),
         assets=assets,
         has_errors=aggregated_results.get("has_errors", False),
+        success=aggregated_results.get("success", True),
         scanner_names=aggregated_results.get("scanner_names", []),
         scanner_selection=aggregated_results.get("scanner_selection"),
         file_metadata=file_metadata,
