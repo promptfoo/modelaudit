@@ -1,1 +1,1 @@
-Recognize extended SentencePiece vocabularies with BERT control tokens, complete endpoint analysis on larger model cards, and count failed coverage checks in scan totals. PyTorch reports distinguish ambiguous contents in fully read storage from probe limits, and missing framework sources have remediation guidance.
+Recognize extended SentencePiece vocabularies with BERT control tokens, complete endpoint analysis on larger model cards, count failed coverage checks in scan totals, and provide remediation guidance for missing framework source.
