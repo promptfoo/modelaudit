@@ -294,7 +294,7 @@ jobs:
                 case "$permission" in admin|maintain|write) printf '%s\n' "$comments" ;; esac
               done | jq -s 'add // []' > "$RUNNER_TEMP/reviewed-notes.json"
           unset GH_TOKEN
-          python3 -I scripts/release_notes.py render --base HEAD --reviews "$RUNNER_TEMP/reviewed-notes.json"
+          python3 -I scripts/release_notes.py render --base HEAD --reviews "$RUNNER_TEMP/reviewed-notes.json" --link-check-config release-link-check.json
 
       - name: Format changelogs with Prettier
         run: npx prettier --write CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
@@ -303,18 +303,14 @@ jobs:
         run: |
           mkdir -p .release-preview
           python3 -I scripts/release_notes.py preview --base HEAD > .release-preview/notes.md
+          node scripts/check-release-links.mjs .release-preview/notes.md
           cat .release-preview/notes.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify release citations against Git and GitHub
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/check-release-links.mjs .release-preview/notes.md
 
       - name: Check links in the new release notes
         uses: gaurav-nelson/github-action-markdown-link-check@5c5dfc0ac2e225883c0e5f03a85311ec2830d368 # v1
         with:
           folder-path: ".release-preview"
-          config-file: ".github/release-note-links.json"
+          config-file: "release-link-check.json"
           use-quiet-mode: "yes"
 
       - name: Upload release metadata
@@ -435,24 +431,12 @@ jobs:
           }
           check_head
           # The generator comes from protected main. Read the approved candidate as Git data.
-          base=$(git merge-base HEAD "$REVIEWED_HEAD")
           notes="$RUNNER_TEMP/release-preview.md"
-          coverage="$RUNNER_TEMP/release-coverage.md"
-          python3 scripts/release_coverage.py HEAD "$REVIEWED_HEAD" > "$coverage"
           marker='<!-- modelaudit-release-notes-preview -->'
           printf '%s\n\n# Release notes preview\n\n' "$marker" > "$notes"
-          budget=$((65000 - $(wc -c < "$notes") - $(wc -c < "$coverage")))
-          python3 -I scripts/release_notes.py preview --base "$base" --ref "$REVIEWED_HEAD" --max-bytes "$budget" >> "$notes"
-          cat "$coverage" >> "$notes"
+          python3 -I scripts/release_notes.py preview --base HEAD --ref "$REVIEWED_HEAD" --max-bytes 64000 >> "$notes"
           check_head
-          endpoint="repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
-          previous=$(gh api --paginate "$endpoint?per_page=100" | jq -sr --arg marker "$marker" '
-            [.[][] | select(.user.login == "github-actions[bot]" and (.body | startswith($marker)))][0].id // empty')
-          if [[ -n "$previous" ]]; then
-            gh api --silent -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$previous" -F "body=@$notes"
-          else
-            gh api --silent -X POST "$endpoint" -F "body=@$notes"
-          fi
+          python3 -I scripts/release_publication.py preview-comment "$PR_NUMBER" "$notes"
 
   build:
     if: needs.release-please.outputs.release_created == 'true'
@@ -1844,18 +1828,28 @@ jobs:
             --repo "${{ github.repository }}" \
             --clobber
 
-  publication-started:
-    needs: release-please
-    if: &has-publication >-
+  publication-finished:
+    needs:
+      - release-please
+      - build
+      - publish-pypi
+      - verify-pypi
+      - provenance
+      - build-picklescan-package
+      - publish-picklescan-pypi
+      - verify-picklescan-pypi
+      - picklescan-provenance
+      - root-provenance-recovery
+    if: >-
       always() && (needs.release-please.outputs.release_created == 'true' ||
       needs.release-please.outputs.picklescan_release_created == 'true' ||
       needs.release-please.outputs.root_provenance_recovery == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: &report-publication-permissions
+    permissions:
       contents: read
       pull-requests: write
-    steps: &report-publication-steps
+    steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.workflow_sha }}
@@ -1866,22 +1860,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_JOBS: ${{ toJSON(needs) }}
         run: python3 -I scripts/release_publication.py
-
-  publication-finished:
-    if: *has-publication
-    needs:
-      - release-please
-      - publication-started
-      - build
-      - publish-pypi
-      - verify-pypi
-      - provenance
-      - build-picklescan-package
-      - publish-picklescan-pypi
-      - verify-picklescan-pypi
-      - picklescan-provenance
-      - root-provenance-recovery
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions: *report-publication-permissions
-    steps: *report-publication-steps

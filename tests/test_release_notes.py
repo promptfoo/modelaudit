@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -500,6 +501,8 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     helper = Path(".github/scripts/prepare-release-metadata.py")
     (root / helper.parent).mkdir(parents=True)
     shutil.copyfile(SCRIPT.parents[1] / helper, root / helper)
+    link_config = Path(".github/markdown-link-check-config.json")
+    shutil.copyfile(SCRIPT.parents[1] / link_config, root / link_config)
     # A component can already be versioned on main before the release manifest catches up.
     write_project_versions(root, "0.2.1", "0.1.2", ">=0.1.1,<0.2.0")
     (root / "package-lock.json").write_text("protected dependency lock")
@@ -753,6 +756,54 @@ def test_reviewed_entry_count_preserves_grouping_and_catches_dropped_notes(repos
     run(repository, "check", "--base", base)
 
 
+def test_preview_checks_each_tag_and_the_latest_target_commit(repository: Path) -> None:
+    root = repository
+    target = git(root, "branch", "--show-current")
+
+    def change(subject: str, *paths: str) -> str:
+        for path in paths:
+            fragment(root, path, subject)
+        return commit(root, subject)
+
+    shipped = change("fix: previously shipped sibling fix (#10)", f"{SIBLING}/engine")
+    git(root, "tag", "-f", "modelaudit-picklescan-v0.1.1")
+    cross_package = change("fix: shared correction (#17)", "root-code", f"{SIBLING}/code")
+    reverted = change("feat: discontinued (#18)", "draft")
+    git(root, "revert", "--no-edit", reverted)
+    restored = change("feat: restored (#19)", "restored")
+    git(root, "revert", "--no-edit", restored)
+    git(root, "revert", "--no-edit", "HEAD")
+    wrong_repo = change("fix: wrongly linked PR (#23)", "another-file")
+    git(root, "switch", "-qc", "release")
+    write_manifest(root, "0.2.2", "0.1.2")
+    raw_section(root, ".", "0.2.1", "0.2.2", "v")
+    raw_section(root, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    p = root / "CHANGELOG.md"
+    p.write_text(
+        p.read_text().replace(
+            "- merged change",
+            f'- Fix #17. [#23](https://github.com/other/repo/pull/23 "reports #23")\n<!-- {wrong_repo} -->',
+        )
+    )
+    candidate = commit(root, "chore: release")
+    git(root, "switch", "-q", target)
+    security = change("chore(deps): update [security] (#21)", "uv.lock")
+    preview = run(root, "preview", "--base", target, "--ref", candidate).stdout
+    root_gaps, sibling_gaps = preview.split("## Release note coverage")[1].split("**modelaudit-picklescan")
+    assert all(sha in root_gaps for sha in (restored, wrong_repo, security))
+    assert cross_package not in root_gaps and cross_package in sibling_gaps
+    assert reverted not in preview and shipped not in sibling_gaps
+    assert f"/compare/modelaudit-picklescan-v0.1.1...{security}" in sibling_gaps
+
+    # A busy release should list a bounded sample with a link to its complete tag range.
+    for i in range(13):
+        change(f"fix: late commit {i}", "late")
+    preview = run(root, "preview", "--base", target, "--ref", candidate).stdout
+    root_gaps = preview.split("## Release note coverage")[1].split("**modelaudit-picklescan")[0]
+    assert root_gaps.count("/commit/") == 12 and "(16)" in root_gaps
+    assert not run(root, "preview", "--base", target, "--ref", target).stdout.strip()
+
+
 def test_recent_paired_release_ingredients_are_visible_in_the_reviewed_preview(repository: Path) -> None:
     # The 0.2.57/0.1.15 pair had installation guidance and the standalone package's only fix in "other".
     guidance = "When upgrading an existing installation, install both ModelAudit and PickleScan."
@@ -788,32 +839,42 @@ def test_release_pr_header_preserves_a_blank_line_before_the_generated_separator
     assert (config["pull-request-header"] + "\n---").endswith("\n\n---")
 
 
-@pytest.mark.skipif(os.name == "nt" or not shutil.which("node"), reason="the release metadata job runs Node on Ubuntu")
-def test_release_citations_validate_commits_prs_and_the_future_tag(repository: Path, tmp_path: Path) -> None:
-    if not (SCRIPT.parents[1] / "node_modules/prettier").exists():
-        pytest.skip("the release workflow installs the repository Markdown parser with npm ci")
+def test_link_checker_exempts_only_the_exact_upcoming_tag_comparisons(repository: Path) -> None:
     base = git(repository, "rev-parse", "HEAD")
-    write_manifest(repository, "0.2.2", "0.1.1")
-    tool = SCRIPT.with_name("check-release-links.mjs")
-    notes = repository / "preview.md"
-    stub = tmp_path / "gh"
-    stub.write_text(
-        '#!/bin/sh\ncase "$*" in "api --silent repos/promptfoo/modelaudit/pulls/2025"'
-        '|"api --silent repos/promptfoo/modelaudit/compare/v0.2.0...v0.2.1") exit 0;; *) exit 1;; esac\n'
-    )
-    stub.chmod(0o755)
-    env = {**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}
+    write_manifest(repository, "0.2.2", "0.1.2")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    raw_section(repository, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    config = repository / "links.json"
+    run(repository, "render", "--base", base, "--link-check-config", str(config))
+    patterns = [entry["pattern"] for entry in json.loads(config.read_text())["ignorePatterns"]]
     repo = "https://github.com/promptfoo/modelaudit"
-    success = f"[Fix]({repo}/commit/{base}) · [PR]({repo}/pull/2025) · [Changes]({repo}/compare/v0.2.1...v0.2.2)"
+    for target, exempt in (
+        ("compare/v0.2.1...v0.2.2", True),
+        ("compare/modelaudit-picklescan-v0.1.1...modelaudit-picklescan-v0.1.2", True),
+        ("compare/v0.2.0...v0.2.1", False),
+        ("compare/v0-2-1...v0-2-2", False),
+        ("pull/9999", False),
+        ("issues/2025", False),
+        ("commit/deadbeef", False),
+    ):
+        assert any(re.search(pattern, f"{repo}/{target}") for pattern in patterns) == exempt
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="the release metadata job runs Node")
+def test_commit_citations_belong_to_the_release_history(repository: Path) -> None:
+    if not (SCRIPT.parents[1] / "node_modules/prettier").exists():
+        pytest.skip("install the repository Markdown parser with npm ci")
+    sha = git(repository, "rev-parse", "HEAD")
+    unrelated = git(repository, "commit-tree", "HEAD^{tree}", "-m", "unrelated")
+    repo = "https://github.com/promptfoo/modelaudit/commit"
+    notes = repository / "preview.md"
     for body, expected in (
-        (success, True),
-        (success.replace("v0.2.1...v0.2.2", "v0.2.0...v0.2.1"), True),
-        (success.replace("pull/2025", "pull/9999"), False),
-        (success.replace(base, "deadbeef"), False),
-        (success.replace("v0.2.1...", "v0.1.1..."), False),
-        (success.replace("pull/2025", "pull/invalid"), False),
-        (f"`[Illustrative link]({repo}/pull/9999)`", True),
+        (f"[Fix]({repo}/{sha})", True),
+        (f"[Fix]({repo}/{unrelated})", False),
+        (f"`[example]({repo}/{unrelated})`", True),
     ):
         notes.write_text(body)
-        result = subprocess.run(["node", str(tool), str(notes)], cwd=repository, env=env, capture_output=True)
+        result = subprocess.run(
+            ["node", str(SCRIPT.with_name("check-release-links.mjs")), str(notes)], cwd=repository, capture_output=True
+        )
         assert (result.returncode == 0) == expected, result.stderr
