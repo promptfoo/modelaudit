@@ -2538,6 +2538,7 @@ class PyTorchZipScanner(BaseScanner):
                 expanded_probe_bytes,
                 PyTorchZipScanner._proto0_or_1_trusted_storage_probe_should_scan,
                 work_budget_remaining=work_budget_remaining,
+                previous_sample=sample,
             ):
                 return True
             sample = expanded_sample
@@ -2755,10 +2756,15 @@ class PyTorchZipScanner(BaseScanner):
         predicate: Callable[..., bool],
         *,
         work_budget_remaining: list[int] | None = None,
+        previous_sample: bytes | None = None,
     ) -> bool:
         if max_probe_bytes <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
             return False
         short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
+        # The short probe and its replay share a work allowance. Only inspect
+        # a prefix again when the expanded read returned different bytes.
+        if short_sample == previous_sample:
+            return False
         if work_budget_remaining is not None:
             return predicate(
                 short_sample,

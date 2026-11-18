@@ -3142,6 +3142,20 @@ def test_pytorch_zip_discovery_skips_padding_only_expanded_probe(
     _assert_storage_padding_clean(tmp_path, ("referenced_scalar_prefix_padding_only_expanded.pt"), (b"\x00"), (70_002))
 
 
+@pytest.mark.parametrize("hidden_pickle", [False, True])
+def test_pytorch_zip_discovery_spends_literal_budget_on_distinct_windows(tmp_path: Path, hidden_pickle: bool) -> None:
+    storage = (b"N.!" + b"S'p'\n0" * 6 + b"N.").ljust(5000, b"!")
+    if hidden_pickle:
+        storage += _malicious_proto0_system_payload()
+    result = _scan_referenced_float_storage_blob(tmp_path, "expanded-storage.pt", storage)
+
+    if hidden_pickle:
+        assert "archive/data/0" in result.metadata["pickle_files"]
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    else:
+        _assert_storage_probe_skipped_cleanly(result)
+
+
 def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_long_window_before_padding_budget.pt"
     malicious_suffix = _malicious_proto0_system_payload()
