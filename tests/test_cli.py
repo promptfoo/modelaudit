@@ -4882,6 +4882,7 @@ def test_scan_strict_implies_no_whitelist_and_no_cache(mock_scan: MagicMock, tmp
     assert mock_scan.call_args.kwargs["use_hf_whitelist"] is False
     assert mock_scan.call_args.kwargs["cache_enabled"] is False
     assert mock_scan.call_args.kwargs["skip_file_types"] is False
+    assert mock_scan.call_args.kwargs["strict_tensor_storage"] is True
 
 
 @patch("modelaudit.cli.scan_model_directory_or_file")
@@ -6823,6 +6824,7 @@ def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     result = runner.invoke(cli, ["scan", "--stream", "--strict", "--quiet", "hf://test/model"])
 
     assert result.exit_code == 0
+    assert mock_scan_streaming.call_args.kwargs["strict_tensor_storage"] is True
     cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")

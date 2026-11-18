@@ -204,7 +204,7 @@ Common scan options:
 ```text
 --format {text,json,sarif}   Output format (default: auto-detected)
 --output FILE                Write results to file
---strict                     Fail on warnings, scan all file types, strict license validation
+--strict                     Fail on warnings, scan all file types, enforce strict license and tensor storage checks
 --sbom FILE                  Generate CycloneDX SBOM
 --stream                     Process files one-by-one; remote downloads are deleted after scanning
 --assume-shard-family        Treat explicitly listed cross-directory shards as one model family
@@ -220,6 +220,9 @@ Common scan options:
 --exclude-scanner NAME       Exclude a scanner from the active set (comma-separated or repeated)
 --list-scanners              List scanner IDs, class names, extensions, and dependencies
 ```
+
+For validated PyTorch tensor storage, the default scan reports isolated pickle-like bytes as informational
+when it can inspect the entire member. Use `--strict` to count these ambiguous members as incomplete.
 
 Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
 should use the emitted keys; previously masked source keys are no longer lookup aliases.

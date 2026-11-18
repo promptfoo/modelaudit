@@ -1,1 +1,1 @@
-Complete PyTorch scans when bounded hidden-pickle heuristics are inconclusive on validated raw tensor storage, while reporting the heuristic limitations and confirmed embedded pickle findings.
+Complete default PyTorch scans when full inspection of validated tensor storage finds only isolated pickle-like bytes. Report the affected members, retain incomplete coverage for unread data or corroborating evidence, and preserve the conservative verdict with `--strict`.

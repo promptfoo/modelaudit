@@ -2477,6 +2477,7 @@ def _build_user_scan_overrides(
         user_overrides["skip_non_model_files"] = False
         user_overrides["selective_download"] = False
         user_overrides["strict_license"] = True
+        user_overrides["strict_tensor_storage"] = True
         user_overrides["use_cache"] = False
         user_overrides["use_hf_whitelist"] = False
     if verbose:
@@ -2629,11 +2630,14 @@ def _resolve_scan_runtime_config(
     )
 
 
-def _scanner_selection_overrides(runtime: _ScanRuntimeConfig) -> dict[str, Any]:
-    """Return config kwargs needed to preserve scanner selection across scan paths."""
-    if runtime.scanner_selection is None:
-        return {}
-    return {SCANNER_SELECTION_CONFIG_KEY: runtime.scanner_selection}
+def _scanner_policy_overrides(runtime: _ScanRuntimeConfig) -> dict[str, Any]:
+    """Forward explicit scanner policies through local, remote, and streaming scans."""
+    overrides: dict[str, Any] = {}
+    if runtime.scanner_selection is not None:
+        overrides[SCANNER_SELECTION_CONFIG_KEY] = runtime.scanner_selection
+    if runtime.config.get("strict_tensor_storage"):
+        overrides["strict_tensor_storage"] = True
+    return overrides
 
 
 def _streaming_scan_options(runtime: _ScanRuntimeConfig, blacklist: tuple[str, ...]) -> dict[str, Any]:
@@ -3191,7 +3195,7 @@ def _scan_local_or_downloaded_path(
                 scan_root=actual_path,
                 progress_callback=progress_callback,
                 **_streaming_scan_options(runtime, blacklist),
-                **_scanner_selection_overrides(runtime),
+                **_scanner_policy_overrides(runtime),
             )
             path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
@@ -3209,7 +3213,7 @@ def _scan_local_or_downloaded_path(
             "progress_update_interval": 2.0,
             "cache_enabled": runtime.cache_enabled,
             "cache_dir": runtime.cache_dir,
-            **_scanner_selection_overrides(runtime),
+            **_scanner_policy_overrides(runtime),
         }
         is_dvc_pointer = actual_path.lower().endswith(".dvc")
         has_prior_dvc_coverage = bool(path_state.dvc_covered_paths or path_state.dvc_covered_directories)
@@ -3573,7 +3577,7 @@ def _resolve_scan_source_for_path(
                             streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
                         streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
                         streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
-                        streaming_kwargs.update(_scanner_selection_overrides(runtime))
+                        streaming_kwargs.update(_scanner_policy_overrides(runtime))
 
                         try:
                             streaming_result = scan_model_streaming(
@@ -3736,7 +3740,7 @@ def _resolve_scan_source_for_path(
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     **_streaming_scan_options(runtime, blacklist),
-                    **_scanner_selection_overrides(runtime),
+                    **_scanner_policy_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 path_state.record_non_shard_result_errors(streaming_result)
@@ -3871,7 +3875,7 @@ def _resolve_scan_source_for_path(
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     **_streaming_scan_options(runtime, blacklist),
-                    **_scanner_selection_overrides(runtime),
+                    **_scanner_policy_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 path_state.record_non_shard_result_errors(streaming_result)
@@ -3975,7 +3979,7 @@ def _resolve_scan_source_for_path(
                 cache_enabled=runtime.cache_enabled,
                 cache_dir=runtime.cache_dir,
                 use_hf_whitelist=runtime.use_hf_whitelist,
-                **_scanner_selection_overrides(runtime),
+                **_scanner_policy_overrides(runtime),
             )
 
             path_state.record_non_shard_result_errors(results)
@@ -4061,7 +4065,7 @@ def _resolve_scan_source_for_path(
                 selective_download=runtime.selective_download,
                 use_hf_whitelist=runtime.use_hf_whitelist,
                 **jfrog_scan_kwargs,
-                **_scanner_selection_overrides(runtime),
+                **_scanner_policy_overrides(runtime),
             )
 
             if download_spinner:
@@ -4523,7 +4527,10 @@ def delegate_info() -> None:
 @click.option(
     "--strict",
     is_flag=True,
-    help="Strict mode: imply --no-whitelist and --no-cache, scan all file types, strict license validation",
+    help=(
+        "Imply --no-whitelist and --no-cache, scan all file types, and require conclusive "
+        "tensor storage discovery and strict license validation"
+    ),
 )
 @click.option(
     "--no-whitelist",
