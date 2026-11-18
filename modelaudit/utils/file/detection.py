@@ -3408,7 +3408,7 @@ def _parse_sentencepiece_trainer_spec_proto(
                     return None
                 signals.model_type = value if 1 <= value <= 4 else None
             elif field_number == 4:
-                if inspect_values and value == 0:
+                if inspect_values and not 0 < value < (1 << 31):
                     return None
                 signals.vocab_size = value or None
             elif field_number == 35:
@@ -3580,8 +3580,11 @@ def _is_sentencepiece_special_identity_piece(piece: str) -> bool:
     return piece in _SENTENCEPIECE_IDENTITY_TOKENS
 
 
-def _is_sentencepiece_byte_fallback_piece(piece: str) -> bool:
-    return _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None
+def _is_sentencepiece_byte_fallback_piece(piece: str, *, require_canonical: bool) -> bool:
+    hex_digits = piece[3:5]
+    return _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None and (
+        not require_canonical or hex_digits == hex_digits.upper()
+    )
 
 
 def _has_strong_sentencepiece_model_proto_evidence(
@@ -3883,7 +3886,7 @@ def _classify_sentencepiece_model_proto_stream(
                     if piece is None:
                         return reject_candidate()
                     byte_piece_count += 1
-                    if _is_sentencepiece_byte_fallback_piece(piece):
+                    if _is_sentencepiece_byte_fallback_piece(piece, require_canonical=inspect_values):
                         byte_piece_texts.add(piece)
                     else:
                         malformed_byte_piece = True

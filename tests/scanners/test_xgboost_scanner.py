@@ -2059,8 +2059,17 @@ class TestXGBoostFailClosedEndToEnd:
             _proto_field(4, 2, b"\x03\x0a\x01\xff"),
             _proto_field(5, 2, b"\x03\x3a\x01x"),
             _sentencepiece_trainer_spec_field(_unknown_sentencepiece_field(b"hidden payload")),
+            _sentencepiece_trainer_spec(vocab_size=1 << 31),
+            _sentencepiece_trainer_spec(vocab_size=(1 << 64) - 1),
         ],
-        ids=["malformed-compiled-map", "malformed-self-test", "unknown-denormalizer", "unknown-trainer-extension"],
+        ids=[
+            "malformed-compiled-map",
+            "malformed-self-test",
+            "unknown-denormalizer",
+            "unknown-trainer-extension",
+            "vocab-size-int32-overflow",
+            "negative-vocab-size",
+        ],
     )
     def test_sentencepiece_incomplete_metadata_is_visible(self, tmp_path: Path, metadata: bytes) -> None:
         tokenizer = tmp_path / "spm.model"
@@ -2073,6 +2082,18 @@ class TestXGBoostFailClosedEndToEnd:
             check.name == "SentencePiece Vocabulary Validation" and check.status == CheckStatus.FAILED
             for check in result.checks
         )
+
+    @pytest.mark.parametrize("replacement", [b"<0x0a>", b"<0x0b>"], ids=["duplicate-byte", "lowercase-byte"])
+    def test_sentencepiece_rejects_noncanonical_byte_pieces(self, tmp_path: Path, replacement: bytes) -> None:
+        tokenizer = _write_official_sentencepiece_fixture(
+            tmp_path, "custom_unknown_disabled_specials_byte_fallback.model"
+        )
+        tokenizer.write_bytes(tokenizer.read_bytes().replace(b"<0x0B>", replacement))
+
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert "sentencepiece" in result.scanner_names
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
 
     @pytest.mark.parametrize("leaf_offset", [0, 1], ids=["valid-map", "out-of-bounds-leaf"])
     def test_sentencepiece_checks_compiled_normalizer_offsets(self, tmp_path: Path, leaf_offset: int) -> None:
@@ -2451,30 +2472,36 @@ class TestXGBoostFailClosedEndToEnd:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_large_real_sentencepiece_model_proto_shape())
         original_classifier = file_detection._classify_sentencepiece_model_proto_stream
-        calls = 0
+        ownership_probes = 0
 
         def counting_classifier(
             stream: Any,
             file_size: int,
             *,
             max_decoded_piece_text_bytes: int = file_detection._SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+            inspect_values: bool = False,
         ) -> Any:
-            nonlocal calls
-            calls += 1
+            nonlocal ownership_probes
+            if not inspect_values:
+                ownership_probes += 1
             return original_classifier(
                 stream,
                 file_size,
                 max_decoded_piece_text_bytes=max_decoded_piece_text_bytes,
+                inspect_values=inspect_values,
             )
 
         file_detection._classify_sentencepiece_model_proto_file_cached.cache_clear()
+        monkeypatch.setattr(
+            "modelaudit.scanners.sentencepiece_scanner._classify_sentencepiece_model_proto_stream", counting_classifier
+        )
         monkeypatch.setattr(file_detection, "_classify_sentencepiece_model_proto_stream", counting_classifier)
 
         direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
 
         assert direct.success is True
         assert direct.scanner_name == "sentencepiece"
-        assert calls == 1
+        assert ownership_probes == 1
 
     @pytest.mark.parametrize("fixture_name", _SENTENCEPIECE_OFFICIAL_FIXTURES)
     def test_dependency_sentencepiece_model_with_disabled_specials_is_not_xgboost_false_positive(
