@@ -15,7 +15,7 @@ for _opcode in pickletools.opcodes:
 _STREAM_STARTS = frozenset(ord(op.code) for op in pickletools.opcodes if not op.stack_before)
 _LENGTH_WIDTH = {-2: 1, -3: 4, -4: 4, -5: 8}
 _TEXT_RUN = re.compile(rb"[A-Za-z0-9_+./=\\]{24}")
-_NUMBER = re.compile(rb"[+\-0-9.eELa-fA-Fx]*")
+_NUMBER = re.compile(rb"[+\-0-9.eELa-fA-Fx\s]*")
 _MAX_LINE_CHECK = 256
 _MAX_OPCODE_RUN = 16
 _MAX_WITNESS_BYTES = 8192
@@ -103,7 +103,7 @@ def storage_pickle_evidence(
     size = len(data)
     runs = bytearray(size + 1)
     effects = bytearray(size + 1)
-    newline = following_newline = next_control = size
+    newline = following_newline = next_non_ascii = size
     witnesses = 0
     for offset in range(size - 1, -1, -1):
         if offset % 65536 == 0:
@@ -111,12 +111,11 @@ def storage_pickle_evidence(
         op = data[offset]
         if op == 10:
             following_newline, newline = newline, offset
-            next_control = offset
             continue
-        # next_control bounds line operands without repeatedly searching long binary suffixes.
-        line_is_text = newline == next_control and newline < size
-        if op < 32 or op == 127:
-            next_control = offset
+        # PERSID accepts any ASCII byte before the newline, including controls.
+        # Track the first non-ASCII byte to avoid rescanning overlapping operands.
+        if op > 127:
+            next_non_ascii = offset
         width = _ARGUMENT_WIDTH[op]
         if width == _INVALID:
             continue
@@ -136,7 +135,7 @@ def storage_pickle_evidence(
             if op == 0x95 and int.from_bytes(data[start:end], "little") > size - end:
                 continue
         elif width == -1:
-            if not line_is_text:
+            if newline == size:
                 continue
             end = newline + 1
             if op in b"ci":
@@ -152,7 +151,7 @@ def storage_pickle_evidence(
             elif op in b"ILFpg":
                 if newline - start > _MAX_LINE_CHECK or not _NUMBER.fullmatch(data, start, newline):
                     continue
-            elif (op == ord("P") and not _text_operand(data, start, newline, ascii_only=True)) or (
+            elif (op == ord("P") and next_non_ascii < newline) or (
                 op == ord("S")
                 and (newline - start < 2 or data[start] not in b"\"'" or data[newline - 1] != data[start])
             ):

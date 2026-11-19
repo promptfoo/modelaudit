@@ -2279,6 +2279,9 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
         b"K\x03\x83\x00\x01\x86.",
         b"\x8c\x04evilQ.",
         b"K\x01Q.",
+        b"Vname\t\nQ.",
+        b"Pname\t\n.",
+        b"S'name\t'\nQ.",
     ],
     ids=[
         "named-reference-before-error",
@@ -2290,6 +2293,9 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
         "integer-before-ext2",
         "headerless-string-persistent-id",
         "headerless-integer-persistent-id",
+        "unicode-control-persistent-id",
+        "ascii-control-persistent-id",
+        "quoted-control-persistent-id",
     ],
 )
 def test_ambiguous_storage_retains_structured_pickle_evidence(tmp_path: Path, payload: bytes) -> None:
