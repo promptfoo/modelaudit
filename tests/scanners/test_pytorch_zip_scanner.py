@@ -2269,7 +2269,13 @@ def test_verified_tensor_reports_separate_hidden_coverage_or_strict_failure(tmp_
         _assert_incomplete_storage_discovery(result)
         assert not should_cache_scan_result(result.to_dict())
     else:
-        assert result.success
+        # Missing torch source can independently make data.pkl incomplete. Raw
+        # storage ambiguity must neither introduce nor erase that failure.
+        control = tmp_path / "plain.pt"
+        _write_referenced_float_storage(control, bytes(len(storage)), metadata=metadata)
+        plain = PyTorchZipScanner().scan(str(control))
+        assert result.success == plain.success
+        assert result.metadata.get("scan_outcome_reasons") == plain.metadata.get("scan_outcome_reasons")
         assert result.metadata["hidden_pickle_coverage"] == "inconclusive"
         check = next(check for check in result.checks if check.name == "Hidden Pickle Coverage")
         assert check.status == CheckStatus.FAILED
@@ -2353,7 +2359,7 @@ def test_memo_overwrite_never_clears_hidden_pickle_coverage(tmp_path: Path, stri
     _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage) if canonical else None)
     result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
     if canonical and not strict:
-        assert result.success
+        assert "pytorch_zip_pickle_discovery_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
         assert result.metadata["hidden_pickle_coverage"] == "inconclusive"
     else:
         _assert_incomplete_storage_discovery(result)
