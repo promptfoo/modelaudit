@@ -2277,6 +2277,8 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
         b"\x84\x00\x00\x01\x00.",
         b")\x82\x01\x86.",
         b"K\x03\x83\x00\x01\x86.",
+        b"\x8c\x04evilQ.",
+        b"K\x01Q.",
     ],
     ids=[
         "named-reference-before-error",
@@ -2286,6 +2288,8 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
         "ext4-reference",
         "tuple-before-ext1",
         "integer-before-ext2",
+        "headerless-string-persistent-id",
+        "headerless-integer-persistent-id",
     ],
 )
 def test_ambiguous_storage_retains_structured_pickle_evidence(tmp_path: Path, payload: bytes) -> None:
@@ -2293,6 +2297,12 @@ def test_ambiguous_storage_retains_structured_pickle_evidence(tmp_path: Path, pa
     result = _scan_referenced_float_storage(tmp_path / "structured.pt", storage)
     _assert_incomplete_storage_discovery(result)
     assert not should_cache_scan_result(result.to_dict())
+
+
+@pytest.mark.parametrize("payload", [b"\x82\x00.", b"\x84\xff\xff\xff\xff."])
+def test_ambiguous_storage_ignores_unregistrable_extension_codes(tmp_path: Path, payload: bytes) -> None:
+    storage = _ambiguous_tensor_storage().ljust(300_000, b"!") + payload.ljust(32, b"!")
+    _assert_clean_metadata_pickle_only(_scan_referenced_float_storage(tmp_path / "noise.pt", storage))
 
 
 @pytest.mark.parametrize("budget", ["_STORAGE_RECOVERY_MAX_MEMBER_BYTES", "_STORAGE_RECOVERY_MAX_ARCHIVE_BYTES"])

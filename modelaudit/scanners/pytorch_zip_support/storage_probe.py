@@ -12,6 +12,7 @@ _INVALID = -8
 _ARGUMENT_WIDTH = [_INVALID] * 256
 for _opcode in pickletools.opcodes:
     _ARGUMENT_WIDTH[ord(_opcode.code)] = _opcode.arg.n if _opcode.arg is not None else 0
+_STREAM_STARTS = frozenset(ord(op.code) for op in pickletools.opcodes if not op.stack_before)
 _LENGTH_WIDTH = {-2: 1, -3: 4, -4: 4, -5: 8}
 _TEXT_RUN = re.compile(rb"[A-Za-z0-9_+./=\\]{24}")
 _NUMBER = re.compile(rb"[+\-0-9.eELa-fA-Fx]*")
@@ -21,9 +22,8 @@ _MAX_WITNESS_BYTES = 8192
 _MAX_WITNESSES = 64
 
 _ENDS_AT_STOP = 1
-_HAS_EXTENSION = 4
+_HAS_REFERENCE = 4
 _HAS_STACK_GLOBAL = 8
-_HAS_PERSISTENT_ID = 16
 _HAS_INST = 32
 
 
@@ -170,12 +170,14 @@ def storage_pickle_evidence(
         if count >= _MAX_OPCODE_RUN:
             return "coherent_opcode_sequence"
         state = effects[end]
-        if op in b"\x82\x83\x84":
-            state |= _HAS_EXTENSION
+        if op in b"\x82\x83\x84" and state & _ENDS_AT_STOP:
+            # copyreg only registers positive extension codes. EXT4 is signed.
+            if int.from_bytes(data[start:end], "little", signed=op == 0x84) > 0:
+                state |= _HAS_REFERENCE
         elif op == 0x93:
             state |= _HAS_STACK_GLOBAL
         elif op in b"PQ":
-            state |= _HAS_PERSISTENT_ID
+            state |= _HAS_REFERENCE
         elif op == ord("i"):
             state |= _HAS_INST
         runs[offset] = count
@@ -194,14 +196,9 @@ def storage_pickle_evidence(
                 return "stack_global_operands"
         if not state & _ENDS_AT_STOP:
             continue
-        # EXT can import without a call. Validate from each prefix reaching EXT and STOP:
-        # later instructions may need stack or memo entries created before the reference.
-        candidate = state & _HAS_EXTENSION
-        if op == 0x80:
-            candidate |= state & (_HAS_STACK_GLOBAL | _HAS_PERSISTENT_ID)
-        elif string_start:
-            candidate |= state & _HAS_STACK_GLOBAL
-        if candidate:
+        # Headerless references can import a module or call persistent_load. Validate
+        # from each possible empty-stack start, not just the reference opcode.
+        if state & (_HAS_REFERENCE | _HAS_STACK_GLOBAL) and op in _STREAM_STARTS:
             if witnesses >= _MAX_WITNESSES:
                 return "pickle_witness_budget_exhausted"
             witnesses += 1
