@@ -168,11 +168,14 @@ def _float_storage_persistent_id_payload_for_bytes(key: str | bytes, data: bytes
     )
 
 
-def _write_referenced_float_storage(model_path: Path, storage_blob: bytes) -> None:
+def _write_referenced_float_storage(model_path: Path, storage_blob: bytes, *, metadata: bytes | None = None) -> None:
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3\n")
         zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr(
+            "archive/data.pkl",
+            metadata if metadata is not None else _float_storage_persistent_id_payload_for_bytes("0", storage_blob),
+        )
         zip_file.writestr("archive/data/0", storage_blob)
 
 
@@ -2226,15 +2229,39 @@ def _ambiguous_tensor_storage() -> bytes:
     return (header.ljust(96, b"!") + b"K\x82t").ljust(128, b"!")
 
 
+def _tensor_checkpoint_metadata(storage: bytes) -> bytes:
+    size = _pickle_binint(len(storage) // 4)
+    return (
+        b"\x80\x02"
+        + _pickle_global("torch._utils", "_rebuild_tensor_v2")
+        + b"(("
+        + _pickle_binunicode(b"storage")
+        + _pickle_global("torch", "FloatStorage")
+        + _pickle_binunicode(b"0")
+        + _pickle_binunicode(b"cuda:0")
+        + size
+        + b"tQ"
+        + b"K\x00"
+        + size
+        + b"\x85K\x01\x85\x89"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"tR."
+    )
+
+
 @pytest.mark.parametrize("strict", [False, True])
-def test_validated_tensor_storage_ambiguity_reports_full_coverage_or_strict_failure(
-    tmp_path: Path, strict: bool
-) -> None:
+def test_verified_tensor_reports_separate_hidden_coverage_or_strict_failure(tmp_path: Path, strict: bool) -> None:
     path = tmp_path / "ambiguous.pt"
     rng = random.Random(1042)
     weights = b"".join(struct.pack("<f", rng.uniform(-1.0, 1.0)) for _ in range(4096))
-    storage = _ambiguous_tensor_storage() + weights + b"os!!system!!\x93!!!"
-    _write_referenced_float_storage(path, storage)
+    storage = _ambiguous_tensor_storage() + weights + b"os!!system!!\x93!!!" + b"\x82\x01.!"
+    # Nested integer-keyed optimizer state with a reused tensor constructor.
+    tensor = _tensor_checkpoint_metadata(storage)[2:-1]
+    rebuild = _pickle_global("torch._utils", "_rebuild_tensor_v2")
+    first = tensor.replace(rebuild, rebuild + b"q\x00")
+    second = tensor.replace(rebuild, b"h\x00")
+    metadata = b"\x80\x02}(K\x00}(K\x01" + first + b"K\x02" + second + b"uu."
+    _write_referenced_float_storage(path, storage, metadata=metadata)
     result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
 
     assert not any(check.name == "Embedded Pickle Payload" for check in result.checks)
@@ -2242,10 +2269,12 @@ def test_validated_tensor_storage_ambiguity_reports_full_coverage_or_strict_fail
         _assert_incomplete_storage_discovery(result)
         assert not should_cache_scan_result(result.to_dict())
     else:
-        _assert_clean_metadata_pickle_only(result)
-        check = next(check for check in result.checks if check.name == "Tensor Storage Pickle Heuristic")
-        assert check.status == CheckStatus.PASSED
-        assert check.details["best_effort"] is True
+        assert result.success
+        assert result.metadata["hidden_pickle_coverage"] == "inconclusive"
+        check = next(check for check in result.checks if check.name == "Hidden Pickle Coverage")
+        assert check.status == CheckStatus.FAILED
+        assert check.details["hidden_pickle_coverage"] == "inconclusive"
+        assert not should_cache_scan_result(result.to_dict())
         assert [entry["bytes_read"] for entry in check.details["entries"]] == [len(storage)]
 
 
@@ -2257,7 +2286,8 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
     path = tmp_path / "late.pt"
     prefix = (_ambiguous_tensor_storage() + b"cos\nsystem\n!").ljust(300_000, b"!")
     payload = b"\x8c\x02os\x94\x8c\x06system\x94\x93)R." if stack_global else b"cos\nsystem\n)R."
-    _write_referenced_float_storage(path, prefix + payload.ljust(32, b"!"))
+    storage = prefix + payload.ljust(32, b"!") + b"\x82\x01.!"
+    _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage))
     result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
 
     _assert_incomplete_storage_discovery(result)
@@ -2313,10 +2343,71 @@ def test_ambiguous_storage_retains_structured_pickle_evidence(tmp_path: Path, pa
     assert not should_cache_scan_result(result.to_dict())
 
 
-@pytest.mark.parametrize("payload", [b"\x82\x00.", b"\x84\xff\xff\xff\xff."])
-def test_ambiguous_storage_ignores_unregistrable_extension_codes(tmp_path: Path, payload: bytes) -> None:
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("canonical", [False, True])
+def test_memo_overwrite_never_clears_hidden_pickle_coverage(tmp_path: Path, strict: bool, canonical: bool) -> None:
+    # pickletools.dis rejects a repeated memo write that pickle accepts.
+    payload = b"K\x01q\x00K\x02q\x00\x86Q."
     storage = _ambiguous_tensor_storage().ljust(300_000, b"!") + payload.ljust(32, b"!")
-    _assert_clean_metadata_pickle_only(_scan_referenced_float_storage(tmp_path / "noise.pt", storage))
+    path = tmp_path / "overwritten.pt"
+    _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage) if canonical else None)
+    result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
+    if canonical and not strict:
+        assert result.success
+        assert result.metadata["hidden_pickle_coverage"] == "inconclusive"
+    else:
+        _assert_incomplete_storage_discovery(result)
+    assert not should_cache_scan_result(result.to_dict())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"\x82\x01)R.", b"\x82\x01)\x81.", b"\x82\x01q\x00)q\x00R.", b"\x8c\x04site\x8c\x04hook\x93!", b"csite\nhook\n."],
+)
+def test_verified_tensor_does_not_clear_possible_callable(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "callable.pt"
+    storage = _ambiguous_tensor_storage().ljust(300_000, b"!") + payload.ljust(32, b"!")
+    _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage))
+    _assert_incomplete_storage_discovery(PyTorchZipScanner().scan(str(path)))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b"cuda:0", b"custom"),
+        (b"tQK\x00", b"tQK\x01"),  # out-of-bounds view
+        (b"tQ", b"tQq\x00"),  # replay the storage reference outside the tensor
+        (b"_rebuild_tensor_v2", b"custom_loader"),
+        (b"tR.", b"tR.N."),
+        (b"OrderedDict", b"CustomHooks"),
+    ],
+)
+def test_unverified_tensor_use_stays_incomplete(tmp_path: Path, old: bytes, new: bytes) -> None:
+    path = tmp_path / "unverified.pt"
+    storage = _ambiguous_tensor_storage()
+    metadata = _tensor_checkpoint_metadata(storage).replace(old, new)
+    if new == b"tQq\x00":
+        metadata = metadata[:-1] + b"h\x00\x86."
+    _write_referenced_float_storage(path, storage, metadata=metadata)
+    _assert_incomplete_storage_discovery(PyTorchZipScanner().scan(str(path)))
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("extra_member", [False, True])
+def test_ambiguous_tensor_does_not_mask_malicious_checkpoint(tmp_path: Path, strict: bool, extra_member: bool) -> None:
+    path = tmp_path / "malicious.pt"
+    storage = _ambiguous_tensor_storage()
+    metadata = _tensor_checkpoint_metadata(storage)
+    payload = _metadata_reduce_payload("os", "system", b"")
+    if not extra_member:
+        metadata = metadata[:-1] + payload + b"0."
+    _write_referenced_float_storage(path, storage, metadata=metadata)
+    if extra_member:
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr("archive/data/1", b"\x80\x02" + payload + b".")
+    result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
+    _assert_incomplete_storage_discovery(result)
+    assert any(issue.severity == IssueSeverity.CRITICAL and "os.system" in issue.message for issue in result.issues)
 
 
 @pytest.mark.parametrize("budget", ["_STORAGE_RECOVERY_MAX_MEMBER_BYTES", "_STORAGE_RECOVERY_MAX_ARCHIVE_BYTES"])
@@ -2325,7 +2416,9 @@ def test_ambiguous_storage_requires_a_full_member_read(
 ) -> None:
     monkeypatch.setattr(pytorch_zip_scanner_module, budget, 127)
     storage = _ambiguous_tensor_storage() + b"cos\nsystem\n.".ljust(32, b"!")
-    result = _scan_referenced_float_storage(tmp_path / "over-limit.pt", storage)
+    path = tmp_path / "over-limit.pt"
+    _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage))
+    result = PyTorchZipScanner().scan(str(path))
     _assert_incomplete_storage_discovery(result)
     failure = next(check for check in result.checks if check.name == "Pickle Discovery")
     assert failure.details["entries"][0]["storage_recovery"] == "full_member_read_limit"
@@ -2364,7 +2457,8 @@ def test_ambiguous_storage_read_failure_cannot_be_downgraded(
 
     monkeypatch.setattr(scanner, "_read_member_bytes", read_member)
     path = tmp_path / "unread.pt"
-    _write_referenced_float_storage(path, _ambiguous_tensor_storage())
+    storage = _ambiguous_tensor_storage()
+    _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage))
     result = scanner.scan(str(path))
     _assert_incomplete_storage_discovery(result)
     failure = next(c for c in result.checks if c.name == "Pickle Discovery").details["entries"][0]

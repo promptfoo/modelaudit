@@ -1,1 +1,1 @@
-Complete default PyTorch scans when full inspection of validated tensor storage finds only isolated pickle-like bytes. Report the affected members, retain incomplete coverage for unread data or corroborating evidence, and preserve the conservative verdict with `--strict`.
+Separate uncertain hidden-pickle coverage from default scan completion for verified PyTorch tensor storage. Keep findings visible, skip caching these results, and retain incomplete status with `--strict`.

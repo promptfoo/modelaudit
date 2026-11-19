@@ -16,14 +16,13 @@ _STREAM_STARTS = frozenset(ord(op.code) for op in pickletools.opcodes if not op.
 _LENGTH_WIDTH = {-2: 1, -3: 4, -4: 4, -5: 8}
 _TEXT_RUN = re.compile(rb"[A-Za-z0-9_+./=\\]{24}")
 _MAX_LINE_CHECK = 256
-_MAX_OPCODE_RUN = 16
 _MAX_WITNESS_BYTES = 8192
 _MAX_WITNESSES = 64
 
 _ENDS_AT_STOP = 1
 _HAS_REFERENCE = 4
 _HAS_STACK_GLOBAL = 8
-_HAS_INST = 32
+_HAS_INVOCATION = 128
 
 
 def _text_operand(data: bytes, start: int, end: int, *, ascii_only: bool = False) -> str:
@@ -40,22 +39,6 @@ def _text_operand(data: bytes, start: int, end: int, *, ascii_only: bool = False
     except UnicodeDecodeError:
         return ""
     return text if text.isprintable() else ""
-
-
-def _balanced_stream(data: bytes, offset: int) -> bool | None:
-    """Check stack and memo use through STOP, without resolving or calling any globals."""
-    sample = data[offset : offset + _MAX_WITNESS_BYTES]
-    stream = io.BytesIO(sample)
-    try:
-        pickletools.dis(stream, out=io.StringIO())
-    except (ValueError, UnicodeError, OverflowError) as exc:
-        # Unpickling returns the top value even if lower stack entries remain.
-        if str(exc).startswith("stack not empty after STOP"):
-            return True
-        if stream.tell() == len(sample) and offset + len(sample) < len(data):
-            return None
-        return False
-    return True
 
 
 def _has_named_stack_global(data: bytes, offset: int) -> bool:
@@ -83,7 +66,7 @@ def storage_pickle_evidence(
     candidate_limit: int,
     check_timeout: Callable[[], bool],
 ) -> str | None:
-    """Return the reason to retain the original inconclusive verdict, if any.
+    """Look for positive evidence of named references or invocations, not proof of absence.
 
     This is a corroboration pass over an already ambiguous member. Every possible
     byte offset is an entry point. Suffixes share instruction boundaries, so a
@@ -100,7 +83,6 @@ def storage_pickle_evidence(
             return "dense_pickle_candidates"
 
     size = len(data)
-    runs = bytearray(size + 1)
     effects = bytearray(size + 1)
     newline = following_newline = next_non_ascii = size
     witnesses = 0
@@ -119,7 +101,6 @@ def storage_pickle_evidence(
         if width == _INVALID:
             continue
         if op == ord("."):
-            runs[offset] = 1
             effects[offset] = _ENDS_AT_STOP
             continue
 
@@ -163,27 +144,24 @@ def storage_pickle_evidence(
             if end > size:
                 continue
 
-        count = 1 + runs[end]
-        if count >= _MAX_OPCODE_RUN:
-            return "coherent_opcode_sequence"
         state = effects[end]
-        if op in b"\x82\x83\x84" and state & _ENDS_AT_STOP:
-            # copyreg only registers positive extension codes. EXT4 is signed.
-            if int.from_bytes(data[start:end], "little", signed=op == 0x84) > 0:
-                state |= _HAS_REFERENCE
+        if op in b"Rbo\x81\x92":
+            state |= _HAS_INVOCATION
         elif op == 0x93:
             state |= _HAS_STACK_GLOBAL
-        elif op in b"PQc":
+        elif (
+            op in b"\x82\x83\x84Q"
+            and state & _HAS_INVOCATION
+            and state & _ENDS_AT_STOP
+            # NEWOBJ consumes the top as arguments, not as the class. Check
+            # earlier references (the class) and any later invocations too.
+            and (data[end] != 0x81 or effects[end + 1] & _HAS_INVOCATION)
+        ):
             state |= _HAS_REFERENCE
-        elif op == ord("i"):
-            state |= _HAS_INST | _HAS_REFERENCE
-        runs[offset] = count
         effects[offset] = state
 
         if op == ord("P") and state & _ENDS_AT_STOP and start < newline:
             return "persistent_id_stream"
-        if op == ord("(") and state & _HAS_INST:
-            return "inst_with_mark"
         string_start = op in b"SVUTX\x8c\x8d"
         if string_start and state & _HAS_STACK_GLOBAL and _text_operand(data, operand, end if width != -1 else newline):
             if witnesses >= _MAX_WITNESSES:
@@ -191,17 +169,19 @@ def storage_pickle_evidence(
             witnesses += 1
             if _has_named_stack_global(data, offset):
                 return "stack_global_operands"
-        if not state & _ENDS_AT_STOP:
-            continue
-        # Headerless references can import a module or call persistent_load. Validate
-        # from each possible empty-stack start, not just the reference opcode.
-        if state & (_HAS_REFERENCE | _HAS_STACK_GLOBAL) and op in _STREAM_STARTS:
+        if state & _HAS_REFERENCE and op in _STREAM_STARTS:
             if witnesses >= _MAX_WITNESSES:
                 return "pickle_witness_budget_exhausted"
             witnesses += 1
-            balanced = _balanced_stream(data, offset)
-            if balanced is None:
-                return "pickle_witness_read_limit"
-            if balanced:
-                return "structured_pickle_stream"
+            sample = io.BytesIO(data[offset : offset + _MAX_WITNESS_BYTES])
+            try:
+                pickletools.dis(sample, out=io.StringIO())
+            except (ValueError, UnicodeError, OverflowError) as exc:
+                if sample.tell() == _MAX_WITNESS_BYTES:
+                    return "pickle_witness_read_limit"
+                # dis() rejects memo overwrites and extra stack values that
+                # Python unpicklers accept. Neither rules out invocation.
+                if not str(exc).startswith(("stack not empty after STOP", "memo key")):
+                    continue
+            return "possible_pickle_invocation"
     return None

@@ -90,6 +90,7 @@ from .pytorch_zip_support import (
     read_zip_header,
 )
 from .pytorch_zip_support.storage_probe import storage_pickle_evidence
+from .pytorch_zip_support.tensor_usage import uses_only_raw_tensors
 from .rule_mapper import get_generic_rule_code
 from .zip_scanner import ZipPreflightRejected
 
@@ -350,6 +351,7 @@ class _ValidatedPytorchStorageDataPklMembers:
     persistent_id_downgrade_keys_by_data_pkl: dict[str, set[str]]
     additional_pid_keys_by_data_pkl: dict[str, set[str]]
     storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
+    tensor_only: bool = False
 
 
 class _NumericPickleProofReader(io.BytesIO):
@@ -1761,6 +1763,8 @@ class PyTorchZipScanner(BaseScanner):
                 except Exception as read_exc:
                     failure.update(exception=str(read_exc), exception_type=type(read_exc).__name__)
                 else:
+                    if reason is None and not validated_pytorch_storage_data_pkl_members.tensor_only:
+                        reason = "unverified_tensor_usage"
                     if reason is None and not self.config.get("strict_tensor_storage"):
                         storage_diagnostics.append({**failure, "bytes_read": entry.file_size})
                         return
@@ -1822,19 +1826,26 @@ class PyTorchZipScanner(BaseScanner):
                 record_probe_failure(entry, exc)
 
         if storage_diagnostics:
+            result.metadata["hidden_pickle_coverage"] = "inconclusive"
             result.add_check(
-                name="Tensor Storage Pickle Heuristic",
-                passed=True,
+                name="Hidden Pickle Coverage",
+                passed=False,
                 message=(
-                    f"Found isolated pickle-like bytes in {len(storage_diagnostics)} validated raw tensor storage "
-                    "members. Full-member inspection found no corroborating pickle structure."
+                    f"PyTorch uses {len(storage_diagnostics)} ambiguous members as raw tensor values. "
+                    "A separate pickle hidden in those bytes could not be ruled out. "
+                    "Use --strict to count this gap as incomplete."
                 ),
                 severity=IssueSeverity.INFO,
                 location=self.current_file_path,
-                details={"entries": storage_diagnostics, "best_effort": True},
+                details={
+                    "entries": storage_diagnostics,
+                    "scope": "pytorch_tensor_storage",
+                    "hidden_pickle_coverage": "inconclusive",
+                },
             )
 
         if probe_failures:
+            result.metadata["hidden_pickle_coverage"] = "inconclusive"
             mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
             count = len(probe_failures)
             noun = "member" if count == 1 else "members"
@@ -1863,7 +1874,7 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
         bytes_remaining: list[int],
     ) -> str | None:
-        """Discharge only an impossible leading length followed by unstructured raw bytes."""
+        """Require a full read and check for stronger evidence before separating coverage."""
         limit = min(bytes_remaining[0], _STORAGE_RECOVERY_MAX_MEMBER_BYTES)
         if self.max_file_read_size > 0:
             limit = min(limit, self.max_file_read_size)
@@ -1906,6 +1917,8 @@ class PyTorchZipScanner(BaseScanner):
             return "full_member_read_limit"
         if len(sample) != entry.file_size:
             return "incomplete_member_read"
+        if not self._zip_payload_bounds_match(zip_file, entry):
+            return "unverified_storage_bounds"
         if self._impossible_declared_storage_prefix_header_end(sample, entry_size=len(sample)) is None:
             return "unresolved_storage_prefix"
         return storage_pickle_evidence(
@@ -8846,6 +8859,7 @@ class PyTorchZipScanner(BaseScanner):
             else None
         )
         storage_member_sizes_by_data_pkl: dict[str, dict[str, int]] = {}
+        tensor_only = False
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
         for data_pkl_member, data_pkl_entries in entries_by_name.items():
@@ -8986,7 +9000,37 @@ class PyTorchZipScanner(BaseScanner):
                     for storage_key in exact_trusted_storage_keys
                 }
 
+                # This narrower proof scopes *only* ambiguous hidden-pickle
+                # discovery. It never grants trust to data.pkl or its imports.
+                controls = {
+                    prefix + name
+                    for name in (
+                        "data.pkl",
+                        "version",
+                        "byteorder",
+                        ".data/serialization_id",
+                        ".format_version",
+                        ".storage_alignment",
+                    )
+                }
+                if (
+                    exact_trusted_storage_keys == existing_storage_keys
+                    and self.pickle_scanner is not None
+                    and prefix.count("/") == 1
+                    and len(entries_by_name) == len(zip_file.infolist())
+                    and entries_by_name.keys() <= controls | {data_prefix + key for key in existing_storage_keys}
+                    and all(
+                        entry.compress_type == zipfile.ZIP_STORED and entry.compress_size == entry.file_size
+                        for entry in safe_entries
+                    )
+                    and self._zip_payload_bounds_match(zip_file, data_pkl_entry)
+                ):
+                    tensor_only = uses_only_raw_tensors(
+                        pickle_data, storage_member_sizes_by_data_pkl[data_pkl_member], self._check_timeout
+                    )
+
         return _ValidatedPytorchStorageDataPklMembers(
+            tensor_only=tensor_only,
             storage_keys_by_data_pkl=trusted_members,
             storage_probe_keys_by_data_pkl=storage_probe_members,
             persistent_id_downgrade_keys_by_data_pkl=persistent_id_downgrade_members,
