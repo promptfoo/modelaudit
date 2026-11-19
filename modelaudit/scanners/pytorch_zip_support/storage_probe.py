@@ -21,7 +21,6 @@ _MAX_WITNESS_BYTES = 8192
 _MAX_WITNESSES = 64
 
 _ENDS_AT_STOP = 1
-_HAS_INVOCATION = 2
 _HAS_EXTENSION = 4
 _HAS_STACK_GLOBAL = 8
 _HAS_PERSISTENT_ID = 16
@@ -171,9 +170,7 @@ def storage_pickle_evidence(
         if count >= _MAX_OPCODE_RUN:
             return "coherent_opcode_sequence"
         state = effects[end]
-        if op in b"Rbo\x81\x92":
-            state |= _HAS_INVOCATION
-        elif op in b"\x82\x83\x84":
+        if op in b"\x82\x83\x84":
             state |= _HAS_EXTENSION
         elif op == 0x93:
             state |= _HAS_STACK_GLOBAL
@@ -197,10 +194,9 @@ def storage_pickle_evidence(
                 return "stack_global_operands"
         if not state & _ENDS_AT_STOP:
             continue
-        if op == 0x80:
+        # Resolving an extension can import a module even without a call opcode.
+        if op in b"\x80\x82\x83\x84":
             candidate = state & (_HAS_EXTENSION | _HAS_STACK_GLOBAL | _HAS_PERSISTENT_ID)
-        elif op in b"\x82\x83\x84":
-            candidate = state & _HAS_INVOCATION
         elif string_start:
             candidate = state & _HAS_STACK_GLOBAL
         else:
