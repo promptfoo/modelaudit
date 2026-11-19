@@ -194,13 +194,13 @@ def storage_pickle_evidence(
                 return "stack_global_operands"
         if not state & _ENDS_AT_STOP:
             continue
-        # Resolving an extension can import a module even without a call opcode.
-        if op in b"\x80\x82\x83\x84":
-            candidate = state & (_HAS_EXTENSION | _HAS_STACK_GLOBAL | _HAS_PERSISTENT_ID)
+        # EXT can import without a call. Validate from each prefix reaching EXT and STOP:
+        # later instructions may need stack or memo entries created before the reference.
+        candidate = state & _HAS_EXTENSION
+        if op == 0x80:
+            candidate |= state & (_HAS_STACK_GLOBAL | _HAS_PERSISTENT_ID)
         elif string_start:
-            candidate = state & _HAS_STACK_GLOBAL
-        else:
-            continue
+            candidate |= state & _HAS_STACK_GLOBAL
         if candidate:
             if witnesses >= _MAX_WITNESSES:
                 return "pickle_witness_budget_exhausted"

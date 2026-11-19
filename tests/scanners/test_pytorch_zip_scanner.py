@@ -2269,8 +2269,24 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
 
 @pytest.mark.parametrize(
     "payload",
-    [b"\x8c\x04site\x8c\x04hook\x93!", b"\x82\x01)R.", b"\x82\x01.", b"\x83\x00\x01.", b"\x84\x00\x00\x01\x00."],
-    ids=["named-reference-before-error", "extension-invocation", "ext1-reference", "ext2-reference", "ext4-reference"],
+    [
+        b"\x8c\x04site\x8c\x04hook\x93!",
+        b"\x82\x01)R.",
+        b"\x82\x01.",
+        b"\x83\x00\x01.",
+        b"\x84\x00\x00\x01\x00.",
+        b")\x82\x01\x86.",
+        b"K\x03\x83\x00\x01\x86.",
+    ],
+    ids=[
+        "named-reference-before-error",
+        "extension-invocation",
+        "ext1-reference",
+        "ext2-reference",
+        "ext4-reference",
+        "tuple-before-ext1",
+        "integer-before-ext2",
+    ],
 )
 def test_ambiguous_storage_retains_structured_pickle_evidence(tmp_path: Path, payload: bytes) -> None:
     storage = _ambiguous_tensor_storage().ljust(300_000, b"!") + payload.ljust(32, b"!")
