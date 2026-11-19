@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.network_comm import (
+    NetworkCommDetector,
     iter_port_token_positions,
     official_readme_urlopen_image_example_spans,
     redact_url_for_finding,
@@ -134,6 +135,11 @@ BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
 )
 BARE_NETWORK_IPV6_TOKEN_PATTERN = re.compile(rb"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}")
 BARE_NETWORK_DOMAIN_TOKEN_PATTERN = re.compile(rb"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}")
+# WordPiece continuations, email suffixes and bare disclosure links. No
+# credentials, queries, commands, assignments or executable expressions.
+WORDPIECE_DOMAIN_TOKEN = re.compile(
+    rb"(?:##@?|https?://)?" + BARE_NETWORK_DOMAIN_TOKEN_PATTERN.pattern + rb"(?:/[a-zA-Z0-9./_-]*)?[.,]?"
+)
 BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_URL_TOKEN_PATTERN,
     BARE_NETWORK_IPV4_TOKEN_PATTERN,
@@ -1079,19 +1085,19 @@ class TextScanner(BaseScanner):
         return nonempty_lines, token_lines, sentinel_lines, subword_lines
 
     @classmethod
-    def _has_line_oriented_tokenizer_vocabulary_evidence(cls, path: str, payload: bytes) -> bool:
+    def _vocabulary_evidence(cls, path: str, payload: bytes) -> tuple[bool, bool]:
         nonempty_lines, token_lines, sentinel_lines, subword_lines = cls._tokenizer_vocabulary_line_evidence(payload)
         if nonempty_lines == 0 or token_lines / nonempty_lines < MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO:
-            return False
+            return False, False
 
-        if cls._has_tokenizer_vocabulary_filename(path):
-            return nonempty_lines >= MIN_TOKENIZER_VOCABULARY_LINES
-
-        return (
+        strong = (
             nonempty_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_LINES
             and sentinel_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SENTINELS
             and subword_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES
         )
+        if cls._has_tokenizer_vocabulary_filename(path):
+            return nonempty_lines >= MIN_TOKENIZER_VOCABULARY_LINES, strong and token_lines == nonempty_lines
+        return strong, False
 
     @classmethod
     def _finding_line_parts(cls, payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
@@ -3200,6 +3206,28 @@ class TextScanner(BaseScanner):
             return candidate, False
 
     @staticmethod
+    def _passive_wordpiece_domains(payload: bytes, domains: set[bytes]) -> set[bytes]:
+        # Domain findings are deduplicated. One active use anywhere vetoes a
+        # downgrade, even if the first occurrence was a vocabulary fragment.
+        passive: set[bytes] = set()
+        for raw in io.BytesIO(payload):
+            line = raw.rstrip(b"\r\n")
+            if len(line) > MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES:
+                return set()
+            if b"." not in line:
+                continue
+            bare = WORDPIECE_DOMAIN_TOKEN.fullmatch(line)
+            for match in NetworkCommDetector.DOMAIN_PATTERN.finditer(line):
+                host = match.group().lower()
+                if host in domains:
+                    if bare:
+                        passive.add(host)
+                    else:
+                        domains.discard(host)
+                        passive.discard(host)
+        return passive
+
+    @staticmethod
     def _all_network_candidate_lines_are_bare(payload: bytes) -> bool:
         for line in payload.splitlines():
             stripped = line.strip()
@@ -4040,7 +4068,16 @@ class TextScanner(BaseScanner):
             else ()
         )
         lowered_payload = payload.lower() if documentation_sidecar else b""
-        tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
+        tokenizer_vocabulary_sidecar, strong_vocab = cls._vocabulary_evidence(path, payload)
+        passive_domains: set[bytes] = set()
+        if payload_complete and strong_vocab:
+            domains = {
+                f["domain"].encode()
+                for f in findings
+                if f.get("type") == "domain_name" and f.get("severity") == "MEDIUM" and f.get("confidence") == 0.3
+            }
+            if domains:
+                passive_domains = cls._passive_wordpiece_domains(payload, domains)
         last_retargetable_index = max(
             (
                 index
@@ -4118,6 +4155,11 @@ class TextScanner(BaseScanner):
             try:
                 if not retarget_incomplete and (
                     routine_example
+                    or (
+                        finding.get("type") == "domain_name"
+                        and finding.get("severity") == "MEDIUM"
+                        and finding["domain"].encode() in passive_domains
+                    )
                     or (finding.get("type") == "cc_pattern" and position in prohibited_terms)
                     or cls._sidecar_network_finding_is_informational(
                         path,

@@ -91,6 +91,7 @@ from .pytorch_zip_support import (
 )
 from .pytorch_zip_support.storage_probe import storage_pickle_evidence
 from .pytorch_zip_support.tensor_usage import uses_only_raw_tensors
+from .pytorch_zip_support.trainer_runtime import trusted_trainer_runtime
 from .rule_mapper import get_generic_rule_code
 from .zip_scanner import ZipPreflightRejected
 
@@ -351,7 +352,7 @@ class _ValidatedPytorchStorageDataPklMembers:
     persistent_id_downgrade_keys_by_data_pkl: dict[str, set[str]]
     additional_pid_keys_by_data_pkl: dict[str, set[str]]
     storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
-    tensor_only: bool = False
+    tensor_metadata_digest: bytes | None = None
 
 
 class _NumericPickleProofReader(io.BytesIO):
@@ -789,6 +790,7 @@ class PyTorchZipScanner(BaseScanner):
                     pickle_files,
                     result,
                     path,
+                    tensor_metadata_digest=validated_storage_data_pkl_members.tensor_metadata_digest,
                     trusted_pytorch_storage_persistent_id_data_pkl_members=(
                         validated_storage_data_pkl_members.persistent_id_downgrade_keys_by_data_pkl
                         | validated_storage_data_pkl_members.additional_pid_keys_by_data_pkl
@@ -1763,7 +1765,7 @@ class PyTorchZipScanner(BaseScanner):
                 except Exception as read_exc:
                     failure.update(exception=str(read_exc), exception_type=type(read_exc).__name__)
                 else:
-                    if reason is None and not validated_pytorch_storage_data_pkl_members.tensor_only:
+                    if reason is None and validated_pytorch_storage_data_pkl_members.tensor_metadata_digest is None:
                         reason = "unverified_tensor_usage"
                     if reason is None and not self.config.get("strict_tensor_storage"):
                         storage_diagnostics.append({**failure, "bytes_read": entry.file_size})
@@ -8212,6 +8214,110 @@ class PyTorchZipScanner(BaseScanner):
         ):
             sub_result.metadata["pickle_verdict"] = "clean"
 
+    def _classify_trainer_calls(
+        self, result: ScanResult, data: bytes, tensor_digest: bytes | None, sizes: dict[str, int] | None
+    ) -> None:
+        coverage = result.metadata.get("pickle_coverage", {})
+        if (
+            self.config.get("strict_tensor_storage")
+            or self.config.get("use_hf_whitelist") is False
+            or not result.success
+            or result.metadata.get("analysis_incomplete")
+            or result.metadata.get("pickle_report_status") != "complete"
+            or result.metadata.get("pickle_verdict") != "suspicious"
+            or coverage.get("raw_scan_complete") is not True
+            or coverage.get("opcode_scan_complete") is not True
+            or result.metadata.get("nested_opcode_counts") != {}
+            or result.metadata.get("follow_on_opcode_counts") != {}
+            or result.metadata.get("import_references_truncated") is not False
+            or result.metadata.get("callable_invocations_truncated") is not False
+        ):
+            return
+
+        digest = hashlib.sha256(data).digest()
+        # Complex BUILD states are not safe by class name. Bind their arguments,
+        # memo uses and every opcode to the reviewed control stream, not a file
+        # name or model ID. FinTwitBERT revision 9c2c2e384fe41c0beed437c7b359c45022df50bc.
+        if digest == tensor_digest:
+            expected = {"torch._utils._rebuild_tensor_v2"}
+            runtime = expected | {"torch.FloatStorage"}
+        elif digest.hex() == "7cd0c63bb04f97d9b7045ad614b4a7cc0b574604d19e050851a21db3096048f4" and sizes == {
+            "0": 5056,
+            "1": 16,
+        }:
+            expected = {
+                "torch._utils._rebuild_tensor_v2",
+                "_codecs.encode",
+                "numpy.core.multiarray._reconstruct",
+                "numpy.dtype",
+            }
+            runtime = expected | {"torch.ByteStorage", "numpy.ndarray"}
+        elif digest.hex() == "65af945242547b63bcafa7bd6decc96656d3a818f881b8713664f3dd0af07894":
+            expected = {
+                "transformers.training_args.TrainingArguments",
+                "transformers.training_args.OptimizerNames",
+                "transformers.trainer_utils.IntervalStrategy",
+                "transformers.trainer_utils.SchedulerType",
+                "transformers.trainer_utils.HubStrategy",
+                "accelerate.state.PartialState",
+                "accelerate.utils.dataclasses.DistributedType",
+                "torch.device",
+            }
+            runtime = expected
+        else:
+            return
+
+        def matches(record: Check | Issue) -> bool:
+            return (
+                record.rule_code == "NON_ALLOWLISTED_GLOBAL"
+                and record.severity == IssueSeverity.WARNING
+                and record.details.get("opcode") == "GLOBAL"
+                and record.details.get("import_reference") in expected
+                and "nested_source" not in record.details
+            )
+
+        selected = [c for c in result.checks if c.status == CheckStatus.FAILED and matches(c)]
+        if not selected or any(
+            i.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} and not matches(i) for i in result.issues
+        ):
+            return
+        # A change of installed libraries can also invalidate a negative result.
+        result.metadata["trainer_runtime_dependent"] = True
+        if not trusted_trainer_runtime(runtime, self._check_timeout):
+            return
+        # Earlier PID classification can leave private evidence while other
+        # warnings remain. Reconcile only the exact passed storage checks.
+        passed_pids = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.PASSED
+            and c.details.get("trusted_pytorch_archive_context") is True
+            and c.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        ]
+        self._remove_private_actionable_failed_check_entries(
+            result,
+            [{"name": c.name, "rule_code": c.rule_code or "", "severity": "warning"} for c in selected + passed_pids],
+        )
+        for check in selected:
+            check.status = CheckStatus.PASSED
+        for record in chain[Check | Issue](selected, result.issues):
+            if matches(record):
+                record.severity = IssueSeverity.INFO
+                record.details["reviewed_trainer_runtime"] = True
+                record.details["original_severity"] = "warning"
+                record.message = f"Expected checkpoint reconstruction: {record.details['import_reference']}"
+                record.why = (
+                    "Validated loading instructions and matching installed framework files. "
+                    "Assumes a trusted Python runtime and dependencies, including the codec registry. "
+                    "This does not verify another machine's environment."
+                )
+        if (
+            not result.has_errors
+            and not result.has_warnings
+            and not result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        ):
+            result.metadata["pickle_verdict"] = "clean"
+
     def _scan_pickle_files(
         self,
         zip_file: zipfile.ZipFile,
@@ -8222,6 +8328,7 @@ class PyTorchZipScanner(BaseScanner):
         trusted_pytorch_storage_persistent_id_data_pkl_members: dict[str, set[str]],
         pytorch_data_pickle_storage_sizes_by_data_pkl: dict[str, dict[str, int]],
         trusted_storage_blob_members: set[str],
+        tensor_metadata_digest: bytes | None = None,
     ) -> tuple[int, set[int]]:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -8341,6 +8448,12 @@ class PyTorchZipScanner(BaseScanner):
             ):
                 clean_pickle_entry_ids.add(id(info))
 
+            # Classify only after deciding which members need secondary scans.
+            # Recognizing a reconstruction call must never skip another detector.
+            if in_memory_pickle_data is not None and name.endswith("/data.pkl") and len(pickle_files) == 1:
+                self._classify_trainer_calls(
+                    sub_result, in_memory_pickle_data, tensor_metadata_digest, pytorch_data_pickle_storage_sizes
+                )
             result.merge_member_result(sub_result, name)
             self._record_pickle_member_outcome(
                 result,
@@ -8859,7 +8972,7 @@ class PyTorchZipScanner(BaseScanner):
             else None
         )
         storage_member_sizes_by_data_pkl: dict[str, dict[str, int]] = {}
-        tensor_only = False
+        tensor_metadata_digest = None
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
         for data_pkl_member, data_pkl_entries in entries_by_name.items():
@@ -9000,8 +9113,8 @@ class PyTorchZipScanner(BaseScanner):
                     for storage_key in exact_trusted_storage_keys
                 }
 
-                # This narrower proof scopes *only* ambiguous hidden-pickle
-                # discovery. It never grants trust to data.pkl or its imports.
+                # Bind the layout proof to the exact instructions. Classifying
+                # reconstruction calls also requires independent runtime proof.
                 controls = {
                     prefix + name
                     for name in (
@@ -9024,13 +9137,13 @@ class PyTorchZipScanner(BaseScanner):
                         for entry in safe_entries
                     )
                     and self._zip_payload_bounds_match(zip_file, data_pkl_entry)
+                ) and uses_only_raw_tensors(
+                    pickle_data, storage_member_sizes_by_data_pkl[data_pkl_member], self._check_timeout
                 ):
-                    tensor_only = uses_only_raw_tensors(
-                        pickle_data, storage_member_sizes_by_data_pkl[data_pkl_member], self._check_timeout
-                    )
+                    tensor_metadata_digest = hashlib.sha256(pickle_data).digest()
 
         return _ValidatedPytorchStorageDataPklMembers(
-            tensor_only=tensor_only,
+            tensor_metadata_digest=tensor_metadata_digest,
             storage_keys_by_data_pkl=trusted_members,
             storage_probe_keys_by_data_pkl=storage_probe_members,
             persistent_id_downgrade_keys_by_data_pkl=persistent_id_downgrade_members,

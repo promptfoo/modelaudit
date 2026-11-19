@@ -6,6 +6,7 @@ import json
 import os
 import pickle
 import pickletools
+import py_compile
 import random
 import stat
 import struct
@@ -60,6 +61,7 @@ from modelaudit.scanners import pytorch_zip_scanner as pytorch_zip_scanner_modul
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
+from modelaudit.scanners.pytorch_zip_support import trainer_runtime
 from modelaudit.utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
     REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
@@ -2247,6 +2249,84 @@ def _tensor_checkpoint_metadata(storage: bytes) -> bytes:
         + _pytorch_empty_ordered_dict_reduce_expr()
         + b"tR."
     )
+
+
+@pytest.mark.parametrize("case", ["verified", "unknown", "changed", "strict", "partial", "other", "critical"])
+def test_reconstruction_requires_complete_bound_instructions_and_trusted_runtime(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    data = _tensor_checkpoint_metadata(bytes(32))
+    digest = hashlib.sha256(data).digest()
+    scanner = PyTorchZipScanner(config={"strict_tensor_storage": case == "strict"})
+    result = ScanResult(scanner_name="pickle")
+    result.metadata.update(
+        pickle_report_status="complete",
+        pickle_verdict="suspicious",
+        pickle_coverage={"raw_scan_complete": True, "opcode_scan_complete": case != "partial"},
+        import_references_truncated=False,
+        callable_invocations_truncated=False,
+        nested_opcode_counts={},
+        follow_on_opcode_counts={},
+    )
+    reference = "torch._utils._rebuild_tensor_v2"
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Unverified reference",
+        severity=IssueSeverity.CRITICAL if case == "critical" else IssueSeverity.WARNING,
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={"opcode": "GLOBAL", "import_reference": "os.system" if case == "other" else reference},
+    )
+    monkeypatch.setattr(
+        pytorch_zip_scanner_module,
+        "trusted_trainer_runtime",
+        lambda refs, timeout: case != "unknown" and refs == {reference, "torch.FloatStorage"},
+    )
+    if case == "changed":
+        data += b"cos\nsystem\n)R."
+    scanner._classify_trainer_calls(result, data, digest, {"0": 32})
+    if case == "verified":
+        assert result.metadata["pickle_verdict"] == "clean"
+        assert result.checks[0].status == CheckStatus.PASSED
+        assert result.issues[0].severity == IssueSeverity.INFO
+        assert not should_cache_scan_result(result.to_dict())
+    else:
+        assert result.metadata["pickle_verdict"] == "suspicious"
+        assert result.checks[0].status == CheckStatus.FAILED
+
+
+def test_trainer_runtime_requires_original_wheel_including_bytecode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "torch"
+    package.mkdir()
+    source = package / "__init__.py"
+    source.write_bytes(b"pass\n")
+    digest = hashlib.sha256(b"torch/__init__.py\0" + hashlib.sha256(source.read_bytes()).digest()).hexdigest()
+    monkeypatch.setitem(trainer_runtime._WHEELS, "torch", {1: {digest}})
+
+    def matches() -> bool:
+        return trainer_runtime._wheel_matches(tmp_path, "torch", lambda: False)
+
+    assert matches()
+    extra = package / "shadow.py"
+    extra.write_bytes(b"pass")
+    assert not matches()
+    extra.unlink()
+    source.write_bytes(b"exit()")
+    assert not matches()
+    source.write_bytes(b"pass\n")
+    compiled = py_compile.compile(str(source), doraise=True)
+    assert compiled is not None
+    cache = Path(compiled)
+    cache.write_bytes(cache.read_bytes()[:16] + b"tampered")
+    assert not matches()
+
+
+def test_trainer_runtime_rejects_pythonpath_before_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "torch.py").write_text("raise RuntimeError('must not import')", encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(tmp_path)])
+    assert not trainer_runtime.trusted_trainer_runtime({"torch._utils._rebuild_tensor_v2"}, lambda: False)
 
 
 @pytest.mark.parametrize("strict", [False, True])

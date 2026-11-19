@@ -232,6 +232,19 @@ This distinction applies only to recognized protocol-2 float tensor layouts afte
 stronger evidence of an embedded callable still block completion. Loading instructions and confirmed
 threats are checked in either mode. A completed scan can still report warnings and exit nonzero.
 
+In default mode, expected tensor reconstruction calls can be informational **only** if both the
+instructions and the installed framework files check out. For complex Trainer arguments and RNG
+state, only the exact reviewed FinTwitBERT instruction streams qualify. This is not a model-name
+exception. Changed instructions, missing or modified packages, and unrecognized environments
+keep the original findings. Strict mode keeps the reconstruction warnings.
+
+The initial wheel fingerprints cover CPython 3.11, macOS arm64 and Linux x86-64, with PyTorch
+2.15.0 or 2.11.0, NumPy 2.4.6 or 2.4.4, Transformers 4.57.6 and Accelerate 1.12.0.
+Use a clean, non-editable environment without a custom `PYTHONPATH`. ModelAudit checks installed
+package contents without loading the checkpoint. It assumes the interpreter, import machinery
+and transitive dependencies are trusted. It does not verify the machine that eventually loads
+the model. Runtime-dependent results are not cached.
+
 Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
 should use the emitted keys; previously masked source keys are no longer lookup aliases.
 Very long source identifiers are shortened consistently within each report.

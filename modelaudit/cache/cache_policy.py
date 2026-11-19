@@ -94,6 +94,8 @@ def _metadata_disqualifies_cache(metadata: Any) -> bool:
     if (
         bool(metadata.get("operational_error"))
         or metadata.get("hidden_pickle_coverage") == "inconclusive"
+        or metadata.get("trainer_runtime_dependent") is True
+        or metadata.get("reviewed_trainer_runtime") is True
         or metadata.get("relaxed_crc") is True
         or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         or _has_incomplete_coverage_reasons(metadata)
