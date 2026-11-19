@@ -2282,6 +2282,10 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
         b"Vname\t\nQ.",
         b"Pname\t\n.",
         b"S'name\t'\nQ.",
+        b"Fnan\nQ.",
+        b"Finf\nQ.",
+        b"F-inf\nQ.",
+        b"csite\nhook\t\n.",
     ],
     ids=[
         "named-reference-before-error",
@@ -2296,6 +2300,10 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
         "unicode-control-persistent-id",
         "ascii-control-persistent-id",
         "quoted-control-persistent-id",
+        "nan-persistent-id",
+        "infinity-persistent-id",
+        "negative-infinity-persistent-id",
+        "control-global-name",
     ],
 )
 def test_ambiguous_storage_retains_structured_pickle_evidence(tmp_path: Path, payload: bytes) -> None:

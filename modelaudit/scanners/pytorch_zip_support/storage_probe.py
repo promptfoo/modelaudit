@@ -15,7 +15,6 @@ for _opcode in pickletools.opcodes:
 _STREAM_STARTS = frozenset(ord(op.code) for op in pickletools.opcodes if not op.stack_before)
 _LENGTH_WIDTH = {-2: 1, -3: 4, -4: 4, -5: 8}
 _TEXT_RUN = re.compile(rb"[A-Za-z0-9_+./=\\]{24}")
-_NUMBER = re.compile(rb"[+\-0-9.eELa-fA-Fx\s]*")
 _MAX_LINE_CHECK = 256
 _MAX_OPCODE_RUN = 16
 _MAX_WITNESS_BYTES = 8192
@@ -137,19 +136,18 @@ def storage_pickle_evidence(
         elif width == -1:
             if newline == size:
                 continue
+            # Find boundaries here. Let pickletools validate numerical operands
+            # in bounded witnesses rather than approximating Python's number grammar.
             end = newline + 1
             if op in b"ci":
                 if following_newline == size:
                     continue
                 module = _text_operand(data, start, newline, ascii_only=op == ord("i"))
                 name = _text_operand(data, newline + 1, following_newline, ascii_only=op == ord("i"))
-                if not module or not name:
-                    continue
                 if all(any(c == "_" or c.isalpha() for c in part) for part in (module, name)):
                     return "named_pickle_reference"
                 end = following_newline + 1
-            elif op in b"ILFpg":
-                if newline - start > _MAX_LINE_CHECK or not _NUMBER.fullmatch(data, start, newline):
+                if not (module and name) and not effects[end] & _ENDS_AT_STOP:
                     continue
             elif (op == ord("P") and next_non_ascii < newline) or (
                 op == ord("S")
@@ -175,10 +173,10 @@ def storage_pickle_evidence(
                 state |= _HAS_REFERENCE
         elif op == 0x93:
             state |= _HAS_STACK_GLOBAL
-        elif op in b"PQ":
+        elif op in b"PQc":
             state |= _HAS_REFERENCE
         elif op == ord("i"):
-            state |= _HAS_INST
+            state |= _HAS_INST | _HAS_REFERENCE
         runs[offset] = count
         effects[offset] = state
 
