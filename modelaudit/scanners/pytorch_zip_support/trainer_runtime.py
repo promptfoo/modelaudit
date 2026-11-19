@@ -13,42 +13,27 @@ from pathlib import Path
 from modelaudit_picklescan import call_graph
 
 # SHA-256 over sorted (wheel-relative path NUL, binary file digest) pairs
-# under <package>/ and <package>.libs/. Count is a cheap rejection filter.
+# under <package>/ and <package>.libs/, excluding __pycache__/*.pyc (checked
+# against source below, including NumPy 2.4.4's bundled bytecode).
 # Pins are derived from independent PyPI wheels, not the target installation.
-_WHEELS: dict[str, dict[int, set[str]]] = {
+_WHEELS: dict[str, dict[int, str]] = {
     "accelerate": {
-        84: {
-            "5acbc66852c766881671470927d1f23bcce1e2b679d58f52c9f2a36fbd791a49",  # 1.12.0 universal
-        },
+        84: "5acbc66852c766881671470927d1f23bcce1e2b679d58f52c9f2a36fbd791a49",  # 1.12.0 universal
     },
     "numpy": {
-        1018: {
-            "b0d0ce893a7af92e9dd68a7e315a935551aa9fd567fb6f1c106de7e44a089667",  # 2.4.4 macOS arm64
-            "9c981a943f8db2e62ad4810d0d823a6b756c10021da00cd9731e88f39d3012ba",  # 2.4.6 macOS arm64
-        },
-        1021: {
-            "09853e6561763bef95c6a798dc8e4e57154e50b4a0ef503ef8c75dacb8c2711a",  # 2.4.4 Linux x86_64
-            "e3c34895f98e7bac06ff315c681629588f5f4a261d6fafb97cf0949a02c60d37",  # 2.4.6 Linux x86_64
-        },
+        1017: "ba63b1eca5cfce04411e74df9b56b7696e91d7b6607d13716e6b0cc1b0ab49e9",  # 2.4.4 macOS arm64
+        1018: "9c981a943f8db2e62ad4810d0d823a6b756c10021da00cd9731e88f39d3012ba",  # 2.4.6 macOS arm64
+        1020: "976d25f64674e2ae6128ab33e0ac4257f042ca7b8fda0edc59c9bda23136affb",  # 2.4.4 Linux x86_64
+        1021: "e3c34895f98e7bac06ff315c681629588f5f4a261d6fafb97cf0949a02c60d37",  # 2.4.6 Linux x86_64
     },
     "torch": {
-        11678: {
-            "cbcdb8d0185e2b3836a05ca30ceb8fdb626f440dbcf2fb8d6ff1126a1482e4e4",  # 2.11.0 Linux x86_64
-        },
-        12189: {
-            "c09bc230ecb7116a1c96b97bba2ee7ada2ac33d3a84a63806c39f9eb9e1fe997",  # 2.15.0 Linux x86_64
-        },
-        12245: {
-            "e0e43645ecad4c07ff49332e40afd3a530188fe9cf0617c894a540713ba1f3c7",  # 2.11.0 macOS arm64
-        },
-        12836: {
-            "44965ff430de38aa0b4a1cb6334946c01539f0ed6a07449279822fdc2779381c",  # 2.15.0 macOS arm64
-        },
+        11678: "cbcdb8d0185e2b3836a05ca30ceb8fdb626f440dbcf2fb8d6ff1126a1482e4e4",  # 2.11.0 Linux x86_64
+        12189: "c09bc230ecb7116a1c96b97bba2ee7ada2ac33d3a84a63806c39f9eb9e1fe997",  # 2.15.0 Linux x86_64
+        12245: "e0e43645ecad4c07ff49332e40afd3a530188fe9cf0617c894a540713ba1f3c7",  # 2.11.0 macOS arm64
+        12836: "44965ff430de38aa0b4a1cb6334946c01539f0ed6a07449279822fdc2779381c",  # 2.15.0 macOS arm64
     },
     "transformers": {
-        2240: {
-            "2046524703f6828726b596d4decfb0676a85ce9e50edb3c40e08d1afda8284f7",  # 4.57.6 universal
-        },
+        2240: "2046524703f6828726b596d4decfb0676a85ce9e50edb3c40e08d1afda8284f7",  # 4.57.6 universal
     },
 }
 _MAX_BYTES = 2 * 1024**3
@@ -61,6 +46,12 @@ def _isolated_paths() -> bool:
     stdlib = Path(paths["stdlib"])
     trusted = {Path(paths[name]) for name in ("stdlib", "platstdlib", "purelib", "platlib", "scripts")}
     trusted.add(stdlib / "lib-dynload")
+    # uv can use a minor-version symlink for the interpreter's extension
+    # directory. Accept the interpreter's alias only if it is the same directory.
+    if sys.base_exec_prefix != sys.base_prefix:
+        alias = Path(sys.base_exec_prefix) / stdlib.relative_to(sys.base_prefix) / "lib-dynload"
+        if alias.is_absolute() and alias.samefile(stdlib / "lib-dynload"):
+            trusted.add(alias)
     # ModelAudit adds its installed protobuf module root during discovery.
     trusted.add(Path(paths["purelib"]) / "modelaudit" / "protos")
     stdlib_zip = stdlib.parent / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
@@ -116,7 +107,7 @@ def _wheel_matches(root: Path, pkg: str, check_timeout: Callable[[], bool]) -> b
                     return False
                 h.update(chunk)
         digest.update(rel.encode() + b"\0" + h.digest())
-    if digest.hexdigest() not in pins[len(files)]:
+    if digest.hexdigest() != pins[len(files)]:
         return False
     # A timestamp-valid .pyc can override even an authentic source file.
     for cache in caches:

@@ -12,6 +12,7 @@ import stat
 import struct
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import tracemalloc
@@ -2303,7 +2304,7 @@ def test_trainer_runtime_requires_original_wheel_including_bytecode(
     source = package / "__init__.py"
     source.write_bytes(b"pass\n")
     digest = hashlib.sha256(b"torch/__init__.py\0" + hashlib.sha256(source.read_bytes()).digest()).hexdigest()
-    monkeypatch.setitem(trainer_runtime._WHEELS, "torch", {1: {digest}})
+    monkeypatch.setitem(trainer_runtime._WHEELS, "torch", {1: digest})
 
     def matches() -> bool:
         return trainer_runtime._wheel_matches(tmp_path, "torch", lambda: False)
@@ -2321,6 +2322,24 @@ def test_trainer_runtime_requires_original_wheel_including_bytecode(
     cache = Path(compiled)
     cache.write_bytes(cache.read_bytes()[:16] + b"tampered")
     assert not matches()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX lib-dynload layout")
+def test_trainer_runtime_checks_uv_interpreter_alias(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    base = tmp_path / "python-3.11.14"
+    (base / "lib/python3.11/lib-dynload").mkdir(parents=True)
+    alias = tmp_path / "python-3.11"
+    alias.symlink_to(base, target_is_directory=True)
+    paths = sysconfig.get_paths() | {"stdlib": str(base / "lib/python3.11")}
+    monkeypatch.setattr(sysconfig, "get_paths", lambda: paths)
+    monkeypatch.setattr(sys, "base_prefix", str(base))
+    monkeypatch.setattr(sys, "base_exec_prefix", str(alias))
+    monkeypatch.setattr(sys, "pycache_prefix", None)
+    monkeypatch.setattr(sys, "path", [str(alias / "lib/python3.11/lib-dynload")])
+    assert trainer_runtime._isolated_paths()
+    alias.unlink()
+    (alias / "lib/python3.11/lib-dynload").mkdir(parents=True)
+    assert not trainer_runtime._isolated_paths()
 
 
 def test_trainer_runtime_rejects_pythonpath_before_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
