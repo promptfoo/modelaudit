@@ -8,18 +8,15 @@ Features and fixes increment the patch version. Breaking changes increment the m
 
 [Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
 
-## [0.1.15](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...modelaudit-picklescan-v0.1.15) (2026-11-17)
+## [0.1.15](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...modelaudit-picklescan-v0.1.15) (2026-11-18)
 
 <!-- release-note-source: 754c59bb7c0b7de016efa2f0539c87980510db9c -->
 
 <!-- release-note-entries: 1 -->
 
-<details>
-<summary>Other changes</summary>
+### Bug fix
 
-- Pickle scans avoid a false oversized frame warning when encoded data resembles a nested pickle with an invalid persistent ID.
-
-</details>
+- Pickle scans avoid a false oversized frame warning when encoded data resembles a nested pickle with an invalid persistent ID. [#2022](https://github.com/promptfoo/modelaudit/pull/2022)
 
 <details>
 <summary>All changes</summary>

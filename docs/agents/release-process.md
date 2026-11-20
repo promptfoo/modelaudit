@@ -36,13 +36,13 @@ When an OpenAI API key is set, documentation triage can send eligible findings a
 
 From the repository root, run `python scripts/release_notes.py check` to validate pending fragments and detect edits to shipped files. Run `python scripts/release_notes.py pending --package modelaudit` or `--package modelaudit-picklescan` to preview one package’s source fragments. These commands use uv and the pinned Towncrier environment in `scripts/release-tools/`. Shipped fragment files stay in Git, so give later notes new filenames.
 
-On the rolling release branch, both commands use the merge base with `origin/main` to find the last published versions. For a detached release PR checkout, pass `--base <PR-base-SHA>` to either command. If a package tag is missing locally, the error names the tag to fetch. To see wording supplied by reviewers, read the generated changelog on the release PR.
+On the rolling release branch, both commands use the merge base with `origin/main` to find the last published versions. For a detached release PR checkout, pass `--base <PR-base-SHA>` to either command. If a package tag is missing locally, the error names the tag to fetch. To see the reviewed package sections and coverage locally, fetch the release PR and run `python scripts/release_notes.py preview --base origin/main --ref HEAD --max-bytes 64000` from its checkout.
 
 Each generated version section records the reviewed `main` commit and the number of rendered notes in hidden Markdown comments. Identical notes grouped by Towncrier count as one entry. If another fragment lands or a pending fragment changes before the release PR merges, the next release picks up that addition or revision. Older tags without a source comment keep their original cutoff. If an open release PR is missing these comments, refresh its metadata using the command below.
 
 ### Reviewing the rolling release PR
 
-Inspect the versioned section in each changed changelog. CI checks that it follows **Unreleased**, includes the pending categories and numbered issue links, and points to the component’s tag comparison under **All changes**. Later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
+Review the **Release notes preview** comment on the release PR. It shows the exact versioned section for each changed component, including the approved wording and the folded commit inventory. Check any listed source changes missing from the notes before merging. For unusually long releases the preview links to the changelogs at the reviewed commit. CI checks that it follows **Unreleased**, includes the pending categories and numbered issue links, and points to the component’s tag comparison under **All changes**. Later merges refresh the same release PR. To change the wording of a fragment on that PR, a maintainer with repository write access can post a comment with its exact path on the first line, followed by the complete replacement fragment.
 
 ```markdown
 <!-- release-note: changes/1924.upgrade.md -->
@@ -57,7 +57,7 @@ gh api repos/promptfoo/modelaudit/dispatches -f event_type=release-metadata-retr
   -f 'client_payload[pr_branch]=release-please--branches--main'
 ```
 
-The publisher uses the approved versioned section from the matching tag for the public GitHub Release. The comparison link and generated pull request inventory are available under **All changes**. A manual retry of an existing historical release retains its release page.
+The publisher uses the approved versioned section from the matching tag for the public GitHub Release. Upgrade, security and other reviewed notes are visible directly. When a release has no fragments, up to three entries from the generated inventory are shown. The comparison link and complete inventory are available under **All changes**. CI checks that cited ModelAudit commits belong to the release history and that reader-facing links return a successful public HTTP response after redirects. The new tag in the comparison is checked against the proposed release manifest and becomes available after merge. A manual retry of an existing historical release retains its release page.
 
 ## Version scheme (0ver)
 
@@ -149,7 +149,7 @@ Before merging a Release PR:
    - project URL metadata checks (`Bug Tracker`, `Changelog`)
    - standalone Rust gates: `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo test`, wheel build, clean-room wheel smoke test
 4. No unreviewed high-severity security findings outstanding.
-5. After merging, verify GitHub Release exists and PyPI publish completed for each bumped component:
+5. When the publication jobs finish, the merged release PR gets a status comment for each package with its build, PyPI upload, install, and provenance results. Each comment links to the exact PyPI version and workflow attempt. A provenance-only recovery posts a separate result. To check the registries directly:
 
    ```bash
    # modelaudit

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -160,6 +161,7 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
     run(root, "render", "--base", base)
     public = run(root, "extract", "--package", "modelaudit-picklescan", "--version", "0.1.2").stdout
     assert "<summary>All changes</summary>" in public
+    assert "### Changes\n\n- merged change" in public.partition("<details>")[0]
     assert "merged change" in public
     assert "### Highlights" not in public
     assert (root / "CHANGELOG.md").read_bytes() == before
@@ -192,7 +194,7 @@ def test_sibling_only_release_with_no_fragments_retains_inventory(repository: Pa
         ("<!-- release-note-source:", "<!-- removed:", "missing release-note-source"),
         ("<!-- release-note-entries:", "<!-- removed:", "reviewed entry count"),
         ("### Upgrade notes", "", "missing reviewed category"),
-        ("<summary>Other changes</summary>", "", "missing reviewed category"),
+        ("### Other changes", "", "missing reviewed category"),
         ("- First change. [#42]", "- First change. [#43]", "missing reviewed reference for"),
     ],
 )
@@ -398,6 +400,7 @@ def test_extract_from_historical_tags_with_repeated_unreleased_headings(reposito
     ("manual", "exists", "tagged", "predates_changelog", "expected"),
     [
         (False, True, True, False, "edit"),
+        (True, True, True, False, "preserve"),
         (True, False, True, False, "create"),
         (True, False, False, False, "create"),
         (True, False, True, True, "create"),
@@ -463,7 +466,10 @@ def test_publication_sends_the_exact_tagged_section(
         "GITHUB_SHA": dispatch,
     }
     subprocess.run(["bash", "-c", shell], cwd=root, env=env, check=True, capture_output=True)
-    assert json.loads((scratch / "sent.json").read_text()) == [expected, expected_notes]
+    if expected == "preserve":
+        assert not (scratch / "sent.json").exists()
+    else:
+        assert json.loads((scratch / "sent.json").read_text()) == [expected, expected_notes]
     assert (scratch / "created-tag").exists() == (not tagged)
 
 
@@ -495,6 +501,8 @@ def test_metadata_job_accepts_only_review_comments_from_writers(
     helper = Path(".github/scripts/prepare-release-metadata.py")
     (root / helper.parent).mkdir(parents=True)
     shutil.copyfile(SCRIPT.parents[1] / helper, root / helper)
+    link_config = Path(".github/markdown-link-check-config.json")
+    shutil.copyfile(SCRIPT.parents[1] / link_config, root / link_config)
     # A component can already be versioned on main before the release manifest catches up.
     write_project_versions(root, "0.2.1", "0.1.2", ">=0.1.1,<0.2.0")
     (root / "package-lock.json").write_text("protected dependency lock")
@@ -663,6 +671,7 @@ def test_metadata_writer_preserves_candidate_and_compares_remote_head(
         **os.environ,
         "PATH": str(scratch) + os.pathsep + os.environ["PATH"],
         "PR_NUMBER": "7",
+        "GITHUB_OUTPUT": str(scratch / "output"),
         "MOCK_PR": str(scratch / "pr.json"),
         "PR_BRANCH": branch,
         "EXPECTED_HEAD": head,
@@ -745,3 +754,127 @@ def test_reviewed_entry_count_preserves_grouping_and_catches_dropped_notes(repos
     assert "<!-- release-note-entries: 4 -->" in approved
     assert approved.count("- Unnumbered instructions.") == 1
     run(repository, "check", "--base", base)
+
+
+def test_preview_checks_each_tag_and_the_latest_target_commit(repository: Path) -> None:
+    root = repository
+    target = git(root, "branch", "--show-current")
+
+    def change(subject: str, *paths: str) -> str:
+        for path in paths:
+            fragment(root, path, subject)
+        return commit(root, subject)
+
+    shipped = change("fix: previously shipped sibling fix (#10)", f"{SIBLING}/engine")
+    git(root, "tag", "-f", "modelaudit-picklescan-v0.1.1")
+    cross_package = change("fix: shared correction (#17)", "root-code", f"{SIBLING}/code")
+    reverted = change("feat: discontinued (#18)", "draft")
+    git(root, "revert", "--no-edit", reverted)
+    restored = change("feat: restored (#19)", "restored")
+    git(root, "revert", "--no-edit", restored)
+    git(root, "revert", "--no-edit", "HEAD")
+    wrong_repo = change("fix: wrongly linked PR (#23)", "another-file")
+    git(root, "switch", "-qc", "release")
+    write_manifest(root, "0.2.2", "0.1.2")
+    raw_section(root, ".", "0.2.1", "0.2.2", "v")
+    raw_section(root, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    p = root / "CHANGELOG.md"
+    p.write_text(
+        p.read_text().replace(
+            "- merged change",
+            f'- Fix #17. [#23](https://github.com/other/repo/pull/23 "reports #23")\n<!-- {wrong_repo} -->',
+        )
+    )
+    candidate = commit(root, "chore: release")
+    git(root, "switch", "-q", target)
+    security = change("chore(deps): update [security] (#21)", "uv.lock")
+    preview = run(root, "preview", "--base", target, "--ref", candidate).stdout
+    root_gaps, sibling_gaps = preview.split("## Release note coverage")[1].split("**modelaudit-picklescan")
+    assert all(sha in root_gaps for sha in (restored, wrong_repo, security))
+    assert cross_package not in root_gaps and cross_package in sibling_gaps
+    assert reverted not in preview and shipped not in sibling_gaps
+    assert f"/compare/modelaudit-picklescan-v0.1.1...{security}" in sibling_gaps
+
+    # A busy release should list a bounded sample with a link to its complete tag range.
+    for i in range(13):
+        change(f"fix: late commit {i}", "late")
+    preview = run(root, "preview", "--base", target, "--ref", candidate).stdout
+    root_gaps = preview.split("## Release note coverage")[1].split("**modelaudit-picklescan")[0]
+    assert root_gaps.count("/commit/") == 12 and "(16)" in root_gaps
+    assert not run(root, "preview", "--base", target, "--ref", target).stdout.strip()
+
+
+def test_recent_paired_release_ingredients_are_visible_in_the_reviewed_preview(repository: Path) -> None:
+    # The 0.2.57/0.1.15 pair had installation guidance and the standalone package's only fix in "other".
+    guidance = "When upgrading an existing installation, install both ModelAudit and PickleScan."
+    fix = "Pickle scans avoid false oversized-frame warnings."
+    fragment(repository, "changes/2025.other.md", guidance)
+    fragment(repository, "changes/2040.security.md", "Detect executable fairseq configurations.")
+    fragment(repository, f"{SIBLING}/changes/2022.other.md", fix)
+    base = commit(repository, "include the reviewed paired release notes")
+    write_manifest(repository, "0.2.2", "0.1.2")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    raw_section(repository, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    run(repository, "render", "--base", base)
+    candidate = commit(repository, "review both package sections")
+    write_manifest(repository, "0.2.1", "0.1.1")  # The checkout can advance after the PR was reviewed.
+    preview = run(repository, "preview", "--base", base, "--ref", candidate).stdout
+    for package, version, note in (("modelaudit", "0.2.2", guidance), ("modelaudit-picklescan", "0.1.2", fix)):
+        section = run(repository, "extract", "--package", package, "--version", version, "--ref", candidate).stdout
+        assert section.rstrip() in preview
+        assert note in section.partition("<details>")[0]
+        assert "merged change" in section.partition("<summary>All changes</summary>")[2]
+    compact = run(
+        repository, "preview", "--base", base, "--ref", candidate, "--max-bytes", str(len(preview) - 1)
+    ).stdout
+    assert guidance in compact and fix in compact and "<summary>All changes</summary>" not in compact
+    links = run(repository, "preview", "--base", base, "--ref", "HEAD", "--max-bytes", "400").stdout
+    assert f"/blob/{candidate}/CHANGELOG.md" in links
+    assert f"/blob/{candidate}/{SIBLING}/CHANGELOG.md" in links
+
+
+def test_release_pr_header_preserves_a_blank_line_before_the_generated_separator() -> None:
+    config = json.loads((SCRIPT.parents[1] / "release-please-config.json").read_text())
+    # PullRequestBody.toString joins the header and the delimiter with exactly one newline.
+    assert (config["pull-request-header"] + "\n---").endswith("\n\n---")
+
+
+def test_link_checker_exempts_only_the_exact_upcoming_tag_comparisons(repository: Path) -> None:
+    base = git(repository, "rev-parse", "HEAD")
+    write_manifest(repository, "0.2.2", "0.1.2")
+    raw_section(repository, ".", "0.2.1", "0.2.2", "v")
+    raw_section(repository, SIBLING, "0.1.1", "0.1.2", "modelaudit-picklescan-v")
+    config = repository / "links.json"
+    run(repository, "render", "--base", base, "--link-check-config", str(config))
+    patterns = [entry["pattern"] for entry in json.loads(config.read_text())["ignorePatterns"]]
+    repo = "https://github.com/promptfoo/modelaudit"
+    for target, exempt in (
+        ("compare/v0.2.1...v0.2.2", True),
+        ("compare/modelaudit-picklescan-v0.1.1...modelaudit-picklescan-v0.1.2", True),
+        ("compare/v0.2.0...v0.2.1", False),
+        ("compare/v0-2-1...v0-2-2", False),
+        ("pull/9999", False),
+        ("issues/2025", False),
+        ("commit/deadbeef", False),
+    ):
+        assert any(re.search(pattern, f"{repo}/{target}") for pattern in patterns) == exempt
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="the release metadata job runs Node")
+def test_commit_citations_belong_to_the_release_history(repository: Path) -> None:
+    if not (SCRIPT.parents[1] / "node_modules/prettier").exists():
+        pytest.skip("install the repository Markdown parser with npm ci")
+    sha = git(repository, "rev-parse", "HEAD")
+    unrelated = git(repository, "commit-tree", "HEAD^{tree}", "-m", "unrelated")
+    repo = "https://github.com/promptfoo/modelaudit/commit"
+    notes = repository / "preview.md"
+    for body, expected in (
+        (f"[Fix]({repo}/{sha})", True),
+        (f"[Fix]({repo}/{unrelated})", False),
+        (f"`[example]({repo}/{unrelated})`", True),
+    ):
+        notes.write_text(body)
+        result = subprocess.run(
+            ["node", str(SCRIPT.with_name("check-release-links.mjs")), str(notes)], cwd=repository, capture_output=True
+        )
+        assert (result.returncode == 0) == expected, result.stderr
