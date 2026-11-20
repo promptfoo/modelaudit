@@ -4,16 +4,30 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](../../docs/agents/release-process.md#version-scheme-0ver).
 
+## [Unreleased]
+
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.16...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+
 ## [0.1.16](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...modelaudit-picklescan-v0.1.16) (2026-11-20)
 
+<!-- release-note-source: 9415dfd72ec870ed3506e6527718692adefcf2f8 -->
+
+<!-- release-note-entries: 1 -->
+
+### Other changes
+
+- Stop flagging ordinary checkpoint reconstruction by trusted PyTorch, NumPy, Transformers and Accelerate installations.
+
+<details>
+<summary>All changes</summary>
 
 ### Bug Fixes
 
-* stop flagging normal PyTorch and Transformers checkpoints ([#2051](https://github.com/promptfoo/modelaudit/issues/2051)) ([f10748f](https://github.com/promptfoo/modelaudit/commit/f10748f32c5a2f5c1f3bd07ac283eab91a6ae12b))
+- stop flagging normal PyTorch and Transformers checkpoints ([#2051](https://github.com/promptfoo/modelaudit/issues/2051)) ([f10748f](https://github.com/promptfoo/modelaudit/commit/f10748f32c5a2f5c1f3bd07ac283eab91a6ae12b))
 
-## [Unreleased]
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...modelaudit-picklescan-v0.1.16)
 
-[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+</details>
 
 ## [0.1.15](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...modelaudit-picklescan-v0.1.15) (2026-11-18)
 

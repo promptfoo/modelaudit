@@ -4,22 +4,42 @@ All notable changes to this project will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](docs/agents/release-process.md#version-scheme-0ver).
 
+## [Unreleased]
+
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.58...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
+
 ## [0.2.58](https://github.com/promptfoo/modelaudit/compare/v0.2.57...v0.2.58) (2026-11-20)
 
+<!-- release-note-source: 9415dfd72ec870ed3506e6527718692adefcf2f8 -->
+
+<!-- release-note-entries: 7 -->
+
+### Other changes
+
+- PyTorch ZIP scans avoid counting the same tensor-storage prefix twice against the hidden-pickle inspection work limit.
+- README scans correctly classify visible hostnames near tokenizer and authentication terminology, avoiding unnecessary exhaustion of the endpoint inspection budget.
+- Recognize extended SentencePiece vocabularies with BERT control tokens, complete endpoint analysis on larger model cards, count failed coverage checks in scan totals, and provide remediation guidance for missing framework source.
+- Separate speculative hidden-pickle coverage in verified raw PyTorch tensors from default scan completion. Keep concrete payload findings and strict-mode incomplete coverage.
+- Show incomplete coverage in scanner summaries and saved reports. Keep coverage evidence visible in nonverbose JSON and omit the success rate when coverage is incomplete.
+- Treat low-confidence domains found only as passive WordPiece vocabulary tokens as informational. Preserve active and high-risk domain findings.
+- Upgrade `modelaudit-picklescan` to 0.1.16 to avoid false positives for ordinary checkpoint loading operations when trusted framework libraries are installed. Upgrading ModelAudit alone can leave an older PickleScan version installed.
+
+<details>
+<summary>All changes</summary>
 
 ### Bug Fixes
 
-* avoid rechecking identical PyTorch storage prefixes ([#2044](https://github.com/promptfoo/modelaudit/issues/2044)) ([80b1b0d](https://github.com/promptfoo/modelaudit/commit/80b1b0dd5de1e10934ae42935c5f8bb66043bfae))
-* classify passive WordPiece domain tokens as informational ([#2050](https://github.com/promptfoo/modelaudit/issues/2050)) ([3e7dfa5](https://github.com/promptfoo/modelaudit/commit/3e7dfa5c967e557eab7130ae9b3757856b1f6029))
-* finish tokenizer and model card scans and report incomplete checks ([#2042](https://github.com/promptfoo/modelaudit/issues/2042)) ([239e575](https://github.com/promptfoo/modelaudit/commit/239e5753281a6759bc73f4f202e2ffb6c0c78f5a))
-* preserve hostname markers during endpoint classification ([#2047](https://github.com/promptfoo/modelaudit/issues/2047)) ([83fa9c9](https://github.com/promptfoo/modelaudit/commit/83fa9c9a22534376d982663af5c89a98438c5c60))
-* preserve incomplete coverage in saved scan reports ([#2045](https://github.com/promptfoo/modelaudit/issues/2045)) ([9415dfd](https://github.com/promptfoo/modelaudit/commit/9415dfd72ec870ed3506e6527718692adefcf2f8))
-* stop flagging normal PyTorch and Transformers checkpoints ([#2051](https://github.com/promptfoo/modelaudit/issues/2051)) ([f10748f](https://github.com/promptfoo/modelaudit/commit/f10748f32c5a2f5c1f3bd07ac283eab91a6ae12b))
-* stop valid PyTorch models from failing scans ([#2043](https://github.com/promptfoo/modelaudit/issues/2043)) ([0513a46](https://github.com/promptfoo/modelaudit/commit/0513a46914eb5b19170c352be4e78e4a92ff994c))
+- avoid rechecking identical PyTorch storage prefixes ([#2044](https://github.com/promptfoo/modelaudit/issues/2044)) ([80b1b0d](https://github.com/promptfoo/modelaudit/commit/80b1b0dd5de1e10934ae42935c5f8bb66043bfae))
+- classify passive WordPiece domain tokens as informational ([#2050](https://github.com/promptfoo/modelaudit/issues/2050)) ([3e7dfa5](https://github.com/promptfoo/modelaudit/commit/3e7dfa5c967e557eab7130ae9b3757856b1f6029))
+- finish tokenizer and model card scans and report incomplete checks ([#2042](https://github.com/promptfoo/modelaudit/issues/2042)) ([239e575](https://github.com/promptfoo/modelaudit/commit/239e5753281a6759bc73f4f202e2ffb6c0c78f5a))
+- preserve hostname markers during endpoint classification ([#2047](https://github.com/promptfoo/modelaudit/issues/2047)) ([83fa9c9](https://github.com/promptfoo/modelaudit/commit/83fa9c9a22534376d982663af5c89a98438c5c60))
+- preserve incomplete coverage in saved scan reports ([#2045](https://github.com/promptfoo/modelaudit/issues/2045)) ([9415dfd](https://github.com/promptfoo/modelaudit/commit/9415dfd72ec870ed3506e6527718692adefcf2f8))
+- stop flagging normal PyTorch and Transformers checkpoints ([#2051](https://github.com/promptfoo/modelaudit/issues/2051)) ([f10748f](https://github.com/promptfoo/modelaudit/commit/f10748f32c5a2f5c1f3bd07ac283eab91a6ae12b))
+- stop valid PyTorch models from failing scans ([#2043](https://github.com/promptfoo/modelaudit/issues/2043)) ([0513a46](https://github.com/promptfoo/modelaudit/commit/0513a46914eb5b19170c352be4e78e4a92ff994c))
 
-## [Unreleased]
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/v0.2.57...v0.2.58)
 
-[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.57...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
+</details>
 
 ## [0.2.57](https://github.com/promptfoo/modelaudit/compare/v0.2.56...v0.2.57) (2026-11-18)
 
