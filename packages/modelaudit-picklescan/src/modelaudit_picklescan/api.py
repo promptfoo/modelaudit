@@ -32,8 +32,6 @@ from .call_graph import (
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
     _class_base_targets,
-    _ClassSourceContext,
-    _definition_scope_statements,
     _ensure_shared_source_snapshot_stable,
     _find_module_spec_without_imports,
     _interpreter_reference_is_trusted,
@@ -42,7 +40,6 @@ from .call_graph import (
     _resolve_class_target,
     _runtime_module_attribute_without_hooks,
     _source_class_context,
-    _statement_binds_name,
     class_static_attribute_lookup_is_proven_source_backed,
     find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
@@ -5464,7 +5461,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         try:
             if callable_invocations_complete and non_allowlisted_global_imports_complete:
                 ordinary_checkpoint_positions = _ordinary_checkpoint_positions(
-                    report, payload, suppress_safe_numpy_reconstruct, analyzed_invocation_global_positions
+                    report, payload, suppress_safe_numpy_reconstruct
                 )
         except Exception as error:
             enrichment_errors.append(("python_checkpoint_reconstruction", error))
@@ -6057,355 +6054,79 @@ def _distribution_owns_module(module: str) -> bool:
         return False
 
 
-def _checkpoint_opcodes(payload: bytes) -> list[tuple[str, Any, int, int | None]]:
-    memo: dict[int, tuple[str, Any, int | None] | None] = {}
-    operations: list[tuple[str, Any, int, int | None]] = []
-    for count, (opcode, arg, position) in enumerate(pickletools.genops(payload), 1):
-        if count > _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES or position is None:
-            return []
-        name = opcode.name
-        if name in {"BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"}:
-            if name == "MEMOIZE":
-                key = len(memo)
-            elif arg is not None:
-                key = int(arg)
-            else:
-                return []
-            previous = operations[-1] if operations else None
-            memo[key] = (
-                (previous[0], previous[1], previous[3])
-                if previous and previous[0] in {"GLOBAL", "BINUNICODE", "SHORT_BINUNICODE"}
-                else None
-            )
-            continue
-        value = memo.get(int(arg)) if name in {"BINGET", "LONG_BINGET", "GET"} and arg is not None else None
-        if value is not None:
-            kind, value_arg, definition = value
-            operations.append((kind, value_arg, position, definition))
-        else:
-            operations.append((name, arg, position, position if name == "GLOBAL" else None))
-    return operations if operations and operations[-1][0] == "STOP" and operations[-1][2] + 1 == len(payload) else []
-
-
 def _ordinary_checkpoint_positions(
-    report: PickleReport,
-    payload: bytes | None,
-    safe_numpy: bool,
-    analyzed: frozenset[int],
+    report: PickleReport, payload: bytes | None, safe_numpy: bool
 ) -> frozenset[tuple[int, str, str]]:
-    if (
-        report.status != ScanStatus.COMPLETE
-        or report.verdict == SafetyVerdict.MALICIOUS
-        or type(payload) is not bytes
-        or len(payload) > _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES
-    ):
+    if report.status != ScanStatus.COMPLETE or report.verdict == SafetyVerdict.MALICIOUS or type(payload) is not bytes:
         return frozenset()
     supported = _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES | _CODECS_ENCODE_REFERENCES
-    candidates = [
-        f
-        for f in report.findings
-        if f.rule_code == "NON_ALLOWLISTED_GLOBAL" and (f.details.get("module"), f.details.get("name")) in supported
-    ]
-    if not candidates:
-        return frozenset()
-    operations = _checkpoint_opcodes(payload)
-    if not operations:
-        return frozenset()
-    uses: dict[int, list[int]] = {}
-    for index, (opcode, _arg, _position, definition) in enumerate(operations):
-        if opcode == "GLOBAL" and definition is not None:
-            uses.setdefault(definition, []).append(index)
-    calls_by_position: dict[int, list[Mapping[str, object]]] = {}
+    calls: dict[int, list[Mapping[str, object]]] = {}
     for item in _sequence(report.metadata.get("callable_invocations")):
         invocation = _mapping(item)
         position = _optional_int(invocation.get("global_position"))
         if position is not None:
-            calls_by_position.setdefault(position, []).append(invocation)
+            calls.setdefault(position, []).append(invocation)
     ownership: dict[str, bool] = {}
     safe: set[tuple[int, str, str]] = set()
-    for finding in candidates:
+    for finding in report.findings:
+        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL":
+            continue
         module, name = str(finding.details.get("module", "")), str(finding.details.get("name", ""))
+        reference = (module, name)
         position = _optional_int(finding.details.get("position"))
-        if position is None or position not in uses:
+        if reference not in supported or position is None or position < 0:
             continue
-        if any(operations[i][1] != f"{module} {name}" for i in uses[position]):
+        header = f"c{module}\n{name}\n".encode()
+        if not payload.startswith(header, position):
             continue
-        key = (position, module, name)
-        invocations = calls_by_position.get(position, [])
-        if not invocations:
+        invocations = calls.get(position, [])
+        if not invocations or any((item.get("module"), item.get("name")) != reference for item in invocations):
             continue
-        if (module, name) == ("_codecs", "encode"):
-            if (
-                safe_numpy
-                and _interpreter_reference_is_trusted("_codecs", "encode")
-                and all(
-                    _checkpoint_literal_call(operations, i, {"latin1", "latin-1"}, codec=True) for i in uses[position]
-                )
-            ):
-                safe.add(key)
+        if reference == ("_codecs", "encode"):
+            trusted = safe_numpy and _interpreter_reference_is_trusted(module, name)
+        else:
+            if module not in ownership:
+                ownership[module] = _distribution_owns_module(module)
+            trusted = ownership[module] and all(
+                import_only_reference_is_proven_trusted_for_pickle_invocation(module, name, item)
+                for item in invocations
+            )
+        if not trusted:
             continue
-        if (module, name) not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES:
-            continue
-        if module not in ownership:
-            ownership[module] = _distribution_owns_module(module)
-        if not ownership[module] or not all(
-            import_only_reference_is_proven_trusted_for_pickle_invocation(module, name, invocation)
-            for invocation in invocations
-        ):
-            continue
-        if (module, name) in _NUMPY_RECONSTRUCT_REFERENCES | _NUMPY_DTYPE_REFERENCES:
-            if safe_numpy:
-                safe.add(key)
-        elif (module, name) == ("torch._utils", "_rebuild_tensor_v2"):
-            if _collections_ordered_dict_binding_is_canonical() and all(
-                _checkpoint_tensor_call(operations, i) for i in uses[position]
-            ):
-                safe.add(key)
-        elif (module, name) == ("torch", "device"):
-            if all(_checkpoint_device_call(operations, i) for i in uses[position]):
-                safe.add(key)
+        shape = [(item.get("opcode"), item.get("positional_arg_count")) for item in invocations]
+        if reference in _NUMPY_RECONSTRUCT_REFERENCES | _NUMPY_DTYPE_REFERENCES:
+            ordinary = safe_numpy
+        elif reference == ("_codecs", "encode"):
+            ordinary = all(item == ("REDUCE", 2) for item in shape)
+        elif reference == ("torch._utils", "_rebuild_tensor_v2"):
+            ordinary = _collections_ordered_dict_binding_is_canonical() and all(item == ("REDUCE", 6) for item in shape)
+        elif reference == ("torch", "device"):
+            ordinary = all(item in {("REDUCE", 1), ("REDUCE", 2)} for item in shape)
         else:
             context = _source_class_context(f"{module}.{name}")
-            if context is None:
-                continue
-            node = context.class_node
-            values = _checkpoint_enum_values(node)
-            is_enum = bool(values) and _checkpoint_enum_has_trusted_base(context, ownership)
-            ordinary_enum = (
-                values and is_enum and all(_checkpoint_literal_call(operations, i, values) for i in uses[position])
+            ordinary = context is not None and (
+                (all(item == ("REDUCE", 1) for item in shape) and _checkpoint_is_enum(f"{module}.{name}"))
+                or (
+                    not context.class_node.bases
+                    and shape == [("NEWOBJ", 0), ("BUILD", None)]
+                    and invocations[1].get("build_uses_slot_state") is False
+                )
             )
-            ordinary_class = len(uses[position]) == 1 and _checkpoint_plain_class(
-                context, invocations, position in analyzed
-            )
-            if ordinary_enum or ordinary_class:
-                safe.add(key)
+        if ordinary:
+            safe.add((position, module, name))
     return frozenset(safe)
 
 
-def _checkpoint_enum_values(node: ast.ClassDef) -> set[str]:
-    values: set[str] = set()
-    for statement in node.body:
-        if (
-            isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Constant)
-            and isinstance(statement.value.value, str)
-        ):
-            continue
-        if (
-            not isinstance(statement, ast.Assign)
-            or len(statement.targets) != 1
-            or not isinstance(statement.targets[0], ast.Name)
-            or statement.targets[0].id.startswith("_")
-            or not statement.targets[0].id.isupper()
-            or not isinstance(statement.value, ast.Constant)
-            or not isinstance(statement.value.value, str)
-        ):
-            return set()
-        values.add(statement.value.value)
-    return values
-
-
-def _checkpoint_enum_has_trusted_base(context: _ClassSourceContext, ownership: dict[str, bool], depth: int = 0) -> bool:
-    node = context.class_node
-    if depth >= 4 or node.keywords or node.decorator_list:
+def _checkpoint_is_enum(target: str, depth: int = 0) -> bool:
+    if target == "enum.Enum":
+        return _runtime_module_attribute_without_hooks("enum", "Enum") is Enum
+    if depth >= 4 or (context := _source_class_context(target)) is None:
         return False
-    targets = _class_base_targets(node, context.module_name, context.aliases, context.local_defs)
-    if len(targets) != len(node.bases):
-        return False
-    enum_bases = 0
-    for target in targets:
-        if target in {"str", "builtins.str"}:
-            continue
-        resolved = _resolve_class_target(target)
-        if resolved == "enum.Enum":
-            if _runtime_module_attribute_without_hooks("enum", "Enum") is not Enum:
-                return False
-        else:
-            parent = _source_class_context(resolved) if resolved else None
-            if parent is None:
-                return False
-            if any(
-                not (
-                    (
-                        isinstance(statement, ast.Expr)
-                        and isinstance(statement.value, ast.Constant)
-                        and isinstance(statement.value.value, str)
-                    )
-                    or (isinstance(statement, ast.FunctionDef) and statement.name == "_missing_")
-                )
-                for statement in parent.class_node.body
-            ):
-                return False
-            module = parent.module_name
-            if module not in ownership:
-                ownership[module] = _distribution_owns_module(module)
-            if not ownership[module] or not _checkpoint_enum_has_trusted_base(parent, ownership, depth + 1):
-                return False
-        enum_bases += 1
-    return enum_bases == 1
-
-
-def _checkpoint_literal_call(
-    operations: list[tuple[str, Any, int, int | None]], index: int, values: set[str], *, codec: bool = False
-) -> bool:
-    window = operations[index : index + (5 if codec else 4)]
-    names = [x[0] for x in window]
-    if codec:
-        return names == ["GLOBAL", "BINUNICODE", "BINUNICODE", "TUPLE2", "REDUCE"] and window[2][1] in values
-    return (
-        len(window) == 4
-        and names[1] in {"BINUNICODE", "SHORT_BINUNICODE"}
-        and names[2:] == ["TUPLE1", "REDUCE"]
-        and window[1][1] in values
-    )
-
-
-def _checkpoint_device_call(operations: list[tuple[str, Any, int, int | None]], index: int) -> bool:
-    window = operations[index : index + 5]
-    if len(window) < 4 or window[1][0] not in {"BINUNICODE", "SHORT_BINUNICODE"}:
-        return False
-    device = str(window[1][1])
-    if not re.fullmatch(r"(?:cpu|cuda|mps|xpu|meta|hpu|npu)(?::[0-9]+)?", device):
-        return False
-    return (window[2][0], window[3][0]) == ("TUPLE1", "REDUCE") or (
-        len(window) == 5
-        and window[2][0] in {"BININT", "BININT1", "BININT2"}
-        and type(window[2][1]) is int
-        and window[2][1] >= 0
-        and (window[3][0], window[4][0]) == ("TUPLE2", "REDUCE")
-    )
-
-
-def _checkpoint_tensor_call(operations: list[tuple[str, Any, int, int | None]], index: int) -> bool:
-    window = operations[index : index + 64]
-    if len(window) < 8 or window[1][0] != "MARK":
-        return False
-    reductions = [i for i, op in enumerate(window) if op[0] == "REDUCE"]
-    if len(reductions) < 2:
-        return False
-    first, second = reductions[:2]
-    if second != first + 2 or first < 2:
-        return False
-    prefix = window[2 : first - 2]
-    allowed = {
-        "MARK",
-        "BINUNICODE",
-        "SHORT_BINUNICODE",
-        "GLOBAL",
-        "BININT",
-        "BININT1",
-        "BININT2",
-        "TUPLE",
-        "TUPLE1",
-        "TUPLE2",
-        "TUPLE3",
-        "EMPTY_TUPLE",
-        "BINPERSID",
-        "NEWFALSE",
-        "NEWTRUE",
-    }
-    return (
-        window[first - 2][0:2] == ("GLOBAL", "collections OrderedDict")
-        and window[first - 1][0] == "EMPTY_TUPLE"
-        and window[first + 1][0] == "TUPLE"
-        and sum(op[0] == "BINPERSID" for op in prefix) == 1
-        and all(
-            op[0] in allowed and (op[0] != "GLOBAL" or tuple(str(op[1]).split()) in _PYTORCH_STORAGE_GLOBALS)
-            for op in prefix
-        )
-    )
-
-
-def _checkpoint_plain_class(
-    context: _ClassSourceContext, invocations: list[Mapping[str, object]], analyzed: bool
-) -> bool:
-    node = context.class_node
-    if (
-        node.bases
-        or node.keywords
-        or any(not isinstance(decorator, ast.Name) or decorator.id != "dataclass" for decorator in node.decorator_list)
-    ):
-        return False
-    if node.decorator_list:
-        bindings = [
-            statement
-            for statement in _definition_scope_statements(context.module_statements)
-            if _statement_binds_name(statement, "dataclass", class_body=True)
-        ]
-        if (
-            context.aliases.get("dataclass") != "dataclasses.dataclass"
-            or len(bindings) != 1
-            or not isinstance(bindings[0], ast.ImportFrom)
-            or _runtime_module_attribute_without_hooks("dataclasses", "dataclass") is not dataclass
-        ):
-            return False
-    statements = _definition_scope_statements(node.body)
-    supported = (
-        ast.Assign,
-        ast.AnnAssign,
-        ast.AugAssign,
-        ast.If,
-        ast.FunctionDef,
-        ast.AsyncFunctionDef,
-        ast.Import,
-        ast.ImportFrom,
-        ast.Pass,
-        ast.Expr,
-    )
-    if any(not isinstance(statement, supported) for statement in statements) or any(
-        isinstance(child, ast.NamedExpr) for child in ast.walk(node)
-    ):
-        return False
-    if any(
-        isinstance(statement, ast.Expr)
-        and not (isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str))
-        for statement in statements
-    ):
-        return False
-    for statement in statements:
-        targets = (
-            statement.targets
-            if isinstance(statement, ast.Assign)
-            else ([statement.target] if isinstance(statement, ast.AnnAssign | ast.AugAssign) else [])
-        )
-        if any(not isinstance(target, ast.Name) for target in targets):
-            return False
-    hooks = {
-        "__new__",
-        "__setstate__",
-        "__getattribute__",
-        "__setattr__",
-        "__dict__",
-        "__del__",
-        "__hash__",
-        "__eq__",
-        "__setitem__",
-        "append",
-        "extend",
-        "add",
-        "update",
-    }
-    if any(_statement_binds_name(statement, hook, class_body=True) for statement in statements for hook in hooks):
-        return False
-    getters = [
-        statement for statement in statements if _statement_binds_name(statement, "__getattr__", class_body=True)
-    ]
-    if getters and (
-        not analyzed
-        or any(
-            not isinstance(x, ast.FunctionDef)
-            or x not in node.body
-            or any(isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) for child in ast.walk(x))
-            for x in getters
-        )
-    ):
-        return False
-    return (
-        len(invocations) == 2
-        and invocations[0].get("opcode") == "NEWOBJ"
-        and invocations[0].get("positional_arg_count") == 0
-        and invocations[1].get("opcode") == "BUILD"
-        and invocations[1].get("build_uses_slot_state") is False
+    bases = _class_base_targets(context.class_node, context.module_name, context.aliases, context.local_defs)
+    return any(
+        resolved is not None and _checkpoint_is_enum(resolved, depth + 1)
+        for base in bases
+        if (resolved := _resolve_class_target(base)) not in {"str", "builtins.str"}
     )
 
 
