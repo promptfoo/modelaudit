@@ -149,6 +149,22 @@ def test_checkpoint_class_unresolved_binding_is_not_suppressed(transformers_inst
     assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def dataclass(cls):\n    cls.__setstate__ = restore\n    return cls\n"
+        "@dataclass\nclass TrainingArguments:\n    pass\n",
+        "class TrainingArguments:\n    locals()['__setstate__'] = restore\n",
+    ],
+)
+def test_checkpoint_class_indirect_restore_hook_is_not_suppressed(transformers_install: Path, source: str) -> None:
+    (transformers_install / "training_args.py").write_text("def restore(self, state):\n    print(state)\n" + source)
+    _record_files(transformers_install)
+    call_graph._clear_source_sensitive_caches()
+    payload = b"\x80\x02ctransformers.training_args\nTrainingArguments\n)\x81}b."
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
 def test_changed_checkpoint_module_is_not_suppressed(transformers_install: Path) -> None:
     (transformers_install / "trainer_utils.py").write_text(
         "from enum import Enum\n"

@@ -6175,7 +6175,7 @@ def _ordinary_checkpoint_positions(
                 values and is_enum and all(_checkpoint_literal_call(operations, i, values) for i in uses[position])
             )
             ordinary_class = len(uses[position]) == 1 and _checkpoint_plain_class(
-                node, invocations, position in analyzed
+                context, invocations, position in analyzed
             )
             if ordinary_enum or ordinary_class:
                 safe.add(key)
@@ -6316,13 +6316,29 @@ def _checkpoint_tensor_call(operations: list[tuple[str, Any, int, int | None]], 
     )
 
 
-def _checkpoint_plain_class(node: ast.ClassDef, invocations: list[Mapping[str, object]], analyzed: bool) -> bool:
+def _checkpoint_plain_class(
+    context: _ClassSourceContext, invocations: list[Mapping[str, object]], analyzed: bool
+) -> bool:
+    node = context.class_node
     if (
         node.bases
         or node.keywords
         or any(not isinstance(decorator, ast.Name) or decorator.id != "dataclass" for decorator in node.decorator_list)
     ):
         return False
+    if node.decorator_list:
+        bindings = [
+            statement
+            for statement in _definition_scope_statements(context.module_statements)
+            if _statement_binds_name(statement, "dataclass", class_body=True)
+        ]
+        if (
+            context.aliases.get("dataclass") != "dataclasses.dataclass"
+            or len(bindings) != 1
+            or not isinstance(bindings[0], ast.ImportFrom)
+            or _runtime_module_attribute_without_hooks("dataclasses", "dataclass") is not dataclass
+        ):
+            return False
     statements = _definition_scope_statements(node.body)
     supported = (
         ast.Assign,
@@ -6346,6 +6362,14 @@ def _checkpoint_plain_class(node: ast.ClassDef, invocations: list[Mapping[str, o
         for statement in statements
     ):
         return False
+    for statement in statements:
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else ([statement.target] if isinstance(statement, ast.AnnAssign | ast.AugAssign) else [])
+        )
+        if any(not isinstance(target, ast.Name) for target in targets):
+            return False
     hooks = {
         "__new__",
         "__setstate__",
