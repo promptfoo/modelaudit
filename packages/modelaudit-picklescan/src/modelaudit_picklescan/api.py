@@ -6095,7 +6095,12 @@ def _ordinary_checkpoint_positions(
         or len(payload) > _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES
     ):
         return frozenset()
-    candidates = [f for f in report.findings if f.rule_code == "NON_ALLOWLISTED_GLOBAL"]
+    supported = _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES | _CODECS_ENCODE_REFERENCES
+    candidates = [
+        f
+        for f in report.findings
+        if f.rule_code == "NON_ALLOWLISTED_GLOBAL" and (f.details.get("module"), f.details.get("name")) in supported
+    ]
     if not candidates:
         return frozenset()
     operations = _checkpoint_opcodes(payload)
@@ -6105,7 +6110,12 @@ def _ordinary_checkpoint_positions(
     for index, (opcode, _arg, _position, definition) in enumerate(operations):
         if opcode == "GLOBAL" and definition is not None:
             uses.setdefault(definition, []).append(index)
-    calls = _sequence(report.metadata.get("callable_invocations"))
+    calls_by_position: dict[int, list[Mapping[str, object]]] = {}
+    for item in _sequence(report.metadata.get("callable_invocations")):
+        invocation = _mapping(item)
+        position = _optional_int(invocation.get("global_position"))
+        if position is not None:
+            calls_by_position.setdefault(position, []).append(invocation)
     ownership: dict[str, bool] = {}
     safe: set[tuple[int, str, str]] = set()
     for finding in candidates:
@@ -6116,7 +6126,7 @@ def _ordinary_checkpoint_positions(
         if any(operations[i][1] != f"{module} {name}" for i in uses[position]):
             continue
         key = (position, module, name)
-        invocations = [_mapping(x) for x in calls if _optional_int(_mapping(x).get("global_position")) == position]
+        invocations = calls_by_position.get(position, [])
         if not invocations:
             continue
         if (module, name) == ("_codecs", "encode"):
