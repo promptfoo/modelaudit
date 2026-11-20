@@ -6226,11 +6226,12 @@ def _checkpoint_enum_has_trusted_base(context: _ClassSourceContext, ownership: d
                 return False
             if any(
                 not (
-                    (isinstance(statement, ast.Expr)
-                    and isinstance(statement.value, ast.Constant)
-                    and isinstance(statement.value.value, str))
-                    or (isinstance(statement, ast.FunctionDef)
-                    and statement.name == "_missing_")
+                    (
+                        isinstance(statement, ast.Expr)
+                        and isinstance(statement.value, ast.Constant)
+                        and isinstance(statement.value.value, str)
+                    )
+                    or (isinstance(statement, ast.FunctionDef) and statement.name == "_missing_")
                 )
                 for statement in parent.class_node.body
             ):
@@ -6323,6 +6324,28 @@ def _checkpoint_plain_class(node: ast.ClassDef, invocations: list[Mapping[str, o
     ):
         return False
     statements = _definition_scope_statements(node.body)
+    supported = (
+        ast.Assign,
+        ast.AnnAssign,
+        ast.AugAssign,
+        ast.If,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.Import,
+        ast.ImportFrom,
+        ast.Pass,
+        ast.Expr,
+    )
+    if any(not isinstance(statement, supported) for statement in statements) or any(
+        isinstance(child, ast.NamedExpr) for child in ast.walk(node)
+    ):
+        return False
+    if any(
+        isinstance(statement, ast.Expr)
+        and not (isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str))
+        for statement in statements
+    ):
+        return False
     hooks = {
         "__new__",
         "__setstate__",
