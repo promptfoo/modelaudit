@@ -817,6 +817,9 @@ def _capture_trusted_loaded_interpreter_modules() -> Mapping[
                 for trusted_module, name in _TRUSTED_IMPORT_ONLY_REFERENCES
                 if trusted_module == module_name and "." not in name and name in module_namespace
             }
+            # Capture identity without generally allowlisting codec invocations.
+            if module_name == "_codecs" and "encode" in module_namespace:
+                trusted_names.add("encode")
             trusted[module_name] = (
                 module,
                 spec,
