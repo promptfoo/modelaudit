@@ -5575,6 +5575,10 @@ def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
         (["www.bank.com/researchdisclosures,"], IssueSeverity.INFO),
         (["##@bank.com", 'connect("bank.com")'], IssueSeverity.WARNING),
         (["##@bank.com", "bank.com/?token=secret"], IssueSeverity.WARNING),
+        (
+            ["##@bank.com", "__import__('socket').gethostbyname(", "'''", "bank.com", "'''.strip()", ")"],
+            IssueSeverity.WARNING,
+        ),
     ],
 )
 def test_wordpiece_domain_requires_only_passive_occurrences(

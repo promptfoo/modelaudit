@@ -3205,12 +3205,13 @@ class TextScanner(BaseScanner):
             candidate.pop("snippet", None)
             return candidate, False
 
-    @staticmethod
-    def _passive_wordpiece_domains(payload: bytes, domains: set[bytes]) -> set[bytes]:
+    @classmethod
+    def _passive_wordpiece_domains(cls, payload: bytes, domains: set[bytes]) -> set[bytes]:
         # Domain findings are deduplicated. One active use anywhere vetoes a
         # downgrade, even if the first occurrence was a vocabulary fragment.
         passive: set[bytes] = set()
-        for raw in io.BytesIO(payload):
+        stream = io.BytesIO(payload)
+        for raw in stream:
             line = raw.rstrip(b"\r\n")
             if len(line) > MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES:
                 return set()
@@ -3220,7 +3221,15 @@ class TextScanner(BaseScanner):
             for match in NetworkCommDetector.DOMAIN_PATTERN.finditer(line):
                 host = match.group().lower()
                 if host in domains:
-                    if bare:
+                    position = stream.tell() - len(raw) + match.start()
+                    context = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
+                    in_multiline_string = any(context.count(quote) % 2 for quote in (b"'''", b'"""'))
+                    in_code = (
+                        cls._documentation_multiline_literal_contains_position(payload, position)
+                        or cls._documentation_multiline_return_contains_position(payload, position)
+                        or in_multiline_string
+                    )
+                    if bare and not in_code:
                         passive.add(host)
                     else:
                         domains.discard(host)
