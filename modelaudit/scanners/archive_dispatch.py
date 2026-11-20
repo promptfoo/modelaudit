@@ -411,7 +411,7 @@ def _make_incomplete_routing_result(path: str, *, name: str, message: str, forma
         message=message,
         severity=IssueSeverity.INFO,
         location=path,
-        details={"format": format_, "path": path},
+        details={"format": format_, "path": path, "scan_outcome_reason": reason},
     )
     mark_inconclusive_scan_result(result, reason)
     mark_operational_scan_error(result, reason)

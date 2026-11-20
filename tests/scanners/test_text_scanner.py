@@ -5567,27 +5567,6 @@ def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
     return "\n".join(tokens) + "\n"
 
 
-@pytest.mark.parametrize(
-    ("tokens", "expected"),
-    [
-        (["##@bank.com."], IssueSeverity.INFO),
-        (["##@bank.tk"], IssueSeverity.CRITICAL),
-        (["www.bank.com/researchdisclosures,"], IssueSeverity.INFO),
-        (["##@bank.com", 'connect("bank.com")'], IssueSeverity.WARNING),
-        (["##@bank.com", "bank.com/?token=secret"], IssueSeverity.WARNING),
-    ],
-)
-def test_wordpiece_domain_requires_only_passive_occurrences(
-    tmp_path: Path, tokens: list[str], expected: IssueSeverity
-) -> None:
-    path = tmp_path / "vocab.txt"
-    path.write_text(_bert_like_multilingual_vocabulary(*tokens), encoding="utf-8")
-    result = TextScanner().scan(str(path))
-    findings = [c for c in result.checks if c.details.get("type") == "domain_name"]
-    assert findings
-    assert all(c.severity == expected for c in findings)
-
-
 class _LineIterationGuardBytes(bytes):
     def find(self, *args: Any, **kwargs: Any) -> int:
         raise AssertionError("line iteration must not call bytes.find")

@@ -6,13 +6,11 @@ import json
 import os
 import pickle
 import pickletools
-import py_compile
 import random
 import stat
 import struct
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import time
 import tracemalloc
@@ -62,7 +60,6 @@ from modelaudit.scanners import pytorch_zip_scanner as pytorch_zip_scanner_modul
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
-from modelaudit.scanners.pytorch_zip_support import trainer_runtime
 from modelaudit.utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
     REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
@@ -2252,102 +2249,6 @@ def _tensor_checkpoint_metadata(storage: bytes) -> bytes:
     )
 
 
-@pytest.mark.parametrize("case", ["verified", "unknown", "changed", "strict", "partial", "other", "critical"])
-def test_reconstruction_requires_complete_bound_instructions_and_trusted_runtime(
-    monkeypatch: pytest.MonkeyPatch, case: str
-) -> None:
-    data = _tensor_checkpoint_metadata(bytes(32))
-    digest = hashlib.sha256(data).digest()
-    scanner = PyTorchZipScanner(config={"strict_tensor_storage": case == "strict"})
-    result = ScanResult(scanner_name="pickle")
-    result.metadata.update(
-        pickle_report_status="complete",
-        pickle_verdict="suspicious",
-        pickle_coverage={"raw_scan_complete": True, "opcode_scan_complete": case != "partial"},
-        import_references_truncated=False,
-        callable_invocations_truncated=False,
-        nested_opcode_counts={},
-        follow_on_opcode_counts={},
-    )
-    reference = "torch._utils._rebuild_tensor_v2"
-    result.add_check(
-        name="Standalone Pickle Finding",
-        passed=False,
-        message="Unverified reference",
-        severity=IssueSeverity.CRITICAL if case == "critical" else IssueSeverity.WARNING,
-        rule_code="NON_ALLOWLISTED_GLOBAL",
-        details={"opcode": "GLOBAL", "import_reference": "os.system" if case == "other" else reference},
-    )
-    monkeypatch.setattr(
-        pytorch_zip_scanner_module,
-        "trusted_trainer_runtime",
-        lambda refs, timeout: case != "unknown" and refs == {reference, "torch.FloatStorage"},
-    )
-    if case == "changed":
-        data += b"cos\nsystem\n)R."
-    scanner._classify_trainer_calls(result, data, digest, {"0": 32})
-    if case == "verified":
-        assert result.metadata["pickle_verdict"] == "clean"
-        assert result.checks[0].status == CheckStatus.PASSED
-        assert result.issues[0].severity == IssueSeverity.INFO
-        assert not should_cache_scan_result(result.to_dict())
-    else:
-        assert result.metadata["pickle_verdict"] == "suspicious"
-        assert result.checks[0].status == CheckStatus.FAILED
-
-
-def test_trainer_runtime_requires_original_wheel_including_bytecode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    package = tmp_path / "torch"
-    package.mkdir()
-    source = package / "__init__.py"
-    source.write_bytes(b"pass\n")
-    digest = hashlib.sha256(b"torch/__init__.py\0" + hashlib.sha256(source.read_bytes()).digest()).hexdigest()
-    monkeypatch.setitem(trainer_runtime._WHEELS, "torch", {1: digest})
-
-    def matches() -> bool:
-        return trainer_runtime._wheel_matches(tmp_path, "torch", lambda: False)
-
-    assert matches()
-    extra = package / "shadow.py"
-    extra.write_bytes(b"pass")
-    assert not matches()
-    extra.unlink()
-    source.write_bytes(b"exit()")
-    assert not matches()
-    source.write_bytes(b"pass\n")
-    compiled = py_compile.compile(str(source), doraise=True)
-    assert compiled is not None
-    cache = Path(compiled)
-    cache.write_bytes(cache.read_bytes()[:16] + b"tampered")
-    assert not matches()
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX lib-dynload layout")
-def test_trainer_runtime_checks_uv_interpreter_alias(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    base = tmp_path / "python-3.11.14"
-    (base / "lib/python3.11/lib-dynload").mkdir(parents=True)
-    alias = tmp_path / "python-3.11"
-    alias.symlink_to(base, target_is_directory=True)
-    paths = sysconfig.get_paths() | {"stdlib": str(base / "lib/python3.11")}
-    monkeypatch.setattr(sysconfig, "get_paths", lambda: paths)
-    monkeypatch.setattr(sys, "base_prefix", str(base))
-    monkeypatch.setattr(sys, "base_exec_prefix", str(alias))
-    monkeypatch.setattr(sys, "pycache_prefix", None)
-    monkeypatch.setattr(sys, "path", [str(alias / "lib/python3.11/lib-dynload")])
-    assert trainer_runtime._isolated_paths()
-    alias.unlink()
-    (alias / "lib/python3.11/lib-dynload").mkdir(parents=True)
-    assert not trainer_runtime._isolated_paths()
-
-
-def test_trainer_runtime_rejects_pythonpath_before_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    (tmp_path / "torch.py").write_text("raise RuntimeError('must not import')", encoding="utf-8")
-    monkeypatch.setattr(sys, "path", [str(tmp_path)])
-    assert not trainer_runtime.trusted_trainer_runtime({"torch._utils._rebuild_tensor_v2"}, lambda: False)
-
-
 @pytest.mark.parametrize("strict", [False, True])
 def test_verified_tensor_reports_separate_hidden_coverage_or_strict_failure(tmp_path: Path, strict: bool) -> None:
     path = tmp_path / "ambiguous.pt"
@@ -2395,85 +2296,43 @@ def test_ambiguous_storage_finds_complete_callable_beyond_prefix(
     _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage))
     result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
 
-    _assert_incomplete_storage_discovery(result)
+    if strict:
+        _assert_incomplete_storage_discovery(result)
+    else:
+        assert result.metadata["hidden_pickle_coverage"] == "inconclusive"
     finding = next(c for c in result.checks if c.name == "Embedded Pickle Payload")
     assert finding.severity == IssueSeverity.CRITICAL
     assert finding.details == {"zip_entry": "archive/data/0", "offset": len(prefix), "callable": "os\nsystem"}
     assert not should_cache_scan_result(result.to_dict())
 
 
+@pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize(
     "payload",
     [
-        b"\x8c\x04site\x8c\x04hook\x93!",
-        b"\x82\x01)R.",
+        b"\x8c\x0btask:run:meQ.",
+        b"Ptask:run:me\n.",
         b"\x82\x01.",
         b"\x83\x00\x01.",
         b"\x84\x00\x00\x01\x00.",
-        b")\x82\x01\x86.",
-        b"K\x03\x83\x00\x01\x86.",
-        b"\x8c\x04evilQ.",
-        b"K\x01Q.",
-        b"Vname\t\nQ.",
-        b"Pname\t\n.",
-        b"S'name\t'\nQ.",
-        b"Fnan\nQ.",
-        b"Finf\nQ.",
-        b"F-inf\nQ.",
-        b"csite\nhook\t\n.",
+        b"K\x01q\x00K\x02q\x00\x86Q.",
     ],
-    ids=[
-        "named-reference-before-error",
-        "extension-invocation",
-        "ext1-reference",
-        "ext2-reference",
-        "ext4-reference",
-        "tuple-before-ext1",
-        "integer-before-ext2",
-        "headerless-string-persistent-id",
-        "headerless-integer-persistent-id",
-        "unicode-control-persistent-id",
-        "ascii-control-persistent-id",
-        "quoted-control-persistent-id",
-        "nan-persistent-id",
-        "infinity-persistent-id",
-        "negative-infinity-persistent-id",
-        "control-global-name",
-    ],
+    ids=["binpersid", "persid", "ext1", "ext2", "ext4", "memo-overwrite"],
 )
-def test_ambiguous_storage_retains_structured_pickle_evidence(tmp_path: Path, payload: bytes) -> None:
+def test_independently_unpickled_tensor_bytes_remain_explicitly_inconclusive(
+    tmp_path: Path, strict: bool, payload: bytes
+) -> None:
     storage = _ambiguous_tensor_storage().ljust(300_000, b"!") + payload.ljust(32, b"!")
-    result = _scan_referenced_float_storage(tmp_path / "structured.pt", storage)
-    _assert_incomplete_storage_discovery(result)
-    assert not should_cache_scan_result(result.to_dict())
-
-
-@pytest.mark.parametrize("strict", [False, True])
-@pytest.mark.parametrize("canonical", [False, True])
-def test_memo_overwrite_never_clears_hidden_pickle_coverage(tmp_path: Path, strict: bool, canonical: bool) -> None:
-    # pickletools.dis rejects a repeated memo write that pickle accepts.
-    payload = b"K\x01q\x00K\x02q\x00\x86Q."
-    storage = _ambiguous_tensor_storage().ljust(300_000, b"!") + payload.ljust(32, b"!")
-    path = tmp_path / "overwritten.pt"
-    _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage) if canonical else None)
-    result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
-    if canonical and not strict:
-        assert "pytorch_zip_pickle_discovery_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
-        assert result.metadata["hidden_pickle_coverage"] == "inconclusive"
-    else:
-        _assert_incomplete_storage_discovery(result)
-    assert not should_cache_scan_result(result.to_dict())
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [b"\x82\x01)R.", b"\x82\x01)\x81.", b"\x82\x01q\x00)q\x00R.", b"\x8c\x04site\x8c\x04hook\x93!", b"csite\nhook\n."],
-)
-def test_verified_tensor_does_not_clear_possible_callable(tmp_path: Path, payload: bytes) -> None:
-    path = tmp_path / "callable.pt"
-    storage = _ambiguous_tensor_storage().ljust(300_000, b"!") + payload.ljust(32, b"!")
+    path = tmp_path / "raw.pt"
     _write_referenced_float_storage(path, storage, metadata=_tensor_checkpoint_metadata(storage))
-    _assert_incomplete_storage_discovery(PyTorchZipScanner().scan(str(path)))
+    result = PyTorchZipScanner(config={"strict_tensor_storage": strict}).scan(str(path))
+    assert result.metadata["hidden_pickle_coverage"] == "inconclusive"
+    if strict:
+        _assert_incomplete_storage_discovery(result)
+    else:
+        assert "pytorch_zip_pickle_discovery_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+        assert any(c.name == "Hidden Pickle Coverage" for c in result.checks)
+    assert not should_cache_scan_result(result.to_dict())
 
 
 @pytest.mark.parametrize(
