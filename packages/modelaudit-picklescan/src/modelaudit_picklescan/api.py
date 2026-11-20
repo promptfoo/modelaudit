@@ -31,13 +31,18 @@ from .call_graph import (
     UnanalyzedCallGraphReference,
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
+    _class_base_targets,
+    _ClassSourceContext,
+    _definition_scope_statements,
     _ensure_shared_source_snapshot_stable,
     _find_module_spec_without_imports,
     _interpreter_reference_is_trusted,
     _is_skippable_pytorch_storage_persistent_id_reference,
     _module_spec_fields_without_hooks,
+    _resolve_class_target,
     _runtime_module_attribute_without_hooks,
     _source_class_context,
+    _statement_binds_name,
     class_static_attribute_lookup_is_proven_source_backed,
     find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
@@ -6164,20 +6169,8 @@ def _ordinary_checkpoint_positions(
             if context is None:
                 continue
             node = context.class_node
-            values = {
-                value.value
-                for statement in node.body
-                if isinstance(statement, ast.Assign)
-                for value in (statement.value,)
-                if isinstance(value, ast.Constant) and isinstance(value.value, str)
-            }
-            enum_bases = {ast.unparse(base) for base in node.bases}
-            is_enum = (
-                bool(enum_bases & {"ExplicitEnum", "Enum", "enum.Enum"})
-                and enum_bases <= {"str", "ExplicitEnum", "Enum", "enum.Enum"}
-                and not node.keywords
-                and not node.decorator_list
-            )
+            values = _checkpoint_enum_values(node)
+            is_enum = bool(values) and _checkpoint_enum_has_trusted_base(context, ownership)
             ordinary_enum = (
                 values and is_enum and all(_checkpoint_literal_call(operations, i, values) for i in uses[position])
             )
@@ -6187,6 +6180,56 @@ def _ordinary_checkpoint_positions(
             if ordinary_enum or ordinary_class:
                 safe.add(key)
     return frozenset(safe)
+
+
+def _checkpoint_enum_values(node: ast.ClassDef) -> set[str]:
+    values: set[str] = set()
+    for statement in node.body:
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue
+        if (
+            not isinstance(statement, ast.Assign)
+            or len(statement.targets) != 1
+            or not isinstance(statement.targets[0], ast.Name)
+            or not statement.targets[0].id.isupper()
+            or not isinstance(statement.value, ast.Constant)
+            or not isinstance(statement.value.value, str)
+        ):
+            return set()
+        values.add(statement.value.value)
+    return values
+
+
+def _checkpoint_enum_has_trusted_base(context: _ClassSourceContext, ownership: dict[str, bool], depth: int = 0) -> bool:
+    node = context.class_node
+    if depth >= 4 or node.keywords or node.decorator_list:
+        return False
+    targets = _class_base_targets(node, context.module_name, context.aliases, context.local_defs)
+    if len(targets) != len(node.bases):
+        return False
+    enum_bases = 0
+    for target in targets:
+        if target in {"str", "builtins.str"}:
+            continue
+        resolved = _resolve_class_target(target)
+        if resolved == "enum.Enum":
+            if _runtime_module_attribute_without_hooks("enum", "Enum") is not Enum:
+                return False
+        else:
+            parent = _source_class_context(resolved) if resolved else None
+            if parent is None:
+                return False
+            module = parent.module_name
+            if module not in ownership:
+                ownership[module] = _distribution_owns_module(module)
+            if not ownership[module] or not _checkpoint_enum_has_trusted_base(parent, ownership, depth + 1):
+                return False
+        enum_bases += 1
+    return enum_bases == 1
 
 
 def _checkpoint_literal_call(
@@ -6267,20 +6310,14 @@ def _checkpoint_plain_class(node: ast.ClassDef, invocations: list[Mapping[str, o
         or any(not isinstance(decorator, ast.Name) or decorator.id != "dataclass" for decorator in node.decorator_list)
     ):
         return False
-    methods = {n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    assigned = {
-        name.id
-        for statement in node.body
-        if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign))
-        for target in (statement.targets if isinstance(statement, ast.Assign) else [statement.target])
-        for name in ast.walk(target)
-        if isinstance(name, ast.Name)
-    }
-    if (methods | assigned) & {"__new__", "__setstate__", "__getattribute__", "__setattr__", "__dict__"}:
+    statements = _definition_scope_statements(node.body)
+    hooks = {"__new__", "__setstate__", "__getattribute__", "__setattr__", "__dict__"}
+    if any(_statement_binds_name(statement, hook, class_body=True) for statement in statements for hook in hooks):
         return False
-    if "__getattr__" in assigned:
-        return False
-    if "__getattr__" in methods and not analyzed:
+    getters = [
+        statement for statement in statements if _statement_binds_name(statement, "__getattr__", class_body=True)
+    ]
+    if getters and (not analyzed or any(not isinstance(x, ast.FunctionDef) or x not in node.body for x in getters)):
         return False
     return (
         len(invocations) == 2

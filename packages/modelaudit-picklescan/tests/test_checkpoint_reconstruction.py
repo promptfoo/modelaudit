@@ -96,12 +96,46 @@ def test_checkpoint_class_with_assigned_setstate_is_not_suppressed(transformers_
     assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
 
 
+def test_checkpoint_class_with_conditional_setstate_is_not_suppressed(transformers_install: Path) -> None:
+    (transformers_install / "training_args.py").write_text(
+        "class TrainingArguments:\n    if True:\n        def __setstate__(self, state):\n            print(state)\n"
+    )
+    _record_files(transformers_install)
+    call_graph._clear_source_sensitive_caches()
+    payload = b"\x80\x02ctransformers.training_args\nTrainingArguments\n)\x81}b."
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
 def test_changed_checkpoint_module_is_not_suppressed(transformers_install: Path) -> None:
     (transformers_install / "trainer_utils.py").write_text(
         "from enum import Enum\n"
         "print('module initialization')\n"
         "class SchedulerType(str, Enum):\n    LINEAR = 'linear'\n"
     )
+    call_graph._clear_source_sensitive_caches()
+    payload = b"\x80\x02ctransformers.trainer_utils\nSchedulerType\n" + _text(b"linear") + b"\x85R."
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
+def test_checkpoint_enum_base_must_be_real_enum(transformers_install: Path) -> None:
+    (transformers_install / "trainer_utils.py").write_text(
+        "class ExplicitEnum:\n"
+        "    def __init__(self, value):\n        print(value)\n"
+        "class SchedulerType(ExplicitEnum):\n    LINEAR = 'linear'\n"
+    )
+    _record_files(transformers_install)
+    call_graph._clear_source_sensitive_caches()
+    payload = b"\x80\x02ctransformers.trainer_utils\nSchedulerType\n" + _text(b"linear") + b"\x85R."
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
+def test_checkpoint_enum_ignored_value_is_not_trusted(transformers_install: Path) -> None:
+    (transformers_install / "trainer_utils.py").write_text(
+        "from enum import Enum\nclass SchedulerType(str, Enum):\n"
+        "    _ignore_ = 'LINEAR'\n    LINEAR = 'linear'\n"
+        "    @classmethod\n    def _missing_(cls, value):\n        print(value)\n"
+    )
+    _record_files(transformers_install)
     call_graph._clear_source_sensitive_caches()
     payload = b"\x80\x02ctransformers.trainer_utils\nSchedulerType\n" + _text(b"linear") + b"\x85R."
     assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
