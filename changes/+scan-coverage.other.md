@@ -1,0 +1,1 @@
+Recognize extended SentencePiece vocabularies with BERT control tokens, complete endpoint analysis on larger model cards, count failed coverage checks in scan totals, and provide remediation guidance for missing framework source.

@@ -816,22 +816,14 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     # Dictionary-like access provided by DictCompatMixin
 
     def _finalize_checks(self) -> None:
-        """Calculate check statistics.
-
-        Only counts security-relevant checks (excludes failed INFO/DEBUG from total).
-        This ensures the success rate reflects actual security status, not informational notes.
-        """
-
-        # Exclude only failed INFO/DEBUG checks from success rate calculation
-        # Include: passed checks, skipped checks, and failed WARNING/CRITICAL checks
-        def is_failed_info_or_debug(check):
-            if check.status != CheckStatus.FAILED:
-                return False
-            # Only exclude failed INFO/DEBUG checks
-            return check.severity in (IssueSeverity.INFO, IssueSeverity.DEBUG)
-
-        security_checks = [c for c in self.checks if not is_failed_info_or_debug(c)]
-
+        """Count failed coverage checks alongside actionable security checks."""
+        security_checks = [
+            check
+            for check in self.checks
+            if check.status != CheckStatus.FAILED
+            or check.severity not in (IssueSeverity.INFO, IssueSeverity.DEBUG)
+            or _details_have_incomplete_coverage(check.details)
+        ]
         self.total_checks = len(security_checks)
         self.passed_checks = sum(1 for c in security_checks if c.status == CheckStatus.PASSED)
         self.failed_checks = sum(1 for c in security_checks if c.status == CheckStatus.FAILED)
