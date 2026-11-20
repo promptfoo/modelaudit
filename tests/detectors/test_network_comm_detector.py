@@ -8972,8 +8972,9 @@ def test_shared_evidence_redaction_classification_budget_fails_closed(
 
 
 def test_model_card_endpoint_classification_scales_with_document_size() -> None:
-    links = b"".join(f"[paper](https://github.com/library/model-{index})\n".encode() for index in range(48))
-    data = b"per token weights\n" + links + b"ordinary documentation " * 380 + b"\ngit clone https://github.com/a/b"
+    # Unlike hostnames inside URLs, bare hostnames near token prose need evidence classification.
+    hosts = b"".join(f"mirror{index}.example.org\n".encode() for index in range(48))
+    data = b"per token weights\n" + hosts + b"ordinary documentation " * 380 + b"\ngit clone https://github.com/a/b"
     detector = NetworkCommDetector({"max_findings": 100})
     findings = detector.scan(data, "README.md")
     assert detector._evidence_redaction_classifications > 32
