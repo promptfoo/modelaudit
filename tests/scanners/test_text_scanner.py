@@ -6263,6 +6263,21 @@ def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: 
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
 
 
+def test_model_card_links_near_token_prose_complete_network_inspection(tmp_path: Path) -> None:
+    links = "".join(f"[Example {i}](https://GitHub.com/org/example{i})\n" for i in range(40))
+    result = _scan_text_content(
+        tmp_path / "README.md",
+        f"To obtain token weights, see these examples.\n{links}\n```sh\ngit clone https://github.com/org/model\n```\n",
+    )
+
+    assert result.success
+    assert any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(check.details.get("command_type") == "git_clone" for check in _failed_network_detection_checks(result))
+    assert not any(check.name == "Network Communication Reporting Limit" for check in result.checks)
+
+
 def test_text_scanner_documentation_passive_endpoint_redaction_limit_is_informational(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
