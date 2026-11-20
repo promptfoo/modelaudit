@@ -13012,6 +13012,24 @@ def test_latin1_reduce_records_the_requested_codec_and_call(text: bytes, encodin
     assert "codec registry" in (finding.why or "")
 
 
+def test_safe_numpy_does_not_trust_rebound_codec_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    import _codecs
+    import codecs
+
+    original = _codecs.encode
+
+    def replacement(value: str, encoding: str) -> bytes:
+        return original(value, encoding)
+
+    monkeypatch.setattr(_codecs, "encode", replacement)
+    monkeypatch.setattr(codecs, "encode", replacement)
+    report = scan_bytes(_SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD)
+    assert any(
+        f.rule_code == "NON_ALLOWLISTED_GLOBAL" and f.details.get("import_reference") == "_codecs.encode"
+        for f in report.findings
+    )
+
+
 @pytest.mark.parametrize(
     "operands",
     [

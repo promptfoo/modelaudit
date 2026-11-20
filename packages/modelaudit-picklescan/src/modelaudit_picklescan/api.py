@@ -33,6 +33,7 @@ from .call_graph import (
     _CallGraphAnalysisLimitError,
     _ensure_shared_source_snapshot_stable,
     _find_module_spec_without_imports,
+    _interpreter_reference_is_trusted,
     _is_skippable_pytorch_storage_persistent_id_reference,
     _module_spec_fields_without_hooks,
     _runtime_module_attribute_without_hooks,
@@ -6121,7 +6122,7 @@ def _ordinary_checkpoint_positions(
         if (module, name) == ("_codecs", "encode"):
             if (
                 safe_numpy
-                and _runtime_module_attribute_without_hooks("_codecs", "encode") is codecs.encode
+                and _interpreter_reference_is_trusted("_codecs", "encode")
                 and all(
                     _checkpoint_literal_call(operations, i, {"latin1", "latin-1"}, codec=True) for i in uses[position]
                 )
