@@ -169,3 +169,29 @@ def test_checkpoint_enum_ignored_value_is_not_trusted(transformers_install: Path
     call_graph._clear_source_sensitive_caches()
     payload = b"\x80\x02ctransformers.trainer_utils\nSchedulerType\n" + _text(b"linear") + b"\x85R."
     assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
+def test_checkpoint_enum_dunder_is_not_a_member(transformers_install: Path) -> None:
+    (transformers_install / "trainer_utils.py").write_text(
+        "from enum import Enum\nclass ExplicitEnum(str, Enum):\n"
+        "    @classmethod\n    def _missing_(cls, value):\n        print(value)\n"
+        "class SchedulerType(ExplicitEnum):\n    OTHER = 'other'\n    __FAKE__ = 'linear'\n"
+    )
+    _record_files(transformers_install)
+    call_graph._clear_source_sensitive_caches()
+    payload = b"\x80\x02ctransformers.trainer_utils\nSchedulerType\n" + _text(b"linear") + b"\x85R."
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
+def test_checkpoint_enum_base_cannot_rewrite_values(transformers_install: Path) -> None:
+    (transformers_install / "trainer_utils.py").write_text(
+        "from enum import Enum\nclass ExplicitEnum(str, Enum):\n"
+        "    def __new__(cls, value):\n        obj = str.__new__(cls, value)\n"
+        "        obj._value_ = 'changed'\n        return obj\n"
+        "    @classmethod\n    def _missing_(cls, value):\n        print(value)\n"
+        "class SchedulerType(ExplicitEnum):\n    LINEAR = 'linear'\n"
+    )
+    _record_files(transformers_install)
+    call_graph._clear_source_sensitive_caches()
+    payload = b"\x80\x02ctransformers.trainer_utils\nSchedulerType\n" + _text(b"linear") + b"\x85R."
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN

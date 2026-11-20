@@ -6195,6 +6195,7 @@ def _checkpoint_enum_values(node: ast.ClassDef) -> set[str]:
             not isinstance(statement, ast.Assign)
             or len(statement.targets) != 1
             or not isinstance(statement.targets[0], ast.Name)
+            or statement.targets[0].id.startswith("_")
             or not statement.targets[0].id.isupper()
             or not isinstance(statement.value, ast.Constant)
             or not isinstance(statement.value.value, str)
@@ -6222,6 +6223,17 @@ def _checkpoint_enum_has_trusted_base(context: _ClassSourceContext, ownership: d
         else:
             parent = _source_class_context(resolved) if resolved else None
             if parent is None:
+                return False
+            if any(
+                not (
+                    (isinstance(statement, ast.Expr)
+                    and isinstance(statement.value, ast.Constant)
+                    and isinstance(statement.value.value, str))
+                    or (isinstance(statement, ast.FunctionDef)
+                    and statement.name == "_missing_")
+                )
+                for statement in parent.class_node.body
+            ):
                 return False
             module = parent.module_name
             if module not in ownership:
