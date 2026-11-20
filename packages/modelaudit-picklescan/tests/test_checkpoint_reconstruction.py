@@ -106,6 +106,36 @@ def test_checkpoint_class_with_conditional_setstate_is_not_suppressed(transforme
     assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
 
 
+@pytest.mark.parametrize(
+    ("method", "tail"),
+    [
+        ("def __del__(self):\n        print('finalizer')", b"0N."),
+        ("def __hash__(self):\n        print('hash')\n        return 1", b"K\x01s."),
+        ("def __setitem__(self, key, value):\n        print(key)", b"K\x01K\x02s."),
+        ("def append(self, value):\n        print(value)", b"K\x01a."),
+    ],
+)
+def test_checkpoint_class_runtime_hooks_are_not_suppressed(
+    transformers_install: Path, method: str, tail: bytes
+) -> None:
+    (transformers_install / "training_args.py").write_text(f"class TrainingArguments:\n    {method}\n")
+    _record_files(transformers_install)
+    call_graph._clear_source_sensitive_caches()
+    prefix = b"}" if "__hash__" in method else b""
+    payload = b"\x80\x02" + prefix + b"ctransformers.training_args\nTrainingArguments\n)\x81}b" + tail
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
+def test_checkpoint_dynamic_restore_hook_is_not_suppressed(transformers_install: Path) -> None:
+    (transformers_install / "training_args.py").write_text(
+        "class TrainingArguments:\n    def __getattr__(self, name):\n        return lambda value: print(value)\n"
+    )
+    _record_files(transformers_install)
+    call_graph._clear_source_sensitive_caches()
+    payload = b"\x80\x02ctransformers.training_args\nTrainingArguments\n)\x81}b."
+    assert scan_bytes(payload).verdict != SafetyVerdict.CLEAN
+
+
 def test_changed_checkpoint_module_is_not_suppressed(transformers_install: Path) -> None:
     (transformers_install / "trainer_utils.py").write_text(
         "from enum import Enum\n"

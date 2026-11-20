@@ -6311,13 +6311,35 @@ def _checkpoint_plain_class(node: ast.ClassDef, invocations: list[Mapping[str, o
     ):
         return False
     statements = _definition_scope_statements(node.body)
-    hooks = {"__new__", "__setstate__", "__getattribute__", "__setattr__", "__dict__"}
+    hooks = {
+        "__new__",
+        "__setstate__",
+        "__getattribute__",
+        "__setattr__",
+        "__dict__",
+        "__del__",
+        "__hash__",
+        "__eq__",
+        "__setitem__",
+        "append",
+        "extend",
+        "add",
+        "update",
+    }
     if any(_statement_binds_name(statement, hook, class_body=True) for statement in statements for hook in hooks):
         return False
     getters = [
         statement for statement in statements if _statement_binds_name(statement, "__getattr__", class_body=True)
     ]
-    if getters and (not analyzed or any(not isinstance(x, ast.FunctionDef) or x not in node.body for x in getters)):
+    if getters and (
+        not analyzed
+        or any(
+            not isinstance(x, ast.FunctionDef)
+            or x not in node.body
+            or any(isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) for child in ast.walk(x))
+            for x in getters
+        )
+    ):
         return False
     return (
         len(invocations) == 2
