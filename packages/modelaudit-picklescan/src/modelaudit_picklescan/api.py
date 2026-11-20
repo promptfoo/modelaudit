@@ -6054,6 +6054,76 @@ def _distribution_owns_module(module: str) -> bool:
         return False
 
 
+def _checkpoint_opcodes(payload: bytes) -> list[tuple[str, Any, int, int | None]]:
+    memo: dict[int, tuple[str, Any, int | None] | None] = {}
+    operations: list[tuple[str, Any, int, int | None]] = []
+    for count, (opcode, arg, position) in enumerate(pickletools.genops(payload), 1):
+        if count > _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES or position is None:
+            return []
+        name = opcode.name
+        if name in {"BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"}:
+            if name == "MEMOIZE":
+                key = len(memo)
+            elif arg is not None:
+                key = int(arg)
+            else:
+                return []
+            previous = operations[-1] if operations else None
+            memo[key] = (
+                (previous[0], previous[1], previous[3])
+                if previous and previous[0] in {"GLOBAL", "BINUNICODE", "SHORT_BINUNICODE"}
+                else None
+            )
+            continue
+        value = memo.get(int(arg)) if name in {"BINGET", "LONG_BINGET", "GET"} and arg is not None else None
+        if value is not None:
+            kind, value_arg, definition = value
+            operations.append((kind, value_arg, position, definition))
+        else:
+            operations.append((name, arg, position, position if name == "GLOBAL" else None))
+    return operations if operations and operations[-1][0] == "STOP" and operations[-1][2] + 1 == len(payload) else []
+
+
+def _checkpoint_tensor_call(operations: list[tuple[str, Any, int, int | None]], index: int) -> bool:
+    window = operations[index : index + 64]
+    if len(window) < 8 or window[1][0] != "MARK":
+        return False
+    reductions = [i for i, op in enumerate(window) if op[0] == "REDUCE"]
+    if len(reductions) < 2:
+        return False
+    first, second = reductions[:2]
+    if second != first + 2 or first < 2:
+        return False
+    prefix = window[2 : first - 2]
+    allowed = {
+        "MARK",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+        "GLOBAL",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "TUPLE",
+        "TUPLE1",
+        "TUPLE2",
+        "TUPLE3",
+        "EMPTY_TUPLE",
+        "BINPERSID",
+        "NEWFALSE",
+        "NEWTRUE",
+    }
+    return (
+        window[first - 2][0:2] == ("GLOBAL", "collections OrderedDict")
+        and window[first - 1][0] == "EMPTY_TUPLE"
+        and window[first + 1][0] == "TUPLE"
+        and sum(op[0] == "BINPERSID" for op in prefix) == 1
+        and all(
+            op[0] in allowed and (op[0] != "GLOBAL" or tuple(str(op[1]).split()) in _PYTORCH_STORAGE_GLOBALS)
+            for op in prefix
+        )
+    )
+
+
 def _ordinary_checkpoint_positions(
     report: PickleReport, payload: bytes | None, safe_numpy: bool
 ) -> frozenset[tuple[int, str, str]]:
@@ -6099,7 +6169,17 @@ def _ordinary_checkpoint_positions(
         elif reference == ("_codecs", "encode"):
             ordinary = all(item == ("REDUCE", 2) for item in shape)
         elif reference == ("torch._utils", "_rebuild_tensor_v2"):
-            ordinary = _collections_ordered_dict_binding_is_canonical() and all(item == ("REDUCE", 6) for item in shape)
+            operations = (
+                _checkpoint_opcodes(payload) if len(payload) <= _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES else []
+            )
+            uses = [
+                i for i, (op, _, _, definition) in enumerate(operations) if op == "GLOBAL" and definition == position
+            ]
+            ordinary = (
+                bool(uses)
+                and _collections_ordered_dict_binding_is_canonical()
+                and all(_checkpoint_tensor_call(operations, i) for i in uses)
+            )
         elif reference == ("torch", "device"):
             ordinary = all(item in {("REDUCE", 1), ("REDUCE", 2)} for item in shape)
         else:
