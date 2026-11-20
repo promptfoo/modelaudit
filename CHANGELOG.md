@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](docs/agents/release-process.md#version-scheme-0ver).
 
+## [0.2.58](https://github.com/promptfoo/modelaudit/compare/v0.2.57...v0.2.58) (2026-11-20)
+
+
+### Bug Fixes
+
+* avoid rechecking identical PyTorch storage prefixes ([#2044](https://github.com/promptfoo/modelaudit/issues/2044)) ([80b1b0d](https://github.com/promptfoo/modelaudit/commit/80b1b0dd5de1e10934ae42935c5f8bb66043bfae))
+* classify passive WordPiece domain tokens as informational ([#2050](https://github.com/promptfoo/modelaudit/issues/2050)) ([3e7dfa5](https://github.com/promptfoo/modelaudit/commit/3e7dfa5c967e557eab7130ae9b3757856b1f6029))
+* finish tokenizer and model card scans and report incomplete checks ([#2042](https://github.com/promptfoo/modelaudit/issues/2042)) ([239e575](https://github.com/promptfoo/modelaudit/commit/239e5753281a6759bc73f4f202e2ffb6c0c78f5a))
+* preserve hostname markers during endpoint classification ([#2047](https://github.com/promptfoo/modelaudit/issues/2047)) ([83fa9c9](https://github.com/promptfoo/modelaudit/commit/83fa9c9a22534376d982663af5c89a98438c5c60))
+* preserve incomplete coverage in saved scan reports ([#2045](https://github.com/promptfoo/modelaudit/issues/2045)) ([9415dfd](https://github.com/promptfoo/modelaudit/commit/9415dfd72ec870ed3506e6527718692adefcf2f8))
+* stop flagging normal PyTorch and Transformers checkpoints ([#2051](https://github.com/promptfoo/modelaudit/issues/2051)) ([f10748f](https://github.com/promptfoo/modelaudit/commit/f10748f32c5a2f5c1f3bd07ac283eab91a6ae12b))
+* stop valid PyTorch models from failing scans ([#2043](https://github.com/promptfoo/modelaudit/issues/2043)) ([0513a46](https://github.com/promptfoo/modelaudit/commit/0513a46914eb5b19170c352be4e78e4a92ff994c))
+
 ## [Unreleased]
 
 [Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.57...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
