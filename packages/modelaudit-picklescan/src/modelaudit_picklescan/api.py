@@ -6,6 +6,7 @@ import ast
 import base64
 import binascii
 import codecs
+import hashlib
 import io
 import os
 import pickletools
@@ -5358,7 +5359,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
     invocation_load_safe_modules: frozenset[str] = frozenset()
     safe_getattr_reconstruction_keys: frozenset[tuple[int, int]] = frozenset()
     source_snapshot_stable = True
-    ordinary_checkpoint_positions: frozenset[int] = frozenset()
+    ordinary_checkpoint_positions: frozenset[tuple[int, str, str]] = frozenset()
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
     try:
@@ -5479,7 +5480,8 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
             finding
             for finding in report.findings
             if finding.rule_code != "NON_ALLOWLISTED_GLOBAL"
-            or finding.details.get("position") not in ordinary_checkpoint_positions
+            or (finding.details.get("position"), finding.details.get("module"), finding.details.get("name"))
+            not in ordinary_checkpoint_positions
         )
         report = replace(
             report, findings=findings, verdict=_verdict_for_findings(report.status, findings), private_metadata={}
@@ -6021,17 +6023,30 @@ def _source_backed_framework_identity_requires_contextual_invocation(module: str
 def _distribution_owns_module(module: str) -> bool:
     if importlib_metadata.distribution is not _CANONICAL_DISTRIBUTION_LOOKUP:
         return False
-    spec = _find_module_spec_without_imports(module)
-    if spec is None:
-        return False
-    origin, _loader = _module_spec_fields_without_hooks(spec)
-    if not isinstance(origin, str):
-        return False
     root = module.split(".", 1)[0]
     try:
         distribution = importlib_metadata.distribution(root)
-        relative = Path(origin).resolve().relative_to(Path(str(distribution.locate_file(""))).resolve())
-        return str(relative).replace(os.sep, "/") in {str(file) for file in distribution.files or ()}
+        directory = Path(str(distribution.locate_file(""))).resolve()
+        files = {str(file): file for file in distribution.files or ()}
+        parts = module.split(".")
+        for length in range(1, len(parts) + 1):
+            spec = _find_module_spec_without_imports(".".join(parts[:length]))
+            if spec is None:
+                return False
+            origin, _loader = _module_spec_fields_without_hooks(spec)
+            if not isinstance(origin, str):
+                return False
+            path = Path(origin).resolve()
+            entry = files.get(path.relative_to(directory).as_posix())
+            if entry is None or entry.hash is None or entry.hash.mode != "sha256" or entry.size != path.stat().st_size:
+                return False
+            with path.open("rb") as source:
+                digest = hashlib.sha256()
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            if base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii") != entry.hash.value:
+                return False
+        return True
     except (importlib_metadata.PackageNotFoundError, OSError, RuntimeError, ValueError):
         return False
 
@@ -6071,9 +6086,10 @@ def _ordinary_checkpoint_positions(
     payload: bytes | None,
     safe_numpy: bool,
     analyzed: frozenset[int],
-) -> frozenset[int]:
+) -> frozenset[tuple[int, str, str]]:
     if (
         report.status != ScanStatus.COMPLETE
+        or report.verdict == SafetyVerdict.MALICIOUS
         or type(payload) is not bytes
         or len(payload) > _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES
     ):
@@ -6090,12 +6106,15 @@ def _ordinary_checkpoint_positions(
             uses.setdefault(definition, []).append(index)
     calls = _sequence(report.metadata.get("callable_invocations"))
     ownership: dict[str, bool] = {}
-    safe: set[int] = set()
+    safe: set[tuple[int, str, str]] = set()
     for finding in candidates:
         module, name = str(finding.details.get("module", "")), str(finding.details.get("name", ""))
         position = _optional_int(finding.details.get("position"))
         if position is None or position not in uses:
             continue
+        if any(operations[i][1] != f"{module} {name}" for i in uses[position]):
+            continue
+        key = (position, module, name)
         invocations = [_mapping(x) for x in calls if _optional_int(_mapping(x).get("global_position")) == position]
         if not invocations:
             continue
@@ -6107,7 +6126,7 @@ def _ordinary_checkpoint_positions(
                     _checkpoint_literal_call(operations, i, {"latin1", "latin-1"}, codec=True) for i in uses[position]
                 )
             ):
-                safe.add(position)
+                safe.add(key)
             continue
         if (module, name) not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES:
             continue
@@ -6120,15 +6139,15 @@ def _ordinary_checkpoint_positions(
             continue
         if (module, name) in _NUMPY_RECONSTRUCT_REFERENCES | _NUMPY_DTYPE_REFERENCES:
             if safe_numpy:
-                safe.add(position)
+                safe.add(key)
         elif (module, name) == ("torch._utils", "_rebuild_tensor_v2"):
             if _collections_ordered_dict_binding_is_canonical() and all(
                 _checkpoint_tensor_call(operations, i) for i in uses[position]
             ):
-                safe.add(position)
+                safe.add(key)
         elif (module, name) == ("torch", "device"):
             if all(_checkpoint_device_call(operations, i) for i in uses[position]):
-                safe.add(position)
+                safe.add(key)
         else:
             context = _source_class_context(f"{module}.{name}")
             if context is None:
@@ -6155,7 +6174,7 @@ def _ordinary_checkpoint_positions(
                 node, invocations, position in analyzed
             )
             if ordinary_enum or ordinary_class:
-                safe.add(position)
+                safe.add(key)
     return frozenset(safe)
 
 
@@ -6237,8 +6256,18 @@ def _checkpoint_plain_class(node: ast.ClassDef, invocations: list[Mapping[str, o
         or any(not isinstance(decorator, ast.Name) or decorator.id != "dataclass" for decorator in node.decorator_list)
     ):
         return False
-    methods = {n.name: n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    if methods.keys() & {"__new__", "__setstate__", "__getattribute__", "__setattr__"}:
+    methods = {n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assigned = {
+        name.id
+        for statement in node.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for target in (statement.targets if isinstance(statement, ast.Assign) else [statement.target])
+        for name in ast.walk(target)
+        if isinstance(name, ast.Name)
+    }
+    if (methods | assigned) & {"__new__", "__setstate__", "__getattribute__", "__setattr__", "__dict__"}:
+        return False
+    if "__getattr__" in assigned:
         return False
     if "__getattr__" in methods and not analyzed:
         return False
