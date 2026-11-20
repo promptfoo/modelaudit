@@ -140,6 +140,7 @@ BARE_NETWORK_DOMAIN_TOKEN_PATTERN = re.compile(rb"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]
 WORDPIECE_DOMAIN_TOKEN = re.compile(
     rb"(?:##@?|https?://)?" + BARE_NETWORK_DOMAIN_TOKEN_PATTERN.pattern + rb"(?:/[a-zA-Z0-9./_-]*)?[.,]?"
 )
+SOURCE_CALL_PATTERN = re.compile(rb"[A-Za-z_$][\w$]*[ \t]*\(")
 BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_URL_TOKEN_PATTERN,
     BARE_NETWORK_IPV4_TOKEN_PATTERN,
@@ -3223,11 +3224,13 @@ class TextScanner(BaseScanner):
                 if host in domains:
                     position = stream.tell() - len(raw) + match.start()
                     context = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
-                    in_multiline_string = any(context.count(quote) % 2 for quote in (b"'''", b'"""'))
                     in_code = (
                         cls._documentation_multiline_literal_contains_position(payload, position)
                         or cls._documentation_multiline_return_contains_position(payload, position)
-                        or in_multiline_string
+                        or (
+                            SOURCE_CALL_PATTERN.search(context) is not None
+                            and cls._documentation_open_call_context_status(payload, position) is not False
+                        )
                     )
                     if bare and not in_code:
                         passive.add(host)

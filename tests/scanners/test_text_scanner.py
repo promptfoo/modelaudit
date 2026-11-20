@@ -5579,6 +5579,7 @@ def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
             ["##@bank.com", "__import__('socket').gethostbyname(", "'''", "bank.com", "'''.strip()", ")"],
             IssueSeverity.WARNING,
         ),
+        (["##@bank.com", "require('dns').resolve(", "`", "bank.com", "`", ")"], IssueSeverity.WARNING),
     ],
 )
 def test_wordpiece_domain_requires_only_passive_occurrences(
