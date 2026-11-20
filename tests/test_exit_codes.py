@@ -782,6 +782,20 @@ def test_directory_total_size_limit_returns_exit_code_2(tmp_path: Path) -> None:
     )
 
 
+def test_failed_informational_coverage_check_counts_as_failure() -> None:
+    result = ScanResult(scanner_name="test")
+    result.add_check(
+        name="Routing",
+        passed=False,
+        message="Routing probe reached its limit",
+        severity=IssueSeverity.INFO,
+        details={"scan_outcome_reason": "routing_incomplete"},
+    )
+    result.add_check(name="Network", passed=False, message="Documentation link", severity=IssueSeverity.INFO)
+    assert result.to_dict()["failed_checks"] == 1
+    assert "Scan coverage incomplete" in result.summary()
+
+
 def test_mixed_check_summary_preserves_security_evidence_in_either_order() -> None:
     passive = Check(
         name="Network",

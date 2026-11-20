@@ -2877,9 +2877,23 @@ def _format_scan_output(
     """Render scan results in the requested output format."""
     if output_format == "json":
         if not verbose:
-            audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
-            audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
+            audit_result = audit_result.model_copy(
+                update={
+                    "issues": [
+                        issue
+                        for issue in audit_result.issues
+                        if issue.severity != IssueSeverity.DEBUG or record_details_have_incomplete_coverage(issue)
+                    ],
+                    "checks": [
+                        check
+                        for check in audit_result.checks
+                        if check.severity != IssueSeverity.DEBUG
+                        or record_details_have_incomplete_coverage(check, allow_skipped_check_exemption=True)
+                    ],
+                }
+            )
         serialized_result = _serialize_scan_report(audit_result, exclude_none=True)
+        serialized_result["incomplete_coverage"] = results_have_inconclusive_outcome(audit_result)
         return json.dumps(_JSON_VALUE_ADAPTER.dump_python(serialized_result, mode="json"), indent=2)
 
     if output_format == "sarif":
@@ -2919,7 +2933,9 @@ def _emit_scan_output(
                     click.echo(f"Found {warning_count} warning(s)")
                 else:
                     click.echo(f"Found {len(visible_issues)} informational issue(s)")
-            else:
+            if results_have_inconclusive_outcome(audit_result):
+                click.echo("Scan coverage incomplete")
+            elif not visible_issues:
                 click.echo("No security issues found")
         return
 
@@ -4949,7 +4965,8 @@ def scan_command(
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
-    has_incomplete_coverage = _results_have_incomplete_coverage(results)
+    incomplete_summaries = _incomplete_coverage_summaries(results)
+    has_incomplete_coverage = results.get("incomplete_coverage") is True or bool(incomplete_summaries)
 
     # Add scan summary header
     output_lines.append(style_text("\n📊 SCAN SUMMARY", fg="white", bold=True))
@@ -5056,12 +5073,23 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                     output_lines.append(f"  • Framework: {style_text(framework_version, fg='cyan')}")
                 break  # Only show the first model info found
 
+    if has_incomplete_coverage:
+        output_lines.append("")
+        output_lines.append(style_text("  Scan Coverage:", fg="bright_black"))
+        output_lines.append(
+            "  " + style_text("⚠️  Incomplete security coverage", fg="yellow", bold=True),
+        )
+        for file_path, reason in incomplete_summaries[:5]:
+            output_lines.append(f"    • {_escape_terminal_text(file_path)}: {_escape_terminal_text(reason)}")
+        incomplete_count = len(incomplete_summaries)
+        if incomplete_count > 5:
+            output_lines.append(f"    ... and {incomplete_count - 5} more incomplete files")
+
     # Add security check statistics
     if "total_checks" in results and results["total_checks"] > 0:
         total = results["total_checks"]
         passed = results.get("passed_checks", 0)
         failed = results.get("failed_checks", 0)
-        success_rate = (passed / total * 100) if total > 0 else 0
 
         output_lines.append("")
         output_lines.append(style_text("  Security Checks:", fg="bright_black"))
@@ -5075,19 +5103,20 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         check_str += f" (Total: {total})"
         output_lines.append(check_str)
 
-        # Show success rate with color coding
-        if success_rate >= 95:
-            rate_color = "green"
-            rate_icon = "✅"
-        elif success_rate >= 80:
-            rate_color = "yellow"
-            rate_icon = "⚠️"
-        else:
-            rate_color = "red"
-            rate_icon = "🚨"
+        if not has_incomplete_coverage:
+            success_rate = passed / total * 100
+            if success_rate >= 95:
+                rate_color = "green"
+                rate_icon = "✅"
+            elif success_rate >= 80:
+                rate_color = "yellow"
+                rate_icon = "⚠️"
+            else:
+                rate_color = "red"
+                rate_icon = "🚨"
 
-        rate_str = style_text(f"  {rate_icon} Success Rate: {success_rate:.1f}%", fg=rate_color, bold=True)
-        output_lines.append(rate_str)
+            rate_str = style_text(f"  {rate_icon} Success Rate: {success_rate:.1f}%", fg=rate_color, bold=True)
+            output_lines.append(rate_str)
 
     # Show failed checks if any exist
     failed_checks_list = [c for c in results.get("checks", []) if c.get("status") == "failed"]
@@ -5111,19 +5140,6 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append(f"    • {check_name}: {unique_msg}")
         if len(check_groups) > 5:
             output_lines.append(f"    ... and {len(check_groups) - 5} more check types")
-
-    if has_incomplete_coverage:
-        incomplete_summaries = _incomplete_coverage_summaries(results)
-        output_lines.append("")
-        output_lines.append(style_text("  Scan Coverage:", fg="bright_black"))
-        output_lines.append(
-            "  " + style_text("⚠️  Incomplete security coverage", fg="yellow", bold=True),
-        )
-        for file_path, reason in incomplete_summaries[:5]:
-            output_lines.append(f"    • {_escape_terminal_text(file_path)}: {_escape_terminal_text(reason)}")
-        incomplete_count = len(incomplete_summaries)
-        if incomplete_count > 5:
-            output_lines.append(f"    ... and {incomplete_count - 5} more incomplete files")
 
     # Add issue summary
     issues = results.get("issues", [])
@@ -5278,10 +5294,6 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(encouragement_line)
 
     return "\n".join(output_lines)
-
-
-def _results_have_incomplete_coverage(results: dict[str, Any]) -> bool:
-    return bool(_incomplete_coverage_summaries(results))
 
 
 def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, str]]:
