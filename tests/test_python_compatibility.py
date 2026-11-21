@@ -14,8 +14,8 @@ from tests import conftest as root_conftest
 from tests.helpers.file_creators import SystemCommandPayload
 
 
-def test_python314_keeps_the_broad_test_profile() -> None:
-    assert (3, 14) not in root_conftest.RESTRICTED_PYTHON_VERSIONS
+def test_recent_python_versions_keep_the_broad_test_profile() -> None:
+    assert {(3, 14), (3, 15)}.isdisjoint(root_conftest.RESTRICTED_PYTHON_VERSIONS)
 
 
 @pytest.mark.parametrize("protocol", [None, 4, 5], ids=["runtime-default", "protocol-4", "protocol-5"])

@@ -18,13 +18,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
         shard: [0, 1, 2]
         exclude:
           - { os: windows-latest, python-version: "3.10" }
           - { os: windows-latest, python-version: "3.12" }
           - { os: windows-latest, python-version: "3.13" }
           - { os: windows-latest, python-version: "3.14" }
+          - { os: windows-latest, python-version: "3.15" }
     steps:
       - &checkout-repo
         name: Checkout repo
@@ -46,10 +47,24 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      # h5py 3.16 has no CPython 3.15 wheels. Exercise the explicit h5 extra on Linux.
+      - name: Install HDF5 development libraries
+        if: matrix.python-version == '3.15'
+        run: |
+          if ! pkg-config --exists hdf5; then
+            sudo apt-get update
+            sudo apt-get install -y libhdf5-dev
+          fi
+
       - name: Sync dependencies
         id: sync
-        run: |
+        run: >-
           uv sync --extra ${{ matrix.os == 'windows-latest' && 'all-ci-windows' || 'all-ci' }}
+          ${{ matrix.python-version == '3.15' && '--extra h5' || '' }}
+
+      - name: Verify H5 import
+        if: matrix.python-version == '3.15'
+        run: uv run --no-sync python -c "import h5py; print(h5py.version.info)"
 
       - name: Run correctness shard (fast + slow + integration)
         run: |

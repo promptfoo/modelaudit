@@ -497,6 +497,7 @@ def test_python_ci_integration_scheduling_covers_remaining_job_surface() -> None
     picklescan = "needs.changes.outputs.picklescan == 'true'"
     expected_conditions = {
         "lint": f"{integration} || {python} || {workflows}",
+        "windows-tests": f"{integration} || {python} || {workflows}",
         "license-check": f"{integration} || {dependencies} || {workflows}",
         "uv-lock-check": f"{integration} || {dependencies} || {workflows}",
         "type-check": f"{integration} || {python} || {workflows}",
@@ -525,79 +526,29 @@ def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() ->
         "needs.changes.outputs.workflows == 'true'"
     )
 
-    matrix_expression = test_job["strategy"]["matrix"]["include"]
-    assert "needs.changes.outputs.workflows != 'true'" in matrix_expression
-    matrix_options = _matrix_options(matrix_expression)
-    assert matrix_options == [
-        [
-            {"python-version": "3.10", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
-            {"python-version": "3.12", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
-            {"python-version": "3.13", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
-            {"python-version": "3.14", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
-        ],
-        [
-            {
-                "python-version": python_version,
-                "shard-count": 2,
-                "shard-index": shard_index,
-                "shard-name": f"{shard_index + 1}/2",
-            }
-            for python_version in ("3.10", "3.11", "3.12", "3.13", "3.14")
-            for shard_index in (0, 1)
-        ],
+    versions = test_job["strategy"]["matrix"]["python-version"]
+    assert "github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'" in versions
+    assert _matrix_options(versions) == [
+        ["3.10", "3.12", "3.13", "3.14", "3.15"],
+        ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"],
     ]
 
-    steps = test_job["steps"]
-    assert isinstance(steps, list)
-    fail_fast_step = _step_by_name(steps, "Run fast tests with fail-fast")
-    assert fail_fast_step["if"] == ("github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'")
-    fail_fast_run = fail_fast_step["run"]
-    assert "--maxfail=1" in fail_fast_run
-    assert '-m "not slow and not integration and not performance"' in fail_fast_run
-    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in fail_fast_run
-    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in fail_fast_run
 
-    exhaustive_step = _step_by_name(steps, "Run exhaustive fast-test shard")
-    assert exhaustive_step["if"] == ("github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'")
-    exhaustive_run = exhaustive_step["run"]
-    assert "--maxfail=1" not in exhaustive_run
-    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in exhaustive_run
-    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in exhaustive_run
-    assert '-m "not slow and not integration and not performance"' in exhaustive_run
-
-
-def test_python_ci_windows_matrix_shards_main_and_workflow_prs() -> None:
-    workflow = _load_workflow("test.yml")
-    windows_job = _jobs(workflow)["windows-tests"]
-    assert windows_job["if"] == (
-        "needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || "
-        "needs.changes.outputs.workflows == 'true'"
-    )
-
-    matrix_options = _matrix_options(windows_job["strategy"]["matrix"]["include"])
-    assert matrix_options == [
-        [{"shard-count": 1, "shard-index": 0, "shard-name": "1/1"}],
-        [
-            {"shard-count": 2, "shard-index": 0, "shard-name": "1/2"},
-            {"shard-count": 2, "shard-index": 1, "shard-name": "2/2"},
-        ],
+@pytest.mark.parametrize("job_name", ["test", "windows-tests"])
+def test_python_ci_shards_main_and_workflow_prs(job_name: str) -> None:
+    job = _jobs(_load_workflow("test.yml"))[job_name]
+    shards = job["strategy"]["matrix"]["shard"]
+    assert "github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'" in shards
+    assert _matrix_options(shards) == [
+        [{"count": 1, "index": 0, "name": "1/1"}],
+        [{"count": 2, "index": 0, "name": "1/2"}, {"count": 2, "index": 1, "name": "2/2"}],
     ]
 
-    steps = windows_job["steps"]
-    assert isinstance(steps, list)
-    fail_fast_step = _step_by_name(steps, "Run fast tests with fail-fast")
-    assert fail_fast_step["if"] == ("github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'")
-    fail_fast_run = fail_fast_step["run"]
-    assert "--maxfail=1" in fail_fast_run
-    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in fail_fast_run
-    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in fail_fast_run
-
-    exhaustive_step = _step_by_name(steps, "Run exhaustive fast-test shard")
-    assert exhaustive_step["if"] == ("github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'")
-    exhaustive_run = exhaustive_step["run"]
-    assert "--maxfail=1" not in exhaustive_run
-    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in exhaustive_run
-    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in exhaustive_run
+    run = _step_by_name(job["steps"], "Run fast tests")["run"]
+    assert '-m "not slow and not integration and not performance"' in run
+    assert "--maxfail=${{ matrix.shard.count == 1 && 1 || 0 }}" in run
+    assert "--modelaudit-shard-count ${{ matrix.shard.count }}" in run
+    assert "--modelaudit-shard-index ${{ matrix.shard.index }}" in run
 
 
 def test_python_ci_keeps_performance_out_of_the_xdist_slow_suite() -> None:
@@ -673,7 +624,7 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
         ("EXPECT_DEPENDENCY_SURFACE", "UV_LOCK_RESULT"),
         ("EXPECT_CORE_FAST", "TYPE_CHECK_RESULT"),
         ("EXPECT_CORE_FAST", "WINDOWS_RESULT"),
-        ("EXPECT_CORE_FAST", "PYTHON314_SMOKE_RESULT"),
+        ("EXPECT_CORE_FAST", "PYTHON_SMOKE_RESULT"),
         ("EXPECT_TEST", "TEST_RESULT"),
         ("EXPECT_SLOW", "SLOW_RESULT"),
         ("EXPECT_COVERAGE", "COVERAGE_RESULT"),
@@ -935,26 +886,28 @@ def test_python_ci_verifies_download_before_enabling_uploader(
         assert args[args.index("--header") + 1] == "Accept: application/octet-stream"
 
 
-def test_python314_platform_smoke_is_required_for_python_changes() -> None:
+def test_python_platform_smoke_is_required_for_python_changes() -> None:
     jobs = _jobs(_load_workflow("test.yml"))
-    smoke = jobs["python314-platform-smoke"]
+    smoke = jobs["python-platform-smoke"]
     assert smoke["if"] == jobs["lint"]["if"]
-    assert smoke["strategy"]["matrix"] == {"os": ["macos-latest", "windows-latest"]}
+    assert smoke["strategy"]["matrix"] == {"os": ["macos-latest", "windows-latest"], "python-version": ["3.14", "3.15"]}
     assert smoke["strategy"]["fail-fast"] is False
     assert smoke["runs-on"] == "${{ matrix.os }}"
-    assert "python314-platform-smoke" in jobs["ci-success"]["needs"]
+    assert "python-platform-smoke" in jobs["ci-success"]["needs"]
     steps = smoke["steps"]
-    sync = _step_by_name(steps, "Sync Python 3.14 smoke dependencies")["run"]
-    assert "--locked --python 3.14 --extra all-ci-windows --extra h5" in sync
-    probe = _step_by_name(steps, "Verify Python 3.14 native and H5 imports")
+    pin = _step_by_name(steps, "Pin Python version")
+    assert pin["run"].strip() == "uv python pin ${{ matrix.python-version }}"
+    sync = _step_by_name(steps, "Sync smoke dependencies")
+    assert (
+        sync["run"]
+        == "uv sync --locked --extra all-ci-windows ${{ matrix.python-version == '3.14' && '--extra h5' || '' }}"
+    )
+    probe = _step_by_name(steps, "Verify H5 import")
     # PowerShell reports the last native command's status, so the probe must own its step.
-    assert probe["run"].strip().splitlines() == [
-        'uv run --locked --python 3.14 python -c "import h5py, modelaudit_picklescan._rust; print(h5py.version.info)"'
-    ]
-    assert "if" not in probe
-    assert "continue-on-error" not in probe
-    assert "continue-on-error" not in smoke
-    test_step = _step_by_name(steps, "Test Python 3.14 native pickle and H5 scanning")
-    assert steps.index(probe) < steps.index(test_step)
+    assert probe["run"] == 'uv run --locked python -c "import h5py; print(h5py.version.info)"'
+    assert probe["if"] == "matrix.python-version == '3.14'"
+    test_step = _step_by_name(steps, "Test runtime compatibility")
+    assert steps.index(pin) < steps.index(sync) < steps.index(probe) < steps.index(test_step)
     assert "if" not in test_step
-    assert "--locked --python 3.14 pytest tests/test_python_compatibility.py -n 0" in test_step["run"]
+    assert "uv run --locked pytest tests/test_python_compatibility.py -n 0" in test_step["run"]
+    assert not any(step.get("continue-on-error") for step in [smoke, pin, sync, probe, test_step])

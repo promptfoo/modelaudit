@@ -263,13 +263,14 @@ def test_nightly_correctness_matrix_uses_exhaustive_three_way_shards() -> None:
     matrix = correctness["strategy"]["matrix"]
     assert matrix == {
         "os": ["ubuntu-latest", "windows-latest"],
-        "python-version": ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        "python-version": ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"],
         "shard": [0, 1, 2],
         "exclude": [
             {"os": "windows-latest", "python-version": "3.10"},
             {"os": "windows-latest", "python-version": "3.12"},
             {"os": "windows-latest", "python-version": "3.13"},
             {"os": "windows-latest", "python-version": "3.14"},
+            {"os": "windows-latest", "python-version": "3.15"},
         ],
     }
     assert "3.11" in matrix["python-version"]
@@ -278,6 +279,12 @@ def test_nightly_correctness_matrix_uses_exhaustive_three_way_shards() -> None:
     sync_run = _step_by_name(correctness, "Sync dependencies")["run"]
     assert "matrix.os == 'windows-latest'" in sync_run
     assert "'all-ci-windows' || 'all-ci'" in sync_run
+    install = _step_by_name(correctness, "Install HDF5 development libraries")
+    probe = _step_by_name(correctness, "Verify H5 import")
+    assert install["if"] == probe["if"] == "matrix.python-version == '3.15'"
+    assert "libhdf5-dev" in install["run"]
+    assert "${{ matrix.python-version == '3.15' && '--extra h5' || '' }}" in sync_run
+    assert "import h5py" in probe["run"]
 
     run = _step_by_name(correctness, "Run correctness shard (fast + slow + integration)")["run"]
     assert run.count('-m "not performance"') == 1

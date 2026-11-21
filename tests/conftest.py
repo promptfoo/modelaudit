@@ -41,7 +41,7 @@ _FRAMEWORK_AVAILABILITY: dict[str, bool] = {}
 # Reduced CI lanes only install the dependency set needed for this curated test
 # subset. Keep this centralized so adding a supported Python version requires one
 # deliberate update instead of duplicating version checks in hook logic.
-# Python 3.11 and standard 3.14 deliberately exercise the broad test profile.
+# Python 3.11, 3.14 and 3.15 exercise the broad test profile.
 RESTRICTED_PYTHON_VERSIONS = frozenset({(3, 10), (3, 12), (3, 13)})
 
 

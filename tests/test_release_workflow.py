@@ -127,43 +127,39 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
     workflow = yaml.safe_load((root_dir / ".github/workflows/test.yml").read_text(encoding="utf-8"))
     job = _jobs(workflow)["picklescan-package"]
     matrix = job["strategy"]["matrix"]
-    versions = matrix["python-version"]
-    lanes = {(os_name, version) for os_name in matrix["os"] for version in versions}
-    lanes.update((lane["os"], lane["python-version"]) for lane in matrix["include"])
     release_platforms = {
         lane["os"]
         for lane in _jobs(_load_release_workflow())["build-picklescan-package"]["strategy"]["matrix"]["include"]
     }
-
-    assert {"3.10", "3.11", "3.12", "3.13", "3.14"} <= set(versions)
-    assert {(os_name, "3.14") for os_name in release_platforms} <= lanes
-    assert job["timeout-minutes"] == (
-        "${{ matrix.timeout-minutes || ((matrix.os == 'macos-15-intel' || "
-        "matrix.os == 'windows-latest') && 30 || 15) }}"
-    )
-    for version in ("3.12", "3.13", "3.14"):
-        linux = next(
-            lane for lane in matrix["include"] if lane["os"] == "ubuntu-latest" and lane["python-version"] == version
-        )
-        assert linux["timeout-minutes"] == 30
-    intel311 = next(
-        lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.11"
-    )
-    assert intel311["timeout-minutes"] == 45
-    intel314 = next(
-        lane for lane in matrix["include"] if lane["os"] == "macos-15-intel" and lane["python-version"] == "3.14"
-    )
-    assert intel314["timeout-minutes"] == 75
-    arm314 = next(lane for lane in matrix["include"] if lane["os"] == "macos-15" and lane["python-version"] == "3.14")
-    assert arm314["timeout-minutes"] == 60
-    ubuntu_arm314 = next(
-        lane for lane in matrix["include"] if lane["os"] == "ubuntu-24.04-arm" and lane["python-version"] == "3.14"
-    )
-    assert ubuntu_arm314["timeout-minutes"] == 30
-    windows314 = next(
-        lane for lane in matrix["include"] if lane["os"] == "windows-latest" and lane["python-version"] == "3.14"
-    )
-    assert windows314["timeout-minutes"] == 90
+    assert set(matrix["os"]) == release_platforms
+    assert matrix["python-version"] == ["3.14", "3.15"]
+    assert not matrix.get("exclude")
+    assert job["timeout-minutes"] == "${{ matrix.timeout-minutes }}"
+    # Per-platform timeouts apply to both recent versions. Extra lanes cover older releases.
+    platform_timeouts = {
+        lane["os"]: lane["timeout-minutes"] for lane in matrix["include"] if "python-version" not in lane
+    }
+    assert platform_timeouts == {
+        "ubuntu-latest": 30,
+        "ubuntu-24.04-arm": 30,
+        "macos-15": 60,
+        "macos-15-intel": 75,
+        "windows-latest": 90,
+    }
+    extra_lanes = {
+        (lane["os"], lane["python-version"]): lane["timeout-minutes"]
+        for lane in matrix["include"]
+        if "python-version" in lane
+    }
+    assert extra_lanes == {
+        ("ubuntu-latest", "3.10"): 15,
+        ("ubuntu-latest", "3.11"): 15,
+        ("ubuntu-latest", "3.12"): 30,
+        ("ubuntu-latest", "3.13"): 30,
+        ("macos-15-intel", "3.11"): 45,
+        ("macos-15-intel", "3.12"): 45,
+    }
+    versions = set(matrix["python-version"]) | {version for _, version in extra_lanes}
     assert project["requires-python"] == ">=3.10"
     assert cargo["features"]["abi3"] == ["pyo3/abi3-py310"]
     for version in versions:
