@@ -1,0 +1,1 @@
+Pickle scans now check Python source encoding declarations before trusting a referenced module. They treat unsupported encodings and bytecode caches that could require excessive compilation of nested `finally` blocks as untrusted.
