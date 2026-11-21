@@ -133,9 +133,9 @@ class StorageLiteralMatcher:
     def __init__(self, patterns: Iterable[str] = _STANDALONE_PATTERNS) -> None:
         raw = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (*patterns, _MAGIC_METHOD_PATTERN))
         self._patterns = raw + _ROUTE_PATTERNS
-        # Decoding can erase token boundaries. Route the bare name, but let the
-        # native classifier decide whether it is a call, including in continued text.
-        self._discovery_patterns = (*self._patterns, re.compile("__lazy_import__", re.IGNORECASE))
+        # Route aliases and wrapped calls, but leave the verdict to the native
+        # classifier. Lossy decoding can erase a separator next to the dunder.
+        self._discovery_patterns = (*self._patterns, re.compile(r"__lazy_import__|\b(?:eval|exec)\b", re.IGNORECASE))
 
     def matches_text(self, text: str, *, discovery: bool = False) -> bool:
         patterns = self._discovery_patterns if discovery else self._patterns

@@ -1170,7 +1170,11 @@ fn contains_lazy_import(lower: &str) -> bool {
         let prefix = prefix
             .trim_end()
             .strip_suffix('.')
-            .and_then(|module| module.trim_end().strip_suffix("builtins"))
+            .map(|module| {
+                module
+                    .trim_end()
+                    .trim_end_matches(is_suffix_identifier_continue)
+            })
             .unwrap_or(prefix);
         callable_use(prefix, rest, suffix_starts_non_prose_call)
     })

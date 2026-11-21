@@ -437,8 +437,10 @@ def test_pickle_report_to_scan_result_preserves_reduce_associated_global_alias()
     [
         ("eval", "S104"),
         ("exec", "S104"),
+        ("execfile", "S104"),
         ("compile", "S105"),
         ("__import__", "S106"),
+        ("__lazy_import__", "S106"),
     ],
 )
 def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias(
@@ -601,6 +603,8 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
         ("SUSPICIOUS_STRING", {"pattern": "os.system(payload)"}, "S101"),
         ("SUSPICIOUS_STRING", {"pattern": "subprocess.Popen(payload)"}, "S103"),
         ("SUSPICIOUS_STRING", {"pattern": "__import__('os')"}, "S106"),
+        ("SUSPICIOUS_STRING", {"pattern": "__lazy_import__("}, "S106"),
+        ("SUSPICIOUS_STRING", {"pattern": "base64 __lazy_import__"}, "S106"),
         ("SUSPICIOUS_STRING", {"pattern": "compile(source, path, mode)"}, "S105"),
         ("SUSPICIOUS_STRING", {"pattern": "base64 encoded string literal"}, "S601"),
         ("SUSPICIOUS_STRING", {"pattern": "ordinary string literal"}, None),

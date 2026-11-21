@@ -58,7 +58,7 @@ def get_import_rule_code(module: str, function: str | None = None) -> str | None
                 return _rule("S104")
             elif func_lower == "compile":
                 return _rule("S105")
-            elif func_lower == "__import__":
+            elif func_lower in {"__import__", "__lazy_import__"}:
                 return _rule("S106")
         return _rule("S115")  # General builtins manipulation
 
