@@ -57,7 +57,7 @@ gh api repos/promptfoo/modelaudit/dispatches -f event_type=release-metadata-retr
   -f 'client_payload[pr_branch]=release-please--branches--main'
 ```
 
-The publisher uses the approved versioned section from the matching tag for the public GitHub Release. Upgrade, security and other reviewed notes are visible directly. When a release has no fragments, up to three entries from the generated inventory are shown. The comparison link and complete inventory are available under **All changes**. CI checks that cited ModelAudit commits belong to the release history and that reader-facing links return a successful public HTTP response after redirects. The new tag in the comparison is checked against the proposed release manifest and becomes available after merge. A manual retry of an existing historical release retains its release page.
+The publisher uses the approved versioned section from the matching tag for the public GitHub Release. Upgrade, security and other reviewed notes are visible directly. When a release has no fragments, up to three entries from the generated inventory are shown. The comparison link and complete inventory are available under **All changes**. CI checks that cited ModelAudit commits belong to the release history. An exact ModelAudit commit URL ending in the full 40-character commit hash is verified by Git alone. CI verifies the upcoming tag comparison against the release manifest and checks other reader-facing links for a successful public HTTP response after redirects. A manual retry of an existing historical release retains its release page.
 
 ## Version scheme (0ver)
 
