@@ -5203,18 +5203,24 @@ def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tupl
     )
 
 
-def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes, os.stat_result]:
+def _read_bounded_regular_file(
+    path: Path,
+    max_bytes: int | None,
+    *,
+    expected: os.stat_result | None = None,
+    require_complete: bool = True,
+) -> tuple[bytes, os.stat_result]:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     file_descriptor = os.open(path, flags)
     try:
         before = os.fstat(file_descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise OSError(f"source candidate is not a regular file: {path}")
-        if max_bytes is not None and before.st_size > max_bytes:
+        if require_complete and max_bytes is not None and before.st_size > max_bytes:
             raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
 
         chunks: list[bytes] = []
-        remaining = 0 if max_bytes is None else max_bytes + 1
+        remaining = 0 if max_bytes is None else max_bytes + int(require_complete)
         while remaining > 0:
             chunk = os.read(file_descriptor, min(64 * 1024, remaining))
             if not chunk:
@@ -5231,9 +5237,11 @@ def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes
         # identity. path_stat is a path view; reconcile it with the cross-view
         # identity that omits fields Windows reports differently across stat
         # methods (st_ctime, permission bits).
-        if _stat_identity(before) != _stat_identity(after) or _cross_view_file_stat_identity(
-            before
-        ) != _cross_view_file_stat_identity(path_stat):
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or (expected is not None and _stat_identity(expected) != _stat_identity(path_stat))
+            or _cross_view_file_stat_identity(before) != _cross_view_file_stat_identity(path_stat)
+        ):
             raise OSError(f"source candidate changed while being read: {path}")
         if max_bytes is not None and len(content) > max_bytes:
             raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
@@ -5299,44 +5307,11 @@ def _read_candidate_fingerprint(
             return False, None
         return True, hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).digest()
     if not stat.S_ISREG(before.st_mode):
-        return True, None
-
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        file_descriptor = os.open(path, flags)
-    except (FileNotFoundError, NotADirectoryError):
         return False, None
+
     try:
-        opened = os.fstat(file_descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            return False, None
-        chunks: list[bytes] = []
-        remaining = read_limit + int(require_complete)
-        while remaining > 0:
-            chunk = os.read(file_descriptor, min(64 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        source = b"".join(chunks)
-        after = os.fstat(file_descriptor)
-        path_after = path.stat()
+        source, _ = _read_bounded_regular_file(path, read_limit, expected=before, require_complete=require_complete)
     except OSError:
-        return False, None
-    finally:
-        os.close(file_descriptor)
-
-    # opened/after share the descriptor view and before/path_after share the path
-    # view, so each pair uses the full identity. The two views are reconciled with
-    # the cross-view identity (Windows reports st_ctime and permission bits
-    # differently across stat methods).
-    if (
-        _stat_identity(opened) != _stat_identity(after)
-        or _stat_identity(before) != _stat_identity(path_after)
-        or _cross_view_file_stat_identity(before) != _cross_view_file_stat_identity(opened)
-    ):
-        return False, None
-    if require_complete and len(source) > read_limit:
         return False, None
     return True, hashlib.sha256(b"file\0" + source).digest()
 
@@ -8351,12 +8326,16 @@ def _bytecode_cache_can_override_source(
     source: str,
     optimize_level: int,
 ) -> bool:
-    if not cache_path.is_file():
-        return False
     try:
-        if cache_path.stat().st_size > _MAX_BYTECODE_CACHE_BYTES:
-            return True
-        cache_bytes = cache_path.read_bytes()
+        expected = cache_path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    if not stat.S_ISREG(expected.st_mode):
+        return True
+    try:
+        cache_bytes, _ = _read_bounded_regular_file(cache_path, _MAX_BYTECODE_CACHE_BYTES, expected=expected)
     except OSError:
         return True
     header = cache_bytes[:16]
@@ -8380,7 +8359,8 @@ def _bytecode_cache_can_override_source(
     # On CPython 3.15, py_compile can serialize a singly referenced code object.
     # Match importlib's extra reference when the root sets marshal's FLAG_REF.
     if body and body[0] & 0x80:
-        _retained_code = source_code
+        retained_code = source_code
+        return body != marshal.dumps(retained_code)
     return body != marshal.dumps(source_code)
 
 

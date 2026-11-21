@@ -13792,14 +13792,21 @@ def test_valid_mismatched_source_bytecode_fails_closed(
         sys.modules.pop(module_name, None)
 
 
+@pytest.mark.parametrize("writer", ["py_compile", "importlib"])
 def test_matching_source_bytecode_remains_analyzable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    writer: str,
 ) -> None:
     module_name = "matching_cached_bytecode"
     module_path = tmp_path / f"{module_name}.py"
     module_path.write_text("def entrypoint():\n    return 1\n")
-    py_compile.compile(str(module_path), doraise=True)
+    if writer == "py_compile":
+        py_compile.compile(str(module_path), doraise=True)
+    else:
+        monkeypatch.setattr(sys, "dont_write_bytecode", False)
+        SourceFileLoader(module_name, str(module_path)).get_code(module_name)
+    assert Path(cache_from_source(str(module_path))).is_file()
     monkeypatch.syspath_prepend(str(tmp_path))
     _isolate_reusable_meta_path_finders(monkeypatch)
 
@@ -13821,6 +13828,40 @@ def test_matching_source_bytecode_remains_analyzable(
     source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert str(Path(cache_from_source(str(module_path))).absolute()) in source_fingerprints["fingerprints"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open file")
+def test_bytecode_cache_replaced_during_validation_is_untrusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = "value = 1\n"
+    module = tmp_path / "helper.py"
+    module.write_text(source)
+    cache = Path(cache_from_source(str(module)))
+    py_compile.compile(str(module), doraise=True)
+    replacement = tmp_path / "replacement.pyc"
+    replacement.write_bytes(cache.read_bytes()[:16] + b"changed")
+    _replace_source_on_read(monkeypatch, cache, tmp_path / "displaced.pyc", replacement)
+
+    assert call_graph._bytecode_cache_can_override_source(cache, module, source, 0)
+    assert cache.read_bytes().endswith(b"changed")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="Requires POSIX FIFOs")
+def test_bytecode_cache_fifo_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = tmp_path / "fifo_cached_module.py"
+    module.write_text("def entrypoint(): return 1\n")
+    cache = Path(cache_from_source(str(module)))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(cache)  # type: ignore[attr-defined]
+    assert _read_candidate_fingerprint(cache) == (False, None)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    report = scan_bytes(b"cfifo_cached_module\nentrypoint\n(tR.")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(n.code == "call_graph_source_unavailable" for n in report.notices)
+    assert report.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
 
 
 @pytest.mark.parametrize(("suffix", "size"), [(".py", 33), (".pyc", 65)], ids=["source", "bytecode"])
