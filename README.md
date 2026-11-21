@@ -52,6 +52,8 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 Scan evidence and source errors can include original credential values, including in JSON, SARIF, SBOM, and shared reports. Credential normalization remains where it affects detection, grouping, or suppression.
 
+On POSIX systems, new `--output` and `--sbom` files have owner-only permissions (`0600` or stricter). Overwriting a file keeps its existing permissions. Check who can read an existing file before reusing it.
+
 ## What It Detects
 
 - **Code execution attacks** in Pickle, PyTorch, NumPy, and Joblib files

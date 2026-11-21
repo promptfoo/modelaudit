@@ -606,9 +606,11 @@ def test_scan_cli_tokenizer_json_late_chat_template_after_structure_budget_repor
     )
 
 
-def _run_cli_subprocess(args: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run_cli_subprocess(
+    args: list[str], *, env: dict[str, str] | None = None, umask: int = -1
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "modelaudit", *args], check=False, capture_output=True, text=True, env=env
+        [sys.executable, "-m", "modelaudit", *args], check=False, capture_output=True, text=True, env=env, umask=umask
     )
 
 
@@ -1622,7 +1624,7 @@ def test_cli_report_writers_pin_dotdot_before_parent_rename(
     def rename_child_after_open(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         flags: int,
-        mode: int = 0o777,
+        mode: int = 0o600,
         *,
         dir_fd: int | None = None,
     ) -> int:
@@ -2015,6 +2017,7 @@ def test_cli_report_writers_stage_new_output_in_private_directory(
         assert dst_dir_fd is not None
         assert src_dir_fd != dst_dir_fd
         observed_stage_modes.append(stat.S_IMODE(os.fstat(src_dir_fd).st_mode))
+        assert os.stat(source, dir_fd=src_dir_fd, follow_symlinks=False).st_mode & 0o077 == 0
         original_link(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(cli_module.os, "link", inspect_staging_then_link)
@@ -2024,10 +2027,12 @@ def test_cli_report_writers_stage_new_output_in_private_directory(
         {inspect_staging_then_link if function is original_link else function for function in original_supports_dir_fd},
     )
 
+    cli_module._preflight_output_text_file(str(output_path))
+    assert not output_path.exists()
     result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
-    assert observed_stage_modes
+    assert len(observed_stage_modes) == 2  # Preflight probe and report installation.
     assert all(mode & 0o077 == 0 for mode in observed_stage_modes)
     assert json.loads(output_path.read_text())["scanners"]
     assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
@@ -2331,132 +2336,109 @@ def test_cli_report_writers_check_permissions_through_open_parent(
     assert access_kwargs["follow_symlinks"] is (not supports_follow_symlinks)
 
 
-def test_cli_report_writers_recheck_parent_links_on_fallback(
+@pytest.fixture
+def closed_windows_handles(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Exercise Windows path checks and handle lifetimes even on POSIX."""
+    closed_handles: list[int] = []
+    validate = cli_module._validated_absolute_output_path
+    monkeypatch.setattr(cli_module, "_open_output_parent_directory", lambda path: (validate(path), None, 123))
+    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: 456)
+    monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
+
+    if os.name != "nt":
+        temp_path: Path
+
+        def create_temp(_output: str, path: Path, name: str, *, preserve_security: bool) -> tuple[int, Path]:
+            nonlocal temp_path
+            assert not preserve_security
+            temp_path = path.parent / name
+            return os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), temp_path
+
+        def install_temp(_output: str, fd: int, path: Path, *, replace_existing: bool) -> None:
+            assert not replace_existing
+            assert os.path.samestat(os.fstat(fd), temp_path.stat())
+            temp_path.rename(path)
+
+        monkeypatch.setattr(cli_module, "_open_windows_output_temp_file", create_temp)
+        monkeypatch.setattr(cli_module, "_replace_windows_output_file", install_temp)
+
+    return closed_handles
+
+
+def test_cli_report_writers_recheck_windows_parent_links(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     requires_symlinks: None,
+    closed_windows_handles: list[int],
 ) -> None:
-    """Fallback platforms must validate a parent swapped after the initial check."""
+    """A parent swapped after the initial check must fail validation."""
     output_dir = tmp_path / "output"
     output_dir.mkdir()
-    original_output_dir = tmp_path / "original-output"
     redirected_dir = tmp_path / "redirected"
     redirected_dir.mkdir()
     victim_path = redirected_dir / "scanners.json"
     victim_path.write_text("sentinel")
     output_path = output_dir / victim_path.name
-    guard_handle = 123
-    lock_handle = 456
-    closed_handles: list[int] = []
 
-    def swap_parent_then_open(path: str) -> tuple[Path, int | None, int | None]:
-        opened_path = cli_module._validated_absolute_output_path(path)
-        output_dir.rename(original_output_dir)
+    def swap_parent_then_lock(*_args: object) -> int:
+        output_dir.rename(tmp_path / "original-output")
         output_dir.symlink_to(redirected_dir, target_is_directory=True)
-        return opened_path, None, guard_handle
+        return 456
 
-    monkeypatch.setattr(cli_module, "_open_output_parent_directory", swap_parent_then_open)
-    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: lock_handle)
-    monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
-
+    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", swap_parent_then_lock)
     result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
     assert "Refusing to write output through symlink" in result.output
     assert victim_path.read_text() == "sentinel"
-    assert not list(redirected_dir.glob(".scanners.json.*.tmp"))
-    assert closed_handles == ([lock_handle, guard_handle] if os.name == "nt" else [guard_handle])
+    assert not list(redirected_dir.glob(".modelaudit-output-*.tmp"))
+    assert closed_windows_handles == [456, 123]
 
 
-def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
+def test_cli_report_writers_do_not_truncate_late_hard_link_on_windows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    closed_windows_handles: list[int],
 ) -> None:
     """A destination replaced after validation must not expose its inode to writes."""
     output_path = tmp_path / "scanners.json"
     victim_path = tmp_path / "victim.txt"
     victim_path.write_text("sentinel")
-    original_validate = cli_module._validated_absolute_output_path
-    validation_count = 0
-    guard_handle = 123
-    lock_handle = 456
-    closed_handles: list[int] = []
+    original_validate = cli_module._validate_windows_temporary_file
 
-    def install_hard_link_after_validation(path: str) -> Path:
-        nonlocal validation_count
-        validated_path = original_validate(path)
-        validation_count += 1
-        if validation_count == 2:
-            output_path.hardlink_to(victim_path)
-        return validated_path
+    def install_hard_link_after_validation(path: str, absolute_path: Path, fd: int) -> None:
+        original_validate(path, absolute_path, fd)
+        output_path.hardlink_to(victim_path)
 
-    monkeypatch.setattr(
-        cli_module,
-        "_open_output_parent_directory",
-        lambda path: (original_validate(path), None, guard_handle),
-    )
-    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: lock_handle)
-    monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
-    monkeypatch.setattr(cli_module, "_validated_absolute_output_path", install_hard_link_after_validation)
-
+    monkeypatch.setattr(cli_module, "_validate_windows_temporary_file", install_hard_link_after_validation)
     result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 2
+    assert "its path changed" in result.output
     assert victim_path.read_text() == "sentinel"
     assert output_path.samefile(victim_path)
-    assert closed_handles == ([lock_handle, guard_handle] if os.name == "nt" else [guard_handle])
+    assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+    assert closed_windows_handles == [456, 123]
 
 
 def test_cli_report_writers_keep_windows_parent_guard_through_replace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    closed_windows_handles: list[int],
 ) -> None:
     """The Windows parent guard must remain live until atomic installation finishes."""
     output_path = tmp_path / "scanners.json"
-    guard_handle = 123
-    lock_handle = 456
-    closed_handles: list[int] = []
+    original_replace = cli_module._replace_windows_output_file
 
-    monkeypatch.setattr(
-        cli_module,
-        "_open_output_parent_directory",
-        lambda _path: (output_path, None, guard_handle),
-    )
-    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: lock_handle)
-    monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
+    def guarded_replace(output: str, temp_fd: int, destination_path: Path, *, replace_existing: bool) -> None:
+        assert not closed_windows_handles
+        original_replace(output, temp_fd, destination_path, replace_existing=replace_existing)
 
-    if os.name == "nt":
-        original_windows_replace = cli_module._replace_windows_output_file
-
-        def guarded_windows_replace(
-            output: str,
-            temp_fd: int,
-            destination_path: Path,
-            *,
-            replace_existing: bool,
-        ) -> None:
-            assert closed_handles == []
-            original_windows_replace(
-                output,
-                temp_fd,
-                destination_path,
-                replace_existing=replace_existing,
-            )
-
-        monkeypatch.setattr(cli_module, "_replace_windows_output_file", guarded_windows_replace)
-    else:
-        original_replace = cli_module.os.replace
-
-        def guarded_replace(source: Path, destination: Path) -> None:
-            assert closed_handles == []
-            original_replace(source, destination)
-
-        monkeypatch.setattr(cli_module.os, "replace", guarded_replace)
-
+    monkeypatch.setattr(cli_module, "_replace_windows_output_file", guarded_replace)
     result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
-    assert closed_handles == ([lock_handle, guard_handle] if os.name == "nt" else [guard_handle])
+    assert closed_windows_handles == [456, 123]
     assert json.loads(output_path.read_text())["scanners"]
 
 
@@ -2948,19 +2930,55 @@ def test_cli_report_writers_create_regular_output_files(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes are required")
+def test_cli_report_writers_reject_inherited_extended_acl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An inherited macOS ACL could grant access even with a private POSIX mode."""
+    report = tmp_path / "report.txt"
+    monkeypatch.setattr(cli_module, "_posix_fd_has_extended_acl", lambda _path, _fd: True)
+
+    with pytest.raises(cli_module._OutputWriteError, match="owner-only output permissions"):
+        cli_module._preflight_output_text_file(str(report))
+    with pytest.raises(cli_module._OutputWriteError, match="owner-only output permissions"):
+        cli_module._write_output_text_file(str(report), "raw evidence")
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes are required")
+def test_scan_creates_private_reports_with_permissive_umask(tmp_path: Path) -> None:
+    model = tmp_path / "internal-model.dat"
+    model.write_bytes(b"test content")
+    report = tmp_path / "report.json"
+    sbom = tmp_path / "sbom.json"
+
+    result = _run_cli_subprocess(
+        ["scan", str(model), "--no-cache", "--format", "json", "--output", str(report), "--sbom", str(sbom)],
+        env={**os.environ, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path), "PYTHONDONTWRITEBYTECODE": "1"},
+        umask=0o000,
+    )
+
+    assert result.returncode == 0, result.stderr
+    for path in (report, sbom):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert model.name in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes are required")
 def test_cli_report_writers_atomically_overwrite_regular_file_and_preserve_mode(tmp_path: Path) -> None:
     """A normal existing output should be replaced without changing its access mode."""
     output_path = tmp_path / "scanners.json"
     output_path.write_text("stale")
     output_path.chmod(0o640)
-    original_inode = output_path.stat().st_ino
+    original = output_path.stat()
 
+    cli_module._preflight_output_text_file(str(output_path))
+    assert output_path.read_text() == "stale"
     result = _invoke_scanner_catalog(output_path)
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
-    assert output_path.stat().st_ino != original_inode
-    assert stat.S_IMODE(output_path.stat().st_mode) == 0o640
+    replacement = output_path.stat()
+    assert replacement.st_ino != original.st_ino
+    assert (replacement.st_uid, replacement.st_gid) == (original.st_uid, original.st_gid)
+    assert stat.S_IMODE(replacement.st_mode) == 0o640
 
 
 def test_scan_output_utf8_locale(tmp_path):

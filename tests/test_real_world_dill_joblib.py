@@ -386,7 +386,7 @@ class TestPerformanceBenchmarks:
 class TestErrorScenarios:
     """Test various error scenarios for robustness."""
 
-    def test_permission_denied_handling(self, tmp_path):
+    def test_permission_denied_handling(self, tmp_path: Path) -> None:
         """Test handling of files with permission issues."""
         if not hasattr(os, "chmod") or not hasattr(os, "geteuid"):
             # Skip on Windows - chmod exists but doesn't work the same way, geteuid doesn't exist
@@ -398,7 +398,7 @@ class TestErrorScenarios:
         restricted_file.write_bytes(b"joblib test")
 
         # Remove read permissions
-        os.chmod(str(restricted_file), 0o000)
+        restricted_file.chmod(0o000)
 
         try:
             scanner = PickleScanner()
@@ -409,7 +409,7 @@ class TestErrorScenarios:
             assert len(result.issues) > 0
         finally:
             # Restore permissions for cleanup
-            os.chmod(str(restricted_file), 0o644)
+            restricted_file.chmod(0o600)
 
     def test_network_file_timeout_simulation(self, tmp_path: Path) -> None:
         """Report an I/O timeout while opening an otherwise scannable file."""
