@@ -1,0 +1,1 @@
+JAX and Orbax checkpoint scans now report the number of paths skipped at the metadata depth limit and the first affected path. This bounds memory used by depth-limit reporting while preserving full paths for security findings.

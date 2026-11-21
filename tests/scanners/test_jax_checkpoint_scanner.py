@@ -2095,24 +2095,42 @@ def test_can_handle_letter_prefixed_jax_payload_still_routes_malicious_json(tmp_
     )
 
 
+@pytest.mark.parametrize("oversized", [False, True])
+def test_wide_depth_limit_preserves_first_path_and_later_findings(tmp_path: Path, oversized: bool) -> None:
+    key = "long" * 1024
+    branches: object = [[] for _ in range(32)]
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH - 2):
+        branches = [branches]
+    callback = "jax.experimental.io_callback"
+    metadata = {"framework": "jax", key: branches, "docs": [callback], "payload": callback}
+    if oversized:
+        metadata["padding"] = "x" * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
+    path = tmp_path / "model.checkpoint"
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = JaxCheckpointScanner().scan(str(path))
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    limits = [check for check in result.checks if check.name == "JSON Metadata Traversal Depth Limit"]
+    assert len(limits) == 1
+    root = "json_checkpoint_bounded_prefix" if oversized else "json_checkpoint"
+    assert limits[0].details["context"] == f"{root}.{key}" + "[0]" * (
+        JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH - 1
+    )
+    assert limits[0].details["limited_paths"] == 32
+    critical = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert [issue.details["context"] for issue in critical] == [f"{root}.payload"]
+
+
 def test_metadata_traversal_stops_at_depth_limit_without_recursing_unbounded() -> None:
     nested_metadata: object = "jax.experimental.host_callback.call(os.system, 'id')"
     for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
         nested_metadata = {"nested": nested_metadata}
 
-    depth_cap_contexts: set[str] = set()
-    assert (
-        list(
-            JaxCheckpointScanner._iter_string_metadata(
-                nested_metadata,
-                depth_cap_contexts=depth_cap_contexts,
-            )
-        )
-        == []
-    )
-    assert depth_cap_contexts == {
-        "root" + (".nested" * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH),
-    }
+    (skipped,) = JaxCheckpointScanner._iter_string_metadata(nested_metadata)
+    context, value = skipped
+    assert value is None
+    assert str(context) == "root" + (".nested" * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH)
 
 
 def test_deep_orbax_metadata_reports_depth_limit_without_silent_truncation(tmp_path: Path) -> None:

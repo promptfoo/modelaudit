@@ -11019,14 +11019,7 @@ def test_scan_file_fails_closed_and_does_not_cache_bounded_jax_prefix_read_failu
     )
     cache_dir = tmp_path / "cache"
 
-    def fail_prefix_read(
-        _scanner: JaxCheckpointScanner,
-        _path: str,
-        _result: ScanResult,
-        *,
-        detect_orbax_restore_fn: bool = False,
-    ) -> None:
-        del detect_orbax_restore_fn
+    def fail_prefix_read(_scanner: JaxCheckpointScanner, _path: str, _result: ScanResult) -> None:
         raise OSError("forced bounded prefix read failure")
 
     monkeypatch.setattr(JaxCheckpointScanner, "_scan_bounded_json_prefix_patterns", fail_prefix_read)
