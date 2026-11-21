@@ -526,14 +526,34 @@ def _darwin_fd_has_extended_acl(fd: int) -> bool:
     import ctypes
 
     libc = ctypes.CDLL(None, use_errno=True)
-    acl_extended_fd = libc.acl_extended_fd_np
-    acl_extended_fd.argtypes = (ctypes.c_int,)
-    acl_extended_fd.restype = ctypes.c_int
-    result = acl_extended_fd(fd)
-    if result < 0:
-        error = ctypes.get_errno()
+    try:
+        libc.acl_get_fd.argtypes = (ctypes.c_int,)
+        libc.acl_get_fd.restype = ctypes.c_void_p
+        libc.acl_get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+        libc.acl_valid.argtypes = (ctypes.c_void_p,)
+        libc.acl_free.argtypes = (ctypes.c_void_p,)
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "macOS ACL inspection is unavailable") from exc
+
+    ctypes.set_errno(0)
+    acl = libc.acl_get_fd(fd)
+    if acl is None:
+        error = ctypes.get_errno() or errno.EIO
+        if error == errno.ENOENT:  # No FILESEC_ACL on the pinned descriptor.
+            return False
         raise OSError(error, os.strerror(error))
-    return bool(result)
+    try:
+        entry = ctypes.c_void_p()
+        ctypes.set_errno(0)
+        if libc.acl_get_entry(acl, 0, ctypes.byref(entry)) == 0:  # ACL_FIRST_ENTRY
+            return True
+        error = ctypes.get_errno() or errno.EIO
+        # Darwin reports EINVAL for both an empty ACL and an invalid ACL.
+        if error == errno.EINVAL and libc.acl_valid(acl) == 0:
+            return False
+        raise OSError(error, os.strerror(error))
+    finally:
+        libc.acl_free(acl)
 
 
 def _directory_can_replace_entries(path: Path) -> bool:
@@ -1209,6 +1229,8 @@ def _open_posix_output_staging_directory(output_path: str, parent_fd: int, stagi
             raise _OutputWriteError(
                 f"Refusing to write output because its staging path changed: {_display_path(output_path)}"
             )
+        if _darwin_fd_has_extended_acl(staging_fd):
+            raise _OutputWriteError(f"Unable to ensure owner-only staging permissions for {_display_path(output_path)}")
         return staging_fd
     except Exception:
         if staging_fd is not None:
@@ -1223,8 +1245,15 @@ def _copy_posix_output_metadata(output_path: str, source_fd: int, target_fd: int
     source_stat = os.fstat(source_fd)
     target_stat = os.fstat(target_fd)
     try:
-        if _posix_fd_has_extended_acl(output_path, source_fd):
+        if _posix_fd_has_extended_acl(output_path, source_fd) or _posix_fd_has_extended_acl(output_path, target_fd):
             raise _OutputWriteError(f"Unable to preserve extended output ACL for {_display_path(output_path)}")
+        if sys.platform == "linux":
+            # Restoring group bits with fchmod could unmask inherited grants absent from the source.
+            try:
+                os.removexattr(target_fd, "system.posix_acl_access")
+            except OSError as exc:
+                if exc.errno not in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                    raise
         if (source_stat.st_uid, source_stat.st_gid) != (target_stat.st_uid, target_stat.st_gid):
             os.fchown(target_fd, source_stat.st_uid, source_stat.st_gid)
         os.fchmod(target_fd, stat.S_IMODE(source_stat.st_mode))

@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import stat
 import struct
 import subprocess
@@ -2169,6 +2170,71 @@ def test_cli_report_writers_reject_unpreservable_extended_acl(
     assert output_path.read_text() == "sentinel"
 
 
+@pytest.mark.skipif(sys.platform != "linux" or not shutil.which("setfacl"), reason="Linux setfacl is required")
+@pytest.mark.parametrize("with_acl", [False, True])
+def test_cli_report_writers_keep_only_original_linux_acl(tmp_path: Path, with_acl: bool) -> None:
+    """Restoring group access must not enable entries inherited from the staging directory."""
+    report = tmp_path / "scanners.json"
+    report.write_text("sentinel")
+    report.chmod(0o640)
+    if with_acl:
+        subprocess.run(["setfacl", "-m", f"u:{os.getuid()}:r--", str(report)], check=True)
+    attribute = "system.posix_acl_access"
+    original_acl = os.getxattr(report, attribute) if with_acl else None
+    subprocess.run(["setfacl", "-m", f"d:g:{os.getgid()}:r-x", str(tmp_path)], check=True)
+
+    cli_module._preflight_output_text_file(str(report))
+    result = _invoke_scanner_catalog(report)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(report.read_text())["scanners"]
+    assert stat.S_IMODE(report.stat().st_mode) == 0o640
+    if with_acl:
+        assert os.getxattr(report, attribute) == original_acl
+    else:
+        assert attribute not in os.listxattr(report)
+
+
+@pytest.mark.parametrize(
+    ("pointer", "error", "valid", "expected"),
+    [
+        (None, errno.ENOENT, True, False),
+        (None, errno.EACCES, True, None),
+        (2**32, 0, True, True),
+        (2**32, errno.EINVAL, True, False),
+        (2**32, errno.EINVAL, False, None),
+        (2**32, errno.EIO, True, None),
+    ],
+)
+def test_darwin_acl_inspection(
+    monkeypatch: pytest.MonkeyPatch, pointer: int | None, error: int, valid: bool, expected: bool | None
+) -> None:
+    """Only a missing or valid empty ACL is safe. Every allocated ACL must be freed."""
+    libc = MagicMock()
+    libc.acl_get_fd.return_value = pointer
+    libc.acl_get_entry.return_value = -1 if error else 0
+    libc.acl_valid.return_value = 0 if valid else -1
+    monkeypatch.setattr(cli_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(ctypes, "get_errno", lambda: error)
+
+    if expected is None:
+        with pytest.raises(OSError) as exc_info:
+            cli_module._darwin_fd_has_extended_acl(17)
+        assert exc_info.value.errno == error
+    else:
+        assert cli_module._darwin_fd_has_extended_acl(17) is expected
+    libc.acl_get_fd.assert_called_once_with(17)
+    assert libc.acl_get_fd.restype is ctypes.c_void_p
+    if pointer is None:
+        libc.acl_get_entry.assert_not_called()
+        libc.acl_free.assert_not_called()
+    else:
+        assert libc.acl_get_entry.call_args.args[:2] == (pointer, 0)
+        assert libc.acl_free.argtypes == (ctypes.c_void_p,)
+        libc.acl_free.assert_called_once_with(pointer)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptors are required")
 def test_directory_can_replace_entries_allows_darwin_root_without_acl(
     monkeypatch: pytest.MonkeyPatch,
@@ -2930,14 +2996,19 @@ def test_cli_report_writers_create_regular_output_files(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes are required")
-def test_cli_report_writers_reject_inherited_extended_acl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("on_directory", [False, True])
+def test_cli_report_writers_reject_inherited_extended_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_directory: bool
+) -> None:
     """An inherited macOS ACL could grant access even with a private POSIX mode."""
-    report = tmp_path / "report.txt"
-    monkeypatch.setattr(cli_module, "_posix_fd_has_extended_acl", lambda _path, _fd: True)
+    report = tmp_path.resolve() / "report.txt"
+    monkeypatch.setattr(
+        cli_module, "_darwin_fd_has_extended_acl", lambda fd: stat.S_ISDIR(os.fstat(fd).st_mode) == on_directory
+    )
 
-    with pytest.raises(cli_module._OutputWriteError, match="owner-only output permissions"):
+    with pytest.raises(cli_module._OutputWriteError, match="owner-only"):
         cli_module._preflight_output_text_file(str(report))
-    with pytest.raises(cli_module._OutputWriteError, match="owner-only output permissions"):
+    with pytest.raises(cli_module._OutputWriteError, match="owner-only"):
         cli_module._write_output_text_file(str(report), "raw evidence")
     assert not list(tmp_path.iterdir())
 
