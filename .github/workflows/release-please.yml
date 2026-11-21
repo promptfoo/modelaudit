@@ -311,7 +311,7 @@ jobs:
         run: |
           mkdir -p .release-preview
           python3 -I scripts/release_notes.py preview --base HEAD > .release-preview/notes.md
-          node scripts/check-release-links.mjs .release-preview/notes.md
+          node scripts/check-release-links.mjs .release-preview/notes.md release-link-check.json
           cat .release-preview/notes.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check links in the new release notes

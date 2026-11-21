@@ -871,6 +871,8 @@ def test_commit_citations_belong_to_the_release_history(repository: Path) -> Non
     for body, expected in (
         (f"[Fix]({repo}/{sha})", True),
         (f"[Fix]({repo}/{unrelated})", False),
+        (f"[Fix]({repo}/{unrelated[:8]})", False),
+        (f"[Fix]({repo}/{unrelated}#diff)", False),
         (f"`[example]({repo}/{unrelated})`", True),
     ):
         notes.write_text(body)
@@ -878,3 +880,39 @@ def test_commit_citations_belong_to_the_release_history(repository: Path) -> Non
             ["node", str(SCRIPT.with_name("check-release-links.mjs")), str(notes)], cwd=repository, capture_output=True
         )
         assert (result.returncode == 0) == expected, result.stderr
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="the release metadata job runs Node")
+def test_http_check_skips_only_verified_commit_permalinks(repository: Path) -> None:
+    if not (SCRIPT.parents[1] / "node_modules/prettier").exists():
+        pytest.skip("install the repository Markdown parser with npm ci")
+    parent = git(repository, "rev-parse", "HEAD")
+    git(repository, "commit", "--allow-empty", "-m", "next")
+    sha = git(repository, "rev-parse", "HEAD")
+    git(repository, "tag", "-a", "test-tag", "-m", "tag")
+    tag = git(repository, "rev-parse", "refs/tags/test-tag")
+    unrelated = git(repository, "commit-tree", "HEAD^{tree}", "-m", "unrelated")
+    repo = "https://github.com/promptfoo/modelaudit"
+    url = f"{repo}/commit/{sha}"
+    notes = repository / "preview.md"
+    config = repository / "links.json"
+    comparison = {"pattern": f"^{re.escape(repo + '/compare/v1...v2')}$"}
+    original = json.dumps({"ignorePatterns": [comparison], "retryCount": 2})
+    config.write_text(original)
+    command = ["node", str(SCRIPT.with_name("check-release-links.mjs")), str(notes), str(config)]
+    notes.write_text(f"[fix]({url}) [bad]({repo}/commit/{unrelated})")
+    assert subprocess.run(command, cwd=repository, capture_output=True).returncode != 0
+    assert config.read_text() == original
+
+    notes.write_text(
+        f"[fix][ref]\n\n[ref]: {url}\n\n"
+        f"[short]({repo}/commit/{parent[:8]}) [slash]({repo}/commit/{parent}/)\n"
+        f"[query]({repo}/commit/{parent}?x=1) [anchor]({repo}/commit/{parent}#diff)\n"
+        f"[tag]({repo}/commit/{tag}) [other](https://github.com/promptfoo/other/commit/{parent})\n"
+        f"`[example]({repo}/commit/{unrelated})`"
+    )
+    subprocess.run(command, cwd=repository, check=True)
+    assert json.loads(config.read_text()) == {
+        "ignorePatterns": [comparison, {"pattern": f"^{re.escape(url)}$"}],
+        "retryCount": 2,
+    }

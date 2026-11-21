@@ -78,6 +78,7 @@ jobs:
             python:
               - '**.py'
               - 'scripts/compile_tensorflow_protos.sh'
+              - 'scripts/check-release-links.mjs'
               - 'pyproject.toml'
               - 'uv.lock'
             picklescan:
@@ -458,6 +459,10 @@ jobs:
             ${{ runner.os }}-uv-
 
       - *sync-all-ci-dependencies
+
+      - name: Install the Markdown parser for release link tests
+        if: matrix.python-version == '3.12'
+        run: npm ci --ignore-scripts
 
       - *run-fast-tests
 
