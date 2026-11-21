@@ -9,14 +9,16 @@ from ..scanner_results import IssueSeverity, ScanResult, mark_inconclusive_scan_
 
 @dataclass(frozen=True)
 class ReadFailure:
-    """Finish a failed scan using the format's existing diagnostics."""
+    """Report an operational read failure using the format's diagnostics."""
 
     reason: str
     check_name: str
     message: str
     error_key: Literal["exception", "error"] = "exception"
+    why: str | None = None
 
-    def __call__(self, result: ScanResult, path: str, error: OSError) -> ScanResult:
+    def record(self, result: ScanResult, path: str, error: OSError | UnicodeError) -> None:
+        """Record the failure while leaving scan finalization to the caller."""
         mark_inconclusive_scan_result(result, self.reason)
         mark_operational_scan_error(result, self.reason)
         result.add_check(
@@ -31,6 +33,10 @@ class ReadFailure:
                 "analysis_incomplete": True,
                 "scan_outcome_reason": self.reason,
             },
+            why=self.why,
         )
+
+    def __call__(self, result: ScanResult, path: str, error: OSError) -> ScanResult:
+        self.record(result, path, error)
         result.finish(success=False)
         return result

@@ -1,6 +1,7 @@
 """Tests for metadata scanner."""
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -108,6 +109,7 @@ class TestMetadataScanner:
         assert direct.metadata["operational_error_reason"] == "metadata_read_failed"
         read_check = next(check for check in direct.checks if check.name == "Metadata File Read")
         assert read_check.details["exception_type"] == "UnicodeDecodeError"
+        assert direct.bytes_scanned == readme_path.stat().st_size
         assert read_check.severity == IssueSeverity.INFO
         assert read_check.rule_code is None
 
@@ -115,6 +117,7 @@ class TestMetadataScanner:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         readme_path = tmp_path / "README.md"
         readme_path.write_text("# Model Card\n", encoding="utf-8")
@@ -125,7 +128,9 @@ class TestMetadataScanner:
 
         monkeypatch.setattr("modelaudit.scanners.base.os.access", inaccessible_owned_path)
 
-        direct = MetadataScanner().scan(str(readme_path))
+        with caplog.at_level(logging.INFO, logger="modelaudit.scanners"):
+            direct = MetadataScanner().scan(str(readme_path))
+        assert not any(record.levelno >= logging.CRITICAL for record in caplog.records)
         assert direct.success is False
         assert direct.metadata["operational_error_reason"] == "metadata_read_failed"
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
