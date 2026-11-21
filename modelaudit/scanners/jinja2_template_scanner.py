@@ -1509,8 +1509,7 @@ class Jinja2TemplateScanner(BaseScanner):
         cursor = 0
 
         try:
-            tokens = jinja2.Environment().lex(template_content)
-            for _lineno, token_type, token_value in tokens:
+            for _lineno, token_type, token_value in jinja2.Environment(autoescape=True).lex(template_content):
                 token_start = cursor
                 token_end = token_start + len(token_value)
                 if template_content[token_start:token_end] != token_value:
@@ -4342,7 +4341,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _parse_template_ast(self, template_content: str) -> Any | None:
         try:
-            return jinja2.Environment().parse(template_content)
+            return jinja2.Environment(autoescape=True).parse(template_content)
         except Exception:
             return None
 
