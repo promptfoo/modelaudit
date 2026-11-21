@@ -102,7 +102,9 @@ def test_tensorrt_unavailable_read_is_inconclusive_not_security_finding(
     assert aggregate.success is False
     assert len(read_checks) == 1
     assert read_checks[0].status == CheckStatus.FAILED
-    assert "Error reading TensorRT engine" in read_checks[0].message
+    assert read_checks[0].message == "Error reading TensorRT engine: simulated TensorRT read failure"
+    assert read_checks[0].details["exception"] == "simulated TensorRT read failure"
+    assert read_checks[0].details["exception_type"] == "OSError"
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "tensorrt_read_failed"

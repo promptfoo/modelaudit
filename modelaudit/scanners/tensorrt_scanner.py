@@ -7,9 +7,8 @@ import re
 from collections.abc import Iterator
 from typing import ClassVar, Literal
 
-from ..core_results import mark_operational_scan_error
-from ..scanner_results import mark_inconclusive_scan_result
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from ._read_errors import ReadFailure
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("../", re.compile(r"(?<![A-Za-z0-9_.-])(?:\.\./|\.\.\\)", re.IGNORECASE)),
@@ -121,49 +120,18 @@ class TensorRTScanner(BaseScanner):
     name = "tensorrt"
     description = "Scans TensorRT engine files for suspicious strings"
     supported_extensions: ClassVar[list[str]] = [".engine", ".plan", ".trt"]
+    _finish_read_failure = ReadFailure(
+        "tensorrt_read_failed", "TensorRT Engine Read", "Error reading TensorRT engine: {error}"
+    )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
         return os.path.isfile(path) and os.path.splitext(path)[1].lower() in cls.supported_extensions
 
-    @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
-
-    @staticmethod
-    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
-        mark_inconclusive_scan_result(result, "tensorrt_read_failed")
-        mark_operational_scan_error(result, "tensorrt_read_failed")
-        result.add_check(
-            name="TensorRT Engine Read",
-            passed=False,
-            message=f"Error reading TensorRT engine: {error}",
-            severity=IssueSeverity.INFO,
-            location=path,
-            details={
-                "exception": str(error),
-                "exception_type": type(error).__name__,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": "tensorrt_read_failed",
-            },
-        )
-        result.finish(success=False)
-        return result
-
     def scan(self, path: str) -> ScanResult:
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if self._is_unreadable_path_result(path_check_result):
-                return self._finish_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._finish_read_failure)
+        if preflight_result:
+            return preflight_result
 
         result = self._create_result()
         file_size = self.get_file_size(path)

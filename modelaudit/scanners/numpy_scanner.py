@@ -15,7 +15,7 @@ from modelaudit_picklescan.call_graph import import_only_reference_is_proven_tru
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
 _picklescan_current_loaded_interpreter_reference_state: Callable[[str, str], tuple[bool, object | None]] | None
@@ -216,10 +216,6 @@ class NumPyScanner(BaseScanner):
         if not NUMPY_AVAILABLE or not NUMPY_FORMAT_AVAILABLE:
             return False
         return super().can_handle(path)
-
-    @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
 
     @staticmethod
     def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
@@ -448,19 +444,9 @@ class NumPyScanner(BaseScanner):
             _finish_with_inconclusive_contract(result, default_success=False)
             return result
 
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if self._is_unreadable_path_result(path_check_result):
-                return self._finish_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._finish_read_failure)
+        if preflight_result:
+            return preflight_result
 
         result = self._create_result()
         file_size = self.get_file_size(path)

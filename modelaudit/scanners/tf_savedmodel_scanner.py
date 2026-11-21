@@ -39,7 +39,7 @@ from ._evidence_redaction import (
     redact_evidence_value,
     redact_untrusted_error_message,
 )
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
 logger = logging.getLogger(__name__)
@@ -516,10 +516,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
-
-    @staticmethod
     def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
         redacted_error = redact_untrusted_error_message(error)
         mark_inconclusive_scan_result(result, "savedmodel_read_failed")
@@ -758,20 +754,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a TensorFlow SavedModel file or directory"""
-        # Check if path is valid
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if self._is_unreadable_path_result(path_check_result):
-                return self._finish_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._finish_read_failure)
+        if preflight_result:
+            return preflight_result
 
         # Store the file path for use in issue locations
         self.current_file_path = path

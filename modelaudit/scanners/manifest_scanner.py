@@ -24,7 +24,7 @@ from . import base as scanner_base
 from ._archive_config import get_archive_depth
 from ._evidence_redaction import redact_evidence_string
 from ._fairseq_config import check_fairseq_expressions
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
 try:
     _tomllib: ModuleType | None = importlib.import_module("tomllib")
@@ -661,20 +661,9 @@ class ManifestScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a manifest or configuration file for blacklisted content"""
-        # Check if path is valid
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if self._is_unreadable_path_result(path_check_result):
-                return self._finish_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._finish_read_failure)
+        if preflight_result:
+            return preflight_result
 
         self._start_scan_timer()
         result = self._create_result()
@@ -856,10 +845,6 @@ class ManifestScanner(BaseScanner):
             return
 
         result.finish(success=True)
-
-    @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
 
     @staticmethod
     def _record_read_failure(
