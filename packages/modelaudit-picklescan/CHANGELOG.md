@@ -4,6 +4,13 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](../../docs/agents/release-process.md#version-scheme-0ver).
 
+## [0.1.17](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.16...modelaudit-picklescan-v0.1.17) (2026-11-21)
+
+
+### Features
+
+* support CPython 3.15 and detect deferred imports in pickle scans ([#2059](https://github.com/promptfoo/modelaudit/issues/2059)) ([59ea813](https://github.com/promptfoo/modelaudit/commit/59ea813feafac3b405a745bb2500b1db119fb182))
+
 ## [Unreleased]
 
 [Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.16...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
