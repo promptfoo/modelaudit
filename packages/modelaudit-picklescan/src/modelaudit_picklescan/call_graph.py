@@ -19,6 +19,7 @@ import sysconfig
 import threading
 import zipimport
 from _collections import defaultdict as _CANONICAL_COLLECTIONS_DEFAULTDICT
+from codecs import BOM_UTF8
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -126,6 +127,8 @@ _MAX_MODULE_COMPONENTS = 32
 # inputs. This is an explicit coverage/performance tradeoff and can be tuned if
 # scan precision or throughput needs change.
 _MAX_SOURCE_BYTES = 1024 * 1024
+_SOURCE_ENCODING = re.compile(rb"[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+_SOURCE_BLANK_OR_COMMENT = re.compile(rb"[ \t\f]*(?:[#\r]|$)")
 _CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
 _MAX_FILE_FINDER_IDENTITY_CACHE_SIZE = 128
@@ -143,6 +146,7 @@ _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
 _UNREUSABLE_HOOK_STATE_IDENTITY = "<unreusable-hook-state>"
 _MAX_BYTECODE_CACHE_BYTES = 4 * _MAX_SOURCE_BYTES
+_MAX_FINALLY_EXPANSION = 64 * 1024
 _MAX_BYTECODE_CACHE_DIRECTORY_BYTES = 64 * 1024
 _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
 _BYTECODE_CACHE_OPTIMIZATIONS = (("", 0), ("1", 1), ("2", 2))
@@ -5250,9 +5254,40 @@ def _read_bounded_regular_file(
         os.close(file_descriptor)
 
 
+def _declared_source_encoding(headers: list[bytes]) -> bytes | None:
+    # PEP 263 honors the first eligible declaration. tokenize.detect_encoding
+    # would look up a source-controlled codec, potentially running search hooks.
+    for header in headers:
+        if cookie := _SOURCE_ENCODING.match(header):
+            return cookie[1].lower().replace(b"_", b"-")
+        if not _SOURCE_BLANK_OR_COMMENT.match(header):
+            break
+    return None
+
+
 def _read_bounded_source_text(path: Path) -> str:
     source, _ = _read_bounded_regular_file(path, _MAX_SOURCE_BYTES)
-    return source.decode("utf-8")
+    has_bom = source.startswith(BOM_UTF8)
+    source = source.removeprefix(BOM_UTF8)
+    headers = source.split(b"\n", 2)[:2]
+    declared = _declared_source_encoding(headers)
+    # Compiler diagnostics use linecache's LF-only header reader. A bare CR
+    # can expose a different declaration there than in Python's source parser.
+    if any(b"\r" in header.removesuffix(b"\r") for header in headers):
+        physical = _declared_source_encoding(re.split(rb"\r\n?|\n", source, maxsplit=2)[:2])
+        if declared is not None and declared != physical:
+            raise UnicodeError("ambiguous Python source encoding")
+        declared = physical
+    encoding = declared or b"utf-8"
+    if has_bom and encoding not in {b"utf-8", b"utf-8-sig"}:
+        raise UnicodeError("source encoding conflicts with UTF-8 BOM")
+    if encoding in {b"utf-8", b"utf-8-sig", b"utf8"}:
+        return source.decode("utf-8")
+    if encoding in {b"ascii", b"us-ascii"}:
+        return source.decode("ascii")
+    if encoding in {b"latin-1", b"latin1", b"iso-8859-1", b"iso8859-1", b"iso-latin-1"}:
+        return source.decode("latin-1")
+    raise UnicodeError("unsupported Python source encoding")
 
 
 def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
@@ -8208,6 +8243,62 @@ def _module_deleted_export_names(nodes: Iterable[ast.stmt]) -> frozenset[str]:
     return frozenset(deleted_names)
 
 
+def _excessive_finally_expansion(source: str) -> bool:
+    if "finally" not in source:
+        return False
+    remaining = _MAX_FINALLY_EXPANSION
+    lines = source.encode().splitlines()
+    # CPython 3.10 needs a line-table entry per 127 lines crossed. Inlined
+    # cleanup can jump repeatedly outside the try, e.g. to an enclosing with.
+    # Charge per 16 two-byte entries to avoid rejecting ordinary large modules.
+    base_cost = 1 + (len(lines) // (127 * 16) if sys.version_info < (3, 11) else 0)
+    # Repeated compiler warnings can quote a whole decoded source line.
+    base_cost += max(map(len, lines), default=0) // 1024
+
+    def count(node: ast.AST) -> tuple[int, int, int]:
+        nonlocal remaining
+        size = base_cost
+        returns = int(isinstance(node, ast.Return))
+        jumps = int(isinstance(node, ast.Break | ast.Continue))
+        final_size = final_returns = final_jumps = 0
+        for field_name, value in ast.iter_fields(node):
+            for child in value if isinstance(value, list) else (value,):
+                if not isinstance(child, ast.AST):
+                    # One node can contain many import components or nonlocal names.
+                    if isinstance(child, str | bytes):
+                        size += len(child)
+                    elif isinstance(child, int):
+                        size += child.bit_length() // 8
+                    continue
+                child_size, child_returns, child_jumps = count(child)
+                if remaining < 0:
+                    return 0, 0, 0
+                if field_name == "finalbody":
+                    final_size += child_size
+                    final_returns += child_returns
+                    final_jumps += child_jumps
+                    continue
+                size += child_size
+                returns += child_returns
+                # A loop consumes its body's jumps, but not jumps from its else clause.
+                if field_name != "body" or not isinstance(node, ast.For | ast.AsyncFor | ast.While):
+                    jumps += child_jumps
+        # CPython emits the finalizer on normal and exceptional paths and
+        # can inline it at each early exit. Nested copies multiply.
+        if final_size:
+            copies = 2 + returns + jumps
+            remaining -= (copies - 1) * final_size
+            size += copies * final_size
+            returns += copies * final_returns
+            jumps += copies * final_jumps
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            returns = jumps = 0
+        return size, returns, jumps
+
+    count(ast.parse(source))
+    return remaining < 0
+
+
 def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bool:
     cache_paths: list[tuple[Path, int]] = []
     for optimization, optimize_level in _BYTECODE_CACHE_OPTIMIZATIONS:
@@ -8322,7 +8413,12 @@ def _bytecode_cache_can_override_source(
         cached_size = int.from_bytes(header[12:16], "little")
         if cached_mtime != int(source_stat.st_mtime) & 0xFFFFFFFF or cached_size != source_stat.st_size & 0xFFFFFFFF:
             return False
-    source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=optimize_level)
+    try:
+        if _excessive_finally_expansion(source):
+            return True
+        source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=optimize_level)
+    except (RecursionError, SyntaxError, ValueError):
+        return True
     body = cache_bytes[16:]
     # On CPython 3.15, py_compile can serialize a singly referenced code object.
     # Match importlib's extra reference when the root sets marshal's FLAG_REF.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import codecs
 import collections
 import collections.abc
 import copyreg
@@ -10715,6 +10716,64 @@ def test_scan_bytes_allows_inert_source_with_future_import(
     _assert_inert_source_allowed(module_name)
 
 
+@pytest.mark.parametrize(
+    ("header", "verdict"),
+    [
+        (b"# coding: utf-7\n", SafetyVerdict.SUSPICIOUS),
+        (b"#!/usr/bin/python\r\n# -*- coding: utf-7 -*-\r\n", SafetyVerdict.SUSPICIOUS),
+        (b"\r\t# coding=utf-7\r", SafetyVerdict.SUSPICIOUS),
+        (b"# header\r# comment\r# coding: utf-7\n", SafetyVerdict.SUSPICIOUS),
+        (b"# header\r# coding: latin-1\rx = '\xe9'\r", SafetyVerdict.CLEAN),
+        (b"# header\r# comment\r", SafetyVerdict.CLEAN),
+        (b"# coding: utf8\n# coding: utf-7\n", SafetyVerdict.CLEAN),
+        (b"x = 1\n# coding: utf-7\n", SafetyVerdict.CLEAN),
+        (b"\n\n# coding: utf-7\n", SafetyVerdict.CLEAN),
+        (codecs.BOM_UTF8 + b"# coding: UTF_8\n", SafetyVerdict.CLEAN),
+        (codecs.BOM_UTF8 + b"# coding: utf8\n", SafetyVerdict.SUSPICIOUS),
+        (b"# coding: latin-1\nx = '\xe9'\n", SafetyVerdict.CLEAN),
+        (b"# coding: ascii\nx = '\xc3\xa9'\n", SafetyVerdict.SUSPICIOUS),
+    ],
+)
+def test_import_only_scan_respects_source_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header: bytes, verdict: SafetyVerdict
+) -> None:
+    # The UTF-7 decoder introduces a newline before an otherwise commented-out call.
+    (tmp_path / "encoded_fixture.py").write_bytes(header + b"class Entry: pass\n# +AAo-value = abs(1)\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(b"cencoded_fixture\nEntry\n.")
+
+    assert "encoded_fixture" not in sys.modules
+    _assert_report_state(report, ScanStatus.COMPLETE, verdict)
+    if verdict == SafetyVerdict.SUSPICIOUS:
+        assert _has_import_finding(report, "NON_ALLOWLISTED_GLOBAL", "encoded_fixture.Entry")
+
+
+def test_invoked_scan_rejects_unknown_source_encoding_without_codec_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "encoded_fixture.py").write_bytes(b"# coding: modelaudit_probe\ndef entry(): pass\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    lookups: list[str] = []
+    record_lookup = lookups.append
+    codecs.register(record_lookup)
+    try:
+        report = scan_bytes(b"cencoded_fixture\nentry\n(tR.")
+    finally:
+        codecs.unregister(record_lookup)
+
+    assert "modelaudit_probe" not in lookups
+    assert "encoded_fixture" not in sys.modules
+    _assert_report_state(report, ScanStatus.INCONCLUSIVE, SafetyVerdict.SUSPICIOUS)
+    assert _has_import_finding(report, "NON_ALLOWLISTED_GLOBAL", "encoded_fixture.entry")
+    assert any(
+        notice.code == "call_graph_source_unavailable"
+        and notice.details.get("reason") == "source_unreadable"
+        and notice.details.get("import_reference") == "encoded_fixture.entry"
+        for notice in report.notices
+    )
+
+
 def test_scan_bytes_warns_when_package_shadows_inert_module_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10988,6 +11047,82 @@ def test_scan_bytes_checks_source_local_cache_with_pycache_prefix(
         assert marker.read_text(encoding="utf-8") == "owned"
     finally:
         sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize(
+    ("cleanup", "budget"),
+    [
+        ("try: x = 2\n        finally: x = 3", 30),
+        ("import xml.etree.ElementTree as tree", 18),
+    ],
+    ids=["nested-finally", "dotted-import"],
+)
+def test_bytecode_cache_validation_limits_duplicated_finalizers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup: str, budget: int
+) -> None:
+    module = tmp_path / "cached_finally.py"
+    source = f"def entrypoint():\n    try: return 1\n    finally:\n        {cleanup}\n"
+    module.write_text(source)
+    py_compile.compile(str(module), doraise=True)
+    cache = Path(cache_from_source(str(module)))
+    assert not call_graph._bytecode_cache_can_override_source(cache, module, source, 0)
+
+    def reject_compile(*args: object, **kwargs: object) -> None:
+        pytest.fail("over-budget source reached the bytecode compiler")
+
+    monkeypatch.setattr(call_graph, "_MAX_FINALLY_EXPANSION", budget)
+    with monkeypatch.context() as guard:
+        guard.setattr(call_graph, "compile", reject_compile, raising=False)
+        assert call_graph._bytecode_cache_can_override_source(cache, module, source, 0)
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    report = scan_bytes(b"ccached_finally\nentrypoint\n(tR.")
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        notice.code == "call_graph_source_unavailable" and notice.details["reason"] == "untrusted_bytecode_cache"
+        for notice in report.notices
+    )
+    assert report.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+
+
+def test_finally_expansion_tracks_exits_through_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(call_graph, "_MAX_FINALLY_EXPANSION", 1)
+    assert not call_graph._excessive_finally_expansion("try:\n    while True: break\nfinally: pass")
+    assert call_graph._excessive_finally_expansion(
+        "while True:\n    try:\n        for x in (): pass\n        else: continue\n    finally: pass"
+    )
+    assert call_graph._excessive_finally_expansion("def f():\n    try:\n        while True: return\n    finally: pass")
+
+
+def test_finally_expansion_counts_nonlocal_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(call_graph, "_MAX_FINALLY_EXPANSION", 5)
+    source = "def f(a, b, c):\n    try: pass\n    finally:\n        def g(): nonlocal a"
+    assert not call_graph._excessive_finally_expansion(source)
+    assert call_graph._excessive_finally_expansion(source + ", b, c")
+
+
+def test_finally_expansion_accounts_for_python_310_line_deltas(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(call_graph, "_MAX_FINALLY_EXPANSION", 12)
+    prefix = "def f():\n    with manager:\n"
+    body = "        try: return\n        finally: x()"
+    assert not call_graph._excessive_finally_expansion(prefix + body)
+    assert call_graph._excessive_finally_expansion(prefix + "\n" * (127 * 16) + body) == (sys.version_info < (3, 11))
+
+
+def test_finally_expansion_accounts_for_long_diagnostic_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(call_graph, "_MAX_FINALLY_EXPANSION", 1)
+    source = "try: pass\r\nfinally: pass  # "
+    assert not call_graph._excessive_finally_expansion(source)
+    assert call_graph._excessive_finally_expansion(source + "x" * 1024)
+    assert call_graph._excessive_finally_expansion(source + "\n#" + "x" * 1024)
+
+
+def test_finally_expansion_preserves_explicit_utf8_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(call_graph, "_MAX_FINALLY_EXPANSION", 1)
+    source = "try: pass\nfinally: pass\n" + ("#" + "x" * 512 + "\n") * 2
+    assert not call_graph._excessive_finally_expansion(source)
+    assert not call_graph._excessive_finally_expansion("# coding: utf-8\n" + source)
 
 
 def test_scan_bytes_warns_when_timestamp_cache_overrides_inert_source(
