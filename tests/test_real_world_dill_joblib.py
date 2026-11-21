@@ -27,11 +27,20 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
+def _write_dill(path: Path, obj: object) -> None:
+    try:
+        path.write_bytes(dill.dumps(obj))
+    except AttributeError as exc:
+        if exc.name == "co_lnotab" and sys.version_info >= (3, 15):
+            pytest.skip("dill requires code.co_lnotab to generate these function fixtures")
+        raise
+
+
+@pytest.mark.skipif(not HAS_DILL, reason="dill not available")
 class TestRealDillFiles:
     """Tests with actual dill serialized objects."""
 
-    @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
-    def test_real_dill_lambda_function(self, tmp_path):
+    def test_real_dill_lambda_function(self, tmp_path: Path) -> None:
         """Test scanning actual dill files with lambda functions."""
         dill_file = tmp_path / "lambda.dill"
 
@@ -39,8 +48,7 @@ class TestRealDillFiles:
         def lambda_func(x):
             return x * 2
 
-        with open(dill_file, "wb") as f:
-            dill.dump(lambda_func, f)
+        _write_dill(dill_file, lambda_func)
 
         scanner = PickleScanner()
         result = scanner.scan(str(dill_file))
@@ -55,7 +63,6 @@ class TestRealDillFiles:
             dill_related = any("dill" in str(issue.message).lower() for issue in critical_issues)
             assert dill_related, "Critical issues should be dill-related if present"
 
-    @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
     def test_real_dill_complex_object(self, tmp_path: Path) -> None:
         """Test scanning dill files with complex objects."""
         dill_file = tmp_path / "complex.dill"
@@ -68,8 +75,7 @@ class TestRealDillFiles:
 
         obj = ComplexClass()
 
-        with open(dill_file, "wb") as f:
-            dill.dump(obj, f)
+        _write_dill(dill_file, obj)
 
         scanner = PickleScanner()
         result = scanner.scan(str(dill_file))
@@ -96,8 +102,7 @@ class TestRealDillFiles:
             for issue in result.issues
         )
 
-    @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
-    def test_dill_malicious_detection_still_works(self, tmp_path):
+    def test_dill_malicious_detection_still_works(self, tmp_path: Path) -> None:
         """Ensure dill files with malicious content are still detected."""
         malicious_dill = tmp_path / "malicious.dill"
 
@@ -107,8 +112,7 @@ class TestRealDillFiles:
         def malicious_func():
             return os.system("echo malicious")
 
-        with open(malicious_dill, "wb") as f:
-            dill.dump(malicious_func, f)
+        _write_dill(malicious_dill, malicious_func)
 
         scanner = PickleScanner()
         result = scanner.scan(str(malicious_dill))
