@@ -1,0 +1,1 @@
+Avoid false critical security logs for file permission errors. Scanners that report these errors as operational failures now retain the failure reason even when the filename matches a suppressed rule.

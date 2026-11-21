@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
-from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ._evidence_redaction import (
     _iter_r_raw_string_spans,
@@ -24,7 +23,8 @@ from ._evidence_redaction import (
     redact_evidence_string,
 )
 from ._network_indicators import _is_public_ip
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from ._read_errors import ReadFailure
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
 _READ_INCONCLUSIVE_REASON = "r_serialized_read_failed"
@@ -2945,6 +2945,12 @@ class RSerializedScanner(BaseScanner):
     name = "r_serialized"
     description = "Scans R serialized model files for unsafe deserialization indicators"
     supported_extensions: ClassVar[list[str]] = [".rds", ".rda", ".rdata"]
+    _finish_read_failure = ReadFailure(
+        _READ_INCONCLUSIVE_REASON,
+        "R Serialized Read",
+        "Unable to read R serialized payload for analysis: {error!s}",
+        why="The artifact could not be read, so R serialized security analysis did not complete.",
+    )
 
     _SERIALIZATION_MARKERS: ClassVar[tuple[bytes, ...]] = (b"X\n", b"A\n", b"B\n")
     _WORKSPACE_HEADERS: ClassVar[tuple[bytes, ...]] = (b"RDX2\n", b"RDX3\n", b"RDA2\n", b"RDA3\n")
@@ -3636,21 +3642,9 @@ class RSerializedScanner(BaseScanner):
         )
 
     def scan(self, path: str) -> ScanResult:
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if any(
-                check.name == "Path Readable" and check.status == CheckStatus.FAILED
-                for check in path_check_result.checks
-            ):
-                result = self._create_result()
-                self._mark_read_failure(result, path, PermissionError(f"Path is not readable: {path}"))
-                result.finish(success=False)
-                return result
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._finish_read_failure)
+        if preflight_result:
+            return preflight_result
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -3664,9 +3658,8 @@ class RSerializedScanner(BaseScanner):
             return result
         except OSError as exc:
             if exc.errno is not None:
-                self._mark_read_failure(result, path, exc)
-            else:
-                self._mark_decode_failure(result, path, exc)
+                return self._finish_read_failure(result, path, exc)
+            self._mark_decode_failure(result, path, exc)
             result.finish(success=False)
             return result
         except (EOFError, ValueError, MemoryError, lzma.LZMAError) as exc:
@@ -3791,26 +3784,6 @@ class RSerializedScanner(BaseScanner):
             success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
         )
         return result
-
-    @staticmethod
-    def _mark_read_failure(result: ScanResult, path: str, error: OSError) -> None:
-        """Record file-access coverage loss separately from malformed serialized data."""
-        mark_inconclusive_scan_result(result, _READ_INCONCLUSIVE_REASON)
-        mark_operational_scan_error(result, _READ_INCONCLUSIVE_REASON)
-        result.add_check(
-            name="R Serialized Read",
-            passed=False,
-            message=f"Unable to read R serialized payload for analysis: {error!s}",
-            severity=IssueSeverity.INFO,
-            location=path,
-            details={
-                "exception": str(error),
-                "exception_type": type(error).__name__,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": _READ_INCONCLUSIVE_REASON,
-            },
-            why="The artifact could not be read, so R serialized security analysis did not complete.",
-        )
 
     @staticmethod
     def _mark_decode_failure(result: ScanResult, path: str, error: Exception) -> None:

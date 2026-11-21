@@ -11,7 +11,6 @@ from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
-from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import (
     _COREML_DESCRIPTION_FIELD_HINTS,
@@ -21,7 +20,8 @@ from ..utils.file.detection import (
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
 )
 from ..utils.file.detection import _read_proto_varint as _read_varint
-from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from ._read_errors import ReadFailure
+from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, IssueSeverity, ScanResult
 
 _NETWORK_PATTERN = re.compile(
     r"(?i)\b(?:https?://|wss?://|ftp://|file://|s3://|gs://|[a-z0-9.-]+\.(?:com|net|org|io|ai)(?:/|\b))"
@@ -150,6 +150,7 @@ class CoreMLScanner(BaseScanner):
     name = "coreml"
     description = "Scans CoreML .mlmodel files for custom code paths and suspicious metadata"
     supported_extensions: ClassVar[list[str]] = [".mlmodel"]
+    _finish_read_failure = ReadFailure("coreml_read_failed", "CoreML File Read", "Failed to read CoreML file: {error}")
 
     # Bounded parse limits to avoid large-memory processing spikes
     MAX_PARSE_BYTES: ClassVar[int] = 10 * 1024 * 1024  # 10 MB
@@ -257,30 +258,6 @@ class CoreMLScanner(BaseScanner):
         except Exception:
             return False
 
-    @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
-
-    @staticmethod
-    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
-        mark_inconclusive_scan_result(result, "coreml_read_failed")
-        mark_operational_scan_error(result, "coreml_read_failed")
-        result.add_check(
-            name="CoreML File Read",
-            passed=False,
-            message=f"Failed to read CoreML file: {error}",
-            severity=IssueSeverity.INFO,
-            location=path,
-            details={
-                "exception": str(error),
-                "exception_type": type(error).__name__,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": "coreml_read_failed",
-            },
-        )
-        result.finish(success=False)
-        return result
-
     @classmethod
     def _has_coreml_structure(cls, fields: list[_ProtoField]) -> bool:
         spec_version = _first_varint(fields, 1)
@@ -315,19 +292,9 @@ class CoreMLScanner(BaseScanner):
         return any(field.field_number in _COREML_DESCRIPTION_FIELD_HINTS for field in parsed_desc)
 
     def scan(self, path: str) -> ScanResult:
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if self._is_unreadable_path_result(path_check_result):
-                return self._finish_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._finish_read_failure)
+        if preflight_result:
+            return preflight_result
 
         result = self._create_result()
         self.current_file_path = path

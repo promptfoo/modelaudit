@@ -18,7 +18,7 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from ..core_results import mark_operational_scan_error
 from ..utils.helpers.json_limits import validate_json_structural_limits as _validate_json_structural_token_limit
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 # Map SafeTensors dtypes to bit sizes for integrity checking. Sub-byte
 # dtypes are valid only when the complete tensor occupies whole bytes.
@@ -650,10 +650,6 @@ class SafeTensorsScanner(BaseScanner):
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:
         """Mark malformed safetensors framing as an explicit inconclusive scan."""
         BaseScanner._mark_inconclusive_metadata_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
-
-    @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
 
     @classmethod
     def _finish_read_failure(cls, result: ScanResult, path: str, error: OSError) -> ScanResult:
@@ -1359,15 +1355,11 @@ class SafeTensorsScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         """Scan a SafeTensors file."""
         remote_header_only = bool(self.config.get(_REMOTE_HEADER_ONLY_CONFIG_KEY))
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if self._is_unreadable_path_result(path_check_result):
-                return self._finish_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
-            return path_check_result
+        preflight_result = self._run_preflight_checks(
+            path, check_size_limit=not remote_header_only, on_unreadable=self._finish_read_failure
+        )
+        if preflight_result:
+            return preflight_result
 
         if remote_header_only:
             if self._path_validation_result is None:
@@ -1385,9 +1377,6 @@ class SafeTensorsScanner(BaseScanner):
             )
             self._path_validation_result.metadata["file_size"] = file_size
         else:
-            size_check = self._check_size_limit(path)
-            if size_check:
-                return size_check
             file_size = self.get_file_size(path)
 
         result = self._create_result()

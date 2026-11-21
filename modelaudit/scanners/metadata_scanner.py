@@ -8,7 +8,8 @@ from urllib.parse import unquote, urlparse
 from ..core_results import mark_operational_scan_error
 from ..detectors.network_comm import redact_url_for_finding
 from ..scanner_results import mark_inconclusive_scan_result, scan_result_has_inconclusive_outcome
-from .base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
+from ._read_errors import ReadFailure
+from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ class MetadataScanner(BaseScanner):
     name = "metadata"
     description = "Scans model documentation files for security issues"
     supported_extensions: ClassVar[list[str]] = [".md", ".markdown", ".rst", ".txt", ".yml", ".yaml"]
+    _read_failure = ReadFailure(
+        _METADATA_READ_FAILED_REASON, "Metadata File Read", "Unable to load metadata document for analysis: {error!s}"
+    )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -61,21 +65,9 @@ class MetadataScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan metadata file for security issues."""
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if any(
-                check.name == "Path Readable" and check.status == CheckStatus.FAILED
-                for check in path_check_result.checks
-            ):
-                result = self._create_result()
-                self._mark_metadata_read_failure(result, path, PermissionError(f"Path is not readable: {path}"))
-                result.finish(success=False)
-                return result
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._read_failure)
+        if preflight_result:
+            return preflight_result
 
         self._start_scan_timer()
         result = self._create_result()
@@ -153,7 +145,7 @@ class MetadataScanner(BaseScanner):
         except TimeoutError:
             raise
         except (OSError, UnicodeError) as e:
-            self._mark_metadata_read_failure(result, file_path, e)
+            self._read_failure.record(result, file_path, e)
         except Exception as e:
             self._add_issue_check(
                 result,
@@ -166,25 +158,6 @@ class MetadataScanner(BaseScanner):
                     type="file_error",
                 ),
             )
-
-    @staticmethod
-    def _mark_metadata_read_failure(result: ScanResult, file_path: str, error: OSError | UnicodeError) -> None:
-        """Record unavailable document coverage without fabricating a security finding."""
-        mark_inconclusive_scan_result(result, _METADATA_READ_FAILED_REASON)
-        mark_operational_scan_error(result, _METADATA_READ_FAILED_REASON)
-        result.add_check(
-            name="Metadata File Read",
-            passed=False,
-            message=f"Unable to load metadata document for analysis: {error!s}",
-            severity=IssueSeverity.INFO,
-            location=file_path,
-            details={
-                "exception": str(error),
-                "exception_type": type(error).__name__,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": _METADATA_READ_FAILED_REASON,
-            },
-        )
 
     def _check_suspicious_urls_in_text(self, content: str, file_path: str, result: ScanResult) -> None:
         """Check for suspicious URLs in text content."""

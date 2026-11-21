@@ -30,7 +30,8 @@ from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FI
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._archive_config import EXECUTABLE_ARCHIVE_MEMBER_PATH_CONFIG_KEY
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
-from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners._read_errors import ReadFailure
+from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
 from modelaudit.scanners.text_scanner_support.model_card_policy import (
     disclosure_has_harmful_claim,
@@ -901,6 +902,9 @@ class TextScanner(BaseScanner):
 
     name = "text"
     supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst", ".env"]
+    _finish_metadata_read_failure = ReadFailure(
+        "text_metadata_read_failed", "Text File Metadata Read", "Unable to inspect text file metadata: {error!s}"
+    )
     default_max_file_read_size = DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -4225,30 +4229,6 @@ class TextScanner(BaseScanner):
         return findings + passive_findings, finding_limit
 
     @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
-
-    @staticmethod
-    def _finish_metadata_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
-        mark_inconclusive_scan_result(result, "text_metadata_read_failed")
-        mark_operational_scan_error(result, "text_metadata_read_failed")
-        result.add_check(
-            name="Text File Metadata Read",
-            passed=False,
-            message=f"Unable to inspect text file metadata: {error!s}",
-            severity=IssueSeverity.INFO,
-            location=path,
-            details={
-                "exception": str(error),
-                "exception_type": type(error).__name__,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": "text_metadata_read_failed",
-            },
-        )
-        result.finish(success=False)
-        return result
-
-    @staticmethod
     def _mark_content_security_scan_incomplete(
         result: ScanResult,
         path: str,
@@ -4534,14 +4514,10 @@ class TextScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a text file for security issues."""
-        result = self._create_scan_result_after_preflight(path, check_size_limit=False)
+        result = self._create_scan_result_after_preflight(
+            path, check_size_limit=False, on_unreadable=self._finish_metadata_read_failure
+        )
         if not result.success:
-            if self._is_unreadable_path_result(result):
-                return self._finish_metadata_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
             return result
 
         try:

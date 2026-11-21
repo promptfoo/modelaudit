@@ -6,6 +6,7 @@ import re
 # Progress tracking imports with circular dependency detection
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -147,6 +148,7 @@ _WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile
 )
 DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
 DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
+_ReadFailureHandler = Callable[[ScanResult, str, OSError], ScanResult]
 
 
 @lru_cache(maxsize=16)
@@ -571,9 +573,12 @@ class BaseScanner(ABC):
         path: str,
         *,
         check_size_limit: bool = True,
+        on_unreadable: _ReadFailureHandler | None = None,
     ) -> ScanResult | None:
         """Run shared path and optional size validation before a scanner's heavy parsing starts."""
-        path_check_result = self._check_path(path)
+        path_check_result = (
+            self._check_path(path) if on_unreadable is None else self._check_path(path, on_unreadable=on_unreadable)
+        )
         if path_check_result:
             return path_check_result
 
@@ -589,9 +594,15 @@ class BaseScanner(ABC):
         path: str,
         *,
         check_size_limit: bool = True,
+        on_unreadable: _ReadFailureHandler | None = None,
     ) -> ScanResult:
         """Create a scan result after shared preflight, or return the failing preflight result."""
-        preflight_result = self._run_preflight_checks(path, check_size_limit=check_size_limit)
+        if on_unreadable is None:
+            preflight_result = self._run_preflight_checks(path, check_size_limit=check_size_limit)
+        else:
+            preflight_result = self._run_preflight_checks(
+                path, check_size_limit=check_size_limit, on_unreadable=on_unreadable
+            )
         if preflight_result:
             return preflight_result
 
@@ -1430,11 +1441,11 @@ class BaseScanner(ABC):
 
         return len(findings)
 
-    def _check_path(self, path: str) -> ScanResult | None:
+    def _check_path(self, path: str, *, on_unreadable: _ReadFailureHandler | None = None) -> ScanResult | None:
         """Common path checks and validation
 
         Returns:
-            None if path is valid or has only warnings, otherwise a ScanResult with critical errors
+            None if scanning can continue, otherwise the failed path or read result.
         """
         result = self._create_result()
 
@@ -1461,6 +1472,9 @@ class BaseScanner(ABC):
 
         # Check if path is readable
         if not os.access(path, os.R_OK):
+            if on_unreadable is not None:
+                # Report an operational error without emitting a spurious critical finding.
+                return on_unreadable(self._create_result(), path, PermissionError(f"Path is not readable: {path}"))
             result.add_check(
                 name="Path Readable",
                 passed=False,

@@ -6,9 +6,9 @@ from typing import ClassVar
 
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 
-from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from ._read_errors import ReadFailure
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 HAS_PADDLE = True
 
@@ -69,6 +69,7 @@ class PaddleScanner(BaseScanner):
     name = "paddle"
     description = "Scans PaddlePaddle models for embedded code patterns"
     supported_extensions: ClassVar[list[str]] = [".pdmodel", ".pdiparams"]
+    _finish_read_failure = ReadFailure("paddle_read_failed", "Paddle File Read", "Error reading file: {error}")
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -78,44 +79,10 @@ class PaddleScanner(BaseScanner):
             return False
         return os.path.splitext(path)[1].lower() in cls.supported_extensions
 
-    @staticmethod
-    def _is_unreadable_path_result(result: ScanResult) -> bool:
-        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
-
-    @staticmethod
-    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
-        mark_inconclusive_scan_result(result, "paddle_read_failed")
-        mark_operational_scan_error(result, "paddle_read_failed")
-        result.add_check(
-            name="Paddle File Read",
-            passed=False,
-            message=f"Error reading file: {error}",
-            severity=IssueSeverity.INFO,
-            location=path,
-            details={
-                "exception": str(error),
-                "exception_type": type(error).__name__,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": "paddle_read_failed",
-            },
-        )
-        result.finish(success=False)
-        return result
-
     def scan(self, path: str) -> ScanResult:
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            if self._is_unreadable_path_result(path_check_result):
-                return self._finish_read_failure(
-                    self._create_result(),
-                    path,
-                    PermissionError(f"Path is not readable: {path}"),
-                )
-            return path_check_result
-
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        preflight_result = self._run_preflight_checks(path, on_unreadable=self._finish_read_failure)
+        if preflight_result:
+            return preflight_result
 
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)

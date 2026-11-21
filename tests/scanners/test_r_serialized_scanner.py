@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import logging
 import lzma
 import zipfile
 from pathlib import Path
@@ -174,6 +175,7 @@ def test_scan_read_failure_is_operationally_inconclusive_and_not_cached(tmp_path
         assert direct.metadata["operational_error_reason"] == "r_serialized_read_failed"
         assert all(check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
         read_check = _check_by_name(direct, "R Serialized Read")[0]
+        assert read_check.why == "The artifact could not be read, so R serialized security analysis did not complete."
         assert read_check.details["analysis_incomplete"] is True
         assert read_check.details["scan_outcome_reason"] == "r_serialized_read_failed"
 
@@ -281,12 +283,15 @@ def test_scan_renamed_read_failure_bypasses_stale_clean_cache(tmp_path: Path) ->
 def test_scan_unreadable_path_is_operationally_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     path = tmp_path / "unreadable.rds"
     _write_raw_r_serialized(path, "safe\nmodel\nweights")
     monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda *_args: False)
 
-    direct = RSerializedScanner().scan(str(path))
+    with caplog.at_level(logging.INFO, logger="modelaudit.scanners"):
+        direct = RSerializedScanner().scan(str(path))
+    assert not any(record.levelno >= logging.CRITICAL for record in caplog.records)
     aggregate = core.scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     assert direct.success is False

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 
 from modelaudit.analysis.unified_context import UnifiedMLContext
+from modelaudit.config import ModelAuditConfig
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
@@ -271,6 +273,7 @@ def test_lightgbm_read_failure_is_inconclusive_not_security_finding(
 def test_lightgbm_unreadable_path_preflight_is_inconclusive_not_security_finding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     path = tmp_path / "permission-denied.lightgbm"
     path.write_text(_build_lightgbm_text(), encoding="utf-8")
@@ -287,10 +290,34 @@ def test_lightgbm_unreadable_path_preflight_is_inconclusive_not_security_finding
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
     monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
 
-    direct = LightGBMScanner().scan(str(path))
+    with caplog.at_level(logging.INFO, logger="modelaudit.scanners"):
+        direct = LightGBMScanner().scan(str(path))
+    assert not any(record.levelno >= logging.CRITICAL for record in caplog.records)
     aggregate = _scan_without_cache(path)
 
     _assert_lightgbm_read_failure(direct, aggregate, path)
+    assert direct.success is False
+    (check,) = direct.checks
+    assert check.message == f"Unable to read LightGBM file: Path is not readable: {path}"
+    assert check.details["error"] == f"Path is not readable: {path}"
+    assert check.details["error_type"] == "PermissionError"
+
+
+def test_unreadable_lightgbm_remains_inconclusive_when_filename_matches_suppressed_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "path_traversal.lightgbm"
+    path.touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+    monkeypatch.setattr("modelaudit.config.get_config", lambda: ModelAuditConfig(suppress={"S405"}))
+
+    result = LightGBMScanner().scan(path.name)
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "lightgbm_read_failed"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not result.issues
 
 
 def test_lightgbm_read_failure_takes_operational_precedence_over_security_finding(
