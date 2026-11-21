@@ -2385,11 +2385,8 @@ class TarScanner(BaseScanner):
                                     if member_scan_incomplete(file_result):
                                         scan_complete = False
 
-                                    result.merge_member_result(file_result, name)
+                                    result.merge_member_result(file_result, name, extracted_size=total_size)
                                     asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
-
-                                    if file_result.scanner_name == "unknown":
-                                        result.bytes_scanned += total_size
 
                             asset_entry.setdefault("size", member.size)
                             contents.append(asset_entry)

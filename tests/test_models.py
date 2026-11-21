@@ -1007,6 +1007,16 @@ def _single_member_record(result: ScanResult, path_segments: list[str]) -> dict[
     return records[0]
 
 
+@pytest.mark.parametrize(("reported", "expected"), [(0, 8), (4, 8), (8, 8), (12, 12)])
+def test_unrecognized_archive_member_counts_extracted_or_expanded_bytes_once(reported: int, expected: int) -> None:
+    parent = ScanResult(scanner_name="zip")
+    child = ScanResult(scanner_name="unknown")
+    child.bytes_scanned = reported
+    parent.merge_member_result(child, "member", extracted_size=8)
+    assert parent.bytes_scanned == expected
+    assert child.bytes_scanned == reported
+
+
 def test_merge_member_result_namespaces_duplicate_member_hashes() -> None:
     parent = ScanResult(scanner_name="zip")
     parent.metadata["file_hashes"] = {"sha256": "a" * 64}
