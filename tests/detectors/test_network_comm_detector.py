@@ -8972,8 +8972,8 @@ def test_shared_evidence_redaction_classification_budget_fails_closed(
 
 
 def test_model_card_endpoint_classification_scales_with_document_size() -> None:
-    links = b"".join(f"[paper](https://github.com/library/model-{index})\n".encode() for index in range(48))
-    data = b"per token weights\n" + links + b"ordinary documentation " * 380 + b"\ngit clone https://github.com/a/b"
+    endpoints = b"".join(f"api_key=value-{index} endpoint=45.33.32.156\n".encode() for index in range(48))
+    data = endpoints + b"ordinary documentation " * 380 + b"\ngit clone https://github.com/a/b"
     detector = NetworkCommDetector({"max_findings": 100})
     findings = detector.scan(data, "README.md")
     assert detector._evidence_redaction_classifications > 32
