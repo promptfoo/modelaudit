@@ -21,7 +21,6 @@ import re
 import struct
 import subprocess
 import sys
-import sysconfig
 import tarfile
 import time
 import uuid
@@ -9460,10 +9459,7 @@ def test_scan_bytes_detects_pathlib_dotted_method_reduce(
     expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.{method}"
     payload = _pathlib_method_reduce_payload(target, method)
 
-    # Only pathlib is needed. Writes by other workers to the checkout can invalidate import resolution.
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(sys, "path", [sysconfig.get_path("stdlib")])
-        report = scan_bytes(payload, source=f"pathlib-{method}.pkl")
+    report = scan_bytes(payload, source=f"pathlib-{method}.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
     _assert_critical_dangerous_call(report, expected_reference)

@@ -5,12 +5,9 @@ import os
 import pickle
 import struct
 import sys
-import sysconfig
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
-
-import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -46,11 +43,7 @@ def test_rust_pickle_scanner_keeps_common_ml_serialization_clean(tmp_path: Path)
     path = tmp_path / "state.pkl"
     path.write_bytes(pickle.dumps(SafeStateDict(), protocol=4))
 
-    # OrderedDict resolves in the standard library. Concurrent writes to the checkout would
-    # otherwise change a tracked import directory and correctly make the scan inconclusive.
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(sys, "path", [sysconfig.get_path("stdlib")])
-        result = PickleScanner().scan(str(path))
+    result = PickleScanner().scan(str(path))
 
     diagnostic = json.dumps(
         {
